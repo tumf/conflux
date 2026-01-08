@@ -2,15 +2,12 @@ use crate::error::{OrchestratorError, Result};
 use crate::opencode::OpenCodeRunner;
 use crate::openspec::{self, Change};
 use crate::progress::ProgressDisplay;
-use crate::state::OrchestratorState;
 use tracing::{error, info, warn};
 
 pub struct Orchestrator {
     opencode: OpenCodeRunner,
-    openspec_path: String,
-    state: OrchestratorState,
+    openspec_cmd: String,
     progress: Option<ProgressDisplay>,
-    dry_run: bool,
     target_change: Option<String>,
 }
 
@@ -18,30 +15,26 @@ impl Orchestrator {
     /// Create a new orchestrator
     pub fn new(
         opencode_path: &str,
-        openspec_path: &str,
-        dry_run: bool,
+        openspec_cmd: &str,
         target_change: Option<String>,
     ) -> Result<Self> {
-        let state = OrchestratorState::load()?.unwrap_or_else(OrchestratorState::new);
         let opencode = OpenCodeRunner::new(opencode_path);
 
         Ok(Self {
             opencode,
-            openspec_path: openspec_path.to_string(),
-            state,
+            openspec_cmd: openspec_cmd.to_string(),
             progress: None,
-            dry_run,
             target_change,
         })
     }
 
     /// Run the orchestration loop
     pub async fn run(&mut self) -> Result<()> {
-        info!("Starting orchestration loop (dry_run: {})", self.dry_run);
+        info!("Starting orchestration loop");
 
         loop {
-            // 1. List all changes
-            let changes = openspec::list_changes(&self.openspec_path).await?;
+            // 1. List all changes from openspec
+            let changes = openspec::list_changes(&self.openspec_cmd).await?;
 
             if changes.is_empty() {
                 info!("No changes found");
@@ -68,7 +61,7 @@ impl Orchestrator {
 
             if filtered_changes.is_empty() {
                 if self.target_change.is_some() {
-                    return Err(OrchestratorError::NoChanges);
+                    info!("Target change not found or already processed");
                 }
                 info!("All changes processed");
                 if let Some(progress) = &mut self.progress {
@@ -81,10 +74,6 @@ impl Orchestrator {
             let next = self.select_next_change(&filtered_changes).await?;
             info!("Selected change: {}", next.id);
 
-            self.state.current_change = Some(next.id.clone());
-            self.state.touch();
-            self.state.save()?;
-
             if let Some(progress) = &mut self.progress {
                 progress.update_change(&next);
             }
@@ -93,64 +82,45 @@ impl Orchestrator {
             if next.is_complete() {
                 // Archive completed change
                 info!("Change {} is complete, archiving...", next.id);
-                if !self.dry_run {
-                    match self.archive_change(&next).await {
-                        Ok(_) => {
-                            self.state.archived_changes.push(next.id.clone());
-                            if let Some(progress) = &mut self.progress {
-                                progress.archive_change(&next.id);
-                            }
+                match self.archive_change(&next).await {
+                    Ok(_) => {
+                        if let Some(progress) = &mut self.progress {
+                            progress.archive_change(&next.id);
                         }
-                        Err(e) => {
-                            error!("Archive failed for {}: {}", next.id, e);
-                            self.state.failed_changes.push(next.id.clone());
-                            if let Some(progress) = &mut self.progress {
-                                progress.error(&format!("Archive failed: {}", next.id));
-                            }
+                        // If targeting specific change and it's done, stop
+                        if self.target_change.as_ref() == Some(&next.id) {
+                            break;
                         }
                     }
-                } else {
-                    info!("[DRY RUN] Would archive: {}", next.id);
+                    Err(e) => {
+                        error!("Archive failed for {}: {}", next.id, e);
+                        if let Some(progress) = &mut self.progress {
+                            progress.error(&format!("Archive failed: {}", next.id));
+                        }
+                        return Err(e);
+                    }
                 }
             } else {
                 // Apply change
                 info!("Applying change: {}", next.id);
-                if !self.dry_run {
-                    match self.apply_change(&next).await {
-                        Ok(_) => {
-                            self.state.processed_changes.push(next.id.clone());
-                            if let Some(progress) = &mut self.progress {
-                                progress.complete_change(&next.id);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Apply failed for {}: {}", next.id, e);
-                            self.state.failed_changes.push(next.id.clone());
-                            if let Some(progress) = &mut self.progress {
-                                progress.error(&format!("Apply failed: {}", next.id));
-                            }
-                            // Continue with other changes
-                            continue;
+                match self.apply_change(&next).await {
+                    Ok(_) => {
+                        if let Some(progress) = &mut self.progress {
+                            progress.complete_change(&next.id);
                         }
                     }
-                } else {
-                    info!("[DRY RUN] Would apply: {}", next.id);
+                    Err(e) => {
+                        error!("Apply failed for {}: {}", next.id, e);
+                        if let Some(progress) = &mut self.progress {
+                            progress.error(&format!("Apply failed: {}", next.id));
+                        }
+                        return Err(e);
+                    }
                 }
-            }
-
-            // 4. Update state
-            self.state.total_iterations += 1;
-            self.state.touch();
-            self.state.save()?;
-
-            // Check if we should continue
-            if self.should_stop() {
-                break;
             }
         }
 
         info!("Orchestration completed");
-        self.print_summary();
         Ok(())
     }
 
@@ -184,7 +154,11 @@ impl Orchestrator {
             .cloned()
             .ok_or(OrchestratorError::NoChanges)?;
 
-        info!("Fallback selected: {} ({:.1}%)", selected.id, selected.progress_percent());
+        info!(
+            "Fallback selected: {} ({:.1}%)",
+            selected.id,
+            selected.progress_percent()
+        );
         Ok(selected)
     }
 
@@ -209,7 +183,15 @@ impl Orchestrator {
     fn build_analysis_prompt(&self, changes: &[Change]) -> String {
         let change_list = changes
             .iter()
-            .map(|c| format!("- {} ({}/{} tasks, {:.1}%)", c.id, c.completed_tasks, c.total_tasks, c.progress_percent()))
+            .map(|c| {
+                format!(
+                    "- {} ({}/{} tasks, {:.1}%)",
+                    c.id,
+                    c.completed_tasks,
+                    c.total_tasks,
+                    c.progress_percent()
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -250,45 +232,23 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Archive a change using openspec
+    /// Archive a change using OpenCode
     async fn archive_change(&self, change: &Change) -> Result<()> {
-        openspec::archive_change(&self.openspec_path, &change.id).await
-    }
+        info!("Executing /openspec-archive for {}", change.id);
 
-    /// Check if orchestrator should stop
-    fn should_stop(&self) -> bool {
-        // Stop if target change was processed
-        if let Some(target) = &self.target_change {
-            if self.state.archived_changes.contains(target)
-                || self.state.failed_changes.contains(target)
-            {
-                return true;
-            }
+        let status = self
+            .opencode
+            .run_command("/openspec-archive", &change.id)
+            .await?;
+
+        if !status.success() {
+            return Err(OrchestratorError::OpenCodeCommand(format!(
+                "Archive command failed with exit code: {:?}",
+                status.code()
+            )));
         }
 
-        false
-    }
-
-    /// Print execution summary
-    fn print_summary(&self) {
-        println!("\n=== Orchestration Summary ===");
-        println!("Total iterations: {}", self.state.total_iterations);
-        println!("Processed changes: {}", self.state.processed_changes.len());
-        println!("Archived changes: {}", self.state.archived_changes.len());
-        println!("Failed changes: {}", self.state.failed_changes.len());
-
-        if !self.state.archived_changes.is_empty() {
-            println!("\nArchived:");
-            for change in &self.state.archived_changes {
-                println!("  ✓ {}", change);
-            }
-        }
-
-        if !self.state.failed_changes.is_empty() {
-            println!("\nFailed:");
-            for change in &self.state.failed_changes {
-                println!("  ✗ {}", change);
-            }
-        }
+        info!("Successfully archived: {}", change.id);
+        Ok(())
     }
 }

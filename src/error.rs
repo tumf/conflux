@@ -17,15 +17,8 @@ pub enum OrchestratorError {
     #[error("Parse error: {0}")]
     Parse(String),
 
-    #[error("State error: {0}")]
-    State(String),
-
     #[error("No changes found")]
     NoChanges,
-
-    #[error("All changes failed")]
-    #[allow(dead_code)]
-    AllChangesFailed,
 
     #[error("UTF-8 conversion error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),

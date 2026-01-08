@@ -103,7 +103,7 @@ fn setup_openspec_test_env(temp_dir: &Path, changes: &[(&str, u32, u32)]) {
 // ============================================================================
 
 #[test]
-fn test_single_change_flow_dry_run() {
+fn test_single_change_flow_mock_setup() {
     let temp_dir = tempfile::tempdir().unwrap();
     let temp_path = temp_dir.path();
 
@@ -369,92 +369,6 @@ exit 0
         .output()
         .unwrap();
     assert!(output.status.success());
-}
-
-// ============================================================================
-// State persistence tests
-// ============================================================================
-
-#[test]
-fn test_state_file_creation() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let temp_path = temp_dir.path();
-
-    // Create .opencode directory
-    let opencode_dir = temp_path.join(".opencode");
-    fs::create_dir_all(&opencode_dir).unwrap();
-
-    // Create a sample state file
-    let state = serde_json::json!({
-        "current_change": "test-change",
-        "processed_changes": ["change-1"],
-        "archived_changes": ["old-change"],
-        "failed_changes": [],
-        "started_at": "2026-01-08T10:00:00Z",
-        "last_update": "2026-01-08T10:30:00Z",
-        "total_iterations": 5
-    });
-
-    let state_path = opencode_dir.join("orchestrator-state.json");
-    fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
-
-    // Verify state file exists and is readable
-    assert!(state_path.exists());
-
-    let content = fs::read_to_string(&state_path).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-
-    assert_eq!(parsed["current_change"], "test-change");
-    assert_eq!(parsed["total_iterations"], 5);
-}
-
-#[test]
-fn test_state_recovery_after_restart() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let temp_path = temp_dir.path();
-
-    let opencode_dir = temp_path.join(".opencode");
-    fs::create_dir_all(&opencode_dir).unwrap();
-
-    // Create initial state (simulating a previous run)
-    let initial_state = serde_json::json!({
-        "current_change": "in-progress-change",
-        "processed_changes": ["change-1", "change-2"],
-        "archived_changes": ["old-change"],
-        "failed_changes": [],
-        "started_at": "2026-01-08T09:00:00Z",
-        "last_update": "2026-01-08T10:00:00Z",
-        "total_iterations": 10
-    });
-
-    let state_path = opencode_dir.join("orchestrator-state.json");
-    fs::write(
-        &state_path,
-        serde_json::to_string_pretty(&initial_state).unwrap(),
-    )
-    .unwrap();
-
-    // Simulate loading state after restart
-    let loaded_content = fs::read_to_string(&state_path).unwrap();
-    let loaded: serde_json::Value = serde_json::from_str(&loaded_content).unwrap();
-
-    // Verify state was preserved
-    assert_eq!(loaded["current_change"], "in-progress-change");
-    assert_eq!(loaded["processed_changes"].as_array().unwrap().len(), 2);
-    assert_eq!(loaded["total_iterations"], 10);
-
-    // Simulate updating state after recovery
-    let mut updated: serde_json::Value = serde_json::from_str(&loaded_content).unwrap();
-    updated["total_iterations"] = serde_json::json!(11);
-    updated["last_update"] = serde_json::json!("2026-01-08T10:30:00Z");
-
-    fs::write(&state_path, serde_json::to_string_pretty(&updated).unwrap()).unwrap();
-
-    // Verify update
-    let final_content = fs::read_to_string(&state_path).unwrap();
-    let final_state: serde_json::Value = serde_json::from_str(&final_content).unwrap();
-
-    assert_eq!(final_state["total_iterations"], 11);
 }
 
 // ============================================================================
