@@ -14,6 +14,9 @@ pub enum OrchestratorError {
     #[error("OpenCode command failed: {0}")]
     OpenCodeCommand(String),
 
+    #[error("Agent command failed: {0}")]
+    AgentCommand(String),
+
     #[error("Parse error: {0}")]
     Parse(String),
 
@@ -22,6 +25,12 @@ pub enum OrchestratorError {
 
     #[error("UTF-8 conversion error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
+
+    #[error("Config load error: {0}")]
+    ConfigLoad(String),
+
+    #[error("Config parse error: {0}")]
+    ConfigParse(String),
 }
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;

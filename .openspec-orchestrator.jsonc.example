@@ -1,0 +1,23 @@
+{
+  // OpenSpec Orchestrator Configuration Example
+  // Copy this file to `.openspec-orchestrator.jsonc` and customize as needed.
+  //
+  // Configuration file locations (in order of priority):
+  // 1. .openspec-orchestrator.jsonc (project root)
+  // 2. ~/.config/openspec-orchestrator/config.jsonc (global)
+
+  // Apply command template
+  // Executed when applying a change (implementing tasks)
+  // Placeholder: {change_id} - replaced with the change ID at runtime
+  "apply_command": "opencode run '/openspec-apply {change_id}'",
+
+  // Archive command template
+  // Executed when archiving a completed change
+  // Placeholder: {change_id} - replaced with the change ID at runtime
+  "archive_command": "opencode run '/openspec-archive {change_id}'",
+
+  // Analyze command template
+  // Executed for dependency analysis using LLM
+  // Placeholder: {prompt} - replaced with the analysis prompt at runtime
+  "analyze_command": "opencode run --format json '{prompt}'"
+}

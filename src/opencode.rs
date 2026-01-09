@@ -1,8 +1,17 @@
 use crate::error::{OrchestratorError, Result};
 use std::path::PathBuf;
-use std::process::ExitStatus;
-use tokio::process::Command;
+use std::process::{ExitStatus, Stdio};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
 use tracing::{debug, info};
+
+/// Output line from a child process
+#[derive(Debug, Clone)]
+pub enum OutputLine {
+    Stdout(String),
+    Stderr(String),
+}
 
 /// Manages OpenCode process execution in headless mode
 pub struct OpenCodeRunner {
@@ -17,9 +26,13 @@ impl OpenCodeRunner {
         }
     }
 
-    /// Run OpenCode command in headless mode
-    /// Process exit = command completion
-    pub async fn run_command(&self, command: &str, args: &str) -> Result<ExitStatus> {
+    /// Run OpenCode command in headless mode with output streaming
+    /// Returns a child process handle and a receiver for output lines
+    pub async fn run_command_streaming(
+        &self,
+        command: &str,
+        args: &str,
+    ) -> Result<(Child, mpsc::Receiver<OutputLine>)> {
         info!("Running OpenCode command: {} {}", command, args);
 
         let full_command = format!("{} {}", command, args);
@@ -27,17 +40,70 @@ impl OpenCodeRunner {
         let mut child = Command::new(&self.opencode_path)
             .arg("run")
             .arg(&full_command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
                 OrchestratorError::OpenCodeCommand(format!("Failed to spawn process: {}", e))
             })?;
 
-        let status = child.wait().await.map_err(|e| {
-            OrchestratorError::OpenCodeCommand(format!("Failed to wait for process: {}", e))
-        })?;
+        let (tx, rx) = mpsc::channel::<OutputLine>(100);
 
-        debug!("OpenCode command exited with status: {:?}", status);
-        Ok(status)
+        // Take ownership of stdout and stderr
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        // Spawn task to read stdout
+        if let Some(stdout) = stdout {
+            let tx_stdout = tx.clone();
+            tokio::spawn(async move {
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if tx_stdout.send(OutputLine::Stdout(line)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Spawn task to read stderr
+        if let Some(stderr) = stderr {
+            let tx_stderr = tx;
+            tokio::spawn(async move {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if tx_stderr.send(OutputLine::Stderr(line)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        Ok((child, rx))
+    }
+
+    /// Run OpenCode command in headless mode (blocking, no streaming)
+    /// Process exit = command completion
+    pub async fn run_command(&self, command: &str, args: &str) -> Result<ExitStatus> {
+        info!("Running OpenCode command: {} {}", command, args);
+
+        let full_command = format!("{} {}", command, args);
+
+        let output = Command::new(&self.opencode_path)
+            .arg("run")
+            .arg(&full_command)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| {
+                OrchestratorError::OpenCodeCommand(format!("Failed to spawn process: {}", e))
+            })?;
+
+        debug!("OpenCode command exited with status: {:?}", output.status);
+        Ok(output.status)
     }
 
     /// Analyze dependencies using OpenCode with JSON output

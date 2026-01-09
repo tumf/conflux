@@ -181,19 +181,98 @@ Behavior:
 
 ## Configuration
 
+### Agent Configuration File (JSONC)
+
+The orchestrator supports configurable agent commands via JSONC configuration files.
+This allows you to use different AI tools (OpenCode, Codex, Claude Code, etc.) without code changes.
+
+**Configuration file locations** (in order of priority):
+1. `.openspec-orchestrator.jsonc` (project root)
+2. `~/.config/openspec-orchestrator/config.jsonc` (global)
+3. Custom path via `--config` option
+
+**Example configuration:**
+
+```jsonc
+{
+  // Apply command template
+  // Placeholder: {change_id} - replaced with the change ID at runtime
+  "apply_command": "codex run 'openspec-apply {change_id}'",
+
+  // Archive command template
+  "archive_command": "codex run 'openspec-archive {change_id}'",
+
+  // Analyze command template
+  // Placeholder: {prompt} - replaced with the analysis prompt at runtime
+  "analyze_command": "claude '{prompt}'"
+}
+```
+
+**Default commands** (when no config file is present):
+
+```jsonc
+{
+  "apply_command": "opencode run '/openspec-apply {change_id}'",
+  "archive_command": "opencode run '/openspec-archive {change_id}'",
+  "analyze_command": "opencode run --format json '{prompt}'"
+}
+```
+
+**Placeholders:**
+
+| Placeholder | Description | Used in |
+|-------------|-------------|---------|
+| `{change_id}` | The change ID being processed | apply_command, archive_command |
+| `{prompt}` | LLM analysis prompt | analyze_command |
+
+**Quick start:**
+
+```bash
+# Copy the example configuration
+cp .openspec-orchestrator.jsonc.example .openspec-orchestrator.jsonc
+
+# Edit to use your preferred agent
+vim .openspec-orchestrator.jsonc
+
+# Run with the configuration
+openspec-orchestrator run
+```
+
+**Use a custom config path:**
+
+```bash
+openspec-orchestrator run --config /path/to/config.jsonc
+```
+
 ### Environment Variables
 
-- `RUST_LOG`: Set logging level (e.g., `RUST_LOG=debug`)
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `OPENSPEC_CMD` | OpenSpec command (can include arguments) | `npx @fission-ai/openspec@latest` |
+| `RUST_LOG` | Logging level | (none) |
+
+Example:
+
+```bash
+# Use a custom openspec installation
+export OPENSPEC_CMD="/usr/local/bin/openspec"
+openspec-orchestrator run
+
+# Use a specific version via npx
+export OPENSPEC_CMD="npx @fission-ai/openspec@1.2.3"
+openspec-orchestrator run
+```
 
 ### Command-line Options
 
 ```
 Options:
-  --dry-run                 Preview without execution
   --change <ID>             Process only specified change
-  --opencode-path <PATH>    Custom opencode binary path
-  --openspec-path <PATH>    Custom openspec binary path
+  --config <PATH>           Custom configuration file path (JSONC)
+  --openspec-cmd <CMD>      Custom openspec command [env: OPENSPEC_CMD]
 ```
+
+Priority: CLI argument > Environment variable > Default value
 
 ## Error Handling
 
@@ -254,11 +333,13 @@ RUST_LOG=debug cargo run -- run --dry-run
 src/
 ├── main.rs           # Entry point
 ├── cli.rs            # CLI argument parsing
+├── config.rs         # Configuration file parsing (JSONC)
+├── agent.rs          # Agent runner (configurable commands)
 ├── error.rs          # Error types
 ├── openspec.rs       # OpenSpec wrapper (list, archive)
-├── opencode.rs       # OpenCode runner (headless execution)
-├── state.rs          # State persistence
+├── opencode.rs       # OpenCode runner (legacy, kept for compatibility)
 ├── progress.rs       # Progress display (indicatif)
+├── tui.rs            # Interactive TUI dashboard
 └── orchestrator.rs   # Main orchestration loop
 ```
 
