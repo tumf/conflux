@@ -1,14 +1,18 @@
 # OpenSpec Orchestrator
 
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Automates the OpenSpec change workflow: list → dependency analysis → apply → archive.
 
 ## Features
 
+- 🖥️ **Interactive TUI**: Default mode with real-time progress dashboard
 - 🤖 **Automated Workflow**: Automatically processes OpenSpec changes from detection to archival
-- 🧠 **LLM Dependency Analysis**: Uses OpenCode to intelligently analyze and order changes
+- 🧠 **LLM Dependency Analysis**: Uses AI agents to intelligently analyze and order changes
 - 📊 **Real-time Progress**: Visual progress bars showing overall and per-change status
-- 💾 **State Management**: Persistent state for recovery and resumption
-- 🔍 **Headless Execution**: Uses `opencode run` for autonomous, non-interactive processing
+- 🔌 **Multi-Agent Support**: Works with Claude Code, OpenCode, and Codex
+- 🪝 **Lifecycle Hooks**: Configurable hooks for custom actions at each workflow stage
 
 ## Architecture
 
@@ -18,7 +22,8 @@ Automates the OpenSpec change workflow: list → dependency analysis → apply �
 ├─────────────────────────────────────────────┤
 │  CLI → Orchestrator → State Manager         │
 │    ↓        ↓              ↓                │
-│  OpenSpec  OpenCode    Progress Display     │
+│  OpenSpec  AI Agent    Progress Display     │
+│            (Claude/OpenCode/Codex)          │
 └─────────────────────────────────────────────┘
 ```
 
@@ -41,9 +46,42 @@ cargo install --path .
 
 ## Usage
 
-### Run orchestration
+### Default: Interactive TUI
 
-Process all pending changes:
+Running without any subcommand launches the interactive TUI dashboard:
+
+```bash
+openspec-orchestrator
+```
+
+The TUI provides:
+- Real-time change status visualization
+- Progress tracking for all pending changes
+- Keyboard navigation and controls
+
+### Initialize Configuration
+
+Generate a configuration file for your preferred AI agent:
+
+```bash
+# Default: Claude Code template
+openspec-orchestrator init
+
+# OpenCode template
+openspec-orchestrator init --template opencode
+
+# Codex template
+openspec-orchestrator init --template codex
+
+# Overwrite existing config
+openspec-orchestrator init --force
+```
+
+Available templates: `claude` (default), `opencode`, `codex`
+
+### Run Orchestration (Non-Interactive)
+
+Process all pending changes in headless mode:
 
 ```bash
 openspec-orchestrator run
@@ -55,40 +93,16 @@ Process a specific change:
 openspec-orchestrator run --change add-feature-x
 ```
 
-Dry run (preview without execution):
+Custom configuration file:
 
 ```bash
-openspec-orchestrator run --dry-run
+openspec-orchestrator run --config /path/to/config.jsonc
 ```
 
-Custom binary paths:
+### Launch TUI Explicitly
 
 ```bash
-openspec-orchestrator run \
-  --opencode-path /usr/local/bin/opencode \
-  --openspec-path /usr/local/bin/openspec
-```
-
-### Check status
-
-View current orchestration state:
-
-```bash
-openspec-orchestrator status
-```
-
-### Reset state
-
-Reset orchestration state (with confirmation):
-
-```bash
-openspec-orchestrator reset
-```
-
-Skip confirmation:
-
-```bash
-openspec-orchestrator reset --yes
+openspec-orchestrator tui
 ```
 
 ## How It Works
@@ -105,116 +119,62 @@ openspec-orchestrator reset --yes
    ↓
 3. Process change
    • If complete: openspec archive
-   • If incomplete: opencode run "/openspec-apply <id>"
+   • If incomplete: AI agent applies next task
    ↓
 4. Update state and repeat
 ```
 
 ### Dependency Analysis
 
-The orchestrator uses OpenCode to analyze dependencies:
+The orchestrator uses an AI agent to analyze dependencies:
 
-```rust
+```
 // Prompt sent to LLM
-"以下のOpenSpec変更から、次に実行すべきものを1つ選んでください。
+"Select the next change to execute from the following OpenSpec changes.
 
-変更一覧:
+Changes:
 - add-feature-x (2/5 tasks, 40.0%)
 - fix-bug-y (5/5 tasks, 100.0%)
 - refactor-z (0/3 tasks, 0.0%)
 
-選択基準:
-1. 依存関係がない、または依存先が完了しているもの
-2. 進捗が進んでいるもの（継続性）
-3. 名前から推測される依存関係を考慮
+Selection criteria:
+1. No dependencies, or dependencies are completed
+2. Higher progress (continuity)
+3. Consider dependencies inferred from names
 
-回答は変更IDのみを1行で出力してください。"
+Output only the change ID on a single line."
 ```
-
-### State Persistence
-
-State is saved to `.opencode/orchestrator-state.json`:
-
-```json
-{
-  "current_change": "add-feature-x",
-  "processed_changes": ["add-feature-x"],
-  "archived_changes": ["fix-bug-y"],
-  "failed_changes": [],
-  "started_at": "2026-01-08T15:00:00Z",
-  "last_update": "2026-01-08T15:45:00Z",
-  "total_iterations": 5
-}
-```
-
-## OpenCode Commands
-
-The orchestrator uses two custom OpenCode commands:
-
-### `/openspec-apply`
-
-Implements the next incomplete task for a change:
-
-```bash
-opencode run "/openspec-apply add-feature-x"
-```
-
-Behavior:
-1. Read `openspec/changes/<id>/tasks.md`
-2. Find first incomplete task
-3. Implement the task
-4. Update `tasks.md` with `[x]`
-5. Exit when done
-
-### `/openspec-archive`
-
-Archives a completed change:
-
-```bash
-opencode run "/openspec-archive add-feature-x"
-```
-
-Behavior:
-1. Verify all tasks are complete
-2. Run `openspec archive <id> --yes`
-3. Report result
 
 ## Configuration
 
 ### Agent Configuration File (JSONC)
 
 The orchestrator supports configurable agent commands via JSONC configuration files.
-This allows you to use different AI tools (OpenCode, Codex, Claude Code, etc.) without code changes.
+This allows you to use different AI tools (Claude Code, OpenCode, Codex, etc.) without code changes.
 
 **Configuration file locations** (in order of priority):
 1. `.openspec-orchestrator.jsonc` (project root)
 2. `~/.config/openspec-orchestrator/config.jsonc` (global)
 3. Custom path via `--config` option
 
-**Example configuration:**
+**Example configuration (Claude Code):**
 
 ```jsonc
 {
-  // Apply command template
-  // Placeholder: {change_id} - replaced with the change ID at runtime
-  "apply_command": "codex run 'openspec-apply {change_id}'",
+  // Command to analyze dependencies and select next change
+  "analyze_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
 
-  // Archive command template
-  "archive_command": "codex run 'openspec-archive {change_id}'",
+  // Command to apply a change
+  "apply_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id}'",
 
-  // Analyze command template
-  // Placeholder: {prompt} - replaced with the analysis prompt at runtime
-  "analyze_command": "claude '{prompt}'"
-}
-```
+  // Command to archive a completed change
+  "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id}'",
 
-**Default commands** (when no config file is present):
-
-```jsonc
-{
-  "apply_command": "opencode run '/openspec-apply {change_id}'",
-  "archive_command": "opencode run '/openspec-archive {change_id}'",
-  "analyze_command": "opencode run --format json '{prompt}'"
+  // Lifecycle hooks (optional)
+  "hooks": {
+    // "pre_apply": "echo 'Starting {change_id}'",
+    // "post_apply": "echo 'Completed {change_id}'"
+  }
 }
 ```
 
@@ -228,20 +188,17 @@ This allows you to use different AI tools (OpenCode, Codex, Claude Code, etc.) w
 **Quick start:**
 
 ```bash
-# Copy the example configuration
+# Generate configuration with init command
+openspec-orchestrator init
+
+# Or copy the example configuration
 cp .openspec-orchestrator.jsonc.example .openspec-orchestrator.jsonc
 
-# Edit to use your preferred agent
+# Edit to customize settings
 vim .openspec-orchestrator.jsonc
 
 # Run with the configuration
-openspec-orchestrator run
-```
-
-**Use a custom config path:**
-
-```bash
-openspec-orchestrator run --config /path/to/config.jsonc
+openspec-orchestrator
 ```
 
 ### Hooks Configuration
@@ -254,14 +211,14 @@ Hooks are defined in the `hooks` section of the configuration file.
   "hooks": {
     // Simple string format (uses default settings)
     "on_start": "echo 'Orchestrator started'",
-    
+
     // Object format (with detailed settings)
     "post_apply": {
       "command": "cargo test",
       "continue_on_failure": false,  // Stop orchestration if command fails
       "timeout": 300                 // Timeout in seconds
     },
-    
+
     // Available hooks:
     "on_first_apply": "git checkout -b feature/orchestrator-run",
     "pre_apply": "echo 'Applying {change_id}'",
@@ -321,20 +278,42 @@ Example:
 ```bash
 # Use a custom openspec installation
 export OPENSPEC_CMD="/usr/local/bin/openspec"
-openspec-orchestrator run
+openspec-orchestrator
 
 # Use a specific version via npx
 export OPENSPEC_CMD="npx @fission-ai/openspec@1.2.3"
-openspec-orchestrator run
+openspec-orchestrator
 ```
 
 ### Command-line Options
 
 ```
+Usage: openspec-orchestrator [OPTIONS] [COMMAND]
+
+Commands:
+  run   Run the OpenSpec change orchestration loop (non-interactive)
+  tui   Launch the interactive TUI dashboard
+  init  Initialize a new configuration file
+
 Options:
-  --change <ID>             Process only specified change
-  --config <PATH>           Custom configuration file path (JSONC)
-  --openspec-cmd <CMD>      Custom openspec command [env: OPENSPEC_CMD]
+  --opencode-path <PATH>   Path to opencode binary (deprecated, use config file)
+  --openspec-cmd <CMD>     OpenSpec command [env: OPENSPEC_CMD]
+  -h, --help               Print help
+```
+
+**Run subcommand options:**
+```
+Options:
+  --change <ID>         Process only specified change
+  -c, --config <PATH>   Custom configuration file path (JSONC)
+  --openspec-cmd <CMD>  Custom openspec command [env: OPENSPEC_CMD]
+```
+
+**Init subcommand options:**
+```
+Options:
+  -t, --template <TEMPLATE>  Template to use [default: claude] [possible values: claude, opencode, codex]
+  -f, --force                Overwrite existing configuration file
 ```
 
 Priority: CLI argument > Environment variable > Default value
@@ -343,7 +322,7 @@ Priority: CLI argument > Environment variable > Default value
 
 | Error | Behavior |
 |-------|----------|
-| OpenCode startup fails | Retry 3 times, then mark as failed |
+| Agent command fails | Retry 3 times, then mark as failed |
 | Apply command fails | Mark change as failed, continue with others |
 | Archive command fails | Mark change as failed, continue with others |
 | LLM analysis fails | Fall back to progress-based selection |
@@ -356,79 +335,24 @@ Priority: CLI argument > Environment variable > Default value
 - Run `openspec list` to verify changes exist
 - Check that you're in the correct directory
 
-### "OpenCode command failed"
+### "Agent command failed"
 
-- Verify `opencode` is installed: `which opencode`
-- Test manually: `opencode run "echo test"`
-- Check OpenCode configuration: `~/.config/opencode/opencode.jsonc`
+- Verify your AI agent is installed (e.g., `which claude`)
+- Test manually: `claude -p "echo test"`
+- Check your configuration file: `.openspec-orchestrator.jsonc`
 
 ### "All changes failed"
 
 - Check logs for specific errors
-- Review `.opencode/orchestrator-state.json`
 - Try processing a single change: `--change <id>`
-- Use dry run to preview: `--dry-run`
-
-### State corruption
-
-Reset state and restart:
-
-```bash
-openspec-orchestrator reset --yes
-openspec-orchestrator run
-```
 
 ## Development
 
-### Run tests
-
-```bash
-cargo test
-```
-
-### Run tests with coverage
-
-```bash
-# Install cargo-llvm-cov if not present
-cargo install cargo-llvm-cov
-
-# Run tests with coverage summary
-cargo llvm-cov --all-features
-
-# Generate detailed HTML report (opens in browser)
-cargo llvm-cov --all-features --html --open
-
-# Generate JSON report for CI/CD
-cargo llvm-cov --all-features --json --output-path coverage.json
-
-# Show coverage for specific module
-cargo llvm-cov --all-features -- --test-threads=1 2>&1 | grep -A 5 "src/config.rs"
-```
-
-### Run with logging
-
-```bash
-RUST_LOG=debug cargo run -- run --dry-run
-```
-
-### Project Structure
-
-```
-src/
-├── main.rs           # Entry point
-├── cli.rs            # CLI argument parsing
-├── config.rs         # Configuration file parsing (JSONC)
-├── agent.rs          # Agent runner (configurable commands)
-├── error.rs          # Error types
-├── openspec.rs       # OpenSpec wrapper (list, archive)
-├── opencode.rs       # OpenCode runner (legacy, kept for compatibility)
-├── progress.rs       # Progress display (indicatif)
-├── tui.rs            # Interactive TUI dashboard
-└── orchestrator.rs   # Main orchestration loop
-```
+See [DEVELOPMENT.md](DEVELOPMENT.md) for build instructions, testing, and project structure.
 
 ## Future Enhancements
 
+- [ ] State persistence for recovery and resumption
 - [ ] Parallel execution for independent changes
 - [ ] Slack/Discord notifications
 - [ ] Maximum iteration limit (prevent infinite loops)

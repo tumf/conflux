@@ -25,6 +25,7 @@ use ratatui::{
 };
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -566,6 +567,42 @@ impl AppState {
     }
 }
 
+/// Truncate a string to fit within a specified display width.
+///
+/// This function respects Unicode character display widths, where CJK characters
+/// (e.g., Japanese, Chinese) typically occupy 2 terminal columns, while ASCII
+/// characters occupy 1 column.
+///
+/// # Arguments
+/// * `s` - The string to truncate
+/// * `max_width` - The maximum display width in terminal columns
+///
+/// # Returns
+/// A truncated string with "..." appended if truncation occurred
+fn truncate_to_display_width(s: &str, max_width: usize) -> String {
+    let display_width = s.width();
+    if display_width <= max_width {
+        return s.to_string();
+    }
+
+    // Reserve space for "..." (3 columns)
+    let target_width = max_width.saturating_sub(3);
+    let mut result = String::new();
+    let mut current_width = 0;
+
+    for ch in s.chars() {
+        let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width + char_width > target_width {
+            break;
+        }
+        result.push(ch);
+        current_width += char_width;
+    }
+
+    result.push_str("...");
+    result
+}
+
 /// Clear the terminal screen
 fn clear_screen() -> Result<()> {
     use std::io::stdout;
@@ -774,12 +811,18 @@ async fn run_orchestrator(
     use crate::hooks::{HookContext, HookRunner, HookType};
     use crate::openspec;
 
+    // Get completion check configuration values before consuming config
+    let completion_check_delay_ms = config.get_completion_check_delay_ms();
+    let completion_check_max_retries = config.get_completion_check_max_retries();
+
     let hooks = HookRunner::new(config.get_hooks());
     let agent = AgentRunner::new(config);
 
     let total_changes = change_ids.len();
     let mut iteration: u32 = 0;
     let mut first_apply_executed = false;
+    let mut archived_changes: HashSet<String> = HashSet::new();
+    let processed_change_ids: Vec<String> = change_ids.clone();
 
     // Run on_start hook
     let start_context = HookContext::new(0, total_changes, total_changes, false);
@@ -930,6 +973,7 @@ async fn run_orchestrator(
                     let _ = tx
                         .send(OrchestratorEvent::ChangeArchived(change_id.clone()))
                         .await;
+                    archived_changes.insert(change_id.clone());
                 } else {
                     // Run on_error hook
                     let error_msg = format!("Archive failed with exit code: {:?}", status.code());
@@ -1059,111 +1103,160 @@ async fn run_orchestrator(
                         .await;
 
                     // Re-check if change is now complete and needs archiving
-                    let changes_after = openspec::list_changes(&openspec_cmd).await?;
-                    if let Some(updated_change) = changes_after.iter().find(|c| c.id == change_id) {
-                        if updated_change.is_complete() {
-                            // Run on_change_complete hook
-                            let complete_context =
-                                HookContext::new(iteration, total_changes, queue_size, false)
-                                    .with_change(
-                                        &change_id,
-                                        updated_change.completed_tasks,
-                                        updated_change.total_tasks,
-                                    );
-                            if let Err(e) = hooks
-                                .run_hook(HookType::OnChangeComplete, &complete_context)
-                                .await
-                            {
-                                let _ = tx
-                                    .send(OrchestratorEvent::ProcessingError {
-                                        id: change_id.clone(),
-                                        error: format!("on_change_complete hook failed: {}", e),
-                                    })
-                                    .await;
-                                break;
-                            }
+                    // Use retry logic to handle delayed state propagation
+                    let mut completed_change: Option<Change> = None;
+                    for attempt in 0..=completion_check_max_retries {
+                        // Check for cancellation before each retry
+                        if cancel_token.is_cancelled() {
+                            let _ = tx
+                                .send(OrchestratorEvent::Log(LogEntry::warn(
+                                    "Completion check cancelled".to_string(),
+                                )))
+                                .await;
+                            return Ok(());
+                        }
 
-                            // Run pre_archive hook
-                            let pre_archive_context =
-                                HookContext::new(iteration, total_changes, queue_size, false)
-                                    .with_change(
-                                        &change_id,
-                                        updated_change.completed_tasks,
-                                        updated_change.total_tasks,
-                                    );
-                            if let Err(e) = hooks
-                                .run_hook(HookType::PreArchive, &pre_archive_context)
-                                .await
-                            {
-                                let _ = tx
-                                    .send(OrchestratorEvent::ProcessingError {
-                                        id: change_id.clone(),
-                                        error: format!("pre_archive hook failed: {}", e),
-                                    })
-                                    .await;
-                                break;
-                            }
-
-                            // Archive the now-complete change
+                        // Delay on retry attempts (not on first check)
+                        if attempt > 0 {
                             let _ = tx
                                 .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                                    "Change complete, archiving: {}",
+                                    "Completion check retry {}/{} for {}",
+                                    attempt, completion_check_max_retries, change_id
+                                ))))
+                                .await;
+                            tokio::time::sleep(Duration::from_millis(completion_check_delay_ms)).await;
+                        }
+
+                        // Fetch current state
+                        let changes_after = openspec::list_changes(&openspec_cmd).await?;
+                        if let Some(updated) = changes_after.iter().find(|c| c.id == change_id) {
+                            if updated.is_complete() {
+                                completed_change = Some(updated.clone());
+                                break;
+                            }
+                        } else {
+                            // Change not found - may have been archived externally
+                            let _ = tx
+                                .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                                    "Change {} not found, may have been archived externally",
                                     change_id
                                 ))))
                                 .await;
+                            break;
+                        }
+                    }
 
-                            let (mut archive_child, mut archive_rx) =
-                                agent.run_archive_streaming(&change_id).await?;
+                    if let Some(updated_change) = completed_change {
+                        // Run on_change_complete hook
+                        let complete_context =
+                            HookContext::new(iteration, total_changes, queue_size, false)
+                                .with_change(
+                                    &change_id,
+                                    updated_change.completed_tasks,
+                                    updated_change.total_tasks,
+                                );
+                        if let Err(e) = hooks
+                            .run_hook(HookType::OnChangeComplete, &complete_context)
+                            .await
+                        {
+                            let _ = tx
+                                .send(OrchestratorEvent::ProcessingError {
+                                    id: change_id.clone(),
+                                    error: format!("on_change_complete hook failed: {}", e),
+                                })
+                                .await;
+                            break;
+                        }
 
-                            // Stream archive output
-                            loop {
-                                tokio::select! {
-                                    _ = cancel_token.cancelled() => {
-                                        let _ = archive_child.kill().await;
-                                        let _ = tx
-                                            .send(OrchestratorEvent::Log(LogEntry::warn(
-                                                "Archive process killed due to cancellation".to_string(),
-                                            )))
-                                            .await;
-                                        return Ok(());
-                                    }
-                                    line = archive_rx.recv() => {
-                                        match line {
-                                            Some(OutputLine::Stdout(s)) => {
-                                                let _ = tx.send(OrchestratorEvent::Log(LogEntry::info(s))).await;
-                                            }
-                                            Some(OutputLine::Stderr(s)) => {
-                                                let _ = tx.send(OrchestratorEvent::Log(LogEntry::warn(s))).await;
-                                            }
-                                            None => break,
+                        // Run pre_archive hook
+                        let pre_archive_context =
+                            HookContext::new(iteration, total_changes, queue_size, false)
+                                .with_change(
+                                    &change_id,
+                                    updated_change.completed_tasks,
+                                    updated_change.total_tasks,
+                                );
+                        if let Err(e) = hooks
+                            .run_hook(HookType::PreArchive, &pre_archive_context)
+                            .await
+                        {
+                            let _ = tx
+                                .send(OrchestratorEvent::ProcessingError {
+                                    id: change_id.clone(),
+                                    error: format!("pre_archive hook failed: {}", e),
+                                })
+                                .await;
+                            break;
+                        }
+
+                        // Archive the now-complete change
+                        let _ = tx
+                            .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                                "Change complete, archiving: {}",
+                                change_id
+                            ))))
+                            .await;
+
+                        let (mut archive_child, mut archive_rx) =
+                            agent.run_archive_streaming(&change_id).await?;
+
+                        // Stream archive output
+                        loop {
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => {
+                                    let _ = archive_child.kill().await;
+                                    let _ = tx
+                                        .send(OrchestratorEvent::Log(LogEntry::warn(
+                                            "Archive process killed due to cancellation".to_string(),
+                                        )))
+                                        .await;
+                                    return Ok(());
+                                }
+                                line = archive_rx.recv() => {
+                                    match line {
+                                        Some(OutputLine::Stdout(s)) => {
+                                            let _ = tx.send(OrchestratorEvent::Log(LogEntry::info(s))).await;
                                         }
+                                        Some(OutputLine::Stderr(s)) => {
+                                            let _ = tx.send(OrchestratorEvent::Log(LogEntry::warn(s))).await;
+                                        }
+                                        None => break,
                                     }
                                 }
                             }
-
-                            let archive_status = archive_child.wait().await.map_err(|e| {
-                                crate::error::OrchestratorError::AgentCommand(format!(
-                                    "Failed to wait for archive process: {}",
-                                    e
-                                ))
-                            })?;
-
-                            if archive_status.success() {
-                                let _ = tx
-                                    .send(OrchestratorEvent::ChangeArchived(change_id.clone()))
-                                    .await;
-                            } else {
-                                let _ = tx
-                                    .send(OrchestratorEvent::ProcessingError {
-                                        id: change_id.clone(),
-                                        error: format!(
-                                            "Archive failed with exit code: {:?}",
-                                            archive_status.code()
-                                        ),
-                                    })
-                                    .await;
-                            }
                         }
+
+                        let archive_status = archive_child.wait().await.map_err(|e| {
+                            crate::error::OrchestratorError::AgentCommand(format!(
+                                "Failed to wait for archive process: {}",
+                                e
+                            ))
+                        })?;
+
+                        if archive_status.success() {
+                            let _ = tx
+                                .send(OrchestratorEvent::ChangeArchived(change_id.clone()))
+                                .await;
+                            archived_changes.insert(change_id.clone());
+                        } else {
+                            let _ = tx
+                                .send(OrchestratorEvent::ProcessingError {
+                                    id: change_id.clone(),
+                                    error: format!(
+                                        "Archive failed with exit code: {:?}",
+                                        archive_status.code()
+                                    ),
+                                })
+                                .await;
+                        }
+                    } else {
+                        // Max retries exhausted without completion detection
+                        let _ = tx
+                            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                                "Change {} did not reach completion state after {} retries",
+                                change_id, completion_check_max_retries
+                            ))))
+                            .await;
                     }
                 } else {
                     let error_msg = format!("Apply failed with exit code: {:?}", status.code());
@@ -1191,6 +1284,67 @@ async fn run_orchestrator(
                 })
                 .await;
         }
+    }
+
+    // Final verification: check if any changes remain unarchived
+    // This is a safety check to log warnings if archiving didn't complete
+    let _ = tx
+        .send(OrchestratorEvent::Log(LogEntry::info(
+            "Verifying all changes have been archived...".to_string(),
+        )))
+        .await;
+
+    // Check against our tracked archived set for reliable verification
+    let unarchived_by_tracking: Vec<&str> = processed_change_ids
+        .iter()
+        .filter(|id| !archived_changes.contains(*id))
+        .map(|id| id.as_str())
+        .collect();
+
+    // Also verify against openspec list as backup
+    let final_changes = openspec::list_changes(&openspec_cmd).await.ok();
+    if let Some(changes) = final_changes {
+        let unarchived_by_list: Vec<&str> = processed_change_ids
+            .iter()
+            .filter(|id| changes.iter().any(|c| &c.id == *id))
+            .map(|id| id.as_str())
+            .collect();
+
+        // Report unarchived changes (use tracking as primary, list as confirmation)
+        if !unarchived_by_tracking.is_empty() {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                    "Warning: {} change(s) were not archived (tracking): {}",
+                    unarchived_by_tracking.len(),
+                    unarchived_by_tracking.join(", ")
+                ))))
+                .await;
+        }
+        if !unarchived_by_list.is_empty() {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                    "Warning: {} change(s) remain in openspec list: {}",
+                    unarchived_by_list.len(),
+                    unarchived_by_list.join(", ")
+                ))))
+                .await;
+        }
+        if unarchived_by_tracking.is_empty() && unarchived_by_list.is_empty() {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::success(
+                    "All processed changes have been archived".to_string(),
+                )))
+                .await;
+        }
+    } else if !unarchived_by_tracking.is_empty() {
+        // Could not fetch final list, but tracking shows unarchived changes
+        let _ = tx
+            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                "Warning: {} change(s) were not archived (tracking): {}",
+                unarchived_by_tracking.len(),
+                unarchived_by_tracking.join(", ")
+            ))))
+            .await;
     }
 
     let _ = tx.send(OrchestratorEvent::AllCompleted).await;
@@ -1453,7 +1607,7 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
             .filter(|c| {
                 matches!(
                     c.queue_status,
-                    QueueStatus::Queued | QueueStatus::Processing | QueueStatus::Completed
+                    QueueStatus::Queued | QueueStatus::Processing
                 )
             })
             .fold((0u32, 0u32), |(total, completed), c| {
@@ -1522,18 +1676,9 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
         .take((area.height as usize).saturating_sub(2))
         .rev()
         .map(|entry| {
-            // Truncate message to fit in available width
-            // Use char count instead of byte length to avoid UTF-8 boundary panics
-            let char_count = entry.message.chars().count();
-            let message = if char_count > available_width {
-                let truncated: String = entry.message
-                    .chars()
-                    .take(available_width.saturating_sub(3))
-                    .collect();
-                format!("{}...", truncated)
-            } else {
-                entry.message.clone()
-            };
+            // Truncate message to fit in available width using Unicode display width
+            // This correctly handles CJK characters that occupy 2 terminal columns
+            let message = truncate_to_display_width(&entry.message, available_width);
 
             Line::from(vec![
                 Span::styled(
@@ -1555,10 +1700,16 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
     frame.render_widget(logs, area);
 }
 
+/// Get version string for display
+pub fn get_version_string() -> String {
+    format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
 /// Render footer in selection mode
 fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
     let selected = app.selected_count();
     let new_count = app.new_change_count;
+    let version = get_version_string();
 
     let mut spans = vec![
         Span::styled(
@@ -1603,13 +1754,33 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
         ));
     }
 
-    let footer = Paragraph::new(Line::from(spans)).block(
+    // Split area into left content and right-aligned version
+    let version_width = version.len() as u16 + 2; // +2 for padding
+    let chunks = Layout::horizontal([
+        Constraint::Min(1),
+        Constraint::Length(version_width),
+    ])
+    .split(area);
+
+    // Render left content (status information) with left and bottom/top borders
+    let left_footer = Paragraph::new(Line::from(spans)).block(
         Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::LEFT | Borders::TOP | Borders::BOTTOM)
             .border_style(Style::default().fg(Color::Blue)),
     );
+    frame.render_widget(left_footer, chunks[0]);
 
-    frame.render_widget(footer, area);
+    // Render right content (version) with right and bottom/top borders
+    let right_footer = Paragraph::new(Line::from(vec![Span::styled(
+        version,
+        Style::default().fg(Color::DarkGray),
+    )]))
+    .block(
+        Block::default()
+            .borders(Borders::RIGHT | Borders::TOP | Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::Blue)),
+    );
+    frame.render_widget(right_footer, chunks[1]);
 }
 
 #[cfg(test)]
@@ -2099,14 +2270,14 @@ mod tests {
         app.start_processing();
         assert_eq!(app.mode, AppMode::Running);
 
-        // Calculate progress like render_status does
+        // Calculate progress like render_status does (only Queued and Processing)
         let (total_tasks, completed_tasks) = app
             .changes
             .iter()
             .filter(|c| {
                 matches!(
                     c.queue_status,
-                    QueueStatus::Queued | QueueStatus::Processing | QueueStatus::Completed
+                    QueueStatus::Queued | QueueStatus::Processing
                 )
             })
             .fold((0u32, 0u32), |(total, completed), c| {
@@ -2128,5 +2299,100 @@ mod tests {
         // since selected=true implies initial state
         let state = ChangeState::from_change(&change, true);
         assert!(!state.is_new);
+    }
+
+    #[test]
+    fn test_truncate_to_display_width_ascii_no_truncation() {
+        let result = truncate_to_display_width("hello world", 20);
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_truncate_to_display_width_ascii_with_truncation() {
+        let result = truncate_to_display_width("hello world", 8);
+        // "hello" (5) + "..." (3) = 8
+        assert_eq!(result, "hello...");
+    }
+
+    #[test]
+    fn test_truncate_to_display_width_japanese_no_truncation() {
+        // Japanese characters typically have width 2
+        let result = truncate_to_display_width("こんにちは", 20);
+        assert_eq!(result, "こんにちは");
+    }
+
+    #[test]
+    fn test_truncate_to_display_width_japanese_with_truncation() {
+        // "こんにちは" = 5 chars * 2 width = 10 display width
+        // With max_width=8, we need to truncate
+        // target_width = 8 - 3 = 5
+        // "こん" = 2 chars * 2 width = 4, fits
+        // "こんに" = 3 chars * 2 width = 6, doesn't fit
+        let result = truncate_to_display_width("こんにちは", 8);
+        assert_eq!(result, "こん...");
+    }
+
+    #[test]
+    fn test_truncate_to_display_width_mixed_content() {
+        // Mixed ASCII and Japanese
+        // "Hello日本語" = "Hello" (5) + "日本語" (3*2=6) = 11 display width
+        let result = truncate_to_display_width("Hello日本語", 10);
+        // target_width = 10 - 3 = 7
+        // "Hello" (5) + "日" (2) = 7, fits exactly
+        assert_eq!(result, "Hello日...");
+    }
+
+    #[test]
+    fn test_truncate_to_display_width_empty_string() {
+        let result = truncate_to_display_width("", 10);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_truncate_to_display_width_exact_fit() {
+        // String that exactly fits the max width
+        let result = truncate_to_display_width("hello", 5);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_truncate_to_display_width_very_small_max() {
+        // Max width smaller than "..."
+        let result = truncate_to_display_width("hello", 2);
+        // target_width = 2 - 3 = 0 (saturating)
+        assert_eq!(result, "...");
+    }
+
+    #[test]
+    fn test_truncate_to_display_width_emoji() {
+        // Emoji width can vary by unicode-width version and terminal
+        // Just verify the function handles emojis without panicking
+        let input = "👍 Good";
+        let result = truncate_to_display_width(input, 8);
+        // Should either return original (if fits) or truncated with "..."
+        assert!(result == input || result.ends_with("..."));
+        // Should not panic on emoji input
+    }
+
+    #[test]
+    fn test_get_version_string_format() {
+        let version = get_version_string();
+        // Version string should start with "v"
+        assert!(version.starts_with('v'));
+        // Version string should have at least one digit after "v"
+        assert!(version.len() > 1);
+        // Version should match Cargo.toml version format (e.g., "v0.1.0")
+        let version_part = &version[1..]; // Remove "v" prefix
+        assert!(version_part
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.'));
+    }
+
+    #[test]
+    fn test_get_version_string_matches_cargo_version() {
+        let version = get_version_string();
+        // Should match the version from Cargo.toml
+        let expected = format!("v{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(version, expected);
     }
 }

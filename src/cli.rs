@@ -4,6 +4,7 @@ use std::path::PathBuf;
 /// OpenSpec Orchestrator - Automate OpenSpec workflow
 #[derive(Parser, Debug)]
 #[command(name = "openspec-orchestrator")]
+#[command(version)]
 #[command(about = "Automates OpenSpec change workflow (list → apply → archive)", long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
@@ -350,5 +351,26 @@ mod tests {
             }
             _ => panic!("Expected Init subcommand"),
         }
+    }
+
+    #[test]
+    fn test_version_flag_exits_with_display_version() {
+        // --version flag should cause parse to return an error (DisplayVersion)
+        let result = Cli::try_parse_from(["openspec-orchestrator", "--version"]);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        // clap returns DisplayVersion error kind for --version
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn test_short_version_flag() {
+        // -V flag should also display version
+        let result = Cli::try_parse_from(["openspec-orchestrator", "-V"]);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
     }
 }

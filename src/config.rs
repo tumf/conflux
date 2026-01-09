@@ -30,6 +30,12 @@ pub const DEFAULT_ARCHIVE_COMMAND: &str = "opencode run '/openspec-archive {chan
 /// Default analyze command template (OpenCode)
 pub const DEFAULT_ANALYZE_COMMAND: &str = "opencode run --format json '{prompt}'";
 
+/// Default delay between completion check retries in milliseconds
+pub const DEFAULT_COMPLETION_CHECK_DELAY_MS: u64 = 500;
+
+/// Default maximum number of retries for completion check
+pub const DEFAULT_COMPLETION_CHECK_MAX_RETRIES: u32 = 3;
+
 /// Orchestrator configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OrchestratorConfig {
@@ -52,6 +58,16 @@ pub struct OrchestratorConfig {
     /// All hooks are optional.
     #[serde(default)]
     pub hooks: Option<HooksConfig>,
+
+    /// Delay between completion check retries in milliseconds.
+    /// Default: 500ms
+    #[serde(default)]
+    pub completion_check_delay_ms: Option<u64>,
+
+    /// Maximum number of retries for completion check.
+    /// Default: 3
+    #[serde(default)]
+    pub completion_check_max_retries: Option<u32>,
 }
 
 impl OrchestratorConfig {
@@ -85,6 +101,18 @@ impl OrchestratorConfig {
     /// Get the hooks configuration, returning default (empty) if not set
     pub fn get_hooks(&self) -> HooksConfig {
         self.hooks.clone().unwrap_or_default()
+    }
+
+    /// Get the completion check delay in milliseconds
+    pub fn get_completion_check_delay_ms(&self) -> u64 {
+        self.completion_check_delay_ms
+            .unwrap_or(DEFAULT_COMPLETION_CHECK_DELAY_MS)
+    }
+
+    /// Get the maximum number of completion check retries
+    pub fn get_completion_check_max_retries(&self) -> u32 {
+        self.completion_check_max_retries
+            .unwrap_or(DEFAULT_COMPLETION_CHECK_MAX_RETRIES)
     }
 
     /// Expand `{change_id}` placeholder in a command template
@@ -275,7 +303,7 @@ mod tests {
             apply_command: Some("custom apply {change_id}".to_string()),
             archive_command: Some("custom archive {change_id}".to_string()),
             analyze_command: Some("custom analyze '{prompt}'".to_string()),
-            hooks: None,
+            ..Default::default()
         };
         assert_eq!(config.get_apply_command(), "custom apply {change_id}");
         assert_eq!(config.get_archive_command(), "custom archive {change_id}");

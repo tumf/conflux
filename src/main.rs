@@ -7,6 +7,7 @@ mod opencode;
 mod openspec;
 mod orchestrator;
 mod progress;
+mod task_parser;
 mod templates;
 mod tui;
 

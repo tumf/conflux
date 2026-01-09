@@ -329,7 +329,7 @@ mod tests {
             apply_command: Some("custom-agent apply {change_id}".to_string()),
             archive_command: Some("custom-agent archive {change_id}".to_string()),
             analyze_command: Some("custom-agent analyze '{prompt}'".to_string()),
-            hooks: None,
+            ..Default::default()
         };
         let runner = AgentRunner::new(config);
         assert_eq!(
@@ -351,9 +351,7 @@ mod tests {
         // Test with a simple echo command
         let config = OrchestratorConfig {
             apply_command: Some("echo 'Applying {change_id}'".to_string()),
-            archive_command: None,
-            analyze_command: None,
-            hooks: None,
+            ..Default::default()
         };
         let runner = AgentRunner::new(config);
         let status = runner.run_apply("test-change").await.unwrap();
@@ -363,10 +361,8 @@ mod tests {
     #[tokio::test]
     async fn test_run_archive_echo_command() {
         let config = OrchestratorConfig {
-            apply_command: None,
             archive_command: Some("echo 'Archiving {change_id}'".to_string()),
-            analyze_command: None,
-            hooks: None,
+            ..Default::default()
         };
         let runner = AgentRunner::new(config);
         let status = runner.run_archive("test-change").await.unwrap();
@@ -376,10 +372,8 @@ mod tests {
     #[tokio::test]
     async fn test_analyze_dependencies_echo_command() {
         let config = OrchestratorConfig {
-            apply_command: None,
-            archive_command: None,
             analyze_command: Some("echo '{prompt}'".to_string()),
-            hooks: None,
+            ..Default::default()
         };
         let runner = AgentRunner::new(config);
         let result = runner.analyze_dependencies("test prompt").await.unwrap();
@@ -390,9 +384,7 @@ mod tests {
     async fn test_run_apply_streaming() {
         let config = OrchestratorConfig {
             apply_command: Some("echo 'line1' && echo 'line2'".to_string()),
-            archive_command: None,
-            analyze_command: None,
-            hooks: None,
+            ..Default::default()
         };
         let runner = AgentRunner::new(config);
         let (mut child, mut rx) = runner.run_apply_streaming("test-change").await.unwrap();

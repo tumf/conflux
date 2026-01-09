@@ -369,3 +369,105 @@ The TUI SHALL display an animated spinner next to items with `Processing` status
 - **AND** an item has status other than `Processing` (Queued, Completed, Error)
 - **THEN** no spinner is displayed for that item
 
+### Requirement: 完了検出のリトライ設定
+
+完了状態の検出においてリトライ動作を実装しなければならない（SHALL）。
+
+#### Scenario: デフォルトのリトライ設定
+
+- **WHEN** 設定ファイルにリトライ設定がない
+- **THEN** 最大リトライ回数は3回である
+- **AND** リトライ間隔は500ミリ秒である
+
+#### Scenario: キャンセル時のリトライ中断
+
+- **WHEN** リトライループ実行中である
+- **AND** キャンセルトークンがキャンセルされる
+- **THEN** リトライループは即座に終了する
+- **AND** プロセスは適切にクリーンアップされる
+
+### Requirement: TUI Unicode Display Width Support
+
+The TUI SHALL correctly calculate and truncate text based on Unicode display width, not byte length or character count.
+
+#### Scenario: Japanese text truncation in logs
+- **WHEN** a log message contains Japanese characters (e.g., "設定ファイル初期化")
+- **AND** the message exceeds the available display width
+- **THEN** the message is truncated at a valid display width boundary
+- **AND** ellipsis "..." is appended
+- **AND** no panic occurs due to UTF-8 boundary issues
+
+#### Scenario: Mixed ASCII and CJK text
+- **WHEN** a log message contains both ASCII and CJK characters
+- **THEN** ASCII characters count as 1 display column
+- **AND** CJK characters count as 2 display columns
+- **AND** truncation respects the total display width
+
+#### Scenario: Emoji handling
+- **WHEN** a log message contains emoji characters
+- **THEN** emoji characters are counted with their proper display width
+- **AND** truncation does not split emoji sequences
+
+### Requirement: Native Task Progress Parsing
+
+The system SHALL parse `tasks.md` files natively to determine task completion status, independent of the openspec CLI.
+
+#### Scenario: Parse bullet list tasks
+- **WHEN** a `tasks.md` file contains bullet list checkboxes (`- [ ]`, `- [x]`)
+- **THEN** the system counts each `- [ ]` as an incomplete task
+- **AND** the system counts each `- [x]` as a completed task
+- **AND** case-insensitive matching is used for `[x]` and `[X]`
+
+#### Scenario: Parse numbered list tasks
+- **WHEN** a `tasks.md` file contains numbered list checkboxes (`1. [ ]`, `1. [x]`)
+- **THEN** the system counts each numbered `[ ]` as an incomplete task
+- **AND** the system counts each numbered `[x]` as a completed task
+
+#### Scenario: Ignore non-task lines
+- **WHEN** a `tasks.md` file contains markdown headers, plain text, or indented sub-items
+- **THEN** those lines are not counted as tasks
+- **AND** only top-level checkbox items are counted
+
+#### Scenario: Fallback when tasks.md not found
+- **WHEN** the `tasks.md` file does not exist for a change
+- **THEN** the system uses the task count from openspec CLI output
+- **AND** no error is raised
+
+### Requirement: Task Progress Fallback Behavior
+
+The system SHALL use native task parsing as primary source when openspec CLI returns zero task counts.
+
+#### Scenario: CLI returns zero tasks
+- **WHEN** openspec CLI returns `completedTasks: 0, totalTasks: 0` for a change
+- **AND** a `tasks.md` file exists for that change
+- **THEN** the system uses native parsing to determine actual task counts
+- **AND** the TUI displays the native-parsed task counts
+
+#### Scenario: CLI returns non-zero tasks
+- **WHEN** openspec CLI returns non-zero task counts for a change
+- **THEN** the system uses the CLI-provided task counts
+- **AND** native parsing is not performed for that change
+
+### Requirement: Version Display
+
+The CLI SHALL support a `--version` flag to display the application version.
+
+#### Scenario: Display version with --version flag
+- **WHEN** user runs `openspec-orchestrator --version`
+- **THEN** the application version from Cargo.toml is displayed
+- **AND** the program exits with code 0
+
+#### Scenario: Display version with -V short flag
+- **WHEN** user runs `openspec-orchestrator -V`
+- **THEN** the application version is displayed (same as `--version`)
+
+### Requirement: TUI Footer Version Display
+
+The TUI selection mode footer SHALL display the application version.
+
+#### Scenario: Version in selection mode footer
+- **WHEN** TUI is in selection mode
+- **THEN** the footer displays the application version (e.g., "v0.1.0")
+- **AND** the version is displayed on the right side of the footer
+- **AND** the version text uses a muted/gray color to avoid distraction
+

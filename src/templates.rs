@@ -7,11 +7,14 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // OpenSpec Orchestrator Configuration
   // Template: Claude Code
 
-  // Agent command configuration
-  "agent": {
-    // Command to run for applying changes
-    "apply_command": "claude --dangerously-skip-permissions -p '/openspec:apply {change_id}'"
-  },
+  // Command to analyze dependencies and select next change
+  "analyze_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
+
+  // Command to apply a change
+  "apply_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id}'",
+
+  // Command to archive a completed change
+  "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id}'",
 
   // Lifecycle hooks (optional)
   "hooks": {
@@ -26,11 +29,14 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // OpenSpec Orchestrator Configuration
   // Template: OpenCode
 
-  // Agent command configuration
-  "agent": {
-    // Command to run for applying changes
-    "apply_command": "opencode run '/openspec-apply {change_id}'"
-  },
+  // Command to analyze dependencies and select next change
+  "analyze_command": "opencode run --format json '{prompt}'",
+
+  // Command to apply a change
+  "apply_command": "opencode run '/openspec-apply {change_id}'",
+
+  // Command to archive a completed change
+  "archive_command": "opencode run '/openspec-archive {change_id}'",
 
   // Lifecycle hooks (optional)
   "hooks": {
@@ -45,11 +51,14 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // OpenSpec Orchestrator Configuration
   // Template: Codex
 
-  // Agent command configuration
-  "agent": {
-    // Command to run for applying changes
-    "apply_command": "codex '/openspec:apply {change_id}'"
-  },
+  // Command to analyze dependencies and select next change
+  "analyze_command": "codex --json '{prompt}'",
+
+  // Command to apply a change
+  "apply_command": "codex '/openspec:apply {change_id}'",
+
+  // Command to archive a completed change
+  "archive_command": "codex '/openspec:archive {change_id}'",
 
   // Lifecycle hooks (optional)
   "hooks": {
@@ -71,28 +80,39 @@ pub fn get_template_content(template: Template) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OrchestratorConfig;
 
     #[test]
     fn test_claude_template_is_valid_jsonc() {
         // JSONC allows comments and trailing commas, but we should at least
         // verify the template contains expected fields
-        assert!(CLAUDE_TEMPLATE.contains("agent"));
         assert!(CLAUDE_TEMPLATE.contains("apply_command"));
+        assert!(CLAUDE_TEMPLATE.contains("archive_command"));
+        assert!(CLAUDE_TEMPLATE.contains("analyze_command"));
         assert!(CLAUDE_TEMPLATE.contains("claude --dangerously-skip-permissions"));
+        assert!(CLAUDE_TEMPLATE.contains("--verbose --output-format stream-json"));
+        // Should NOT contain nested agent structure
+        assert!(!CLAUDE_TEMPLATE.contains("\"agent\":"));
     }
 
     #[test]
     fn test_opencode_template_is_valid_jsonc() {
-        assert!(OPENCODE_TEMPLATE.contains("agent"));
         assert!(OPENCODE_TEMPLATE.contains("apply_command"));
+        assert!(OPENCODE_TEMPLATE.contains("archive_command"));
+        assert!(OPENCODE_TEMPLATE.contains("analyze_command"));
         assert!(OPENCODE_TEMPLATE.contains("opencode run"));
+        // Should NOT contain nested agent structure
+        assert!(!OPENCODE_TEMPLATE.contains("\"agent\":"));
     }
 
     #[test]
     fn test_codex_template_is_valid_jsonc() {
-        assert!(CODEX_TEMPLATE.contains("agent"));
         assert!(CODEX_TEMPLATE.contains("apply_command"));
+        assert!(CODEX_TEMPLATE.contains("archive_command"));
+        assert!(CODEX_TEMPLATE.contains("analyze_command"));
         assert!(CODEX_TEMPLATE.contains("codex"));
+        // Should NOT contain nested agent structure
+        assert!(!CODEX_TEMPLATE.contains("\"agent\":"));
     }
 
     #[test]
@@ -108,5 +128,38 @@ mod tests {
         assert!(CLAUDE_TEMPLATE.contains("{change_id}"));
         assert!(OPENCODE_TEMPLATE.contains("{change_id}"));
         assert!(CODEX_TEMPLATE.contains("{change_id}"));
+    }
+
+    #[test]
+    fn test_claude_template_parseable_by_config() {
+        // Template should be parseable by OrchestratorConfig
+        let config = OrchestratorConfig::parse_jsonc(CLAUDE_TEMPLATE)
+            .expect("CLAUDE_TEMPLATE should be valid JSONC");
+        assert!(config.apply_command.is_some());
+        assert!(config.archive_command.is_some());
+        assert!(config.analyze_command.is_some());
+        assert!(config.apply_command.unwrap().contains("claude"));
+    }
+
+    #[test]
+    fn test_opencode_template_parseable_by_config() {
+        // Template should be parseable by OrchestratorConfig
+        let config = OrchestratorConfig::parse_jsonc(OPENCODE_TEMPLATE)
+            .expect("OPENCODE_TEMPLATE should be valid JSONC");
+        assert!(config.apply_command.is_some());
+        assert!(config.archive_command.is_some());
+        assert!(config.analyze_command.is_some());
+        assert!(config.apply_command.unwrap().contains("opencode"));
+    }
+
+    #[test]
+    fn test_codex_template_parseable_by_config() {
+        // Template should be parseable by OrchestratorConfig
+        let config = OrchestratorConfig::parse_jsonc(CODEX_TEMPLATE)
+            .expect("CODEX_TEMPLATE should be valid JSONC");
+        assert!(config.apply_command.is_some());
+        assert!(config.archive_command.is_some());
+        assert!(config.analyze_command.is_some());
+        assert!(config.apply_command.unwrap().contains("codex"));
     }
 }

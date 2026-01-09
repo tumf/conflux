@@ -1,4 +1,5 @@
 use crate::error::{OrchestratorError, Result};
+use crate::task_parser;
 use serde::Deserialize;
 use std::process::Command;
 use tracing::{debug, info};
@@ -72,7 +73,7 @@ pub async fn list_changes(openspec_cmd: &str) -> Result<Vec<Change>> {
     let response: OpenSpecListResponse = serde_json::from_str(&stdout)
         .map_err(|e| OrchestratorError::Parse(format!("Failed to parse JSON: {}", e)))?;
 
-    let changes = response
+    let mut changes: Vec<Change> = response
         .changes
         .into_iter()
         .map(|c| Change {
@@ -82,6 +83,21 @@ pub async fn list_changes(openspec_cmd: &str) -> Result<Vec<Change>> {
             last_modified: c.last_modified,
         })
         .collect();
+
+    // Use native parsing as fallback when CLI reports 0/0 task counts
+    // This handles the OpenSpec CLI bug where numbered task lists aren't recognized
+    for change in &mut changes {
+        if change.total_tasks == 0 {
+            if let Ok(progress) = task_parser::parse_change(&change.id) {
+                debug!(
+                    "Native parsing for '{}': {}/{} tasks",
+                    change.id, progress.completed, progress.total
+                );
+                change.completed_tasks = progress.completed;
+                change.total_tasks = progress.total;
+            }
+        }
+    }
 
     Ok(changes)
 }

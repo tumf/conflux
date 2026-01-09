@@ -2,13 +2,9 @@
   // OpenSpec Orchestrator Configuration
   // Template: Claude Code
   // Agent command configuration
-  "agent": {
-    // Command to run for applying changes
-    "analyze_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
-    "apply_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id}'",
-    "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id}'",
-  },
-
+  "analyze_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
+  "apply_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id}'",
+  "archive_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id}'",
   // Lifecycle hooks (optional)
   "hooks": {
     // "pre_apply": "echo 'Starting {change_id}'",
