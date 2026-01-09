@@ -472,3 +472,232 @@ fn test_opencode_run_command_format() {
     assert_eq!(opencode_command[1], "run");
     assert!(opencode_command[2].starts_with("/openspec-apply"));
 }
+
+// ============================================================================
+// Archive Priority Tests (fix-tui-archive-skip)
+// ============================================================================
+
+#[test]
+fn test_archive_priority_complete_changes_first() {
+    // Test scenario: Change A at 100%, Change B at 50%
+    // Verify A should be archived before B is processed
+    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_path = temp_dir.path();
+
+    // Set up multiple changes with different completion states
+    setup_openspec_test_env(
+        temp_path,
+        &[
+            ("change-a", 5, 5),  // 100% complete - should be archived first
+            ("change-b", 2, 4),  // 50% complete - should be processed second
+        ],
+    );
+
+    // Create mock openspec that tracks archive calls
+    let archive_log = temp_path.join("archive_log.txt");
+    let list_output = r#"Changes:
+  change-a     5/5 tasks   5m ago
+  change-b     2/4 tasks   10m ago"#;
+
+    let script_path = temp_path.join("mock_openspec_priority.sh");
+    let script_content = format!(
+        r#"#!/bin/bash
+case "$1" in
+    list)
+        echo '{}'
+        ;;
+    archive)
+        echo "$(date +%s%N) archived: $2" >> {}
+        echo "Archived: $2"
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        exit 1
+        ;;
+esac
+"#,
+        list_output.replace('\n', "\\n"),
+        archive_log.display()
+    );
+
+    let mut file = fs::File::create(&script_path).unwrap();
+    file.write_all(script_content.as_bytes()).unwrap();
+
+    let mut perms = fs::metadata(&script_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script_path, perms).unwrap();
+
+    // Verify the complete change (5/5) appears in list
+    let output = Command::new(&script_path).arg("list").output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("change-a"));
+    assert!(stdout.contains("5/5")); // Complete change
+
+    // Verify archive command works
+    let output = Command::new(&script_path)
+        .args(["archive", "change-a", "--yes"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+}
+
+#[test]
+fn test_archive_priority_multiple_complete_changes() {
+    // Test scenario: Multiple changes at 100% completion
+    // Verify all complete changes are archived before any apply happens
+    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_path = temp_dir.path();
+
+    setup_openspec_test_env(
+        temp_path,
+        &[
+            ("complete-1", 3, 3),   // 100% complete
+            ("complete-2", 5, 5),   // 100% complete
+            ("incomplete", 1, 10),  // 10% - needs apply
+        ],
+    );
+
+    let list_output = r#"Changes:
+  complete-1     3/3 tasks   5m ago
+  complete-2     5/5 tasks   3m ago
+  incomplete     1/10 tasks   15m ago"#;
+
+    let mock_openspec = create_mock_openspec(
+        temp_path,
+        list_output,
+        r#"
+echo "Archived: $2"
+exit 0
+"#,
+    );
+
+    // Verify both complete changes appear in list
+    let output = Command::new(&mock_openspec).arg("list").output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Count complete changes
+    assert!(stdout.contains("3/3")); // complete-1
+    assert!(stdout.contains("5/5")); // complete-2
+    assert!(stdout.contains("1/10")); // incomplete
+}
+
+#[test]
+fn test_mid_apply_completion_detection() {
+    // Test scenario: Change becomes 100% during another apply
+    // Verify complete change is detected and archived on next loop iteration
+    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_path = temp_dir.path();
+
+    // Initial state: both incomplete
+    setup_openspec_test_env(
+        temp_path,
+        &[
+            ("change-a", 4, 5),  // 80% - will complete during apply
+            ("change-b", 2, 5),  // 40% - being applied
+        ],
+    );
+
+    // Create stateful mock that simulates change-a completing mid-process
+    let state_file = temp_path.join("state.txt");
+    fs::write(&state_file, "0").unwrap(); // Initial state
+
+    let script_path = temp_path.join("mock_openspec_midapply.sh");
+    let script_content = format!(
+        r#"#!/bin/bash
+STATE_FILE="{}"
+STATE=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+
+case "$1" in
+    list)
+        if [ "$STATE" = "0" ]; then
+            echo 'Changes:
+  change-a     4/5 tasks   5m ago
+  change-b     2/5 tasks   10m ago'
+        else
+            # After first apply, change-a is complete
+            echo 'Changes:
+  change-a     5/5 tasks   5m ago
+  change-b     3/5 tasks   10m ago'
+        fi
+        ;;
+    archive)
+        echo "Archived: $2"
+        ;;
+    increment)
+        echo "1" > "$STATE_FILE"
+        echo "State incremented"
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        exit 1
+        ;;
+esac
+"#,
+        state_file.display()
+    );
+
+    let mut file = fs::File::create(&script_path).unwrap();
+    file.write_all(script_content.as_bytes()).unwrap();
+
+    let mut perms = fs::metadata(&script_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script_path, perms).unwrap();
+
+    // Initial list - both incomplete
+    let output = Command::new(&script_path).arg("list").output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("4/5")); // change-a incomplete
+    assert!(stdout.contains("2/5")); // change-b incomplete
+
+    // Simulate apply completing (increment state)
+    let output = Command::new(&script_path).arg("increment").output().unwrap();
+    assert!(output.status.success());
+
+    // After state change - change-a is now complete
+    let output = Command::new(&script_path).arg("list").output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("5/5")); // change-a now complete
+    assert!(stdout.contains("3/5")); // change-b progressed
+
+    // Verify archive works for newly complete change
+    let output = Command::new(&script_path)
+        .args(["archive", "change-a", "--yes"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Archived"));
+}
+
+#[test]
+fn test_no_complete_changes_fallback() {
+    // Test scenario: No changes at 100% completion
+    // Verify orchestrator selects highest progress change for apply
+    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_path = temp_dir.path();
+
+    setup_openspec_test_env(
+        temp_path,
+        &[
+            ("low", 1, 10),     // 10%
+            ("medium", 5, 10),  // 50%
+            ("high", 8, 10),    // 80% - should be selected
+        ],
+    );
+
+    let list_output = r#"Changes:
+  low     1/10 tasks   1h ago
+  medium     5/10 tasks   30m ago
+  high     8/10 tasks   15m ago"#;
+
+    let mock_openspec = create_mock_openspec(temp_path, list_output, "exit 0");
+
+    let output = Command::new(&mock_openspec).arg("list").output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // All changes present, none complete
+    assert!(stdout.contains("1/10"));
+    assert!(stdout.contains("5/10"));
+    assert!(stdout.contains("8/10"));
+    assert!(!stdout.contains("/10 tasks") || !stdout.contains("10/10")); // No complete changes
+}

@@ -30,11 +30,6 @@ impl AgentRunner {
         Self { config }
     }
 
-    /// Get the archive command template (for debugging)
-    pub fn get_archive_command(&self) -> &str {
-        self.config.get_archive_command()
-    }
-
     /// Run apply command for the given change ID with output streaming
     /// Returns a child process handle and a receiver for output lines
     pub async fn run_apply_streaming(
@@ -42,7 +37,9 @@ impl AgentRunner {
         change_id: &str,
     ) -> Result<(Child, mpsc::Receiver<OutputLine>)> {
         let template = self.config.get_apply_command();
+        let prompt = self.config.get_apply_prompt();
         let command = OrchestratorConfig::expand_change_id(template, change_id);
+        let command = OrchestratorConfig::expand_prompt(&command, prompt);
         info!("Running apply command: {}", command);
         self.execute_shell_command_streaming(&command).await
     }
@@ -54,7 +51,9 @@ impl AgentRunner {
         change_id: &str,
     ) -> Result<(Child, mpsc::Receiver<OutputLine>)> {
         let template = self.config.get_archive_command();
+        let prompt = self.config.get_archive_prompt();
         let command = OrchestratorConfig::expand_change_id(template, change_id);
+        let command = OrchestratorConfig::expand_prompt(&command, prompt);
         info!("Running archive command: {}", command);
         self.execute_shell_command_streaming(&command).await
     }
@@ -62,7 +61,9 @@ impl AgentRunner {
     /// Run apply command for the given change ID (blocking, no streaming)
     pub async fn run_apply(&self, change_id: &str) -> Result<ExitStatus> {
         let template = self.config.get_apply_command();
+        let prompt = self.config.get_apply_prompt();
         let command = OrchestratorConfig::expand_change_id(template, change_id);
+        let command = OrchestratorConfig::expand_prompt(&command, prompt);
         info!("Running apply command: {}", command);
         self.execute_shell_command(&command).await
     }
@@ -70,7 +71,9 @@ impl AgentRunner {
     /// Run archive command for the given change ID (blocking, no streaming)
     pub async fn run_archive(&self, change_id: &str) -> Result<ExitStatus> {
         let template = self.config.get_archive_command();
+        let prompt = self.config.get_archive_prompt();
         let command = OrchestratorConfig::expand_change_id(template, change_id);
+        let command = OrchestratorConfig::expand_prompt(&command, prompt);
         info!("Running archive command: {}", command);
         self.execute_shell_command(&command).await
     }
@@ -397,5 +400,95 @@ mod tests {
         let status = child.wait().await.unwrap();
         assert!(status.success());
         assert!(!lines.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_run_apply_with_prompt_expansion() {
+        // Test apply command with both {change_id} and {prompt} placeholders
+        let config = OrchestratorConfig {
+            apply_command: Some("echo 'Apply {change_id} with {prompt}'".to_string()),
+            apply_prompt: Some("custom instructions".to_string()),
+            ..Default::default()
+        };
+        let runner = AgentRunner::new(config);
+        let status = runner.run_apply("test-change").await.unwrap();
+        assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn test_run_archive_with_prompt_expansion() {
+        // Test archive command with both {change_id} and {prompt} placeholders
+        let config = OrchestratorConfig {
+            archive_command: Some("echo 'Archive {change_id} with {prompt}'".to_string()),
+            archive_prompt: Some("archive instructions".to_string()),
+            ..Default::default()
+        };
+        let runner = AgentRunner::new(config);
+        let status = runner.run_archive("test-change").await.unwrap();
+        assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn test_run_apply_with_default_prompt() {
+        // Test that apply uses default prompt when not specified
+        let config = OrchestratorConfig {
+            apply_command: Some("echo 'Apply {change_id} {prompt}'".to_string()),
+            ..Default::default()
+        };
+        let runner = AgentRunner::new(config);
+        // Default apply_prompt should be used
+        assert_eq!(
+            runner.config().get_apply_prompt(),
+            crate::config::DEFAULT_APPLY_PROMPT
+        );
+        let status = runner.run_apply("test-change").await.unwrap();
+        assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn test_run_archive_with_empty_default_prompt() {
+        // Test that archive uses empty default prompt when not specified
+        let config = OrchestratorConfig {
+            archive_command: Some("echo 'Archive {change_id}:{prompt}:end'".to_string()),
+            ..Default::default()
+        };
+        let runner = AgentRunner::new(config);
+        // Default archive_prompt should be empty
+        assert_eq!(
+            runner.config().get_archive_prompt(),
+            crate::config::DEFAULT_ARCHIVE_PROMPT
+        );
+        assert_eq!(runner.config().get_archive_prompt(), "");
+        let status = runner.run_archive("test-change").await.unwrap();
+        assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn test_run_apply_streaming_with_prompt() {
+        let config = OrchestratorConfig {
+            apply_command: Some("echo '{change_id}:{prompt}'".to_string()),
+            apply_prompt: Some("streaming test".to_string()),
+            ..Default::default()
+        };
+        let runner = AgentRunner::new(config);
+        let (mut child, mut rx) = runner.run_apply_streaming("my-change").await.unwrap();
+
+        let mut lines = Vec::new();
+        while let Some(line) = rx.recv().await {
+            lines.push(line);
+        }
+
+        let status = child.wait().await.unwrap();
+        assert!(status.success());
+        // Verify the output contains expanded placeholders
+        let output: String = lines
+            .iter()
+            .map(|l| match l {
+                OutputLine::Stdout(s) => s.clone(),
+                OutputLine::Stderr(s) => s.clone(),
+            })
+            .collect();
+        assert!(output.contains("my-change"));
+        assert!(output.contains("streaming test"));
     }
 }

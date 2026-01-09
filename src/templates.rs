@@ -10,11 +10,17 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // Command to analyze dependencies and select next change
   "analyze_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
 
-  // Command to apply a change
-  "apply_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id}'",
+  // Command to apply a change (supports {change_id} and {prompt} placeholders)
+  "apply_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id} {prompt}'",
 
-  // Command to archive a completed change
-  "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id}'",
+  // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
+  "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id} {prompt}'",
+
+  // System prompt for apply command (injected into {prompt} placeholder)
+  "apply_prompt": "スコープ外タスクは削除せよ。ユーザを待つもしくはユーザによるタスクは削除せよ。",
+
+  // System prompt for archive command (injected into {prompt} placeholder)
+  "archive_prompt": "",
 
   // Lifecycle hooks (optional)
   "hooks": {
@@ -32,11 +38,17 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // Command to analyze dependencies and select next change
   "analyze_command": "opencode run --format json '{prompt}'",
 
-  // Command to apply a change
-  "apply_command": "opencode run '/openspec-apply {change_id}'",
+  // Command to apply a change (supports {change_id} and {prompt} placeholders)
+  "apply_command": "opencode run '/openspec-apply {change_id} {prompt}'",
 
-  // Command to archive a completed change
-  "archive_command": "opencode run '/openspec-archive {change_id}'",
+  // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
+  "archive_command": "opencode run '/openspec-archive {change_id} {prompt}'",
+
+  // System prompt for apply command (injected into {prompt} placeholder)
+  "apply_prompt": "スコープ外タスクは削除せよ。ユーザを待つもしくはユーザによるタスクは削除せよ。",
+
+  // System prompt for archive command (injected into {prompt} placeholder)
+  "archive_prompt": "",
 
   // Lifecycle hooks (optional)
   "hooks": {
@@ -54,11 +66,17 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // Command to analyze dependencies and select next change
   "analyze_command": "codex --json '{prompt}'",
 
-  // Command to apply a change
-  "apply_command": "codex '/openspec:apply {change_id}'",
+  // Command to apply a change (supports {change_id} and {prompt} placeholders)
+  "apply_command": "codex '/openspec:apply {change_id} {prompt}'",
 
-  // Command to archive a completed change
-  "archive_command": "codex '/openspec:archive {change_id}'",
+  // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
+  "archive_command": "codex '/openspec:archive {change_id} {prompt}'",
+
+  // System prompt for apply command (injected into {prompt} placeholder)
+  "apply_prompt": "スコープ外タスクは削除せよ。ユーザを待つもしくはユーザによるタスクは削除せよ。",
+
+  // System prompt for archive command (injected into {prompt} placeholder)
+  "archive_prompt": "",
 
   // Lifecycle hooks (optional)
   "hooks": {

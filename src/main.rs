@@ -31,8 +31,8 @@ async fn main() -> Result<()> {
             let openspec_cmd = cli.openspec_cmd;
             let opencode_path = cli.opencode_path;
 
-            // Get initial changes
-            let changes = openspec::list_changes(&openspec_cmd).await?;
+            // Get initial changes using native implementation
+            let changes = openspec::list_changes_native()?;
 
             // Load config (uses default paths)
             let config = OrchestratorConfig::load(None)?;
@@ -43,8 +43,8 @@ async fn main() -> Result<()> {
 
         // Explicit TUI subcommand
         Some(Commands::Tui(args)) => {
-            // Get initial changes
-            let changes = openspec::list_changes(&args.openspec_cmd).await?;
+            // Get initial changes using native implementation
+            let changes = openspec::list_changes_native()?;
 
             // Load config
             let config = OrchestratorConfig::load(args.config.as_deref())?;

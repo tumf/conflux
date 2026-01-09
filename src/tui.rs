@@ -23,11 +23,12 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     DefaultTerminal, Frame,
 };
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use unicode_width::UnicodeWidthStr;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
+use unicode_width::UnicodeWidthStr;
 
 /// Auto-refresh interval in seconds
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 5;
@@ -37,6 +38,69 @@ const MAX_LOG_ENTRIES: usize = 100;
 
 /// Spinner characters for processing animation (Braille dot pattern)
 const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Dynamic queue for runtime change additions
+///
+/// This struct provides a thread-safe queue for dynamically adding changes
+/// during orchestrator execution. TUI pushes change IDs when the user adds
+/// them via Space key, and the orchestrator pops them for processing.
+#[derive(Clone)]
+pub struct DynamicQueue {
+    inner: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl DynamicQueue {
+    /// Create a new empty DynamicQueue
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    /// Push a change ID to the queue
+    /// Returns false if the ID is already in the queue
+    pub async fn push(&self, id: String) -> bool {
+        let mut queue = self.inner.lock().await;
+        if queue.contains(&id) {
+            return false;
+        }
+        queue.push_back(id);
+        true
+    }
+
+    /// Pop the next change ID from the queue
+    pub async fn pop(&self) -> Option<String> {
+        let mut queue = self.inner.lock().await;
+        queue.pop_front()
+    }
+
+    /// Check if the queue is empty
+    #[cfg(test)]
+    pub async fn is_empty(&self) -> bool {
+        let queue = self.inner.lock().await;
+        queue.is_empty()
+    }
+
+    /// Check if an ID is already in the queue
+    #[cfg(test)]
+    pub async fn contains(&self, id: &str) -> bool {
+        let queue = self.inner.lock().await;
+        queue.iter().any(|i| i == id)
+    }
+
+    /// Get the current queue length
+    #[cfg(test)]
+    pub async fn len(&self) -> usize {
+        let queue = self.inner.lock().await;
+        queue.len()
+    }
+}
+
+impl Default for DynamicQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Application mode
 #[derive(Debug, Clone, PartialEq)]
@@ -364,13 +428,33 @@ impl AppState {
                     _ => None,
                 }
             }
-            AppMode::Completed | AppMode::Error => None,
+            AppMode::Completed => {
+                // Allow queue modifications in Completed mode (same as Running)
+                match &change.queue_status {
+                    QueueStatus::NotQueued => {
+                        change.queue_status = QueueStatus::Queued;
+                        change.selected = true;
+                        let id = change.id.clone();
+                        self.add_log(LogEntry::info(format!("Added to queue: {}", id)));
+                        Some(TuiCommand::AddToQueue(id))
+                    }
+                    QueueStatus::Queued => {
+                        change.queue_status = QueueStatus::NotQueued;
+                        change.selected = false;
+                        let id = change.id.clone();
+                        self.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
+                        Some(TuiCommand::RemoveFromQueue(id))
+                    }
+                    _ => None,
+                }
+            }
+            AppMode::Error => None,
         }
     }
 
     /// Start processing selected changes
     pub fn start_processing(&mut self) -> Option<TuiCommand> {
-        if self.mode != AppMode::Select {
+        if self.mode != AppMode::Select && self.mode != AppMode::Completed {
             return None;
         }
 
@@ -643,11 +727,13 @@ async fn run_tui_loop(
     let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(100);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<TuiCommand>(100);
 
+    // Dynamic queue for runtime change additions
+    let dynamic_queue = DynamicQueue::new();
+
     // Cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
 
     // Start auto-refresh task
-    let refresh_cmd = openspec_cmd.clone();
     let refresh_tx = tx.clone();
     let refresh_cancel = cancel_token.clone();
     let refresh_handle = tokio::spawn(async move {
@@ -658,7 +744,7 @@ async fn run_tui_loop(
                     break;
                 }
                 _ = interval.tick() => {
-                    match openspec::list_changes(&refresh_cmd).await {
+                    match openspec::list_changes_native() {
                         Ok(changes) => {
                             if refresh_tx
                                 .send(OrchestratorEvent::ChangesRefreshed(changes))
@@ -733,6 +819,7 @@ async fn run_tui_loop(
                                     let orch_openspec_cmd = openspec_cmd.clone();
                                     let orch_config = config.clone();
                                     let orch_cancel = CancellationToken::new();
+                                    let orch_dynamic_queue = dynamic_queue.clone();
                                     orchestrator_cancel = Some(orch_cancel.clone());
 
                                     orchestrator_handle = Some(tokio::spawn(async move {
@@ -742,6 +829,7 @@ async fn run_tui_loop(
                                             orch_config,
                                             orch_tx,
                                             orch_cancel,
+                                            orch_dynamic_queue,
                                         )
                                         .await
                                     }));
@@ -765,8 +853,18 @@ async fn run_tui_loop(
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 TuiCommand::AddToQueue(id) => {
-                    // The orchestrator should pick this up on next iteration
-                    app.add_log(LogEntry::info(format!("Queued: {}", id)));
+                    // Push to dynamic queue for orchestrator to pick up
+                    if dynamic_queue.push(id.clone()).await {
+                        app.add_log(LogEntry::info(format!(
+                            "Added to dynamic queue: {}",
+                            id
+                        )));
+                    } else {
+                        app.add_log(LogEntry::warn(format!(
+                            "Already in dynamic queue: {}",
+                            id
+                        )));
+                    }
                 }
                 TuiCommand::RemoveFromQueue(id) => {
                     // Log the removal (orchestrator will see the updated status)
@@ -797,32 +895,248 @@ async fn run_tui_loop(
     Ok(())
 }
 
+/// Context for archive operations
+struct ArchiveContext {
+    iteration: u32,
+    total_changes: usize,
+    queue_size: usize,
+}
+
+/// Result of archive operation
+enum ArchiveResult {
+    Success,
+    Failed,
+    Cancelled,
+}
+
+/// Archive a single completed change
+/// Returns Ok(ArchiveResult) indicating success, failure, or cancellation
+async fn archive_single_change(
+    change_id: &str,
+    change: &Change,
+    agent: &AgentRunner,
+    hooks: &crate::hooks::HookRunner,
+    tx: &mpsc::Sender<OrchestratorEvent>,
+    cancel_token: &CancellationToken,
+    context: &ArchiveContext,
+) -> Result<ArchiveResult> {
+    use crate::agent::OutputLine;
+    use crate::hooks::{HookContext, HookType};
+
+    // Run on_change_complete hook
+    let complete_context =
+        HookContext::new(context.iteration, context.total_changes, context.queue_size, false)
+            .with_change(change_id, change.completed_tasks, change.total_tasks);
+    if let Err(e) = hooks
+        .run_hook(HookType::OnChangeComplete, &complete_context)
+        .await
+    {
+        let _ = tx
+            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                "on_change_complete hook failed: {}",
+                e
+            ))))
+            .await;
+    }
+
+    // Run pre_archive hook
+    let pre_archive_context =
+        HookContext::new(context.iteration, context.total_changes, context.queue_size, false)
+            .with_change(change_id, change.completed_tasks, change.total_tasks);
+    if let Err(e) = hooks
+        .run_hook(HookType::PreArchive, &pre_archive_context)
+        .await
+    {
+        let _ = tx
+            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                "pre_archive hook failed: {}",
+                e
+            ))))
+            .await;
+    }
+
+    // Archive the change
+    let _ = tx
+        .send(OrchestratorEvent::Log(LogEntry::info(format!(
+            "Archiving: {}",
+            change_id
+        ))))
+        .await;
+
+    // Run archive command with streaming output
+    let (mut child, mut output_rx) = agent.run_archive_streaming(change_id).await?;
+
+    // Stream output to TUI log, with cancellation support
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                let _ = child.kill().await;
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::warn(
+                        "Process killed due to cancellation".to_string(),
+                    )))
+                    .await;
+                return Ok(ArchiveResult::Cancelled);
+            }
+            line = output_rx.recv() => {
+                match line {
+                    Some(OutputLine::Stdout(s)) => {
+                        let _ = tx.send(OrchestratorEvent::Log(LogEntry::info(s))).await;
+                    }
+                    Some(OutputLine::Stderr(s)) => {
+                        let _ = tx.send(OrchestratorEvent::Log(LogEntry::warn(s))).await;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // Wait for child process to complete
+    let status = child.wait().await.map_err(|e| {
+        crate::error::OrchestratorError::AgentCommand(format!(
+            "Failed to wait for process: {}",
+            e
+        ))
+    })?;
+
+    if status.success() {
+        // Run post_archive hook
+        let post_archive_context =
+            HookContext::new(context.iteration, context.total_changes, context.queue_size.saturating_sub(1), false)
+                .with_change(change_id, change.completed_tasks, change.total_tasks);
+        if let Err(e) = hooks
+            .run_hook(HookType::PostArchive, &post_archive_context)
+            .await
+        {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                    "post_archive hook failed: {}",
+                    e
+                ))))
+                .await;
+        }
+
+        let _ = tx
+            .send(OrchestratorEvent::ChangeArchived(change_id.to_string()))
+            .await;
+        Ok(ArchiveResult::Success)
+    } else {
+        let error_msg = format!("Archive failed with exit code: {:?}", status.code());
+
+        // Run on_error hook
+        let error_context =
+            HookContext::new(context.iteration, context.total_changes, context.queue_size, false)
+                .with_change(change_id, change.completed_tasks, change.total_tasks)
+                .with_error(&error_msg);
+        let _ = hooks.run_hook(HookType::OnError, &error_context).await;
+
+        let _ = tx
+            .send(OrchestratorEvent::ProcessingError {
+                id: change_id.to_string(),
+                error: error_msg.clone(),
+            })
+            .await;
+        Ok(ArchiveResult::Failed)
+    }
+}
+
+/// Archive all complete changes from the pending set
+/// Returns the number of successfully archived changes
+async fn archive_all_complete_changes(
+    pending_ids: &HashSet<String>,
+    _openspec_cmd: &str, // Kept for API compatibility, native impl doesn't need it
+    agent: &AgentRunner,
+    hooks: &crate::hooks::HookRunner,
+    tx: &mpsc::Sender<OrchestratorEvent>,
+    cancel_token: &CancellationToken,
+    archived_set: &mut HashSet<String>,
+    total_changes: usize,
+    iteration: &mut u32,
+) -> Result<usize> {
+    use crate::openspec;
+
+    // Fetch current state of all changes using native implementation
+    let changes = openspec::list_changes_native()?;
+
+    // Find complete changes that are still in pending set
+    let complete_changes: Vec<Change> = changes
+        .into_iter()
+        .filter(|c| pending_ids.contains(&c.id) && !archived_set.contains(&c.id) && c.is_complete())
+        .collect();
+
+    let mut archived_count = 0;
+
+    for change in complete_changes {
+        if cancel_token.is_cancelled() {
+            break;
+        }
+
+        *iteration += 1;
+        let queue_size = pending_ids.len().saturating_sub(archived_count);
+        let context = ArchiveContext {
+            iteration: *iteration,
+            total_changes,
+            queue_size,
+        };
+
+        // Notify processing started for this change
+        let _ = tx
+            .send(OrchestratorEvent::ProcessingStarted(change.id.clone()))
+            .await;
+
+        // Send ProcessingCompleted before archiving
+        let _ = tx
+            .send(OrchestratorEvent::ProcessingCompleted(change.id.clone()))
+            .await;
+
+        match archive_single_change(&change.id, &change, agent, hooks, tx, cancel_token, &context).await? {
+            ArchiveResult::Success => {
+                archived_set.insert(change.id.clone());
+                archived_count += 1;
+            }
+            ArchiveResult::Failed => {
+                // Error already logged and sent, continue to next
+            }
+            ArchiveResult::Cancelled => {
+                break;
+            }
+        }
+    }
+
+    Ok(archived_count)
+}
+
 /// Run the orchestrator for selected changes
 /// Uses streaming output to send log entries in real-time
 /// Supports cancellation via CancellationToken for graceful shutdown
+///
+/// The orchestrator uses a two-phase loop:
+/// - Phase 1: Archive all complete changes before doing any apply
+/// - Phase 2: Apply one incomplete change
+///
+/// This ensures complete changes are never skipped.
 async fn run_orchestrator(
     change_ids: Vec<String>,
     openspec_cmd: String,
     config: OrchestratorConfig,
     tx: mpsc::Sender<OrchestratorEvent>,
     cancel_token: CancellationToken,
+    dynamic_queue: DynamicQueue,
 ) -> Result<()> {
     use crate::agent::OutputLine;
     use crate::hooks::{HookContext, HookRunner, HookType};
     use crate::openspec;
 
-    // Get completion check configuration values before consuming config
-    let completion_check_delay_ms = config.get_completion_check_delay_ms();
-    let completion_check_max_retries = config.get_completion_check_max_retries();
-
     let hooks = HookRunner::new(config.get_hooks());
     let agent = AgentRunner::new(config);
 
-    let total_changes = change_ids.len();
+    let mut total_changes = change_ids.len();
     let mut iteration: u32 = 0;
     let mut first_apply_executed = false;
     let mut archived_changes: HashSet<String> = HashSet::new();
-    let processed_change_ids: Vec<String> = change_ids.clone();
+    let mut pending_changes: HashSet<String> = change_ids.iter().cloned().collect();
+    let mut processed_change_ids: Vec<String> = change_ids.clone();
 
     // Run on_start hook
     let start_context = HookContext::new(0, total_changes, total_changes, false);
@@ -835,9 +1149,9 @@ async fn run_orchestrator(
             .await;
     }
 
-    for change_id in change_ids {
-        iteration += 1;
-        // Check for cancellation before starting each change
+    // Main two-phase loop
+    loop {
+        // Check for cancellation before each iteration
         if cancel_token.is_cancelled() {
             let _ = tx
                 .send(OrchestratorEvent::Log(LogEntry::warn(
@@ -847,447 +1161,254 @@ async fn run_orchestrator(
             break;
         }
 
+        // Check dynamic queue for new changes before checking if we're done
+        while let Some(dynamic_id) = dynamic_queue.pop().await {
+            // Skip if already archived or in pending
+            if !archived_changes.contains(&dynamic_id) && !pending_changes.contains(&dynamic_id) {
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                        "Processing dynamically added: {}",
+                        dynamic_id
+                    ))))
+                    .await;
+                pending_changes.insert(dynamic_id.clone());
+                processed_change_ids.push(dynamic_id);
+                total_changes += 1;
+            }
+        }
+
+        // Check if all pending changes are done
+        if pending_changes.is_empty() {
+            break;
+        }
+
+        // Phase 1: Archive all complete changes
+        let archived_count = archive_all_complete_changes(
+            &pending_changes,
+            &openspec_cmd,
+            &agent,
+            &hooks,
+            &tx,
+            &cancel_token,
+            &mut archived_changes,
+            total_changes,
+            &mut iteration,
+        )
+        .await?;
+
+        // Remove archived changes from pending
+        for id in &archived_changes {
+            pending_changes.remove(id);
+        }
+
+        if archived_count > 0 {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                    "Archived {} complete change(s)",
+                    archived_count
+                ))))
+                .await;
+        }
+
+        // Check if all done after archiving
+        // Dynamic queue is checked at the start of the next iteration
+        if pending_changes.is_empty() {
+            continue; // Re-check dynamic queue
+        }
+
+        // Check for cancellation after archive phase
+        if cancel_token.is_cancelled() {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::warn(
+                    "Processing cancelled".to_string(),
+                )))
+                .await;
+            break;
+        }
+
+        // Phase 2: Select and apply next incomplete change
+        // Fetch current state to find best candidate using native implementation
+        let changes = openspec::list_changes_native()?;
+
+        // Find the next incomplete change from our pending set
+        // Prioritize by highest progress percentage
+        let next_change = changes
+            .iter()
+            .filter(|c| pending_changes.contains(&c.id) && !c.is_complete())
+            .max_by(|a, b| {
+                let a_progress = if a.total_tasks > 0 {
+                    a.completed_tasks as f32 / a.total_tasks as f32
+                } else {
+                    0.0
+                };
+                let b_progress = if b.total_tasks > 0 {
+                    b.completed_tasks as f32 / b.total_tasks as f32
+                } else {
+                    0.0
+                };
+                a_progress.partial_cmp(&b_progress).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+        let Some(change) = next_change else {
+            // No incomplete changes found - might all be complete now
+            // Loop will re-check in Phase 1
+            continue;
+        };
+
+        let change_id = change.id.clone();
+        let change = change.clone();
+        iteration += 1;
+
         // Notify processing started
         let _ = tx
             .send(OrchestratorEvent::ProcessingStarted(change_id.clone()))
             .await;
 
-        // Get current change state
-        let changes = openspec::list_changes(&openspec_cmd).await?;
-        let change = changes.iter().find(|c| c.id == change_id);
+        let queue_size = pending_changes.len();
 
-        let queue_size = total_changes - iteration as usize + 1;
-
-        if let Some(change) = change {
-            if change.is_complete() {
-                // Run on_change_complete hook
-                let complete_context =
-                    HookContext::new(iteration, total_changes, queue_size, false).with_change(
-                        &change_id,
-                        change.completed_tasks,
-                        change.total_tasks,
-                    );
-                if let Err(e) = hooks
-                    .run_hook(HookType::OnChangeComplete, &complete_context)
-                    .await
-                {
-                    let _ = tx
-                        .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                            "on_change_complete hook failed: {}",
-                            e
-                        ))))
-                        .await;
-                }
-
-                // Run pre_archive hook
-                let pre_archive_context =
-                    HookContext::new(iteration, total_changes, queue_size, false).with_change(
-                        &change_id,
-                        change.completed_tasks,
-                        change.total_tasks,
-                    );
-                if let Err(e) = hooks
-                    .run_hook(HookType::PreArchive, &pre_archive_context)
-                    .await
-                {
-                    let _ = tx
-                        .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                            "pre_archive hook failed: {}",
-                            e
-                        ))))
-                        .await;
-                }
-
-                // Archive the change
+        // Run on_first_apply hook (once)
+        if !first_apply_executed {
+            let first_apply_context =
+                HookContext::new(iteration, total_changes, queue_size, false).with_change(
+                    &change_id,
+                    change.completed_tasks,
+                    change.total_tasks,
+                );
+            if let Err(e) = hooks
+                .run_hook(HookType::OnFirstApply, &first_apply_context)
+                .await
+            {
                 let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                        "Archiving: {}",
-                        change_id
-                    ))))
+                    .send(OrchestratorEvent::ProcessingError {
+                        id: change_id.clone(),
+                        error: format!("on_first_apply hook failed: {}", e),
+                    })
                     .await;
-
-                // Debug: Log the archive command
-                let archive_cmd = agent.get_archive_command().to_string();
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                        "Archive command: {}",
-                        archive_cmd
-                    ))))
-                    .await;
-
-                // Run archive command with streaming output
-                let (mut child, mut output_rx) = agent.run_archive_streaming(&change_id).await?;
-
-                // Stream output to TUI log, with cancellation support
-                loop {
-                    tokio::select! {
-                        _ = cancel_token.cancelled() => {
-                            // Kill child process on cancellation
-                            let _ = child.kill().await;
-                            let _ = tx
-                                .send(OrchestratorEvent::Log(LogEntry::warn(
-                                    "Process killed due to cancellation".to_string(),
-                                )))
-                                .await;
-                            return Ok(());
-                        }
-                        line = output_rx.recv() => {
-                            match line {
-                                Some(OutputLine::Stdout(s)) => {
-                                    let _ = tx.send(OrchestratorEvent::Log(LogEntry::info(s))).await;
-                                }
-                                Some(OutputLine::Stderr(s)) => {
-                                    let _ = tx.send(OrchestratorEvent::Log(LogEntry::warn(s))).await;
-                                }
-                                None => break,
-                            }
-                        }
-                    }
-                }
-
-                // Wait for child process to complete
-                let status = child.wait().await.map_err(|e| {
-                    crate::error::OrchestratorError::AgentCommand(format!(
-                        "Failed to wait for process: {}",
-                        e
-                    ))
-                })?;
-
-                if status.success() {
-                    // Run post_archive hook
-                    let post_archive_context =
-                        HookContext::new(iteration, total_changes, queue_size - 1, false)
-                            .with_change(&change_id, change.completed_tasks, change.total_tasks);
-                    if let Err(e) = hooks
-                        .run_hook(HookType::PostArchive, &post_archive_context)
-                        .await
-                    {
-                        let _ = tx
-                            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                                "post_archive hook failed: {}",
-                                e
-                            ))))
-                            .await;
-                    }
-
-                    let _ = tx
-                        .send(OrchestratorEvent::ChangeArchived(change_id.clone()))
-                        .await;
-                    archived_changes.insert(change_id.clone());
-                } else {
-                    // Run on_error hook
-                    let error_msg = format!("Archive failed with exit code: {:?}", status.code());
-                    let error_context =
-                        HookContext::new(iteration, total_changes, queue_size, false)
-                            .with_change(&change_id, change.completed_tasks, change.total_tasks)
-                            .with_error(&error_msg);
-                    let _ = hooks.run_hook(HookType::OnError, &error_context).await;
-
-                    let _ = tx
-                        .send(OrchestratorEvent::ProcessingError {
-                            id: change_id.clone(),
-                            error: error_msg,
-                        })
-                        .await;
-                }
-            } else {
-                // Run on_first_apply hook (once)
-                if !first_apply_executed {
-                    let first_apply_context =
-                        HookContext::new(iteration, total_changes, queue_size, false).with_change(
-                            &change_id,
-                            change.completed_tasks,
-                            change.total_tasks,
-                        );
-                    if let Err(e) = hooks
-                        .run_hook(HookType::OnFirstApply, &first_apply_context)
-                        .await
-                    {
-                        let _ = tx
-                            .send(OrchestratorEvent::ProcessingError {
-                                id: change_id.clone(),
-                                error: format!("on_first_apply hook failed: {}", e),
-                            })
-                            .await;
-                        break;
-                    }
-                    first_apply_executed = true;
-                }
-
-                // Run pre_apply hook
-                let pre_apply_context =
-                    HookContext::new(iteration, total_changes, queue_size, false).with_change(
-                        &change_id,
-                        change.completed_tasks,
-                        change.total_tasks,
-                    );
-                if let Err(e) = hooks.run_hook(HookType::PreApply, &pre_apply_context).await {
-                    let _ = tx
-                        .send(OrchestratorEvent::ProcessingError {
-                            id: change_id.clone(),
-                            error: format!("pre_apply hook failed: {}", e),
-                        })
-                        .await;
-                    break;
-                }
-
-                // Apply the change
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                        "Applying: {}",
-                        change_id
-                    ))))
-                    .await;
-
-                // Run apply command with streaming output
-                let (mut child, mut output_rx) = agent.run_apply_streaming(&change_id).await?;
-
-                // Stream output to TUI log, with cancellation support
-                loop {
-                    tokio::select! {
-                        _ = cancel_token.cancelled() => {
-                            // Kill child process on cancellation
-                            let _ = child.kill().await;
-                            let _ = tx
-                                .send(OrchestratorEvent::Log(LogEntry::warn(
-                                    "Process killed due to cancellation".to_string(),
-                                )))
-                                .await;
-                            return Ok(());
-                        }
-                        line = output_rx.recv() => {
-                            match line {
-                                Some(OutputLine::Stdout(s)) => {
-                                    let _ = tx.send(OrchestratorEvent::Log(LogEntry::info(s))).await;
-                                }
-                                Some(OutputLine::Stderr(s)) => {
-                                    let _ = tx.send(OrchestratorEvent::Log(LogEntry::warn(s))).await;
-                                }
-                                None => break,
-                            }
-                        }
-                    }
-                }
-
-                // Wait for child process to complete
-                let status = child.wait().await.map_err(|e| {
-                    crate::error::OrchestratorError::AgentCommand(format!(
-                        "Failed to wait for process: {}",
-                        e
-                    ))
-                })?;
-
-                if status.success() {
-                    // Run post_apply hook
-                    let post_apply_context =
-                        HookContext::new(iteration, total_changes, queue_size, false).with_change(
-                            &change_id,
-                            change.completed_tasks,
-                            change.total_tasks,
-                        );
-                    if let Err(e) = hooks
-                        .run_hook(HookType::PostApply, &post_apply_context)
-                        .await
-                    {
-                        let _ = tx
-                            .send(OrchestratorEvent::ProcessingError {
-                                id: change_id.clone(),
-                                error: format!("post_apply hook failed: {}", e),
-                            })
-                            .await;
-                        break;
-                    }
-
-                    let _ = tx
-                        .send(OrchestratorEvent::ProcessingCompleted(change_id.clone()))
-                        .await;
-
-                    // Re-check if change is now complete and needs archiving
-                    // Use retry logic to handle delayed state propagation
-                    let mut completed_change: Option<Change> = None;
-                    for attempt in 0..=completion_check_max_retries {
-                        // Check for cancellation before each retry
-                        if cancel_token.is_cancelled() {
-                            let _ = tx
-                                .send(OrchestratorEvent::Log(LogEntry::warn(
-                                    "Completion check cancelled".to_string(),
-                                )))
-                                .await;
-                            return Ok(());
-                        }
-
-                        // Delay on retry attempts (not on first check)
-                        if attempt > 0 {
-                            let _ = tx
-                                .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                                    "Completion check retry {}/{} for {}",
-                                    attempt, completion_check_max_retries, change_id
-                                ))))
-                                .await;
-                            tokio::time::sleep(Duration::from_millis(completion_check_delay_ms)).await;
-                        }
-
-                        // Fetch current state
-                        let changes_after = openspec::list_changes(&openspec_cmd).await?;
-                        if let Some(updated) = changes_after.iter().find(|c| c.id == change_id) {
-                            if updated.is_complete() {
-                                completed_change = Some(updated.clone());
-                                break;
-                            }
-                        } else {
-                            // Change not found - may have been archived externally
-                            let _ = tx
-                                .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                                    "Change {} not found, may have been archived externally",
-                                    change_id
-                                ))))
-                                .await;
-                            break;
-                        }
-                    }
-
-                    if let Some(updated_change) = completed_change {
-                        // Run on_change_complete hook
-                        let complete_context =
-                            HookContext::new(iteration, total_changes, queue_size, false)
-                                .with_change(
-                                    &change_id,
-                                    updated_change.completed_tasks,
-                                    updated_change.total_tasks,
-                                );
-                        if let Err(e) = hooks
-                            .run_hook(HookType::OnChangeComplete, &complete_context)
-                            .await
-                        {
-                            let _ = tx
-                                .send(OrchestratorEvent::ProcessingError {
-                                    id: change_id.clone(),
-                                    error: format!("on_change_complete hook failed: {}", e),
-                                })
-                                .await;
-                            break;
-                        }
-
-                        // Run pre_archive hook
-                        let pre_archive_context =
-                            HookContext::new(iteration, total_changes, queue_size, false)
-                                .with_change(
-                                    &change_id,
-                                    updated_change.completed_tasks,
-                                    updated_change.total_tasks,
-                                );
-                        if let Err(e) = hooks
-                            .run_hook(HookType::PreArchive, &pre_archive_context)
-                            .await
-                        {
-                            let _ = tx
-                                .send(OrchestratorEvent::ProcessingError {
-                                    id: change_id.clone(),
-                                    error: format!("pre_archive hook failed: {}", e),
-                                })
-                                .await;
-                            break;
-                        }
-
-                        // Archive the now-complete change
-                        let _ = tx
-                            .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                                "Change complete, archiving: {}",
-                                change_id
-                            ))))
-                            .await;
-
-                        let (mut archive_child, mut archive_rx) =
-                            agent.run_archive_streaming(&change_id).await?;
-
-                        // Stream archive output
-                        loop {
-                            tokio::select! {
-                                _ = cancel_token.cancelled() => {
-                                    let _ = archive_child.kill().await;
-                                    let _ = tx
-                                        .send(OrchestratorEvent::Log(LogEntry::warn(
-                                            "Archive process killed due to cancellation".to_string(),
-                                        )))
-                                        .await;
-                                    return Ok(());
-                                }
-                                line = archive_rx.recv() => {
-                                    match line {
-                                        Some(OutputLine::Stdout(s)) => {
-                                            let _ = tx.send(OrchestratorEvent::Log(LogEntry::info(s))).await;
-                                        }
-                                        Some(OutputLine::Stderr(s)) => {
-                                            let _ = tx.send(OrchestratorEvent::Log(LogEntry::warn(s))).await;
-                                        }
-                                        None => break,
-                                    }
-                                }
-                            }
-                        }
-
-                        let archive_status = archive_child.wait().await.map_err(|e| {
-                            crate::error::OrchestratorError::AgentCommand(format!(
-                                "Failed to wait for archive process: {}",
-                                e
-                            ))
-                        })?;
-
-                        if archive_status.success() {
-                            let _ = tx
-                                .send(OrchestratorEvent::ChangeArchived(change_id.clone()))
-                                .await;
-                            archived_changes.insert(change_id.clone());
-                        } else {
-                            let _ = tx
-                                .send(OrchestratorEvent::ProcessingError {
-                                    id: change_id.clone(),
-                                    error: format!(
-                                        "Archive failed with exit code: {:?}",
-                                        archive_status.code()
-                                    ),
-                                })
-                                .await;
-                        }
-                    } else {
-                        // Max retries exhausted without completion detection
-                        let _ = tx
-                            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                                "Change {} did not reach completion state after {} retries",
-                                change_id, completion_check_max_retries
-                            ))))
-                            .await;
-                    }
-                } else {
-                    let error_msg = format!("Apply failed with exit code: {:?}", status.code());
-
-                    // Run on_error hook
-                    let error_context =
-                        HookContext::new(iteration, total_changes, queue_size, false)
-                            .with_change(&change_id, change.completed_tasks, change.total_tasks)
-                            .with_error(&error_msg);
-                    let _ = hooks.run_hook(HookType::OnError, &error_context).await;
-
-                    let _ = tx
-                        .send(OrchestratorEvent::ProcessingError {
-                            id: change_id.clone(),
-                            error: error_msg,
-                        })
-                        .await;
-                }
+                break;
             }
-        } else {
+            first_apply_executed = true;
+        }
+
+        // Run pre_apply hook
+        let pre_apply_context =
+            HookContext::new(iteration, total_changes, queue_size, false).with_change(
+                &change_id,
+                change.completed_tasks,
+                change.total_tasks,
+            );
+        if let Err(e) = hooks.run_hook(HookType::PreApply, &pre_apply_context).await {
             let _ = tx
                 .send(OrchestratorEvent::ProcessingError {
                     id: change_id.clone(),
-                    error: "Change not found".to_string(),
+                    error: format!("pre_apply hook failed: {}", e),
                 })
                 .await;
+            break;
+        }
+
+        // Apply the change
+        let _ = tx
+            .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                "Applying: {}",
+                change_id
+            ))))
+            .await;
+
+        // Run apply command with streaming output
+        let (mut child, mut output_rx) = agent.run_apply_streaming(&change_id).await?;
+
+        // Stream output to TUI log, with cancellation support
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    let _ = child.kill().await;
+                    let _ = tx
+                        .send(OrchestratorEvent::Log(LogEntry::warn(
+                            "Process killed due to cancellation".to_string(),
+                        )))
+                        .await;
+                    // Exit the main loop
+                    pending_changes.clear();
+                    break;
+                }
+                line = output_rx.recv() => {
+                    match line {
+                        Some(OutputLine::Stdout(s)) => {
+                            let _ = tx.send(OrchestratorEvent::Log(LogEntry::info(s))).await;
+                        }
+                        Some(OutputLine::Stderr(s)) => {
+                            let _ = tx.send(OrchestratorEvent::Log(LogEntry::warn(s))).await;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        // Check if we were cancelled during streaming
+        if cancel_token.is_cancelled() {
+            break;
+        }
+
+        // Wait for child process to complete
+        let status = child.wait().await.map_err(|e| {
+            crate::error::OrchestratorError::AgentCommand(format!(
+                "Failed to wait for process: {}",
+                e
+            ))
+        })?;
+
+        if status.success() {
+            // Run post_apply hook
+            let post_apply_context =
+                HookContext::new(iteration, total_changes, queue_size, false).with_change(
+                    &change_id,
+                    change.completed_tasks,
+                    change.total_tasks,
+                );
+            if let Err(e) = hooks
+                .run_hook(HookType::PostApply, &post_apply_context)
+                .await
+            {
+                let _ = tx
+                    .send(OrchestratorEvent::ProcessingError {
+                        id: change_id.clone(),
+                        error: format!("post_apply hook failed: {}", e),
+                    })
+                    .await;
+                break;
+            }
+
+            // Apply succeeded - loop will re-check for complete changes in Phase 1
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                    "Apply completed for {}, checking for completion...",
+                    change_id
+                ))))
+                .await;
+        } else {
+            let error_msg = format!("Apply failed with exit code: {:?}", status.code());
+
+            // Run on_error hook
+            let error_context =
+                HookContext::new(iteration, total_changes, queue_size, false)
+                    .with_change(&change_id, change.completed_tasks, change.total_tasks)
+                    .with_error(&error_msg);
+            let _ = hooks.run_hook(HookType::OnError, &error_context).await;
+
+            let _ = tx
+                .send(OrchestratorEvent::ProcessingError {
+                    id: change_id.clone(),
+                    error: error_msg,
+                })
+                .await;
+
+            // Remove failed change from pending to prevent infinite retry
+            pending_changes.remove(&change_id);
         }
     }
 
     // Final verification: check if any changes remain unarchived
-    // This is a safety check to log warnings if archiving didn't complete
     let _ = tx
         .send(OrchestratorEvent::Log(LogEntry::info(
             "Verifying all changes have been archived...".to_string(),
@@ -1301,8 +1422,8 @@ async fn run_orchestrator(
         .map(|id| id.as_str())
         .collect();
 
-    // Also verify against openspec list as backup
-    let final_changes = openspec::list_changes(&openspec_cmd).await.ok();
+    // Also verify against native list as backup
+    let final_changes = openspec::list_changes_native().ok();
     if let Some(changes) = final_changes {
         let unarchived_by_list: Vec<&str> = processed_change_ids
             .iter()
@@ -1429,20 +1550,12 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Error => Color::Red,
     };
 
-    let elapsed = app.last_refresh.elapsed().as_secs();
-    let next_refresh = AUTO_REFRESH_INTERVAL_SECS.saturating_sub(elapsed);
-
     let header_text = Line::from(vec![
         Span::styled("OpenSpec Orchestrator", Style::default().fg(Color::White)),
         Span::raw("  "),
         Span::styled(
             format!("[{}]", mode_text),
             Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("Auto-refresh: {}s ↻", next_refresh),
-            Style::default().fg(Color::DarkGray),
         ),
     ]);
 
@@ -1534,6 +1647,9 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 QueueStatus::Processing => {
                     format!("{} [{:>3.0}%]", spinner_char, change.progress_percent())
                 }
+                QueueStatus::Completed | QueueStatus::Archived | QueueStatus::Error(_) => {
+                    format!("[{}]", change.queue_status.display())
+                }
                 status => format!("[{}]", status.display()),
             };
 
@@ -1550,7 +1666,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!(" {:>12}", status_text),
+                    format!(" {:>18}", status_text),
                     Style::default().fg(change.queue_status.color()),
                 ),
                 Span::styled(
@@ -1566,7 +1682,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Changes (Space: toggle queue) ")
+                .title(" Changes (Space: add/remove from queue - processed dynamically) ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         )
@@ -1586,6 +1702,7 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
             let error_id = app.error_change_id.as_deref().unwrap_or("unknown");
             (format!("Error in: {}", error_id), Color::Red)
         }
+        AppMode::Completed => ("Done".to_string(), Color::Green),
         _ => match &app.current_change {
             Some(id) => (format!("Current: {}", id), Color::White),
             None => ("Waiting...".to_string(), Color::White),
@@ -1599,15 +1716,15 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Error => ("Press F5 to retry, or 'q' to quit.", Color::Yellow),
     };
 
-    // Calculate overall progress for queued/processing changes
+    // Calculate overall progress for all queued changes (including completed/archived)
     let progress_info = if app.mode == AppMode::Running {
         let (total_tasks, completed_tasks) = app
             .changes
             .iter()
             .filter(|c| {
-                matches!(
+                !matches!(
                     c.queue_status,
-                    QueueStatus::Queued | QueueStatus::Processing
+                    QueueStatus::NotQueued | QueueStatus::Error(_)
                 )
             })
             .fold((0u32, 0u32), |(total, completed), c| {
@@ -1756,11 +1873,8 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
 
     // Split area into left content and right-aligned version
     let version_width = version.len() as u16 + 2; // +2 for padding
-    let chunks = Layout::horizontal([
-        Constraint::Min(1),
-        Constraint::Length(version_width),
-    ])
-    .split(area);
+    let chunks =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(version_width)]).split(area);
 
     // Render left content (status information) with left and bottom/top borders
     let left_footer = Paragraph::new(Line::from(spans)).block(
@@ -2270,14 +2384,14 @@ mod tests {
         app.start_processing();
         assert_eq!(app.mode, AppMode::Running);
 
-        // Calculate progress like render_status does (only Queued and Processing)
+        // Calculate progress like render_status does (excludes NotQueued and Error)
         let (total_tasks, completed_tasks) = app
             .changes
             .iter()
             .filter(|c| {
-                matches!(
+                !matches!(
                     c.queue_status,
-                    QueueStatus::Queued | QueueStatus::Processing
+                    QueueStatus::NotQueued | QueueStatus::Error(_)
                 )
             })
             .fold((0u32, 0u32), |(total, completed), c| {
@@ -2290,6 +2404,148 @@ mod tests {
 
         let percent = (completed_tasks as f32 / total_tasks as f32) * 100.0;
         assert!((percent - 62.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_progress_calculation_includes_completed_changes() {
+        let changes = vec![
+            create_test_change("a", 2, 5), // 2/5 done, will be Processing
+            create_test_change("b", 3, 3), // 3/3 done, will be Completed
+        ];
+        let mut app = AppState::new(changes);
+
+        // Start processing
+        app.start_processing();
+        assert_eq!(app.mode, AppMode::Running);
+
+        // Simulate: a is processing, b is completed
+        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[1].queue_status = QueueStatus::Completed;
+
+        // Calculate progress (includes Completed changes)
+        let (total_tasks, completed_tasks) = app
+            .changes
+            .iter()
+            .filter(|c| {
+                !matches!(
+                    c.queue_status,
+                    QueueStatus::NotQueued | QueueStatus::Error(_)
+                )
+            })
+            .fold((0u32, 0u32), |(total, completed), c| {
+                (total + c.total_tasks, completed + c.completed_tasks)
+            });
+
+        // Both changes should be counted
+        // Total: 5 + 3 = 8, Completed: 2 + 3 = 5
+        assert_eq!(total_tasks, 8);
+        assert_eq!(completed_tasks, 5);
+    }
+
+    #[test]
+    fn test_progress_calculation_includes_archived_changes() {
+        let changes = vec![
+            create_test_change("a", 2, 5), // 2/5 done, will be Processing
+            create_test_change("b", 3, 3), // 3/3 done, will be Archived
+        ];
+        let mut app = AppState::new(changes);
+
+        // Start processing
+        app.start_processing();
+        assert_eq!(app.mode, AppMode::Running);
+
+        // Simulate: a is processing, b is archived
+        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[1].queue_status = QueueStatus::Archived;
+
+        // Calculate progress (includes Archived changes)
+        let (total_tasks, completed_tasks) = app
+            .changes
+            .iter()
+            .filter(|c| {
+                !matches!(
+                    c.queue_status,
+                    QueueStatus::NotQueued | QueueStatus::Error(_)
+                )
+            })
+            .fold((0u32, 0u32), |(total, completed), c| {
+                (total + c.total_tasks, completed + c.completed_tasks)
+            });
+
+        // Both changes should be counted
+        // Total: 5 + 3 = 8, Completed: 2 + 3 = 5
+        assert_eq!(total_tasks, 8);
+        assert_eq!(completed_tasks, 5);
+    }
+
+    #[test]
+    fn test_progress_calculation_excludes_not_queued() {
+        let changes = vec![
+            create_test_change("a", 2, 5), // 2/5 done, will be Processing
+            create_test_change("b", 3, 3), // 3/3 done, will be NotQueued
+        ];
+        let mut app = AppState::new(changes);
+
+        // Start processing
+        app.start_processing();
+
+        // Simulate: a is processing, b is removed from queue
+        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[1].queue_status = QueueStatus::NotQueued;
+
+        // Calculate progress (excludes NotQueued)
+        let (total_tasks, completed_tasks) = app
+            .changes
+            .iter()
+            .filter(|c| {
+                !matches!(
+                    c.queue_status,
+                    QueueStatus::NotQueued | QueueStatus::Error(_)
+                )
+            })
+            .fold((0u32, 0u32), |(total, completed), c| {
+                (total + c.total_tasks, completed + c.completed_tasks)
+            });
+
+        // Only 'a' should be counted
+        // Total: 5, Completed: 2
+        assert_eq!(total_tasks, 5);
+        assert_eq!(completed_tasks, 2);
+    }
+
+    #[test]
+    fn test_progress_calculation_excludes_error() {
+        let changes = vec![
+            create_test_change("a", 2, 5), // 2/5 done, will be Processing
+            create_test_change("b", 3, 3), // 3/3 done, will be Error
+        ];
+        let mut app = AppState::new(changes);
+
+        // Start processing
+        app.start_processing();
+
+        // Simulate: a is processing, b has error
+        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[1].queue_status = QueueStatus::Error("test error".to_string());
+
+        // Calculate progress (excludes Error)
+        let (total_tasks, completed_tasks) = app
+            .changes
+            .iter()
+            .filter(|c| {
+                !matches!(
+                    c.queue_status,
+                    QueueStatus::NotQueued | QueueStatus::Error(_)
+                )
+            })
+            .fold((0u32, 0u32), |(total, completed), c| {
+                (total + c.total_tasks, completed + c.completed_tasks)
+            });
+
+        // Only 'a' should be counted
+        // Total: 5, Completed: 2
+        assert_eq!(total_tasks, 5);
+        assert_eq!(completed_tasks, 2);
     }
 
     #[test]
@@ -2383,9 +2639,7 @@ mod tests {
         assert!(version.len() > 1);
         // Version should match Cargo.toml version format (e.g., "v0.1.0")
         let version_part = &version[1..]; // Remove "v" prefix
-        assert!(version_part
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '.'));
+        assert!(version_part.chars().all(|c| c.is_ascii_digit() || c == '.'));
     }
 
     #[test]
@@ -2394,5 +2648,225 @@ mod tests {
         // Should match the version from Cargo.toml
         let expected = format!("v{}", env!("CARGO_PKG_VERSION"));
         assert_eq!(version, expected);
+    }
+
+    #[test]
+    fn test_status_text_format_for_terminal_states() {
+        // Test that terminal states show only status name (task count is in separate column)
+        let change = ChangeState {
+            id: "test-change".to_string(),
+            completed_tasks: 8,
+            total_tasks: 13,
+            queue_status: QueueStatus::Completed,
+            selected: true,
+            is_new: false,
+            last_modified: "now".to_string(),
+        };
+
+        // Verify completed status format (no task count - shown in separate column)
+        let status_text = format!("[{}]", change.queue_status.display());
+        assert_eq!(status_text, "[completed]");
+
+        // Verify archived status format
+        let mut archived_change = change.clone();
+        archived_change.queue_status = QueueStatus::Archived;
+        let status_text = format!("[{}]", archived_change.queue_status.display());
+        assert_eq!(status_text, "[archived]");
+
+        // Verify error status format
+        let mut error_change = change.clone();
+        error_change.queue_status = QueueStatus::Error("test error".to_string());
+        let status_text = format!("[{}]", error_change.queue_status.display());
+        assert_eq!(status_text, "[error]");
+    }
+
+    #[test]
+    fn test_status_text_format_width_accommodates_status() {
+        // Test that status text fits within column width
+        let max_status_width = 18; // Column width
+
+        // Terminal states show only status name (task count in separate column)
+        let completed_status = "[completed]";
+        assert!(completed_status.len() <= max_status_width);
+
+        // Archived format
+        let archived_status = "[archived]";
+        assert!(archived_status.len() <= max_status_width);
+
+        // Error format
+        let error_status = "[error]";
+        assert!(error_status.len() <= max_status_width);
+
+        // Processing format (includes percentage)
+        let processing_status = "⠋ [100%]";
+        assert!(processing_status.chars().count() <= max_status_width);
+    }
+
+    #[test]
+    fn test_processing_completed_only_marks_complete_when_100_percent() {
+        let changes = vec![create_test_change("a", 8, 13)]; // 8/13 tasks - not 100%
+        let mut app = AppState::new(changes);
+
+        // Start processing
+        app.start_processing();
+        app.handle_orchestrator_event(OrchestratorEvent::ProcessingStarted("a".to_string()));
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Processing);
+
+        // If ProcessingCompleted is sent, it should mark as Completed
+        // (The key change is that ProcessingCompleted should NOT be sent for incomplete tasks)
+        app.handle_orchestrator_event(OrchestratorEvent::ProcessingCompleted("a".to_string()));
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Completed);
+
+        // This test documents the behavior: ProcessingCompleted always sets Completed status.
+        // The fix ensures ProcessingCompleted is only sent when tasks are 100% done.
+    }
+
+    #[test]
+    fn test_processing_stays_processing_without_completed_event() {
+        let changes = vec![create_test_change("a", 8, 13)]; // 8/13 tasks - not 100%
+        let mut app = AppState::new(changes);
+
+        // Start processing
+        app.start_processing();
+        app.handle_orchestrator_event(OrchestratorEvent::ProcessingStarted("a".to_string()));
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Processing);
+
+        // Without ProcessingCompleted event, status stays Processing
+        // This is the expected behavior when apply succeeds but tasks are not 100%
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Processing);
+
+        // Status is NOT Completed
+        assert_ne!(app.changes[0].queue_status, QueueStatus::Completed);
+    }
+
+    #[test]
+    fn test_progress_updated_does_not_change_queue_status() {
+        let changes = vec![create_test_change("a", 0, 10)];
+        let mut app = AppState::new(changes);
+
+        // Start processing
+        app.start_processing();
+        app.handle_orchestrator_event(OrchestratorEvent::ProcessingStarted("a".to_string()));
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Processing);
+
+        // Progress update should not change queue status
+        app.handle_orchestrator_event(OrchestratorEvent::ProgressUpdated {
+            id: "a".to_string(),
+            completed: 5,
+            total: 10,
+        });
+
+        // Queue status should still be Processing
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Processing);
+        // But progress should be updated
+        assert_eq!(app.changes[0].completed_tasks, 5);
+        assert_eq!(app.changes[0].total_tasks, 10);
+    }
+
+    #[test]
+    fn test_completed_status_only_after_processing_completed_event() {
+        let changes = vec![create_test_change("a", 10, 10)]; // 100% complete
+        let mut app = AppState::new(changes);
+
+        // Start processing
+        app.start_processing();
+        app.handle_orchestrator_event(OrchestratorEvent::ProcessingStarted("a".to_string()));
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Processing);
+
+        // Even with 100% tasks, status is Processing until ProcessingCompleted event
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Processing);
+
+        // Only ProcessingCompleted event transitions to Completed
+        app.handle_orchestrator_event(OrchestratorEvent::ProcessingCompleted("a".to_string()));
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Completed);
+    }
+
+    // DynamicQueue tests
+
+    #[tokio::test]
+    async fn test_dynamic_queue_push_pop() {
+        let queue = DynamicQueue::new();
+
+        // Push items
+        assert!(queue.push("change-a".to_string()).await);
+        assert!(queue.push("change-b".to_string()).await);
+
+        // Pop in FIFO order
+        assert_eq!(queue.pop().await, Some("change-a".to_string()));
+        assert_eq!(queue.pop().await, Some("change-b".to_string()));
+        assert_eq!(queue.pop().await, None);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_queue_duplicate_prevention() {
+        let queue = DynamicQueue::new();
+
+        // First push succeeds
+        assert!(queue.push("change-a".to_string()).await);
+
+        // Duplicate push fails
+        assert!(!queue.push("change-a".to_string()).await);
+
+        // Different ID succeeds
+        assert!(queue.push("change-b".to_string()).await);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_queue_is_empty() {
+        let queue = DynamicQueue::new();
+
+        assert!(queue.is_empty().await);
+
+        queue.push("change-a".to_string()).await;
+        assert!(!queue.is_empty().await);
+
+        queue.pop().await;
+        assert!(queue.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_queue_contains() {
+        let queue = DynamicQueue::new();
+
+        assert!(!queue.contains("change-a").await);
+
+        queue.push("change-a".to_string()).await;
+        assert!(queue.contains("change-a").await);
+        assert!(!queue.contains("change-b").await);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_queue_len() {
+        let queue = DynamicQueue::new();
+
+        assert_eq!(queue.len().await, 0);
+
+        queue.push("change-a".to_string()).await;
+        assert_eq!(queue.len().await, 1);
+
+        queue.push("change-b".to_string()).await;
+        assert_eq!(queue.len().await, 2);
+
+        queue.pop().await;
+        assert_eq!(queue.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_queue_clone_shares_state() {
+        let queue1 = DynamicQueue::new();
+        let queue2 = queue1.clone();
+
+        // Push on one clone
+        queue1.push("change-a".to_string()).await;
+
+        // Visible on the other
+        assert!(queue2.contains("change-a").await);
+        assert_eq!(queue2.len().await, 1);
+
+        // Pop from the other
+        assert_eq!(queue2.pop().await, Some("change-a".to_string()));
+
+        // Reflected in both
+        assert!(queue1.is_empty().await);
     }
 }

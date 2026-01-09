@@ -99,7 +99,9 @@ pub fn parse_file(path: &Path) -> Result<TaskProgress> {
 ///
 /// Looks for tasks.md at `openspec/changes/{change_id}/tasks.md`.
 pub fn parse_change(change_id: &str) -> Result<TaskProgress> {
-    let tasks_path = Path::new("openspec/changes").join(change_id).join("tasks.md");
+    let tasks_path = Path::new("openspec/changes")
+        .join(change_id)
+        .join("tasks.md");
 
     if !tasks_path.exists() {
         return Err(OrchestratorError::ConfigLoad(format!(
@@ -201,7 +203,8 @@ mod tests {
 
     #[test]
     fn test_mixed_bullets_and_numbers() {
-        let content = "- [x] Bullet done\n1. [ ] Number pending\n* [X] Asterisk done\n2. [x] Number done";
+        let content =
+            "- [x] Bullet done\n1. [ ] Number pending\n* [X] Asterisk done\n2. [x] Number done";
         let progress = parse_content(content);
         assert_eq!(progress.total, 4);
         assert_eq!(progress.completed, 3);
@@ -245,7 +248,8 @@ mod tests {
 
     #[test]
     fn test_indented_not_counted() {
-        let content = "- [x] Parent task\n  - [ ] Sub-task (should not count)\n  - [x] Another sub-task";
+        let content =
+            "- [x] Parent task\n  - [ ] Sub-task (should not count)\n  - [x] Another sub-task";
         let progress = parse_content(content);
         // Only the parent task at the start of line should count
         assert_eq!(progress.total, 1);

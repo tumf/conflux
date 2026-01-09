@@ -164,11 +164,17 @@ openspec-orchestrator tui
   // 依存関係を分析し次の変更を選択するコマンド
   "analyze_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
 
-  // 変更を適用するコマンド
-  "apply_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id}'",
+  // 変更を適用するコマンド（{change_id}と{prompt}プレースホルダーをサポート）
+  "apply_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id} {prompt}'",
 
-  // 完了した変更をアーカイブするコマンド
-  "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id}'",
+  // 完了した変更をアーカイブするコマンド（{change_id}と{prompt}プレースホルダーをサポート）
+  "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id} {prompt}'",
+
+  // applyコマンドのシステムプロンプト（{prompt}プレースホルダーに注入）
+  "apply_prompt": "スコープ外タスクは削除せよ。ユーザを待つもしくはユーザによるタスクは削除せよ。",
+
+  // archiveコマンドのシステムプロンプト（{prompt}プレースホルダーに注入）
+  "archive_prompt": "",
 
   // ライフサイクルフック（オプション）
   "hooks": {
@@ -183,7 +189,14 @@ openspec-orchestrator tui
 | プレースホルダー | 説明 | 使用箇所 |
 |-------------|-------------|---------|
 | `{change_id}` | 処理中の変更ID | apply_command, archive_command |
-| `{prompt}` | LLM分析プロンプト | analyze_command |
+| `{prompt}` | エージェントコマンドのシステムプロンプト | apply_command, archive_command, analyze_command |
+
+**システムプロンプト:**
+
+| 設定キー | 説明 | デフォルト |
+|------------|-------------|---------|
+| `apply_prompt` | apply_commandの`{prompt}`に注入されるプロンプト | `スコープ外タスクは削除せよ。ユーザを待つもしくはユーザによるタスクは削除せよ。` |
+| `archive_prompt` | archive_commandの`{prompt}`に注入されるプロンプト | （空） |
 
 **クイックスタート:**
 

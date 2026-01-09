@@ -30,11 +30,12 @@ pub const DEFAULT_ARCHIVE_COMMAND: &str = "opencode run '/openspec-archive {chan
 /// Default analyze command template (OpenCode)
 pub const DEFAULT_ANALYZE_COMMAND: &str = "opencode run --format json '{prompt}'";
 
-/// Default delay between completion check retries in milliseconds
-pub const DEFAULT_COMPLETION_CHECK_DELAY_MS: u64 = 500;
+/// Default prompt for apply command - instructs agent to clean up out-of-scope tasks
+pub const DEFAULT_APPLY_PROMPT: &str =
+    "スコープ外タスクは削除せよ。ユーザを待つもしくはユーザによるタスクは削除せよ。";
 
-/// Default maximum number of retries for completion check
-pub const DEFAULT_COMPLETION_CHECK_MAX_RETRIES: u32 = 3;
+/// Default prompt for archive command - empty (no additional instructions)
+pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
 
 /// Orchestrator configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -53,6 +54,16 @@ pub struct OrchestratorConfig {
     /// Supports `{prompt}` placeholder.
     #[serde(default)]
     pub analyze_command: Option<String>,
+
+    /// System prompt for apply command.
+    /// Injected into the `{prompt}` placeholder in apply_command.
+    #[serde(default)]
+    pub apply_prompt: Option<String>,
+
+    /// System prompt for archive command.
+    /// Injected into the `{prompt}` placeholder in archive_command.
+    #[serde(default)]
+    pub archive_prompt: Option<String>,
 
     /// Hook configurations for various orchestration stages.
     /// All hooks are optional.
@@ -98,21 +109,23 @@ impl OrchestratorConfig {
             .unwrap_or(DEFAULT_ANALYZE_COMMAND)
     }
 
+    /// Get the apply prompt, falling back to default if not set
+    pub fn get_apply_prompt(&self) -> &str {
+        self.apply_prompt
+            .as_deref()
+            .unwrap_or(DEFAULT_APPLY_PROMPT)
+    }
+
+    /// Get the archive prompt, falling back to default if not set
+    pub fn get_archive_prompt(&self) -> &str {
+        self.archive_prompt
+            .as_deref()
+            .unwrap_or(DEFAULT_ARCHIVE_PROMPT)
+    }
+
     /// Get the hooks configuration, returning default (empty) if not set
     pub fn get_hooks(&self) -> HooksConfig {
         self.hooks.clone().unwrap_or_default()
-    }
-
-    /// Get the completion check delay in milliseconds
-    pub fn get_completion_check_delay_ms(&self) -> u64 {
-        self.completion_check_delay_ms
-            .unwrap_or(DEFAULT_COMPLETION_CHECK_DELAY_MS)
-    }
-
-    /// Get the maximum number of completion check retries
-    pub fn get_completion_check_max_retries(&self) -> u32 {
-        self.completion_check_max_retries
-            .unwrap_or(DEFAULT_COMPLETION_CHECK_MAX_RETRIES)
     }
 
     /// Expand `{change_id}` placeholder in a command template
@@ -528,5 +541,75 @@ mod tests {
             config.get_apply_command(),
             "project-agent apply {change_id}"
         );
+    }
+
+    #[test]
+    fn test_get_apply_prompt_default() {
+        let config = OrchestratorConfig::default();
+        assert_eq!(config.get_apply_prompt(), DEFAULT_APPLY_PROMPT);
+    }
+
+    #[test]
+    fn test_get_archive_prompt_default() {
+        let config = OrchestratorConfig::default();
+        assert_eq!(config.get_archive_prompt(), DEFAULT_ARCHIVE_PROMPT);
+    }
+
+    #[test]
+    fn test_get_prompts_with_custom_values() {
+        let config = OrchestratorConfig {
+            apply_prompt: Some("Custom apply prompt".to_string()),
+            archive_prompt: Some("Custom archive prompt".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.get_apply_prompt(), "Custom apply prompt");
+        assert_eq!(config.get_archive_prompt(), "Custom archive prompt");
+    }
+
+    #[test]
+    fn test_parse_jsonc_with_prompts() {
+        let jsonc = r#"{
+            "apply_command": "claude -p '/openspec:apply {change_id} {prompt}'",
+            "archive_command": "claude -p '/openspec:archive {change_id} {prompt}'",
+            "apply_prompt": "Test apply prompt",
+            "archive_prompt": "Test archive prompt"
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        assert_eq!(config.apply_prompt, Some("Test apply prompt".to_string()));
+        assert_eq!(
+            config.archive_prompt,
+            Some("Test archive prompt".to_string())
+        );
+        assert_eq!(config.get_apply_prompt(), "Test apply prompt");
+        assert_eq!(config.get_archive_prompt(), "Test archive prompt");
+    }
+
+    #[test]
+    fn test_expand_prompt_in_apply_command() {
+        let template = "claude -p '/openspec:apply {change_id} {prompt}'";
+        let command = OrchestratorConfig::expand_change_id(template, "fix-bug");
+        let command = OrchestratorConfig::expand_prompt(&command, "Custom instructions");
+        assert_eq!(
+            command,
+            "claude -p '/openspec:apply fix-bug Custom instructions'"
+        );
+    }
+
+    #[test]
+    fn test_expand_prompt_with_empty_string() {
+        let template = "claude -p '/openspec:archive {change_id} {prompt}'";
+        let command = OrchestratorConfig::expand_change_id(template, "add-feature");
+        let command = OrchestratorConfig::expand_prompt(&command, "");
+        assert_eq!(command, "claude -p '/openspec:archive add-feature '");
+    }
+
+    #[test]
+    fn test_backward_compatible_no_prompt_placeholder() {
+        // Commands without {prompt} placeholder should continue to work
+        let template = "claude -p '/openspec:apply {change_id}'";
+        let command = OrchestratorConfig::expand_change_id(template, "fix-bug");
+        let command = OrchestratorConfig::expand_prompt(&command, "Ignored prompt");
+        // The {prompt} replacement does nothing since placeholder doesn't exist
+        assert_eq!(command, "claude -p '/openspec:apply fix-bug'");
     }
 }

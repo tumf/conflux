@@ -1,6 +1,8 @@
 use crate::error::{OrchestratorError, Result};
 use crate::task_parser;
 use serde::Deserialize;
+use std::fs;
+use std::path::Path;
 use std::process::Command;
 use tracing::{debug, info};
 
@@ -24,7 +26,7 @@ struct OpenSpecChange {
 }
 
 /// Represents a change from openspec list
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Change {
     pub id: String,
     pub completed_tasks: u32,
@@ -99,6 +101,72 @@ pub async fn list_changes(openspec_cmd: &str) -> Result<Vec<Change>> {
         }
     }
 
+    Ok(changes)
+}
+
+/// List changes by directly reading the openspec/changes directory.
+///
+/// This is the native implementation that avoids calling the external
+/// `openspec list --json` command. It reads the directory structure and
+/// parses tasks.md files to get accurate task progress.
+pub fn list_changes_native() -> Result<Vec<Change>> {
+    let changes_dir = Path::new("openspec/changes");
+
+    if !changes_dir.exists() {
+        debug!("Changes directory does not exist: {:?}", changes_dir);
+        return Ok(Vec::new());
+    }
+
+    let entries = fs::read_dir(changes_dir).map_err(|e| {
+        OrchestratorError::ConfigLoad(format!("Failed to read changes directory: {}", e))
+    })?;
+
+    let mut changes = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            OrchestratorError::ConfigLoad(format!("Failed to read directory entry: {}", e))
+        })?;
+
+        let path = entry.path();
+
+        // Skip non-directories
+        if !path.is_dir() {
+            continue;
+        }
+
+        // Skip special directories like 'archive'
+        let dir_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+
+        if dir_name == "archive" || dir_name.starts_with('.') {
+            continue;
+        }
+
+        // Parse tasks.md for this change
+        let (completed_tasks, total_tasks) = match task_parser::parse_change(dir_name) {
+            Ok(progress) => (progress.completed, progress.total),
+            Err(_) => {
+                // If tasks.md doesn't exist or can't be parsed, use 0/0
+                debug!("Could not parse tasks for change '{}', using 0/0", dir_name);
+                (0, 0)
+            }
+        };
+
+        changes.push(Change {
+            id: dir_name.to_string(),
+            completed_tasks,
+            total_tasks,
+            last_modified: String::new(), // Not used in native implementation
+        });
+    }
+
+    // Sort by id for consistent ordering
+    changes.sort_by(|a, b| a.id.cmp(&b.id));
+
+    debug!("Found {} changes via native parsing", changes.len());
     Ok(changes)
 }
 
@@ -205,5 +273,82 @@ mod tests {
         };
         assert_eq!(change.progress_percent(), 100.0);
         assert!(change.is_complete());
+    }
+
+    // ====================
+    // list_changes_native tests
+    // ====================
+
+    // Note: These tests run in the actual project directory which has openspec/changes
+    // The function relies on relative paths, so these tests validate real behavior
+
+    #[test]
+    fn test_list_changes_native_returns_ok() {
+        // Test that the function returns Ok when run in a valid openspec project
+        // This test verifies the basic functionality works in the real project structure
+        let result = list_changes_native();
+        // The function should always return Ok (empty vec if dir doesn't exist)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_list_changes_native_excludes_archive() {
+        // The result should not include "archive" as a change ID
+        let result = list_changes_native().unwrap();
+        assert!(
+            !result.iter().any(|c| c.id == "archive"),
+            "archive directory should be excluded"
+        );
+    }
+
+    #[test]
+    fn test_list_changes_native_excludes_hidden() {
+        // The result should not include any hidden directories (starting with .)
+        let result = list_changes_native().unwrap();
+        assert!(
+            !result.iter().any(|c| c.id.starts_with('.')),
+            "hidden directories should be excluded"
+        );
+    }
+
+    #[test]
+    fn test_list_changes_native_sorted_by_id() {
+        // The result should be sorted by change ID
+        let result = list_changes_native().unwrap();
+        if result.len() > 1 {
+            let mut sorted = result.clone();
+            sorted.sort_by(|a, b| a.id.cmp(&b.id));
+            assert_eq!(result, sorted, "changes should be sorted by ID");
+        }
+    }
+
+    #[test]
+    fn test_list_changes_native_parses_task_counts() {
+        // If there are any changes, verify they have valid task counts
+        let result = list_changes_native().unwrap();
+        for change in &result {
+            // completed_tasks should never exceed total_tasks
+            assert!(
+                change.completed_tasks <= change.total_tasks,
+                "completed_tasks ({}) should not exceed total_tasks ({}) for change '{}'",
+                change.completed_tasks,
+                change.total_tasks,
+                change.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_list_changes_native_integration() {
+        // Integration test: verify the function works with the actual project structure
+        // This test runs in the project root where openspec/changes exists
+        let result = list_changes_native();
+        assert!(result.is_ok(), "list_changes_native should succeed");
+
+        let changes = result.unwrap();
+        // Verify each change has a non-empty ID
+        for change in &changes {
+            assert!(!change.id.is_empty(), "change ID should not be empty");
+        }
     }
 }
