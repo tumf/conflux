@@ -32,6 +32,15 @@ pub enum OrchestratorError {
 
     #[error("Config parse error: {0}")]
     ConfigParse(String),
+
+    #[error("Hook execution failed ({hook_type}): {message}")]
+    HookFailed { hook_type: String, message: String },
+
+    #[error("Hook timed out ({hook_type}): exceeded {timeout_secs}s")]
+    HookTimeout {
+        hook_type: String,
+        timeout_secs: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;

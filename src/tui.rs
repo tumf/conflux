@@ -747,11 +747,29 @@ async fn run_orchestrator(
     cancel_token: CancellationToken,
 ) -> Result<()> {
     use crate::agent::OutputLine;
+    use crate::hooks::{HookContext, HookRunner, HookType};
     use crate::openspec;
 
+    let hooks = HookRunner::new(config.get_hooks());
     let agent = AgentRunner::new(config);
 
+    let total_changes = change_ids.len();
+    let mut iteration: u32 = 0;
+    let mut first_apply_executed = false;
+
+    // Run on_start hook
+    let start_context = HookContext::new(0, total_changes, total_changes, false);
+    if let Err(e) = hooks.run_hook(HookType::OnStart, &start_context).await {
+        let _ = tx
+            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                "on_start hook failed: {}",
+                e
+            ))))
+            .await;
+    }
+
     for change_id in change_ids {
+        iteration += 1;
         // Check for cancellation before starting each change
         if cancel_token.is_cancelled() {
             let _ = tx
@@ -771,8 +789,48 @@ async fn run_orchestrator(
         let changes = openspec::list_changes(&openspec_cmd).await?;
         let change = changes.iter().find(|c| c.id == change_id);
 
+        let queue_size = total_changes - iteration as usize + 1;
+
         if let Some(change) = change {
             if change.is_complete() {
+                // Run on_change_complete hook
+                let complete_context =
+                    HookContext::new(iteration, total_changes, queue_size, false).with_change(
+                        &change_id,
+                        change.completed_tasks,
+                        change.total_tasks,
+                    );
+                if let Err(e) = hooks
+                    .run_hook(HookType::OnChangeComplete, &complete_context)
+                    .await
+                {
+                    let _ = tx
+                        .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                            "on_change_complete hook failed: {}",
+                            e
+                        ))))
+                        .await;
+                }
+
+                // Run pre_archive hook
+                let pre_archive_context =
+                    HookContext::new(iteration, total_changes, queue_size, false).with_change(
+                        &change_id,
+                        change.completed_tasks,
+                        change.total_tasks,
+                    );
+                if let Err(e) = hooks
+                    .run_hook(HookType::PreArchive, &pre_archive_context)
+                    .await
+                {
+                    let _ = tx
+                        .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                            "pre_archive hook failed: {}",
+                            e
+                        ))))
+                        .await;
+                }
+
                 // Archive the change
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::info(format!(
@@ -820,18 +878,82 @@ async fn run_orchestrator(
                 })?;
 
                 if status.success() {
+                    // Run post_archive hook
+                    let post_archive_context =
+                        HookContext::new(iteration, total_changes, queue_size - 1, false)
+                            .with_change(&change_id, change.completed_tasks, change.total_tasks);
+                    if let Err(e) = hooks
+                        .run_hook(HookType::PostArchive, &post_archive_context)
+                        .await
+                    {
+                        let _ = tx
+                            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                                "post_archive hook failed: {}",
+                                e
+                            ))))
+                            .await;
+                    }
+
                     let _ = tx
                         .send(OrchestratorEvent::ChangeArchived(change_id.clone()))
                         .await;
                 } else {
+                    // Run on_error hook
+                    let error_msg = format!("Archive failed with exit code: {:?}", status.code());
+                    let error_context =
+                        HookContext::new(iteration, total_changes, queue_size, false)
+                            .with_change(&change_id, change.completed_tasks, change.total_tasks)
+                            .with_error(&error_msg);
+                    let _ = hooks.run_hook(HookType::OnError, &error_context).await;
+
                     let _ = tx
                         .send(OrchestratorEvent::ProcessingError {
                             id: change_id.clone(),
-                            error: format!("Archive failed with exit code: {:?}", status.code()),
+                            error: error_msg,
                         })
                         .await;
                 }
             } else {
+                // Run on_first_apply hook (once)
+                if !first_apply_executed {
+                    let first_apply_context =
+                        HookContext::new(iteration, total_changes, queue_size, false).with_change(
+                            &change_id,
+                            change.completed_tasks,
+                            change.total_tasks,
+                        );
+                    if let Err(e) = hooks
+                        .run_hook(HookType::OnFirstApply, &first_apply_context)
+                        .await
+                    {
+                        let _ = tx
+                            .send(OrchestratorEvent::ProcessingError {
+                                id: change_id.clone(),
+                                error: format!("on_first_apply hook failed: {}", e),
+                            })
+                            .await;
+                        break;
+                    }
+                    first_apply_executed = true;
+                }
+
+                // Run pre_apply hook
+                let pre_apply_context =
+                    HookContext::new(iteration, total_changes, queue_size, false).with_change(
+                        &change_id,
+                        change.completed_tasks,
+                        change.total_tasks,
+                    );
+                if let Err(e) = hooks.run_hook(HookType::PreApply, &pre_apply_context).await {
+                    let _ = tx
+                        .send(OrchestratorEvent::ProcessingError {
+                            id: change_id.clone(),
+                            error: format!("pre_apply hook failed: {}", e),
+                        })
+                        .await;
+                    break;
+                }
+
                 // Apply the change
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::info(format!(
@@ -879,6 +1001,26 @@ async fn run_orchestrator(
                 })?;
 
                 if status.success() {
+                    // Run post_apply hook
+                    let post_apply_context =
+                        HookContext::new(iteration, total_changes, queue_size, false).with_change(
+                            &change_id,
+                            change.completed_tasks,
+                            change.total_tasks,
+                        );
+                    if let Err(e) = hooks
+                        .run_hook(HookType::PostApply, &post_apply_context)
+                        .await
+                    {
+                        let _ = tx
+                            .send(OrchestratorEvent::ProcessingError {
+                                id: change_id.clone(),
+                                error: format!("post_apply hook failed: {}", e),
+                            })
+                            .await;
+                        break;
+                    }
+
                     let _ = tx
                         .send(OrchestratorEvent::ProcessingCompleted(change_id.clone()))
                         .await;
@@ -887,6 +1029,48 @@ async fn run_orchestrator(
                     let changes_after = openspec::list_changes(&openspec_cmd).await?;
                     if let Some(updated_change) = changes_after.iter().find(|c| c.id == change_id) {
                         if updated_change.is_complete() {
+                            // Run on_change_complete hook
+                            let complete_context =
+                                HookContext::new(iteration, total_changes, queue_size, false)
+                                    .with_change(
+                                        &change_id,
+                                        updated_change.completed_tasks,
+                                        updated_change.total_tasks,
+                                    );
+                            if let Err(e) = hooks
+                                .run_hook(HookType::OnChangeComplete, &complete_context)
+                                .await
+                            {
+                                let _ = tx
+                                    .send(OrchestratorEvent::ProcessingError {
+                                        id: change_id.clone(),
+                                        error: format!("on_change_complete hook failed: {}", e),
+                                    })
+                                    .await;
+                                break;
+                            }
+
+                            // Run pre_archive hook
+                            let pre_archive_context =
+                                HookContext::new(iteration, total_changes, queue_size, false)
+                                    .with_change(
+                                        &change_id,
+                                        updated_change.completed_tasks,
+                                        updated_change.total_tasks,
+                                    );
+                            if let Err(e) = hooks
+                                .run_hook(HookType::PreArchive, &pre_archive_context)
+                                .await
+                            {
+                                let _ = tx
+                                    .send(OrchestratorEvent::ProcessingError {
+                                        id: change_id.clone(),
+                                        error: format!("pre_archive hook failed: {}", e),
+                                    })
+                                    .await;
+                                break;
+                            }
+
                             // Archive the now-complete change
                             let _ = tx
                                 .send(OrchestratorEvent::Log(LogEntry::info(format!(
@@ -949,10 +1133,19 @@ async fn run_orchestrator(
                         }
                     }
                 } else {
+                    let error_msg = format!("Apply failed with exit code: {:?}", status.code());
+
+                    // Run on_error hook
+                    let error_context =
+                        HookContext::new(iteration, total_changes, queue_size, false)
+                            .with_change(&change_id, change.completed_tasks, change.total_tasks)
+                            .with_error(&error_msg);
+                    let _ = hooks.run_hook(HookType::OnError, &error_context).await;
+
                     let _ = tx
                         .send(OrchestratorEvent::ProcessingError {
                             id: change_id.clone(),
-                            error: format!("Apply failed with exit code: {:?}", status.code()),
+                            error: error_msg,
                         })
                         .await;
                 }

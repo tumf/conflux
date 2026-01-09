@@ -15,23 +15,19 @@
   // Apply command template
   // Executed when applying a change (implementing tasks)
   // Placeholder: {change_id} - replaced with the change ID at runtime
-  // Uses the /openspec:apply slash command defined in .claude/commands/openspec/apply.md
-  // Note: Environment variables are now automatically inherited from the orchestrator process
-  // Note: --print flag is used for non-interactive execution
-  "apply_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions --print /openspec:apply {change_id}",
+  // Note: Claude Code cannot be run as a separate process due to authentication limitations
+  // Using opencode instead for reliable orchestration
+  "apply_command": "opencode run '/openspec-apply {change_id}'",
 
   // Archive command template
   // Executed when archiving a completed change
   // Placeholder: {change_id} - replaced with the change ID at runtime
-  // Uses the /openspec:archive slash command defined in .claude/commands/openspec/archive.md
-  "archive_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions --print /openspec:archive {change_id}",
+  "archive_command": "opencode run '/openspec-archive {change_id}'",
 
   // Analyze command template
   // Executed for dependency analysis using LLM
   // Placeholder: {prompt} - replaced with the analysis prompt at runtime
-  // Claude Code doesn't have a direct --format json option, so we wrap the prompt
-  // to request JSON output explicitly
-  "analyze_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions --print '{prompt} (Please respond with ONLY the change ID, no explanation)'",
+  "analyze_command": "opencode run --format json '{prompt}'",
 
   // Hooks configuration
   // Run commands at various stages of orchestration

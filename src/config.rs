@@ -7,6 +7,7 @@
 //! 3. Default values (OpenCode-based commands)
 
 use crate::error::{OrchestratorError, Result};
+use crate::hooks::HooksConfig;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -46,6 +47,11 @@ pub struct OrchestratorConfig {
     /// Supports `{prompt}` placeholder.
     #[serde(default)]
     pub analyze_command: Option<String>,
+
+    /// Hook configurations for various orchestration stages.
+    /// All hooks are optional.
+    #[serde(default)]
+    pub hooks: Option<HooksConfig>,
 }
 
 impl OrchestratorConfig {
@@ -74,6 +80,11 @@ impl OrchestratorConfig {
         self.analyze_command
             .as_deref()
             .unwrap_or(DEFAULT_ANALYZE_COMMAND)
+    }
+
+    /// Get the hooks configuration, returning default (empty) if not set
+    pub fn get_hooks(&self) -> HooksConfig {
+        self.hooks.clone().unwrap_or_default()
     }
 
     /// Expand `{change_id}` placeholder in a command template
@@ -264,6 +275,7 @@ mod tests {
             apply_command: Some("custom apply {change_id}".to_string()),
             archive_command: Some("custom archive {change_id}".to_string()),
             analyze_command: Some("custom analyze '{prompt}'".to_string()),
+            hooks: None,
         };
         assert_eq!(config.get_apply_command(), "custom apply {change_id}");
         assert_eq!(config.get_archive_command(), "custom archive {change_id}");

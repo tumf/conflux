@@ -2,6 +2,7 @@ mod agent;
 mod cli;
 mod config;
 mod error;
+mod hooks;
 mod opencode;
 mod openspec;
 mod orchestrator;
