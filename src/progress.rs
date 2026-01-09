@@ -92,6 +92,15 @@ impl ProgressDisplay {
 mod tests {
     use super::*;
 
+    fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
+        Change {
+            id: id.to_string(),
+            completed_tasks: completed,
+            total_tasks: total,
+            last_modified: "now".to_string(),
+        }
+    }
+
     #[test]
     fn test_progress_display_creation() {
         let _display = ProgressDisplay::new(5);
@@ -101,13 +110,91 @@ mod tests {
     #[test]
     fn test_progress_update() {
         let mut display = ProgressDisplay::new(3);
-        let change = Change {
-            id: "test-change".to_string(),
-            completed_tasks: 2,
-            total_tasks: 5,
-            last_modified: "now".to_string(),
-        };
+        let change = create_test_change("test-change", 2, 5);
         display.update_change(&change);
         // Just test that it doesn't panic
+    }
+
+    #[test]
+    fn test_progress_complete_change() {
+        let mut display = ProgressDisplay::new(3);
+        let change = create_test_change("test-change", 5, 5);
+        display.update_change(&change);
+        display.complete_change("test-change");
+        // Just test that it doesn't panic
+    }
+
+    #[test]
+    fn test_progress_archive_change() {
+        let mut display = ProgressDisplay::new(3);
+        let change = create_test_change("test-change", 5, 5);
+        display.update_change(&change);
+        display.archive_change("test-change");
+        // Just test that it doesn't panic
+    }
+
+    #[test]
+    fn test_progress_error() {
+        let mut display = ProgressDisplay::new(3);
+        let change = create_test_change("test-change", 2, 5);
+        display.update_change(&change);
+        display.error("Something went wrong");
+        // Just test that it doesn't panic
+    }
+
+    #[test]
+    fn test_progress_complete_all() {
+        let mut display = ProgressDisplay::new(3);
+        let change = create_test_change("test-change", 2, 5);
+        display.update_change(&change);
+        display.complete_all();
+        // Just test that it doesn't panic
+    }
+
+    #[test]
+    fn test_progress_set_message() {
+        let display = ProgressDisplay::new(3);
+        display.set_message("Processing changes...");
+        // Just test that it doesn't panic
+    }
+
+    #[test]
+    fn test_progress_multiple_updates() {
+        let mut display = ProgressDisplay::new(3);
+
+        // Update with first change
+        let change1 = create_test_change("change-1", 1, 3);
+        display.update_change(&change1);
+
+        // Update with second change (should replace first)
+        let change2 = create_test_change("change-2", 2, 4);
+        display.update_change(&change2);
+
+        display.complete_change("change-2");
+        // Just test that it doesn't panic
+    }
+
+    #[test]
+    fn test_progress_complete_without_current() {
+        let mut display = ProgressDisplay::new(3);
+        // Complete without setting current change
+        display.complete_change("nonexistent");
+        // Should not panic
+    }
+
+    #[test]
+    fn test_progress_archive_without_current() {
+        let mut display = ProgressDisplay::new(3);
+        // Archive without setting current change
+        display.archive_change("nonexistent");
+        // Should not panic
+    }
+
+    #[test]
+    fn test_progress_error_without_current() {
+        let mut display = ProgressDisplay::new(3);
+        // Error without setting current change
+        display.error("Error message");
+        // Should not panic
     }
 }

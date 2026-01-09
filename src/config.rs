@@ -424,4 +424,84 @@ mod tests {
         assert_eq!(config.get_archive_command(), DEFAULT_ARCHIVE_COMMAND);
         assert_eq!(config.get_analyze_command(), DEFAULT_ANALYZE_COMMAND);
     }
+
+    #[test]
+    fn test_load_from_custom_path() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        // Create a temporary config file
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(
+            temp_file,
+            r#"{{"apply_command": "custom-agent apply {{change_id}}"}}"#
+        )
+        .unwrap();
+
+        // Load from custom path
+        let config = OrchestratorConfig::load(Some(temp_file.path())).unwrap();
+
+        assert_eq!(
+            config.get_apply_command(),
+            "custom-agent apply {change_id}"
+        );
+    }
+
+    #[test]
+    fn test_load_returns_default_when_no_config_exists() {
+        use tempfile::TempDir;
+        use std::env;
+
+        // Create a temporary directory with no config files
+        let temp_dir = TempDir::new().unwrap();
+
+        // Save current directory and change to temp dir
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(temp_dir.path()).unwrap();
+
+        // Load config (should return defaults since no config file exists)
+        let config = OrchestratorConfig::load(None).unwrap();
+
+        // Restore original directory
+        env::set_current_dir(original_dir).unwrap();
+
+        // Should use default values
+        assert_eq!(config.get_apply_command(), DEFAULT_APPLY_COMMAND);
+        assert_eq!(config.get_archive_command(), DEFAULT_ARCHIVE_COMMAND);
+        assert_eq!(config.get_analyze_command(), DEFAULT_ANALYZE_COMMAND);
+    }
+
+    #[test]
+    fn test_load_project_config_takes_priority() {
+        use tempfile::TempDir;
+        use std::env;
+        use std::fs;
+
+        // Create a temporary directory
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create project config file
+        let project_config_path = temp_dir.path().join(PROJECT_CONFIG_FILE);
+        fs::write(
+            &project_config_path,
+            r#"{"apply_command": "project-agent apply {change_id}"}"#,
+        )
+        .unwrap();
+
+        // Save current directory and change to temp dir
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(temp_dir.path()).unwrap();
+
+        // Load config (should use project config)
+        let config = OrchestratorConfig::load(None).unwrap();
+
+        // Restore original directory
+        env::set_current_dir(original_dir).unwrap();
+
+        // Project config should be used
+        assert_eq!(
+            config.get_apply_command(),
+            "project-agent apply {change_id}"
+        );
+    }
 }

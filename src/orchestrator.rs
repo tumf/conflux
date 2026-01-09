@@ -594,4 +594,79 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].completed_tasks, 4); // Progress should be updated
     }
+
+    #[test]
+    fn test_build_analysis_prompt_format() {
+        let config = OrchestratorConfig::default();
+        let orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
+
+        let changes = vec![
+            create_test_change("add-feature", 2, 5),
+            create_test_change("fix-bug", 4, 4),
+        ];
+
+        let prompt = orchestrator.build_analysis_prompt(&changes);
+
+        // Verify prompt contains change IDs
+        assert!(prompt.contains("add-feature"));
+        assert!(prompt.contains("fix-bug"));
+
+        // Verify prompt contains progress info
+        assert!(prompt.contains("2/5 tasks"));
+        assert!(prompt.contains("40.0%"));
+        assert!(prompt.contains("4/4 tasks"));
+        assert!(prompt.contains("100.0%"));
+
+        // Verify prompt contains instruction header
+        assert!(prompt.contains("変更一覧"));
+        assert!(prompt.contains("選択基準"));
+    }
+
+    #[test]
+    fn test_build_analysis_prompt_with_empty_changes() {
+        let config = OrchestratorConfig::default();
+        let orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
+
+        let changes: Vec<Change> = vec![];
+        let prompt = orchestrator.build_analysis_prompt(&changes);
+
+        // Prompt should still have structure even with no changes
+        assert!(prompt.contains("変更一覧"));
+        assert!(prompt.contains("選択基準"));
+    }
+
+    #[test]
+    fn test_build_analysis_prompt_with_single_change() {
+        let config = OrchestratorConfig::default();
+        let orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
+
+        let changes = vec![create_test_change("only-change", 1, 3)];
+        let prompt = orchestrator.build_analysis_prompt(&changes);
+
+        assert!(prompt.contains("only-change"));
+        assert!(prompt.contains("1/3 tasks"));
+        assert!(prompt.contains("33.3%"));
+    }
+
+    #[test]
+    fn test_orchestrator_creation() {
+        let config = OrchestratorConfig::default();
+        let orchestrator = Orchestrator::with_config("test_openspec", None, config).unwrap();
+
+        assert_eq!(orchestrator.openspec_cmd, "test_openspec");
+        assert!(orchestrator.target_change.is_none());
+        assert!(orchestrator.initial_change_ids.is_none());
+        assert!(!orchestrator.first_apply_executed);
+        assert_eq!(orchestrator.iteration, 0);
+    }
+
+    #[test]
+    fn test_orchestrator_with_target_change() {
+        let config = OrchestratorConfig::default();
+        let orchestrator =
+            Orchestrator::with_config("test_openspec", Some("my-change".to_string()), config)
+                .unwrap();
+
+        assert_eq!(orchestrator.target_change, Some("my-change".to_string()));
+    }
 }

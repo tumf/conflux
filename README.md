@@ -386,6 +386,25 @@ openspec-orchestrator run
 cargo test
 ```
 
+### Run tests with coverage
+
+```bash
+# Install cargo-llvm-cov if not present
+cargo install cargo-llvm-cov
+
+# Run tests with coverage summary
+cargo llvm-cov --all-features
+
+# Generate detailed HTML report (opens in browser)
+cargo llvm-cov --all-features --html --open
+
+# Generate JSON report for CI/CD
+cargo llvm-cov --all-features --json --output-path coverage.json
+
+# Show coverage for specific module
+cargo llvm-cov --all-features -- --test-threads=1 2>&1 | grep -A 5 "src/config.rs"
+```
+
 ### Run with logging
 
 ```bash

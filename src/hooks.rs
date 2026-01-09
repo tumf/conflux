@@ -458,7 +458,11 @@ impl HookRunner {
             cmd.env(key, value);
         }
 
-        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        // Disable terminal output to prevent hooks from corrupting TUI
+        // Hooks run in background and should not output to terminal
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
 
         let child = cmd.spawn().map_err(|e| OrchestratorError::HookFailed {
             hook_type: hook_type.to_string(),

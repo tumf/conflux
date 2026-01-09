@@ -616,6 +616,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "indicatif",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

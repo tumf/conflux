@@ -30,6 +30,11 @@ impl AgentRunner {
         Self { config }
     }
 
+    /// Get the archive command template (for debugging)
+    pub fn get_archive_command(&self) -> &str {
+        self.config.get_archive_command()
+    }
+
     /// Run apply command for the given change ID with output streaming
     /// Returns a child process handle and a receiver for output lines
     pub async fn run_apply_streaming(
@@ -104,6 +109,17 @@ impl AgentRunner {
                 .arg(command)
                 .env_clear()
                 .envs(std::env::vars())
+                // Disable terminal-related environment variables
+                .env("NO_COLOR", "1")
+                .env("CLICOLOR", "0")
+                .env("CLICOLOR_FORCE", "0")
+                .env("CI", "true")
+                // Disable pagers
+                .env("PAGER", "type")
+                .env("GIT_PAGER", "type")
+                .env("LESS", "")
+                .env("MORE", "")
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -111,17 +127,69 @@ impl AgentRunner {
                     OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
                 })?
         } else {
-            // Use interactive shell to ensure .zshrc/.bashrc are loaded
+            // Use non-interactive shell for automation
+            // Note: .zshrc/.bashrc are not loaded, use .zshenv/.profile for PATH setup
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            Command::new(&shell)
-                .arg("-i")
-                .arg("-c")
+            let mut cmd = Command::new(&shell);
+            cmd.arg("-c")
                 .arg(command)
                 .env_clear()
                 .envs(std::env::vars())
+                // Disable terminal-related environment variables
+                .env("TERM", "dumb")
+                .env("NO_COLOR", "1")
+                .env("CLICOLOR", "0")
+                .env("CLICOLOR_FORCE", "0")
+                // Disable interactive features
+                .env("CI", "true")
+                .env("CONTINUOUS_INTEGRATION", "true")
+                .env("NON_INTERACTIVE", "1")
+                // Disable pagers completely
+                .env("PAGER", "cat")
+                .env("GIT_PAGER", "cat")
+                .env("LESS", "-FX")  // -F: quit if one screen, -X: no init
+                .env("MORE", "-E")   // -E: quit at EOF
+                // Prevent any pager from being used
+                .env("MANPAGER", "cat")
+                .env("SYSTEMD_PAGER", "cat")
+                // Disable git interactive features
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
+                .stderr(Stdio::piped());
+            
+            #[cfg(unix)]
+            {
+                // Detach from controlling terminal completely
+                unsafe {
+                    #[allow(unused_imports)]
+                    use std::os::unix::process::CommandExt;
+                    cmd.pre_exec(|| {
+                        use std::os::unix::io::RawFd;
+                        
+                        // Create a new session - this detaches from the controlling terminal
+                        if libc::setsid() == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        
+                        // Close /dev/tty to prevent any direct terminal access
+                        // Open /dev/null and redirect any attempts to access /dev/tty
+                        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+                        if devnull != -1 {
+                            // Try to open /dev/tty and close it if successful
+                            let tty_fd: RawFd = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR);
+                            if tty_fd != -1 {
+                                libc::close(tty_fd);
+                            }
+                            libc::close(devnull);
+                        }
+                        
+                        Ok(())
+                    });
+                }
+            }
+            
+            cmd.spawn()
                 .map_err(|e| {
                     OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
                 })?

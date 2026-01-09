@@ -1,31 +1,33 @@
 {
   // OpenSpec Orchestrator Configuration for Claude Code
-  // This configuration uses Claude Code CLI for task execution.
+  // This configuration uses Claude Code instead of opencode for task execution.
   //
   // Configuration file locations (in order of priority):
   // 1. .openspec-orchestrator.jsonc (project root) ← THIS FILE
   // 2. ~/.config/openspec-orchestrator/config.jsonc (global)
   //
-  // Note: Using ~/.local/bin/claude with --print and --dangerously-skip-permissions flags
-  // - --print (-p): Non-interactive mode - print response and exit (useful for automation)
-  // - --dangerously-skip-permissions: Skip permission checks and workspace trust dialog
-  // - --output-format: Control output format (text/json/stream-json)
-  // - Adjust the path based on your Claude Code installation
+  // Note: Adjust the claude command path based on your installation:
+  // - macOS: /Applications/Claude.app/Contents/MacOS/claude
+  // - Linux: claude (if in PATH)
+  // - Custom: /path/to/your/claude
+  // Current: Using ~/.local/bin/claude to avoid Node version conflicts
 
   // Apply command template
   // Executed when applying a change (implementing tasks)
   // Placeholder: {change_id} - replaced with the change ID at runtime
-  "apply_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions -p '/openspec:apply {change_id}'",
+  // Note: Claude Code cannot be run as a separate process due to authentication limitations
+  // Using opencode instead for reliable orchestration
+  "apply_command": "opencode run '/openspec-apply {change_id}'",
 
   // Archive command template
   // Executed when archiving a completed change
   // Placeholder: {change_id} - replaced with the change ID at runtime
-  "archive_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions -p '/openspec:archive {change_id}'",
+  "archive_command": "opencode run '/openspec-archive {change_id}'",
 
   // Analyze command template
   // Executed for dependency analysis using LLM
   // Placeholder: {prompt} - replaced with the analysis prompt at runtime
-  "analyze_command": "/Users/tumf/.local/bin/claude --print --dangerously-skip-permissions --output-format json '{prompt}'",
+  "analyze_command": "opencode run --format json '{prompt}'",
 
   // Hooks configuration
   // Run commands at various stages of orchestration

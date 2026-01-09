@@ -11,7 +11,11 @@ use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::openspec::Change;
 use chrono::Local;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{Clear, ClearType},
+};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -556,6 +560,15 @@ impl AppState {
     }
 }
 
+/// Clear the terminal screen
+fn clear_screen() -> Result<()> {
+    use std::io::stdout;
+    
+    execute!(stdout(), Clear(ClearType::All))?;
+    
+    Ok(())
+}
+
 /// Run the TUI application
 pub async fn run_tui(
     initial_changes: Vec<Change>,
@@ -567,6 +580,8 @@ pub async fn run_tui(
 
     let result = run_tui_loop(&mut terminal, initial_changes, openspec_cmd, config).await;
 
+    // Clear screen before restoring terminal
+    clear_screen()?;
     ratatui::restore();
 
     result
@@ -836,6 +851,15 @@ async fn run_orchestrator(
                     .send(OrchestratorEvent::Log(LogEntry::info(format!(
                         "Archiving: {}",
                         change_id
+                    ))))
+                    .await;
+
+                // Debug: Log the archive command
+                let archive_cmd = agent.get_archive_command().to_string();
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                        "Archive command: {}",
+                        archive_cmd
                     ))))
                     .await;
 
@@ -1868,5 +1892,95 @@ mod tests {
             .logs
             .iter()
             .any(|log| log.message.contains("error-change")));
+    }
+
+    #[test]
+    fn test_should_refresh_after_interval() {
+        use std::time::Duration;
+
+        let changes = vec![create_test_change("test", 1, 2)];
+        let mut app = AppState::new(changes);
+
+        // Initially should not need refresh (just created)
+        assert!(!app.should_refresh());
+
+        // Manually set last_refresh to simulate elapsed time
+        app.last_refresh = std::time::Instant::now() - Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS + 1);
+
+        // Now should need refresh
+        assert!(app.should_refresh());
+    }
+
+    #[test]
+    fn test_new_badge_state_tracking() {
+        let changes = vec![
+            create_test_change("existing", 1, 2),
+            create_test_change("new-change", 0, 3),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Set up known changes
+        app.known_change_ids.insert("existing".to_string());
+
+        // Mark new-change as new
+        app.changes[1].is_new = true;
+
+        // Verify is_new state
+        assert!(!app.changes[0].is_new);
+        assert!(app.changes[1].is_new);
+    }
+
+    #[test]
+    fn test_update_changes_marks_new_changes_correctly() {
+        let initial_changes = vec![create_test_change("existing", 1, 2)];
+        let mut app = AppState::new(initial_changes);
+
+        // Simulate discovering new change
+        let updated_changes = vec![
+            create_test_change("existing", 1, 2),
+            create_test_change("brand-new", 0, 3),
+        ];
+
+        app.update_changes(updated_changes);
+
+        // Find the new change
+        let brand_new = app.changes.iter().find(|c| c.id == "brand-new");
+        assert!(brand_new.is_some());
+        assert!(brand_new.unwrap().is_new);
+
+        // Existing should not be marked as new
+        let existing = app.changes.iter().find(|c| c.id == "existing");
+        assert!(existing.is_some());
+        assert!(!existing.unwrap().is_new);
+    }
+
+    #[test]
+    fn test_new_change_count_tracking() {
+        let initial_changes = vec![create_test_change("existing", 1, 2)];
+        let mut app = AppState::new(initial_changes);
+
+        // Initially no new changes
+        assert_eq!(app.new_change_count, 0);
+
+        // Add new changes
+        let updated_changes = vec![
+            create_test_change("existing", 1, 2),
+            create_test_change("new1", 0, 1),
+            create_test_change("new2", 0, 2),
+        ];
+
+        app.update_changes(updated_changes);
+
+        // Should have 2 new changes
+        assert_eq!(app.new_change_count, 2);
+    }
+
+    #[test]
+    fn test_change_state_is_new_default_false() {
+        let change = create_test_change("test", 1, 2);
+        // By default, changes created via from_change should not be new
+        // since selected=true implies initial state
+        let state = ChangeState::from_change(&change, true);
+        assert!(!state.is_new);
     }
 }
