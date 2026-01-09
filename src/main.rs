@@ -55,8 +55,7 @@ async fn main() -> Result<()> {
             tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
             info!("Starting orchestrator");
-            let mut orchestrator =
-                Orchestrator::new(&args.openspec_cmd, args.change, args.config)?;
+            let mut orchestrator = Orchestrator::new(&args.openspec_cmd, args.change, args.config)?;
             orchestrator.run().await?;
         }
     }

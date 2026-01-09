@@ -1,3 +1,10 @@
+//! OpenCode runner module (legacy - use agent.rs instead)
+//!
+//! This module is kept for backwards compatibility but is not actively used.
+//! The AgentRunner in agent.rs provides the same functionality with configurable commands.
+
+#![allow(dead_code)]
+
 use crate::error::{OrchestratorError, Result};
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};

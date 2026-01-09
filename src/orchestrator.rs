@@ -348,8 +348,7 @@ mod tests {
     fn test_filter_to_snapshot_filters_new_changes() {
         // Create orchestrator with mock config (won't be used in this test)
         let config = OrchestratorConfig::default();
-        let mut orchestrator =
-            Orchestrator::with_config("mock_openspec", None, config).unwrap();
+        let mut orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
 
         // Set up snapshot with only change-a and change-b
         let snapshot: HashSet<String> = ["change-a", "change-b"]
@@ -394,8 +393,7 @@ mod tests {
     #[test]
     fn test_filter_to_snapshot_removes_archived_changes() {
         let config = OrchestratorConfig::default();
-        let mut orchestrator =
-            Orchestrator::with_config("mock_openspec", None, config).unwrap();
+        let mut orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
 
         // Set up snapshot with change-a, change-b, change-c
         let snapshot: HashSet<String> = ["change-a", "change-b", "change-c"]
@@ -420,8 +418,7 @@ mod tests {
     #[test]
     fn test_filter_to_snapshot_handles_empty_changes() {
         let config = OrchestratorConfig::default();
-        let mut orchestrator =
-            Orchestrator::with_config("mock_openspec", None, config).unwrap();
+        let mut orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
 
         let snapshot: HashSet<String> = ["change-a"].iter().map(|s| s.to_string()).collect();
         orchestrator.set_initial_change_ids(snapshot);
@@ -436,8 +433,7 @@ mod tests {
     #[test]
     fn test_snapshot_preserves_updated_progress() {
         let config = OrchestratorConfig::default();
-        let mut orchestrator =
-            Orchestrator::with_config("mock_openspec", None, config).unwrap();
+        let mut orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
 
         // Set up snapshot with change-a
         let snapshot: HashSet<String> = ["change-a"].iter().map(|s| s.to_string()).collect();

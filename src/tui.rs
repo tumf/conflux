@@ -39,6 +39,8 @@ pub enum AppMode {
     Running,
     /// Completed mode - all processing finished
     Completed,
+    /// Error mode - an error occurred during processing
+    Error,
 }
 
 /// Queue status for a change
@@ -198,6 +200,8 @@ pub enum TuiCommand {
     StartProcessing(Vec<String>),
     /// Add a change to the queue dynamically
     AddToQueue(String),
+    /// Remove a change from the queue dynamically
+    RemoveFromQueue(String),
     /// Stop processing (graceful shutdown)
     #[allow(dead_code)]
     Stop,
@@ -241,6 +245,8 @@ pub struct AppState {
     pub list_state: ListState,
     /// ID of the currently processing change
     pub current_change: Option<String>,
+    /// ID of the change that caused the error (for display in Error mode)
+    pub error_change_id: Option<String>,
     /// Log entries
     pub logs: Vec<LogEntry>,
     /// Last auto-refresh timestamp
@@ -275,6 +281,7 @@ impl AppState {
             cursor_index: 0,
             list_state,
             current_change: None,
+            error_change_id: None,
             logs: Vec::new(),
             last_refresh: Instant::now(),
             new_change_count: 0,
@@ -325,18 +332,28 @@ impl AppState {
                 None
             }
             AppMode::Running => {
-                // Can only add not-queued changes to the queue
-                if change.queue_status == QueueStatus::NotQueued {
-                    change.queue_status = QueueStatus::Queued;
-                    change.selected = true;
-                    let id = change.id.clone();
-                    self.add_log(LogEntry::info(format!("Added to queue: {}", id)));
-                    Some(TuiCommand::AddToQueue(id))
-                } else {
-                    None
+                match &change.queue_status {
+                    QueueStatus::NotQueued => {
+                        // Add to queue
+                        change.queue_status = QueueStatus::Queued;
+                        change.selected = true;
+                        let id = change.id.clone();
+                        self.add_log(LogEntry::info(format!("Added to queue: {}", id)));
+                        Some(TuiCommand::AddToQueue(id))
+                    }
+                    QueueStatus::Queued => {
+                        // Remove from queue
+                        change.queue_status = QueueStatus::NotQueued;
+                        change.selected = false;
+                        let id = change.id.clone();
+                        self.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
+                        Some(TuiCommand::RemoveFromQueue(id))
+                    }
+                    // Processing, Completed, Archived, Error - cannot change status
+                    _ => None,
                 }
             }
-            AppMode::Completed => None,
+            AppMode::Completed | AppMode::Error => None,
         }
     }
 
@@ -377,6 +394,45 @@ impl AppState {
     /// Get the number of selected changes
     pub fn selected_count(&self) -> usize {
         self.changes.iter().filter(|c| c.selected).count()
+    }
+
+    /// Retry error changes - resets error changes to queued and returns their IDs
+    /// Returns None if not in Error mode or no error changes found
+    pub fn retry_error_changes(&mut self) -> Option<TuiCommand> {
+        if self.mode != AppMode::Error {
+            return None;
+        }
+
+        // Collect error change IDs
+        let error_ids: Vec<String> = self
+            .changes
+            .iter()
+            .filter(|c| matches!(c.queue_status, QueueStatus::Error(_)))
+            .map(|c| c.id.clone())
+            .collect();
+
+        if error_ids.is_empty() {
+            return None;
+        }
+
+        // Reset error changes to queued
+        for change in &mut self.changes {
+            if matches!(change.queue_status, QueueStatus::Error(_)) {
+                change.queue_status = QueueStatus::Queued;
+                change.selected = true;
+            }
+        }
+
+        // Add retry log messages
+        for id in &error_ids {
+            self.add_log(LogEntry::info(format!("Retrying: {}", id)));
+        }
+
+        // Reset error state and transition to Running
+        self.mode = AppMode::Running;
+        self.error_change_id = None;
+
+        Some(TuiCommand::StartProcessing(error_ids))
     }
 
     /// Add a log entry
@@ -424,6 +480,10 @@ impl AppState {
                     change.queue_status = QueueStatus::Error(error.clone());
                 }
                 self.add_log(LogEntry::error(format!("Error in {}: {}", id, error)));
+                // Transition to Error mode
+                self.mode = AppMode::Error;
+                self.error_change_id = Some(id.clone());
+                self.current_change = None;
             }
             OrchestratorEvent::AllCompleted => {
                 self.mode = AppMode::Completed;
@@ -593,7 +653,14 @@ async fn run_tui_loop(
                             }
                         }
                         KeyCode::F(5) => {
-                            if let Some(cmd) = app.start_processing() {
+                            // Determine which command to use based on mode
+                            let cmd = if app.mode == AppMode::Error {
+                                app.retry_error_changes()
+                            } else {
+                                app.start_processing()
+                            };
+
+                            if let Some(cmd) = cmd {
                                 // Start orchestrator task
                                 let selected_ids = match &cmd {
                                     TuiCommand::StartProcessing(ids) => ids.clone(),
@@ -633,11 +700,18 @@ async fn run_tui_loop(
             app.handle_orchestrator_event(event);
         }
 
-        // Handle dynamic queue additions
+        // Handle dynamic queue additions and removals
         while let Ok(cmd) = cmd_rx.try_recv() {
-            if let TuiCommand::AddToQueue(id) = cmd {
-                // The orchestrator should pick this up on next iteration
-                app.add_log(LogEntry::info(format!("Queued: {}", id)));
+            match cmd {
+                TuiCommand::AddToQueue(id) => {
+                    // The orchestrator should pick this up on next iteration
+                    app.add_log(LogEntry::info(format!("Queued: {}", id)));
+                }
+                TuiCommand::RemoveFromQueue(id) => {
+                    // Log the removal (orchestrator will see the updated status)
+                    app.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
+                }
+                _ => {}
             }
         }
 
@@ -808,6 +882,72 @@ async fn run_orchestrator(
                     let _ = tx
                         .send(OrchestratorEvent::ProcessingCompleted(change_id.clone()))
                         .await;
+
+                    // Re-check if change is now complete and needs archiving
+                    let changes_after = openspec::list_changes(&openspec_cmd).await?;
+                    if let Some(updated_change) = changes_after.iter().find(|c| c.id == change_id) {
+                        if updated_change.is_complete() {
+                            // Archive the now-complete change
+                            let _ = tx
+                                .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                                    "Change complete, archiving: {}",
+                                    change_id
+                                ))))
+                                .await;
+
+                            let (mut archive_child, mut archive_rx) =
+                                agent.run_archive_streaming(&change_id).await?;
+
+                            // Stream archive output
+                            loop {
+                                tokio::select! {
+                                    _ = cancel_token.cancelled() => {
+                                        let _ = archive_child.kill().await;
+                                        let _ = tx
+                                            .send(OrchestratorEvent::Log(LogEntry::warn(
+                                                "Archive process killed due to cancellation".to_string(),
+                                            )))
+                                            .await;
+                                        return Ok(());
+                                    }
+                                    line = archive_rx.recv() => {
+                                        match line {
+                                            Some(OutputLine::Stdout(s)) => {
+                                                let _ = tx.send(OrchestratorEvent::Log(LogEntry::info(s))).await;
+                                            }
+                                            Some(OutputLine::Stderr(s)) => {
+                                                let _ = tx.send(OrchestratorEvent::Log(LogEntry::warn(s))).await;
+                                            }
+                                            None => break,
+                                        }
+                                    }
+                                }
+                            }
+
+                            let archive_status = archive_child.wait().await.map_err(|e| {
+                                crate::error::OrchestratorError::AgentCommand(format!(
+                                    "Failed to wait for archive process: {}",
+                                    e
+                                ))
+                            })?;
+
+                            if archive_status.success() {
+                                let _ = tx
+                                    .send(OrchestratorEvent::ChangeArchived(change_id.clone()))
+                                    .await;
+                            } else {
+                                let _ = tx
+                                    .send(OrchestratorEvent::ProcessingError {
+                                        id: change_id.clone(),
+                                        error: format!(
+                                            "Archive failed with exit code: {:?}",
+                                            archive_status.code()
+                                        ),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
                 } else {
                     let _ = tx
                         .send(OrchestratorEvent::ProcessingError {
@@ -845,7 +985,9 @@ fn render(frame: &mut Frame, app: &mut AppState) {
 
     match app.mode {
         AppMode::Select => render_select_mode(frame, app, area),
-        AppMode::Running | AppMode::Completed => render_running_mode(frame, app, area),
+        AppMode::Running | AppMode::Completed | AppMode::Error => {
+            render_running_mode(frame, app, area)
+        }
     }
 }
 
@@ -897,12 +1039,14 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Select => "Select Mode",
         AppMode::Running => "Running",
         AppMode::Completed => "Completed",
+        AppMode::Error => "Error",
     };
 
     let mode_color = match app.mode {
         AppMode::Select => Color::Cyan,
         AppMode::Running => Color::Yellow,
         AppMode::Completed => Color::Green,
+        AppMode::Error => Color::Red,
     };
 
     let elapsed = app.last_refresh.elapsed().as_secs();
@@ -1040,7 +1184,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Changes (Space: add to queue) ")
+                .title(" Changes (Space: toggle queue) ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         )
@@ -1055,21 +1199,28 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
 /// Render status panel
 fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
-    let current_text = match &app.current_change {
-        Some(id) => format!("Current: {}", id),
-        None => "Waiting...".to_string(),
+    let (current_text, current_color) = match app.mode {
+        AppMode::Error => {
+            let error_id = app.error_change_id.as_deref().unwrap_or("unknown");
+            (format!("Error in: {}", error_id), Color::Red)
+        }
+        _ => match &app.current_change {
+            Some(id) => (format!("Current: {}", id), Color::White),
+            None => ("Waiting...".to_string(), Color::White),
+        },
     };
 
-    let status_text = match app.mode {
-        AppMode::Completed => "All processing completed. Press 'q' to quit.",
-        AppMode::Running => "Processing...",
-        AppMode::Select => "",
+    let (status_text, status_color) = match app.mode {
+        AppMode::Completed => ("All processing completed. Press 'q' to quit.", Color::Green),
+        AppMode::Running => ("Processing...", Color::Cyan),
+        AppMode::Select => ("", Color::White),
+        AppMode::Error => ("Press F5 to retry, or 'q' to quit.", Color::Yellow),
     };
 
     let content = Line::from(vec![
-        Span::styled(current_text, Style::default().fg(Color::White)),
+        Span::styled(current_text, Style::default().fg(current_color)),
         Span::raw("  |  "),
-        Span::styled(status_text, Style::default().fg(Color::Cyan)),
+        Span::styled(status_text, Style::default().fg(status_color)),
     ]);
 
     let status = Paragraph::new(content).block(
@@ -1084,6 +1235,10 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
 
 /// Render logs panel
 fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
+    // Calculate available width for message (subtract borders, timestamp, and padding)
+    // Timestamp format: "HH:MM:SS " = 9 chars, borders = 2 chars
+    let available_width = (area.width as usize).saturating_sub(2 + 9 + 1);
+
     let log_items: Vec<Line> = app
         .logs
         .iter()
@@ -1091,12 +1246,19 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
         .take((area.height as usize).saturating_sub(2))
         .rev()
         .map(|entry| {
+            // Truncate message to fit in available width
+            let message = if entry.message.len() > available_width {
+                format!("{}...", &entry.message[..available_width.saturating_sub(3)])
+            } else {
+                entry.message.clone()
+            };
+
             Line::from(vec![
                 Span::styled(
                     format!("{} ", entry.timestamp),
                     Style::default().fg(Color::DarkGray),
                 ),
-                Span::styled(&entry.message, Style::default().fg(entry.color)),
+                Span::styled(message, Style::default().fg(entry.color)),
             ])
         })
         .collect();
@@ -1308,5 +1470,210 @@ mod tests {
         assert_eq!(QueueStatus::Completed.display(), "completed");
         assert_eq!(QueueStatus::Archived.display(), "archived");
         assert_eq!(QueueStatus::Error("err".to_string()).display(), "error");
+    }
+
+    #[test]
+    fn test_toggle_selection_removes_from_queue_in_running_mode() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing to enter Running mode
+        app.start_processing();
+        assert_eq!(app.mode, AppMode::Running);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+
+        // Toggle should remove from queue
+        let cmd = app.toggle_selection();
+        assert!(matches!(cmd, Some(TuiCommand::RemoveFromQueue(_))));
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+        assert!(!app.changes[0].selected);
+    }
+
+    #[test]
+    fn test_toggle_selection_adds_to_queue_after_removal_in_running_mode() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing to enter Running mode
+        app.start_processing();
+
+        // Remove from queue
+        let cmd = app.toggle_selection();
+        assert!(matches!(cmd, Some(TuiCommand::RemoveFromQueue(_))));
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+
+        // Add back to queue
+        let cmd = app.toggle_selection();
+        assert!(matches!(cmd, Some(TuiCommand::AddToQueue(_))));
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+        assert!(app.changes[0].selected);
+    }
+
+    #[test]
+    fn test_toggle_selection_does_nothing_for_processing_status() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing and set the change to Processing status
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Processing;
+
+        // Toggle should do nothing
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Processing);
+    }
+
+    #[test]
+    fn test_toggle_selection_does_nothing_for_completed_status() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing and set the change to Completed status
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Completed;
+
+        // Toggle should do nothing
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Completed);
+    }
+
+    #[test]
+    fn test_toggle_selection_does_nothing_for_archived_status() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing and set the change to Archived status
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Archived;
+
+        // Toggle should do nothing
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archived);
+    }
+
+    #[test]
+    fn test_toggle_selection_does_nothing_for_error_status() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing and set the change to Error status
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Error("test error".to_string());
+
+        // Toggle should do nothing
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+        assert!(matches!(app.changes[0].queue_status, QueueStatus::Error(_)));
+    }
+
+    #[test]
+    fn test_processing_error_transitions_to_error_mode() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing
+        app.start_processing();
+        assert_eq!(app.mode, AppMode::Running);
+
+        // Simulate processing error
+        app.handle_orchestrator_event(OrchestratorEvent::ProcessingError {
+            id: "a".to_string(),
+            error: "LLM error".to_string(),
+        });
+
+        // Mode should be Error
+        assert_eq!(app.mode, AppMode::Error);
+        assert_eq!(app.error_change_id, Some("a".to_string()));
+        assert!(matches!(app.changes[0].queue_status, QueueStatus::Error(_)));
+        assert!(app.current_change.is_none());
+    }
+
+    #[test]
+    fn test_retry_error_changes_from_error_mode() {
+        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 2)];
+        let mut app = AppState::new(changes);
+
+        // Start processing
+        app.start_processing();
+
+        // Set one change to error
+        app.mode = AppMode::Error;
+        app.error_change_id = Some("a".to_string());
+        app.changes[0].queue_status = QueueStatus::Error("LLM error".to_string());
+        app.changes[1].queue_status = QueueStatus::Completed;
+
+        // Retry should reset error changes
+        let cmd = app.retry_error_changes();
+
+        assert!(cmd.is_some());
+        if let Some(TuiCommand::StartProcessing(ids)) = cmd {
+            assert_eq!(ids, vec!["a".to_string()]);
+        } else {
+            panic!("Expected StartProcessing command");
+        }
+
+        // Mode should be Running
+        assert_eq!(app.mode, AppMode::Running);
+        assert!(app.error_change_id.is_none());
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+        assert!(app.changes[0].selected);
+        // Completed change should remain completed
+        assert_eq!(app.changes[1].queue_status, QueueStatus::Completed);
+    }
+
+    #[test]
+    fn test_retry_error_changes_does_nothing_in_select_mode() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Set change to error but mode is Select
+        app.changes[0].queue_status = QueueStatus::Error("LLM error".to_string());
+
+        // Retry should do nothing
+        let cmd = app.retry_error_changes();
+        assert!(cmd.is_none());
+        assert_eq!(app.mode, AppMode::Select);
+    }
+
+    #[test]
+    fn test_retry_error_changes_does_nothing_when_no_errors() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing and set mode to Error manually
+        app.start_processing();
+        app.mode = AppMode::Error;
+        // But no changes have error status
+
+        // Retry should do nothing
+        let cmd = app.retry_error_changes();
+        assert!(cmd.is_none());
+    }
+
+    #[test]
+    fn test_retry_logs_retrying_message() {
+        let changes = vec![create_test_change("error-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Set up error state
+        app.mode = AppMode::Error;
+        app.error_change_id = Some("error-change".to_string());
+        app.changes[0].queue_status = QueueStatus::Error("test error".to_string());
+
+        // Clear logs
+        app.logs.clear();
+
+        // Retry
+        let _ = app.retry_error_changes();
+
+        // Check that log contains retry message
+        assert!(app.logs.iter().any(|log| log.message.contains("Retrying")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("error-change")));
     }
 }

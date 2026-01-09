@@ -50,6 +50,7 @@ pub struct OrchestratorConfig {
 
 impl OrchestratorConfig {
     /// Create a new empty configuration
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -211,7 +212,7 @@ fn strip_jsonc_features(content: &str) -> String {
 /// Remove trailing commas before `]` or `}`
 fn remove_trailing_commas(content: &str) -> String {
     let mut result = String::with_capacity(content.len());
-    let mut chars: Vec<char> = content.chars().collect();
+    let chars: Vec<char> = content.chars().collect();
     let mut i = 0;
 
     while i < chars.len() {

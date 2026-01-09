@@ -12,6 +12,7 @@ pub enum OrchestratorError {
     OpenSpecCommand(String),
 
     #[error("OpenCode command failed: {0}")]
+    #[allow(dead_code)]
     OpenCodeCommand(String),
 
     #[error("Agent command failed: {0}")]
