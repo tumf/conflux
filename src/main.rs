@@ -7,6 +7,7 @@ mod opencode;
 mod openspec;
 mod orchestrator;
 mod progress;
+mod templates;
 mod tui;
 
 use clap::Parser;
@@ -14,6 +15,7 @@ use cli::{Cli, Commands};
 use config::OrchestratorConfig;
 use error::Result;
 use orchestrator::Orchestrator;
+use std::path::Path;
 use tracing::{info, Level};
 
 #[tokio::main]
@@ -58,6 +60,29 @@ async fn main() -> Result<()> {
             info!("Starting orchestrator");
             let mut orchestrator = Orchestrator::new(&args.openspec_cmd, args.change, args.config)?;
             orchestrator.run().await?;
+        }
+
+        // Init subcommand: generate configuration file
+        Some(Commands::Init(args)) => {
+            let config_path = Path::new(".openspec-orchestrator.jsonc");
+
+            if config_path.exists() && !args.force {
+                eprintln!(
+                    "Error: Configuration file '{}' already exists.",
+                    config_path.display()
+                );
+                eprintln!("Use --force to overwrite the existing file.");
+                std::process::exit(1);
+            }
+
+            let content = templates::get_template_content(args.template);
+            std::fs::write(config_path, content)?;
+
+            println!(
+                "Created configuration file '{}' with {:?} template.",
+                config_path.display(),
+                args.template
+            );
         }
     }
 

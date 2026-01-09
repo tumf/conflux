@@ -15,17 +15,17 @@
   // Apply command template
   // Executed when applying a change (implementing tasks)
   // Placeholder: {change_id} - replaced with the change ID at runtime
-  "apply_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions -p '/openspec:apply {change_id}'",
+  "apply_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions -p --verbose --output-format stream-json '/openspec:apply {change_id}' | jq -r 'select(.type == \"assistant\") | .message.content[] | select(.type == \"text\") | .text'",
 
   // Archive command template
   // Executed when archiving a completed change
   // Placeholder: {change_id} - replaced with the change ID at runtime
-  "archive_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions -p '/openspec:archive {change_id}'",
+  "archive_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions -p --verbose --output-format stream-json '/openspec:archive {change_id}' | jq -r 'select(.type == \"assistant\") | .message.content[] | select(.type == \"text\") | .text'",
 
   // Analyze command template
   // Executed for dependency analysis using LLM
   // Placeholder: {prompt} - replaced with the analysis prompt at runtime
-  "analyze_command": "/Users/tumf/.local/bin/claude --print --dangerously-skip-permissions --output-format json '{prompt}'",
+  "analyze_command": "/Users/tumf/.local/bin/claude --print --dangerously-skip-permissions --verbose --output-format stream-json '{prompt}' | jq -r 'select(.type == \"assistant\") | .message.content[] | select(.type == \"text\") | .text'",
 
   // Hooks configuration
   // Run commands at various stages of orchestration

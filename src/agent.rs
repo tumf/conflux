@@ -147,8 +147,8 @@ impl AgentRunner {
                 // Disable pagers completely
                 .env("PAGER", "cat")
                 .env("GIT_PAGER", "cat")
-                .env("LESS", "-FX")  // -F: quit if one screen, -X: no init
-                .env("MORE", "-E")   // -E: quit at EOF
+                .env("LESS", "-FX") // -F: quit if one screen, -X: no init
+                .env("MORE", "-E") // -E: quit at EOF
                 // Prevent any pager from being used
                 .env("MANPAGER", "cat")
                 .env("SYSTEMD_PAGER", "cat")
@@ -157,7 +157,7 @@ impl AgentRunner {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            
+
             #[cfg(unix)]
             {
                 // Detach from controlling terminal completely
@@ -166,12 +166,12 @@ impl AgentRunner {
                     use std::os::unix::process::CommandExt;
                     cmd.pre_exec(|| {
                         use std::os::unix::io::RawFd;
-                        
+
                         // Create a new session - this detaches from the controlling terminal
                         if libc::setsid() == -1 {
                             return Err(std::io::Error::last_os_error());
                         }
-                        
+
                         // Close /dev/tty to prevent any direct terminal access
                         // Open /dev/null and redirect any attempts to access /dev/tty
                         let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
@@ -183,16 +183,15 @@ impl AgentRunner {
                             }
                             libc::close(devnull);
                         }
-                        
+
                         Ok(())
                     });
                 }
             }
-            
-            cmd.spawn()
-                .map_err(|e| {
-                    OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
-                })?
+
+            cmd.spawn().map_err(|e| {
+                OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
+            })?
         };
 
         let (tx, rx) = mpsc::channel::<OutputLine>(100);

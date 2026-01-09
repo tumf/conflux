@@ -427,8 +427,8 @@ mod tests {
 
     #[test]
     fn test_load_from_custom_path() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         // Create a temporary config file
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -441,16 +441,13 @@ mod tests {
         // Load from custom path
         let config = OrchestratorConfig::load(Some(temp_file.path())).unwrap();
 
-        assert_eq!(
-            config.get_apply_command(),
-            "custom-agent apply {change_id}"
-        );
+        assert_eq!(config.get_apply_command(), "custom-agent apply {change_id}");
     }
 
     #[test]
     fn test_load_returns_default_when_no_config_exists() {
-        use tempfile::TempDir;
         use std::env;
+        use tempfile::TempDir;
 
         // Create a temporary directory with no config files
         let temp_dir = TempDir::new().unwrap();
@@ -473,9 +470,9 @@ mod tests {
 
     #[test]
     fn test_load_project_config_takes_priority() {
-        use tempfile::TempDir;
         use std::env;
         use std::fs;
+        use tempfile::TempDir;
 
         // Create a temporary directory
         let temp_dir = TempDir::new().unwrap();

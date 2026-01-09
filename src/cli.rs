@@ -30,6 +30,9 @@ pub enum Commands {
 
     /// Launch the interactive TUI dashboard
     Tui(TuiArgs),
+
+    /// Initialize a new configuration file
+    Init(InitArgs),
 }
 
 /// Arguments for the run subcommand
@@ -72,6 +75,29 @@ pub struct TuiArgs {
     pub openspec_cmd: String,
 }
 
+/// Template options for init command
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+pub enum Template {
+    /// Claude Code agent (claude --dangerously-skip-permissions)
+    #[default]
+    Claude,
+    /// OpenCode agent
+    Opencode,
+    /// Codex agent
+    Codex,
+}
+
+/// Arguments for the init subcommand
+#[derive(Parser, Debug)]
+pub struct InitArgs {
+    /// Template to use for configuration
+    #[arg(long, short = 't', value_enum, default_value_t = Template::Claude)]
+    pub template: Template,
+
+    /// Overwrite existing configuration file
+    #[arg(long, short = 'f')]
+    pub force: bool,
+}
 
 #[cfg(test)]
 mod tests {
@@ -177,11 +203,8 @@ mod tests {
         env::set_var("OPENSPEC_CMD", "/env/openspec");
 
         // Parse CLI with --openspec-cmd argument
-        let cli = Cli::try_parse_from([
-            "openspec-orchestrator",
-            "--openspec-cmd",
-            "./cli-openspec",
-        ]);
+        let cli =
+            Cli::try_parse_from(["openspec-orchestrator", "--openspec-cmd", "./cli-openspec"]);
 
         // Restore original env value
         if let Some(val) = original {
@@ -206,10 +229,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::Run(args)) => {
-                assert_eq!(
-                    args.config,
-                    Some(PathBuf::from("/path/to/config.jsonc"))
-                );
+                assert_eq!(args.config, Some(PathBuf::from("/path/to/config.jsonc")));
             }
             _ => panic!("Expected Run subcommand"),
         }
@@ -217,12 +237,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_change_option() {
-        let cli = Cli::parse_from([
-            "openspec-orchestrator",
-            "run",
-            "--change",
-            "add-feature-x",
-        ]);
+        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--change", "add-feature-x"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -250,5 +265,90 @@ mod tests {
 
         // The global --openspec-cmd is parsed at the Cli level
         assert_eq!(cli.openspec_cmd, "/global/openspec");
+    }
+
+    #[test]
+    fn test_init_subcommand_default_template() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "init"]);
+
+        match cli.command {
+            Some(Commands::Init(args)) => {
+                assert!(matches!(args.template, Template::Claude));
+                assert!(!args.force);
+            }
+            _ => panic!("Expected Init subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_init_subcommand_opencode_template() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "init", "--template", "opencode"]);
+
+        match cli.command {
+            Some(Commands::Init(args)) => {
+                assert!(matches!(args.template, Template::Opencode));
+            }
+            _ => panic!("Expected Init subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_init_subcommand_claude_template() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "init", "--template", "claude"]);
+
+        match cli.command {
+            Some(Commands::Init(args)) => {
+                assert!(matches!(args.template, Template::Claude));
+            }
+            _ => panic!("Expected Init subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_init_subcommand_codex_template() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "init", "--template", "codex"]);
+
+        match cli.command {
+            Some(Commands::Init(args)) => {
+                assert!(matches!(args.template, Template::Codex));
+            }
+            _ => panic!("Expected Init subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_init_subcommand_short_template_flag() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "init", "-t", "opencode"]);
+
+        match cli.command {
+            Some(Commands::Init(args)) => {
+                assert!(matches!(args.template, Template::Opencode));
+            }
+            _ => panic!("Expected Init subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_init_subcommand_force_flag() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "init", "--force"]);
+
+        match cli.command {
+            Some(Commands::Init(args)) => {
+                assert!(args.force);
+            }
+            _ => panic!("Expected Init subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_init_subcommand_short_force_flag() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "init", "-f"]);
+
+        match cli.command {
+            Some(Commands::Init(args)) => {
+                assert!(args.force);
+            }
+            _ => panic!("Expected Init subcommand"),
+        }
     }
 }

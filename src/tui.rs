@@ -12,7 +12,7 @@ use crate::error::Result;
 use crate::openspec::Change;
 use chrono::Local;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{Clear, ClearType},
 };
@@ -563,9 +563,9 @@ impl AppState {
 /// Clear the terminal screen
 fn clear_screen() -> Result<()> {
     use std::io::stdout;
-    
+
     execute!(stdout(), Clear(ClearType::All))?;
-    
+
     Ok(())
 }
 
@@ -651,23 +651,23 @@ async fn run_tui_loop(
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') => {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             app.should_quit = true;
                             break;
                         }
-                        KeyCode::Up | KeyCode::Char('k') => {
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
                             app.cursor_up();
                         }
-                        KeyCode::Down | KeyCode::Char('j') => {
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
                             app.cursor_down();
                         }
-                        KeyCode::Char(' ') => {
+                        (KeyCode::Char(' '), _) => {
                             if let Some(cmd) = app.toggle_selection() {
                                 let _ = cmd_tx.send(cmd).await;
                             }
                         }
-                        KeyCode::F(5) => {
+                        (KeyCode::F(5), _) => {
                             // Determine which command to use based on mode
                             let cmd = if app.mode == AppMode::Error {
                                 app.retry_error_changes()
@@ -1339,7 +1339,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Changes (↑↓: move, Space: toggle, F5: run, q: quit) ")
+                .title(" Changes (↑↓: move, Space: toggle, F5: run, q/Ctrl+C: quit) ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         )
@@ -1905,7 +1905,8 @@ mod tests {
         assert!(!app.should_refresh());
 
         // Manually set last_refresh to simulate elapsed time
-        app.last_refresh = std::time::Instant::now() - Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS + 1);
+        app.last_refresh =
+            std::time::Instant::now() - Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS + 1);
 
         // Now should need refresh
         assert!(app.should_refresh());
