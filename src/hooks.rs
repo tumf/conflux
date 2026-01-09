@@ -448,12 +448,15 @@ impl HookRunner {
             c.arg("/C").arg(command);
             c
         } else {
-            let mut c = Command::new("sh");
+            // Use /bin/sh directly instead of user's $SHELL to avoid job control issues
+            // (e.g., zsh's "suspended (tty output)" when running as background process)
+            let mut c = Command::new("/bin/sh");
             c.arg("-c").arg(command);
             c
         };
 
-        // Set environment variables
+        // Inherit environment and set hook-specific variables
+        cmd.env_clear().envs(std::env::vars());
         for (key, value) in env_vars {
             cmd.env(key, value);
         }

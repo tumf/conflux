@@ -1,0 +1,86 @@
+{
+  // OpenSpec Orchestrator Configuration for Claude Code
+  // This configuration uses Claude Code CLI for task execution.
+  //
+  // Configuration file locations (in order of priority):
+  // 1. .openspec-orchestrator.jsonc (project root) ← THIS FILE
+  // 2. ~/.config/openspec-orchestrator/config.jsonc (global)
+  //
+  // Note: Using ~/.local/bin/claude with --print and --dangerously-skip-permissions flags
+  // - --print (-p): Non-interactive mode - print response and exit (useful for automation)
+  // - --dangerously-skip-permissions: Skip permission checks and workspace trust dialog
+  // - --output-format: Control output format (text/json/stream-json)
+  // - Adjust the path based on your Claude Code installation
+
+  // Apply command template
+  // Executed when applying a change (implementing tasks)
+  // Placeholder: {change_id} - replaced with the change ID at runtime
+  "apply_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions -p --verbose --output-format stream-json '/openspec:apply {change_id}' | jq --unbuffered -r 'select(.type == \"assistant\") | .message.content[] | select(.type == \"text\") | .text'",
+
+  // Archive command template
+  // Executed when archiving a completed change
+  // Placeholder: {change_id} - replaced with the change ID at runtime
+  "archive_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions -p --verbose --output-format stream-json '/openspec:archive {change_id}' | jq --unbuffered -r 'select(.type == \"assistant\") | .message.content[] | select(.type == \"text\") | .text'",
+
+  // Analyze command template
+  // Executed for dependency analysis using LLM
+  // Placeholder: {prompt} - replaced with the analysis prompt at runtime
+  "analyze_command": "/Users/tumf/.local/bin/claude --print --dangerously-skip-permissions --verbose --output-format stream-json '{prompt}' | jq --unbuffered -r 'select(.type == \"assistant\") | .message.content[] | select(.type == \"text\") | .text'",
+
+  // Hooks configuration
+  // Run commands at various stages of orchestration
+  "hooks": {
+    // Triggered once when orchestrator starts
+    "on_start": "echo '🚀 OpenSpec Orchestrator started with Claude Code'",
+
+    // Triggered only once before the first apply
+    // Example: Create a feature branch for the orchestration session
+    "on_first_apply": {
+      "command": "git checkout -b feature/openspec-orchestration-$(date +%Y%m%d-%H%M%S)",
+      "continue_on_failure": true
+    },
+
+    // Triggered at the start of each iteration
+    "on_iteration_start": "echo '🔄 Iteration {iteration}: Processing changes...'",
+
+    // Triggered before applying each change
+    "pre_apply": "echo '📝 Applying change: {change_id}'",
+
+    // Triggered after successfully applying a change
+    // Example: Run tests to validate the implementation
+    "post_apply": {
+      "command": "cargo test",
+      "continue_on_failure": false,  // Stop orchestration if tests fail
+      "timeout": 300  // 5 minutes timeout
+    },
+
+    // Triggered when a change reaches 100% task completion
+    "on_change_complete": "echo '✅ Change {change_id} is complete ({completed_tasks}/{total_tasks} tasks)'",
+
+    // Triggered before archiving a change
+    // Example: Run linting and quality checks
+    "pre_archive": {
+      "command": "cargo clippy -- -D warnings && cargo fmt --check",
+      "continue_on_failure": false,
+      "timeout": 60
+    },
+
+    // Triggered after successfully archiving a change
+    "post_archive": "echo '📦 Archived: {change_id}'",
+
+    // Triggered at the end of each iteration
+    "on_iteration_end": "echo '✓ Iteration {iteration} complete. Queue size: {queue_size}'",
+
+    // Triggered when the number of pending changes changes
+    "on_queue_change": "echo '📊 Queue update: {queue_size} changes remaining'",
+
+    // Triggered when orchestrator finishes (success or iteration limit)
+    "on_finish": {
+      "command": "echo '🎉 Orchestration finished with status: {status}' && git status",
+      "continue_on_failure": true
+    },
+
+    // Triggered when an error occurs during apply or archive
+    "on_error": "echo '❌ Error in {change_id}: {error}' | tee -a orchestrator-errors.log"
+  }
+}

@@ -34,6 +34,9 @@ const AUTO_REFRESH_INTERVAL_SECS: u64 = 5;
 /// Maximum number of log entries to keep
 const MAX_LOG_ENTRIES: usize = 100;
 
+/// Spinner characters for processing animation (Braille dot pattern)
+const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
 /// Application mode
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
@@ -263,6 +266,8 @@ pub struct AppState {
     pub should_quit: bool,
     /// Warning message to display
     pub warning_message: Option<String>,
+    /// Current spinner animation frame
+    pub spinner_frame: usize,
 }
 
 impl AppState {
@@ -292,6 +297,7 @@ impl AppState {
             known_change_ids: known_ids,
             should_quit: false,
             warning_message: None,
+            spinner_frame: 0,
         }
     }
 
@@ -644,6 +650,9 @@ async fn run_tui_loop(
     let mut orchestrator_cancel: Option<CancellationToken> = None;
 
     loop {
+        // Increment spinner frame for animation (updates every 100ms)
+        app.spinner_frame = (app.spinner_frame + 1) % SPINNER_CHARS.len();
+
         // Draw the UI
         terminal.draw(|frame| render(frame, &mut app))?;
 
@@ -1354,6 +1363,8 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
 
 /// Render changes list in running mode
 fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect) {
+    let spinner_char = SPINNER_CHARS[app.spinner_frame];
+
     let items: Vec<ListItem> = app
         .changes
         .iter()
@@ -1367,7 +1378,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
             let status_text = match &change.queue_status {
                 QueueStatus::Processing => {
-                    format!("[{:>3.0}%]", change.progress_percent())
+                    format!("{} [{:>3.0}%]", spinner_char, change.progress_percent())
                 }
                 status => format!("[{}]", status.display()),
             };
@@ -1434,11 +1445,59 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Error => ("Press F5 to retry, or 'q' to quit.", Color::Yellow),
     };
 
-    let content = Line::from(vec![
+    // Calculate overall progress for queued/processing changes
+    let progress_info = if app.mode == AppMode::Running {
+        let (total_tasks, completed_tasks) = app
+            .changes
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.queue_status,
+                    QueueStatus::Queued | QueueStatus::Processing | QueueStatus::Completed
+                )
+            })
+            .fold((0u32, 0u32), |(total, completed), c| {
+                (total + c.total_tasks, completed + c.completed_tasks)
+            });
+
+        if total_tasks > 0 {
+            let percent = (completed_tasks as f32 / total_tasks as f32) * 100.0;
+            let bar_width = 20;
+            let filled = ((percent / 100.0) * bar_width as f32) as usize;
+            let empty = bar_width - filled;
+            Some((
+                format!(
+                    "[{}{}] {:>5.1}% ({}/{})",
+                    "█".repeat(filled),
+                    "░".repeat(empty),
+                    percent,
+                    completed_tasks,
+                    total_tasks
+                ),
+                Color::Cyan,
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut spans = vec![
         Span::styled(current_text, Style::default().fg(current_color)),
         Span::raw("  |  "),
         Span::styled(status_text, Style::default().fg(status_color)),
-    ]);
+    ];
+
+    if let Some((progress_text, progress_color)) = progress_info {
+        spans.push(Span::raw("  |  "));
+        spans.push(Span::styled(
+            progress_text,
+            Style::default().fg(progress_color),
+        ));
+    }
+
+    let content = Line::from(spans);
 
     let status = Paragraph::new(content).block(
         Block::default()
@@ -1464,8 +1523,14 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
         .rev()
         .map(|entry| {
             // Truncate message to fit in available width
-            let message = if entry.message.len() > available_width {
-                format!("{}...", &entry.message[..available_width.saturating_sub(3)])
+            // Use char count instead of byte length to avoid UTF-8 boundary panics
+            let char_count = entry.message.chars().count();
+            let message = if char_count > available_width {
+                let truncated: String = entry.message
+                    .chars()
+                    .take(available_width.saturating_sub(3))
+                    .collect();
+                format!("{}...", truncated)
             } else {
                 entry.message.clone()
             };
@@ -1518,7 +1583,20 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
             warning.clone(),
             Style::default().fg(Color::Red),
         ));
+    } else if app.changes.is_empty() {
+        // No changes available
+        spans.push(Span::styled(
+            "Add new proposals to get started",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else if selected == 0 {
+        // Changes exist but none selected
+        spans.push(Span::styled(
+            "Select changes with Space to process",
+            Style::default().fg(Color::Yellow),
+        ));
     } else {
+        // Changes selected and ready to process
         spans.push(Span::styled(
             "Press F5 to start processing",
             Style::default().fg(Color::Cyan),
@@ -1974,6 +2052,73 @@ mod tests {
 
         // Should have 2 new changes
         assert_eq!(app.new_change_count, 2);
+    }
+
+    #[test]
+    fn test_footer_message_when_no_changes() {
+        // Empty changes list should show "Add new proposals to get started"
+        let app = AppState::new(vec![]);
+        assert!(app.changes.is_empty());
+        assert_eq!(app.selected_count(), 0);
+        // The condition in render_footer_select: app.changes.is_empty() -> "Add new proposals..."
+    }
+
+    #[test]
+    fn test_footer_message_when_none_selected() {
+        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 2)];
+        let mut app = AppState::new(changes);
+
+        // Deselect all
+        app.changes[0].selected = false;
+        app.changes[1].selected = false;
+
+        assert!(!app.changes.is_empty());
+        assert_eq!(app.selected_count(), 0);
+        // The condition: !app.changes.is_empty() && selected == 0 -> "Select changes with Space..."
+    }
+
+    #[test]
+    fn test_footer_message_when_changes_selected() {
+        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 2)];
+        let app = AppState::new(changes);
+
+        assert!(!app.changes.is_empty());
+        assert!(app.selected_count() > 0);
+        // The condition: selected > 0 -> "Press F5 to start processing"
+    }
+
+    #[test]
+    fn test_progress_calculation_during_running() {
+        let changes = vec![
+            create_test_change("a", 2, 5), // 2/5 done
+            create_test_change("b", 3, 3), // 3/3 done
+        ];
+        let mut app = AppState::new(changes);
+
+        // Start processing to enter Running mode
+        app.start_processing();
+        assert_eq!(app.mode, AppMode::Running);
+
+        // Calculate progress like render_status does
+        let (total_tasks, completed_tasks) = app
+            .changes
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.queue_status,
+                    QueueStatus::Queued | QueueStatus::Processing | QueueStatus::Completed
+                )
+            })
+            .fold((0u32, 0u32), |(total, completed), c| {
+                (total + c.total_tasks, completed + c.completed_tasks)
+            });
+
+        // Total: 5 + 3 = 8 tasks, Completed: 2 + 3 = 5 tasks
+        assert_eq!(total_tasks, 8);
+        assert_eq!(completed_tasks, 5);
+
+        let percent = (completed_tasks as f32 / total_tasks as f32) * 100.0;
+        assert!((percent - 62.5).abs() < 0.01);
     }
 
     #[test]

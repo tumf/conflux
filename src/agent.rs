@@ -127,11 +127,12 @@ impl AgentRunner {
                     OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
                 })?
         } else {
-            // Use non-interactive shell for automation
-            // Note: .zshrc/.bashrc are not loaded, use .zshenv/.profile for PATH setup
+            // Use login shell to load .zprofile/.profile for PATH and environment setup
+            // Note: -l (login) instead of -i (interactive) to avoid job control issues with TUI
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
             let mut cmd = Command::new(&shell);
-            cmd.arg("-c")
+            cmd.arg("-l")
+                .arg("-c")
                 .arg(command)
                 .env_clear()
                 .envs(std::env::vars())
