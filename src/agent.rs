@@ -102,6 +102,8 @@ impl AgentRunner {
             Command::new("cmd")
                 .arg("/C")
                 .arg(command)
+                .env_clear()
+                .envs(std::env::vars())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -109,9 +111,14 @@ impl AgentRunner {
                     OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
                 })?
         } else {
-            Command::new("sh")
+            // Use interactive shell to ensure .zshrc/.bashrc are loaded
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            Command::new(&shell)
+                .arg("-i")
                 .arg("-c")
                 .arg(command)
+                .env_clear()
+                .envs(std::env::vars())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -163,6 +170,8 @@ impl AgentRunner {
             Command::new("cmd")
                 .arg("/C")
                 .arg(command)
+                .env_clear()
+                .envs(std::env::vars())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
@@ -171,9 +180,13 @@ impl AgentRunner {
                     OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
                 })?
         } else {
-            Command::new("sh")
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            Command::new(&shell)
+                .arg("-i")
                 .arg("-c")
                 .arg(command)
+                .env_clear()
+                .envs(std::env::vars())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
@@ -196,15 +209,21 @@ impl AgentRunner {
             Command::new("cmd")
                 .arg("/C")
                 .arg(command)
+                .env_clear()
+                .envs(std::env::vars())
                 .output()
                 .await
                 .map_err(|e| {
                     OrchestratorError::AgentCommand(format!("Failed to execute command: {}", e))
                 })?
         } else {
-            Command::new("sh")
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            Command::new(&shell)
+                .arg("-i")
                 .arg("-c")
                 .arg(command)
+                .env_clear()
+                .envs(std::env::vars())
                 .output()
                 .await
                 .map_err(|e| {
@@ -242,6 +261,7 @@ mod tests {
             apply_command: Some("custom-agent apply {change_id}".to_string()),
             archive_command: Some("custom-agent archive {change_id}".to_string()),
             analyze_command: Some("custom-agent analyze '{prompt}'".to_string()),
+            hooks: None,
         };
         let runner = AgentRunner::new(config);
         assert_eq!(
@@ -265,6 +285,7 @@ mod tests {
             apply_command: Some("echo 'Applying {change_id}'".to_string()),
             archive_command: None,
             analyze_command: None,
+            hooks: None,
         };
         let runner = AgentRunner::new(config);
         let status = runner.run_apply("test-change").await.unwrap();
@@ -277,6 +298,7 @@ mod tests {
             apply_command: None,
             archive_command: Some("echo 'Archiving {change_id}'".to_string()),
             analyze_command: None,
+            hooks: None,
         };
         let runner = AgentRunner::new(config);
         let status = runner.run_archive("test-change").await.unwrap();
@@ -289,6 +311,7 @@ mod tests {
             apply_command: None,
             archive_command: None,
             analyze_command: Some("echo '{prompt}'".to_string()),
+            hooks: None,
         };
         let runner = AgentRunner::new(config);
         let result = runner.analyze_dependencies("test prompt").await.unwrap();
@@ -301,6 +324,7 @@ mod tests {
             apply_command: Some("echo 'line1' && echo 'line2'".to_string()),
             archive_command: None,
             analyze_command: None,
+            hooks: None,
         };
         let runner = AgentRunner::new(config);
         let (mut child, mut rx) = runner.run_apply_streaming("test-change").await.unwrap();
