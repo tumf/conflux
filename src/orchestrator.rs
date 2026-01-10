@@ -10,9 +10,9 @@ use tracing::{debug, error, info, warn};
 
 pub struct Orchestrator {
     agent: AgentRunner,
-    openspec_cmd: String,
     progress: Option<ProgressDisplay>,
-    target_change: Option<String>,
+    /// Target changes specified by --change option (comma-separated)
+    target_changes: Option<Vec<String>>,
     /// Snapshot of change IDs captured at run start.
     /// Only changes present in this snapshot will be processed during the run.
     /// This prevents mid-run proposals from being processed before they are ready.
@@ -29,20 +29,15 @@ pub struct Orchestrator {
 
 impl Orchestrator {
     /// Create a new orchestrator with optional custom config path
-    pub fn new(
-        openspec_cmd: &str,
-        target_change: Option<String>,
-        config_path: Option<PathBuf>,
-    ) -> Result<Self> {
+    pub fn new(target_changes: Option<Vec<String>>, config_path: Option<PathBuf>) -> Result<Self> {
         let config = OrchestratorConfig::load(config_path.as_deref())?;
         let hooks = HookRunner::new(config.get_hooks());
         let agent = AgentRunner::new(config);
 
         Ok(Self {
             agent,
-            openspec_cmd: openspec_cmd.to_string(),
             progress: None,
-            target_change,
+            target_changes,
             initial_change_ids: None,
             hooks,
             first_apply_executed: false,
@@ -54,8 +49,7 @@ impl Orchestrator {
     /// Create a new orchestrator with explicit configuration (for testing)
     #[cfg(test)]
     pub fn with_config(
-        openspec_cmd: &str,
-        target_change: Option<String>,
+        target_changes: Option<Vec<String>>,
         config: OrchestratorConfig,
     ) -> Result<Self> {
         let hooks = HookRunner::new(config.get_hooks());
@@ -63,9 +57,8 @@ impl Orchestrator {
 
         Ok(Self {
             agent,
-            openspec_cmd: openspec_cmd.to_string(),
             progress: None,
-            target_change,
+            target_changes,
             initial_change_ids: None,
             hooks,
             first_apply_executed: false,
@@ -81,15 +74,67 @@ impl Orchestrator {
         // Capture initial snapshot of change IDs at run start.
         // Only changes present at this point will be processed during the run.
         // This prevents mid-run proposals from being processed before they are ready.
-        let initial_changes = openspec::list_changes(&self.openspec_cmd).await?;
+        let initial_changes = openspec::list_changes_native()?;
 
         if initial_changes.is_empty() {
             info!("No changes found");
             return Ok(());
         }
 
-        // Store snapshot of change IDs
-        let snapshot_ids: HashSet<String> = initial_changes.iter().map(|c| c.id.clone()).collect();
+        // Filter by target_changes if specified (early filtering)
+        // Both explicit targets and default mode require approval check
+        let filtered_initial = if let Some(targets) = &self.target_changes {
+            // Explicit targets specified via --change option
+            let mut found = Vec::new();
+            for target in targets {
+                let trimmed = target.trim();
+                if let Some(change) = initial_changes.iter().find(|c| c.id == trimmed) {
+                    // Check approval status even for explicitly specified changes
+                    if change.is_approved {
+                        found.push(change.clone());
+                    } else {
+                        warn!(
+                            "Skipping unapproved change '{}'. Approve it first with: openspec-orchestrator approve set {}",
+                            trimmed, trimmed
+                        );
+                    }
+                } else {
+                    warn!("Specified change '{}' not found, skipping", trimmed);
+                }
+            }
+            found
+        } else {
+            // No explicit target: filter to only approved changes
+            let (approved, unapproved): (Vec<_>, Vec<_>) =
+                initial_changes.into_iter().partition(|c| c.is_approved);
+
+            // Warn about unapproved changes
+            for change in &unapproved {
+                warn!(
+                    "Skipping unapproved change '{}'. Approve it first with: openspec-orchestrator approve set {}",
+                    change.id, change.id
+                );
+            }
+
+            if approved.is_empty() && !unapproved.is_empty() {
+                info!(
+                    "No approved changes found. {} change(s) are pending approval.",
+                    unapproved.len()
+                );
+                return Ok(());
+            }
+
+            approved
+        };
+
+        if filtered_initial.is_empty() {
+            info!("No changes found matching specified targets");
+            return Ok(());
+        }
+
+        // Store snapshot of change IDs (only the filtered ones)
+        let snapshot_ids: HashSet<String> =
+            filtered_initial.iter().map(|c| c.id.clone()).collect();
         info!(
             "Captured snapshot of {} changes: {:?}",
             snapshot_ids.len(),
@@ -98,9 +143,9 @@ impl Orchestrator {
         self.initial_change_ids = Some(snapshot_ids.clone());
 
         // Initialize progress display
-        self.progress = Some(ProgressDisplay::new(initial_changes.len()));
+        self.progress = Some(ProgressDisplay::new(filtered_initial.len()));
 
-        let total_changes = initial_changes.len();
+        let total_changes = filtered_initial.len();
 
         // Run on_start hook
         let start_context = HookContext::new(0, total_changes, total_changes, false);
@@ -115,7 +160,7 @@ impl Orchestrator {
             self.iteration += 1;
 
             // List all changes from openspec (to get updated progress)
-            let changes = openspec::list_changes(&self.openspec_cmd).await?;
+            let changes = openspec::list_changes_native()?;
 
             // Filter to only include changes from initial snapshot
             let snapshot_changes = self.filter_to_snapshot(&changes);
@@ -146,27 +191,8 @@ impl Orchestrator {
                 break;
             }
 
-            // Filter by target change if specified
-            let filtered_changes: Vec<Change> = if let Some(target) = &self.target_change {
-                snapshot_changes
-                    .into_iter()
-                    .filter(|c| &c.id == target)
-                    .collect()
-            } else {
-                snapshot_changes
-            };
-
-            if filtered_changes.is_empty() {
-                if self.target_change.is_some() {
-                    info!("Target change not found or already processed");
-                }
-                info!("All changes processed");
-                if let Some(progress) = &mut self.progress {
-                    progress.complete_all();
-                }
-                finish_status = "completed";
-                break;
-            }
+            // No additional filtering needed here - target_changes filtering
+            // is done at snapshot capture time (early filtering)
 
             // Run on_iteration_start hook
             let iter_start_context =
@@ -176,7 +202,7 @@ impl Orchestrator {
                 .await?;
 
             // 2. Select next change to process
-            let next = self.select_next_change(&filtered_changes).await?;
+            let next = self.select_next_change(&snapshot_changes).await?;
             info!("Selected change: {}", next.id);
 
             if let Some(progress) = &mut self.progress {
@@ -223,11 +249,8 @@ impl Orchestrator {
                         if let Some(progress) = &mut self.progress {
                             progress.archive_change(&next.id);
                         }
-                        // If targeting specific change and it's done, stop
-                        if self.target_change.as_ref() == Some(&next.id) {
-                            finish_status = "completed";
-                            break;
-                        }
+                        // If targeting specific changes and all are done, stop
+                        // (The loop will exit naturally when snapshot_changes is empty)
                     }
                     Err(e) => {
                         // Run on_error hook
@@ -409,7 +432,7 @@ impl Orchestrator {
     }
 
     /// Apply a change using the configured agent
-    async fn apply_change(&self, change: &Change) -> Result<()> {
+    async fn apply_change(&mut self, change: &Change) -> Result<()> {
         info!("Applying change: {}", change.id);
 
         let status = self.agent.run_apply(&change.id).await?;
@@ -426,7 +449,7 @@ impl Orchestrator {
     }
 
     /// Archive a change using the configured agent
-    async fn archive_change(&self, change: &Change) -> Result<()> {
+    async fn archive_change(&mut self, change: &Change) -> Result<()> {
         info!("Archiving change: {}", change.id);
 
         let status = self.agent.run_archive(&change.id).await?;
@@ -437,6 +460,9 @@ impl Orchestrator {
                 status.code()
             )));
         }
+
+        // Clear apply history for the archived change
+        self.agent.clear_apply_history(&change.id);
 
         info!("Successfully archived: {}", change.id);
         Ok(())
@@ -487,6 +513,7 @@ mod tests {
             completed_tasks: completed,
             total_tasks: total,
             last_modified: "1m ago".to_string(),
+            is_approved: false,
         }
     }
 
@@ -494,7 +521,7 @@ mod tests {
     fn test_filter_to_snapshot_filters_new_changes() {
         // Create orchestrator with mock config (won't be used in this test)
         let config = OrchestratorConfig::default();
-        let mut orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
+        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
 
         // Set up snapshot with only change-a and change-b
         let snapshot: HashSet<String> = ["change-a", "change-b"]
@@ -524,7 +551,7 @@ mod tests {
     fn test_filter_to_snapshot_returns_all_when_no_snapshot() {
         // Create orchestrator without setting snapshot
         let config = OrchestratorConfig::default();
-        let orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
+        let orchestrator = Orchestrator::with_config(None, config).unwrap();
 
         let all_changes = vec![
             create_test_change("change-a", 2, 5),
@@ -539,7 +566,7 @@ mod tests {
     #[test]
     fn test_filter_to_snapshot_removes_archived_changes() {
         let config = OrchestratorConfig::default();
-        let mut orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
+        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
 
         // Set up snapshot with change-a, change-b, change-c
         let snapshot: HashSet<String> = ["change-a", "change-b", "change-c"]
@@ -564,7 +591,7 @@ mod tests {
     #[test]
     fn test_filter_to_snapshot_handles_empty_changes() {
         let config = OrchestratorConfig::default();
-        let mut orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
+        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
 
         let snapshot: HashSet<String> = ["change-a"].iter().map(|s| s.to_string()).collect();
         orchestrator.set_initial_change_ids(snapshot);
@@ -579,7 +606,7 @@ mod tests {
     #[test]
     fn test_snapshot_preserves_updated_progress() {
         let config = OrchestratorConfig::default();
-        let mut orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
+        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
 
         // Set up snapshot with change-a
         let snapshot: HashSet<String> = ["change-a"].iter().map(|s| s.to_string()).collect();
@@ -598,7 +625,7 @@ mod tests {
     #[test]
     fn test_build_analysis_prompt_format() {
         let config = OrchestratorConfig::default();
-        let orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
+        let orchestrator = Orchestrator::with_config(None, config).unwrap();
 
         let changes = vec![
             create_test_change("add-feature", 2, 5),
@@ -625,7 +652,7 @@ mod tests {
     #[test]
     fn test_build_analysis_prompt_with_empty_changes() {
         let config = OrchestratorConfig::default();
-        let orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
+        let orchestrator = Orchestrator::with_config(None, config).unwrap();
 
         let changes: Vec<Change> = vec![];
         let prompt = orchestrator.build_analysis_prompt(&changes);
@@ -638,7 +665,7 @@ mod tests {
     #[test]
     fn test_build_analysis_prompt_with_single_change() {
         let config = OrchestratorConfig::default();
-        let orchestrator = Orchestrator::with_config("mock_openspec", None, config).unwrap();
+        let orchestrator = Orchestrator::with_config(None, config).unwrap();
 
         let changes = vec![create_test_change("only-change", 1, 3)];
         let prompt = orchestrator.build_analysis_prompt(&changes);
@@ -651,22 +678,46 @@ mod tests {
     #[test]
     fn test_orchestrator_creation() {
         let config = OrchestratorConfig::default();
-        let orchestrator = Orchestrator::with_config("test_openspec", None, config).unwrap();
+        let orchestrator = Orchestrator::with_config(None, config).unwrap();
 
-        assert_eq!(orchestrator.openspec_cmd, "test_openspec");
-        assert!(orchestrator.target_change.is_none());
+        assert!(orchestrator.target_changes.is_none());
         assert!(orchestrator.initial_change_ids.is_none());
         assert!(!orchestrator.first_apply_executed);
         assert_eq!(orchestrator.iteration, 0);
     }
 
     #[test]
-    fn test_orchestrator_with_target_change() {
+    fn test_orchestrator_with_single_target_change() {
         let config = OrchestratorConfig::default();
         let orchestrator =
-            Orchestrator::with_config("test_openspec", Some("my-change".to_string()), config)
-                .unwrap();
+            Orchestrator::with_config(Some(vec!["my-change".to_string()]), config).unwrap();
 
-        assert_eq!(orchestrator.target_change, Some("my-change".to_string()));
+        assert_eq!(
+            orchestrator.target_changes,
+            Some(vec!["my-change".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_orchestrator_with_multiple_target_changes() {
+        let config = OrchestratorConfig::default();
+        let orchestrator = Orchestrator::with_config(
+            Some(vec![
+                "change-a".to_string(),
+                "change-b".to_string(),
+                "change-c".to_string(),
+            ]),
+            config,
+        )
+        .unwrap();
+
+        assert_eq!(
+            orchestrator.target_changes,
+            Some(vec![
+                "change-a".to_string(),
+                "change-b".to_string(),
+                "change-c".to_string()
+            ])
+        );
     }
 }

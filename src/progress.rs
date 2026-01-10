@@ -98,6 +98,7 @@ mod tests {
             completed_tasks: completed,
             total_tasks: total,
             last_modified: "now".to_string(),
+            is_approved: false,
         }
     }
 

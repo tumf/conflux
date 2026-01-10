@@ -3,8 +3,8 @@
   // Template: Claude Code
   // Agent command configuration
   "analyze_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
-  "apply_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id}'",
-  "archive_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id}'",
+  "apply_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id} {prompt}'",
+  "archive_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id} {prompt}'",
   // Lifecycle hooks (optional)
   "hooks": {
     // "pre_apply": "echo 'Starting {change_id}'",

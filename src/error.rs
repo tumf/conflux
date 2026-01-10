@@ -8,9 +8,6 @@ pub enum OrchestratorError {
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("OpenSpec command failed: {0}")]
-    OpenSpecCommand(String),
-
     #[error("OpenCode command failed: {0}")]
     #[allow(dead_code)]
     OpenCodeCommand(String),

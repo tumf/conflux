@@ -34,14 +34,17 @@ pub enum Commands {
 
     /// Initialize a new configuration file
     Init(InitArgs),
+
+    /// Manage change approval status
+    Approve(ApproveArgs),
 }
 
 /// Arguments for the run subcommand
 #[derive(Parser, Debug)]
 pub struct RunArgs {
-    /// Process only the specified change
-    #[arg(long)]
-    pub change: Option<String>,
+    /// Process only the specified changes (comma-separated, e.g., --change a,b,c)
+    #[arg(long, value_delimiter = ',')]
+    pub change: Option<Vec<String>>,
 
     /// Path to custom configuration file (JSONC format)
     #[arg(long, short = 'c')]
@@ -98,6 +101,35 @@ pub struct InitArgs {
     /// Overwrite existing configuration file
     #[arg(long, short = 'f')]
     pub force: bool,
+}
+
+/// Arguments for the approve subcommand
+#[derive(Parser, Debug)]
+pub struct ApproveArgs {
+    #[command(subcommand)]
+    pub action: ApproveAction,
+}
+
+/// Approve subcommand actions
+#[derive(Subcommand, Debug)]
+pub enum ApproveAction {
+    /// Approve a change (create approved file with checksums)
+    Set {
+        /// The change ID to approve
+        change_id: String,
+    },
+
+    /// Unapprove a change (remove approved file)
+    Unset {
+        /// The change ID to unapprove
+        change_id: String,
+    },
+
+    /// Check approval status of a change
+    Status {
+        /// The change ID to check
+        change_id: String,
+    },
 }
 
 #[cfg(test)]
@@ -242,7 +274,54 @@ mod tests {
 
         match cli.command {
             Some(Commands::Run(args)) => {
-                assert_eq!(args.change, Some("add-feature-x".to_string()));
+                assert_eq!(args.change, Some(vec!["add-feature-x".to_string()]));
+            }
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_run_subcommand_multiple_changes_comma_separated() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--change", "a,b,c"]);
+
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert_eq!(
+                    args.change,
+                    Some(vec![
+                        "a".to_string(),
+                        "b".to_string(),
+                        "c".to_string()
+                    ])
+                );
+            }
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_run_subcommand_multiple_changes_with_spaces() {
+        // Test that spaces around commas are handled
+        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--change", "a, b, c"]);
+
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                // clap preserves spaces - trimming should be done by application logic if needed
+                assert!(args.change.is_some());
+                let changes = args.change.unwrap();
+                assert_eq!(changes.len(), 3);
+            }
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_run_subcommand_no_change_option() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "run"]);
+
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert!(args.change.is_none());
             }
             _ => panic!("Expected Run subcommand"),
         }

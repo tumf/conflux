@@ -6,7 +6,9 @@
 
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::history::{ApplyAttempt, ApplyHistory};
 use std::process::{ExitStatus, Stdio};
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -22,26 +24,64 @@ pub enum OutputLine {
 /// Manages agent process execution based on configuration
 pub struct AgentRunner {
     config: OrchestratorConfig,
+    /// History of apply attempts per change for context injection
+    apply_history: ApplyHistory,
 }
 
 impl AgentRunner {
     /// Create a new AgentRunner with the given configuration
     pub fn new(config: OrchestratorConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            apply_history: ApplyHistory::new(),
+        }
     }
 
-    /// Run apply command for the given change ID with output streaming
-    /// Returns a child process handle and a receiver for output lines
+    /// Run apply command for the given change ID with output streaming.
+    /// Returns a child process handle, a receiver for output lines, and a start time.
+    /// The caller is responsible for recording the attempt after the child completes
+    /// by calling `record_apply_attempt()`.
     pub async fn run_apply_streaming(
         &self,
         change_id: &str,
-    ) -> Result<(Child, mpsc::Receiver<OutputLine>)> {
+    ) -> Result<(Child, mpsc::Receiver<OutputLine>, Instant)> {
+        let start = Instant::now();
         let template = self.config.get_apply_command();
-        let prompt = self.config.get_apply_prompt();
+        let base_prompt = self.config.get_apply_prompt();
+        let history_context = self.apply_history.format_context(change_id);
+        let full_prompt = if history_context.is_empty() {
+            base_prompt.to_string()
+        } else {
+            format!("{}\n\n{}", base_prompt, history_context)
+        };
         let command = OrchestratorConfig::expand_change_id(template, change_id);
-        let command = OrchestratorConfig::expand_prompt(&command, prompt);
+        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
         info!("Running apply command: {}", command);
-        self.execute_shell_command_streaming(&command).await
+        let (child, rx) = self.execute_shell_command_streaming(&command).await?;
+        Ok((child, rx, start))
+    }
+
+    /// Record an apply attempt after streaming execution completes.
+    /// Call this after `run_apply_streaming()` child process finishes.
+    pub fn record_apply_attempt(
+        &mut self,
+        change_id: &str,
+        status: &ExitStatus,
+        start: Instant,
+    ) {
+        let duration = start.elapsed();
+        let attempt = ApplyAttempt {
+            attempt: self.apply_history.count(change_id) + 1,
+            success: status.success(),
+            duration,
+            error: if status.success() {
+                None
+            } else {
+                Some(format!("Exit code: {:?}", status.code()))
+            },
+            exit_code: status.code(),
+        };
+        self.apply_history.record(change_id, attempt);
     }
 
     /// Run archive command for the given change ID with output streaming
@@ -59,13 +99,45 @@ impl AgentRunner {
     }
 
     /// Run apply command for the given change ID (blocking, no streaming)
-    pub async fn run_apply(&self, change_id: &str) -> Result<ExitStatus> {
+    /// Records the attempt result in history for subsequent retries.
+    pub async fn run_apply(&mut self, change_id: &str) -> Result<ExitStatus> {
+        let start = Instant::now();
+
         let template = self.config.get_apply_command();
-        let prompt = self.config.get_apply_prompt();
+        let base_prompt = self.config.get_apply_prompt();
+        let history_context = self.apply_history.format_context(change_id);
+        let full_prompt = if history_context.is_empty() {
+            base_prompt.to_string()
+        } else {
+            format!("{}\n\n{}", base_prompt, history_context)
+        };
         let command = OrchestratorConfig::expand_change_id(template, change_id);
-        let command = OrchestratorConfig::expand_prompt(&command, prompt);
+        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
         info!("Running apply command: {}", command);
-        self.execute_shell_command(&command).await
+
+        let status = self.execute_shell_command(&command).await?;
+        let duration = start.elapsed();
+
+        // Record the attempt
+        let attempt = ApplyAttempt {
+            attempt: self.apply_history.count(change_id) + 1,
+            success: status.success(),
+            duration,
+            error: if status.success() {
+                None
+            } else {
+                Some(format!("Exit code: {:?}", status.code()))
+            },
+            exit_code: status.code(),
+        };
+        self.apply_history.record(change_id, attempt);
+
+        Ok(status)
+    }
+
+    /// Clear apply history for a change (call after archiving)
+    pub fn clear_apply_history(&mut self, change_id: &str) {
+        self.apply_history.clear(change_id);
     }
 
     /// Run archive command for the given change ID (blocking, no streaming)
@@ -356,7 +428,7 @@ mod tests {
             apply_command: Some("echo 'Applying {change_id}'".to_string()),
             ..Default::default()
         };
-        let runner = AgentRunner::new(config);
+        let mut runner = AgentRunner::new(config);
         let status = runner.run_apply("test-change").await.unwrap();
         assert!(status.success());
     }
@@ -390,7 +462,7 @@ mod tests {
             ..Default::default()
         };
         let runner = AgentRunner::new(config);
-        let (mut child, mut rx) = runner.run_apply_streaming("test-change").await.unwrap();
+        let (mut child, mut rx, _start) = runner.run_apply_streaming("test-change").await.unwrap();
 
         let mut lines = Vec::new();
         while let Some(line) = rx.recv().await {
@@ -410,7 +482,7 @@ mod tests {
             apply_prompt: Some("custom instructions".to_string()),
             ..Default::default()
         };
-        let runner = AgentRunner::new(config);
+        let mut runner = AgentRunner::new(config);
         let status = runner.run_apply("test-change").await.unwrap();
         assert!(status.success());
     }
@@ -435,7 +507,7 @@ mod tests {
             apply_command: Some("echo 'Apply {change_id} {prompt}'".to_string()),
             ..Default::default()
         };
-        let runner = AgentRunner::new(config);
+        let mut runner = AgentRunner::new(config);
         // Default apply_prompt should be used
         assert_eq!(
             runner.config().get_apply_prompt(),
@@ -471,7 +543,7 @@ mod tests {
             ..Default::default()
         };
         let runner = AgentRunner::new(config);
-        let (mut child, mut rx) = runner.run_apply_streaming("my-change").await.unwrap();
+        let (mut child, mut rx, _start) = runner.run_apply_streaming("my-change").await.unwrap();
 
         let mut lines = Vec::new();
         while let Some(line) = rx.recv().await {

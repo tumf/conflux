@@ -12,7 +12,7 @@ use crate::error::Result;
 use crate::openspec::Change;
 use chrono::Local;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
     execute,
     terminal::{Clear, ClearType},
 };
@@ -34,7 +34,7 @@ use unicode_width::UnicodeWidthStr;
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 5;
 
 /// Maximum number of log entries to keep
-const MAX_LOG_ENTRIES: usize = 100;
+const MAX_LOG_ENTRIES: usize = 1000;
 
 /// Spinner characters for processing animation (Braille dot pattern)
 const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -176,6 +176,8 @@ pub struct ChangeState {
     /// Last modified timestamp
     #[allow(dead_code)]
     pub last_modified: String,
+    /// Whether this change is approved for execution
+    pub is_approved: bool,
 }
 
 impl ChangeState {
@@ -189,6 +191,7 @@ impl ChangeState {
             is_new: false,
             queue_status: QueueStatus::NotQueued,
             last_modified: change.last_modified.clone(),
+            is_approved: change.is_approved,
         }
     }
 
@@ -274,6 +277,8 @@ pub enum TuiCommand {
     AddToQueue(String),
     /// Remove a change from the queue dynamically
     RemoveFromQueue(String),
+    /// Toggle approval status for a change
+    ToggleApproval(String),
     /// Stop processing (graceful shutdown)
     #[allow(dead_code)]
     Stop,
@@ -333,20 +338,41 @@ pub struct AppState {
     pub warning_message: Option<String>,
     /// Current spinner animation frame
     pub spinner_frame: usize,
+    /// Log scroll offset (0 = show most recent at bottom)
+    pub log_scroll_offset: usize,
+    /// Whether to auto-scroll logs to bottom on new entries
+    pub log_auto_scroll: bool,
 }
 
 impl AppState {
     /// Create a new AppState with initial changes
+    ///
+    /// Only approved changes are auto-selected on startup.
+    /// Unapproved changes start unselected.
     pub fn new(changes: Vec<Change>) -> Self {
         let known_ids: HashSet<String> = changes.iter().map(|c| c.id.clone()).collect();
+
+        // Auto-select only approved changes
         let change_states: Vec<ChangeState> = changes
             .iter()
-            .map(|c| ChangeState::from_change(c, true)) // Default: all selected
+            .map(|c| ChangeState::from_change(c, c.is_approved))
             .collect();
+
+        // Count auto-queued approved changes
+        let approved_count = change_states.iter().filter(|c| c.is_approved).count();
 
         let mut list_state = ListState::default();
         if !change_states.is_empty() {
             list_state.select(Some(0));
+        }
+
+        // Create initial log entries for auto-queued changes
+        let mut logs = Vec::new();
+        if approved_count > 0 {
+            logs.push(LogEntry::info(format!(
+                "Auto-queued {} approved change(s)",
+                approved_count
+            )));
         }
 
         Self {
@@ -356,13 +382,15 @@ impl AppState {
             list_state,
             current_change: None,
             error_change_id: None,
-            logs: Vec::new(),
+            logs,
             last_refresh: Instant::now(),
             new_change_count: 0,
             known_change_ids: known_ids,
             should_quit: false,
             warning_message: None,
             spinner_frame: 0,
+            log_scroll_offset: 0,
+            log_auto_scroll: true,
         }
     }
 
@@ -389,12 +417,28 @@ impl AppState {
     }
 
     /// Toggle selection of the current change
+    ///
+    /// In Select mode:
+    /// - Unapproved changes cannot be selected (shows warning)
+    /// - Approved changes can be toggled between selected/unselected
+    ///
+    /// In Running/Completed mode:
+    /// - Only approved changes can be added to queue
     pub fn toggle_selection(&mut self) -> Option<TuiCommand> {
         if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
             return None;
         }
 
         let change = &mut self.changes[self.cursor_index];
+
+        // Cannot select unapproved changes
+        if !change.is_approved {
+            self.warning_message = Some(format!(
+                "Cannot queue unapproved change '{}'. Press @ to approve first.",
+                change.id
+            ));
+            return None;
+        }
 
         match self.mode {
             AppMode::Select => {
@@ -491,6 +535,37 @@ impl AppState {
         self.changes.iter().filter(|c| c.selected).count()
     }
 
+    /// Toggle approval status for the current change
+    ///
+    /// Only available in Select mode. Returns a TuiCommand::ToggleApproval
+    /// to be processed by the main loop.
+    pub fn toggle_approval(&mut self) -> Option<TuiCommand> {
+        if self.mode != AppMode::Select {
+            return None;
+        }
+
+        if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
+            return None;
+        }
+
+        let change = &self.changes[self.cursor_index];
+        let id = change.id.clone();
+
+        Some(TuiCommand::ToggleApproval(id))
+    }
+
+    /// Update approval status for a specific change
+    pub fn update_approval_status(&mut self, change_id: &str, is_approved: bool) {
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            change.is_approved = is_approved;
+            let status_msg = if is_approved { "approved" } else { "unapproved" };
+            self.add_log(LogEntry::info(format!(
+                "Change '{}' {}",
+                change_id, status_msg
+            )));
+        }
+    }
+
     /// Retry error changes - resets error changes to queued and returns their IDs
     /// Returns None if not in Error mode or no error changes found
     pub fn retry_error_changes(&mut self) -> Option<TuiCommand> {
@@ -535,7 +610,45 @@ impl AppState {
         self.logs.push(entry);
         if self.logs.len() > MAX_LOG_ENTRIES {
             self.logs.remove(0);
+            // Adjust scroll offset if oldest logs are removed
+            if self.log_scroll_offset > 0 {
+                self.log_scroll_offset = self.log_scroll_offset.saturating_sub(1);
+            }
         }
+        // Auto-scroll to bottom if enabled
+        if self.log_auto_scroll {
+            self.log_scroll_offset = 0;
+        }
+    }
+
+    /// Scroll logs up by a page (show older entries)
+    pub fn scroll_logs_up(&mut self, page_size: usize) {
+        let max_offset = self.logs.len().saturating_sub(1);
+        self.log_scroll_offset = (self.log_scroll_offset + page_size).min(max_offset);
+        // Disable auto-scroll when user scrolls up
+        self.log_auto_scroll = false;
+    }
+
+    /// Scroll logs down by a page (show newer entries)
+    pub fn scroll_logs_down(&mut self, page_size: usize) {
+        self.log_scroll_offset = self.log_scroll_offset.saturating_sub(page_size);
+        // Re-enable auto-scroll when at bottom
+        if self.log_scroll_offset == 0 {
+            self.log_auto_scroll = true;
+        }
+    }
+
+    /// Jump to the oldest log entry (top of history)
+    pub fn scroll_logs_to_top(&mut self) {
+        let max_offset = self.logs.len().saturating_sub(1);
+        self.log_scroll_offset = max_offset;
+        self.log_auto_scroll = false;
+    }
+
+    /// Jump to the newest log entry (bottom) and re-enable auto-scroll
+    pub fn scroll_logs_to_bottom(&mut self) {
+        self.log_scroll_offset = 0;
+        self.log_auto_scroll = true;
     }
 
     /// Handle an event from the orchestrator
@@ -705,7 +818,13 @@ pub async fn run_tui(
 ) -> Result<()> {
     let mut terminal = ratatui::init();
 
+    // Enable mouse capture for scroll wheel support
+    execute!(std::io::stdout(), EnableMouseCapture)?;
+
     let result = run_tui_loop(&mut terminal, initial_changes, openspec_cmd, config).await;
+
+    // Disable mouse capture before restoring terminal
+    execute!(std::io::stdout(), DisableMouseCapture)?;
 
     // Clear screen before restoring terminal
     clear_screen()?;
@@ -781,8 +900,8 @@ async fn run_tui_loop(
 
         // Handle events with timeout
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     match (key.code, key.modifiers) {
                         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             app.should_quit = true;
@@ -796,6 +915,12 @@ async fn run_tui_loop(
                         }
                         (KeyCode::Char(' '), _) => {
                             if let Some(cmd) = app.toggle_selection() {
+                                let _ = cmd_tx.send(cmd).await;
+                            }
+                        }
+                        (KeyCode::Char('@'), _) => {
+                            // Toggle approval status
+                            if let Some(cmd) = app.toggle_approval() {
                                 let _ = cmd_tx.send(cmd).await;
                             }
                         }
@@ -836,11 +961,41 @@ async fn run_tui_loop(
                                 }
                             }
                         }
+                        (KeyCode::PageUp, _) => {
+                            // Scroll logs up (show older entries)
+                            app.scroll_logs_up(5);
+                        }
+                        (KeyCode::PageDown, _) => {
+                            // Scroll logs down (show newer entries)
+                            app.scroll_logs_down(5);
+                        }
+                        (KeyCode::Home, _) => {
+                            // Jump to oldest log entry
+                            app.scroll_logs_to_top();
+                        }
+                        (KeyCode::End, _) => {
+                            // Jump to newest log entry and re-enable auto-scroll
+                            app.scroll_logs_to_bottom();
+                        }
                         _ => {}
                     }
                     // Clear warning message on any key press
                     app.warning_message = None;
                 }
+                Event::Mouse(mouse) => {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            // Scroll logs up (show older entries) - 3 lines at a time
+                            app.scroll_logs_up(3);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            // Scroll logs down (show newer entries) - 3 lines at a time
+                            app.scroll_logs_down(3);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -869,6 +1024,35 @@ async fn run_tui_loop(
                 TuiCommand::RemoveFromQueue(id) => {
                     // Log the removal (orchestrator will see the updated status)
                     app.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
+                }
+                TuiCommand::ToggleApproval(id) => {
+                    // Toggle approval status using the approval module
+                    use crate::approval;
+
+                    let current_approved = app
+                        .changes
+                        .iter()
+                        .find(|c| c.id == id)
+                        .map(|c| c.is_approved)
+                        .unwrap_or(false);
+
+                    let result = if current_approved {
+                        approval::unapprove_change(&id)
+                    } else {
+                        approval::approve_change(&id)
+                    };
+
+                    match result {
+                        Ok(_) => {
+                            app.update_approval_status(&id, !current_approved);
+                        }
+                        Err(e) => {
+                            app.add_log(LogEntry::error(format!(
+                                "Failed to toggle approval for '{}': {}",
+                                id, e
+                            )));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -914,7 +1098,7 @@ enum ArchiveResult {
 async fn archive_single_change(
     change_id: &str,
     change: &Change,
-    agent: &AgentRunner,
+    agent: &mut AgentRunner,
     hooks: &crate::hooks::HookRunner,
     tx: &mpsc::Sender<OrchestratorEvent>,
     cancel_token: &CancellationToken,
@@ -1001,6 +1185,9 @@ async fn archive_single_change(
     })?;
 
     if status.success() {
+        // Clear apply history for the archived change
+        agent.clear_apply_history(change_id);
+
         // Run post_archive hook
         let post_archive_context =
             HookContext::new(context.iteration, context.total_changes, context.queue_size.saturating_sub(1), false)
@@ -1046,7 +1233,7 @@ async fn archive_single_change(
 async fn archive_all_complete_changes(
     pending_ids: &HashSet<String>,
     _openspec_cmd: &str, // Kept for API compatibility, native impl doesn't need it
-    agent: &AgentRunner,
+    agent: &mut AgentRunner,
     hooks: &crate::hooks::HookRunner,
     tx: &mpsc::Sender<OrchestratorEvent>,
     cancel_token: &CancellationToken,
@@ -1129,7 +1316,7 @@ async fn run_orchestrator(
     use crate::openspec;
 
     let hooks = HookRunner::new(config.get_hooks());
-    let agent = AgentRunner::new(config);
+    let mut agent = AgentRunner::new(config);
 
     let mut total_changes = change_ids.len();
     let mut iteration: u32 = 0;
@@ -1186,7 +1373,7 @@ async fn run_orchestrator(
         let archived_count = archive_all_complete_changes(
             &pending_changes,
             &openspec_cmd,
-            &agent,
+            &mut agent,
             &hooks,
             &tx,
             &cancel_token,
@@ -1315,7 +1502,7 @@ async fn run_orchestrator(
             .await;
 
         // Run apply command with streaming output
-        let (mut child, mut output_rx) = agent.run_apply_streaming(&change_id).await?;
+        let (mut child, mut output_rx, start_time) = agent.run_apply_streaming(&change_id).await?;
 
         // Stream output to TUI log, with cancellation support
         loop {
@@ -1358,6 +1545,9 @@ async fn run_orchestrator(
             ))
         })?;
 
+        // Record the apply attempt for history context in subsequent retries
+        agent.record_apply_attempt(&change_id, &status, start_time);
+
         if status.success() {
             // Run post_apply hook
             let post_apply_context =
@@ -1379,7 +1569,21 @@ async fn run_orchestrator(
                 break;
             }
 
-            // Apply succeeded - loop will re-check for complete changes in Phase 1
+            // Apply succeeded - check if tasks are now 100% complete
+            // Re-fetch change to get updated task counts after apply
+            let updated_changes = crate::openspec::list_changes_native().unwrap_or_default();
+            let is_complete = updated_changes
+                .iter()
+                .find(|c| c.id == change_id)
+                .is_some_and(|c| c.is_complete());
+
+            if is_complete {
+                // Only send ProcessingCompleted when tasks are 100% done
+                let _ = tx
+                    .send(OrchestratorEvent::ProcessingCompleted(change_id.clone()))
+                    .await;
+            }
+
             let _ = tx
                 .send(OrchestratorEvent::Log(LogEntry::info(format!(
                     "Apply completed for {}, checking for completion...",
@@ -1575,22 +1779,33 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
         .iter()
         .enumerate()
         .map(|(i, change)| {
-            let checkbox = if change.selected { "[x]" } else { "[ ]" };
+            // Checkbox display:
+            // [ ] - unapproved (cannot be selected)
+            // [@] - approved but not queued
+            // [x] - queued (approved and selected)
+            let (checkbox, checkbox_color) = if !change.is_approved {
+                ("[ ]", Color::DarkGray) // Unapproved
+            } else if change.selected {
+                ("[x]", Color::Green) // Queued
+            } else {
+                ("[@]", Color::Yellow) // Approved but not queued
+            };
+
             let cursor = if i == app.cursor_index { "►" } else { " " };
             let new_badge = if change.is_new { " NEW" } else { "" };
 
             let line = Line::from(vec![
                 Span::styled(
                     format!("{} {} ", checkbox, cursor),
-                    Style::default().fg(if change.selected {
-                        Color::Green
-                    } else {
-                        Color::White
-                    }),
+                    Style::default().fg(checkbox_color),
                 ),
                 Span::styled(
                     format!("{:<25}", change.id),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(if change.is_approved {
+                        Color::White
+                    } else {
+                        Color::DarkGray
+                    }),
                 ),
                 Span::styled(
                     new_badge,
@@ -1615,7 +1830,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Changes (↑↓: move, Space: toggle, F5: run, q/Ctrl+C: quit) ")
+                .title(" Changes (↑↓/jk: move, Space: queue, @: approve, F5: run, q: quit) ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         )
@@ -1780,18 +1995,26 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
     frame.render_widget(status, area);
 }
 
-/// Render logs panel
+/// Render logs panel with scroll support
 fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
     // Calculate available width for message (subtract borders, timestamp, and padding)
     // Timestamp format: "HH:MM:SS " = 9 chars, borders = 2 chars
     let available_width = (area.width as usize).saturating_sub(2 + 9 + 1);
 
+    // Calculate visible area height (subtract borders)
+    let visible_height = (area.height as usize).saturating_sub(2);
+    let total_logs = app.logs.len();
+
+    // Calculate the range of logs to display based on scroll offset
+    // scroll_offset = 0 means show the most recent logs at the bottom
+    let end_index = total_logs.saturating_sub(app.log_scroll_offset);
+    let start_index = end_index.saturating_sub(visible_height);
+
     let log_items: Vec<Line> = app
         .logs
         .iter()
-        .rev()
-        .take((area.height as usize).saturating_sub(2))
-        .rev()
+        .skip(start_index)
+        .take(end_index - start_index)
         .map(|entry| {
             // Truncate message to fit in available width using Unicode display width
             // This correctly handles CJK characters that occupy 2 terminal columns
@@ -1807,9 +2030,18 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
         })
         .collect();
 
+    // Build title with scroll position indicator
+    let title = if total_logs > visible_height {
+        let visible_start = start_index + 1;
+        let visible_end = end_index;
+        format!(" Logs [{}-{}/{}] ", visible_start, visible_end, total_logs)
+    } else {
+        " Logs ".to_string()
+    };
+
     let logs = Paragraph::new(log_items).block(
         Block::default()
-            .title(" Logs ")
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Blue)),
     );
@@ -1907,11 +2139,23 @@ mod tests {
             completed_tasks: completed,
             total_tasks: total,
             last_modified: "now".to_string(),
+            is_approved: false,
+        }
+    }
+
+    fn create_approved_change(id: &str, completed: u32, total: u32) -> Change {
+        Change {
+            id: id.to_string(),
+            completed_tasks: completed,
+            total_tasks: total,
+            last_modified: "now".to_string(),
+            is_approved: true,
         }
     }
 
     #[test]
-    fn test_app_state_new() {
+    fn test_app_state_new_unapproved_not_selected() {
+        // Unapproved changes should NOT be selected on startup
         let changes = vec![
             create_test_change("change-a", 2, 5),
             create_test_change("change-b", 0, 3),
@@ -1922,8 +2166,40 @@ mod tests {
         assert_eq!(app.mode, AppMode::Select);
         assert_eq!(app.changes.len(), 2);
         assert_eq!(app.cursor_index, 0);
-        assert!(app.changes[0].selected);
-        assert!(app.changes[1].selected);
+        assert!(!app.changes[0].selected); // Unapproved = not selected
+        assert!(!app.changes[1].selected); // Unapproved = not selected
+    }
+
+    #[test]
+    fn test_app_state_new_approved_auto_selected() {
+        // Approved changes should be auto-selected on startup
+        let changes = vec![
+            create_approved_change("change-a", 2, 5),
+            create_test_change("change-b", 0, 3), // Unapproved
+        ];
+
+        let app = AppState::new(changes);
+
+        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.changes.len(), 2);
+        assert!(app.changes[0].selected); // Approved = selected
+        assert!(!app.changes[1].selected); // Unapproved = not selected
+        // Should have log entry for auto-queued changes
+        assert!(app.logs.iter().any(|log| log.message.contains("Auto-queued")));
+    }
+
+    #[test]
+    fn test_app_state_new_no_auto_queue_log_when_none_approved() {
+        // No auto-queue log when no changes are approved
+        let changes = vec![
+            create_test_change("change-a", 2, 5),
+            create_test_change("change-b", 0, 3),
+        ];
+
+        let app = AppState::new(changes);
+
+        // Should NOT have auto-queue log entry
+        assert!(!app.logs.iter().any(|log| log.message.contains("Auto-queued")));
     }
 
     #[test]
@@ -1953,7 +2229,8 @@ mod tests {
 
     #[test]
     fn test_toggle_selection() {
-        let changes = vec![create_test_change("a", 0, 1)];
+        // Use approved change so it starts selected
+        let changes = vec![create_approved_change("a", 0, 1)];
 
         let mut app = AppState::new(changes);
 
@@ -1968,10 +2245,11 @@ mod tests {
 
     #[test]
     fn test_selected_count() {
+        // Use approved changes so they start selected
         let changes = vec![
-            create_test_change("a", 0, 1),
-            create_test_change("b", 0, 1),
-            create_test_change("c", 0, 1),
+            create_approved_change("a", 0, 1),
+            create_approved_change("b", 0, 1),
+            create_approved_change("c", 0, 1),
         ];
 
         let mut app = AppState::new(changes);
@@ -1984,7 +2262,8 @@ mod tests {
 
     #[test]
     fn test_start_processing_with_selection() {
-        let changes = vec![create_test_change("a", 0, 1)];
+        // Use approved change so it starts selected
+        let changes = vec![create_approved_change("a", 0, 1)];
 
         let mut app = AppState::new(changes);
 
@@ -2035,6 +2314,7 @@ mod tests {
             selected: false,
             is_new: false,
             last_modified: "now".to_string(),
+            is_approved: false,
         };
 
         assert_eq!(change.progress_percent(), 50.0);
@@ -2054,7 +2334,8 @@ mod tests {
 
     #[test]
     fn test_toggle_selection_removes_from_queue_in_running_mode() {
-        let changes = vec![create_test_change("a", 0, 1)];
+        // Use approved change so it starts selected
+        let changes = vec![create_approved_change("a", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Start processing to enter Running mode
@@ -2071,7 +2352,8 @@ mod tests {
 
     #[test]
     fn test_toggle_selection_adds_to_queue_after_removal_in_running_mode() {
-        let changes = vec![create_test_change("a", 0, 1)];
+        // Use approved change so it starts selected
+        let changes = vec![create_approved_change("a", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Start processing to enter Running mode
@@ -2091,7 +2373,8 @@ mod tests {
 
     #[test]
     fn test_toggle_selection_does_nothing_for_processing_status() {
-        let changes = vec![create_test_change("a", 0, 1)];
+        // Use approved change so it starts selected
+        let changes = vec![create_approved_change("a", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Start processing and set the change to Processing status
@@ -2106,7 +2389,8 @@ mod tests {
 
     #[test]
     fn test_toggle_selection_does_nothing_for_completed_status() {
-        let changes = vec![create_test_change("a", 0, 1)];
+        // Use approved change so it starts selected
+        let changes = vec![create_approved_change("a", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Start processing and set the change to Completed status
@@ -2121,7 +2405,8 @@ mod tests {
 
     #[test]
     fn test_toggle_selection_does_nothing_for_archived_status() {
-        let changes = vec![create_test_change("a", 0, 1)];
+        // Use approved change so it starts selected
+        let changes = vec![create_approved_change("a", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Start processing and set the change to Archived status
@@ -2136,7 +2421,8 @@ mod tests {
 
     #[test]
     fn test_toggle_selection_does_nothing_for_error_status() {
-        let changes = vec![create_test_change("a", 0, 1)];
+        // Use approved change so it starts selected
+        let changes = vec![create_approved_change("a", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Start processing and set the change to Error status
@@ -2151,7 +2437,8 @@ mod tests {
 
     #[test]
     fn test_processing_error_transitions_to_error_mode() {
-        let changes = vec![create_test_change("a", 0, 1)];
+        // Use approved change so it starts selected
+        let changes = vec![create_approved_change("a", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Start processing
@@ -2173,7 +2460,11 @@ mod tests {
 
     #[test]
     fn test_retry_error_changes_from_error_mode() {
-        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 2)];
+        // Use approved changes so they start selected
+        let changes = vec![
+            create_approved_change("a", 0, 1),
+            create_approved_change("b", 0, 2),
+        ];
         let mut app = AppState::new(changes);
 
         // Start processing
@@ -2220,7 +2511,8 @@ mod tests {
 
     #[test]
     fn test_retry_error_changes_does_nothing_when_no_errors() {
-        let changes = vec![create_test_change("a", 0, 1)];
+        // Use approved change so it starts selected
+        let changes = vec![create_approved_change("a", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Start processing and set mode to Error manually
@@ -2364,7 +2656,11 @@ mod tests {
 
     #[test]
     fn test_footer_message_when_changes_selected() {
-        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 2)];
+        // Use approved changes so they start selected
+        let changes = vec![
+            create_approved_change("a", 0, 1),
+            create_approved_change("b", 0, 2),
+        ];
         let app = AppState::new(changes);
 
         assert!(!app.changes.is_empty());
@@ -2374,9 +2670,10 @@ mod tests {
 
     #[test]
     fn test_progress_calculation_during_running() {
+        // Use approved changes so they start selected
         let changes = vec![
-            create_test_change("a", 2, 5), // 2/5 done
-            create_test_change("b", 3, 3), // 3/3 done
+            create_approved_change("a", 2, 5), // 2/5 done
+            create_approved_change("b", 3, 3), // 3/3 done
         ];
         let mut app = AppState::new(changes);
 
@@ -2408,9 +2705,10 @@ mod tests {
 
     #[test]
     fn test_progress_calculation_includes_completed_changes() {
+        // Use approved changes so they start selected
         let changes = vec![
-            create_test_change("a", 2, 5), // 2/5 done, will be Processing
-            create_test_change("b", 3, 3), // 3/3 done, will be Completed
+            create_approved_change("a", 2, 5), // 2/5 done, will be Processing
+            create_approved_change("b", 3, 3), // 3/3 done, will be Completed
         ];
         let mut app = AppState::new(changes);
 
@@ -2444,9 +2742,10 @@ mod tests {
 
     #[test]
     fn test_progress_calculation_includes_archived_changes() {
+        // Use approved changes so they start selected
         let changes = vec![
-            create_test_change("a", 2, 5), // 2/5 done, will be Processing
-            create_test_change("b", 3, 3), // 3/3 done, will be Archived
+            create_approved_change("a", 2, 5), // 2/5 done, will be Processing
+            create_approved_change("b", 3, 3), // 3/3 done, will be Archived
         ];
         let mut app = AppState::new(changes);
 
@@ -2480,9 +2779,10 @@ mod tests {
 
     #[test]
     fn test_progress_calculation_excludes_not_queued() {
+        // Use approved changes so they start selected
         let changes = vec![
-            create_test_change("a", 2, 5), // 2/5 done, will be Processing
-            create_test_change("b", 3, 3), // 3/3 done, will be NotQueued
+            create_approved_change("a", 2, 5), // 2/5 done, will be Processing
+            create_approved_change("b", 3, 3), // 3/3 done, will be NotQueued
         ];
         let mut app = AppState::new(changes);
 
@@ -2661,6 +2961,7 @@ mod tests {
             selected: true,
             is_new: false,
             last_modified: "now".to_string(),
+            is_approved: false,
         };
 
         // Verify completed status format (no task count - shown in separate column)
@@ -2868,5 +3169,85 @@ mod tests {
 
         // Reflected in both
         assert!(queue1.is_empty().await);
+    }
+
+    // Log scroll tests
+
+    #[test]
+    fn test_scroll_logs_to_top() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Add some log entries
+        for i in 0..10 {
+            app.add_log(LogEntry::info(format!("Log entry {}", i)));
+        }
+
+        // Initially at bottom with auto-scroll enabled
+        assert_eq!(app.log_scroll_offset, 0);
+        assert!(app.log_auto_scroll);
+
+        // Scroll to top
+        app.scroll_logs_to_top();
+
+        // Should be at max offset (oldest logs) with auto-scroll disabled
+        assert_eq!(app.log_scroll_offset, app.logs.len().saturating_sub(1));
+        assert!(!app.log_auto_scroll);
+    }
+
+    #[test]
+    fn test_scroll_logs_to_bottom() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Add some log entries
+        for i in 0..10 {
+            app.add_log(LogEntry::info(format!("Log entry {}", i)));
+        }
+
+        // Scroll up first
+        app.scroll_logs_up(5);
+        assert_eq!(app.log_scroll_offset, 5);
+        assert!(!app.log_auto_scroll);
+
+        // Scroll to bottom
+        app.scroll_logs_to_bottom();
+
+        // Should be at offset 0 (newest logs) with auto-scroll enabled
+        assert_eq!(app.log_scroll_offset, 0);
+        assert!(app.log_auto_scroll);
+    }
+
+    #[test]
+    fn test_scroll_logs_to_top_empty_logs() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Clear logs
+        app.logs.clear();
+
+        // Scroll to top should handle empty logs gracefully
+        app.scroll_logs_to_top();
+
+        // With no logs, max_offset should be 0 (saturating_sub on len=0)
+        assert_eq!(app.log_scroll_offset, 0);
+        assert!(!app.log_auto_scroll);
+    }
+
+    #[test]
+    fn test_scroll_logs_to_top_single_log() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Clear and add single log
+        app.logs.clear();
+        app.add_log(LogEntry::info("Single log entry".to_string()));
+
+        // Scroll to top
+        app.scroll_logs_to_top();
+
+        // With single log, max_offset should be 0
+        assert_eq!(app.log_scroll_offset, 0);
+        assert!(!app.log_auto_scroll);
     }
 }
