@@ -26,7 +26,3 @@
 - [ ] 5.1 Update `src/tui/mod.rs` with final re-exports
 - [ ] 5.2 Remove old `src/tui.rs` and update external imports
 - [ ] 5.3 Migrate tests to appropriate submodules
-
-## 6. Validation
-
-- [ ] 6.1 Run `cargo fmt && cargo clippy -- -D warnings && cargo test && cargo build --release`
