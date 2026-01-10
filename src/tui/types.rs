@@ -27,8 +27,6 @@ pub enum AppMode {
     Stopping,
     /// Stopped mode - processing halted, can modify queue
     Stopped,
-    /// Completed mode - all processing finished
-    Completed,
     /// Error mode - an error occurred during processing
     Error,
 }

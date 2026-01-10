@@ -32,12 +32,6 @@ TUIの選択モードで `e` キーを押すと、カーソル位置のchangeデ
 - **THEN** エディタは起動しない
 - **AND** TUIの表示は変更されない
 
-#### Scenario: 完了モードではエディタ起動不可
-
-- **GIVEN** TUIがCompletedモードである
-- **WHEN** ユーザーが `e` キーを押す
-- **THEN** エディタは起動しない
-
 #### Scenario: エラーモードではエディタ起動不可
 
 - **GIVEN** TUIがErrorモードである

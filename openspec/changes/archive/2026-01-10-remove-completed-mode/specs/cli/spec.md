@@ -1,18 +1,5 @@
 # cli Specification Delta
 
-## REMOVED Requirements
-
-### Requirement: Completed mode
-
-The `Completed` mode SHALL be removed. After all processing completes, TUI returns to `Select` mode.
-
-#### Scenario: Completed mode no longer exists
-
-- **GIVEN** TUI has processed all queued changes
-- **WHEN** the last change completes
-- **THEN** TUI does not enter Completed mode
-- **AND** TUI enters Select mode instead
-
 ## ADDED Requirements
 
 ### Requirement: Log-based layout rendering
@@ -44,17 +31,3 @@ TUI layout SHALL be determined by log existence, not by mode.
 - **AND** completion message is added to logs
 - **AND** log panel remains visible (logs exist)
 
-## MODIFIED Requirements
-
-### Requirement: Mode transitions
-
-The `AllCompleted` event SHALL transition to `Select` mode instead of `Completed` mode.
-
-#### Scenario: All processing completed
-
-- **GIVEN** TUI is in Running mode
-- **AND** all queued changes are processed
-- **WHEN** AllCompleted event is received
-- **THEN** mode changes to Select (not Completed)
-- **AND** user can immediately select more changes
-- **AND** user can launch editor with `e` key

@@ -1,45 +1,44 @@
 ## ADDED Requirements
 
+### Requirement: jj Repository Detection
+
+The CLI SHALL detect whether the current directory is a jj-managed repository by checking for the `.jj` directory.
+
+#### Scenario: jj repository detected
+- **WHEN** a `.jj` directory exists in the current working directory
+- **THEN** jj features (parallel mode) are available
+
+#### Scenario: jj repository not detected
+- **WHEN** no `.jj` directory exists in the current working directory
+- **AND** user runs `openspec-orchestrator run --parallel`
+- **THEN** the command exits with a non-zero exit code
+- **AND** an error message is displayed: "Error: --parallel requires a jj repository (.jj directory not found)"
+
 ### Requirement: Parallel Execution Mode Flag
 
-The CLI SHALL support a `--parallel` flag to enable parallel change execution using jj workspaces.
+The CLI SHALL support a `--parallel` flag to enable parallel change execution using jj workspaces. Parallel mode is OFF by default.
 
 #### Scenario: Enable parallel mode via CLI flag
 - **WHEN** user runs `openspec-orchestrator run --parallel`
+- **AND** a `.jj` directory exists
 - **THEN** the orchestrator enters parallel execution mode
 - **AND** changes are analyzed for parallelization opportunities
 
-#### Scenario: Parallel mode requires jj
+#### Scenario: Parallel mode disabled by default
+- **WHEN** user runs `openspec-orchestrator run` without `--parallel` flag
+- **THEN** the orchestrator uses sequential execution mode
+- **AND** no parallelization analysis is performed
+
+#### Scenario: Parallel mode requires jj directory
 - **WHEN** user runs `openspec-orchestrator run --parallel`
-- **AND** jj is not installed or not detected
-- **THEN** the command exits with an error
-- **AND** an error message indicates jj is required for parallel mode
+- **AND** no `.jj` directory exists
+- **THEN** the command exits with error code 1
+- **AND** an error message indicates jj repository is required for parallel mode
 
 #### Scenario: Parallel mode with max concurrent limit
 - **WHEN** user runs `openspec-orchestrator run --parallel --max-concurrent 4`
 - **THEN** at most 4 workspaces are created simultaneously
 - **AND** additional changes wait until a workspace becomes available
-
-### Requirement: Parallel Mode Conflict Strategy Flag
-
-The CLI SHALL support a `--conflict-strategy` flag to specify how merge conflicts are handled.
-
-#### Scenario: Fail on conflict (default)
-- **WHEN** user runs `openspec-orchestrator run --parallel`
-- **AND** no `--conflict-strategy` is specified
-- **THEN** the orchestrator stops on first merge conflict
-- **AND** workspace state is preserved for inspection
-
-#### Scenario: Skip conflicting changes
-- **WHEN** user runs `openspec-orchestrator run --parallel --conflict-strategy skip`
-- **AND** a merge conflict occurs
-- **THEN** the conflicting change is skipped
-- **AND** processing continues with remaining changes
-
-#### Scenario: Resolve conflicts with AI
-- **WHEN** user runs `openspec-orchestrator run --parallel --conflict-strategy resolve`
-- **AND** a merge conflict occurs
-- **THEN** the configured `resolve_command` is executed to resolve the conflict
 
 ### Requirement: Parallel Mode TUI Display
 

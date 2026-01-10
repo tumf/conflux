@@ -242,8 +242,8 @@ impl AppState {
                     _ => None,
                 }
             }
-            AppMode::Completed | AppMode::Stopped => {
-                // Allow queue modifications in Completed/Stopped mode (same as Running)
+            AppMode::Stopped => {
+                // Allow queue modifications in Stopped mode (same as Running)
                 match &change.queue_status {
                     QueueStatus::NotQueued => {
                         change.queue_status = QueueStatus::Queued;
@@ -268,7 +268,7 @@ impl AppState {
 
     /// Start processing selected changes
     pub fn start_processing(&mut self) -> Option<TuiCommand> {
-        if self.mode != AppMode::Select && self.mode != AppMode::Completed {
+        if self.mode != AppMode::Select {
             return None;
         }
 
@@ -326,8 +326,8 @@ impl AppState {
         let is_approved = change.is_approved;
 
         match self.mode {
-            AppMode::Select | AppMode::Completed | AppMode::Stopped => {
-                // In select/completed/stopped mode:
+            AppMode::Select | AppMode::Stopped => {
+                // In select/stopped mode:
                 // [ ] (unapproved) → @ → [x] (approved + selected)
                 // [x] (approved + selected) → @ → [ ] (unapproved + not selected)
                 if !is_approved {
@@ -499,10 +499,10 @@ impl AppState {
                 self.current_change = None;
             }
             OrchestratorEvent::AllCompleted => {
-                self.mode = AppMode::Completed;
+                self.mode = AppMode::Select;
                 self.current_change = None;
                 self.stop_mode = StopMode::None;
-                self.add_log(LogEntry::success("All changes processed"));
+                self.add_log(LogEntry::success("All changes processed successfully"));
             }
             OrchestratorEvent::Stopped => {
                 self.mode = AppMode::Stopped;

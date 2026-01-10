@@ -1,81 +1,105 @@
 ## 1. Core Infrastructure
 
-- [ ] 1.1 Add `jj` detection utility function (check if jj is installed and repo is jj-managed)
-- [ ] 1.2 Create `src/jj_workspace.rs` module with `JjWorkspaceManager` struct
-- [ ] 1.3 Implement workspace creation: `jj workspace add <path> -r @`
-- [ ] 1.4 Implement workspace cleanup: `jj workspace forget` + directory removal
-- [ ] 1.5 Implement revision retrieval: `jj log -r @ --no-graph -T change_id`
-- [ ] 1.6 Add jj-specific error types to `src/error.rs` (`JjCommand`, `JjConflict`, `Workspace`)
+- [ ] 1.1 Add jj directory detection function (`check_jj_directory()` - checks for `.jj` directory existence)
+- [ ] 1.2 Add `jj` command availability check (`check_jj_available()` - checks if jj CLI is installed)
+- [ ] 1.3 Create `src/jj_workspace.rs` module with `JjWorkspaceManager` struct (partially exists)
+- [ ] 1.4 Implement workspace creation: `jj workspace add <path> --name <name>`
+- [ ] 1.5 Implement workspace cleanup: `jj workspace forget` + directory removal
+- [ ] 1.6 Implement revision retrieval: `jj log -r @ --no-graph -T change_id`
+- [ ] 1.7 Add jj-specific error types to `src/error.rs` (`JjCommand`, `JjConflict`, `JjNotAvailable`)
 
 ## 2. Parallelization Analyzer
 
 - [ ] 2.1 Create `src/analyzer.rs` module with `ParallelizationAnalyzer` struct
-- [ ] 2.2 Define `AnalysisResult` and `ParallelGroup` data structures
-- [ ] 2.3 Build parallelization prompt for LLM (list changes, request JSON grouping)
-- [ ] 2.4 Parse LLM JSON response to `ParallelGroup` structs
-- [ ] 2.5 Implement topological sort for group execution order
-- [ ] 2.6 Add validation for LLM response (all change IDs must exist)
+- [ ] 2.2 Define `AnalysisResult`, `ParallelGroup`, and dependency structures
+- [ ] 2.3 Build parallelization prompt for LLM (list changes, request JSON grouping with dependencies)
+- [ ] 2.4 Parse LLM JSON response to `ParallelGroup` structs with `depends_on` field
+- [ ] 2.5 Implement topological sort for group execution order based on dependencies
+- [ ] 2.6 Add circular dependency detection with error reporting
+- [ ] 2.7 Add validation for LLM response (all change IDs must exist, valid depends_on references)
 
 ## 3. Configuration Extension
 
-- [ ] 3.1 Add parallel config fields to `OrchestratorConfig`: `parallel_mode`, `max_concurrent_workspaces`, `workspace_base_dir`, `conflict_strategy`, `resolve_command`
-- [ ] 3.2 Implement `ConflictStrategy` enum: `Fail`, `Skip`, `Resolve`
-- [ ] 3.3 Add default values for parallel config options
-- [ ] 3.4 Update config templates (claude, opencode, codex) with commented parallel options
+- [ ] 3.1 Add parallel config fields to `OrchestratorConfig`: `parallel_mode` (default: false), `max_concurrent_workspaces`, `workspace_base_dir`
+- [ ] 3.2 Ensure `parallel_mode` defaults to `false` (off by default)
+- [ ] 3.3 Update config templates (claude, opencode, codex) with commented parallel options
 
 ## 4. CLI Extension
 
 - [ ] 4.1 Add `--parallel` flag to `run` subcommand
-- [ ] 4.2 Add `--max-concurrent` option
-- [ ] 4.3 Add `--conflict-strategy` option
+- [ ] 4.2 Add jj directory check at `run --parallel` startup (exit with error if `.jj` not found)
+- [ ] 4.3 Add `--max-concurrent` option
 - [ ] 4.4 Add `--dry-run` flag for parallel mode preview
+- [ ] 4.5 Display clear error message when `--parallel` used without jj repository
 
-## 5. Parallel Executor
+## 5. TUI Extension
 
-- [ ] 5.1 Create `src/parallel_executor.rs` module
-- [ ] 5.2 Define `ParallelEvent` enum for progress reporting
-- [ ] 5.3 Implement group execution with `tokio::task::JoinSet`
-- [ ] 5.4 Add semaphore-based concurrency limiting
-- [ ] 5.5 Implement workspace-scoped apply command execution
-- [ ] 5.6 Implement merge logic: `jj new <rev1> <rev2> ... -m "Merge"`
-- [ ] 5.7 Implement conflict detection and handling per strategy
-- [ ] 5.8 Add `resolve_command` execution for conflict resolution
+- [ ] 5.1 Add jj detection at TUI startup (cache `jj_available` flag)
+- [ ] 5.2 Add `=` key handler for parallel mode toggle
+- [ ] 5.3 Conditionally show `=: parallel` in help text only when jj available
+- [ ] 5.4 Block parallel toggle in Running/Stopping modes with warning message
+- [ ] 5.5 Add `[parallel]` badge to header when parallel mode enabled
+- [ ] 5.6 Add parallel mode state to `AppState`
 
-## 6. Orchestrator Integration
+## 6. Parallel Executor
 
-- [ ] 6.1 Add `run_parallel()` method to `Orchestrator`
-- [ ] 6.2 Implement mode selection based on config/CLI flag
-- [ ] 6.3 Add event handling for parallel execution events
-- [ ] 6.4 Implement jj detection check at orchestrator startup
-- [ ] 6.5 Integrate parallelization analysis into main loop
+- [ ] 6.1 Create `src/parallel_executor.rs` module
+- [ ] 6.2 Define `ParallelEvent` enum for progress reporting
+- [ ] 6.3 Implement group execution with `tokio::task::JoinSet`
+- [ ] 6.4 Add semaphore-based concurrency limiting
+- [ ] 6.5 Implement workspace-scoped apply command execution
+- [ ] 6.6 Implement merge logic: `jj new <rev1> <rev2> ... -m "Merge"`
+- [ ] 6.7 Implement conflict detection via `jj status` parsing
+- [ ] 6.8 Implement automatic conflict resolution with hardcoded prompt
+- [ ] 6.9 Add retry logic for conflict resolution (max 3 retries)
 
-## 7. TUI Updates
+## 7. Automatic Conflict Resolution
 
-- [ ] 7.1 Add `ParallelState` tracking struct
-- [ ] 7.2 Update `QueueStatus` enum with parallel-specific statuses
-- [ ] 7.3 Implement parallel group display in change list
-- [ ] 7.4 Add multi-spinner support for concurrent processing
-- [ ] 7.5 Add merge progress indicator
-- [ ] 7.6 Add workspace status column/indicator
+- [ ] 7.1 Implement `detect_conflicts()` function (parse `jj status` output)
+- [ ] 7.2 Implement `build_conflict_resolution_prompt()` with hardcoded template
+- [ ] 7.3 Execute AI agent (apply_command) with conflict resolution prompt
+- [ ] 7.4 Verify resolution success via `jj status`
+- [ ] 7.5 Preserve workspace state on resolution failure for manual inspection
 
-## 8. Hooks Extension (Optional)
+## 8. Orchestrator Integration
 
-- [ ] 8.1 Add `PreParallelGroup` hook
-- [ ] 8.2 Add `PostParallelGroup` hook
-- [ ] 8.3 Add `PreMerge` and `PostMerge` hooks
-- [ ] 8.4 Add `OnMergeConflict` hook
+- [ ] 8.1 Add `run_parallel()` method to `Orchestrator`
+- [ ] 8.2 Implement mode selection based on config/CLI flag/TUI toggle
+- [ ] 8.3 Add event handling for parallel execution events
+- [ ] 8.4 Integrate jj detection check at orchestrator startup
+- [ ] 8.5 Integrate parallelization analysis into main loop
 
-## 9. Testing
+## 9. TUI Parallel Display
 
-- [ ] 9.1 Unit tests for `JjWorkspaceManager` (mock jj commands)
-- [ ] 9.2 Unit tests for `ParallelizationAnalyzer` (LLM response parsing)
-- [ ] 9.3 Unit tests for topological sort
-- [ ] 9.4 Integration tests for parallel execution flow
-- [ ] 9.5 Test conflict detection and each conflict strategy
+- [ ] 9.1 Add `ParallelState` tracking struct
+- [ ] 9.2 Update `QueueStatus` enum with parallel-specific statuses
+- [ ] 9.3 Implement parallel group display in change list
+- [ ] 9.4 Add multi-spinner support for concurrent processing
+- [ ] 9.5 Add merge progress indicator
+- [ ] 9.6 Add workspace status column/indicator
+- [ ] 9.7 Add conflict resolution status display
 
-## 10. Documentation
+## 10. Hooks Extension (Optional)
 
-- [ ] 10.1 Update README with parallel mode documentation
-- [ ] 10.2 Add jj installation requirements
-- [ ] 10.3 Document conflict resolution strategies
-- [ ] 10.4 Add troubleshooting guide for common issues
+- [ ] 10.1 Add `PreParallelGroup` hook
+- [ ] 10.2 Add `PostParallelGroup` hook
+- [ ] 10.3 Add `PreMerge` and `PostMerge` hooks
+- [ ] 10.4 Add `OnConflictResolution` hook
+
+## 11. Testing
+
+- [ ] 11.1 Unit tests for jj directory detection
+- [ ] 11.2 Unit tests for `JjWorkspaceManager` (mock jj commands)
+- [ ] 11.3 Unit tests for `ParallelizationAnalyzer` (LLM response parsing)
+- [ ] 11.4 Unit tests for topological sort and circular dependency detection
+- [ ] 11.5 Integration tests for CLI `--parallel` flag with jj requirement
+- [ ] 11.6 Integration tests for TUI `=` key toggle behavior
+- [ ] 11.7 Test conflict detection and automatic resolution flow
+
+## 12. Documentation
+
+- [ ] 12.1 Update README with parallel mode documentation
+- [ ] 12.2 Add jj installation requirements section
+- [ ] 12.3 Document automatic conflict resolution behavior
+- [ ] 12.4 Add troubleshooting guide for common issues
+- [ ] 12.5 Document dependency analysis output format

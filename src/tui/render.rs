@@ -29,13 +29,11 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
         return;
     }
 
-    match app.mode {
-        AppMode::Select => render_select_mode(frame, app, area),
-        AppMode::Running
-        | AppMode::Stopping
-        | AppMode::Stopped
-        | AppMode::Completed
-        | AppMode::Error => render_running_mode(frame, app, area),
+    // Show logs panel when logs exist, regardless of mode
+    if app.logs.is_empty() {
+        render_select_mode(frame, app, area);
+    } else {
+        render_running_mode(frame, app, area);
     }
 }
 
@@ -88,7 +86,6 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Running => "Running",
         AppMode::Stopping => "Stopping...",
         AppMode::Stopped => "Stopped",
-        AppMode::Completed => "Completed",
         AppMode::Error => "Error",
     };
 
@@ -97,7 +94,6 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Running => Color::Yellow,
         AppMode::Stopping => Color::Yellow,
         AppMode::Stopped => Color::DarkGray,
-        AppMode::Completed => Color::Green,
         AppMode::Error => Color::Red,
     };
 
@@ -316,12 +312,22 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
 /// Render status panel
 fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
+    // Check if all queued changes have completed
+    let all_completed = !app.logs.is_empty()
+        && app.mode == AppMode::Select
+        && app.changes.iter().any(|c| {
+            matches!(
+                c.queue_status,
+                QueueStatus::Completed | QueueStatus::Archived
+            )
+        });
+
     let (current_text, current_color) = match app.mode {
         AppMode::Error => {
             let error_id = app.error_change_id.as_deref().unwrap_or("unknown");
             (format!("Error in: {}", error_id), Color::Red)
         }
-        AppMode::Completed => ("Done".to_string(), Color::Green),
+        AppMode::Select if all_completed => ("Done".to_string(), Color::Green),
         _ => match &app.current_change {
             Some(id) => (format!("Current: {}", id), Color::White),
             None => ("Waiting...".to_string(), Color::White),
@@ -329,7 +335,10 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
     };
 
     let (status_text, status_color) = match app.mode {
-        AppMode::Completed => ("All processing completed. Press 'q' to quit.", Color::Green),
+        AppMode::Select if all_completed => (
+            "All processing completed. Press 'q' to quit.",
+            Color::Green,
+        ),
         AppMode::Running => ("Processing... Esc: stop", Color::Cyan),
         AppMode::Stopping => (
             "Stopping after current change... Esc: force stop",

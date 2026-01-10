@@ -4,6 +4,11 @@
 
 The current orchestrator processes changes sequentially: analyze → select → apply → archive → repeat. This is safe but slow when multiple independent changes exist. jj (Jujutsu) provides first-class workspace support that enables isolated parallel work on the same repository.
 
+**References:**
+- Official jj documentation: https://docs.jj-vcs.dev/latest/
+- jj GitHub repository: https://github.com/jj-vcs/jj
+- Working copy & workspaces: https://docs.jj-vcs.dev/latest/working-copy/
+
 **Stakeholders:**
 - Developers who want faster change processing
 - CI/CD pipelines that need efficient batch processing
@@ -12,6 +17,7 @@ The current orchestrator processes changes sequentially: analyze → select → 
 - Must work with existing config-based agent commands
 - Must preserve data integrity (no partial states)
 - Must support fallback to sequential mode
+- **jj is strictly required** - parallel mode is unavailable without `.jj` directory
 
 ## Goals / Non-Goals
 
@@ -62,17 +68,37 @@ The current orchestrator processes changes sequentially: analyze → select → 
 }
 ```
 
-### Decision 3: Configurable conflict resolution
+### Decision 3: Automatic conflict resolution with jj
 
-**What:** Support multiple strategies via `conflict_strategy` config:
-- `fail` (default): Stop on conflict, preserve workspace state
-- `skip`: Skip conflicting change, continue with others
-- `resolve`: Use `resolve_command` (AI agent) to resolve conflicts
+**What:** Always use AI agent to resolve conflicts via jj commands. No configurable strategies - resolution is automatic.
 
 **Why:**
-- Different projects have different tolerance for automation
-- AI-assisted resolution leverages existing agent infrastructure
-- `fail` is safe default for unknown situations
+- This is an AI-driven automation tool - manual intervention defeats the purpose
+- jj provides excellent conflict resolution tooling (`jj resolve`, conflict markers)
+- Simplifies configuration (no `conflict_strategy` or `resolve_command` options)
+
+**Hardcoded Resolution Prompt:**
+```
+The merge resulted in conflicts. Use jj commands to resolve them.
+
+Conflicted files:
+{conflict_files}
+
+Steps:
+1. Run `jj status` to see conflict details
+2. For each conflicted file, either:
+   - Edit the file to resolve conflict markers, OR
+   - Run `jj resolve <file>` to use merge tool
+3. After resolving all conflicts, run `jj status` to verify
+4. Conflicts are resolved when `jj status` shows no conflicts
+
+Important jj conflict commands:
+- `jj status` - Show current conflicts
+- `jj resolve <file>` - Interactive resolve for a file
+- `jj diff` - Show current changes including conflict markers
+```
+
+**Fallback:** If AI cannot resolve conflicts after max retries, stop with error and preserve workspace state for manual inspection.
 
 ### Decision 4: Event-based progress reporting
 
@@ -82,6 +108,84 @@ The current orchestrator processes changes sequentially: analyze → select → 
 - Decouples executor from display logic
 - Enables real-time progress updates
 - Supports both TUI and headless modes
+
+## Technical Feasibility: Parallelization Analyzer
+
+### Existing Infrastructure (Reusable)
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| LLM analysis method | ✅ Existing | `src/agent.rs:163-182` `analyze_dependencies()` |
+| Prompt building | ✅ Existing | `src/orchestrator.rs:476-506` |
+| JSON parsing | ✅ Available | `serde_json` in dependencies |
+| Config extension | ✅ Easy | `src/config.rs` JSONC system |
+| Placeholder expansion | ✅ Existing | `{prompt}`, `{change_id}` patterns |
+
+### Implementation Approach
+
+New module `src/analyzer.rs`:
+
+```rust
+pub struct ParallelizationAnalyzer {
+    agent: AgentRunner,
+}
+
+impl ParallelizationAnalyzer {
+    pub async fn analyze_groups(&self, changes: &[Change]) -> Result<Vec<ParallelGroup>> {
+        // 1. Build prompt (reuse existing pattern)
+        let prompt = self.build_parallelization_prompt(changes);
+
+        // 2. Call LLM (reuse existing method)
+        let response = self.agent.analyze_dependencies(&prompt).await?;
+
+        // 3. Parse JSON response (serde_json)
+        let result: AnalysisResult = serde_json::from_str(&response)?;
+
+        // 4. Validate DAG (detect circular dependencies)
+        self.validate_dependency_graph(&result.groups)?;
+
+        // 5. Return groups in topological order
+        Ok(self.topological_sort(result.groups))
+    }
+}
+```
+
+### Key Algorithms
+
+**DAG Validation (Circular Dependency Detection):**
+- Kahn's algorithm or DFS-based cycle detection
+- Standard graph algorithm, ~50 lines of code
+
+**Topological Sort:**
+- Order groups by `depends_on` relationships
+- Standard algorithm, ~30 lines of code
+
+### Estimated Effort
+
+| Component | Lines of Code |
+|-----------|---------------|
+| `src/analyzer.rs` | ~200-300 |
+| Config extensions | ~50 |
+| Orchestrator integration | ~150 |
+| Tests | ~400 |
+| **Total** | **~700-1000** |
+
+### Fallback Strategy
+
+```
+LLM analysis success?
+  → Yes: Use parallelization groups
+  → No: Fallback to sequential execution (existing behavior)
+```
+
+### Risk Assessment
+
+| Risk | Probability | Mitigation |
+|------|-------------|------------|
+| LLM returns invalid JSON | Medium | Fallback to sequential |
+| LLM misidentifies dependencies | Medium | Validation + manual override config |
+| Circular dependency in response | Low | DAG validation rejects |
+| Performance overhead | Low | Analysis runs once per batch |
 
 ## Execution Flow
 
@@ -103,9 +207,13 @@ The current orchestrator processes changes sequentially: analyze → select → 
        jj new {rev1} {rev2} ... -m "Merge parallel changes"
 
    3.5 Handle conflicts (if any)
-       - fail: Stop and report
-       - skip: Continue without conflicting changes
-       - resolve: Run resolve_command
+       - Run `jj status` to detect conflicts
+       - If conflicts exist:
+         a. Build hardcoded resolution prompt with conflict file list
+         b. Execute AI agent (apply_command) to resolve via jj commands
+         c. Verify with `jj status`
+         d. Retry up to max_retries if still conflicted
+         e. If still unresolved: stop with error, preserve workspace
 
    3.6 Cleanup workspaces
        jj workspace forget ws-{change_id}
@@ -117,36 +225,63 @@ The current orchestrator processes changes sequentially: analyze → select → 
 
 ## jj Commands Reference
 
-```bash
-# Create workspace
-jj workspace add /tmp/ws-change1 -r @
+Based on official jj documentation (https://docs.jj-vcs.dev/latest/):
 
-# Get current revision
+```bash
+# Check if jj is available and repo is jj-managed
+jj root  # Returns repo root path, or error if not jj repo
+
+# Create workspace with name
+# Ref: https://docs.jj-vcs.dev/latest/working-copy/#workspaces
+jj workspace add /tmp/ws-change1 --name ws-change1
+
+# Get current revision (change ID)
 jj log -r @ --no-graph -T change_id
 
-# Merge multiple revisions
+# Merge multiple revisions (creates new commit with multiple parents)
+# jj records conflicts as first-class objects - merge won't fail
 jj new {rev1} {rev2} {rev3} -m "Merge parallel changes"
 
-# Check for conflicts
-jj status  # Look for "Conflict" markers
+# Check for conflicts in working copy
+jj status  # Shows "Conflict" markers if present
 
-# Cleanup
+# Resolve conflicts with external tool
+jj resolve  # Uses configured merge tool for 2-way conflicts
+
+# Cleanup workspace
+# Ref: "When you're done using a workspace, use jj workspace forget"
 jj workspace forget ws-change1
 rm -rf /tmp/ws-change1
 
-# List workspaces
+# List all workspaces
 jj workspace list
+
+# Update stale working copy (if modified from another workspace)
+jj workspace update-stale
 ```
+
+### Key jj Concepts for This Design
+
+From https://docs.jj-vcs.dev/latest/working-copy/:
+
+1. **Workspaces**: "You can have multiple working copies backed by a single repo. Use `jj workspace add` to create a new working copy. The working copy will have a `.jj/` directory linked to the main repo."
+
+2. **Automatic commits**: "Unlike most other VCSs, Jujutsu will automatically create commits from the working-copy contents when they have changed."
+
+3. **Conflicts as first-class objects**: "If an operation results in conflicts, information about those conflicts will be recorded in the commit(s). The operation will succeed."
+
+4. **Stale working copy**: "When you modify workspace A's working-copy commit from workspace B, workspace A's working copy will become stale." → Use `jj workspace update-stale` to recover.
 
 ## Risks / Trade-offs
 
 | Risk | Mitigation |
 |------|------------|
-| jj not installed | Detect at startup, fallback to sequential mode |
+| jj not installed | Detect `.jj` directory at startup; CLI exits with error, TUI hides parallel option |
 | Disk space exhaustion | Limit max_concurrent_workspaces (default: 3) |
-| Merge conflicts | Configurable strategy, AI-assisted resolution option |
+| Merge conflicts | jj records conflicts as first-class objects; configurable strategy with AI resolution option |
 | LLM wrong grouping | Manual override via config, validation before execution |
 | Workspace cleanup failure | Best-effort cleanup with warning, manual cleanup guide |
+| Stale working copy | Use `jj workspace update-stale` if needed after parallel operations |
 
 ## Migration Plan
 
