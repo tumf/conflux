@@ -255,43 +255,69 @@ Hooks are defined in the `hooks` section of the configuration file.
       "timeout": 300                 // Timeout in seconds
     },
 
-    // Available hooks:
-    "on_first_apply": "git checkout -b feature/orchestrator-run",
-    "pre_apply": "echo 'Applying {change_id}'",
+    // Run lifecycle hooks
+    "on_start": "echo 'Starting orchestration with {total_changes} changes'",
+    "on_finish": "echo 'Finished with status: {status}'",
+    "on_error": "echo 'Error in {change_id}: {error}' >> errors.log",
+
+    // Change lifecycle hooks
+    "on_change_start": "echo 'Starting {change_id}'",
+    "pre_apply": "echo 'Applying {change_id} (attempt {apply_count})'",
+    "post_apply": "cargo test",
     "on_change_complete": "echo '{change_id} is 100% complete'",
     "pre_archive": "cargo clippy -- -D warnings",
     "post_archive": "echo '{change_id} archived successfully'",
-    "on_finish": "echo 'Finished with status: {status}'",
-    "on_error": "echo 'Error in {change_id}: {error}' >> errors.log"
+    "on_change_end": "echo 'Finished processing {change_id}'",
+
+    // TUI-only hooks (user interaction)
+    "on_queue_add": "echo 'Added {change_id} to queue'",
+    "on_queue_remove": "echo 'Removed {change_id} from queue'",
+    "on_approve": "echo 'Approved {change_id}'",
+    "on_unapprove": "echo 'Unapproved {change_id}'"
   }
 }
 ```
 
 **Available Hooks:**
 
+*Run lifecycle hooks:*
+
 | Hook Name | Trigger | Description |
 |-----------|---------|-------------|
 | `on_start` | Start | Orchestrator starts |
-| `on_first_apply` | Before First Apply | Triggered only once before the first apply |
-| `on_iteration_start` | Iteration Start | Start of each iteration loop |
+| `on_finish` | Finish | Orchestrator completes (success or limit) |
+| `on_error` | Error | When an error occurs during apply or archive |
+
+*Change lifecycle hooks:*
+
+| Hook Name | Trigger | Description |
+|-----------|---------|-------------|
+| `on_change_start` | Change Start | When processing begins for a new change |
 | `pre_apply` | Before Apply | Before applying a change |
 | `post_apply` | After Apply | After successfully applying a change |
 | `on_change_complete` | Task 100% | When a change reaches 100% task completion |
 | `pre_archive` | Before Archive | Before archiving a change |
 | `post_archive` | After Archive | After successfully archiving a change |
-| `on_iteration_end` | Iteration End | End of each iteration loop |
-| `on_queue_change` | Queue Change | When the number of pending changes changes |
-| `on_finish` | Finish | Orchestrator completes (success or limit) |
-| `on_error` | Error | When an error occurs during apply or archive |
+| `on_change_end` | Change End | After a change is successfully archived |
+
+*TUI-only hooks (user interaction):*
+
+| Hook Name | Trigger | Description |
+|-----------|---------|-------------|
+| `on_queue_add` | Queue Add | When user adds a change to queue (Space key) |
+| `on_queue_remove` | Queue Remove | When user removes a change from queue (Space key) |
+| `on_approve` | Approve | When user approves a change (@ key) |
+| `on_unapprove` | Unapprove | When user unapproves a change (@ key) |
 
 **Placeholders:**
 
 | Placeholder | Description |
 |-------------|-------------|
 | `{change_id}` | Current Change ID |
-| `{iteration}` | Current iteration number |
+| `{changes_processed}` | Number of changes processed so far |
 | `{total_changes}` | Total number of changes in initial snapshot |
-| `{queue_size}` | Current queue size |
+| `{remaining_changes}` | Remaining changes in queue |
+| `{apply_count}` | Number of apply attempts for current change |
 | `{completed_tasks}` | Number of completed tasks for current change |
 | `{total_tasks}` | Total number of tasks for current change |
 | `{status}` | Finish status (completed/iteration_limit) |
@@ -300,7 +326,7 @@ Hooks are defined in the `hooks` section of the configuration file.
 **Environment Variables:**
 
 Hooks receive context via environment variables:
-`OPENSPEC_CHANGE_ID`, `OPENSPEC_ITERATION`, `OPENSPEC_TOTAL_CHANGES`, `OPENSPEC_QUEUE_SIZE`, `OPENSPEC_COMPLETED_TASKS`, `OPENSPEC_TOTAL_TASKS`, `OPENSPEC_STATUS`, `OPENSPEC_ERROR`, `OPENSPEC_DRY_RUN`
+`OPENSPEC_CHANGE_ID`, `OPENSPEC_CHANGES_PROCESSED`, `OPENSPEC_TOTAL_CHANGES`, `OPENSPEC_REMAINING_CHANGES`, `OPENSPEC_APPLY_COUNT`, `OPENSPEC_COMPLETED_TASKS`, `OPENSPEC_TOTAL_TASKS`, `OPENSPEC_STATUS`, `OPENSPEC_ERROR`, `OPENSPEC_DRY_RUN`
 
 ### Environment Variables
 

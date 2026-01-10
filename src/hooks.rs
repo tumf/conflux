@@ -18,48 +18,62 @@ pub const DEFAULT_HOOK_TIMEOUT: u64 = 60;
 /// Types of hooks that can be executed
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HookType {
-    /// Triggered when the orchestrator starts
+    // === Run lifecycle ===
+    /// Triggered when the orchestrator starts (once per run)
     OnStart,
-    /// Triggered before the first apply (once per run)
-    OnFirstApply,
-    /// Triggered at the start of each iteration
-    OnIterationStart,
-    /// Triggered before each apply
+    /// Triggered when the orchestrator finishes (once per run)
+    OnFinish,
+    /// Triggered on error
+    OnError,
+
+    // === Change lifecycle ===
+    /// Triggered when starting to process a new change (once per change)
+    OnChangeStart,
+    /// Triggered before each apply execution
     PreApply,
     /// Triggered after each successful apply
     PostApply,
     /// Triggered when a change reaches 100% task completion
     OnChangeComplete,
-    /// Triggered before each archive
+    /// Triggered before each archive execution
     PreArchive,
     /// Triggered after each successful archive
     PostArchive,
-    /// Triggered at the end of each iteration
-    OnIterationEnd,
-    /// Triggered when the queue state changes
-    OnQueueChange,
-    /// Triggered when the orchestrator finishes
-    OnFinish,
-    /// Triggered on error
-    OnError,
+    /// Triggered when change processing ends (once per change, after archive)
+    OnChangeEnd,
+
+    // === User interaction (TUI only) ===
+    /// Triggered when user adds a change to queue (Space key)
+    OnQueueAdd,
+    /// Triggered when user removes a change from queue (Space key)
+    OnQueueRemove,
+    /// Triggered when user approves a change (@ key)
+    OnApprove,
+    /// Triggered when user removes approval from a change (@ key)
+    OnUnapprove,
 }
 
 impl HookType {
     /// Get the configuration key name for this hook type
     pub fn config_key(&self) -> &'static str {
         match self {
+            // Run lifecycle
             HookType::OnStart => "on_start",
-            HookType::OnFirstApply => "on_first_apply",
-            HookType::OnIterationStart => "on_iteration_start",
+            HookType::OnFinish => "on_finish",
+            HookType::OnError => "on_error",
+            // Change lifecycle
+            HookType::OnChangeStart => "on_change_start",
             HookType::PreApply => "pre_apply",
             HookType::PostApply => "post_apply",
             HookType::OnChangeComplete => "on_change_complete",
             HookType::PreArchive => "pre_archive",
             HookType::PostArchive => "post_archive",
-            HookType::OnIterationEnd => "on_iteration_end",
-            HookType::OnQueueChange => "on_queue_change",
-            HookType::OnFinish => "on_finish",
-            HookType::OnError => "on_error",
+            HookType::OnChangeEnd => "on_change_end",
+            // User interaction (TUI only)
+            HookType::OnQueueAdd => "on_queue_add",
+            HookType::OnQueueRemove => "on_queue_remove",
+            HookType::OnApprove => "on_approve",
+            HookType::OnUnapprove => "on_unapprove",
         }
     }
 }
@@ -169,12 +183,17 @@ impl HookConfigValue {
 /// Configuration for all hooks
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HooksConfig {
+    // === Run lifecycle ===
     #[serde(default)]
     pub on_start: Option<HookConfigValue>,
     #[serde(default)]
-    pub on_first_apply: Option<HookConfigValue>,
+    pub on_finish: Option<HookConfigValue>,
     #[serde(default)]
-    pub on_iteration_start: Option<HookConfigValue>,
+    pub on_error: Option<HookConfigValue>,
+
+    // === Change lifecycle ===
+    #[serde(default)]
+    pub on_change_start: Option<HookConfigValue>,
     #[serde(default)]
     pub pre_apply: Option<HookConfigValue>,
     #[serde(default)]
@@ -186,31 +205,40 @@ pub struct HooksConfig {
     #[serde(default)]
     pub post_archive: Option<HookConfigValue>,
     #[serde(default)]
-    pub on_iteration_end: Option<HookConfigValue>,
+    pub on_change_end: Option<HookConfigValue>,
+
+    // === User interaction (TUI only) ===
     #[serde(default)]
-    pub on_queue_change: Option<HookConfigValue>,
+    pub on_queue_add: Option<HookConfigValue>,
     #[serde(default)]
-    pub on_finish: Option<HookConfigValue>,
+    pub on_queue_remove: Option<HookConfigValue>,
     #[serde(default)]
-    pub on_error: Option<HookConfigValue>,
+    pub on_approve: Option<HookConfigValue>,
+    #[serde(default)]
+    pub on_unapprove: Option<HookConfigValue>,
 }
 
 impl HooksConfig {
     /// Get the hook configuration for a specific hook type
     pub fn get(&self, hook_type: HookType) -> Option<HookConfig> {
         let value = match hook_type {
+            // Run lifecycle
             HookType::OnStart => self.on_start.clone(),
-            HookType::OnFirstApply => self.on_first_apply.clone(),
-            HookType::OnIterationStart => self.on_iteration_start.clone(),
+            HookType::OnFinish => self.on_finish.clone(),
+            HookType::OnError => self.on_error.clone(),
+            // Change lifecycle
+            HookType::OnChangeStart => self.on_change_start.clone(),
             HookType::PreApply => self.pre_apply.clone(),
             HookType::PostApply => self.post_apply.clone(),
             HookType::OnChangeComplete => self.on_change_complete.clone(),
             HookType::PreArchive => self.pre_archive.clone(),
             HookType::PostArchive => self.post_archive.clone(),
-            HookType::OnIterationEnd => self.on_iteration_end.clone(),
-            HookType::OnQueueChange => self.on_queue_change.clone(),
-            HookType::OnFinish => self.on_finish.clone(),
-            HookType::OnError => self.on_error.clone(),
+            HookType::OnChangeEnd => self.on_change_end.clone(),
+            // User interaction (TUI only)
+            HookType::OnQueueAdd => self.on_queue_add.clone(),
+            HookType::OnQueueRemove => self.on_queue_remove.clone(),
+            HookType::OnApprove => self.on_approve.clone(),
+            HookType::OnUnapprove => self.on_unapprove.clone(),
         };
         value.map(|v| v.into_hook_config())
     }
@@ -219,36 +247,40 @@ impl HooksConfig {
     #[allow(dead_code)]
     pub fn has_any_hooks(&self) -> bool {
         self.on_start.is_some()
-            || self.on_first_apply.is_some()
-            || self.on_iteration_start.is_some()
+            || self.on_finish.is_some()
+            || self.on_error.is_some()
+            || self.on_change_start.is_some()
             || self.pre_apply.is_some()
             || self.post_apply.is_some()
             || self.on_change_complete.is_some()
             || self.pre_archive.is_some()
             || self.post_archive.is_some()
-            || self.on_iteration_end.is_some()
-            || self.on_queue_change.is_some()
-            || self.on_finish.is_some()
-            || self.on_error.is_some()
+            || self.on_change_end.is_some()
+            || self.on_queue_add.is_some()
+            || self.on_queue_remove.is_some()
+            || self.on_approve.is_some()
+            || self.on_unapprove.is_some()
     }
 }
 
 /// Context information passed to hooks
 #[derive(Debug, Clone, Default)]
 pub struct HookContext {
-    /// Current change ID (if applicable)
+    /// Current change ID (always set except for on_start/on_finish)
     pub change_id: Option<String>,
-    /// Current iteration number
-    pub iteration: u32,
-    /// Total number of changes in initial snapshot
+    /// Number of changes processed so far (completed + archived)
+    pub changes_processed: usize,
+    /// Total number of changes in initial queue
     pub total_changes: usize,
-    /// Current queue size (remaining changes)
-    pub queue_size: usize,
+    /// Remaining changes in queue
+    pub remaining_changes: usize,
     /// Completed tasks for current change
     pub completed_tasks: Option<u32>,
     /// Total tasks for current change
     pub total_tasks: Option<u32>,
-    /// Finish status (completed, iteration_limit)
+    /// Apply count for current change (how many times applied)
+    pub apply_count: u32,
+    /// Finish status (for on_finish: "completed", "iteration_limit", "cancelled")
     pub status: Option<String>,
     /// Error message (for on_error hook)
     pub error: Option<String>,
@@ -257,12 +289,17 @@ pub struct HookContext {
 }
 
 impl HookContext {
-    /// Create a new HookContext with basic info
-    pub fn new(iteration: u32, total_changes: usize, queue_size: usize, dry_run: bool) -> Self {
+    /// Create a new HookContext with basic run-level info
+    pub fn new(
+        changes_processed: usize,
+        total_changes: usize,
+        remaining_changes: usize,
+        dry_run: bool,
+    ) -> Self {
         Self {
-            iteration,
+            changes_processed,
             total_changes,
-            queue_size,
+            remaining_changes,
             dry_run,
             ..Default::default()
         }
@@ -273,6 +310,12 @@ impl HookContext {
         self.change_id = Some(change_id.to_string());
         self.completed_tasks = Some(completed_tasks);
         self.total_tasks = Some(total_tasks);
+        self
+    }
+
+    /// Set the apply count for the current change
+    pub fn with_apply_count(mut self, apply_count: u32) -> Self {
+        self.apply_count = apply_count;
         self
     }
 
@@ -295,14 +338,17 @@ impl HookContext {
         if let Some(ref change_id) = self.change_id {
             vars.insert("OPENSPEC_CHANGE_ID".to_string(), change_id.clone());
         }
-        vars.insert("OPENSPEC_ITERATION".to_string(), self.iteration.to_string());
+        vars.insert(
+            "OPENSPEC_CHANGES_PROCESSED".to_string(),
+            self.changes_processed.to_string(),
+        );
         vars.insert(
             "OPENSPEC_TOTAL_CHANGES".to_string(),
             self.total_changes.to_string(),
         );
         vars.insert(
-            "OPENSPEC_QUEUE_SIZE".to_string(),
-            self.queue_size.to_string(),
+            "OPENSPEC_REMAINING_CHANGES".to_string(),
+            self.remaining_changes.to_string(),
         );
         if let Some(completed) = self.completed_tasks {
             vars.insert(
@@ -313,6 +359,10 @@ impl HookContext {
         if let Some(total) = self.total_tasks {
             vars.insert("OPENSPEC_TOTAL_TASKS".to_string(), total.to_string());
         }
+        vars.insert(
+            "OPENSPEC_APPLY_COUNT".to_string(),
+            self.apply_count.to_string(),
+        );
         if let Some(ref status) = self.status {
             vars.insert("OPENSPEC_STATUS".to_string(), status.clone());
         }
@@ -331,15 +381,16 @@ impl HookContext {
         if let Some(ref change_id) = self.change_id {
             result = result.replace("{change_id}", change_id);
         }
-        result = result.replace("{iteration}", &self.iteration.to_string());
+        result = result.replace("{changes_processed}", &self.changes_processed.to_string());
         result = result.replace("{total_changes}", &self.total_changes.to_string());
-        result = result.replace("{queue_size}", &self.queue_size.to_string());
+        result = result.replace("{remaining_changes}", &self.remaining_changes.to_string());
         if let Some(completed) = self.completed_tasks {
             result = result.replace("{completed_tasks}", &completed.to_string());
         }
         if let Some(total) = self.total_tasks {
             result = result.replace("{total_tasks}", &total.to_string());
         }
+        result = result.replace("{apply_count}", &self.apply_count.to_string());
         if let Some(ref status) = self.status {
             result = result.replace("{status}", status);
         }
@@ -519,27 +570,31 @@ mod tests {
     fn test_hook_context_expand_placeholders() {
         let context = HookContext::new(2, 5, 3, false)
             .with_change("test-change", 3, 10)
+            .with_apply_count(1)
             .with_status("completed");
 
-        let template = "Change {change_id} iter {iteration} of {total_changes} queue {queue_size}";
+        let template = "Change {change_id} processed {changes_processed} of {total_changes} remaining {remaining_changes} apply {apply_count}";
         let result = context.expand_placeholders(template);
-        assert_eq!(result, "Change test-change iter 2 of 5 queue 3");
+        assert_eq!(result, "Change test-change processed 2 of 5 remaining 3 apply 1");
     }
 
     #[test]
     fn test_hook_context_to_env_vars() {
-        let context = HookContext::new(1, 5, 3, true).with_change("my-change", 2, 10);
+        let context = HookContext::new(1, 5, 3, true)
+            .with_change("my-change", 2, 10)
+            .with_apply_count(2);
 
         let vars = context.to_env_vars();
         assert_eq!(
             vars.get("OPENSPEC_CHANGE_ID"),
             Some(&"my-change".to_string())
         );
-        assert_eq!(vars.get("OPENSPEC_ITERATION"), Some(&"1".to_string()));
+        assert_eq!(vars.get("OPENSPEC_CHANGES_PROCESSED"), Some(&"1".to_string()));
         assert_eq!(vars.get("OPENSPEC_TOTAL_CHANGES"), Some(&"5".to_string()));
-        assert_eq!(vars.get("OPENSPEC_QUEUE_SIZE"), Some(&"3".to_string()));
+        assert_eq!(vars.get("OPENSPEC_REMAINING_CHANGES"), Some(&"3".to_string()));
         assert_eq!(vars.get("OPENSPEC_COMPLETED_TASKS"), Some(&"2".to_string()));
         assert_eq!(vars.get("OPENSPEC_TOTAL_TASKS"), Some(&"10".to_string()));
+        assert_eq!(vars.get("OPENSPEC_APPLY_COUNT"), Some(&"2".to_string()));
         assert_eq!(vars.get("OPENSPEC_DRY_RUN"), Some(&"true".to_string()));
     }
 

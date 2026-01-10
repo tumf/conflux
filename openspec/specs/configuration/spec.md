@@ -227,12 +227,33 @@ TBD - created by archiving change add-env-openspec-cmd. Update Purpose after arc
 
 オーケストレータはフック実行時に、コマンド文字列内のプレースホルダーを展開し、同等の情報を環境変数としても提供しなければならない (MUST)。
 
+**Available placeholders and environment variables:**
+
+| Placeholder | Environment Variable | Description |
+|-------------|---------------------|-------------|
+| `{change_id}` | `OPENSPEC_CHANGE_ID` | Current change ID |
+| `{changes_processed}` | `OPENSPEC_CHANGES_PROCESSED` | Number of changes processed so far |
+| `{total_changes}` | `OPENSPEC_TOTAL_CHANGES` | Total number of changes in initial queue |
+| `{remaining_changes}` | `OPENSPEC_REMAINING_CHANGES` | Remaining changes in queue |
+| `{completed_tasks}` | `OPENSPEC_COMPLETED_TASKS` | Completed tasks for current change |
+| `{total_tasks}` | `OPENSPEC_TOTAL_TASKS` | Total tasks for current change |
+| `{apply_count}` | `OPENSPEC_APPLY_COUNT` | Number of apply executions for current change |
+| `{status}` | `OPENSPEC_STATUS` | Finish status (for on_finish: completed/iteration_limit/cancelled) |
+| `{error}` | `OPENSPEC_ERROR` | Error message (for on_error hook) |
+| N/A | `OPENSPEC_DRY_RUN` | Whether running in dry-run mode |
+
 #### Scenario: change_id をプレースホルダーと環境変数で受け取る
 
 - **GIVEN** `hooks.pre_apply.command` が `echo '{change_id} $OPENSPEC_CHANGE_ID'` に設定されている
 - **WHEN** change `add-feature-x` に対して `pre_apply` が実行される
 - **THEN** `{change_id}` は `add-feature-x` に展開される
 - **AND** `OPENSPEC_CHANGE_ID` は `add-feature-x` として渡される
+
+#### Scenario: apply_count でリトライ回数を追跡
+
+- **GIVEN** `hooks.post_apply.command` が `echo 'Apply #{apply_count} for {change_id}'` に設定されている
+- **WHEN** change `fix-bug` に対して2回目の `post_apply` が実行される
+- **THEN** 出力は `Apply #2 for fix-bug` となる
 
 ### Requirement: Configuration Template Structure
 

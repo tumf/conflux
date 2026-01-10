@@ -1314,9 +1314,10 @@ async fn run_tui_loop(
 
 /// Context for archive operations
 struct ArchiveContext {
-    iteration: u32,
+    changes_processed: usize,
     total_changes: usize,
-    queue_size: usize,
+    remaining_changes: usize,
+    apply_count: u32,
 }
 
 /// Result of archive operation
@@ -1342,12 +1343,13 @@ async fn archive_single_change(
 
     // Run on_change_complete hook
     let complete_context = HookContext::new(
-        context.iteration,
+        context.changes_processed,
         context.total_changes,
-        context.queue_size,
+        context.remaining_changes,
         false,
     )
-    .with_change(change_id, change.completed_tasks, change.total_tasks);
+    .with_change(change_id, change.completed_tasks, change.total_tasks)
+    .with_apply_count(context.apply_count);
     if let Err(e) = hooks
         .run_hook(HookType::OnChangeComplete, &complete_context)
         .await
@@ -1362,12 +1364,13 @@ async fn archive_single_change(
 
     // Run pre_archive hook
     let pre_archive_context = HookContext::new(
-        context.iteration,
+        context.changes_processed,
         context.total_changes,
-        context.queue_size,
+        context.remaining_changes,
         false,
     )
-    .with_change(change_id, change.completed_tasks, change.total_tasks);
+    .with_change(change_id, change.completed_tasks, change.total_tasks)
+    .with_apply_count(context.apply_count);
     if let Err(e) = hooks
         .run_hook(HookType::PreArchive, &pre_archive_context)
         .await
@@ -1428,12 +1431,13 @@ async fn archive_single_change(
 
         // Run post_archive hook
         let post_archive_context = HookContext::new(
-            context.iteration,
+            context.changes_processed + 1,
             context.total_changes,
-            context.queue_size.saturating_sub(1),
+            context.remaining_changes.saturating_sub(1),
             false,
         )
-        .with_change(change_id, change.completed_tasks, change.total_tasks);
+        .with_change(change_id, change.completed_tasks, change.total_tasks)
+        .with_apply_count(context.apply_count);
         if let Err(e) = hooks
             .run_hook(HookType::PostArchive, &post_archive_context)
             .await
@@ -1455,12 +1459,13 @@ async fn archive_single_change(
 
         // Run on_error hook
         let error_context = HookContext::new(
-            context.iteration,
+            context.changes_processed,
             context.total_changes,
-            context.queue_size,
+            context.remaining_changes,
             false,
         )
         .with_change(change_id, change.completed_tasks, change.total_tasks)
+        .with_apply_count(context.apply_count)
         .with_error(&error_msg);
         let _ = hooks.run_hook(HookType::OnError, &error_context).await;
 
@@ -1485,7 +1490,8 @@ async fn archive_all_complete_changes(
     cancel_token: &CancellationToken,
     archived_set: &mut HashSet<String>,
     total_changes: usize,
-    iteration: &mut u32,
+    changes_processed: &mut usize,
+    apply_counts: &std::collections::HashMap<String, u32>,
 ) -> Result<usize> {
     use crate::openspec;
 
@@ -1505,12 +1511,13 @@ async fn archive_all_complete_changes(
             break;
         }
 
-        *iteration += 1;
-        let queue_size = pending_ids.len().saturating_sub(archived_count);
+        let remaining_changes = pending_ids.len().saturating_sub(archived_count);
+        let apply_count = *apply_counts.get(&change.id).unwrap_or(&0);
         let context = ArchiveContext {
-            iteration: *iteration,
+            changes_processed: *changes_processed,
             total_changes,
-            queue_size,
+            remaining_changes,
+            apply_count,
         };
 
         // Notify processing started for this change
@@ -1537,6 +1544,7 @@ async fn archive_all_complete_changes(
             ArchiveResult::Success => {
                 archived_set.insert(change.id.clone());
                 archived_count += 1;
+                *changes_processed += 1;
             }
             ArchiveResult::Failed => {
                 // Error already logged and sent, continue to next
@@ -1578,7 +1586,9 @@ async fn run_orchestrator(
 
     let mut total_changes = change_ids.len();
     let mut iteration: u32 = 0;
-    let mut first_apply_executed = false;
+    let mut changes_processed: usize = 0;
+    let mut current_change_id: Option<String> = None;
+    let mut apply_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut archived_changes: HashSet<String> = HashSet::new();
     let mut pending_changes: HashSet<String> = change_ids.iter().cloned().collect();
     let mut processed_change_ids: Vec<String> = change_ids.clone();
@@ -1674,7 +1684,8 @@ async fn run_orchestrator(
             &cancel_token,
             &mut archived_changes,
             total_changes,
-            &mut iteration,
+            &mut changes_processed,
+            &apply_counts,
         )
         .await?;
 
@@ -1748,30 +1759,38 @@ async fn run_orchestrator(
             .send(OrchestratorEvent::ProcessingStarted(change_id.clone()))
             .await;
 
-        let queue_size = pending_changes.len();
+        let remaining_changes = pending_changes.len();
 
-        // Run on_first_apply hook (once)
-        if !first_apply_executed {
-            let first_apply_context = HookContext::new(iteration, total_changes, queue_size, false)
-                .with_change(&change_id, change.completed_tasks, change.total_tasks);
+        // Check if this is a new change (for on_change_start hook)
+        let is_new_change = current_change_id.as_ref() != Some(&change_id);
+        if is_new_change {
+            // Run on_change_start hook
+            let change_start_context = HookContext::new(changes_processed, total_changes, remaining_changes, false)
+                .with_change(&change_id, change.completed_tasks, change.total_tasks)
+                .with_apply_count(0);
             if let Err(e) = hooks
-                .run_hook(HookType::OnFirstApply, &first_apply_context)
+                .run_hook(HookType::OnChangeStart, &change_start_context)
                 .await
             {
                 let _ = tx
                     .send(OrchestratorEvent::ProcessingError {
                         id: change_id.clone(),
-                        error: format!("on_first_apply hook failed: {}", e),
+                        error: format!("on_change_start hook failed: {}", e),
                     })
                     .await;
                 break;
             }
-            first_apply_executed = true;
+            current_change_id = Some(change_id.clone());
         }
 
+        // Get current apply count for this change and increment it
+        let apply_count = *apply_counts.get(&change_id).unwrap_or(&0) + 1;
+        apply_counts.insert(change_id.clone(), apply_count);
+
         // Run pre_apply hook
-        let pre_apply_context = HookContext::new(iteration, total_changes, queue_size, false)
-            .with_change(&change_id, change.completed_tasks, change.total_tasks);
+        let pre_apply_context = HookContext::new(changes_processed, total_changes, remaining_changes, false)
+            .with_change(&change_id, change.completed_tasks, change.total_tasks)
+            .with_apply_count(apply_count);
         if let Err(e) = hooks.run_hook(HookType::PreApply, &pre_apply_context).await {
             let _ = tx
                 .send(OrchestratorEvent::ProcessingError {
@@ -1839,8 +1858,9 @@ async fn run_orchestrator(
 
         if status.success() {
             // Run post_apply hook
-            let post_apply_context = HookContext::new(iteration, total_changes, queue_size, false)
-                .with_change(&change_id, change.completed_tasks, change.total_tasks);
+            let post_apply_context = HookContext::new(changes_processed, total_changes, remaining_changes, false)
+                .with_change(&change_id, change.completed_tasks, change.total_tasks)
+                .with_apply_count(apply_count);
             if let Err(e) = hooks
                 .run_hook(HookType::PostApply, &post_apply_context)
                 .await
@@ -1879,8 +1899,9 @@ async fn run_orchestrator(
             let error_msg = format!("Apply failed with exit code: {:?}", status.code());
 
             // Run on_error hook
-            let error_context = HookContext::new(iteration, total_changes, queue_size, false)
+            let error_context = HookContext::new(changes_processed, total_changes, remaining_changes, false)
                 .with_change(&change_id, change.completed_tasks, change.total_tasks)
+                .with_apply_count(apply_count)
                 .with_error(&error_msg);
             let _ = hooks.run_hook(HookType::OnError, &error_context).await;
 

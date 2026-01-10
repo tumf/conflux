@@ -1,8 +1,21 @@
-# Proposal: Redesign Hook System
+# Change: Redesign Hook System
 
-## Summary
+## Why
 
-Hook システムを再設計し、明確で一貫性のあるライフサイクルモデルを提供する。
+The current hook system has inconsistent "iteration" semantics between orchestrator.rs and tui.rs, lacks `change_id` in `on_iteration_start`, and cannot detect changeset transitions (needed for jj integration). A clean redesign provides a clear two-layer loop model.
+
+## What Changes
+
+- **BREAKING**: Remove ambiguous hooks: `on_first_apply`, `on_iteration_start`, `on_iteration_end`, `on_queue_change`
+- Add new hooks: `on_change_start`, `on_change_end` for changeset lifecycle
+- Add TUI-only hooks: `on_queue_add`, `on_queue_remove`, `on_approve`, `on_unapprove`
+- Unify hook execution between TUI and CLI modes
+- Update all hook context variables and placeholders
+
+## Impact
+
+- Affected specs: hooks (new capability)
+- Affected code: orchestrator.rs, tui.rs, hooks.rs, templates.rs
 
 ## Background
 

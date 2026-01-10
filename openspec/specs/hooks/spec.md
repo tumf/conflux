@@ -1,27 +1,8 @@
-# Capability: hooks
+# hooks Specification
 
-Lifecycle hooks for orchestration workflow customization.
-
-## REMOVED Requirements
-
-### Requirement: on_first_apply hook
-
-This hook is removed. Use `on_change_start` and check `{changes_processed} == 0` if needed.
-
-### Requirement: on_iteration_start hook
-
-This hook is removed. The concept of "iteration" was ambiguous. Use `on_change_start` instead.
-
-### Requirement: on_iteration_end hook
-
-This hook is removed. Use `on_change_end` instead.
-
-### Requirement: on_queue_change hook (旧実装)
-
-The old `on_queue_change` hook (triggered when queue size changed due to archive) is removed.
-
-## ADDED Requirements
-
+## Purpose
+TBD - created by archiving change redesign-hook-system. Update Purpose after archive.
+## Requirements
 ### Requirement: on_queue_add hook
 
 The orchestrator SHALL execute `on_queue_add` hook when a user dynamically adds a change to the queue (via Space key in TUI).
@@ -138,8 +119,6 @@ The orchestrator SHALL execute `on_change_end` hook after a change has been full
 - **AND** 3 changes exist
 - **WHEN** the first change is archived
 - **THEN** the hook outputs `1/3`
-
-## MODIFIED Requirements
 
 ### Requirement: Hook context variables
 
@@ -391,3 +370,4 @@ Templates SHALL use simple string format (not object format with timeout/continu
 - **GIVEN** the generated template
 - **THEN** on_queue_add example is `echo '[on_queue_add] change={change_id} tasks={completed_tasks}/{total_tasks}'`
 - **AND** on_approve example is `echo '[on_approve] change={change_id} tasks={completed_tasks}/{total_tasks}'`
+

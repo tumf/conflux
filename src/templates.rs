@@ -26,9 +26,14 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // "max_iterations": 50,
 
   // Lifecycle hooks (optional)
+  // Available hooks:
+  //   Run lifecycle: on_start, on_finish, on_error
+  //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end
+  //   TUI interaction: on_queue_add, on_queue_remove, on_approve, on_unapprove
+  // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}
   "hooks": {
-    // "pre_apply": "echo 'Starting {change_id}'",
-    // "post_apply": "echo 'Completed {change_id}'"
+    // "on_change_start": "echo 'Starting {change_id}'",
+    // "post_apply": "echo 'Applied {change_id} (attempt {apply_count})'"
   }
 }
 "#;
@@ -57,9 +62,14 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // "max_iterations": 50,
 
   // Lifecycle hooks (optional)
+  // Available hooks:
+  //   Run lifecycle: on_start, on_finish, on_error
+  //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end
+  //   TUI interaction: on_queue_add, on_queue_remove, on_approve, on_unapprove
+  // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}
   "hooks": {
-    // "pre_apply": "echo 'Starting {change_id}'",
-    // "post_apply": "echo 'Completed {change_id}'"
+    // "on_change_start": "echo 'Starting {change_id}'",
+    // "post_apply": "echo 'Applied {change_id} (attempt {apply_count})'"
   }
 }
 "#;
@@ -88,9 +98,14 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // "max_iterations": 50,
 
   // Lifecycle hooks (optional)
+  // Available hooks:
+  //   Run lifecycle: on_start, on_finish, on_error
+  //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end
+  //   TUI interaction: on_queue_add, on_queue_remove, on_approve, on_unapprove
+  // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}
   "hooks": {
-    // "pre_apply": "echo 'Starting {change_id}'",
-    // "post_apply": "echo 'Completed {change_id}'"
+    // "on_change_start": "echo 'Starting {change_id}'",
+    // "post_apply": "echo 'Applied {change_id} (attempt {apply_count})'"
   }
 }
 "#;
