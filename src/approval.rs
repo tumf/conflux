@@ -57,11 +57,7 @@ pub fn discover_md_files(change_id: &str) -> Result<Vec<PathBuf>> {
 /// Recursively discover markdown files in a directory
 fn discover_md_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     let entries = fs::read_dir(dir).map_err(|e| {
-        OrchestratorError::ConfigLoad(format!(
-            "Failed to read directory {}: {}",
-            dir.display(),
-            e
-        ))
+        OrchestratorError::ConfigLoad(format!("Failed to read directory {}: {}", dir.display(), e))
     })?;
 
     for entry in entries {
@@ -368,7 +364,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let approved_path = temp_dir.path().join("approved");
 
-        let content = "abc123  openspec/changes/test/proposal.md\ndef456  openspec/changes/test/design.md\n";
+        let content =
+            "abc123  openspec/changes/test/proposal.md\ndef456  openspec/changes/test/design.md\n";
         fs::write(&approved_path, content).unwrap();
 
         let manifest = parse_approved_file(&approved_path).unwrap();

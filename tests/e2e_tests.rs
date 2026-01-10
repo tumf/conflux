@@ -488,8 +488,8 @@ fn test_archive_priority_complete_changes_first() {
     setup_openspec_test_env(
         temp_path,
         &[
-            ("change-a", 5, 5),  // 100% complete - should be archived first
-            ("change-b", 2, 4),  // 50% complete - should be processed second
+            ("change-a", 5, 5), // 100% complete - should be archived first
+            ("change-b", 2, 4), // 50% complete - should be processed second
         ],
     );
 
@@ -551,9 +551,9 @@ fn test_archive_priority_multiple_complete_changes() {
     setup_openspec_test_env(
         temp_path,
         &[
-            ("complete-1", 3, 3),   // 100% complete
-            ("complete-2", 5, 5),   // 100% complete
-            ("incomplete", 1, 10),  // 10% - needs apply
+            ("complete-1", 3, 3),  // 100% complete
+            ("complete-2", 5, 5),  // 100% complete
+            ("incomplete", 1, 10), // 10% - needs apply
         ],
     );
 
@@ -592,8 +592,8 @@ fn test_mid_apply_completion_detection() {
     setup_openspec_test_env(
         temp_path,
         &[
-            ("change-a", 4, 5),  // 80% - will complete during apply
-            ("change-b", 2, 5),  // 40% - being applied
+            ("change-a", 4, 5), // 80% - will complete during apply
+            ("change-b", 2, 5), // 40% - being applied
         ],
     );
 
@@ -650,7 +650,10 @@ esac
     assert!(stdout.contains("2/5")); // change-b incomplete
 
     // Simulate apply completing (increment state)
-    let output = Command::new(&script_path).arg("increment").output().unwrap();
+    let output = Command::new(&script_path)
+        .arg("increment")
+        .output()
+        .unwrap();
     assert!(output.status.success());
 
     // After state change - change-a is now complete
@@ -679,9 +682,9 @@ fn test_no_complete_changes_fallback() {
     setup_openspec_test_env(
         temp_path,
         &[
-            ("low", 1, 10),     // 10%
-            ("medium", 5, 10),  // 50%
-            ("high", 8, 10),    // 80% - should be selected
+            ("low", 1, 10),    // 10%
+            ("medium", 5, 10), // 50%
+            ("high", 8, 10),   // 80% - should be selected
         ],
     );
 

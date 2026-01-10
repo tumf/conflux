@@ -63,12 +63,7 @@ impl AgentRunner {
 
     /// Record an apply attempt after streaming execution completes.
     /// Call this after `run_apply_streaming()` child process finishes.
-    pub fn record_apply_attempt(
-        &mut self,
-        change_id: &str,
-        status: &ExitStatus,
-        start: Instant,
-    ) {
+    pub fn record_apply_attempt(&mut self, change_id: &str, status: &ExitStatus, start: Instant) {
         let duration = start.elapsed();
         let attempt = ApplyAttempt {
             attempt: self.apply_history.count(change_id) + 1,

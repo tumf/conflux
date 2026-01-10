@@ -12,7 +12,10 @@ use crate::error::Result;
 use crate::openspec::Change;
 use chrono::Local;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{Clear, ClearType},
 };
@@ -279,6 +282,10 @@ pub enum TuiCommand {
     RemoveFromQueue(String),
     /// Toggle approval status for a change
     ToggleApproval(String),
+    /// Approve a change and add it to the queue (used in running/completed mode)
+    ApproveAndQueue(String),
+    /// Unapprove a change and remove it from the queue (used in running/completed mode)
+    UnapproveAndDequeue(String),
     /// Stop processing (graceful shutdown)
     #[allow(dead_code)]
     Stop,
@@ -540,25 +547,49 @@ impl AppState {
     /// Only available in Select mode. Returns a TuiCommand::ToggleApproval
     /// to be processed by the main loop.
     pub fn toggle_approval(&mut self) -> Option<TuiCommand> {
-        if self.mode != AppMode::Select {
-            return None;
-        }
-
         if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
             return None;
         }
 
         let change = &self.changes[self.cursor_index];
-        let id = change.id.clone();
 
-        Some(TuiCommand::ToggleApproval(id))
+        // Block approval toggle for processing changes
+        if matches!(change.queue_status, QueueStatus::Processing) {
+            self.warning_message = Some("Cannot change approval for processing change".to_string());
+            return None;
+        }
+
+        let id = change.id.clone();
+        let is_approved = change.is_approved;
+
+        match self.mode {
+            AppMode::Select => Some(TuiCommand::ToggleApproval(id)),
+            AppMode::Running | AppMode::Completed => {
+                // In running/completed mode, implement new state transitions:
+                // [ ] (unapproved) → @ → [x] (approved + queued)
+                // [@] (approved, not queued) → @ → [ ] (unapproved)
+                // [x] (queued, not processing) → @ → [ ] (unapproved + removed from queue)
+                if !is_approved {
+                    // Unapproved → approved + queued
+                    Some(TuiCommand::ApproveAndQueue(id))
+                } else {
+                    // Approved → unapproved (also removes from queue if queued)
+                    Some(TuiCommand::UnapproveAndDequeue(id))
+                }
+            }
+            AppMode::Error => None,
+        }
     }
 
     /// Update approval status for a specific change
     pub fn update_approval_status(&mut self, change_id: &str, is_approved: bool) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.is_approved = is_approved;
-            let status_msg = if is_approved { "approved" } else { "unapproved" };
+            let status_msg = if is_approved {
+                "approved"
+            } else {
+                "unapproved"
+            };
             self.add_log(LogEntry::info(format!(
                 "Change '{}' {}",
                 change_id, status_msg
@@ -1010,15 +1041,9 @@ async fn run_tui_loop(
                 TuiCommand::AddToQueue(id) => {
                     // Push to dynamic queue for orchestrator to pick up
                     if dynamic_queue.push(id.clone()).await {
-                        app.add_log(LogEntry::info(format!(
-                            "Added to dynamic queue: {}",
-                            id
-                        )));
+                        app.add_log(LogEntry::info(format!("Added to dynamic queue: {}", id)));
                     } else {
-                        app.add_log(LogEntry::warn(format!(
-                            "Already in dynamic queue: {}",
-                            id
-                        )));
+                        app.add_log(LogEntry::warn(format!("Already in dynamic queue: {}", id)));
                     }
                 }
                 TuiCommand::RemoveFromQueue(id) => {
@@ -1049,6 +1074,73 @@ async fn run_tui_loop(
                         Err(e) => {
                             app.add_log(LogEntry::error(format!(
                                 "Failed to toggle approval for '{}': {}",
+                                id, e
+                            )));
+                        }
+                    }
+                }
+                TuiCommand::ApproveAndQueue(id) => {
+                    // Approve and add to queue (used in running/completed mode)
+                    use crate::approval;
+
+                    match approval::approve_change(&id) {
+                        Ok(_) => {
+                            app.update_approval_status(&id, true);
+                            // Also add to queue
+                            if let Some(change) = app.changes.iter_mut().find(|c| c.id == id) {
+                                change.queue_status = QueueStatus::Queued;
+                                change.selected = true;
+                            }
+                            // Push to dynamic queue for orchestrator to pick up
+                            if dynamic_queue.push(id.clone()).await {
+                                app.add_log(LogEntry::info(format!("Approved and queued: {}", id)));
+                            } else {
+                                app.add_log(LogEntry::info(format!(
+                                    "Approved (already in queue): {}",
+                                    id
+                                )));
+                            }
+                        }
+                        Err(e) => {
+                            app.add_log(LogEntry::error(format!(
+                                "Failed to approve '{}': {}",
+                                id, e
+                            )));
+                        }
+                    }
+                }
+                TuiCommand::UnapproveAndDequeue(id) => {
+                    // Unapprove and remove from queue (used in running/completed mode)
+                    use crate::approval;
+
+                    // First check if queued
+                    let was_queued = app
+                        .changes
+                        .iter()
+                        .find(|c| c.id == id)
+                        .map(|c| matches!(c.queue_status, QueueStatus::Queued))
+                        .unwrap_or(false);
+
+                    match approval::unapprove_change(&id) {
+                        Ok(_) => {
+                            app.update_approval_status(&id, false);
+                            // Also remove from queue if queued
+                            if let Some(change) = app.changes.iter_mut().find(|c| c.id == id) {
+                                if matches!(change.queue_status, QueueStatus::Queued) {
+                                    change.queue_status = QueueStatus::NotQueued;
+                                }
+                                change.selected = false;
+                            }
+                            let msg = if was_queued {
+                                format!("Unapproved and removed from queue: {}", id)
+                            } else {
+                                format!("Unapproved: {}", id)
+                            };
+                            app.add_log(LogEntry::info(msg));
+                        }
+                        Err(e) => {
+                            app.add_log(LogEntry::error(format!(
+                                "Failed to unapprove '{}': {}",
                                 id, e
                             )));
                         }
@@ -1108,9 +1200,13 @@ async fn archive_single_change(
     use crate::hooks::{HookContext, HookType};
 
     // Run on_change_complete hook
-    let complete_context =
-        HookContext::new(context.iteration, context.total_changes, context.queue_size, false)
-            .with_change(change_id, change.completed_tasks, change.total_tasks);
+    let complete_context = HookContext::new(
+        context.iteration,
+        context.total_changes,
+        context.queue_size,
+        false,
+    )
+    .with_change(change_id, change.completed_tasks, change.total_tasks);
     if let Err(e) = hooks
         .run_hook(HookType::OnChangeComplete, &complete_context)
         .await
@@ -1124,9 +1220,13 @@ async fn archive_single_change(
     }
 
     // Run pre_archive hook
-    let pre_archive_context =
-        HookContext::new(context.iteration, context.total_changes, context.queue_size, false)
-            .with_change(change_id, change.completed_tasks, change.total_tasks);
+    let pre_archive_context = HookContext::new(
+        context.iteration,
+        context.total_changes,
+        context.queue_size,
+        false,
+    )
+    .with_change(change_id, change.completed_tasks, change.total_tasks);
     if let Err(e) = hooks
         .run_hook(HookType::PreArchive, &pre_archive_context)
         .await
@@ -1178,10 +1278,7 @@ async fn archive_single_change(
 
     // Wait for child process to complete
     let status = child.wait().await.map_err(|e| {
-        crate::error::OrchestratorError::AgentCommand(format!(
-            "Failed to wait for process: {}",
-            e
-        ))
+        crate::error::OrchestratorError::AgentCommand(format!("Failed to wait for process: {}", e))
     })?;
 
     if status.success() {
@@ -1189,9 +1286,13 @@ async fn archive_single_change(
         agent.clear_apply_history(change_id);
 
         // Run post_archive hook
-        let post_archive_context =
-            HookContext::new(context.iteration, context.total_changes, context.queue_size.saturating_sub(1), false)
-                .with_change(change_id, change.completed_tasks, change.total_tasks);
+        let post_archive_context = HookContext::new(
+            context.iteration,
+            context.total_changes,
+            context.queue_size.saturating_sub(1),
+            false,
+        )
+        .with_change(change_id, change.completed_tasks, change.total_tasks);
         if let Err(e) = hooks
             .run_hook(HookType::PostArchive, &post_archive_context)
             .await
@@ -1212,10 +1313,14 @@ async fn archive_single_change(
         let error_msg = format!("Archive failed with exit code: {:?}", status.code());
 
         // Run on_error hook
-        let error_context =
-            HookContext::new(context.iteration, context.total_changes, context.queue_size, false)
-                .with_change(change_id, change.completed_tasks, change.total_tasks)
-                .with_error(&error_msg);
+        let error_context = HookContext::new(
+            context.iteration,
+            context.total_changes,
+            context.queue_size,
+            false,
+        )
+        .with_change(change_id, change.completed_tasks, change.total_tasks)
+        .with_error(&error_msg);
         let _ = hooks.run_hook(HookType::OnError, &error_context).await;
 
         let _ = tx
@@ -1277,7 +1382,17 @@ async fn archive_all_complete_changes(
             .send(OrchestratorEvent::ProcessingCompleted(change.id.clone()))
             .await;
 
-        match archive_single_change(&change.id, &change, agent, hooks, tx, cancel_token, &context).await? {
+        match archive_single_change(
+            &change.id,
+            &change,
+            agent,
+            hooks,
+            tx,
+            cancel_token,
+            &context,
+        )
+        .await?
+        {
             ArchiveResult::Success => {
                 archived_set.insert(change.id.clone());
                 archived_count += 1;
@@ -1316,6 +1431,7 @@ async fn run_orchestrator(
     use crate::openspec;
 
     let hooks = HookRunner::new(config.get_hooks());
+    let max_iterations = config.get_max_iterations();
     let mut agent = AgentRunner::new(config);
 
     let mut total_changes = change_ids.len();
@@ -1346,6 +1462,32 @@ async fn run_orchestrator(
                 )))
                 .await;
             break;
+        }
+
+        // Check max iterations limit (0 = no limit)
+        if max_iterations > 0 && iteration >= max_iterations {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                    "Max iterations ({}) reached, stopping orchestration",
+                    max_iterations
+                ))))
+                .await;
+            // Send completion event
+            let _ = tx.send(OrchestratorEvent::AllCompleted).await;
+            break;
+        }
+
+        // Log warning when approaching limit (80%)
+        if max_iterations > 0 {
+            let warning_threshold = (max_iterations as f32 * 0.8) as u32;
+            if iteration == warning_threshold {
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                        "Approaching max iterations: {}/{}",
+                        iteration, max_iterations
+                    ))))
+                    .await;
+            }
         }
 
         // Check dynamic queue for new changes before checking if we're done
@@ -1433,7 +1575,9 @@ async fn run_orchestrator(
                 } else {
                     0.0
                 };
-                a_progress.partial_cmp(&b_progress).unwrap_or(std::cmp::Ordering::Equal)
+                a_progress
+                    .partial_cmp(&b_progress)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
 
         let Some(change) = next_change else {
@@ -1455,12 +1599,8 @@ async fn run_orchestrator(
 
         // Run on_first_apply hook (once)
         if !first_apply_executed {
-            let first_apply_context =
-                HookContext::new(iteration, total_changes, queue_size, false).with_change(
-                    &change_id,
-                    change.completed_tasks,
-                    change.total_tasks,
-                );
+            let first_apply_context = HookContext::new(iteration, total_changes, queue_size, false)
+                .with_change(&change_id, change.completed_tasks, change.total_tasks);
             if let Err(e) = hooks
                 .run_hook(HookType::OnFirstApply, &first_apply_context)
                 .await
@@ -1477,12 +1617,8 @@ async fn run_orchestrator(
         }
 
         // Run pre_apply hook
-        let pre_apply_context =
-            HookContext::new(iteration, total_changes, queue_size, false).with_change(
-                &change_id,
-                change.completed_tasks,
-                change.total_tasks,
-            );
+        let pre_apply_context = HookContext::new(iteration, total_changes, queue_size, false)
+            .with_change(&change_id, change.completed_tasks, change.total_tasks);
         if let Err(e) = hooks.run_hook(HookType::PreApply, &pre_apply_context).await {
             let _ = tx
                 .send(OrchestratorEvent::ProcessingError {
@@ -1550,12 +1686,8 @@ async fn run_orchestrator(
 
         if status.success() {
             // Run post_apply hook
-            let post_apply_context =
-                HookContext::new(iteration, total_changes, queue_size, false).with_change(
-                    &change_id,
-                    change.completed_tasks,
-                    change.total_tasks,
-                );
+            let post_apply_context = HookContext::new(iteration, total_changes, queue_size, false)
+                .with_change(&change_id, change.completed_tasks, change.total_tasks);
             if let Err(e) = hooks
                 .run_hook(HookType::PostApply, &post_apply_context)
                 .await
@@ -1594,10 +1726,9 @@ async fn run_orchestrator(
             let error_msg = format!("Apply failed with exit code: {:?}", status.code());
 
             // Run on_error hook
-            let error_context =
-                HookContext::new(iteration, total_changes, queue_size, false)
-                    .with_change(&change_id, change.completed_tasks, change.total_tasks)
-                    .with_error(&error_msg);
+            let error_context = HookContext::new(iteration, total_changes, queue_size, false)
+                .with_change(&change_id, change.completed_tasks, change.total_tasks)
+                .with_error(&error_msg);
             let _ = hooks.run_hook(HookType::OnError, &error_context).await;
 
             let _ = tx
@@ -1850,12 +1981,21 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
     let items: Vec<ListItem> = app
         .changes
         .iter()
-        .map(|change| {
-            let cursor = if Some(&change.id) == app.current_change.as_ref() {
-                "►"
+        .enumerate()
+        .map(|(i, change)| {
+            // Checkbox display (same as select mode):
+            // [ ] - unapproved (cannot be selected)
+            // [@] - approved but not queued
+            // [x] - queued (approved and selected)
+            let (checkbox, checkbox_color) = if !change.is_approved {
+                ("[ ]", Color::DarkGray) // Unapproved
+            } else if change.selected {
+                ("[x]", Color::Green) // Queued
             } else {
-                " "
+                ("[@]", Color::Yellow) // Approved but not queued
             };
+
+            let cursor = if i == app.cursor_index { "►" } else { " " };
             let new_badge = if change.is_new { " NEW" } else { "" };
 
             let status_text = match &change.queue_status {
@@ -1869,10 +2009,17 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             };
 
             let line = Line::from(vec![
-                Span::styled(format!("{} ", cursor), Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!("{} {} ", checkbox, cursor),
+                    Style::default().fg(checkbox_color),
+                ),
                 Span::styled(
                     format!("{:<25}", change.id),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(if change.is_approved {
+                        Color::White
+                    } else {
+                        Color::DarkGray
+                    }),
                 ),
                 Span::styled(
                     new_badge,
@@ -1897,7 +2044,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Changes (Space: add/remove from queue - processed dynamically) ")
+                .title(" Changes (Space: queue, @: approve, q: quit) ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         )
@@ -2184,8 +2331,11 @@ mod tests {
         assert_eq!(app.changes.len(), 2);
         assert!(app.changes[0].selected); // Approved = selected
         assert!(!app.changes[1].selected); // Unapproved = not selected
-        // Should have log entry for auto-queued changes
-        assert!(app.logs.iter().any(|log| log.message.contains("Auto-queued")));
+                                           // Should have log entry for auto-queued changes
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("Auto-queued")));
     }
 
     #[test]
@@ -2199,7 +2349,10 @@ mod tests {
         let app = AppState::new(changes);
 
         // Should NOT have auto-queue log entry
-        assert!(!app.logs.iter().any(|log| log.message.contains("Auto-queued")));
+        assert!(!app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("Auto-queued")));
     }
 
     #[test]
@@ -3249,5 +3402,154 @@ mod tests {
         // With single log, max_offset should be 0
         assert_eq!(app.log_scroll_offset, 0);
         assert!(!app.log_auto_scroll);
+    }
+
+    // Approval toggle tests for running/completed mode
+
+    #[test]
+    fn test_toggle_approval_blocked_for_processing_change() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing and set to Processing status
+        app.start_processing();
+        app.handle_orchestrator_event(OrchestratorEvent::ProcessingStarted("a".to_string()));
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Processing);
+
+        // Try to toggle approval - should be blocked with warning
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert_eq!(
+            app.warning_message.unwrap(),
+            "Cannot change approval for processing change"
+        );
+    }
+
+    #[test]
+    fn test_toggle_approval_in_running_mode_unapproved_to_approved_and_queued() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Set to running mode without actually selecting the unapproved change
+        app.mode = AppMode::Running;
+        assert!(!app.changes[0].is_approved);
+        assert!(!app.changes[0].selected);
+
+        // Toggle approval - should return ApproveAndQueue command
+        let cmd = app.toggle_approval();
+        assert!(matches!(cmd, Some(TuiCommand::ApproveAndQueue(_))));
+    }
+
+    #[test]
+    fn test_toggle_approval_in_running_mode_approved_to_unapproved() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing to enter Running mode
+        app.start_processing();
+        assert_eq!(app.mode, AppMode::Running);
+        assert!(app.changes[0].is_approved);
+
+        // Set to Queued status (not processing)
+        app.changes[0].queue_status = QueueStatus::Queued;
+
+        // Toggle approval - should return UnapproveAndDequeue command
+        let cmd = app.toggle_approval();
+        assert!(matches!(cmd, Some(TuiCommand::UnapproveAndDequeue(_))));
+    }
+
+    #[test]
+    fn test_toggle_approval_in_completed_mode() {
+        let changes = vec![create_approved_change("a", 1, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start and complete processing
+        app.start_processing();
+        app.handle_orchestrator_event(OrchestratorEvent::ProcessingStarted("a".to_string()));
+        app.handle_orchestrator_event(OrchestratorEvent::ProcessingCompleted("a".to_string()));
+        app.mode = AppMode::Completed;
+
+        assert!(app.changes[0].is_approved);
+
+        // Toggle approval - should return UnapproveAndDequeue command
+        let cmd = app.toggle_approval();
+        assert!(matches!(cmd, Some(TuiCommand::UnapproveAndDequeue(_))));
+    }
+
+    #[test]
+    fn test_toggle_approval_allowed_for_queued_status() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing to enter Running mode
+        app.start_processing();
+        assert_eq!(app.mode, AppMode::Running);
+
+        // Change is Queued (not Processing)
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+
+        // Toggle approval - should work (not blocked)
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_some());
+        assert!(app.warning_message.is_none());
+    }
+
+    #[test]
+    fn test_toggle_approval_allowed_for_completed_status() {
+        let changes = vec![create_approved_change("a", 1, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing and complete
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Completed;
+
+        // Toggle approval - should work
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_some());
+        assert!(app.warning_message.is_none());
+    }
+
+    #[test]
+    fn test_toggle_approval_allowed_for_archived_status() {
+        let changes = vec![create_approved_change("a", 1, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing and archive
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Archived;
+
+        // Toggle approval - should work
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_some());
+        assert!(app.warning_message.is_none());
+    }
+
+    #[test]
+    fn test_toggle_approval_allowed_for_error_status() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing and set error
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Error("test error".to_string());
+
+        // Toggle approval - should work
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_some());
+        assert!(app.warning_message.is_none());
+    }
+
+    #[test]
+    fn test_toggle_approval_returns_none_in_error_mode() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Set to error mode
+        app.mode = AppMode::Error;
+
+        // Toggle approval - should return None in Error mode
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_none());
     }
 }

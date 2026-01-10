@@ -22,6 +22,9 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // System prompt for archive command (injected into {prompt} placeholder)
   "archive_prompt": "",
 
+  // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
+  // "max_iterations": 50,
+
   // Lifecycle hooks (optional)
   "hooks": {
     // "pre_apply": "echo 'Starting {change_id}'",
@@ -50,6 +53,9 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // System prompt for archive command (injected into {prompt} placeholder)
   "archive_prompt": "",
 
+  // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
+  // "max_iterations": 50,
+
   // Lifecycle hooks (optional)
   "hooks": {
     // "pre_apply": "echo 'Starting {change_id}'",
@@ -77,6 +83,9 @@ pub const CODEX_TEMPLATE: &str = r#"{
 
   // System prompt for archive command (injected into {prompt} placeholder)
   "archive_prompt": "",
+
+  // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
+  // "max_iterations": 50,
 
   // Lifecycle hooks (optional)
   "hooks": {

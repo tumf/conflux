@@ -25,13 +25,21 @@ pub struct Orchestrator {
     iteration: u32,
     /// Previous queue size (for on_queue_change detection)
     prev_queue_size: Option<usize>,
+    /// Maximum iterations limit (0 = no limit)
+    max_iterations: u32,
 }
 
 impl Orchestrator {
-    /// Create a new orchestrator with optional custom config path
-    pub fn new(target_changes: Option<Vec<String>>, config_path: Option<PathBuf>) -> Result<Self> {
+    /// Create a new orchestrator with optional custom config path and max iterations override
+    pub fn new(
+        target_changes: Option<Vec<String>>,
+        config_path: Option<PathBuf>,
+        max_iterations_override: Option<u32>,
+    ) -> Result<Self> {
         let config = OrchestratorConfig::load(config_path.as_deref())?;
         let hooks = HookRunner::new(config.get_hooks());
+        // CLI override takes precedence over config file value
+        let max_iterations = max_iterations_override.unwrap_or_else(|| config.get_max_iterations());
         let agent = AgentRunner::new(config);
 
         Ok(Self {
@@ -43,6 +51,7 @@ impl Orchestrator {
             first_apply_executed: false,
             iteration: 0,
             prev_queue_size: None,
+            max_iterations,
         })
     }
 
@@ -53,6 +62,7 @@ impl Orchestrator {
         config: OrchestratorConfig,
     ) -> Result<Self> {
         let hooks = HookRunner::new(config.get_hooks());
+        let max_iterations = config.get_max_iterations();
         let agent = AgentRunner::new(config);
 
         Ok(Self {
@@ -64,6 +74,7 @@ impl Orchestrator {
             first_apply_executed: false,
             iteration: 0,
             prev_queue_size: None,
+            max_iterations,
         })
     }
 
@@ -133,8 +144,7 @@ impl Orchestrator {
         }
 
         // Store snapshot of change IDs (only the filtered ones)
-        let snapshot_ids: HashSet<String> =
-            filtered_initial.iter().map(|c| c.id.clone()).collect();
+        let snapshot_ids: HashSet<String> = filtered_initial.iter().map(|c| c.id.clone()).collect();
         info!(
             "Captured snapshot of {} changes: {:?}",
             snapshot_ids.len(),
@@ -158,6 +168,31 @@ impl Orchestrator {
         loop {
             // Increment iteration counter
             self.iteration += 1;
+
+            // Check max iterations limit (0 = no limit)
+            if self.max_iterations > 0 {
+                // Log warning when approaching limit (80%)
+                let warning_threshold = (self.max_iterations as f32 * 0.8) as u32;
+                if self.iteration == warning_threshold {
+                    warn!(
+                        "Approaching max iterations: {}/{}",
+                        self.iteration, self.max_iterations
+                    );
+                }
+
+                // Stop if max iterations reached
+                if self.iteration > self.max_iterations {
+                    info!(
+                        "Max iterations ({}) reached, stopping orchestration",
+                        self.max_iterations
+                    );
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_all();
+                    }
+                    finish_status = "iteration_limit";
+                    break;
+                }
+            }
 
             // List all changes from openspec (to get updated progress)
             let changes = openspec::list_changes_native()?;

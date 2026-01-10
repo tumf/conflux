@@ -722,26 +722,36 @@ The CLI SHALL provide an `approve` subcommand to manage change approval status.
 
 The TUI SHALL allow users to toggle approval status using the `@` key.
 
-#### Scenario: Toggle approval in selection mode
+#### Scenario: Approve unapproved change adds to queue automatically
 
-- **WHEN** TUI is in selection mode
+- **WHEN** TUI is in selection mode or running mode
+- **AND** user presses `@` key on an unapproved change (`[ ]`)
+- **THEN** the change becomes approved AND queued (`[x]`)
+- **AND** checkbox transitions directly from `[ ]` to `[x]`
+- **AND** log message indicates both approval and queue addition
+
+#### Scenario: Unapprove approved-but-not-queued change
+
+- **WHEN** TUI is in selection mode or running mode
+- **AND** user presses `@` key on an approved but not queued change (`[@]`)
+- **THEN** the change becomes unapproved (`[ ]`)
+- **AND** checkbox transitions from `[@]` to `[ ]`
+
+#### Scenario: Unapprove queued change removes from queue
+
+- **WHEN** TUI is in selection mode or running mode
+- **AND** user presses `@` key on a queued change (`[x]`) that is NOT processing
+- **THEN** the change becomes unapproved AND removed from queue (`[ ]`)
+- **AND** checkbox transitions from `[x]` to `[ ]`
+- **AND** log message indicates both unapproval and queue removal
+
+#### Scenario: Toggle approval blocked for processing change
+
+- **WHEN** TUI is in running mode
 - **AND** user presses `@` key
-- **AND** a change is highlighted
-- **THEN** the approval status of the highlighted change is toggled
-- **AND** if previously unapproved, an `approved` file is created
-- **AND** if previously approved, the `approved` file is deleted
-
-#### Scenario: Approval badge display
-
-- **WHEN** TUI displays the change list
-- **AND** a change is approved
-- **THEN** an `@` badge is displayed next to the change ID
-- **AND** the badge uses a distinct color (green recommended)
-
-#### Scenario: Help text includes approval key
-
-- **WHEN** TUI is in selection mode
-- **THEN** the help text includes `@: approve` in the key bindings
+- **AND** highlighted change is in `Processing` state
+- **THEN** approval status is NOT changed
+- **AND** a warning message is displayed: "Cannot change approval for processing change"
 
 ### Requirement: Auto-Queue Approved Changes on TUI Startup
 

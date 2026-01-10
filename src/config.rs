@@ -37,6 +37,9 @@ pub const DEFAULT_APPLY_PROMPT: &str =
 /// Default prompt for archive command - empty (no additional instructions)
 pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
 
+/// Default maximum iterations for the orchestration loop
+pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
+
 /// Orchestrator configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OrchestratorConfig {
@@ -79,6 +82,12 @@ pub struct OrchestratorConfig {
     /// Default: 3
     #[serde(default)]
     pub completion_check_max_retries: Option<u32>,
+
+    /// Maximum number of iterations for the orchestration loop.
+    /// Set to 0 to disable the limit.
+    /// Default: 50
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
 }
 
 impl OrchestratorConfig {
@@ -111,9 +120,7 @@ impl OrchestratorConfig {
 
     /// Get the apply prompt, falling back to default if not set
     pub fn get_apply_prompt(&self) -> &str {
-        self.apply_prompt
-            .as_deref()
-            .unwrap_or(DEFAULT_APPLY_PROMPT)
+        self.apply_prompt.as_deref().unwrap_or(DEFAULT_APPLY_PROMPT)
     }
 
     /// Get the archive prompt, falling back to default if not set
@@ -126,6 +133,13 @@ impl OrchestratorConfig {
     /// Get the hooks configuration, returning default (empty) if not set
     pub fn get_hooks(&self) -> HooksConfig {
         self.hooks.clone().unwrap_or_default()
+    }
+
+    /// Get the maximum iterations limit.
+    /// Returns 0 if explicitly set to 0 (disabled), otherwise returns configured or default value.
+    /// A value of 0 means no limit.
+    pub fn get_max_iterations(&self) -> u32 {
+        self.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS)
     }
 
     /// Expand `{change_id}` placeholder in a command template
@@ -611,5 +625,50 @@ mod tests {
         let command = OrchestratorConfig::expand_prompt(&command, "Ignored prompt");
         // The {prompt} replacement does nothing since placeholder doesn't exist
         assert_eq!(command, "claude -p '/openspec:apply fix-bug'");
+    }
+
+    #[test]
+    fn test_get_max_iterations_default() {
+        let config = OrchestratorConfig::default();
+        assert_eq!(config.get_max_iterations(), DEFAULT_MAX_ITERATIONS);
+        assert_eq!(config.get_max_iterations(), 50);
+    }
+
+    #[test]
+    fn test_get_max_iterations_custom() {
+        let config = OrchestratorConfig {
+            max_iterations: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(config.get_max_iterations(), 100);
+    }
+
+    #[test]
+    fn test_get_max_iterations_zero_disables_limit() {
+        let config = OrchestratorConfig {
+            max_iterations: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(config.get_max_iterations(), 0);
+    }
+
+    #[test]
+    fn test_parse_jsonc_with_max_iterations() {
+        let jsonc = r#"{
+            "max_iterations": 75
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        assert_eq!(config.max_iterations, Some(75));
+        assert_eq!(config.get_max_iterations(), 75);
+    }
+
+    #[test]
+    fn test_parse_jsonc_max_iterations_zero() {
+        let jsonc = r#"{
+            "max_iterations": 0
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        assert_eq!(config.max_iterations, Some(0));
+        assert_eq!(config.get_max_iterations(), 0);
     }
 }

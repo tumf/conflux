@@ -57,6 +57,10 @@ pub struct RunArgs {
         default_value = "npx @fission-ai/openspec@latest"
     )]
     pub openspec_cmd: String,
+
+    /// Maximum number of iterations for the orchestration loop (overrides config, 0 = no limit)
+    #[arg(long)]
+    pub max_iterations: Option<u32>,
 }
 
 /// Arguments for the TUI subcommand
@@ -288,11 +292,7 @@ mod tests {
             Some(Commands::Run(args)) => {
                 assert_eq!(
                     args.change,
-                    Some(vec![
-                        "a".to_string(),
-                        "b".to_string(),
-                        "c".to_string()
-                    ])
+                    Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
                 );
             }
             _ => panic!("Expected Run subcommand"),
@@ -451,5 +451,41 @@ mod tests {
 
         let err = result.unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn test_run_subcommand_max_iterations_default() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "run"]);
+
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert!(args.max_iterations.is_none());
+            }
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_run_subcommand_max_iterations_custom() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--max-iterations", "100"]);
+
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert_eq!(args.max_iterations, Some(100));
+            }
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_run_subcommand_max_iterations_zero() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--max-iterations", "0"]);
+
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert_eq!(args.max_iterations, Some(0));
+            }
+            _ => panic!("Expected Run subcommand"),
+        }
     }
 }

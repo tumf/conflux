@@ -1,0 +1,26 @@
+# cargo-dist configuration for binary distribution
+# https://opensource.axo.dev/cargo-dist/
+
+[dist]
+# cargo-dist version
+cargo-dist-version = "0.30.3"
+# CI provider
+ci = "github"
+# Installers to generate
+installers = ["shell", "powershell", "homebrew"]
+# Homebrew tap repository
+tap = "tumf/homebrew-tap"
+# Target platforms
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+# Install path for shell/powershell installers
+install-path = "CARGO_HOME"
+# Update README badges during release
+install-updater = false
+# Release downloads URL
+github-releases-repo = "tumf/openspec-orchestrator"
