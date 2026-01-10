@@ -44,11 +44,13 @@ impl ApplyHistory {
     }
 
     /// Get all attempts for a change
+    #[allow(dead_code)]
     pub fn get(&self, change_id: &str) -> Option<&[ApplyAttempt]> {
         self.attempts.get(change_id).map(|v| v.as_slice())
     }
 
     /// Get the last attempt for a change
+    #[allow(dead_code)]
     pub fn last(&self, change_id: &str) -> Option<&ApplyAttempt> {
         self.attempts.get(change_id).and_then(|v| v.last())
     }

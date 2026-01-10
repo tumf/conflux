@@ -13,6 +13,8 @@ OpenSpec変更ワークフローを自動化: list → 依存関係分析 → ap
 - 📊 **リアルタイム進捗**: 全体および変更ごとのビジュアル進捗バー
 - 🔌 **マルチエージェント対応**: Claude Code、OpenCode、Codexに対応
 - 🪝 **ライフサイクルフック**: ワークフロー各段階でのカスタムアクション設定
+- ✅ **承認ワークフロー**: チェックサム検証による変更の承認管理
+- ⚡ **並列実行**: jjワークスペースを使用した複数の独立した変更の同時処理
 
 ## アーキテクチャ
 
@@ -87,10 +89,14 @@ openspec-orchestrator init --force
 openspec-orchestrator run
 ```
 
-特定の変更を処理:
+特定の変更を処理（単一または複数）:
 
 ```bash
+# 単一の変更
 openspec-orchestrator run --change add-feature-x
+
+# 複数の変更（カンマ区切り）
+openspec-orchestrator run --change add-feature-x,fix-bug-y,refactor-z
 ```
 
 カスタム設定ファイル:
@@ -104,6 +110,23 @@ openspec-orchestrator run --config /path/to/config.jsonc
 ```bash
 openspec-orchestrator tui
 ```
+
+### 変更の承認管理
+
+変更の承認・承認解除を管理して、処理可能な変更を制御:
+
+```bash
+# 変更を承認（検証用チェックサムを作成）
+openspec-orchestrator approve set add-feature-x
+
+# 承認ステータスを確認
+openspec-orchestrator approve status add-feature-x
+
+# 変更の承認を解除
+openspec-orchestrator approve unset add-feature-x
+```
+
+承認された変更には、すべての仕様ファイル（`tasks.md`を除く）のMD5チェックサムを含む`approved`ファイルが作成されます。これにより、承認後に変更が修正されていないことを保証します。
 
 ## 動作原理
 
@@ -304,9 +327,10 @@ openspec-orchestrator
 使用法: openspec-orchestrator [オプション] [コマンド]
 
 コマンド:
-  run   OpenSpec変更オーケストレーションループを実行（非インタラクティブ）
-  tui   インタラクティブTUIダッシュボードを起動
-  init  新しい設定ファイルを初期化
+  run      OpenSpec変更オーケストレーションループを実行（非インタラクティブ）
+  tui      インタラクティブTUIダッシュボードを起動
+  init     新しい設定ファイルを初期化
+  approve  変更の承認ステータスを管理
 
 オプション:
   --opencode-path <PATH>   opencodeバイナリのパス（非推奨、設定ファイルを使用）
@@ -317,7 +341,7 @@ openspec-orchestrator
 **runサブコマンドのオプション:**
 ```
 オプション:
-  --change <ID>         指定した変更のみを処理
+  --change <ID,...>     指定した変更のみを処理（カンマ区切り）
   -c, --config <PATH>   カスタム設定ファイルパス（JSONC）
   --openspec-cmd <CMD>  カスタムopenspecコマンド [env: OPENSPEC_CMD]
 ```
@@ -327,6 +351,14 @@ openspec-orchestrator
 オプション:
   -t, --template <TEMPLATE>  使用するテンプレート [デフォルト: claude] [可能な値: claude, opencode, codex]
   -f, --force                既存の設定ファイルを上書き
+```
+
+**approveサブコマンド:**
+```
+コマンド:
+  set     変更を承認（チェックサム付きapprovedファイルを作成）
+  unset   変更の承認を解除（approvedファイルを削除）
+  status  変更の承認ステータスを確認
 ```
 
 優先順位: CLIの引数 > 環境変数 > デフォルト値
@@ -366,7 +398,7 @@ openspec-orchestrator
 ## 今後の機能強化
 
 - [ ] リカバリと再開のための状態永続化
-- [ ] 独立した変更の並列実行
+- [x] 独立した変更の並列実行（jjワークスペース使用）
 - [ ] Slack/Discord通知
 - [ ] 最大イテレーション制限（無限ループ防止）
 - [ ] 手動優先度オーバーライド

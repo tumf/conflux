@@ -13,6 +13,8 @@ Automates the OpenSpec change workflow: list → dependency analysis → apply �
 - 📊 **Real-time Progress**: Visual progress bars showing overall and per-change status
 - 🔌 **Multi-Agent Support**: Works with Claude Code, OpenCode, and Codex
 - 🪝 **Lifecycle Hooks**: Configurable hooks for custom actions at each workflow stage
+- ✅ **Approval Workflow**: Approve changes with checksum validation before processing
+- ⚡ **Parallel Execution**: Process multiple independent changes simultaneously using jj workspaces
 
 ## Architecture
 
@@ -87,10 +89,14 @@ Process all pending changes in headless mode:
 openspec-orchestrator run
 ```
 
-Process a specific change:
+Process specific changes (single or multiple):
 
 ```bash
+# Single change
 openspec-orchestrator run --change add-feature-x
+
+# Multiple changes (comma-separated)
+openspec-orchestrator run --change add-feature-x,fix-bug-y,refactor-z
 ```
 
 Custom configuration file:
@@ -104,6 +110,23 @@ openspec-orchestrator run --config /path/to/config.jsonc
 ```bash
 openspec-orchestrator tui
 ```
+
+### Manage Change Approval
+
+Approve or unapprove changes to control which changes can be processed:
+
+```bash
+# Approve a change (creates checksums for validation)
+openspec-orchestrator approve set add-feature-x
+
+# Check approval status
+openspec-orchestrator approve status add-feature-x
+
+# Unapprove a change
+openspec-orchestrator approve unset add-feature-x
+```
+
+Approved changes have an `approved` file containing MD5 checksums of all specification files (excluding `tasks.md`). This ensures the change hasn't been modified since approval.
 
 ## How It Works
 
@@ -304,9 +327,10 @@ openspec-orchestrator
 Usage: openspec-orchestrator [OPTIONS] [COMMAND]
 
 Commands:
-  run   Run the OpenSpec change orchestration loop (non-interactive)
-  tui   Launch the interactive TUI dashboard
-  init  Initialize a new configuration file
+  run      Run the OpenSpec change orchestration loop (non-interactive)
+  tui      Launch the interactive TUI dashboard
+  init     Initialize a new configuration file
+  approve  Manage change approval status
 
 Options:
   --opencode-path <PATH>   Path to opencode binary (deprecated, use config file)
@@ -317,7 +341,7 @@ Options:
 **Run subcommand options:**
 ```
 Options:
-  --change <ID>         Process only specified change
+  --change <ID,...>     Process only specified changes (comma-separated)
   -c, --config <PATH>   Custom configuration file path (JSONC)
   --openspec-cmd <CMD>  Custom openspec command [env: OPENSPEC_CMD]
 ```
@@ -327,6 +351,14 @@ Options:
 Options:
   -t, --template <TEMPLATE>  Template to use [default: claude] [possible values: claude, opencode, codex]
   -f, --force                Overwrite existing configuration file
+```
+
+**Approve subcommand:**
+```
+Commands:
+  set     Approve a change (create approved file with checksums)
+  unset   Unapprove a change (remove approved file)
+  status  Check approval status of a change
 ```
 
 Priority: CLI argument > Environment variable > Default value
@@ -366,7 +398,7 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for build instructions, testing, and projec
 ## Future Enhancements
 
 - [ ] State persistence for recovery and resumption
-- [ ] Parallel execution for independent changes
+- [x] Parallel execution for independent changes (using jj workspaces)
 - [ ] Slack/Discord notifications
 - [ ] Maximum iteration limit (prevent infinite loops)
 - [ ] Manual priority override
