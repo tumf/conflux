@@ -106,4 +106,3 @@
 - [ ] 12.2 Run `cargo clippy -- -D warnings`
 - [ ] 12.3 Run `cargo test`
 - [ ] 12.4 Run `cargo build --release`
-- [ ] 12.5 Manual TUI test: `cargo run -- tui`
