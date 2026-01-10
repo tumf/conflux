@@ -70,6 +70,8 @@ pub struct ParallelExecutor {
     apply_command: String,
     /// Archive command template
     archive_command: String,
+    /// Resolve command template
+    resolve_command: String,
     /// Event sender
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
     /// Maximum retries for conflict resolution
@@ -94,6 +96,7 @@ impl ParallelExecutor {
         let max_concurrent = config.get_max_concurrent_workspaces();
         let apply_command = config.get_apply_command().to_string();
         let archive_command = config.get_archive_command().to_string();
+        let resolve_command = config.get_resolve_command().to_string();
 
         let workspace_manager =
             JjWorkspaceManager::new(base_dir, repo_root.clone(), max_concurrent, config.clone());
@@ -103,6 +106,7 @@ impl ParallelExecutor {
             config,
             apply_command,
             archive_command,
+            resolve_command,
             event_tx,
             max_conflict_retries: 3,
             repo_root,
@@ -513,35 +517,53 @@ impl ParallelExecutor {
         Ok(conflict_files)
     }
 
-    /// Attempt to resolve conflicts with retries
-    async fn resolve_conflicts_with_retry(&self, conflict_info: &str) -> Result<()> {
+    /// Attempt to resolve conflicts with retries using the configured resolve command
+    async fn resolve_conflicts_with_retry(&self, _conflict_info: &str) -> Result<()> {
         self.send_event(ParallelEvent::ConflictResolutionStarted)
             .await;
 
+        // Get conflict files for the resolve command
+        let conflict_files = self.detect_conflicts().await?;
+        let conflict_files_str = conflict_files.join(", ");
+
         for attempt in 1..=self.max_conflict_retries {
             info!(
-                "Conflict resolution attempt {}/{}",
-                attempt, self.max_conflict_retries
+                "Conflict resolution attempt {}/{} for files: {}",
+                attempt, self.max_conflict_retries, conflict_files_str
             );
 
-            match self
-                .workspace_manager
-                .resolve_conflicts(conflict_info)
+            // Expand {conflict_files} placeholder in resolve command
+            let command =
+                OrchestratorConfig::expand_conflict_files(&self.resolve_command, &conflict_files_str);
+
+            debug!("Resolve command: {}", command);
+
+            // Execute resolve command using sh -c
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .current_dir(&self.repo_root)
+                .output()
                 .await
-            {
-                Ok(()) => {
-                    // Verify resolution
-                    let conflicts = self.detect_conflicts().await?;
-                    if conflicts.is_empty() {
-                        self.send_event(ParallelEvent::ConflictResolutionCompleted)
-                            .await;
-                        return Ok(());
-                    }
-                    warn!("Conflicts still present after resolution attempt");
+                .map_err(|e| {
+                    OrchestratorError::AgentCommand(format!("Failed to run resolve command: {}", e))
+                })?;
+
+            if output.status.success() {
+                // Verify resolution
+                let remaining_conflicts = self.detect_conflicts().await?;
+                if remaining_conflicts.is_empty() {
+                    self.send_event(ParallelEvent::ConflictResolutionCompleted)
+                        .await;
+                    return Ok(());
                 }
-                Err(e) => {
-                    warn!("Resolution attempt {} failed: {}", attempt, e);
-                }
+                warn!(
+                    "Conflicts still present after resolution attempt: {:?}",
+                    remaining_conflicts
+                );
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!("Resolution attempt {} failed: {}", attempt, stderr);
             }
         }
 

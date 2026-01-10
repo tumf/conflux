@@ -80,6 +80,7 @@ pub struct JjWorkspaceManager {
     /// Maximum concurrent workspaces
     max_concurrent: usize,
     /// Configuration for resolve command
+    #[allow(dead_code)]
     config: OrchestratorConfig,
 }
 
@@ -301,6 +302,7 @@ impl JjWorkspaceManager {
     }
 
     /// Resolve conflicts using the configured resolve command
+    #[allow(dead_code)]
     pub async fn resolve_conflicts(&self, conflict_info: &str) -> Result<()> {
         let resolve_command = match &self.config.resolve_command {
             Some(cmd) => cmd.clone(),

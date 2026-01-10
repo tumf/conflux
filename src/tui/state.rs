@@ -177,8 +177,7 @@ impl AppState {
     pub fn toggle_parallel_mode(&mut self) -> bool {
         // Only allow toggling in Select or Stopped mode
         if !matches!(self.mode, AppMode::Select | AppMode::Stopped) {
-            self.warning_message =
-                Some("Cannot toggle parallel mode while processing".to_string());
+            self.warning_message = Some("Cannot toggle parallel mode while processing".to_string());
             return false;
         }
 

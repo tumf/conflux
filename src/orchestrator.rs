@@ -659,7 +659,10 @@ impl Orchestrator {
             println!();
         }
 
-        println!("Max concurrent workspaces: {}", self.max_concurrent.unwrap_or(4));
+        println!(
+            "Max concurrent workspaces: {}",
+            self.max_concurrent.unwrap_or(4)
+        );
         println!("\nTo execute, run without --dry-run flag.");
 
         Ok(())
@@ -685,7 +688,10 @@ impl Orchestrator {
         let groups = match analyzer.analyze_groups(&approved).await {
             Ok(g) => g,
             Err(e) => {
-                warn!("LLM analysis failed ({}), using simple grouping (all changes in one group)", e);
+                warn!(
+                    "LLM analysis failed ({}), using simple grouping (all changes in one group)",
+                    e
+                );
                 vec![ParallelGroup {
                     id: 1,
                     changes: approved.iter().map(|c| c.id.clone()).collect(),
@@ -724,7 +730,11 @@ impl Orchestrator {
     }
 
     /// Run groups sequentially (fallback when jj is not available)
-    async fn run_sequential(&mut self, approved: &[Change], groups: Vec<ParallelGroup>) -> Result<()> {
+    async fn run_sequential(
+        &mut self,
+        approved: &[Change],
+        groups: Vec<ParallelGroup>,
+    ) -> Result<()> {
         for group in groups {
             info!("Processing group {} sequentially", group.id);
             for change_id in group.changes {

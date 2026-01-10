@@ -543,8 +543,13 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_max_concurrent() {
-        let cli =
-            Cli::parse_from(["openspec-orchestrator", "run", "--parallel", "--max-concurrent", "5"]);
+        let cli = Cli::parse_from([
+            "openspec-orchestrator",
+            "run",
+            "--parallel",
+            "--max-concurrent",
+            "5",
+        ]);
 
         match cli.command {
             Some(Commands::Run(args)) => {

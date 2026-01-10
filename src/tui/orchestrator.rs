@@ -688,3 +688,228 @@ pub async fn run_orchestrator(
     let _ = tx.send(OrchestratorEvent::AllCompleted).await;
     Ok(())
 }
+
+/// Run the orchestrator in parallel mode using jj workspaces
+/// This function executes all changes in parallel using ParallelExecutor
+pub async fn run_orchestrator_parallel(
+    change_ids: Vec<String>,
+    _openspec_cmd: String,
+    config: OrchestratorConfig,
+    tx: mpsc::Sender<OrchestratorEvent>,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    use crate::analyzer::ParallelGroup;
+    use crate::parallel_executor::{ParallelEvent, ParallelExecutor};
+
+    let _ = tx
+        .send(OrchestratorEvent::Log(LogEntry::info(format!(
+            "Starting parallel processing of {} change(s)",
+            change_ids.len()
+        ))))
+        .await;
+
+    // Mark all changes as queued
+    for id in &change_ids {
+        let _ = tx
+            .send(OrchestratorEvent::ProcessingStarted(id.clone()))
+            .await;
+    }
+
+    // Get repo root
+    let repo_root = std::env::current_dir()?;
+
+    // Create event channel for ParallelExecutor
+    let (parallel_tx, mut parallel_rx) = mpsc::channel::<ParallelEvent>(100);
+
+    // Create ParallelExecutor
+    let mut executor = ParallelExecutor::new(repo_root, config.clone(), Some(parallel_tx));
+
+    // Check jj availability
+    if !executor.check_jj_available().await? {
+        let _ = tx
+            .send(OrchestratorEvent::Log(LogEntry::error(
+                "jj is not available for parallel execution".to_string(),
+            )))
+            .await;
+        return Err(crate::error::OrchestratorError::AgentCommand(
+            "jj not available".to_string(),
+        ));
+    }
+
+    // Create a single parallel group with all changes
+    let group = ParallelGroup {
+        id: 1,
+        changes: change_ids.clone(),
+        depends_on: vec![],
+    };
+
+    // Spawn event forwarding task
+    let forward_tx = tx.clone();
+    let forward_cancel = cancel_token.clone();
+    let forward_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = forward_cancel.cancelled() => {
+                    break;
+                }
+                event = parallel_rx.recv() => {
+                    match event {
+                        Some(ParallelEvent::WorkspaceCreated { change_id, workspace }) => {
+                            let _ = forward_tx
+                                .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                                    "Created workspace for {}: {}",
+                                    change_id, workspace
+                                ))))
+                                .await;
+                        }
+                        Some(ParallelEvent::ApplyCompleted { change_id, .. }) => {
+                            let _ = forward_tx
+                                .send(OrchestratorEvent::Log(LogEntry::success(format!(
+                                    "Apply completed: {}",
+                                    change_id
+                                ))))
+                                .await;
+                            let _ = forward_tx
+                                .send(OrchestratorEvent::ProcessingCompleted(change_id))
+                                .await;
+                        }
+                        Some(ParallelEvent::ApplyFailed { change_id, error }) => {
+                            let _ = forward_tx
+                                .send(OrchestratorEvent::ProcessingError {
+                                    id: change_id,
+                                    error,
+                                })
+                                .await;
+                        }
+                        Some(ParallelEvent::MergeStarted { revisions }) => {
+                            let _ = forward_tx
+                                .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                                    "Merging {} revisions",
+                                    revisions.len()
+                                ))))
+                                .await;
+                        }
+                        Some(ParallelEvent::MergeCompleted { .. }) => {
+                            let _ = forward_tx
+                                .send(OrchestratorEvent::Log(LogEntry::success(
+                                    "Merge completed".to_string(),
+                                )))
+                                .await;
+                        }
+                        Some(ParallelEvent::MergeConflict { files }) => {
+                            let _ = forward_tx
+                                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                                    "Merge conflicts in {} files",
+                                    files.len()
+                                ))))
+                                .await;
+                        }
+                        Some(ParallelEvent::CleanupStarted { workspace }) => {
+                            let _ = forward_tx
+                                .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                                    "Cleaning up workspace: {}",
+                                    workspace
+                                ))))
+                                .await;
+                        }
+                        Some(ParallelEvent::CleanupCompleted { .. }) => {
+                            // Silent cleanup completion
+                        }
+                        Some(ParallelEvent::GroupCompleted { .. }) => {
+                            let _ = forward_tx
+                                .send(OrchestratorEvent::Log(LogEntry::success(
+                                    "Parallel group completed".to_string(),
+                                )))
+                                .await;
+                        }
+                        Some(ParallelEvent::AllCompleted) => {
+                            break;
+                        }
+                        Some(ParallelEvent::Error { message }) => {
+                            let _ = forward_tx
+                                .send(OrchestratorEvent::Log(LogEntry::error(message)))
+                                .await;
+                        }
+                        Some(_) => {
+                            // Other events - ignore
+                        }
+                        None => {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Execute the group
+    let result = tokio::select! {
+        _ = cancel_token.cancelled() => {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::warn(
+                    "Parallel execution cancelled".to_string(),
+                )))
+                .await;
+            Err(crate::error::OrchestratorError::AgentCommand("Cancelled".to_string()))
+        }
+        result = executor.execute_groups(vec![group]) => {
+            result
+        }
+    };
+
+    // Wait for forward task to complete
+    let _ = forward_handle.await;
+
+    match result {
+        Ok(_) => {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::success(
+                    "All parallel changes completed, archiving...".to_string(),
+                )))
+                .await;
+
+            // Actually archive completed changes
+            let agent = crate::agent::AgentRunner::new(config);
+            for id in &change_ids {
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                        "Archiving: {}",
+                        id
+                    ))))
+                    .await;
+
+                // Run archive command
+                match agent.run_archive(id).await {
+                    Ok(_) => {
+                        let _ = tx.send(OrchestratorEvent::ChangeArchived(id.clone())).await;
+                        let _ = tx
+                            .send(OrchestratorEvent::Log(LogEntry::success(format!(
+                                "Archived: {}",
+                                id
+                            ))))
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(OrchestratorEvent::Log(LogEntry::error(format!(
+                                "Failed to archive {}: {}",
+                                id, e
+                            ))))
+                            .await;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::error(format!(
+                    "Parallel execution failed: {}",
+                    e
+                ))))
+                .await;
+        }
+    }
+
+    let _ = tx.send(OrchestratorEvent::AllCompleted).await;
+    Ok(())
+}

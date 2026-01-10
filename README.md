@@ -61,6 +61,45 @@ The TUI provides:
 - Progress tracking for all pending changes
 - Keyboard navigation and controls
 
+#### TUI Change States
+
+Changes have two independent states: **approval** and **selection/queue**.
+
+**Checkbox Display:**
+| Symbol | State | Description |
+|--------|-------|-------------|
+| `[ ]` | Unapproved | Cannot be selected for processing |
+| `[@]` | Approved (not selected) | Ready to be selected |
+| `[x]` | Selected (reserved) | Will be queued when F5 is pressed |
+
+**Queue Status (shown in Running mode):**
+| Status | Description |
+|--------|-------------|
+| `[Queued]` | Waiting to be processed |
+| `[Processing]` | Currently being applied |
+| `[Completed]` | All tasks finished |
+| `[Archived]` | Successfully archived |
+| `[Error]` | Processing failed |
+
+**Workflow:**
+1. **Select mode**: Use `@` to approve changes, then `Space` to select (reserve) them
+2. Press `F5` to start processing - all selected changes become `[Queued]`
+3. **Running mode**: Watch progress as changes move through Queued → Processing → Completed → Archived
+
+#### TUI Key Bindings
+
+| Key | Select Mode | Running Mode |
+|-----|-------------|--------------|
+| `↑/↓` or `j/k` | Navigate list | Navigate list |
+| `Space` | Toggle selection | Add/remove from queue |
+| `@` | Toggle approval | Toggle approval |
+| `e` | Open editor | Open editor |
+| `F5` | Start processing | - |
+| `=` | Toggle parallel mode | - |
+| `Esc` | - | Stop (graceful/force) |
+| `q` | Quit | Quit |
+| `PageUp/Down` | - | Scroll logs |
+
 ### Initialize Configuration
 
 Generate a configuration file for your preferred AI agent:

@@ -27,6 +27,11 @@ pub const DEFAULT_APPLY_COMMAND: &str = "opencode run '/openspec-apply {change_i
 /// Default archive command template (OpenCode)
 pub const DEFAULT_ARCHIVE_COMMAND: &str = "opencode run '/openspec-archive {change_id}'";
 
+/// Default resolve command template (OpenCode)
+/// Supports `{conflict_files}` placeholder for the list of conflicting files
+pub const DEFAULT_RESOLVE_COMMAND: &str =
+    "opencode run 'Resolve conflicts in the following files: {conflict_files}'";
+
 /// Default analyze command template (OpenCode)
 pub const DEFAULT_ANALYZE_COMMAND: &str = "opencode run --format json '{prompt}'";
 
@@ -190,11 +195,16 @@ impl OrchestratorConfig {
         self.workspace_base_dir.as_deref().filter(|s| !s.is_empty())
     }
 
-    /// Get the resolve command for conflict resolution.
-    /// Returns None if using automatic AI-based resolution.
-    #[allow(dead_code)]
-    pub fn get_resolve_command(&self) -> Option<&str> {
-        self.resolve_command.as_deref()
+    /// Get the resolve command for conflict resolution, falling back to default if not set.
+    pub fn get_resolve_command(&self) -> &str {
+        self.resolve_command
+            .as_deref()
+            .unwrap_or(DEFAULT_RESOLVE_COMMAND)
+    }
+
+    /// Expand `{conflict_files}` placeholder in a command template
+    pub fn expand_conflict_files(template: &str, conflict_files: &str) -> String {
+        template.replace("{conflict_files}", conflict_files)
     }
 
     /// Expand `{change_id}` placeholder in a command template

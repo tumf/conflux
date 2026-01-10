@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::events::{LogEntry, OrchestratorEvent, TuiCommand};
-use super::orchestrator::run_orchestrator;
+use super::orchestrator::{run_orchestrator, run_orchestrator_parallel};
 use super::queue::DynamicQueue;
 use super::render::{render, SPINNER_CHARS};
 use super::state::{AppState, AUTO_REFRESH_INTERVAL_SECS};
@@ -250,18 +250,30 @@ async fn run_tui_loop(
                                     let orch_dynamic_queue = dynamic_queue.clone();
                                     let orch_graceful_stop = graceful_stop_flag.clone();
                                     orchestrator_cancel = Some(orch_cancel.clone());
+                                    let use_parallel = app.parallel_mode;
 
                                     orchestrator_handle = Some(tokio::spawn(async move {
-                                        run_orchestrator(
-                                            selected_ids,
-                                            orch_openspec_cmd,
-                                            orch_config,
-                                            orch_tx,
-                                            orch_cancel,
-                                            orch_dynamic_queue,
-                                            orch_graceful_stop,
-                                        )
-                                        .await
+                                        if use_parallel {
+                                            run_orchestrator_parallel(
+                                                selected_ids,
+                                                orch_openspec_cmd,
+                                                orch_config,
+                                                orch_tx,
+                                                orch_cancel,
+                                            )
+                                            .await
+                                        } else {
+                                            run_orchestrator(
+                                                selected_ids,
+                                                orch_openspec_cmd,
+                                                orch_config,
+                                                orch_tx,
+                                                orch_cancel,
+                                                orch_dynamic_queue,
+                                                orch_graceful_stop,
+                                            )
+                                            .await
+                                        }
                                     }));
                                 }
                             }

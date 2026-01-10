@@ -112,7 +112,9 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         header_spans.push(Span::raw(" "));
         header_spans.push(Span::styled(
             "[parallel]",
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -153,16 +155,16 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
         .iter()
         .enumerate()
         .map(|(i, change)| {
-            // Checkbox display:
+            // Checkbox display (Select mode):
             // [ ] - unapproved (cannot be selected)
-            // [@] - approved but not queued
-            // [x] - queued (approved and selected)
+            // [@] - approved but not selected (ready to select)
+            // [x] - selected/reserved (will become Queued when F5 is pressed)
             let (checkbox, checkbox_color) = if !change.is_approved {
                 ("[ ]", Color::Gray) // Unapproved
             } else if change.selected {
-                ("[x]", Color::Green) // Queued
+                ("[x]", Color::Green) // Selected (reserved for queue)
             } else {
-                ("[@]", Color::Yellow) // Approved but not queued
+                ("[@]", Color::Yellow) // Approved but not selected
             };
 
             let cursor = if i == app.cursor_index { "►" } else { " " };
@@ -264,16 +266,17 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
         .iter()
         .enumerate()
         .map(|(i, change)| {
-            // Checkbox display (same as select mode):
-            // [ ] - unapproved (cannot be selected)
-            // [@] - approved but not queued
-            // [x] - queued (approved and selected)
+            // Checkbox display (Running mode - same symbols, different meaning):
+            // [ ] - unapproved (cannot be added to queue)
+            // [@] - approved but not in queue
+            // [x] - in queue or being processed
+            // Note: In Running mode, queue_status shows actual state (Queued/Processing/etc.)
             let (checkbox, checkbox_color) = if !change.is_approved {
                 ("[ ]", Color::Gray) // Unapproved
             } else if change.selected {
-                ("[x]", Color::Green) // Queued
+                ("[x]", Color::Green) // In queue
             } else {
-                ("[@]", Color::Yellow) // Approved but not queued
+                ("[@]", Color::Yellow) // Approved but not in queue
             };
 
             let cursor = if i == app.cursor_index { "►" } else { " " };

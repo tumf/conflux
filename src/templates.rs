@@ -16,6 +16,9 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
   "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id} {prompt}'",
 
+  // Command to resolve conflicts (supports {conflict_files} placeholder)
+  // "resolve_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p 'Resolve merge conflicts in these files: {conflict_files}'",
+
   // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
   // Note: A hardcoded system prompt is always appended after this value
   "apply_prompt": "",
@@ -53,6 +56,9 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
   "archive_command": "opencode run '/openspec-archive {change_id} {prompt}'",
 
+  // Command to resolve conflicts (supports {conflict_files} placeholder)
+  // "resolve_command": "opencode run 'Resolve merge conflicts in these files: {conflict_files}'",
+
   // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
   // Note: A hardcoded system prompt is always appended after this value
   "apply_prompt": "",
@@ -89,6 +95,9 @@ pub const CODEX_TEMPLATE: &str = r#"{
 
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
   "archive_command": "codex '/openspec:archive {change_id} {prompt}'",
+
+  // Command to resolve conflicts (supports {conflict_files} placeholder)
+  // "resolve_command": "codex 'Resolve merge conflicts in these files: {conflict_files}'",
 
   // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
   // Note: A hardcoded system prompt is always appended after this value
