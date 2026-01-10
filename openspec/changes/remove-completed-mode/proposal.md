@@ -2,29 +2,32 @@
 
 ## Summary
 
-Remove the `Completed` mode from TUI and return to `Select` mode after all processing completes.
+Remove `AppMode::Completed` and return to `Select` mode after all processing completes. Log display is determined by log existence, not by mode.
 
 ## Problem
 
-Currently, after all queued changes are processed, the TUI transitions to `Completed` mode. This mode:
-- Restricts editor launch (`e` key) unnecessarily
-- Creates an additional state that serves no distinct purpose from `Select` mode
-- Forces users to recognize yet another mode when they simply want to continue working
+`Completed` mode is functionally identical to `Select` mode:
+- Both allow queue operations (Space)
+- Both allow approval operations (@)
+- Both allow starting processing (F5)
+- toggle_selection logic difference is artificial, not essential
+
+The only visible difference is log display, but this should be based on whether logs exist, not on mode.
 
 ## Solution
 
-Remove `AppMode::Completed` and transition directly to `Select` mode when all processing completes. This provides:
-- Immediate ability to select and queue more changes
-- Editor access (`e` key) right after completion
-- Simpler mode state machine
-- Consistent UX - users stay in the familiar Select mode
+1. Remove `AppMode::Completed` variant
+2. Return to `Select` mode when all processing completes
+3. Change render layout logic: show logs panel when `!app.logs.is_empty()`, regardless of mode
+
+## Behavior Change
+
+| Before | After |
+|--------|-------|
+| Processing completes → Completed mode | Processing completes → Select mode |
+| Log panel shown only in Running/Completed/Stopped/Error modes | Log panel shown when logs exist |
 
 ## Scope
 
-- **In scope**: Remove `Completed` mode, update transitions, update specs
+- **In scope**: Remove Completed mode, update render logic for log display
 - **Out of scope**: Other mode changes (Running, Stopped, Error)
-
-## Risk Assessment
-
-- **Low risk**: This simplifies the codebase rather than adding complexity
-- **Backward compatible**: No configuration changes needed
