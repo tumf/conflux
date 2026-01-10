@@ -234,10 +234,14 @@ impl Orchestrator {
             let is_new_change = self.current_change_id.as_ref() != Some(&next.id);
             if is_new_change {
                 // Run on_change_start hook
-                let change_start_context =
-                    HookContext::new(self.changes_processed, total_changes, remaining_changes, false)
-                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                        .with_apply_count(0);
+                let change_start_context = HookContext::new(
+                    self.changes_processed,
+                    total_changes,
+                    remaining_changes,
+                    false,
+                )
+                .with_change(&next.id, next.completed_tasks, next.total_tasks)
+                .with_apply_count(0);
                 self.hooks
                     .run_hook(HookType::OnChangeStart, &change_start_context)
                     .await?;
@@ -253,19 +257,27 @@ impl Orchestrator {
                 info!("Change {} is complete, archiving...", next.id);
 
                 // Run on_change_complete hook (task 100%)
-                let complete_context =
-                    HookContext::new(self.changes_processed, total_changes, remaining_changes, false)
-                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                        .with_apply_count(apply_count);
+                let complete_context = HookContext::new(
+                    self.changes_processed,
+                    total_changes,
+                    remaining_changes,
+                    false,
+                )
+                .with_change(&next.id, next.completed_tasks, next.total_tasks)
+                .with_apply_count(apply_count);
                 self.hooks
                     .run_hook(HookType::OnChangeComplete, &complete_context)
                     .await?;
 
                 // Run pre_archive hook
-                let pre_archive_context =
-                    HookContext::new(self.changes_processed, total_changes, remaining_changes, false)
-                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                        .with_apply_count(apply_count);
+                let pre_archive_context = HookContext::new(
+                    self.changes_processed,
+                    total_changes,
+                    remaining_changes,
+                    false,
+                )
+                .with_change(&next.id, next.completed_tasks, next.total_tasks)
+                .with_apply_count(apply_count);
                 self.hooks
                     .run_hook(HookType::PreArchive, &pre_archive_context)
                     .await?;
@@ -277,19 +289,27 @@ impl Orchestrator {
                         let new_remaining = remaining_changes - 1;
 
                         // Run post_archive hook
-                        let post_archive_context =
-                            HookContext::new(self.changes_processed, total_changes, new_remaining, false)
-                                .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                                .with_apply_count(apply_count);
+                        let post_archive_context = HookContext::new(
+                            self.changes_processed,
+                            total_changes,
+                            new_remaining,
+                            false,
+                        )
+                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
+                        .with_apply_count(apply_count);
                         self.hooks
                             .run_hook(HookType::PostArchive, &post_archive_context)
                             .await?;
 
                         // Run on_change_end hook
-                        let change_end_context =
-                            HookContext::new(self.changes_processed, total_changes, new_remaining, false)
-                                .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                                .with_apply_count(apply_count);
+                        let change_end_context = HookContext::new(
+                            self.changes_processed,
+                            total_changes,
+                            new_remaining,
+                            false,
+                        )
+                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
+                        .with_apply_count(apply_count);
                         self.hooks
                             .run_hook(HookType::OnChangeEnd, &change_end_context)
                             .await?;
@@ -305,11 +325,15 @@ impl Orchestrator {
                     }
                     Err(e) => {
                         // Run on_error hook
-                        let error_context =
-                            HookContext::new(self.changes_processed, total_changes, remaining_changes, false)
-                                .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                                .with_apply_count(apply_count)
-                                .with_error(&e.to_string());
+                        let error_context = HookContext::new(
+                            self.changes_processed,
+                            total_changes,
+                            remaining_changes,
+                            false,
+                        )
+                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
+                        .with_apply_count(apply_count)
+                        .with_error(&e.to_string());
                         let _ = self.hooks.run_hook(HookType::OnError, &error_context).await;
 
                         error!("Archive failed for {}: {}", next.id, e);
@@ -328,10 +352,14 @@ impl Orchestrator {
                 self.apply_counts.insert(next.id.clone(), new_apply_count);
 
                 // Run pre_apply hook
-                let pre_apply_context =
-                    HookContext::new(self.changes_processed, total_changes, remaining_changes, false)
-                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                        .with_apply_count(new_apply_count);
+                let pre_apply_context = HookContext::new(
+                    self.changes_processed,
+                    total_changes,
+                    remaining_changes,
+                    false,
+                )
+                .with_change(&next.id, next.completed_tasks, next.total_tasks)
+                .with_apply_count(new_apply_count);
                 self.hooks
                     .run_hook(HookType::PreApply, &pre_apply_context)
                     .await?;
@@ -339,10 +367,14 @@ impl Orchestrator {
                 match self.apply_change(&next).await {
                     Ok(_) => {
                         // Run post_apply hook
-                        let post_apply_context =
-                            HookContext::new(self.changes_processed, total_changes, remaining_changes, false)
-                                .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                                .with_apply_count(new_apply_count);
+                        let post_apply_context = HookContext::new(
+                            self.changes_processed,
+                            total_changes,
+                            remaining_changes,
+                            false,
+                        )
+                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
+                        .with_apply_count(new_apply_count);
                         self.hooks
                             .run_hook(HookType::PostApply, &post_apply_context)
                             .await?;
@@ -353,11 +385,15 @@ impl Orchestrator {
                     }
                     Err(e) => {
                         // Run on_error hook
-                        let error_context =
-                            HookContext::new(self.changes_processed, total_changes, remaining_changes, false)
-                                .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                                .with_apply_count(new_apply_count)
-                                .with_error(&e.to_string());
+                        let error_context = HookContext::new(
+                            self.changes_processed,
+                            total_changes,
+                            remaining_changes,
+                            false,
+                        )
+                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
+                        .with_apply_count(new_apply_count)
+                        .with_error(&e.to_string());
                         let _ = self.hooks.run_hook(HookType::OnError, &error_context).await;
 
                         error!("Apply failed for {}: {}", next.id, e);
@@ -371,8 +407,8 @@ impl Orchestrator {
         }
 
         // Run on_finish hook
-        let finish_context =
-            HookContext::new(self.changes_processed, total_changes, 0, false).with_status(finish_status);
+        let finish_context = HookContext::new(self.changes_processed, total_changes, 0, false)
+            .with_status(finish_status);
         self.hooks
             .run_hook(HookType::OnFinish, &finish_context)
             .await?;

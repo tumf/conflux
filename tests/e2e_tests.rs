@@ -466,7 +466,7 @@ fn test_openspec_archive_command_format() {
 #[test]
 fn test_opencode_run_command_format() {
     // Validate the opencode run command format
-    let opencode_command = vec!["opencode", "run", "/openspec-apply test-change"];
+    let opencode_command = ["opencode", "run", "/openspec-apply test-change"];
 
     assert_eq!(opencode_command[0], "opencode");
     assert_eq!(opencode_command[1], "run");

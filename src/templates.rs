@@ -16,8 +16,9 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
   "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id} {prompt}'",
 
-  // System prompt for apply command (injected into {prompt} placeholder)
-  "apply_prompt": "スコープ外タスクは削除せよ。ユーザを待つもしくはユーザによるタスクは削除せよ。",
+  // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
+  // Note: A hardcoded system prompt is always appended after this value
+  "apply_prompt": "",
 
   // System prompt for archive command (injected into {prompt} placeholder)
   "archive_prompt": "",
@@ -52,8 +53,9 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
   "archive_command": "opencode run '/openspec-archive {change_id} {prompt}'",
 
-  // System prompt for apply command (injected into {prompt} placeholder)
-  "apply_prompt": "スコープ外タスクは削除せよ。ユーザを待つもしくはユーザによるタスクは削除せよ。",
+  // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
+  // Note: A hardcoded system prompt is always appended after this value
+  "apply_prompt": "",
 
   // System prompt for archive command (injected into {prompt} placeholder)
   "archive_prompt": "",
@@ -88,8 +90,9 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
   "archive_command": "codex '/openspec:archive {change_id} {prompt}'",
 
-  // System prompt for apply command (injected into {prompt} placeholder)
-  "apply_prompt": "スコープ外タスクは削除せよ。ユーザを待つもしくはユーザによるタスクは削除せよ。",
+  // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
+  // Note: A hardcoded system prompt is always appended after this value
+  "apply_prompt": "",
 
   // System prompt for archive command (injected into {prompt} placeholder)
   "archive_prompt": "",

@@ -331,6 +331,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[allow(dead_code)]
     fn setup_test_change(temp_dir: &TempDir, change_id: &str) -> PathBuf {
         let changes_dir = temp_dir.path().join("openspec/changes").join(change_id);
         fs::create_dir_all(&changes_dir).unwrap();

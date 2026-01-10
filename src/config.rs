@@ -30,9 +30,9 @@ pub const DEFAULT_ARCHIVE_COMMAND: &str = "opencode run '/openspec-archive {chan
 /// Default analyze command template (OpenCode)
 pub const DEFAULT_ANALYZE_COMMAND: &str = "opencode run --format json '{prompt}'";
 
-/// Default prompt for apply command - instructs agent to clean up out-of-scope tasks
-pub const DEFAULT_APPLY_PROMPT: &str =
-    "スコープ外タスクは削除せよ。ユーザを待つもしくはユーザによるタスクは削除せよ。";
+/// Default prompt for apply command - empty by default.
+/// The hardcoded system prompt in agent.rs is always appended.
+pub const DEFAULT_APPLY_PROMPT: &str = "";
 
 /// Default prompt for archive command - empty (no additional instructions)
 pub const DEFAULT_ARCHIVE_PROMPT: &str = "";

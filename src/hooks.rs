@@ -17,6 +17,7 @@ pub const DEFAULT_HOOK_TIMEOUT: u64 = 60;
 
 /// Types of hooks that can be executed
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub enum HookType {
     // === Run lifecycle ===
     /// Triggered when the orchestrator starts (once per run)
@@ -575,7 +576,10 @@ mod tests {
 
         let template = "Change {change_id} processed {changes_processed} of {total_changes} remaining {remaining_changes} apply {apply_count}";
         let result = context.expand_placeholders(template);
-        assert_eq!(result, "Change test-change processed 2 of 5 remaining 3 apply 1");
+        assert_eq!(
+            result,
+            "Change test-change processed 2 of 5 remaining 3 apply 1"
+        );
     }
 
     #[test]
@@ -589,9 +593,15 @@ mod tests {
             vars.get("OPENSPEC_CHANGE_ID"),
             Some(&"my-change".to_string())
         );
-        assert_eq!(vars.get("OPENSPEC_CHANGES_PROCESSED"), Some(&"1".to_string()));
+        assert_eq!(
+            vars.get("OPENSPEC_CHANGES_PROCESSED"),
+            Some(&"1".to_string())
+        );
         assert_eq!(vars.get("OPENSPEC_TOTAL_CHANGES"), Some(&"5".to_string()));
-        assert_eq!(vars.get("OPENSPEC_REMAINING_CHANGES"), Some(&"3".to_string()));
+        assert_eq!(
+            vars.get("OPENSPEC_REMAINING_CHANGES"),
+            Some(&"3".to_string())
+        );
         assert_eq!(vars.get("OPENSPEC_COMPLETED_TASKS"), Some(&"2".to_string()));
         assert_eq!(vars.get("OPENSPEC_TOTAL_TASKS"), Some(&"10".to_string()));
         assert_eq!(vars.get("OPENSPEC_APPLY_COUNT"), Some(&"2".to_string()));

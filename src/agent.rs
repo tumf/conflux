@@ -5,6 +5,12 @@
 //! with a configurable approach.
 
 use crate::config::OrchestratorConfig;
+
+/// Hardcoded system prompt for apply commands.
+/// This is always appended after the user-configurable apply_prompt.
+/// These instructions are non-negotiable and cannot be disabled.
+pub const APPLY_SYSTEM_PROMPT: &str =
+    "Remove out-of-scope tasks. Remove tasks that wait for or require user action.";
 use crate::error::{OrchestratorError, Result};
 use crate::history::{ApplyAttempt, ApplyHistory};
 use std::process::{ExitStatus, Stdio};
@@ -41,19 +47,23 @@ impl AgentRunner {
     /// Returns a child process handle, a receiver for output lines, and a start time.
     /// The caller is responsible for recording the attempt after the child completes
     /// by calling `record_apply_attempt()`.
+    ///
+    /// The prompt is constructed as: user_prompt + system_prompt + history_context
+    /// - user_prompt: from config.apply_prompt (user-customizable)
+    /// - system_prompt: APPLY_SYSTEM_PROMPT constant (always included)
+    /// - history_context: previous apply attempts (if any)
     pub async fn run_apply_streaming(
         &self,
         change_id: &str,
     ) -> Result<(Child, mpsc::Receiver<OutputLine>, Instant)> {
         let start = Instant::now();
         let template = self.config.get_apply_command();
-        let base_prompt = self.config.get_apply_prompt();
+        let user_prompt = self.config.get_apply_prompt();
         let history_context = self.apply_history.format_context(change_id);
-        let full_prompt = if history_context.is_empty() {
-            base_prompt.to_string()
-        } else {
-            format!("{}\n\n{}", base_prompt, history_context)
-        };
+
+        // Build full prompt: user_prompt + system_prompt + history_context
+        let full_prompt = build_apply_prompt(user_prompt, &history_context);
+
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
         info!("Running apply command: {}", command);
@@ -95,17 +105,21 @@ impl AgentRunner {
 
     /// Run apply command for the given change ID (blocking, no streaming)
     /// Records the attempt result in history for subsequent retries.
+    ///
+    /// The prompt is constructed as: user_prompt + system_prompt + history_context
+    /// - user_prompt: from config.apply_prompt (user-customizable)
+    /// - system_prompt: APPLY_SYSTEM_PROMPT constant (always included)
+    /// - history_context: previous apply attempts (if any)
     pub async fn run_apply(&mut self, change_id: &str) -> Result<ExitStatus> {
         let start = Instant::now();
 
         let template = self.config.get_apply_command();
-        let base_prompt = self.config.get_apply_prompt();
+        let user_prompt = self.config.get_apply_prompt();
         let history_context = self.apply_history.format_context(change_id);
-        let full_prompt = if history_context.is_empty() {
-            base_prompt.to_string()
-        } else {
-            format!("{}\n\n{}", base_prompt, history_context)
-        };
+
+        // Build full prompt: user_prompt + system_prompt + history_context
+        let full_prompt = build_apply_prompt(user_prompt, &history_context);
+
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
         info!("Running apply command: {}", command);
@@ -379,6 +393,31 @@ impl AgentRunner {
     }
 }
 
+/// Build the full apply prompt by combining user prompt, system prompt, and history context.
+///
+/// The prompt is constructed as:
+/// 1. user_prompt (if not empty)
+/// 2. APPLY_SYSTEM_PROMPT (always included)
+/// 3. history_context (if not empty)
+///
+/// Parts are joined with double newlines.
+fn build_apply_prompt(user_prompt: &str, history_context: &str) -> String {
+    let mut parts = Vec::new();
+
+    if !user_prompt.is_empty() {
+        parts.push(user_prompt.to_string());
+    }
+
+    // System prompt is always included
+    parts.push(APPLY_SYSTEM_PROMPT.to_string());
+
+    if !history_context.is_empty() {
+        parts.push(history_context.to_string());
+    }
+
+    parts.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,5 +596,79 @@ mod tests {
             .collect();
         assert!(output.contains("my-change"));
         assert!(output.contains("streaming test"));
+    }
+
+    // Tests for build_apply_prompt function and prompt construction order
+
+    #[test]
+    fn test_build_apply_prompt_with_all_parts() {
+        let user_prompt = "Focus on implementation.";
+        let history_context = "Previous attempt failed.";
+        let result = build_apply_prompt(user_prompt, history_context);
+
+        // Should contain all three parts in order
+        assert!(result.contains("Focus on implementation."));
+        assert!(result.contains(APPLY_SYSTEM_PROMPT));
+        assert!(result.contains("Previous attempt failed."));
+
+        // Verify order: user_prompt comes before system_prompt
+        let user_pos = result.find("Focus on implementation.").unwrap();
+        let system_pos = result.find(APPLY_SYSTEM_PROMPT).unwrap();
+        let history_pos = result.find("Previous attempt failed.").unwrap();
+        assert!(
+            user_pos < system_pos,
+            "user_prompt should come before system_prompt"
+        );
+        assert!(
+            system_pos < history_pos,
+            "system_prompt should come before history_context"
+        );
+    }
+
+    #[test]
+    fn test_build_apply_prompt_with_empty_user_prompt() {
+        let user_prompt = "";
+        let history_context = "Previous attempt failed.";
+        let result = build_apply_prompt(user_prompt, history_context);
+
+        // Should contain system prompt and history, but no user prompt
+        assert!(result.contains(APPLY_SYSTEM_PROMPT));
+        assert!(result.contains("Previous attempt failed."));
+
+        // System prompt should come first (no empty string at start)
+        assert!(result.starts_with(APPLY_SYSTEM_PROMPT));
+    }
+
+    #[test]
+    fn test_build_apply_prompt_with_empty_history() {
+        let user_prompt = "Focus on implementation.";
+        let history_context = "";
+        let result = build_apply_prompt(user_prompt, history_context);
+
+        // Should contain user prompt and system prompt
+        assert!(result.contains("Focus on implementation."));
+        assert!(result.contains(APPLY_SYSTEM_PROMPT));
+
+        // Verify order
+        let user_pos = result.find("Focus on implementation.").unwrap();
+        let system_pos = result.find(APPLY_SYSTEM_PROMPT).unwrap();
+        assert!(user_pos < system_pos);
+    }
+
+    #[test]
+    fn test_build_apply_prompt_with_only_system_prompt() {
+        let user_prompt = "";
+        let history_context = "";
+        let result = build_apply_prompt(user_prompt, history_context);
+
+        // Should only contain system prompt
+        assert_eq!(result, APPLY_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn test_apply_system_prompt_content() {
+        // Verify the hardcoded system prompt contains expected instructions
+        assert!(APPLY_SYSTEM_PROMPT.contains("out-of-scope"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("user action"));
     }
 }

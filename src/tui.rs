@@ -1026,9 +1026,8 @@ async fn run_tui_loop(
                             }
                         }
                         (KeyCode::Char('e'), _) => {
-                            // Open editor in change directory (Select mode only)
-                            if app.mode == AppMode::Select
-                                && !app.changes.is_empty()
+                            // Open editor in change directory
+                            if !app.changes.is_empty()
                                 && app.cursor_index < app.changes.len()
                             {
                                 let change_id = app.changes[app.cursor_index].id.clone();
@@ -1064,7 +1063,9 @@ async fn run_tui_loop(
                                     app.stop_mode = StopMode::GracefulPending;
                                     graceful_stop_flag.store(true, Ordering::SeqCst);
                                     app.mode = AppMode::Stopping;
-                                    app.add_log(LogEntry::warn("Stopping after current change completes..."));
+                                    app.add_log(LogEntry::warn(
+                                        "Stopping after current change completes...",
+                                    ));
                                 }
                                 AppMode::Stopping => {
                                     // Second Esc: Force stop
@@ -1098,7 +1099,8 @@ async fn run_tui_loop(
                                     .map(|c| c.id.clone())
                                     .collect();
                                 if queued.is_empty() {
-                                    app.warning_message = Some("No queued changes to resume".to_string());
+                                    app.warning_message =
+                                        Some("No queued changes to resume".to_string());
                                     None
                                 } else {
                                     app.mode = AppMode::Running;
@@ -1481,6 +1483,7 @@ async fn archive_single_change(
 
 /// Archive all complete changes from the pending set
 /// Returns the number of successfully archived changes
+#[allow(clippy::too_many_arguments)]
 async fn archive_all_complete_changes(
     pending_ids: &HashSet<String>,
     _openspec_cmd: &str, // Kept for API compatibility, native impl doesn't need it
@@ -1765,9 +1768,10 @@ async fn run_orchestrator(
         let is_new_change = current_change_id.as_ref() != Some(&change_id);
         if is_new_change {
             // Run on_change_start hook
-            let change_start_context = HookContext::new(changes_processed, total_changes, remaining_changes, false)
-                .with_change(&change_id, change.completed_tasks, change.total_tasks)
-                .with_apply_count(0);
+            let change_start_context =
+                HookContext::new(changes_processed, total_changes, remaining_changes, false)
+                    .with_change(&change_id, change.completed_tasks, change.total_tasks)
+                    .with_apply_count(0);
             if let Err(e) = hooks
                 .run_hook(HookType::OnChangeStart, &change_start_context)
                 .await
@@ -1788,9 +1792,10 @@ async fn run_orchestrator(
         apply_counts.insert(change_id.clone(), apply_count);
 
         // Run pre_apply hook
-        let pre_apply_context = HookContext::new(changes_processed, total_changes, remaining_changes, false)
-            .with_change(&change_id, change.completed_tasks, change.total_tasks)
-            .with_apply_count(apply_count);
+        let pre_apply_context =
+            HookContext::new(changes_processed, total_changes, remaining_changes, false)
+                .with_change(&change_id, change.completed_tasks, change.total_tasks)
+                .with_apply_count(apply_count);
         if let Err(e) = hooks.run_hook(HookType::PreApply, &pre_apply_context).await {
             let _ = tx
                 .send(OrchestratorEvent::ProcessingError {
@@ -1858,9 +1863,10 @@ async fn run_orchestrator(
 
         if status.success() {
             // Run post_apply hook
-            let post_apply_context = HookContext::new(changes_processed, total_changes, remaining_changes, false)
-                .with_change(&change_id, change.completed_tasks, change.total_tasks)
-                .with_apply_count(apply_count);
+            let post_apply_context =
+                HookContext::new(changes_processed, total_changes, remaining_changes, false)
+                    .with_change(&change_id, change.completed_tasks, change.total_tasks)
+                    .with_apply_count(apply_count);
             if let Err(e) = hooks
                 .run_hook(HookType::PostApply, &post_apply_context)
                 .await
@@ -1899,10 +1905,11 @@ async fn run_orchestrator(
             let error_msg = format!("Apply failed with exit code: {:?}", status.code());
 
             // Run on_error hook
-            let error_context = HookContext::new(changes_processed, total_changes, remaining_changes, false)
-                .with_change(&change_id, change.completed_tasks, change.total_tasks)
-                .with_apply_count(apply_count)
-                .with_error(&error_msg);
+            let error_context =
+                HookContext::new(changes_processed, total_changes, remaining_changes, false)
+                    .with_change(&change_id, change.completed_tasks, change.total_tasks)
+                    .with_apply_count(apply_count)
+                    .with_error(&error_msg);
             let _ = hooks.run_hook(HookType::OnError, &error_context).await;
 
             let _ = tx
@@ -1995,9 +2002,11 @@ fn render(frame: &mut Frame, app: &mut AppState) {
 
     match app.mode {
         AppMode::Select => render_select_mode(frame, app, area),
-        AppMode::Running | AppMode::Stopping | AppMode::Stopped | AppMode::Completed | AppMode::Error => {
-            render_running_mode(frame, app, area)
-        }
+        AppMode::Running
+        | AppMode::Stopping
+        | AppMode::Stopped
+        | AppMode::Completed
+        | AppMode::Error => render_running_mode(frame, app, area),
     }
 }
 
@@ -2155,10 +2164,32 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
         })
         .collect();
 
+    // Build dynamic key hints based on current state
+    let has_selection = !app.changes.is_empty();
+    let has_queue = app.changes.iter().any(|c| c.selected);
+    let current_item = if has_selection && app.cursor_index < app.changes.len() {
+        Some(&app.changes[app.cursor_index])
+    } else {
+        None
+    };
+
+    let mut keys = vec!["↑↓/jk: move"];
+    if let Some(item) = current_item {
+        keys.push(if item.selected { "Space: unqueue" } else { "Space: queue" });
+        keys.push(if item.is_approved { "@: unapprove" } else { "@: approve" });
+        keys.push("e: edit");
+    }
+    if has_queue {
+        keys.push("F5: run");
+    }
+    keys.push("q: quit");
+
+    let title = format!(" Changes ({}) ", keys.join(", "));
+
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Changes (↑↓/jk: move, Space: queue, @: approve, e: edit, F5: run, q: quit) ")
+                .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         )
@@ -2271,8 +2302,14 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
     let (status_text, status_color) = match app.mode {
         AppMode::Completed => ("All processing completed. Press 'q' to quit.", Color::Green),
         AppMode::Running => ("Processing... Esc: stop", Color::Cyan),
-        AppMode::Stopping => ("Stopping after current change... Esc: force stop", Color::Yellow),
-        AppMode::Stopped => ("Stopped. F5: resume, Space: toggle queue, q: quit", Color::DarkGray),
+        AppMode::Stopping => (
+            "Stopping after current change... Esc: force stop",
+            Color::Yellow,
+        ),
+        AppMode::Stopped => (
+            "Stopped. F5: resume, Space: toggle queue, q: quit",
+            Color::DarkGray,
+        ),
         AppMode::Select => ("", Color::White),
         AppMode::Error => ("Press F5 to retry, or 'q' to quit.", Color::Yellow),
     };
