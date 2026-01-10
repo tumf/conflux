@@ -1,0 +1,436 @@
+//! TUI runner and main event loop
+//!
+//! Contains run_tui and run_tui_loop functions.
+
+use crate::config::OrchestratorConfig;
+use crate::error::Result;
+use crate::openspec::Change;
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
+    },
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::DefaultTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use super::events::{LogEntry, OrchestratorEvent, TuiCommand};
+use super::orchestrator::run_orchestrator;
+use super::queue::DynamicQueue;
+use super::render::{render, SPINNER_CHARS};
+use super::state::{AppState, AUTO_REFRESH_INTERVAL_SECS};
+use super::types::{AppMode, QueueStatus, StopMode};
+use super::utils::clear_screen;
+
+/// Run the TUI application
+pub async fn run_tui(
+    initial_changes: Vec<Change>,
+    openspec_cmd: String,
+    _opencode_path: String, // Deprecated - use config instead
+    config: OrchestratorConfig,
+) -> Result<()> {
+    let mut terminal = ratatui::init();
+
+    // Enable mouse capture for scroll wheel support
+    execute!(std::io::stdout(), EnableMouseCapture)?;
+
+    let result = run_tui_loop(&mut terminal, initial_changes, openspec_cmd, config).await;
+
+    // Disable mouse capture before restoring terminal
+    execute!(std::io::stdout(), DisableMouseCapture)?;
+
+    // Clear screen before restoring terminal
+    clear_screen()?;
+    ratatui::restore();
+
+    result
+}
+
+/// Main TUI event loop
+async fn run_tui_loop(
+    terminal: &mut DefaultTerminal,
+    initial_changes: Vec<Change>,
+    openspec_cmd: String,
+    config: OrchestratorConfig,
+) -> Result<()> {
+    use crate::openspec;
+
+    let mut app = AppState::new(initial_changes);
+    let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(100);
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<TuiCommand>(100);
+
+    // Dynamic queue for runtime change additions
+    let dynamic_queue = DynamicQueue::new();
+
+    // Cancellation token for graceful shutdown
+    let cancel_token = CancellationToken::new();
+
+    // Start auto-refresh task
+    let refresh_tx = tx.clone();
+    let refresh_cancel = cancel_token.clone();
+    let refresh_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS));
+        loop {
+            tokio::select! {
+                _ = refresh_cancel.cancelled() => {
+                    break;
+                }
+                _ = interval.tick() => {
+                    match openspec::list_changes_native() {
+                        Ok(changes) => {
+                            if refresh_tx
+                                .send(OrchestratorEvent::ChangesRefreshed(changes))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = refresh_tx
+                                .send(OrchestratorEvent::Log(LogEntry::error(format!(
+                                    "Refresh failed: {}",
+                                    e
+                                ))))
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Orchestrator task (spawned when processing starts)
+    let mut orchestrator_handle: Option<tokio::task::JoinHandle<Result<()>>> = None;
+    let mut orchestrator_cancel: Option<CancellationToken> = None;
+
+    // Shared flag for graceful stop (signaling orchestrator to stop after current change)
+    let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+
+    loop {
+        // Increment spinner frame for animation (updates every 100ms)
+        app.spinner_frame = (app.spinner_frame + 1) % SPINNER_CHARS.len();
+
+        // Draw the UI
+        terminal.draw(|frame| render(frame, &mut app))?;
+
+        // Handle events with timeout
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                            app.should_quit = true;
+                            break;
+                        }
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                            app.cursor_up();
+                        }
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                            app.cursor_down();
+                        }
+                        (KeyCode::Char(' '), _) => {
+                            if let Some(cmd) = app.toggle_selection() {
+                                let _ = cmd_tx.send(cmd).await;
+                            }
+                        }
+                        (KeyCode::Char('@'), _) => {
+                            // Toggle approval status
+                            if let Some(cmd) = app.toggle_approval() {
+                                let _ = cmd_tx.send(cmd).await;
+                            }
+                        }
+                        (KeyCode::Char('e'), _) => {
+                            // Open editor in change directory
+                            if !app.changes.is_empty() && app.cursor_index < app.changes.len() {
+                                let change_id = app.changes[app.cursor_index].id.clone();
+
+                                // Suspend TUI and launch editor
+                                disable_raw_mode()?;
+                                execute!(
+                                    std::io::stdout(),
+                                    LeaveAlternateScreen,
+                                    DisableMouseCapture
+                                )?;
+
+                                // Launch editor
+                                if let Err(e) =
+                                    super::utils::launch_editor_for_change(&change_id)
+                                {
+                                    eprintln!("Failed to launch editor: {}", e);
+                                }
+
+                                // Restore TUI
+                                enable_raw_mode()?;
+                                execute!(
+                                    std::io::stdout(),
+                                    EnterAlternateScreen,
+                                    EnableMouseCapture
+                                )?;
+                                terminal.clear()?;
+                            }
+                        }
+                        (KeyCode::Esc, _) => {
+                            // Handle stop in Running or Stopping mode
+                            match app.mode {
+                                AppMode::Running => {
+                                    // First Esc: Graceful stop
+                                    app.stop_mode = StopMode::GracefulPending;
+                                    graceful_stop_flag.store(true, Ordering::SeqCst);
+                                    app.mode = AppMode::Stopping;
+                                    app.add_log(LogEntry::warn(
+                                        "Stopping after current change completes...",
+                                    ));
+                                }
+                                AppMode::Stopping => {
+                                    // Second Esc: Force stop
+                                    app.stop_mode = StopMode::ForceStopped;
+                                    if let Some(cancel) = &orchestrator_cancel {
+                                        cancel.cancel();
+                                    }
+                                    // Reset any Processing change back to Queued
+                                    for change in &mut app.changes {
+                                        if matches!(change.queue_status, QueueStatus::Processing) {
+                                            change.queue_status = QueueStatus::Queued;
+                                        }
+                                    }
+                                    app.current_change = None;
+                                    app.mode = AppMode::Stopped;
+                                    app.add_log(LogEntry::warn("Force stopped"));
+                                }
+                                _ => {}
+                            }
+                        }
+                        (KeyCode::F(5), _) => {
+                            // Determine which command to use based on mode
+                            let cmd = if app.mode == AppMode::Error {
+                                app.retry_error_changes()
+                            } else if app.mode == AppMode::Stopped {
+                                // Resume after stop: collect queued changes
+                                let queued: Vec<String> = app
+                                    .changes
+                                    .iter()
+                                    .filter(|c| matches!(c.queue_status, QueueStatus::Queued))
+                                    .map(|c| c.id.clone())
+                                    .collect();
+                                if queued.is_empty() {
+                                    app.warning_message =
+                                        Some("No queued changes to resume".to_string());
+                                    None
+                                } else {
+                                    app.mode = AppMode::Running;
+                                    app.stop_mode = StopMode::None;
+                                    graceful_stop_flag.store(false, Ordering::SeqCst);
+                                    app.add_log(LogEntry::info(format!(
+                                        "Resuming processing {} change(s)",
+                                        queued.len()
+                                    )));
+                                    Some(TuiCommand::StartProcessing(queued))
+                                }
+                            } else {
+                                app.start_processing()
+                            };
+
+                            if let Some(cmd) = cmd {
+                                // Start orchestrator task
+                                let selected_ids = match &cmd {
+                                    TuiCommand::StartProcessing(ids) => ids.clone(),
+                                    _ => vec![],
+                                };
+
+                                if !selected_ids.is_empty() {
+                                    let orch_tx = tx.clone();
+                                    let orch_openspec_cmd = openspec_cmd.clone();
+                                    let orch_config = config.clone();
+                                    let orch_cancel = CancellationToken::new();
+                                    let orch_dynamic_queue = dynamic_queue.clone();
+                                    let orch_graceful_stop = graceful_stop_flag.clone();
+                                    orchestrator_cancel = Some(orch_cancel.clone());
+
+                                    orchestrator_handle = Some(tokio::spawn(async move {
+                                        run_orchestrator(
+                                            selected_ids,
+                                            orch_openspec_cmd,
+                                            orch_config,
+                                            orch_tx,
+                                            orch_cancel,
+                                            orch_dynamic_queue,
+                                            orch_graceful_stop,
+                                        )
+                                        .await
+                                    }));
+                                }
+                            }
+                        }
+                        (KeyCode::PageUp, _) => {
+                            // Scroll logs up (show older entries)
+                            app.scroll_logs_up(5);
+                        }
+                        (KeyCode::PageDown, _) => {
+                            // Scroll logs down (show newer entries)
+                            app.scroll_logs_down(5);
+                        }
+                        (KeyCode::Home, _) => {
+                            // Jump to oldest log entry
+                            app.scroll_logs_to_top();
+                        }
+                        (KeyCode::End, _) => {
+                            // Jump to newest log entry and re-enable auto-scroll
+                            app.scroll_logs_to_bottom();
+                        }
+                        _ => {}
+                    }
+                    // Clear warning message on any key press
+                    app.warning_message = None;
+                }
+                Event::Mouse(mouse) => {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            // Scroll logs up (show older entries) - 3 lines at a time
+                            app.scroll_logs_up(3);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            // Scroll logs down (show newer entries) - 3 lines at a time
+                            app.scroll_logs_down(3);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Handle orchestrator events
+        while let Ok(event) = rx.try_recv() {
+            app.handle_orchestrator_event(event);
+        }
+
+        // Handle dynamic queue additions and removals
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                TuiCommand::AddToQueue(id) => {
+                    // Push to dynamic queue for orchestrator to pick up
+                    if dynamic_queue.push(id.clone()).await {
+                        app.add_log(LogEntry::info(format!("Added to dynamic queue: {}", id)));
+                    } else {
+                        app.add_log(LogEntry::warn(format!("Already in dynamic queue: {}", id)));
+                    }
+                }
+                TuiCommand::RemoveFromQueue(id) => {
+                    // Log the removal (orchestrator will see the updated status)
+                    app.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
+                }
+                TuiCommand::ApproveAndQueue(id) => {
+                    // Approve and add to queue (used in select/stopped/completed mode)
+                    use crate::approval;
+
+                    match approval::approve_change(&id) {
+                        Ok(_) => {
+                            app.update_approval_status(&id, true);
+                            // Also add to queue
+                            if let Some(change) = app.changes.iter_mut().find(|c| c.id == id) {
+                                change.queue_status = QueueStatus::Queued;
+                                change.selected = true;
+                            }
+                            // Push to dynamic queue for orchestrator to pick up
+                            if dynamic_queue.push(id.clone()).await {
+                                app.add_log(LogEntry::info(format!("Approved and queued: {}", id)));
+                            } else {
+                                app.add_log(LogEntry::info(format!(
+                                    "Approved (already in queue): {}",
+                                    id
+                                )));
+                            }
+                        }
+                        Err(e) => {
+                            app.add_log(LogEntry::error(format!(
+                                "Failed to approve '{}': {}",
+                                id, e
+                            )));
+                        }
+                    }
+                }
+                TuiCommand::ApproveOnly(id) => {
+                    // Approve without adding to queue (used in running mode)
+                    use crate::approval;
+
+                    match approval::approve_change(&id) {
+                        Ok(_) => {
+                            app.update_approval_status(&id, true);
+                            app.add_log(LogEntry::info(format!("Approved (not queued): {}", id)));
+                        }
+                        Err(e) => {
+                            app.add_log(LogEntry::error(format!(
+                                "Failed to approve '{}': {}",
+                                id, e
+                            )));
+                        }
+                    }
+                }
+                TuiCommand::UnapproveAndDequeue(id) => {
+                    // Unapprove and remove from queue (used in running/completed mode)
+                    use crate::approval;
+
+                    // First check if queued
+                    let was_queued = app
+                        .changes
+                        .iter()
+                        .find(|c| c.id == id)
+                        .map(|c| matches!(c.queue_status, QueueStatus::Queued))
+                        .unwrap_or(false);
+
+                    match approval::unapprove_change(&id) {
+                        Ok(_) => {
+                            app.update_approval_status(&id, false);
+                            // Also remove from queue if queued
+                            if let Some(change) = app.changes.iter_mut().find(|c| c.id == id) {
+                                if matches!(change.queue_status, QueueStatus::Queued) {
+                                    change.queue_status = QueueStatus::NotQueued;
+                                }
+                                change.selected = false;
+                            }
+                            let msg = if was_queued {
+                                format!("Unapproved and removed from queue: {}", id)
+                            } else {
+                                format!("Unapproved: {}", id)
+                            };
+                            app.add_log(LogEntry::info(msg));
+                        }
+                        Err(e) => {
+                            app.add_log(LogEntry::error(format!(
+                                "Failed to unapprove '{}': {}",
+                                id, e
+                            )));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+
+    // Cleanup: cancel all tasks and wait for them to finish
+    cancel_token.cancel();
+    if let Some(cancel) = orchestrator_cancel {
+        cancel.cancel();
+    }
+
+    // Wait for tasks to finish gracefully
+    refresh_handle.abort();
+    if let Some(handle) = orchestrator_handle {
+        // Give orchestrator time to cleanup child processes
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    Ok(())
+}
