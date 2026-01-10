@@ -53,8 +53,6 @@ The TUI SHALL display dynamic key hints in running mode consistent with select m
 - **AND** the key hints SHALL show "Esc: stop"
 - **AND** the key hints SHALL show "q: quit"
 
-## MODIFIED Requirements
-
 ### Requirement: Approval State Transition in Select Mode
 
 The TUI SHALL transition change state correctly when pressing `@` key in select mode.

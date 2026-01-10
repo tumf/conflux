@@ -1,5 +1,16 @@
 # Improve Dynamic Key Hints and Fix Approval State Transition
 
+## Why
+
+The TUI displays static key hints that show all keys regardless of context, and the approval state transition in Select mode regressed to show `[@]` instead of `[x]`.
+
+## What Changes
+
+- Key hints dynamically hide based on state (empty list hides selection keys, empty queue hides F5)
+- `@` key in Select mode correctly transitions to `[x]` (approved AND queued)
+- Affected specs: `tui-key-hints` (new)
+- Affected code: `src/tui/render.rs`, `src/tui/runner.rs`, `src/tui/state.rs`
+
 ## Summary
 
 1. Enhance the TUI's key hint display to dynamically show only actionable keys

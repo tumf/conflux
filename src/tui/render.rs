@@ -146,7 +146,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             // [@] - approved but not queued
             // [x] - queued (approved and selected)
             let (checkbox, checkbox_color) = if !change.is_approved {
-                ("[ ]", Color::DarkGray) // Unapproved
+                ("[ ]", Color::Gray) // Unapproved
             } else if change.selected {
                 ("[x]", Color::Green) // Queued
             } else {
@@ -166,7 +166,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                     Style::default().fg(if change.is_approved {
                         Color::White
                     } else {
-                        Color::DarkGray
+                        Color::Gray
                     }),
                 ),
                 Span::styled(
@@ -200,8 +200,16 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
 
     let mut keys = vec!["↑↓/jk: move"];
     if let Some(item) = current_item {
-        keys.push(if item.selected { "Space: unqueue" } else { "Space: queue" });
-        keys.push(if item.is_approved { "@: unapprove" } else { "@: approve" });
+        keys.push(if item.selected {
+            "Space: unqueue"
+        } else {
+            "Space: queue"
+        });
+        keys.push(if item.is_approved {
+            "@: unapprove"
+        } else {
+            "@: approve"
+        });
         keys.push("e: edit");
     }
     if has_queue {
@@ -241,7 +249,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             // [@] - approved but not queued
             // [x] - queued (approved and selected)
             let (checkbox, checkbox_color) = if !change.is_approved {
-                ("[ ]", Color::DarkGray) // Unapproved
+                ("[ ]", Color::Gray) // Unapproved
             } else if change.selected {
                 ("[x]", Color::Green) // Queued
             } else {
@@ -271,7 +279,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                     Style::default().fg(if change.is_approved {
                         Color::White
                     } else {
-                        Color::DarkGray
+                        Color::Gray
                     }),
                 ),
                 Span::styled(
@@ -294,10 +302,40 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
         })
         .collect();
 
+    // Build dynamic key hints based on current state (same logic as select mode)
+    let has_selection = !app.changes.is_empty();
+    let has_queue = app.changes.iter().any(|c| c.selected);
+    let current_item = if has_selection && app.cursor_index < app.changes.len() {
+        Some(&app.changes[app.cursor_index])
+    } else {
+        None
+    };
+
+    let mut keys = vec!["↑↓/jk: move"];
+    if let Some(item) = current_item {
+        keys.push(if item.selected {
+            "Space: unqueue"
+        } else {
+            "Space: queue"
+        });
+        keys.push(if item.is_approved {
+            "@: unapprove"
+        } else {
+            "@: approve"
+        });
+        keys.push("e: edit");
+    }
+    if has_queue {
+        keys.push("Esc: stop");
+    }
+    keys.push("q: quit");
+
+    let title = format!(" Changes ({}) ", keys.join(", "));
+
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Changes (Space: queue, @: approve, e: edit, q: quit) ")
+                .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         )
@@ -335,10 +373,9 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
     };
 
     let (status_text, status_color) = match app.mode {
-        AppMode::Select if all_completed => (
-            "All processing completed. Press 'q' to quit.",
-            Color::Green,
-        ),
+        AppMode::Select if all_completed => {
+            ("All processing completed. Press 'q' to quit.", Color::Green)
+        }
         AppMode::Running => ("Processing... Esc: stop", Color::Cyan),
         AppMode::Stopping => (
             "Stopping after current change... Esc: force stop",

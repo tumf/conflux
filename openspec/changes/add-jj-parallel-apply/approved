@@ -1,0 +1,5 @@
+2617bc2afee2246f58b23c662664c405  openspec/changes/add-jj-parallel-apply/design.md
+846103567e88d80d7dbb514d00b4ab10  openspec/changes/add-jj-parallel-apply/proposal.md
+f0b3e4018984b8b07bf08b6b5187c2d5  openspec/changes/add-jj-parallel-apply/specs/cli/spec.md
+62afc5954a26b1c31ba524cc588bb366  openspec/changes/add-jj-parallel-apply/specs/configuration/spec.md
+62d11ad0f68afd306691939031a7cc1f  openspec/changes/add-jj-parallel-apply/specs/tui-editor/spec.md

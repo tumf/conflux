@@ -160,9 +160,7 @@ async fn run_tui_loop(
                                 )?;
 
                                 // Launch editor
-                                if let Err(e) =
-                                    super::utils::launch_editor_for_change(&change_id)
-                                {
+                                if let Err(e) = super::utils::launch_editor_for_change(&change_id) {
                                     eprintln!("Failed to launch editor: {}", e);
                                 }
 

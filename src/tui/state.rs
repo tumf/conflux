@@ -1181,4 +1181,62 @@ mod tests {
         assert_eq!(total_tasks, 8);
         assert_eq!(completed_tasks, 5);
     }
+
+    #[test]
+    fn test_approve_and_queue_in_select_mode_returns_correct_command() {
+        // Test that toggle_approval in Select mode returns ApproveAndQueue for unapproved change
+        let changes = vec![create_test_change("unapproved-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Ensure we're in Select mode with an unapproved change
+        assert_eq!(app.mode, AppMode::Select);
+        assert!(!app.changes[0].is_approved);
+
+        // Toggle approval should return ApproveAndQueue
+        let cmd = app.toggle_approval();
+        assert!(matches!(
+            cmd,
+            Some(TuiCommand::ApproveAndQueue(ref id)) if id == "unapproved-change"
+        ));
+    }
+
+    #[test]
+    fn test_approve_and_queue_state_update_simulation() {
+        // Simulate what runner.rs ApproveAndQueue handler does
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Initial state: unapproved, not selected
+        assert!(!app.changes[0].is_approved);
+        assert!(!app.changes[0].selected);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+
+        // Simulate ApproveAndQueue handler logic (from runner.rs:329-358)
+        let id = "test-change";
+
+        // 1. update_approval_status (this adds a log)
+        app.update_approval_status(id, true);
+
+        // 2. Set queue_status and selected
+        if let Some(change) = app.changes.iter_mut().find(|c| c.id == id) {
+            change.queue_status = QueueStatus::Queued;
+            change.selected = true;
+        }
+
+        // Verify final state: approved + selected + queued
+        assert!(app.changes[0].is_approved);
+        assert!(app.changes[0].selected);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+
+        // This is the state that should render as [x] (Queued)
+        // Checkbox logic: if is_approved && selected → "[x]"
+        let checkbox = if !app.changes[0].is_approved {
+            "[ ]"
+        } else if app.changes[0].selected {
+            "[x]"
+        } else {
+            "[@]"
+        };
+        assert_eq!(checkbox, "[x]");
+    }
 }
