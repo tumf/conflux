@@ -491,14 +491,20 @@ The CLI SHALL support a `--version` flag to display the application version.
 - **WHEN** user runs `openspec-orchestrator -V`
 - **THEN** the application version is displayed (same as `--version`)
 
-### Requirement: TUI Footer Version Display
+### Requirement: TUI Header Version Display
 
-The TUI selection mode footer SHALL display the application version.
+The TUI header SHALL display the application version in both selection and running modes.
 
-#### Scenario: Version in selection mode footer
+#### Scenario: Version in selection mode header
 - **WHEN** TUI is in selection mode
-- **THEN** the footer displays the application version (e.g., "v0.1.0")
-- **AND** the version is displayed on the right side of the footer
+- **THEN** the header displays the application version (e.g., "v0.1.0")
+- **AND** the version is displayed on the right side of the header
+- **AND** the version text uses a muted/gray color to avoid distraction
+
+#### Scenario: Version in running mode header
+- **WHEN** TUI is in running mode
+- **THEN** the header displays the application version (e.g., "v0.1.0")
+- **AND** the version is displayed on the right side of the header
 - **AND** the version text uses a muted/gray color to avoid distraction
 
 ### Requirement: Terminal Status Task Count Display
@@ -719,11 +725,27 @@ The CLI SHALL provide an `approve` subcommand to manage change approval status.
 
 ### Requirement: TUI Approval Toggle
 
-The TUI SHALL allow users to toggle approval status using the `@` key.
+The TUI SHALL allow users to toggle approval status using the `@` key, with different auto-queue behavior based on orchestrator state.
 
-#### Scenario: Approve unapproved change adds to queue automatically
+#### Scenario: Approve unapproved change in Running mode (approve only)
 
-- **WHEN** TUI is in selection mode or running mode
+- **WHEN** TUI is in Running mode (orchestrator actively processing)
+- **AND** user presses `@` key on an unapproved change (`[ ]`)
+- **THEN** the change becomes approved but NOT queued (`[@]`)
+- **AND** checkbox transitions from `[ ]` to `[@]`
+- **AND** log message indicates approval only
+
+#### Scenario: Approve unapproved change in Select mode adds to queue automatically
+
+- **WHEN** TUI is in Select mode (orchestrator stopped)
+- **AND** user presses `@` key on an unapproved change (`[ ]`)
+- **THEN** the change becomes approved AND queued (`[x]`)
+- **AND** checkbox transitions directly from `[ ]` to `[x]`
+- **AND** log message indicates both approval and queue addition
+
+#### Scenario: Approve unapproved change in Completed mode adds to queue automatically
+
+- **WHEN** TUI is in Completed mode (orchestrator stopped, all queued changes done)
 - **AND** user presses `@` key on an unapproved change (`[ ]`)
 - **THEN** the change becomes approved AND queued (`[x]`)
 - **AND** checkbox transitions directly from `[ ]` to `[x]`
@@ -731,14 +753,14 @@ The TUI SHALL allow users to toggle approval status using the `@` key.
 
 #### Scenario: Unapprove approved-but-not-queued change
 
-- **WHEN** TUI is in selection mode or running mode
+- **WHEN** TUI is in any mode (Select, Running, or Completed)
 - **AND** user presses `@` key on an approved but not queued change (`[@]`)
 - **THEN** the change becomes unapproved (`[ ]`)
 - **AND** checkbox transitions from `[@]` to `[ ]`
 
 #### Scenario: Unapprove queued change removes from queue
 
-- **WHEN** TUI is in selection mode or running mode
+- **WHEN** TUI is in any mode (Select, Running, or Completed)
 - **AND** user presses `@` key on a queued change (`[x]`) that is NOT processing
 - **THEN** the change becomes unapproved AND removed from queue (`[ ]`)
 - **AND** checkbox transitions from `[x]` to `[ ]`
@@ -746,7 +768,7 @@ The TUI SHALL allow users to toggle approval status using the `@` key.
 
 #### Scenario: Toggle approval blocked for processing change
 
-- **WHEN** TUI is in running mode
+- **WHEN** TUI is in Running mode
 - **AND** user presses `@` key
 - **AND** highlighted change is in `Processing` state
 - **THEN** approval status is NOT changed

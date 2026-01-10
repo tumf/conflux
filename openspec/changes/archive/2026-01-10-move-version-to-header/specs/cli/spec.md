@@ -1,6 +1,6 @@
 # cli Spec Delta
 
-## MODIFIED Requirements
+## NEW Requirements
 
 ### Requirement: TUI Header Version Display
 

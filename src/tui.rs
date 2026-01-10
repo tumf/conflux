@@ -326,8 +326,10 @@ pub enum TuiCommand {
     RemoveFromQueue(String),
     /// Toggle approval status for a change
     ToggleApproval(String),
-    /// Approve a change and add it to the queue (used in running/completed mode)
+    /// Approve a change and add it to the queue (used in stopped/completed mode)
     ApproveAndQueue(String),
+    /// Approve a change without adding to queue (used in running mode)
+    ApproveOnly(String),
     /// Unapprove a change and remove it from the queue (used in running/completed mode)
     UnapproveAndDequeue(String),
     /// Stop processing (graceful shutdown)
@@ -613,8 +615,21 @@ impl AppState {
 
         match self.mode {
             AppMode::Select => Some(TuiCommand::ToggleApproval(id)),
-            AppMode::Running | AppMode::Completed | AppMode::Stopped => {
-                // In running/completed/stopped mode, implement new state transitions:
+            AppMode::Running => {
+                // In running mode:
+                // [ ] (unapproved) → @ → [@] (approved only, NOT queued)
+                // [@] (approved, not queued) → @ → [ ] (unapproved)
+                // [x] (queued, not processing) → @ → [ ] (unapproved + removed from queue)
+                if !is_approved {
+                    // Unapproved → approved only (no auto-queue)
+                    Some(TuiCommand::ApproveOnly(id))
+                } else {
+                    // Approved → unapproved (also removes from queue if queued)
+                    Some(TuiCommand::UnapproveAndDequeue(id))
+                }
+            }
+            AppMode::Completed | AppMode::Stopped => {
+                // In completed/stopped mode:
                 // [ ] (unapproved) → @ → [x] (approved + queued)
                 // [@] (approved, not queued) → @ → [ ] (unapproved)
                 // [x] (queued, not processing) → @ → [ ] (unapproved + removed from queue)
@@ -1235,6 +1250,23 @@ async fn run_tui_loop(
                                     id
                                 )));
                             }
+                        }
+                        Err(e) => {
+                            app.add_log(LogEntry::error(format!(
+                                "Failed to approve '{}': {}",
+                                id, e
+                            )));
+                        }
+                    }
+                }
+                TuiCommand::ApproveOnly(id) => {
+                    // Approve without adding to queue (used in running mode)
+                    use crate::approval;
+
+                    match approval::approve_change(&id) {
+                        Ok(_) => {
+                            app.update_approval_status(&id, true);
+                            app.add_log(LogEntry::info(format!("Approved (not queued): {}", id)));
                         }
                         Err(e) => {
                             app.add_log(LogEntry::error(format!(
@@ -2045,13 +2077,32 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         ),
     ]);
 
-    let header = Paragraph::new(header_text).block(
+    let version = get_version_string();
+    let version_width = version.len() as u16 + 2; // +2 for padding
+
+    // Split area into left content and right-aligned version
+    let chunks =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(version_width)]).split(area);
+
+    // Render left content (title and mode) with left and top/bottom borders
+    let left_header = Paragraph::new(header_text).block(
         Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::LEFT | Borders::TOP | Borders::BOTTOM)
             .border_style(Style::default().fg(Color::Blue)),
     );
+    frame.render_widget(left_header, chunks[0]);
 
-    frame.render_widget(header, area);
+    // Render right content (version) with right and top/bottom borders
+    let right_header = Paragraph::new(Line::from(vec![Span::styled(
+        version,
+        Style::default().fg(Color::DarkGray),
+    )]))
+    .block(
+        Block::default()
+            .borders(Borders::RIGHT | Borders::TOP | Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::Blue)),
+    );
+    frame.render_widget(right_header, chunks[1]);
 }
 
 /// Render changes list in selection mode
@@ -2358,7 +2409,6 @@ pub fn get_version_string() -> String {
 fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
     let selected = app.selected_count();
     let new_count = app.new_change_count;
-    let version = get_version_string();
 
     let mut spans = vec![
         Span::styled(
@@ -2403,30 +2453,12 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
         ));
     }
 
-    // Split area into left content and right-aligned version
-    let version_width = version.len() as u16 + 2; // +2 for padding
-    let chunks =
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(version_width)]).split(area);
-
-    // Render left content (status information) with left and bottom/top borders
-    let left_footer = Paragraph::new(Line::from(spans)).block(
+    let footer = Paragraph::new(Line::from(spans)).block(
         Block::default()
-            .borders(Borders::LEFT | Borders::TOP | Borders::BOTTOM)
+            .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Blue)),
     );
-    frame.render_widget(left_footer, chunks[0]);
-
-    // Render right content (version) with right and bottom/top borders
-    let right_footer = Paragraph::new(Line::from(vec![Span::styled(
-        version,
-        Style::default().fg(Color::DarkGray),
-    )]))
-    .block(
-        Block::default()
-            .borders(Borders::RIGHT | Borders::TOP | Borders::BOTTOM)
-            .border_style(Style::default().fg(Color::Blue)),
-    );
-    frame.render_widget(right_footer, chunks[1]);
+    frame.render_widget(footer, area);
 }
 
 #[cfg(test)]
@@ -3580,7 +3612,7 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle_approval_in_running_mode_unapproved_to_approved_and_queued() {
+    fn test_toggle_approval_in_running_mode_unapproved_to_approved_only() {
         let changes = vec![create_test_change("a", 0, 1)];
         let mut app = AppState::new(changes);
 
@@ -3589,9 +3621,9 @@ mod tests {
         assert!(!app.changes[0].is_approved);
         assert!(!app.changes[0].selected);
 
-        // Toggle approval - should return ApproveAndQueue command
+        // Toggle approval - should return ApproveOnly command (not queued)
         let cmd = app.toggle_approval();
-        assert!(matches!(cmd, Some(TuiCommand::ApproveAndQueue(_))));
+        assert!(matches!(cmd, Some(TuiCommand::ApproveOnly(_))));
     }
 
     #[test]
@@ -3704,5 +3736,47 @@ mod tests {
         // Toggle approval - should return None in Error mode
         let cmd = app.toggle_approval();
         assert!(cmd.is_none());
+    }
+
+    #[test]
+    fn test_toggle_approval_in_select_mode_returns_toggle_approval() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Should be in Select mode by default
+        assert_eq!(app.mode, AppMode::Select);
+        assert!(!app.changes[0].is_approved);
+
+        // Toggle approval - should return ToggleApproval command
+        let cmd = app.toggle_approval();
+        assert!(matches!(cmd, Some(TuiCommand::ToggleApproval(_))));
+    }
+
+    #[test]
+    fn test_toggle_approval_in_completed_mode_unapproved_to_approved_and_queued() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Set to Completed mode
+        app.mode = AppMode::Completed;
+        assert!(!app.changes[0].is_approved);
+
+        // Toggle approval - should return ApproveAndQueue command (auto-queue in stopped mode)
+        let cmd = app.toggle_approval();
+        assert!(matches!(cmd, Some(TuiCommand::ApproveAndQueue(_))));
+    }
+
+    #[test]
+    fn test_toggle_approval_in_stopped_mode_unapproved_to_approved_and_queued() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Set to Stopped mode
+        app.mode = AppMode::Stopped;
+        assert!(!app.changes[0].is_approved);
+
+        // Toggle approval - should return ApproveAndQueue command (auto-queue in stopped mode)
+        let cmd = app.toggle_approval();
+        assert!(matches!(cmd, Some(TuiCommand::ApproveAndQueue(_))));
     }
 }
