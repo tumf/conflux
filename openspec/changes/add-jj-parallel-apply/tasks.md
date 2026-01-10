@@ -59,7 +59,6 @@
 - [ ] 7.2 Implement `build_conflict_resolution_prompt()` with hardcoded template
 - [ ] 7.3 Execute AI agent (apply_command) with conflict resolution prompt
 - [ ] 7.4 Verify resolution success via `jj status`
-- [ ] 7.5 Preserve workspace state on resolution failure for manual inspection
 
 ## 8. Orchestrator Integration
 
