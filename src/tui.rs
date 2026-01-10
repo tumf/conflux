@@ -1076,6 +1076,13 @@ async fn run_tui_loop(
                                     if let Some(cancel) = &orchestrator_cancel {
                                         cancel.cancel();
                                     }
+                                    // Reset any Processing change back to Queued
+                                    for change in &mut app.changes {
+                                        if matches!(change.queue_status, QueueStatus::Processing) {
+                                            change.queue_status = QueueStatus::Queued;
+                                        }
+                                    }
+                                    app.current_change = None;
                                     app.mode = AppMode::Stopped;
                                     app.add_log(LogEntry::warn("Force stopped"));
                                 }
