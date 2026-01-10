@@ -324,9 +324,7 @@ pub enum TuiCommand {
     AddToQueue(String),
     /// Remove a change from the queue dynamically
     RemoveFromQueue(String),
-    /// Toggle approval status for a change
-    ToggleApproval(String),
-    /// Approve a change and add it to the queue (used in stopped/completed mode)
+    /// Approve a change and add it to the queue (used in select/stopped/completed mode)
     ApproveAndQueue(String),
     /// Approve a change without adding to queue (used in running mode)
     ApproveOnly(String),
@@ -614,7 +612,18 @@ impl AppState {
         let is_approved = change.is_approved;
 
         match self.mode {
-            AppMode::Select => Some(TuiCommand::ToggleApproval(id)),
+            AppMode::Select | AppMode::Completed | AppMode::Stopped => {
+                // In select/completed/stopped mode:
+                // [ ] (unapproved) → @ → [x] (approved + selected)
+                // [x] (approved + selected) → @ → [ ] (unapproved + not selected)
+                if !is_approved {
+                    // Unapproved → approved + selected
+                    Some(TuiCommand::ApproveAndQueue(id))
+                } else {
+                    // Approved → unapproved (also deselects)
+                    Some(TuiCommand::UnapproveAndDequeue(id))
+                }
+            }
             AppMode::Running => {
                 // In running mode:
                 // [ ] (unapproved) → @ → [@] (approved only, NOT queued)
@@ -623,19 +632,6 @@ impl AppState {
                 if !is_approved {
                     // Unapproved → approved only (no auto-queue)
                     Some(TuiCommand::ApproveOnly(id))
-                } else {
-                    // Approved → unapproved (also removes from queue if queued)
-                    Some(TuiCommand::UnapproveAndDequeue(id))
-                }
-            }
-            AppMode::Completed | AppMode::Stopped => {
-                // In completed/stopped mode:
-                // [ ] (unapproved) → @ → [x] (approved + queued)
-                // [@] (approved, not queued) → @ → [ ] (unapproved)
-                // [x] (queued, not processing) → @ → [ ] (unapproved + removed from queue)
-                if !is_approved {
-                    // Unapproved → approved + queued
-                    Some(TuiCommand::ApproveAndQueue(id))
                 } else {
                     // Approved → unapproved (also removes from queue if queued)
                     Some(TuiCommand::UnapproveAndDequeue(id))
@@ -1207,37 +1203,8 @@ async fn run_tui_loop(
                     // Log the removal (orchestrator will see the updated status)
                     app.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
                 }
-                TuiCommand::ToggleApproval(id) => {
-                    // Toggle approval status using the approval module
-                    use crate::approval;
-
-                    let current_approved = app
-                        .changes
-                        .iter()
-                        .find(|c| c.id == id)
-                        .map(|c| c.is_approved)
-                        .unwrap_or(false);
-
-                    let result = if current_approved {
-                        approval::unapprove_change(&id)
-                    } else {
-                        approval::approve_change(&id)
-                    };
-
-                    match result {
-                        Ok(_) => {
-                            app.update_approval_status(&id, !current_approved);
-                        }
-                        Err(e) => {
-                            app.add_log(LogEntry::error(format!(
-                                "Failed to toggle approval for '{}': {}",
-                                id, e
-                            )));
-                        }
-                    }
-                }
                 TuiCommand::ApproveAndQueue(id) => {
-                    // Approve and add to queue (used in running/completed mode)
+                    // Approve and add to queue (used in select/stopped/completed mode)
                     use crate::approval;
 
                     match approval::approve_change(&id) {
@@ -3746,7 +3713,7 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle_approval_in_select_mode_returns_toggle_approval() {
+    fn test_toggle_approval_in_select_mode_unapproved_to_approved_and_selected() {
         let changes = vec![create_test_change("a", 0, 1)];
         let mut app = AppState::new(changes);
 
@@ -3754,9 +3721,26 @@ mod tests {
         assert_eq!(app.mode, AppMode::Select);
         assert!(!app.changes[0].is_approved);
 
-        // Toggle approval - should return ToggleApproval command
+        // Toggle approval - should return ApproveAndQueue command (2-stage transition)
         let cmd = app.toggle_approval();
-        assert!(matches!(cmd, Some(TuiCommand::ToggleApproval(_))));
+        assert!(matches!(cmd, Some(TuiCommand::ApproveAndQueue(_))));
+    }
+
+    #[test]
+    fn test_toggle_approval_in_select_mode_approved_to_unapproved() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Should be in Select mode by default
+        assert_eq!(app.mode, AppMode::Select);
+
+        // Set as approved
+        app.changes[0].is_approved = true;
+        app.changes[0].selected = true;
+
+        // Toggle approval - should return UnapproveAndDequeue command
+        let cmd = app.toggle_approval();
+        assert!(matches!(cmd, Some(TuiCommand::UnapproveAndDequeue(_))));
     }
 
     #[test]
