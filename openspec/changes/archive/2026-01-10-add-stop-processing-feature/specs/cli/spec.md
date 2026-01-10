@@ -126,7 +126,7 @@ Changes interrupted by force stop SHALL be handled gracefully.
 
 ## MODIFIED Requirements
 
-### Requirement: TUI Layout Configuration (MODIFIED)
+### Requirement: TUIレイアウト構成
 
 The TUI SHALL display appropriate layout for Stopping and Stopped modes in addition to existing modes.
 

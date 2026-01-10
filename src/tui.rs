@@ -8,7 +8,7 @@
 
 use crate::agent::AgentRunner;
 use crate::config::OrchestratorConfig;
-use crate::error::Result;
+use crate::error::{OrchestratorError, Result};
 use crate::openspec::Change;
 use chrono::Local;
 use crossterm::{
@@ -17,7 +17,10 @@ use crossterm::{
         MouseEventKind,
     },
     execute,
-    terminal::{Clear, ClearType},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -27,6 +30,9 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 use std::collections::{HashSet, VecDeque};
+use std::path::Path;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
@@ -105,6 +111,40 @@ impl Default for DynamicQueue {
     }
 }
 
+/// Launch editor in the specified change directory
+///
+/// Opens the user's configured editor ($EDITOR) in the change directory.
+/// Falls back to "vi" if $EDITOR is not set.
+fn launch_editor_for_change(change_id: &str) -> Result<()> {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+
+    let change_dir = Path::new("openspec/changes").join(change_id);
+
+    if !change_dir.exists() {
+        return Err(OrchestratorError::ChangeNotFound(change_id.to_string()));
+    }
+
+    Command::new(&editor)
+        .arg(".")
+        .current_dir(&change_dir)
+        .status()
+        .map_err(|e| OrchestratorError::EditorLaunchFailed(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Stop mode for graceful/force stop handling
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum StopMode {
+    /// Not stopping, normal operation
+    #[default]
+    None,
+    /// Graceful stop requested, waiting for current process
+    GracefulPending,
+    /// Force stop executed
+    ForceStopped,
+}
+
 /// Application mode
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
@@ -112,6 +152,10 @@ pub enum AppMode {
     Select,
     /// Running mode - processing selected changes
     Running,
+    /// Stopping mode - graceful stop in progress
+    Stopping,
+    /// Stopped mode - processing halted, can modify queue
+    Stopped,
     /// Completed mode - all processing finished
     Completed,
     /// Error mode - an error occurred during processing
@@ -311,6 +355,8 @@ pub enum OrchestratorEvent {
     ProcessingError { id: String, error: String },
     /// All processing completed
     AllCompleted,
+    /// Processing stopped (graceful stop completed)
+    Stopped,
     /// Log message
     Log(LogEntry),
     /// Changes list refreshed
@@ -349,6 +395,8 @@ pub struct AppState {
     pub log_scroll_offset: usize,
     /// Whether to auto-scroll logs to bottom on new entries
     pub log_auto_scroll: bool,
+    /// Current stop mode
+    pub stop_mode: StopMode,
 }
 
 impl AppState {
@@ -398,6 +446,7 @@ impl AppState {
             spinner_frame: 0,
             log_scroll_offset: 0,
             log_auto_scroll: true,
+            stop_mode: StopMode::None,
         }
     }
 
@@ -479,8 +528,8 @@ impl AppState {
                     _ => None,
                 }
             }
-            AppMode::Completed => {
-                // Allow queue modifications in Completed mode (same as Running)
+            AppMode::Completed | AppMode::Stopped => {
+                // Allow queue modifications in Completed/Stopped mode (same as Running)
                 match &change.queue_status {
                     QueueStatus::NotQueued => {
                         change.queue_status = QueueStatus::Queued;
@@ -499,7 +548,7 @@ impl AppState {
                     _ => None,
                 }
             }
-            AppMode::Error => None,
+            AppMode::Stopping | AppMode::Error => None,
         }
     }
 
@@ -564,8 +613,8 @@ impl AppState {
 
         match self.mode {
             AppMode::Select => Some(TuiCommand::ToggleApproval(id)),
-            AppMode::Running | AppMode::Completed => {
-                // In running/completed mode, implement new state transitions:
+            AppMode::Running | AppMode::Completed | AppMode::Stopped => {
+                // In running/completed/stopped mode, implement new state transitions:
                 // [ ] (unapproved) → @ → [x] (approved + queued)
                 // [@] (approved, not queued) → @ → [ ] (unapproved)
                 // [x] (queued, not processing) → @ → [ ] (unapproved + removed from queue)
@@ -577,7 +626,7 @@ impl AppState {
                     Some(TuiCommand::UnapproveAndDequeue(id))
                 }
             }
-            AppMode::Error => None,
+            AppMode::Stopping | AppMode::Error => None,
         }
     }
 
@@ -727,7 +776,14 @@ impl AppState {
             OrchestratorEvent::AllCompleted => {
                 self.mode = AppMode::Completed;
                 self.current_change = None;
+                self.stop_mode = StopMode::None;
                 self.add_log(LogEntry::success("All changes processed"));
+            }
+            OrchestratorEvent::Stopped => {
+                self.mode = AppMode::Stopped;
+                self.current_change = None;
+                self.stop_mode = StopMode::None;
+                self.add_log(LogEntry::warn("Processing stopped"));
             }
             OrchestratorEvent::Log(entry) => {
                 self.add_log(entry);
@@ -922,6 +978,9 @@ async fn run_tui_loop(
     let mut orchestrator_handle: Option<tokio::task::JoinHandle<Result<()>>> = None;
     let mut orchestrator_cancel: Option<CancellationToken> = None;
 
+    // Shared flag for graceful stop (signaling orchestrator to stop after current change)
+    let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+
     loop {
         // Increment spinner frame for animation (updates every 100ms)
         app.spinner_frame = (app.spinner_frame + 1) % SPINNER_CHARS.len();
@@ -955,10 +1014,84 @@ async fn run_tui_loop(
                                 let _ = cmd_tx.send(cmd).await;
                             }
                         }
+                        (KeyCode::Char('e'), _) => {
+                            // Open editor in change directory (Select mode only)
+                            if app.mode == AppMode::Select
+                                && !app.changes.is_empty()
+                                && app.cursor_index < app.changes.len()
+                            {
+                                let change_id = app.changes[app.cursor_index].id.clone();
+
+                                // Suspend TUI and launch editor
+                                disable_raw_mode()?;
+                                execute!(
+                                    std::io::stdout(),
+                                    LeaveAlternateScreen,
+                                    DisableMouseCapture
+                                )?;
+
+                                // Launch editor
+                                if let Err(e) = launch_editor_for_change(&change_id) {
+                                    eprintln!("Failed to launch editor: {}", e);
+                                }
+
+                                // Restore TUI
+                                enable_raw_mode()?;
+                                execute!(
+                                    std::io::stdout(),
+                                    EnterAlternateScreen,
+                                    EnableMouseCapture
+                                )?;
+                                terminal.clear()?;
+                            }
+                        }
+                        (KeyCode::Esc, _) => {
+                            // Handle stop in Running or Stopping mode
+                            match app.mode {
+                                AppMode::Running => {
+                                    // First Esc: Graceful stop
+                                    app.stop_mode = StopMode::GracefulPending;
+                                    graceful_stop_flag.store(true, Ordering::SeqCst);
+                                    app.mode = AppMode::Stopping;
+                                    app.add_log(LogEntry::warn("Stopping after current change completes..."));
+                                }
+                                AppMode::Stopping => {
+                                    // Second Esc: Force stop
+                                    app.stop_mode = StopMode::ForceStopped;
+                                    if let Some(cancel) = &orchestrator_cancel {
+                                        cancel.cancel();
+                                    }
+                                    app.mode = AppMode::Stopped;
+                                    app.add_log(LogEntry::warn("Force stopped"));
+                                }
+                                _ => {}
+                            }
+                        }
                         (KeyCode::F(5), _) => {
                             // Determine which command to use based on mode
                             let cmd = if app.mode == AppMode::Error {
                                 app.retry_error_changes()
+                            } else if app.mode == AppMode::Stopped {
+                                // Resume after stop: collect queued changes
+                                let queued: Vec<String> = app
+                                    .changes
+                                    .iter()
+                                    .filter(|c| matches!(c.queue_status, QueueStatus::Queued))
+                                    .map(|c| c.id.clone())
+                                    .collect();
+                                if queued.is_empty() {
+                                    app.warning_message = Some("No queued changes to resume".to_string());
+                                    None
+                                } else {
+                                    app.mode = AppMode::Running;
+                                    app.stop_mode = StopMode::None;
+                                    graceful_stop_flag.store(false, Ordering::SeqCst);
+                                    app.add_log(LogEntry::info(format!(
+                                        "Resuming processing {} change(s)",
+                                        queued.len()
+                                    )));
+                                    Some(TuiCommand::StartProcessing(queued))
+                                }
                             } else {
                                 app.start_processing()
                             };
@@ -976,6 +1109,7 @@ async fn run_tui_loop(
                                     let orch_config = config.clone();
                                     let orch_cancel = CancellationToken::new();
                                     let orch_dynamic_queue = dynamic_queue.clone();
+                                    let orch_graceful_stop = graceful_stop_flag.clone();
                                     orchestrator_cancel = Some(orch_cancel.clone());
 
                                     orchestrator_handle = Some(tokio::spawn(async move {
@@ -986,6 +1120,7 @@ async fn run_tui_loop(
                                             orch_tx,
                                             orch_cancel,
                                             orch_dynamic_queue,
+                                            orch_graceful_stop,
                                         )
                                         .await
                                     }));
@@ -1425,6 +1560,7 @@ async fn run_orchestrator(
     tx: mpsc::Sender<OrchestratorEvent>,
     cancel_token: CancellationToken,
     dynamic_queue: DynamicQueue,
+    graceful_stop_flag: Arc<AtomicBool>,
 ) -> Result<()> {
     use crate::agent::OutputLine;
     use crate::hooks::{HookContext, HookRunner, HookType};
@@ -1461,6 +1597,17 @@ async fn run_orchestrator(
                     "Processing cancelled".to_string(),
                 )))
                 .await;
+            break;
+        }
+
+        // Check for graceful stop flag (stop after current change completes)
+        if graceful_stop_flag.load(Ordering::SeqCst) {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::info(
+                    "Graceful stop: stopping after current change".to_string(),
+                )))
+                .await;
+            let _ = tx.send(OrchestratorEvent::Stopped).await;
             break;
         }
 
@@ -1821,7 +1968,7 @@ fn render(frame: &mut Frame, app: &mut AppState) {
 
     match app.mode {
         AppMode::Select => render_select_mode(frame, app, area),
-        AppMode::Running | AppMode::Completed | AppMode::Error => {
+        AppMode::Running | AppMode::Stopping | AppMode::Stopped | AppMode::Completed | AppMode::Error => {
             render_running_mode(frame, app, area)
         }
     }
@@ -1874,6 +2021,8 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
     let mode_text = match app.mode {
         AppMode::Select => "Select Mode",
         AppMode::Running => "Running",
+        AppMode::Stopping => "Stopping...",
+        AppMode::Stopped => "Stopped",
         AppMode::Completed => "Completed",
         AppMode::Error => "Error",
     };
@@ -1881,6 +2030,8 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
     let mode_color = match app.mode {
         AppMode::Select => Color::Cyan,
         AppMode::Running => Color::Yellow,
+        AppMode::Stopping => Color::Yellow,
+        AppMode::Stopped => Color::DarkGray,
         AppMode::Completed => Color::Green,
         AppMode::Error => Color::Red,
     };
@@ -1961,7 +2112,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Changes (↑↓/jk: move, Space: queue, @: approve, F5: run, q: quit) ")
+                .title(" Changes (↑↓/jk: move, Space: queue, @: approve, e: edit, F5: run, q: quit) ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         )
@@ -2073,7 +2224,9 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
 
     let (status_text, status_color) = match app.mode {
         AppMode::Completed => ("All processing completed. Press 'q' to quit.", Color::Green),
-        AppMode::Running => ("Processing...", Color::Cyan),
+        AppMode::Running => ("Processing... Esc: stop", Color::Cyan),
+        AppMode::Stopping => ("Stopping after current change... Esc: force stop", Color::Yellow),
+        AppMode::Stopped => ("Stopped. F5: resume, Space: toggle queue, q: quit", Color::DarkGray),
         AppMode::Select => ("", Color::White),
         AppMode::Error => ("Press F5 to retry, or 'q' to quit.", Color::Yellow),
     };

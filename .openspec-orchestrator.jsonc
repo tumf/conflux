@@ -7,7 +7,7 @@
   "archive_command": "/Users/tumf/.local/bin/claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id} {prompt}'",
   // Lifecycle hooks (optional)
   "hooks": {
-    // "pre_apply": "echo 'Starting {change_id}'",
-    // "post_apply": "echo 'Completed {change_id}'"
+    // Create a new jj change for each changeset before applying
+    "pre_apply": "jj new -m 'changeset: {change_id}'"
   },
 }

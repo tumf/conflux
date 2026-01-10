@@ -38,6 +38,12 @@ pub enum OrchestratorError {
         hook_type: String,
         timeout_secs: u64,
     },
+
+    #[error("Failed to launch editor: {0}")]
+    EditorLaunchFailed(String),
+
+    #[error("Change directory not found: {0}")]
+    ChangeNotFound(String),
 }
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;
