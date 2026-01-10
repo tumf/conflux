@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 
 /// Status of a jj workspace
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum WorkspaceStatus {
     /// Workspace created but not yet used
     Created,
@@ -29,6 +30,7 @@ pub enum WorkspaceStatus {
 
 /// Represents a jj workspace for parallel execution
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct JjWorkspace {
     /// Workspace name (used by jj)
     pub name: String,
@@ -57,6 +59,7 @@ pub struct WorkspaceResult {
 
 /// Result of parallel execution
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ParallelExecutionResult {
     /// Successfully completed workspaces
     pub successful: Vec<WorkspaceResult>,
@@ -103,6 +106,7 @@ impl JjWorkspaceManager {
     }
 
     /// Get list of active workspaces
+    #[allow(dead_code)]
     pub fn workspaces(&self) -> &[JjWorkspace] {
         &self.workspaces
     }
@@ -211,6 +215,7 @@ impl JjWorkspaceManager {
     }
 
     /// Get the current revision in a workspace
+    #[allow(dead_code)]
     pub async fn get_workspace_revision(&self, workspace: &JjWorkspace) -> Result<String> {
         let output = Command::new("jj")
             .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
@@ -315,9 +320,7 @@ impl JjWorkspaceManager {
             .current_dir(&self.repo_root)
             .output()
             .await
-            .map_err(|e| {
-                OrchestratorError::JjCommand(format!("Resolve command failed: {}", e))
-            })?;
+            .map_err(|e| OrchestratorError::JjCommand(format!("Resolve command failed: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -397,6 +400,7 @@ impl JjWorkspaceManager {
     }
 
     /// List all jj workspaces in the repository
+    #[allow(dead_code)]
     pub async fn list_jj_workspaces(&self) -> Result<Vec<String>> {
         let output = Command::new("jj")
             .args(["workspace", "list"])

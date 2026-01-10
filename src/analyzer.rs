@@ -78,10 +78,7 @@ impl ParallelizationAnalyzer {
         // Return groups in topological order
         let sorted = self.topological_sort(result.groups)?;
 
-        info!(
-            "Analysis complete: {} groups identified",
-            sorted.len()
-        );
+        info!("Analysis complete: {} groups identified", sorted.len());
 
         Ok(sorted)
     }
@@ -263,12 +260,12 @@ Rules:
         let mut rec_stack: HashSet<u32> = HashSet::new();
 
         for group in groups {
-            if !visited.contains(&group.id) {
-                if self.has_cycle(group.id, &adjacency, &mut visited, &mut rec_stack) {
-                    return Err(OrchestratorError::Parse(
-                        "Circular dependency detected in parallelization groups".to_string(),
-                    ));
-                }
+            if !visited.contains(&group.id)
+                && self.has_cycle(group.id, &adjacency, &mut visited, &mut rec_stack)
+            {
+                return Err(OrchestratorError::Parse(
+                    "Circular dependency detected in parallelization groups".to_string(),
+                ));
             }
         }
 

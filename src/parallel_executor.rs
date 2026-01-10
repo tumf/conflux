@@ -16,18 +16,23 @@ use tracing::{debug, error, info, warn};
 
 /// Events emitted during parallel execution
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum ParallelEvent {
     /// A workspace was created
-    WorkspaceCreated { change_id: String, workspace: String },
+    WorkspaceCreated {
+        change_id: String,
+        workspace: String,
+    },
     /// Apply started in a workspace
     ApplyStarted { change_id: String },
     /// Apply completed in a workspace
-    ApplyCompleted {
-        change_id: String,
-        revision: String,
-    },
+    ApplyCompleted { change_id: String, revision: String },
     /// Apply failed in a workspace
     ApplyFailed { change_id: String, error: String },
+    /// Change archived successfully
+    ChangeArchived { change_id: String },
+    /// Change archive failed
+    ArchiveFailed { change_id: String, error: String },
     /// Merge started
     MergeStarted { revisions: Vec<String> },
     /// Merge completed
@@ -55,17 +60,22 @@ pub enum ParallelEvent {
 }
 
 /// Parallel executor for running changes in jj workspaces
+#[allow(dead_code)]
 pub struct ParallelExecutor {
     /// Workspace manager
     workspace_manager: JjWorkspaceManager,
-    /// Configuration
+    /// Configuration (kept for potential future use)
     config: OrchestratorConfig,
     /// Apply command template
     apply_command: String,
+    /// Archive command template
+    archive_command: String,
     /// Event sender
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
     /// Maximum retries for conflict resolution
     max_conflict_retries: u32,
+    /// Repository root path for archive operations
+    repo_root: PathBuf,
 }
 
 impl ParallelExecutor {
@@ -83,16 +93,19 @@ impl ParallelExecutor {
 
         let max_concurrent = config.get_max_concurrent_workspaces();
         let apply_command = config.get_apply_command().to_string();
+        let archive_command = config.get_archive_command().to_string();
 
         let workspace_manager =
-            JjWorkspaceManager::new(base_dir, repo_root, max_concurrent, config.clone());
+            JjWorkspaceManager::new(base_dir, repo_root.clone(), max_concurrent, config.clone());
 
         Self {
             workspace_manager,
             config,
             apply_command,
+            archive_command,
             event_tx,
             max_conflict_retries: 3,
+            repo_root,
         }
     }
 
@@ -149,8 +162,11 @@ impl ParallelExecutor {
         let results = self.execute_applies_parallel(&workspaces).await?;
 
         // Collect successful results
-        let successful: Vec<WorkspaceResult> =
-            results.iter().filter(|r| r.error.is_none()).cloned().collect();
+        let successful: Vec<WorkspaceResult> = results
+            .iter()
+            .filter(|r| r.error.is_none())
+            .cloned()
+            .collect();
         let failed: Vec<WorkspaceResult> = results
             .iter()
             .filter(|r| r.error.is_some())
@@ -174,6 +190,27 @@ impl ParallelExecutor {
             return Err(OrchestratorError::AgentCommand(
                 "All changes in group failed".to_string(),
             ));
+        }
+
+        // Archive successful changes before merge
+        for result in &successful {
+            info!("Archiving completed change: {}", result.change_id);
+            match self.archive_change(&result.change_id).await {
+                Ok(()) => {
+                    self.send_event(ParallelEvent::ChangeArchived {
+                        change_id: result.change_id.clone(),
+                    })
+                    .await;
+                }
+                Err(e) => {
+                    warn!("Failed to archive {}: {}", result.change_id, e);
+                    self.send_event(ParallelEvent::ArchiveFailed {
+                        change_id: result.change_id.clone(),
+                        error: e.to_string(),
+                    })
+                    .await;
+                }
+            }
         }
 
         // Merge successful results
@@ -217,7 +254,7 @@ impl ParallelExecutor {
         let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
 
         for workspace in workspaces {
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let sem = semaphore.clone();
             let change_id = workspace.change_id.clone();
             let workspace_path = workspace.path.clone();
             let workspace_name = workspace.name.clone();
@@ -228,9 +265,12 @@ impl ParallelExecutor {
                 .update_workspace_status(&workspace_name, WorkspaceStatus::Applying);
 
             join_set.spawn(async move {
+                // Acquire semaphore inside spawn to allow all tasks to be created
+                let _permit = sem.acquire_owned().await.unwrap();
+
                 let result =
                     Self::execute_apply_in_workspace(&change_id, &workspace_path, &apply_cmd).await;
-                drop(permit); // Release semaphore
+                // _permit is dropped here, releasing semaphore
 
                 match result {
                     Ok(revision) => WorkspaceResult {
@@ -284,33 +324,116 @@ impl ParallelExecutor {
         Ok(results)
     }
 
-    /// Execute apply command in a single workspace
+    /// Execute apply command in a single workspace, repeating until tasks are 100% complete
     async fn execute_apply_in_workspace(
         change_id: &str,
         workspace_path: &PathBuf,
         apply_cmd_template: &str,
     ) -> Result<String> {
-        // Expand change_id in command
-        let command = OrchestratorConfig::expand_change_id(apply_cmd_template, change_id);
+        const MAX_ITERATIONS: u32 = 50;
+        let mut iteration = 0;
 
-        info!("Executing apply in workspace: {}", command);
-        debug!("Workspace path: {:?}", workspace_path);
+        loop {
+            iteration += 1;
+            if iteration > MAX_ITERATIONS {
+                return Err(OrchestratorError::AgentCommand(format!(
+                    "Max iterations ({}) reached for change {}",
+                    MAX_ITERATIONS, change_id
+                )));
+            }
 
-        // Execute command in workspace directory
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .current_dir(workspace_path)
-            .output()
-            .await
-            .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to execute: {}", e)))?;
+            // Check current task progress in workspace
+            let tasks_path = workspace_path
+                .join("openspec/changes")
+                .join(change_id)
+                .join("tasks.md");
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(OrchestratorError::AgentCommand(format!(
-                "Apply command failed: {}",
-                stderr
-            )));
+            debug!("Checking tasks at: {:?}", tasks_path);
+
+            let progress = if tasks_path.exists() {
+                let p = crate::task_parser::parse_file(&tasks_path).unwrap_or_default();
+                debug!("Tasks file found: {}/{} complete", p.completed, p.total);
+                p
+            } else {
+                debug!("Tasks file not found at {:?}", tasks_path);
+                crate::task_parser::TaskProgress::default()
+            };
+
+            // Check if already complete
+            if progress.total > 0 && progress.completed == progress.total {
+                info!(
+                    "Change {} is already complete ({}/{})",
+                    change_id, progress.completed, progress.total
+                );
+                break;
+            }
+
+            info!(
+                "Executing apply #{} for {} in workspace ({}/{} tasks)",
+                iteration, change_id, progress.completed, progress.total
+            );
+
+            // Expand change_id and prompt in command
+            let command = OrchestratorConfig::expand_change_id(apply_cmd_template, change_id);
+            let command = OrchestratorConfig::expand_prompt(&command, "");
+            debug!("Workspace path: {:?}", workspace_path);
+            debug!("Apply command: {}", command);
+
+            // Execute command in workspace directory
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .current_dir(workspace_path)
+                .output()
+                .await
+                .map_err(|e| {
+                    OrchestratorError::AgentCommand(format!("Failed to execute: {}", e))
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(OrchestratorError::AgentCommand(format!(
+                    "Apply command failed: {}",
+                    stderr
+                )));
+            }
+
+            // Run jj status to snapshot working copy changes
+            // This ensures file modifications are visible for task progress check
+            let _ = Command::new("jj")
+                .arg("status")
+                .current_dir(workspace_path)
+                .output()
+                .await;
+
+            // Check task progress after apply
+            let new_progress = if tasks_path.exists() {
+                crate::task_parser::parse_file(&tasks_path).unwrap_or_default()
+            } else {
+                crate::task_parser::TaskProgress::default()
+            };
+
+            info!(
+                "After apply #{}: {}/{} tasks complete",
+                iteration, new_progress.completed, new_progress.total
+            );
+
+            // Check if complete
+            if new_progress.total > 0 && new_progress.completed == new_progress.total {
+                info!(
+                    "Change {} completed after {} iteration(s)",
+                    change_id, iteration
+                );
+                break;
+            }
+
+            // Check for progress (avoid infinite loops)
+            if new_progress.completed <= progress.completed && iteration > 1 {
+                warn!(
+                    "No progress made for {} (still {}/{}), continuing...",
+                    change_id, new_progress.completed, new_progress.total
+                );
+            }
         }
 
         // Get the resulting revision
@@ -319,9 +442,7 @@ impl ParallelExecutor {
             .current_dir(workspace_path)
             .output()
             .await
-            .map_err(|e| {
-                OrchestratorError::JjCommand(format!("Failed to get revision: {}", e))
-            })?;
+            .map_err(|e| OrchestratorError::JjCommand(format!("Failed to get revision: {}", e)))?;
 
         if !revision_output.status.success() {
             return Err(OrchestratorError::JjCommand(
@@ -403,7 +524,11 @@ impl ParallelExecutor {
                 attempt, self.max_conflict_retries
             );
 
-            match self.workspace_manager.resolve_conflicts(conflict_info).await {
+            match self
+                .workspace_manager
+                .resolve_conflicts(conflict_info)
+                .await
+            {
                 Ok(()) => {
                     // Verify resolution
                     let conflicts = self.detect_conflicts().await?;
@@ -432,6 +557,37 @@ impl ParallelExecutor {
         Err(OrchestratorError::JjConflict(error_msg))
     }
 
+    /// Archive a completed change using the configured archive command
+    async fn archive_change(&self, change_id: &str) -> Result<()> {
+        // Expand change_id and prompt in archive command
+        let command = OrchestratorConfig::expand_change_id(&self.archive_command, change_id);
+        let command = OrchestratorConfig::expand_prompt(&command, "");
+
+        debug!("Archive command: {}", command);
+
+        // Execute command using sh -c (same as apply command)
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(&self.repo_root)
+            .output()
+            .await
+            .map_err(|e| {
+                OrchestratorError::AgentCommand(format!("Failed to run archive command: {}", e))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Archive failed for {}: {}",
+                change_id, stderr
+            )));
+        }
+
+        info!("Archived change: {}", change_id);
+        Ok(())
+    }
+
     /// Send an event to the event channel
     async fn send_event(&self, event: ParallelEvent) {
         if let Some(ref tx) = self.event_tx {
@@ -442,6 +598,7 @@ impl ParallelExecutor {
     }
 
     /// Cleanup all workspaces
+    #[allow(dead_code)]
     pub async fn cleanup(&mut self) -> Result<()> {
         self.workspace_manager.cleanup_all().await
     }

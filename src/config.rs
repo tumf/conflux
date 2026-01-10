@@ -44,6 +44,7 @@ pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
 pub const DEFAULT_MAX_CONCURRENT_WORKSPACES: usize = 3;
 
 /// Default workspace base directory (uses system temp)
+#[allow(dead_code)]
 pub const DEFAULT_WORKSPACE_BASE_DIR: &str = "";
 
 /// Orchestrator configuration
@@ -171,6 +172,7 @@ impl OrchestratorConfig {
 
     /// Get whether parallel mode is enabled.
     /// Default: false (off by default)
+    #[allow(dead_code)]
     pub fn get_parallel_mode(&self) -> bool {
         self.parallel_mode.unwrap_or(false)
     }
@@ -185,13 +187,12 @@ impl OrchestratorConfig {
     /// Get the workspace base directory.
     /// Returns None if using system temp directory.
     pub fn get_workspace_base_dir(&self) -> Option<&str> {
-        self.workspace_base_dir
-            .as_deref()
-            .filter(|s| !s.is_empty())
+        self.workspace_base_dir.as_deref().filter(|s| !s.is_empty())
     }
 
     /// Get the resolve command for conflict resolution.
     /// Returns None if using automatic AI-based resolution.
+    #[allow(dead_code)]
     pub fn get_resolve_command(&self) -> Option<&str> {
         self.resolve_command.as_deref()
     }

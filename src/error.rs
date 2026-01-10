@@ -52,6 +52,7 @@ pub enum OrchestratorError {
     JjConflict(String),
 
     #[error("jj not available: {0}")]
+    #[allow(dead_code)]
     JjNotAvailable(String),
 }
 
