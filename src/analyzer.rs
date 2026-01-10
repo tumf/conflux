@@ -27,6 +27,9 @@ pub struct ParallelGroup {
 pub struct AnalysisResult {
     /// Parallel execution groups
     pub groups: Vec<ParallelGroup>,
+    /// Dependencies between changes (change_id -> list of dependencies)
+    #[serde(default)]
+    pub dependencies: HashMap<String, Vec<String>>,
 }
 
 /// Analyzer for determining parallel execution groups
@@ -404,6 +407,7 @@ That's all."#;
                 changes: vec!["a".to_string()], // Missing "b"
                 depends_on: Vec::new(),
             }],
+            dependencies: HashMap::new(),
         };
 
         let validation = analyzer.validate_change_ids(&result, &changes);
@@ -429,6 +433,7 @@ That's all."#;
                     depends_on: vec![1],
                 },
             ],
+            dependencies: HashMap::new(),
         };
 
         let validation = analyzer.validate_change_ids(&result, &changes);
