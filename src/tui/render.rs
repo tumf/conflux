@@ -97,14 +97,26 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Error => Color::Red,
     };
 
-    let header_text = Line::from(vec![
+    // Build header spans
+    let mut header_spans = vec![
         Span::styled("OpenSpec Orchestrator", Style::default().fg(Color::White)),
         Span::raw("  "),
         Span::styled(
             format!("[{}]", mode_text),
             Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
         ),
-    ]);
+    ];
+
+    // Add parallel mode badge if enabled
+    if app.parallel_mode {
+        header_spans.push(Span::raw(" "));
+        header_spans.push(Span::styled(
+            "[parallel]",
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let header_text = Line::from(header_spans);
 
     let version = get_version_string();
     let version_width = version.len() as u16 + 2; // +2 for padding
@@ -214,6 +226,14 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
     }
     if has_queue {
         keys.push("F5: run");
+    }
+    // Show parallel toggle hint only if jj is available
+    if app.jj_available {
+        keys.push(if app.parallel_mode {
+            "=: sequential"
+        } else {
+            "=: parallel"
+        });
     }
     keys.push("q: quit");
 
@@ -366,6 +386,8 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
             (format!("Error in: {}", error_id), Color::Red)
         }
         AppMode::Select if all_completed => ("Done".to_string(), Color::Green),
+        AppMode::Select => ("Ready".to_string(), Color::DarkGray),
+        AppMode::Stopped => ("Stopped".to_string(), Color::DarkGray),
         _ => match &app.current_change {
             Some(id) => (format!("Current: {}", id), Color::White),
             None => ("Waiting...".to_string(), Color::White),

@@ -282,6 +282,10 @@ async fn run_tui_loop(
                             // Jump to newest log entry and re-enable auto-scroll
                             app.scroll_logs_to_bottom();
                         }
+                        (KeyCode::Char('='), _) => {
+                            // Toggle parallel mode (only if jj is available)
+                            app.toggle_parallel_mode();
+                        }
                         _ => {}
                     }
                     // Clear warning message on any key press

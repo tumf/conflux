@@ -40,6 +40,12 @@ pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
 /// Default maximum iterations for the orchestration loop
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
 
+/// Default maximum concurrent workspaces for parallel execution
+pub const DEFAULT_MAX_CONCURRENT_WORKSPACES: usize = 3;
+
+/// Default workspace base directory (uses system temp)
+pub const DEFAULT_WORKSPACE_BASE_DIR: &str = "";
+
 /// Orchestrator configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OrchestratorConfig {
@@ -88,6 +94,27 @@ pub struct OrchestratorConfig {
     /// Default: 50
     #[serde(default)]
     pub max_iterations: Option<u32>,
+
+    /// Enable parallel execution mode (requires jj).
+    /// Default: false (off by default)
+    #[serde(default)]
+    pub parallel_mode: Option<bool>,
+
+    /// Maximum number of concurrent workspaces for parallel execution.
+    /// Default: 3
+    #[serde(default)]
+    pub max_concurrent_workspaces: Option<usize>,
+
+    /// Base directory for creating workspaces.
+    /// Default: system temp directory
+    #[serde(default)]
+    pub workspace_base_dir: Option<String>,
+
+    /// Command template for conflict resolution.
+    /// Supports `{conflict_info}` placeholder.
+    /// If not set, uses automatic AI-based resolution.
+    #[serde(default)]
+    pub resolve_command: Option<String>,
 }
 
 impl OrchestratorConfig {
@@ -140,6 +167,33 @@ impl OrchestratorConfig {
     /// A value of 0 means no limit.
     pub fn get_max_iterations(&self) -> u32 {
         self.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS)
+    }
+
+    /// Get whether parallel mode is enabled.
+    /// Default: false (off by default)
+    pub fn get_parallel_mode(&self) -> bool {
+        self.parallel_mode.unwrap_or(false)
+    }
+
+    /// Get the maximum concurrent workspaces limit.
+    /// Default: 3
+    pub fn get_max_concurrent_workspaces(&self) -> usize {
+        self.max_concurrent_workspaces
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_WORKSPACES)
+    }
+
+    /// Get the workspace base directory.
+    /// Returns None if using system temp directory.
+    pub fn get_workspace_base_dir(&self) -> Option<&str> {
+        self.workspace_base_dir
+            .as_deref()
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Get the resolve command for conflict resolution.
+    /// Returns None if using automatic AI-based resolution.
+    pub fn get_resolve_command(&self) -> Option<&str> {
+        self.resolve_command.as_deref()
     }
 
     /// Expand `{change_id}` placeholder in a command template

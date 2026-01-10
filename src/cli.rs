@@ -61,6 +61,18 @@ pub struct RunArgs {
     /// Maximum number of iterations for the orchestration loop (overrides config, 0 = no limit)
     #[arg(long)]
     pub max_iterations: Option<u32>,
+
+    /// Enable parallel execution mode using jj workspaces (requires jj repository)
+    #[arg(long)]
+    pub parallel: bool,
+
+    /// Maximum number of concurrent workspaces for parallel execution
+    #[arg(long)]
+    pub max_concurrent: Option<usize>,
+
+    /// Preview parallelization groups without executing (dry run)
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Arguments for the TUI subcommand
@@ -134,6 +146,20 @@ pub enum ApproveAction {
         /// The change ID to check
         change_id: String,
     },
+}
+
+/// Check if the current directory is a jj repository
+pub fn check_jj_directory() -> bool {
+    std::path::Path::new(".jj").exists()
+}
+
+/// Check if jj CLI is available
+pub fn check_jj_available() -> bool {
+    std::process::Command::new("jj")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -484,6 +510,59 @@ mod tests {
         match cli.command {
             Some(Commands::Run(args)) => {
                 assert_eq!(args.max_iterations, Some(0));
+            }
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_run_subcommand_parallel_flag_default() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "run"]);
+
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert!(!args.parallel);
+                assert!(args.max_concurrent.is_none());
+                assert!(!args.dry_run);
+            }
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_run_subcommand_parallel_flag_enabled() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--parallel"]);
+
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert!(args.parallel);
+            }
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_run_subcommand_max_concurrent() {
+        let cli =
+            Cli::parse_from(["openspec-orchestrator", "run", "--parallel", "--max-concurrent", "5"]);
+
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert!(args.parallel);
+                assert_eq!(args.max_concurrent, Some(5));
+            }
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_run_subcommand_dry_run() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--parallel", "--dry-run"]);
+
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert!(args.parallel);
+                assert!(args.dry_run);
             }
             _ => panic!("Expected Run subcommand"),
         }

@@ -1,13 +1,16 @@
 mod agent;
+mod analyzer;
 mod approval;
 mod cli;
 mod config;
 mod error;
 mod history;
 mod hooks;
+mod jj_workspace;
 mod opencode;
 mod openspec;
 mod orchestrator;
+mod parallel_executor;
 mod progress;
 mod task_parser;
 mod templates;

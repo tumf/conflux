@@ -111,6 +111,10 @@ pub struct AppState {
     pub log_auto_scroll: bool,
     /// Current stop mode
     pub stop_mode: StopMode,
+    /// Whether parallel mode is enabled
+    pub parallel_mode: bool,
+    /// Whether jj is available in this repository
+    pub jj_available: bool,
 }
 
 impl AppState {
@@ -161,7 +165,37 @@ impl AppState {
             log_scroll_offset: 0,
             log_auto_scroll: true,
             stop_mode: StopMode::None,
+            parallel_mode: false,
+            jj_available: crate::cli::check_jj_directory() && crate::cli::check_jj_available(),
         }
+    }
+
+    /// Toggle parallel mode (only if jj is available)
+    ///
+    /// Returns true if the mode was toggled, false if jj is not available
+    /// or if the mode cannot be changed in current state.
+    pub fn toggle_parallel_mode(&mut self) -> bool {
+        // Only allow toggling in Select or Stopped mode
+        if !matches!(self.mode, AppMode::Select | AppMode::Stopped) {
+            self.warning_message =
+                Some("Cannot toggle parallel mode while processing".to_string());
+            return false;
+        }
+
+        // Check if jj is available
+        if !self.jj_available {
+            self.warning_message = Some("jj is not available (no .jj directory found)".to_string());
+            return false;
+        }
+
+        self.parallel_mode = !self.parallel_mode;
+        let status = if self.parallel_mode {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        self.add_log(LogEntry::info(format!("Parallel mode {}", status)));
+        true
     }
 
     /// Move cursor up
