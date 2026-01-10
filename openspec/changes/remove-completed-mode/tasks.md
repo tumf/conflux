@@ -22,6 +22,3 @@
 - [ ] Run `cargo build` - no compilation errors
 - [ ] Run `cargo test` - all tests pass
 - [ ] Run `cargo clippy` - no warnings
-- [ ] Manual test: queue changes, run, verify returns to Select mode
-- [ ] Manual test: verify logs panel visible after completion
-- [ ] Manual test: verify `e` key works after completion
