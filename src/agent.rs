@@ -365,6 +365,7 @@ impl AgentRunner {
                 .arg(command)
                 .env_clear()
                 .envs(std::env::vars())
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
@@ -375,11 +376,12 @@ impl AgentRunner {
         } else {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
             Command::new(&shell)
-                .arg("-i")
+                .arg("-l")
                 .arg("-c")
                 .arg(command)
                 .env_clear()
                 .envs(std::env::vars())
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
@@ -404,6 +406,7 @@ impl AgentRunner {
                 .arg(command)
                 .env_clear()
                 .envs(std::env::vars())
+                .stdin(Stdio::null())
                 .output()
                 .await
                 .map_err(|e| {
@@ -412,11 +415,12 @@ impl AgentRunner {
         } else {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
             Command::new(&shell)
-                .arg("-i")
+                .arg("-l")
                 .arg("-c")
                 .arg(command)
                 .env_clear()
                 .envs(std::env::vars())
+                .stdin(Stdio::null())
                 .output()
                 .await
                 .map_err(|e| {

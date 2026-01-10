@@ -117,6 +117,7 @@ impl JjWorkspaceManager {
         let output = Command::new("jj")
             .arg("--version")
             .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
             .output()
             .await;
 
@@ -126,6 +127,7 @@ impl JjWorkspaceManager {
                 let root_output = Command::new("jj")
                     .arg("root")
                     .current_dir(&self.repo_root)
+                    .stdin(Stdio::null())
                     .output()
                     .await;
 
@@ -138,11 +140,66 @@ impl JjWorkspaceManager {
         }
     }
 
+    /// Snapshot the current working copy to ensure changes are visible in new workspaces.
+    ///
+    /// In jj, uncommitted changes in the working copy are not visible in new workspaces.
+    /// This function creates a snapshot by running `jj new` to start a new change,
+    /// which effectively commits the current state and makes it available to workspaces.
+    pub async fn snapshot_working_copy(&self) -> Result<()> {
+        info!("Snapshotting working copy for parallel execution");
+
+        // First, check if there are any changes to snapshot
+        let status_output = Command::new("jj")
+            .args(["status"])
+            .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| OrchestratorError::JjCommand(format!("Failed to check status: {}", e)))?;
+
+        let status_str = String::from_utf8_lossy(&status_output.stdout);
+
+        // If there are working copy changes, create a new change
+        if status_str.contains("Working copy changes:") {
+            debug!("Found working copy changes, creating snapshot");
+
+            // Use `jj new` to create a new change, which snapshots the current state
+            let output = Command::new("jj")
+                .args([
+                    "new",
+                    "-m",
+                    "Parallel execution snapshot (auto-created by openspec-orchestrator)",
+                ])
+                .current_dir(&self.repo_root)
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .map_err(|e| {
+                    OrchestratorError::JjCommand(format!("Failed to create snapshot: {}", e))
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(OrchestratorError::JjCommand(format!(
+                    "Failed to create snapshot: {}",
+                    stderr
+                )));
+            }
+
+            info!("Working copy snapshot created successfully");
+        } else {
+            debug!("No working copy changes to snapshot");
+        }
+
+        Ok(())
+    }
+
     /// Get the current jj revision
     pub async fn get_current_revision(&self) -> Result<String> {
         let output = Command::new("jj")
             .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
             .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
             .output()
             .await
             .map_err(|e| OrchestratorError::JjCommand(format!("Failed to get revision: {}", e)))?;
@@ -160,13 +217,48 @@ impl JjWorkspaceManager {
 
     /// Create a new workspace for a change
     pub async fn create_workspace(&mut self, change_id: &str) -> Result<JjWorkspace> {
-        // Sanitize change_id for use as workspace name
-        let workspace_name = format!("ws-{}", change_id.replace(['/', '\\', ' '], "-"));
+        // Sanitize change_id and add unique suffix for workspace name
+        let unique_suffix = format!(
+            "{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u32)
+                .unwrap_or(0)
+        );
+        let workspace_name = format!(
+            "ws-{}-{}",
+            change_id.replace(['/', '\\', ' '], "-"),
+            unique_suffix
+        );
         let workspace_path = self.base_dir.join(&workspace_name);
 
         // Ensure base directory exists
         if !self.base_dir.exists() {
             std::fs::create_dir_all(&self.base_dir).map_err(OrchestratorError::Io)?;
+        }
+
+        // Check if workspace already exists and clean it up
+        if workspace_path.exists() {
+            info!(
+                "Workspace '{}' already exists, cleaning up...",
+                workspace_name
+            );
+
+            // Forget the workspace in jj (ignore errors if it doesn't exist in jj)
+            let _ = Command::new("jj")
+                .args(["workspace", "forget", &workspace_name])
+                .current_dir(&self.repo_root)
+                .stdin(Stdio::null())
+                .output()
+                .await;
+
+            // Remove the directory
+            if let Err(e) = std::fs::remove_dir_all(&workspace_path) {
+                warn!(
+                    "Failed to remove existing workspace directory {:?}: {}",
+                    workspace_path, e
+                );
+            }
         }
 
         // Get current revision before creating workspace
@@ -187,6 +279,7 @@ impl JjWorkspaceManager {
                 &workspace_name,
             ])
             .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
             .output()
             .await
             .map_err(|e| {
@@ -221,6 +314,7 @@ impl JjWorkspaceManager {
         let output = Command::new("jj")
             .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
             .current_dir(&workspace.path)
+            .stdin(Stdio::null())
             .output()
             .await
             .map_err(|e| {
@@ -252,6 +346,7 @@ impl JjWorkspaceManager {
     /// Merge multiple workspace revisions into main
     ///
     /// Creates a merge commit with all successful workspace revisions as parents.
+    /// For single revision, updates the working copy to point to that revision.
     pub async fn merge_workspaces(&self, revisions: &[String]) -> Result<String> {
         if revisions.is_empty() {
             return Err(OrchestratorError::JjCommand(
@@ -260,8 +355,34 @@ impl JjWorkspaceManager {
         }
 
         if revisions.len() == 1 {
-            // Single revision - just return it, no merge needed
-            return Ok(revisions[0].clone());
+            // Single revision - update working copy to this revision
+            // This ensures subsequent groups can access this revision's changes
+            info!(
+                "Single revision, updating working copy to: {}",
+                &revisions[0][..8.min(revisions[0].len())]
+            );
+            let output = Command::new("jj")
+                .args(["new", &revisions[0], "-m", "Continue from workspace change"])
+                .current_dir(&self.repo_root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .map_err(|e| {
+                    OrchestratorError::JjCommand(format!("Failed to update to revision: {}", e))
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(OrchestratorError::JjCommand(format!(
+                    "Failed to update to revision: {}",
+                    stderr
+                )));
+            }
+
+            // Return the new current revision (which is a child of the workspace revision)
+            return self.get_current_revision().await;
         }
 
         info!("Merging {} revisions", revisions.len());
@@ -277,6 +398,7 @@ impl JjWorkspaceManager {
         let output = Command::new("jj")
             .args(&args)
             .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -320,6 +442,7 @@ impl JjWorkspaceManager {
             .arg("-c")
             .arg(&command)
             .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
             .output()
             .await
             .map_err(|e| OrchestratorError::JjCommand(format!("Resolve command failed: {}", e)))?;
@@ -354,6 +477,7 @@ impl JjWorkspaceManager {
         let forget_result = Command::new("jj")
             .args(["workspace", "forget", workspace_name])
             .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
             .output()
             .await;
 
@@ -407,6 +531,7 @@ impl JjWorkspaceManager {
         let output = Command::new("jj")
             .args(["workspace", "list"])
             .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
             .output()
             .await
             .map_err(|e| {

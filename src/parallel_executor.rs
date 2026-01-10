@@ -25,6 +25,8 @@ pub enum ParallelEvent {
     },
     /// Apply started in a workspace
     ApplyStarted { change_id: String },
+    /// Apply output (summary of command output)
+    ApplyOutput { change_id: String, output: String },
     /// Apply completed in a workspace
     ApplyCompleted { change_id: String, revision: String },
     /// Apply failed in a workspace
@@ -87,11 +89,27 @@ impl ParallelExecutor {
         config: OrchestratorConfig,
         event_tx: Option<mpsc::Sender<ParallelEvent>>,
     ) -> Self {
-        // Determine workspace base directory
-        let base_dir = config
-            .get_workspace_base_dir()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join("openspec-workspaces"));
+        // Create a unique temp directory for this execution
+        let base_dir = if let Some(configured_dir) = config.get_workspace_base_dir() {
+            // User configured a specific directory
+            PathBuf::from(configured_dir)
+        } else {
+            // Use tempfile to create a unique temp directory
+            match tempfile::Builder::new().prefix("openspec-ws-").tempdir() {
+                Ok(temp_dir) => {
+                    // Keep the path but leak the TempDir so it doesn't get cleaned up immediately
+                    let path = temp_dir.path().to_path_buf();
+                    std::mem::forget(temp_dir);
+                    path
+                }
+                Err(e) => {
+                    error!("Failed to create temp directory: {}", e);
+                    // Fallback to a fixed temp directory
+                    std::env::temp_dir().join("openspec-workspaces-fallback")
+                }
+            }
+        };
+        info!("Using workspace base directory: {:?}", base_dir);
 
         let max_concurrent = config.get_max_concurrent_workspaces();
         let apply_command = config.get_apply_command().to_string();
@@ -127,6 +145,18 @@ impl ParallelExecutor {
 
         info!("Executing {} groups in parallel mode", groups.len());
 
+        // Snapshot working copy to ensure all changes are visible in workspaces
+        // In jj, uncommitted changes are not visible in new workspaces
+        info!("Snapshotting working copy for parallel execution...");
+        if let Err(e) = self.workspace_manager.snapshot_working_copy().await {
+            let error_msg = format!("Failed to snapshot working copy: {}", e);
+            error!("{}", error_msg);
+            self.send_event(ParallelEvent::Error { message: error_msg })
+                .await;
+            return Err(e);
+        }
+        info!("Working copy snapshot complete");
+
         for group in groups {
             self.execute_group(&group).await?;
         }
@@ -137,11 +167,14 @@ impl ParallelExecutor {
 
     /// Execute a single group of changes
     async fn execute_group(&mut self, group: &ParallelGroup) -> Result<()> {
+        // Get current base revision for this group's workspaces
+        let base_revision = self.workspace_manager.get_current_revision().await?;
         info!(
-            "Executing group {} with {} changes: {:?}",
+            "Executing group {} with {} changes: {:?} (base revision: {})",
             group.id,
             group.changes.len(),
-            group.changes
+            group.changes,
+            &base_revision[..8.min(base_revision.len())]
         );
 
         self.send_event(ParallelEvent::GroupStarted {
@@ -150,20 +183,41 @@ impl ParallelExecutor {
         })
         .await;
 
-        // Create workspaces for all changes in the group
+        // Create workspaces for all changes in the group (from current base revision)
         let mut workspaces: Vec<JjWorkspace> = Vec::new();
         for change_id in &group.changes {
-            let workspace = self.workspace_manager.create_workspace(change_id).await?;
-            self.send_event(ParallelEvent::WorkspaceCreated {
-                change_id: change_id.clone(),
-                workspace: workspace.name.clone(),
-            })
-            .await;
-            workspaces.push(workspace);
+            match self.workspace_manager.create_workspace(change_id).await {
+                Ok(workspace) => {
+                    self.send_event(ParallelEvent::WorkspaceCreated {
+                        change_id: change_id.clone(),
+                        workspace: workspace.name.clone(),
+                    })
+                    .await;
+                    workspaces.push(workspace);
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to create workspace: {}", e);
+                    error!("{} for {}", error_msg, change_id);
+                    self.send_event(ParallelEvent::Error {
+                        message: format!("[{}] {}", change_id, error_msg),
+                    })
+                    .await;
+                    return Err(e);
+                }
+            }
         }
 
         // Execute apply commands in parallel with concurrency limit
-        let results = self.execute_applies_parallel(&workspaces).await?;
+        let results = match self.execute_applies_parallel(&workspaces).await {
+            Ok(r) => r,
+            Err(e) => {
+                let error_msg = format!("Failed to execute applies: {}", e);
+                error!("{}", error_msg);
+                self.send_event(ParallelEvent::Error { message: error_msg })
+                    .await;
+                return Err(e);
+            }
+        };
 
         // Collect successful results
         let successful: Vec<WorkspaceResult> = results
@@ -196,32 +250,54 @@ impl ParallelExecutor {
             ));
         }
 
-        // Archive successful changes before merge
+        // Archive successful changes in their workspaces BEFORE merge
+        // This ensures tasks.md is complete when archive runs
+        // We need to collect the final revisions AFTER archive, not before
+        let mut final_revisions: Vec<String> = Vec::new();
+
         for result in &successful {
-            info!("Archiving completed change: {}", result.change_id);
-            match self.archive_change(&result.change_id).await {
-                Ok(()) => {
-                    self.send_event(ParallelEvent::ChangeArchived {
-                        change_id: result.change_id.clone(),
-                    })
-                    .await;
+            // Find the workspace for this change
+            let workspace = workspaces.iter().find(|w| w.change_id == result.change_id);
+
+            if let Some(ws) = workspace {
+                info!(
+                    "Archiving completed change: {} in workspace {}",
+                    result.change_id, ws.name
+                );
+                match self
+                    .archive_change_in_workspace(&result.change_id, &ws.path)
+                    .await
+                {
+                    Ok(new_revision) => {
+                        self.send_event(ParallelEvent::ChangeArchived {
+                            change_id: result.change_id.clone(),
+                        })
+                        .await;
+                        // Use the post-archive revision which includes archive changes
+                        final_revisions.push(new_revision);
+                    }
+                    Err(e) => {
+                        warn!("Failed to archive {}: {}", result.change_id, e);
+                        self.send_event(ParallelEvent::ArchiveFailed {
+                            change_id: result.change_id.clone(),
+                            error: e.to_string(),
+                        })
+                        .await;
+                        // Fall back to the apply revision if archive failed
+                        if let Some(ref rev) = result.final_revision {
+                            final_revisions.push(rev.clone());
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to archive {}: {}", result.change_id, e);
-                    self.send_event(ParallelEvent::ArchiveFailed {
-                        change_id: result.change_id.clone(),
-                        error: e.to_string(),
-                    })
-                    .await;
-                }
+            } else if let Some(ref rev) = result.final_revision {
+                // No workspace found, use the apply revision
+                final_revisions.push(rev.clone());
             }
         }
 
-        // Merge successful results
-        let revisions: Vec<String> = successful
-            .iter()
-            .filter_map(|r| r.final_revision.clone())
-            .collect();
+        // Merge using the post-archive revisions
+        // These revisions include both apply and archive changes
+        let revisions = final_revisions;
 
         if !revisions.is_empty() {
             self.merge_and_resolve(&revisions).await?;
@@ -263,6 +339,7 @@ impl ParallelExecutor {
             let workspace_path = workspace.path.clone();
             let workspace_name = workspace.name.clone();
             let apply_cmd = self.apply_command.clone();
+            let event_tx = self.event_tx.clone();
 
             // Update status
             self.workspace_manager
@@ -272,8 +349,13 @@ impl ParallelExecutor {
                 // Acquire semaphore inside spawn to allow all tasks to be created
                 let _permit = sem.acquire_owned().await.unwrap();
 
-                let result =
-                    Self::execute_apply_in_workspace(&change_id, &workspace_path, &apply_cmd).await;
+                let result = Self::execute_apply_in_workspace(
+                    &change_id,
+                    &workspace_path,
+                    &apply_cmd,
+                    event_tx,
+                )
+                .await;
                 // _permit is dropped here, releasing semaphore
 
                 match result {
@@ -333,9 +415,11 @@ impl ParallelExecutor {
         change_id: &str,
         workspace_path: &PathBuf,
         apply_cmd_template: &str,
+        event_tx: Option<mpsc::Sender<ParallelEvent>>,
     ) -> Result<String> {
         const MAX_ITERATIONS: u32 = 50;
         let mut iteration = 0;
+        let mut first_apply = true;
 
         loop {
             iteration += 1;
@@ -377,6 +461,18 @@ impl ParallelExecutor {
                 iteration, change_id, progress.completed, progress.total
             );
 
+            // Send ApplyStarted event on first apply
+            if first_apply {
+                first_apply = false;
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::ApplyStarted {
+                            change_id: change_id.to_string(),
+                        })
+                        .await;
+                }
+            }
+
             // Expand change_id and prompt in command
             let command = OrchestratorConfig::expand_change_id(apply_cmd_template, change_id);
             let command = OrchestratorConfig::expand_prompt(&command, "");
@@ -384,15 +480,63 @@ impl ParallelExecutor {
             debug!("Apply command: {}", command);
 
             // Execute command in workspace directory
+            // Use null stdin to prevent any interactive behavior
+            use std::process::Stdio;
             let output = Command::new("sh")
                 .arg("-c")
                 .arg(&command)
                 .current_dir(workspace_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .output()
                 .await
                 .map_err(|e| {
                     OrchestratorError::AgentCommand(format!("Failed to execute: {}", e))
                 })?;
+
+            // Send command output summary through event channel
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+
+            // Combine stdout and stderr for summary
+            let combined_output = if !stdout_str.is_empty() && !stderr_str.is_empty() {
+                format!("{}\n{}", stdout_str, stderr_str)
+            } else if !stdout_str.is_empty() {
+                stdout_str.to_string()
+            } else {
+                stderr_str.to_string()
+            };
+
+            if !combined_output.is_empty() {
+                // Extract last few lines for summary
+                let lines: Vec<&str> = combined_output.lines().collect();
+                let summary = if lines.len() > 10 {
+                    format!(
+                        "... ({} lines) ...\n{}",
+                        lines.len(),
+                        lines[lines.len() - 5..].join("\n")
+                    )
+                } else {
+                    combined_output.clone()
+                };
+                info!(
+                    "Sending ApplyOutput for {} ({} lines)",
+                    change_id,
+                    lines.len()
+                );
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::ApplyOutput {
+                            change_id: change_id.to_string(),
+                            output: summary.clone(),
+                        })
+                        .await;
+                }
+                debug!("Apply output for {}: {}", change_id, summary);
+            } else {
+                info!("No output captured for {} apply command", change_id);
+            }
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -533,8 +677,10 @@ impl ParallelExecutor {
             );
 
             // Expand {conflict_files} placeholder in resolve command
-            let command =
-                OrchestratorConfig::expand_conflict_files(&self.resolve_command, &conflict_files_str);
+            let command = OrchestratorConfig::expand_conflict_files(
+                &self.resolve_command,
+                &conflict_files_str,
+            );
 
             debug!("Resolve command: {}", command);
 
@@ -579,8 +725,127 @@ impl ParallelExecutor {
         Err(OrchestratorError::JjConflict(error_msg))
     }
 
-    /// Archive a completed change using the configured archive command
+    /// Archive a completed change in a workspace directory
+    /// Returns the new revision after archive (includes archive changes)
+    async fn archive_change_in_workspace(
+        &self,
+        change_id: &str,
+        workspace_path: &PathBuf,
+    ) -> Result<String> {
+        // Verify task completion before archiving
+        let tasks_path = workspace_path
+            .join("openspec/changes")
+            .join(change_id)
+            .join("tasks.md");
+
+        if tasks_path.exists() {
+            let progress = crate::task_parser::parse_file(&tasks_path).unwrap_or_default();
+            if progress.total > 0 && progress.completed < progress.total {
+                return Err(OrchestratorError::AgentCommand(format!(
+                    "Cannot archive {}: tasks not complete ({}/{})",
+                    change_id, progress.completed, progress.total
+                )));
+            }
+            info!(
+                "Task verification passed for {}: {}/{}",
+                change_id, progress.completed, progress.total
+            );
+        } else {
+            warn!(
+                "Tasks file not found for {} in workspace, proceeding with archive",
+                change_id
+            );
+        }
+
+        // Expand change_id and prompt in archive command
+        let command = OrchestratorConfig::expand_change_id(&self.archive_command, change_id);
+        let command = OrchestratorConfig::expand_prompt(&command, "");
+
+        debug!("Archive command in workspace: {}", command);
+
+        // Execute command in the workspace directory (where tasks are complete)
+        use std::process::Stdio;
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(workspace_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| {
+                OrchestratorError::AgentCommand(format!("Failed to run archive command: {}", e))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Archive failed for {}: {}",
+                change_id, stderr
+            )));
+        }
+
+        info!("Archived change {} in workspace", change_id);
+
+        // Get the current revision after archive (includes archive changes)
+        // Run jj status to snapshot the archive changes first
+        let _ = Command::new("jj")
+            .arg("status")
+            .current_dir(workspace_path)
+            .stdin(Stdio::null())
+            .output()
+            .await;
+
+        // Get the new revision
+        let revision_output = Command::new("jj")
+            .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
+            .current_dir(workspace_path)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| OrchestratorError::JjCommand(format!("Failed to get revision: {}", e)))?;
+
+        if !revision_output.status.success() {
+            return Err(OrchestratorError::JjCommand(
+                "Failed to get workspace revision after archive".to_string(),
+            ));
+        }
+
+        Ok(String::from_utf8_lossy(&revision_output.stdout)
+            .trim()
+            .to_string())
+    }
+
+    /// Archive a completed change using the configured archive command (in main repo)
+    #[allow(dead_code)]
     async fn archive_change(&self, change_id: &str) -> Result<()> {
+        // Verify task completion before archiving
+        let tasks_path = self
+            .repo_root
+            .join("openspec/changes")
+            .join(change_id)
+            .join("tasks.md");
+
+        if tasks_path.exists() {
+            let progress = crate::task_parser::parse_file(&tasks_path).unwrap_or_default();
+            if progress.total > 0 && progress.completed < progress.total {
+                return Err(OrchestratorError::AgentCommand(format!(
+                    "Cannot archive {}: tasks not complete ({}/{})",
+                    change_id, progress.completed, progress.total
+                )));
+            }
+            info!(
+                "Task verification passed for {}: {}/{}",
+                change_id, progress.completed, progress.total
+            );
+        } else {
+            warn!(
+                "Tasks file not found for {}, proceeding with archive",
+                change_id
+            );
+        }
+
         // Expand change_id and prompt in archive command
         let command = OrchestratorConfig::expand_change_id(&self.archive_command, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, "");
@@ -588,10 +853,12 @@ impl ParallelExecutor {
         debug!("Archive command: {}", command);
 
         // Execute command using sh -c (same as apply command)
+        use std::process::Stdio;
         let output = Command::new("sh")
             .arg("-c")
             .arg(&command)
             .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
             .output()
             .await
             .map_err(|e| {

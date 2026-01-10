@@ -63,6 +63,16 @@ impl ParallelizationAnalyzer {
         // Build prompt for LLM analysis
         let prompt = self.build_parallelization_prompt(changes);
         info!("Analyzing {} changes for parallelization", changes.len());
+
+        // Log dependencies for each change
+        for c in changes {
+            if c.dependencies.is_empty() {
+                info!("  - {}: no dependencies", c.id);
+            } else {
+                info!("  - {}: depends on [{}]", c.id, c.dependencies.join(", "));
+            }
+        }
+
         debug!("Analysis prompt: {}", prompt);
 
         // Call LLM for analysis
@@ -88,9 +98,14 @@ impl ParallelizationAnalyzer {
         let change_list: String = changes
             .iter()
             .map(|c| {
+                let deps_str = if c.dependencies.is_empty() {
+                    "none".to_string()
+                } else {
+                    c.dependencies.join(", ")
+                };
                 format!(
-                    "- {}: {}/{} tasks completed",
-                    c.id, c.completed_tasks, c.total_tasks
+                    "- {}: {}/{} tasks completed, depends on: [{}]",
+                    c.id, c.completed_tasks, c.total_tasks, deps_str
                 )
             })
             .collect::<Vec<_>>()
@@ -103,10 +118,10 @@ Changes to analyze:
 {change_list}
 
 Instructions:
-1. Group changes that can be executed simultaneously (no dependencies between them)
-2. Identify dependencies between groups (which groups must complete before others start)
-3. Consider change IDs - changes with related names likely have dependencies
-4. Changes modifying the same component/module should be in sequential groups
+1. RESPECT EXPLICIT DEPENDENCIES: Changes with declared dependencies MUST wait for those dependencies to complete
+2. Group changes that have no dependencies on each other for parallel execution
+3. Changes with the same dependencies can be grouped together
+4. A change can only start after ALL its dependencies are complete
 
 Return JSON in this exact format:
 {{
@@ -120,7 +135,8 @@ Rules:
 - Every change ID must appear exactly once
 - Group IDs start at 1 and increase
 - depends_on references group IDs, not change IDs
-- Groups with empty depends_on can start immediately
+- Groups with empty depends_on can start immediately (no dependencies)
+- A change with dependency X must be in a group that depends_on the group containing X
 - Return valid JSON only, no additional text"#
         )
     }
@@ -363,6 +379,7 @@ mod tests {
             total_tasks: 5,
             last_modified: "now".to_string(),
             is_approved: true,
+            dependencies: Vec::new(),
         }
     }
 

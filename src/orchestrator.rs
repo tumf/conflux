@@ -1,5 +1,5 @@
 use crate::agent::AgentRunner;
-use crate::analyzer::{ParallelGroup, ParallelizationAnalyzer};
+use crate::analyzer::ParallelGroup;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::hooks::{HookContext, HookRunner, HookType};
@@ -624,13 +624,8 @@ impl Orchestrator {
             return Ok(());
         }
 
-        // For dry-run, use simple grouping (all changes in one group for preview)
-        // This avoids LLM call overhead for preview mode
-        let groups = vec![ParallelGroup {
-            id: 1,
-            changes: approved.iter().map(|c| c.id.clone()).collect(),
-            depends_on: Vec::new(),
-        }];
+        // Group changes based on declared dependencies (deterministic, no LLM)
+        let groups = Self::group_by_dependencies(&approved);
 
         // Display parallelization groups
         println!("\n=== Parallel Execution Plan (Dry Run) ===\n");
@@ -680,25 +675,9 @@ impl Orchestrator {
             return Ok(());
         }
 
-        // Create analyzer and analyze dependencies
-        let agent = AgentRunner::new(self.config.clone());
-        let analyzer = ParallelizationAnalyzer::new(agent);
-
-        // Try LLM analysis, fall back to simple grouping on failure
-        let groups = match analyzer.analyze_groups(&approved).await {
-            Ok(g) => g,
-            Err(e) => {
-                warn!(
-                    "LLM analysis failed ({}), using simple grouping (all changes in one group)",
-                    e
-                );
-                vec![ParallelGroup {
-                    id: 1,
-                    changes: approved.iter().map(|c| c.id.clone()).collect(),
-                    depends_on: Vec::new(),
-                }]
-            }
-        };
+        // Group changes by declared dependencies (deterministic, no LLM)
+        // This respects the explicit dependencies declared in proposal.md files
+        let groups = Self::group_by_dependencies(&approved);
 
         info!(
             "Analyzed {} changes into {} groups",
@@ -730,6 +709,90 @@ impl Orchestrator {
     }
 
     /// Run groups sequentially (fallback when jj is not available)
+    /// Group changes by their declared dependencies (deterministic, no LLM)
+    ///
+    /// Returns groups in topological order where:
+    /// - Group 1: Changes with no dependencies
+    /// - Group 2: Changes that depend only on Group 1 changes
+    /// - And so on...
+    fn group_by_dependencies(changes: &[Change]) -> Vec<ParallelGroup> {
+        use std::collections::{HashMap, HashSet};
+
+        if changes.is_empty() {
+            return Vec::new();
+        }
+
+        // Build lookup maps with owned strings to avoid lifetime issues
+        let change_ids: HashSet<String> = changes.iter().map(|c| c.id.clone()).collect();
+        let mut remaining: HashSet<String> = change_ids.clone();
+        let mut completed_changes: HashSet<String> = HashSet::new();
+
+        // Map from change_id to its dependencies (filtered to only include changes in our set)
+        let deps_map: HashMap<String, Vec<String>> = changes
+            .iter()
+            .map(|c| {
+                let deps: Vec<String> = c
+                    .dependencies
+                    .iter()
+                    .filter(|d| change_ids.contains(*d))
+                    .cloned()
+                    .collect();
+                (c.id.clone(), deps)
+            })
+            .collect();
+
+        let mut groups: Vec<ParallelGroup> = Vec::new();
+        let mut group_id = 1u32;
+
+        // Iteratively find changes whose dependencies are all complete
+        while !remaining.is_empty() {
+            let mut current_group: Vec<String> = Vec::new();
+
+            for change_id in &remaining {
+                let deps = deps_map.get(change_id).map(|d| d.as_slice()).unwrap_or(&[]);
+                // A change can be in this group if all its dependencies are completed
+                if deps.iter().all(|d| completed_changes.contains(d)) {
+                    current_group.push(change_id.clone());
+                }
+            }
+
+            if current_group.is_empty() {
+                // Circular dependency or missing dependency - add remaining changes to last group
+                warn!(
+                    "Unable to resolve dependencies for: {:?}",
+                    remaining.iter().collect::<Vec<_>>()
+                );
+                current_group = remaining.iter().cloned().collect();
+            }
+
+            // Calculate depends_on (previous group if any)
+            let depends_on = if group_id > 1 {
+                vec![group_id - 1]
+            } else {
+                Vec::new()
+            };
+
+            // Remove completed changes from remaining
+            for change_id in &current_group {
+                remaining.remove(change_id);
+                completed_changes.insert(change_id.clone());
+            }
+
+            // Sort for deterministic output
+            current_group.sort();
+
+            groups.push(ParallelGroup {
+                id: group_id,
+                changes: current_group,
+                depends_on,
+            });
+
+            group_id += 1;
+        }
+
+        groups
+    }
+
     async fn run_sequential(
         &mut self,
         approved: &[Change],
@@ -763,6 +826,7 @@ mod tests {
             total_tasks: total,
             last_modified: "1m ago".to_string(),
             is_approved: false,
+            dependencies: Vec::new(),
         }
     }
 

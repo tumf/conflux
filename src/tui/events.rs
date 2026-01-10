@@ -15,6 +15,8 @@ pub struct LogEntry {
     pub message: String,
     /// Log level color
     pub color: Color,
+    /// Optional change_id for parallel mode logs
+    pub change_id: Option<String>,
 }
 
 impl LogEntry {
@@ -24,6 +26,7 @@ impl LogEntry {
             timestamp: Local::now().format("%H:%M:%S").to_string(),
             message: message.into(),
             color: Color::White,
+            change_id: None,
         }
     }
 
@@ -33,6 +36,7 @@ impl LogEntry {
             timestamp: Local::now().format("%H:%M:%S").to_string(),
             message: message.into(),
             color: Color::Green,
+            change_id: None,
         }
     }
 
@@ -42,6 +46,7 @@ impl LogEntry {
             timestamp: Local::now().format("%H:%M:%S").to_string(),
             message: message.into(),
             color: Color::Yellow,
+            change_id: None,
         }
     }
 
@@ -51,7 +56,14 @@ impl LogEntry {
             timestamp: Local::now().format("%H:%M:%S").to_string(),
             message: message.into(),
             color: Color::Red,
+            change_id: None,
         }
+    }
+
+    /// Set change_id for parallel mode logs
+    pub fn with_change_id(mut self, change_id: impl Into<String>) -> Self {
+        self.change_id = Some(change_id.into());
+        self
     }
 }
 

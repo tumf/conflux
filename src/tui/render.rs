@@ -493,23 +493,54 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
     let end_index = total_logs.saturating_sub(app.log_scroll_offset);
     let start_index = end_index.saturating_sub(visible_height);
 
+    // Colors for change_id prefixes (cycling through distinct colors)
+    let change_colors = [
+        Color::Cyan,
+        Color::Magenta,
+        Color::LightBlue,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightMagenta,
+        Color::LightCyan,
+    ];
+
     let log_items: Vec<Line> = app
         .logs
         .iter()
         .skip(start_index)
         .take(end_index - start_index)
         .map(|entry| {
+            let mut spans = vec![Span::styled(
+                format!("{} ", entry.timestamp),
+                Style::default().fg(Color::DarkGray),
+            )];
+
+            // Add change_id prefix with color if present
+            let msg_width = if let Some(ref change_id) = entry.change_id {
+                // Use hash of change_id to pick a consistent color
+                let color_index = change_id
+                    .bytes()
+                    .fold(0usize, |acc, b| acc.wrapping_add(b as usize))
+                    % change_colors.len();
+                let prefix_color = change_colors[color_index];
+                spans.push(Span::styled(
+                    format!("[{}] ", change_id),
+                    Style::default()
+                        .fg(prefix_color)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                // Reduce available width by prefix length
+                available_width.saturating_sub(change_id.len() + 3) // "[" + "]" + " "
+            } else {
+                available_width
+            };
+
             // Truncate message to fit in available width using Unicode display width
             // This correctly handles CJK characters that occupy 2 terminal columns
-            let message = truncate_to_display_width(&entry.message, available_width);
+            let message = truncate_to_display_width(&entry.message, msg_width);
+            spans.push(Span::styled(message, Style::default().fg(entry.color)));
 
-            Line::from(vec![
-                Span::styled(
-                    format!("{} ", entry.timestamp),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(message, Style::default().fg(entry.color)),
-            ])
+            Line::from(spans)
         })
         .collect();
 

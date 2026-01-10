@@ -620,6 +620,7 @@ mod tests {
             total_tasks: total,
             last_modified: "now".to_string(),
             is_approved: false,
+            dependencies: Vec::new(),
         }
     }
 
@@ -630,6 +631,7 @@ mod tests {
             total_tasks: total,
             last_modified: "now".to_string(),
             is_approved: true,
+            dependencies: Vec::new(),
         }
     }
 

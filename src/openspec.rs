@@ -3,7 +3,7 @@ use crate::error::{OrchestratorError, Result};
 use crate::task_parser;
 use std::fs;
 use std::path::Path;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Represents a change from openspec list
 #[derive(Debug, Clone, PartialEq)]
@@ -15,6 +15,8 @@ pub struct Change {
     pub last_modified: String,
     /// Whether this change has been approved for execution
     pub is_approved: bool,
+    /// Dependencies on other changes (parsed from proposal.md)
+    pub dependencies: Vec<String>,
 }
 
 impl Change {
@@ -30,6 +32,98 @@ impl Change {
     pub fn is_complete(&self) -> bool {
         self.completed_tasks == self.total_tasks && self.total_tasks > 0
     }
+}
+
+/// Parse dependencies from a proposal.md file.
+///
+/// Looks for a `## Dependencies` section and extracts change IDs from bullet points.
+/// Supports formats like:
+/// - `- feature-base`
+/// - `- [feature-base](../feature-base/proposal.md)`
+/// - `- feature-base: description`
+fn parse_dependencies(change_id: &str) -> Vec<String> {
+    let proposal_path = Path::new("openspec/changes")
+        .join(change_id)
+        .join("proposal.md");
+
+    let content = match fs::read_to_string(&proposal_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut dependencies = Vec::new();
+    let mut in_deps_section = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Check for Dependencies section header
+        if trimmed.starts_with("## Dependencies") {
+            in_deps_section = true;
+            continue;
+        }
+
+        // Exit section on next header
+        if in_deps_section && trimmed.starts_with("## ") {
+            break;
+        }
+
+        // Parse bullet points in Dependencies section
+        if in_deps_section && trimmed.starts_with("- ") {
+            let item = trimmed.trim_start_matches("- ").trim();
+
+            // Skip "None" or empty items
+            if item.is_empty() || item.eq_ignore_ascii_case("none") {
+                continue;
+            }
+
+            // Extract change ID from various formats
+            let dep_id = extract_dependency_id(item);
+            if !dep_id.is_empty() && dep_id != change_id {
+                dependencies.push(dep_id);
+            }
+        }
+    }
+
+    if !dependencies.is_empty() {
+        info!(
+            "Parsed dependencies for '{}': [{}]",
+            change_id,
+            dependencies.join(", ")
+        );
+    }
+    dependencies
+}
+
+/// Extract a dependency ID from a bullet point item.
+///
+/// Handles formats like:
+/// - `feature-base` -> `feature-base`
+/// - `[feature-base](../feature-base/proposal.md)` -> `feature-base`
+/// - `feature-base: some description` -> `feature-base`
+/// - `feature-base (optional)` -> `feature-base`
+fn extract_dependency_id(item: &str) -> String {
+    // Handle markdown link format: [id](path)
+    if item.starts_with('[') {
+        if let Some(end) = item.find(']') {
+            return item[1..end].trim().to_string();
+        }
+    }
+
+    // Handle inline code format: `id`
+    if let Some(stripped) = item.strip_prefix('`') {
+        if let Some(end) = stripped.find('`') {
+            return stripped[..end].trim().to_string();
+        }
+    }
+
+    // Handle plain text with optional suffix (colon, parenthesis)
+    // Note: Don't split on '-' as it's common in change IDs like "feature-base"
+    item.split(&[':', '('][..])
+        .next()
+        .unwrap_or(item)
+        .trim()
+        .to_string()
 }
 
 /// List changes by directly reading the openspec/changes directory.
@@ -86,12 +180,16 @@ pub fn list_changes_native() -> Result<Vec<Change>> {
         // Check approval status
         let is_approved = approval::check_approval(dir_name).unwrap_or(false);
 
+        // Parse dependencies from proposal.md
+        let dependencies = parse_dependencies(dir_name);
+
         changes.push(Change {
             id: dir_name.to_string(),
             completed_tasks,
             total_tasks,
             last_modified: String::new(), // Not used in native implementation
             is_approved,
+            dependencies,
         });
     }
 
@@ -114,6 +212,7 @@ mod tests {
             total_tasks: 0,
             last_modified: "now".to_string(),
             is_approved: false,
+            dependencies: Vec::new(),
         };
         assert_eq!(change.progress_percent(), 0.0);
         assert!(!change.is_complete());
@@ -127,6 +226,7 @@ mod tests {
             total_tasks: 5,
             last_modified: "now".to_string(),
             is_approved: false,
+            dependencies: Vec::new(),
         };
         assert_eq!(change.progress_percent(), 100.0);
         assert!(change.is_complete());
