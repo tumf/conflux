@@ -2272,7 +2272,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Changes (Space: queue, @: approve, q: quit) ")
+                .title(" Changes (Space: queue, @: approve, e: edit, q: quit) ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         )
