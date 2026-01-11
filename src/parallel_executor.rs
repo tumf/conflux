@@ -7,8 +7,9 @@ use crate::agent::AgentRunner;
 use crate::analyzer::ParallelGroup;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::jj_commands;
 use crate::jj_workspace::{JjWorkspace, JjWorkspaceManager, WorkspaceResult, WorkspaceStatus};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
@@ -99,7 +100,6 @@ impl Drop for WorkspaceCleanupGuard {
 
 /// Events emitted during parallel execution
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum ParallelEvent {
     /// A workspace was created
     WorkspaceCreated {
@@ -117,7 +117,11 @@ pub enum ParallelEvent {
         total: u32,
     },
     /// Apply completed in a workspace
-    ApplyCompleted { change_id: String, revision: String },
+    ApplyCompleted {
+        change_id: String,
+        #[allow(dead_code)] // Available for event consumers to log/display
+        revision: String,
+    },
     /// Apply failed in a workspace
     ApplyFailed { change_id: String, error: String },
     /// Archive started for a change
@@ -131,7 +135,10 @@ pub enum ParallelEvent {
     /// Merge started
     MergeStarted { revisions: Vec<String> },
     /// Merge completed
-    MergeCompleted { revision: String },
+    MergeCompleted {
+        #[allow(dead_code)] // Available for event consumers to log/display
+        revision: String,
+    },
     /// Merge resulted in conflicts
     MergeConflict { files: Vec<String> },
     /// Conflict resolution started
@@ -143,7 +150,10 @@ pub enum ParallelEvent {
     /// Workspace cleanup started
     CleanupStarted { workspace: String },
     /// Workspace cleanup completed
-    CleanupCompleted { workspace: String },
+    CleanupCompleted {
+        #[allow(dead_code)] // Available for event consumers to log/display
+        workspace: String,
+    },
     /// Group execution started
     GroupStarted { group_id: u32, changes: Vec<String> },
     /// Group execution completed
@@ -152,7 +162,8 @@ pub enum ParallelEvent {
     AnalysisStarted { remaining_changes: usize },
     /// Analysis output (streaming)
     AnalysisOutput { output: String },
-    /// Analysis completed
+    /// Analysis completed (reserved for future dynamic re-analysis UI)
+    #[allow(dead_code)]
     AnalysisCompleted { groups_found: usize },
     /// Resolve output (streaming)
     ResolveOutput { output: String },
@@ -163,18 +174,15 @@ pub enum ParallelEvent {
 }
 
 /// Parallel executor for running changes in jj workspaces
-#[allow(dead_code)]
 pub struct ParallelExecutor {
     /// Workspace manager
     workspace_manager: JjWorkspaceManager,
-    /// Configuration (kept for potential future use)
+    /// Configuration (used for AgentRunner and resolve operations)
     config: OrchestratorConfig,
     /// Apply command template
     apply_command: String,
     /// Archive command template
     archive_command: String,
-    /// Resolve command template
-    resolve_command: String,
     /// Event sender
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
     /// Maximum retries for conflict resolution
@@ -215,7 +223,6 @@ impl ParallelExecutor {
         let max_concurrent = config.get_max_concurrent_workspaces();
         let apply_command = config.get_apply_command().to_string();
         let archive_command = config.get_archive_command().to_string();
-        let resolve_command = config.get_resolve_command().to_string();
 
         let workspace_manager =
             JjWorkspaceManager::new(base_dir, repo_root.clone(), max_concurrent, config.clone());
@@ -225,7 +232,6 @@ impl ParallelExecutor {
             config,
             apply_command,
             archive_command,
-            resolve_command,
             event_tx,
             max_conflict_retries: 3,
             repo_root,
@@ -632,7 +638,7 @@ impl ParallelExecutor {
     /// Execute archive command in a workspace with streaming output
     async fn execute_archive_in_workspace(
         change_id: &str,
-        workspace_path: &PathBuf,
+        workspace_path: &Path,
         archive_cmd_template: &str,
         config: &OrchestratorConfig,
         event_tx: Option<mpsc::Sender<ParallelEvent>>,
@@ -768,7 +774,7 @@ impl ParallelExecutor {
     /// Reads and parses the tasks.md file to determine completion status.
     /// Returns None if the file doesn't exist (e.g., after archiving).
     fn check_task_progress(
-        workspace_path: &PathBuf,
+        workspace_path: &Path,
         change_id: &str,
     ) -> Option<crate::task_parser::TaskProgress> {
         let tasks_path = workspace_path
@@ -816,7 +822,7 @@ impl ParallelExecutor {
     /// Execute apply command in a single workspace, repeating until tasks are 100% complete
     async fn execute_apply_in_workspace(
         change_id: &str,
-        workspace_path: &PathBuf,
+        workspace_path: &Path,
         apply_cmd_template: &str,
         event_tx: Option<mpsc::Sender<ParallelEvent>>,
     ) -> Result<String> {
@@ -1069,13 +1075,7 @@ impl ParallelExecutor {
 
     /// Detect conflicted files from jj status
     async fn detect_conflicts(&self) -> Result<Vec<String>> {
-        let output = Command::new("jj")
-            .arg("status")
-            .output()
-            .await
-            .map_err(|e| OrchestratorError::JjCommand(format!("Failed to run jj status: {}", e)))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = jj_commands::get_status(&self.repo_root).await?;
         let mut conflict_files = Vec::new();
 
         for line in stdout.lines() {
@@ -1094,33 +1094,12 @@ impl ParallelExecutor {
 
     /// Get jj status output for context
     async fn get_jj_status(&self) -> Result<String> {
-        let output = Command::new("jj")
-            .arg("status")
-            .current_dir(&self.repo_root)
-            .output()
-            .await
-            .map_err(|e| OrchestratorError::JjCommand(format!("Failed to run jj status: {}", e)))?;
-
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        jj_commands::get_status(&self.repo_root).await
     }
 
     /// Get jj log for specific revisions
     async fn get_jj_log_for_revisions(&self, revisions: &[String]) -> Result<String> {
-        if revisions.is_empty() {
-            return Ok(String::new());
-        }
-
-        // Build revset for the revisions
-        let revset = revisions.join(" | ");
-
-        let output = Command::new("jj")
-            .args(["log", "-r", &revset, "--no-graph"])
-            .current_dir(&self.repo_root)
-            .output()
-            .await
-            .map_err(|e| OrchestratorError::JjCommand(format!("Failed to run jj log: {}", e)))?;
-
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        jj_commands::get_log_for_revisions(revisions, &self.repo_root).await
     }
 
     /// Attempt to resolve conflicts with retries using the configured resolve command
@@ -1236,8 +1215,11 @@ impl ParallelExecutor {
         }
     }
 
-    /// Cleanup all workspaces
-    #[allow(dead_code)]
+    /// Cleanup all workspaces.
+    ///
+    /// Note: Currently cleanup is handled automatically in execute_group.
+    /// This method is provided for manual cleanup in error recovery scenarios.
+    #[allow(dead_code)] // Public API for manual cleanup in error recovery
     pub async fn cleanup(&mut self) -> Result<()> {
         self.workspace_manager.cleanup_all().await
     }

@@ -6,8 +6,8 @@ mod config;
 mod error;
 mod history;
 mod hooks;
+mod jj_commands;
 mod jj_workspace;
-mod opencode;
 mod openspec;
 mod orchestrator;
 mod parallel_executor;
@@ -32,10 +32,11 @@ fn init_file_logging(log_path: &Path) -> Result<()> {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
 
     let file = File::create(log_path).map_err(|e| {
-        error::OrchestratorError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to create log file '{}': {}", log_path.display(), e),
-        ))
+        error::OrchestratorError::Io(std::io::Error::other(format!(
+            "Failed to create log file '{}': {}",
+            log_path.display(),
+            e
+        )))
     })?;
 
     let file_layer = tracing_subscriber::fmt::layer()

@@ -8,10 +8,6 @@ pub enum OrchestratorError {
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("OpenCode command failed: {0}")]
-    #[allow(dead_code)]
-    OpenCodeCommand(String),
-
     #[error("Agent command failed: {0}")]
     AgentCommand(String),
 
@@ -51,8 +47,10 @@ pub enum OrchestratorError {
     #[error("jj conflict detected: {0}")]
     JjConflict(String),
 
+    /// Reserved for future use when jj availability check fails.
+    /// Currently check_jj_repo returns false instead of this error.
     #[error("jj not available: {0}")]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Kept for future use in stricter jj availability checks
     JjNotAvailable(String),
 }
 

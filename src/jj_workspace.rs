@@ -5,6 +5,7 @@
 
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::jj_commands;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
@@ -12,7 +13,6 @@ use tracing::{debug, info, warn};
 
 /// Status of a jj workspace
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub enum WorkspaceStatus {
     /// Workspace created but not yet used
     Created,
@@ -22,7 +22,8 @@ pub enum WorkspaceStatus {
     Applied(String),
     /// Apply failed with error message
     Failed(String),
-    /// Workspace merged into main
+    /// Workspace merged into main (reserved for future merge tracking)
+    #[allow(dead_code)]
     Merged,
     /// Workspace cleaned up
     Cleaned,
@@ -30,7 +31,6 @@ pub enum WorkspaceStatus {
 
 /// Represents a jj workspace for parallel execution
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct JjWorkspace {
     /// Workspace name (used by jj)
     pub name: String,
@@ -38,9 +38,10 @@ pub struct JjWorkspace {
     pub path: PathBuf,
     /// Associated OpenSpec change ID
     pub change_id: String,
-    /// Base revision workspace was created from
+    /// Base revision workspace was created from (used for debugging/logging)
+    #[allow(dead_code)]
     pub base_revision: String,
-    /// Current status
+    /// Current status (managed via update_workspace_status)
     pub status: WorkspaceStatus,
 }
 
@@ -57,18 +58,6 @@ pub struct WorkspaceResult {
     pub error: Option<String>,
 }
 
-/// Result of parallel execution
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ParallelExecutionResult {
-    /// Successfully completed workspaces
-    pub successful: Vec<WorkspaceResult>,
-    /// Failed workspaces
-    pub failed: Vec<WorkspaceResult>,
-    /// Merge revision if merge was performed
-    pub merge_revision: Option<String>,
-}
-
 /// Manages jj workspaces for parallel execution
 pub struct JjWorkspaceManager {
     /// Base directory for creating workspaces
@@ -79,25 +68,24 @@ pub struct JjWorkspaceManager {
     workspaces: Vec<JjWorkspace>,
     /// Maximum concurrent workspaces
     max_concurrent: usize,
-    /// Configuration for resolve command
-    #[allow(dead_code)]
-    config: OrchestratorConfig,
 }
 
 impl JjWorkspaceManager {
     /// Create a new workspace manager
+    ///
+    /// Note: The `_config` parameter is kept for API compatibility but is not used.
+    /// Conflict resolution is handled by ParallelExecutor using AgentRunner.
     pub fn new(
         base_dir: PathBuf,
         repo_root: PathBuf,
         max_concurrent: usize,
-        config: OrchestratorConfig,
+        _config: OrchestratorConfig,
     ) -> Self {
         Self {
             base_dir,
             repo_root,
             workspaces: Vec::new(),
             max_concurrent,
-            config,
         }
     }
 
@@ -114,30 +102,7 @@ impl JjWorkspaceManager {
 
     /// Check if jj is available and the repo is a jj repository
     pub async fn check_jj_available(&self) -> Result<bool> {
-        let output = Command::new("jj")
-            .arg("--version")
-            .current_dir(&self.repo_root)
-            .stdin(Stdio::null())
-            .output()
-            .await;
-
-        match output {
-            Ok(out) if out.status.success() => {
-                // Check if current directory is a jj repo
-                let root_output = Command::new("jj")
-                    .arg("root")
-                    .current_dir(&self.repo_root)
-                    .stdin(Stdio::null())
-                    .output()
-                    .await;
-
-                match root_output {
-                    Ok(out) if out.status.success() => Ok(true),
-                    _ => Ok(false),
-                }
-            }
-            _ => Ok(false),
-        }
+        jj_commands::check_jj_repo(&self.repo_root).await
     }
 
     /// Snapshot the current working copy to ensure changes are visible in new workspaces.
@@ -196,31 +161,7 @@ impl JjWorkspaceManager {
 
     /// Get the current jj revision
     pub async fn get_current_revision(&self) -> Result<String> {
-        let output = Command::new("jj")
-            .args([
-                "log",
-                "-r",
-                "@",
-                "--no-graph",
-                "--ignore-working-copy",
-                "-T",
-                "change_id",
-            ])
-            .current_dir(&self.repo_root)
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .map_err(|e| OrchestratorError::JjCommand(format!("Failed to get revision: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(OrchestratorError::JjCommand(format!(
-                "Failed to get revision: {}",
-                stderr
-            )));
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        jj_commands::get_current_revision(&self.repo_root).await
     }
 
     /// Create a new workspace for a change from a specific base revision
@@ -336,33 +277,7 @@ impl JjWorkspaceManager {
     /// Get the current revision in a workspace
     #[allow(dead_code)]
     pub async fn get_workspace_revision(&self, workspace: &JjWorkspace) -> Result<String> {
-        let output = Command::new("jj")
-            .args([
-                "log",
-                "-r",
-                "@",
-                "--no-graph",
-                "--ignore-working-copy",
-                "-T",
-                "change_id",
-            ])
-            .current_dir(&workspace.path)
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .map_err(|e| {
-                OrchestratorError::JjCommand(format!("Failed to get workspace revision: {}", e))
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(OrchestratorError::JjCommand(format!(
-                "Failed to get workspace revision: {}",
-                stderr
-            )));
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        jj_commands::get_current_revision(&workspace.path).await
     }
 
     /// Update workspace status
@@ -538,48 +453,6 @@ impl JjWorkspaceManager {
         Ok(rev)
     }
 
-    /// Resolve conflicts using the configured resolve command
-    #[allow(dead_code)]
-    pub async fn resolve_conflicts(&self, conflict_info: &str) -> Result<()> {
-        let resolve_command = match &self.config.resolve_command {
-            Some(cmd) => cmd.clone(),
-            None => {
-                return Err(OrchestratorError::JjConflict(
-                    "No resolve_command configured".to_string(),
-                ))
-            }
-        };
-
-        // Build the resolve prompt with conflict info
-        let resolve_prompt = format!(
-            "Resolve merge conflicts in the following files: {}. \
-             Review the conflict markers and resolve them appropriately.",
-            conflict_info
-        );
-
-        let command = resolve_command.replace("{prompt}", &resolve_prompt);
-        info!("Running resolve command: {}", command);
-
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .current_dir(&self.repo_root)
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .map_err(|e| OrchestratorError::JjCommand(format!("Resolve command failed: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(OrchestratorError::JjCommand(format!(
-                "Resolve command failed: {}",
-                stderr
-            )));
-        }
-
-        Ok(())
-    }
-
     /// Cleanup a single workspace (forget + delete directory)
     pub async fn cleanup_workspace(&mut self, workspace_name: &str) -> Result<()> {
         let workspace = self
@@ -650,26 +523,8 @@ impl JjWorkspaceManager {
     /// List all jj workspaces in the repository
     #[allow(dead_code)]
     pub async fn list_jj_workspaces(&self) -> Result<Vec<String>> {
-        let output = Command::new("jj")
-            .args(["workspace", "list"])
-            .current_dir(&self.repo_root)
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .map_err(|e| {
-                OrchestratorError::JjCommand(format!("Failed to list workspaces: {}", e))
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(OrchestratorError::JjCommand(format!(
-                "Failed to list workspaces: {}",
-                stderr
-            )));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let workspaces: Vec<String> = stdout
+        let output = jj_commands::run_jj(&["workspace", "list"], &self.repo_root).await?;
+        let workspaces: Vec<String> = output
             .lines()
             .filter_map(|line| {
                 // Parse workspace list output (format: "name: path")
