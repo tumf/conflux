@@ -7,48 +7,56 @@ Defines TUI key binding hints display based on application mode.
 
 The TUI SHALL display only actionable key hints based on current state in selection mode.
 
+Changes panel title SHALL show only change-related keys.
+App-level control keys SHALL be shown in Status panel title instead of Changes panel.
+
 #### Scenario: Empty changes list hides selection keys
 
 - **GIVEN** the TUI is in select mode
 - **WHEN** the changes list is empty
-- **THEN** the key hints SHALL NOT show "Space: queue"
-- **AND** the key hints SHALL NOT show "@: approve"
-- **AND** the key hints SHALL NOT show "e: edit"
-- **AND** the key hints SHALL show "↑↓/jk: move"
-- **AND** the key hints SHALL show "q: quit"
+- **THEN** the Changes panel key hints SHALL NOT show "Space: queue"
+- **AND** the Changes panel key hints SHALL NOT show "@: approve"
+- **AND** the Changes panel key hints SHALL NOT show "e: edit"
+- **AND** the Changes panel key hints SHALL show "↑↓/jk: move"
+- **AND** the Changes panel title SHALL NOT show "q: quit"
 
 #### Scenario: No queued changes hides F5 key
 
 - **GIVEN** the TUI is in select mode
 - **AND** changes exist but none are selected for queue
-- **THEN** the key hints SHALL NOT show "F5: run"
-- **AND** the key hints SHALL show selection keys (Space/@/e)
+- **THEN** the Changes panel key hints SHALL NOT show "F5: run"
+- **AND** the Changes panel key hints SHALL show selection keys (Space/@/e)
+- **AND** the Changes panel title SHALL NOT show "q: quit"
 
 #### Scenario: Queued changes shows F5 key
 
 - **GIVEN** the TUI is in select mode
 - **AND** at least one change is selected for queue
-- **THEN** the key hints SHALL show "F5: run"
+- **THEN** the Changes panel key hints SHALL show "F5: run"
+- **AND** the Changes panel title SHALL NOT show "q: quit"
 
 ### Requirement: Context-Aware Key Hints in Running Mode
 
 The TUI SHALL display dynamic key hints in running mode consistent with select mode.
 
+Changes panel title SHALL show only change-related keys.
+App-level control keys (Esc, q) SHALL be shown in Status panel title instead of Changes panel.
+
 #### Scenario: Running mode shows appropriate keys
 
 - **GIVEN** the TUI is in running mode
 - **WHEN** changes exist
-- **THEN** the key hints SHALL show selection keys based on current item state
-- **AND** the key hints SHALL show "Esc: stop"
-- **AND** the key hints SHALL show "q: quit"
+- **THEN** the Changes panel key hints SHALL show selection keys based on current item state
+- **AND** the Changes panel title SHALL NOT show "Esc: stop"
+- **AND** the Changes panel title SHALL NOT show "q: quit"
 
 #### Scenario: Running mode with empty list
 
 - **GIVEN** the TUI is in running mode
 - **WHEN** the changes list is empty
-- **THEN** the key hints SHALL NOT show selection keys
-- **AND** the key hints SHALL show "Esc: stop"
-- **AND** the key hints SHALL show "q: quit"
+- **THEN** the Changes panel key hints SHALL NOT show selection keys
+- **AND** the Changes panel title SHALL NOT show "Esc: stop"
+- **AND** the Changes panel title SHALL NOT show "q: quit"
 
 ### Requirement: Approval State Transition in Select Mode
 
@@ -83,3 +91,31 @@ The TUI SHALL allow approval without auto-queuing in running mode.
 - **WHEN** the user presses `@`
 - **THEN** the change SHALL become approved but NOT queued showing `[@]`
 - **AND** a log message "Approved (not queued): {id}" SHALL appear
+
+### Requirement: App Control Keys in Status Panel Title
+
+The TUI SHALL display app-level control keys in the Status panel title based on current mode.
+
+#### Scenario: Status panel title shows quit key in Select mode
+
+- **GIVEN** the TUI is in select mode
+- **THEN** the Status panel title SHALL show "q: quit"
+
+#### Scenario: Status panel title shows stop and quit keys in Running mode
+
+- **GIVEN** the TUI is in running mode
+- **THEN** the Status panel title SHALL show "Esc: stop"
+- **AND** the Status panel title SHALL show "q: quit"
+
+#### Scenario: Status panel title shows force stop in Stopping mode
+
+- **GIVEN** the TUI is in stopping mode
+- **THEN** the Status panel title SHALL show "Esc: force stop"
+- **AND** the Status panel title SHALL show "q: quit"
+
+#### Scenario: Status panel title shows resume key in Stopped mode
+
+- **GIVEN** the TUI is in stopped mode
+- **THEN** the Status panel title SHALL show "F5: resume"
+- **AND** the Status panel title SHALL show "q: quit"
+

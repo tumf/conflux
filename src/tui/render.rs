@@ -254,7 +254,6 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             "=: parallel"
         });
     }
-    keys.push("q: quit");
 
     let title = format!(" Changes ({}) ", keys.join(", "));
 
@@ -359,7 +358,6 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
     // Build dynamic key hints based on current state (same logic as select mode)
     let has_selection = !app.changes.is_empty();
-    let has_queue = app.changes.iter().any(|c| c.selected);
     let current_item = if has_selection && app.cursor_index < app.changes.len() {
         Some(&app.changes[app.cursor_index])
     } else {
@@ -380,10 +378,6 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
         });
         keys.push("e: edit");
     }
-    if has_queue {
-        keys.push("Esc: stop");
-    }
-    keys.push("q: quit");
 
     let title = format!(" Changes ({}) ", keys.join(", "));
 
@@ -542,9 +536,17 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
 
     let content = Line::from(spans);
 
+    // Build title with app control keys based on mode
+    let title = match app.mode {
+        AppMode::Running => " Status (Esc: stop, q: quit) ".to_string(),
+        AppMode::Stopping => " Status (Esc: force stop, q: quit) ".to_string(),
+        AppMode::Stopped => " Status (F5: resume, q: quit) ".to_string(),
+        _ => " Status (q: quit) ".to_string(),
+    };
+
     let status = Paragraph::new(content).block(
         Block::default()
-            .title(" Status ")
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Blue)),
     );
