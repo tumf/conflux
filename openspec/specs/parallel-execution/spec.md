@@ -1,7 +1,7 @@
 # parallel-execution Specification
 
 ## Purpose
-TBD - created by archiving change refactor-parallel-executor. Update Purpose after archive.
+Defines parallel change execution using jj workspaces or Git worktrees.
 ## Requirements
 ### Requirement: Shared Parallel Orchestration Service
 

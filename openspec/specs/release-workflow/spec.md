@@ -1,7 +1,7 @@
 # release-workflow Specification
 
 ## Purpose
-TBD - created by archiving change implement-release-workflow. Update Purpose after archive.
+Defines the release process, versioning, and changelog generation.
 ## Requirements
 ### Requirement: REQ-REL-001 Version Bump Automation
 

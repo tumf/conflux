@@ -1,7 +1,7 @@
 # workspace-cleanup Specification
 
 ## Purpose
-TBD - created by archiving change refactor-parallel-executor. Update Purpose after archive.
+Defines workspace cleanup behavior after parallel execution.
 ## Requirements
 ### Requirement: Workspace Cleanup Guard
 

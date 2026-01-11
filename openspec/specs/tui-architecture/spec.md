@@ -1,7 +1,7 @@
 # tui-architecture Specification
 
 ## Purpose
-TBD - created by archiving change refactor-tui-module-structure. Update Purpose after archive.
+Defines the TUI module structure and architectural patterns.
 ## Requirements
 ### Requirement: TUI Module Structure
 

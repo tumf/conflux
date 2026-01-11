@@ -1,7 +1,7 @@
 # documentation Specification
 
 ## Purpose
-TBD - created by archiving change 2026-01-09-write-readme. Update Purpose after archive.
+Defines requirements for README files and project documentation accuracy.
 ## Requirements
 ### Requirement: README.md Content Accuracy
 

@@ -1,7 +1,7 @@
 # hooks Specification
 
 ## Purpose
-TBD - created by archiving change redesign-hook-system. Update Purpose after archive.
+Defines the lifecycle hook system including available hooks, context variables, and execution order.
 ## Requirements
 ### Requirement: on_queue_add hook
 
