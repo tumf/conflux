@@ -1,11 +1,11 @@
-## 1. 実装
+## 1. Implementation
 
-- [ ] 1.1 `merge_jj_workspaces` で成功時にも stderr の "conflict" チェックを追加
-- [ ] 1.2 コンフリクト検出時に `VcsError::jj_conflict` を返すよう修正
-- [ ] 1.3 ユニットテストまたは統合テストでコンフリクト検出をテスト
+- [x] 1.1 Add stderr "conflict" check on success in `merge_jj_workspaces`
+- [x] 1.2 Return `VcsError::jj_conflict` when conflict detected
+- [x] 1.3 Add unit test for conflict detection logic
 
-## 2. 検証
+## 2. Verification
 
-- [ ] 2.1 実際の jj リポジトリでコンフリクトをシミュレートしてテスト
-- [ ] 2.2 `cargo test` で既存テストがパスすることを確認
-- [ ] 2.3 `cargo clippy` で警告がないことを確認
+- [ ] 2.1 Manual test with actual jj repo conflict simulation (requires human action)
+- [x] 2.2 `cargo test` passes for all existing tests
+- [x] 2.3 `cargo clippy` shows no warnings

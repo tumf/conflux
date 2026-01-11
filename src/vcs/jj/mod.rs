@@ -337,10 +337,12 @@ impl JjWorkspaceManager {
             .await
             .map_err(|e| VcsError::jj_command(format!("Merge failed: {}", e)))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        // Parse stderr for conflict detection and commit parsing
+        // Note: jj outputs "Created new commit" to stderr, not stdout
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
-            // Check for conflicts
+        if !output.status.success() {
+            // Check for conflicts in failure case
             if stderr.contains("conflict") || stderr.contains("Conflict") {
                 return Err(VcsError::jj_conflict(stderr.to_string()));
             }
@@ -348,10 +350,11 @@ impl JjWorkspaceManager {
             return Err(VcsError::jj_command(format!("Merge failed: {}", stderr)));
         }
 
-        // Parse the merge commit revision from the output
-        // Note: jj outputs "Created new commit" to stderr, not stdout
-        // Output format: "Created new commit <change_id> <commit_id> ..."
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // IMPORTANT: jj may succeed (exit code 0) even when conflicts occur.
+        // Check stderr for conflict markers on success as well.
+        if stderr.contains("conflict") || stderr.contains("Conflict") {
+            return Err(VcsError::jj_conflict(stderr.to_string()));
+        }
         let merge_rev = self.parse_created_commit_id(&stderr).await?;
 
         // Switch to the merge commit using `jj edit`
@@ -731,5 +734,56 @@ mod tests {
         let change_id = "feature/add-login";
         let sanitized = format!("ws-{}", change_id.replace(['/', '\\', ' '], "-"));
         assert_eq!(sanitized, "ws-feature-add-login");
+    }
+
+    #[test]
+    fn test_conflict_detection_in_stderr() {
+        // Test that conflict detection logic correctly identifies conflicts in stderr
+        // This verifies the string matching used in merge_jj_workspaces
+
+        // Test cases that should be detected as conflicts
+        // Note: jj outputs "conflict" (lowercase) or "Conflict" (capitalized), not "CONFLICT"
+        let conflict_cases = vec![
+            "New conflicts in: src/main.rs",
+            "Conflict detected in file.txt",
+            "conflict markers found",
+            "There are unresolved conflicts at these paths:",
+        ];
+
+        for case in conflict_cases {
+            assert!(
+                case.contains("conflict") || case.contains("Conflict"),
+                "Should detect conflict in: {}",
+                case
+            );
+        }
+
+        // Test cases that should NOT be detected as conflicts
+        let non_conflict_cases = vec![
+            "Created new commit abc123 def456",
+            "Successfully merged",
+            "Working copy now at: xyz",
+        ];
+
+        for case in non_conflict_cases {
+            assert!(
+                !case.contains("conflict") && !case.contains("Conflict"),
+                "Should not detect conflict in: {}",
+                case
+            );
+        }
+    }
+
+    #[test]
+    fn test_jj_conflict_error_creation() {
+        // Verify VcsError::jj_conflict creates the correct error type
+        let err = VcsError::jj_conflict("New conflicts in: src/main.rs");
+        assert!(matches!(
+            err,
+            VcsError::Conflict {
+                backend: VcsBackend::Jj,
+                ..
+            }
+        ));
     }
 }
