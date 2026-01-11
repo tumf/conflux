@@ -27,6 +27,10 @@ pub const DEFAULT_APPLY_COMMAND: &str = "opencode run '/openspec-apply {change_i
 /// Default archive command template (OpenCode)
 pub const DEFAULT_ARCHIVE_COMMAND: &str = "opencode run '/openspec-archive {change_id}'";
 
+/// Default resolve command template (OpenCode)
+/// Supports `{prompt}` placeholder for the resolve prompt
+pub const DEFAULT_RESOLVE_COMMAND: &str = "opencode run '{prompt}'";
+
 /// Default analyze command template (OpenCode)
 pub const DEFAULT_ANALYZE_COMMAND: &str = "opencode run --format json '{prompt}'";
 
@@ -39,6 +43,13 @@ pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
 
 /// Default maximum iterations for the orchestration loop
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
+
+/// Default maximum concurrent workspaces for parallel execution
+pub const DEFAULT_MAX_CONCURRENT_WORKSPACES: usize = 3;
+
+/// Default workspace base directory (uses system temp)
+#[allow(dead_code)]
+pub const DEFAULT_WORKSPACE_BASE_DIR: &str = "";
 
 /// Orchestrator configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -88,6 +99,33 @@ pub struct OrchestratorConfig {
     /// Default: 50
     #[serde(default)]
     pub max_iterations: Option<u32>,
+
+    /// Enable parallel execution mode (requires jj).
+    /// Default: false (off by default)
+    #[serde(default)]
+    pub parallel_mode: Option<bool>,
+
+    /// Maximum number of concurrent workspaces for parallel execution.
+    /// Default: 3
+    #[serde(default)]
+    pub max_concurrent_workspaces: Option<usize>,
+
+    /// Base directory for creating workspaces.
+    /// Default: system temp directory
+    #[serde(default)]
+    pub workspace_base_dir: Option<String>,
+
+    /// Command template for conflict resolution.
+    /// Supports `{conflict_info}` placeholder.
+    /// If not set, uses automatic AI-based resolution.
+    #[serde(default)]
+    pub resolve_command: Option<String>,
+
+    /// Enable LLM-based analysis for parallelization.
+    /// When true (default), uses analyze_command to determine dependencies between changes.
+    /// When false, skips analysis and runs all changes in parallel (no dependency inference).
+    #[serde(default)]
+    pub use_llm_analysis: Option<bool>,
 }
 
 impl OrchestratorConfig {
@@ -140,6 +178,46 @@ impl OrchestratorConfig {
     /// A value of 0 means no limit.
     pub fn get_max_iterations(&self) -> u32 {
         self.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS)
+    }
+
+    /// Get whether parallel mode is enabled.
+    /// Default: false (off by default)
+    #[allow(dead_code)]
+    pub fn get_parallel_mode(&self) -> bool {
+        self.parallel_mode.unwrap_or(false)
+    }
+
+    /// Get the maximum concurrent workspaces limit.
+    /// Default: 3
+    pub fn get_max_concurrent_workspaces(&self) -> usize {
+        self.max_concurrent_workspaces
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_WORKSPACES)
+    }
+
+    /// Get the workspace base directory.
+    /// Returns None if using system temp directory.
+    pub fn get_workspace_base_dir(&self) -> Option<&str> {
+        self.workspace_base_dir.as_deref().filter(|s| !s.is_empty())
+    }
+
+    /// Get the resolve command for conflict resolution, falling back to default if not set.
+    pub fn get_resolve_command(&self) -> &str {
+        self.resolve_command
+            .as_deref()
+            .unwrap_or(DEFAULT_RESOLVE_COMMAND)
+    }
+
+    /// Check if LLM-based analysis is enabled for parallelization.
+    /// Default: true (use LLM to analyze dependencies between changes)
+    /// Set to false to skip LLM analysis and run all changes in parallel.
+    pub fn use_llm_analysis(&self) -> bool {
+        self.use_llm_analysis.unwrap_or(true)
+    }
+
+    /// Expand `{conflict_files}` placeholder in a command template
+    #[allow(dead_code)]
+    pub fn expand_conflict_files(template: &str, conflict_files: &str) -> String {
+        template.replace("{conflict_files}", conflict_files)
     }
 
     /// Expand `{change_id}` placeholder in a command template

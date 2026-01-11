@@ -86,12 +86,9 @@ pub async fn archive_single_change(
             .await;
     }
 
-    // Archive the change
+    // Archive the change - send ArchiveStarted event
     let _ = tx
-        .send(OrchestratorEvent::Log(LogEntry::info(format!(
-            "Archiving: {}",
-            change_id
-        ))))
+        .send(OrchestratorEvent::ArchiveStarted(change_id.to_string()))
         .await;
 
     // Run archive command with streaming output
@@ -683,6 +680,142 @@ pub async fn run_orchestrator(
                 unarchived_by_tracking.join(", ")
             ))))
             .await;
+    }
+
+    let _ = tx.send(OrchestratorEvent::AllCompleted).await;
+    Ok(())
+}
+
+/// Run the orchestrator in parallel mode using jj workspaces
+/// This function executes all changes in parallel using ParallelRunService
+pub async fn run_orchestrator_parallel(
+    change_ids: Vec<String>,
+    _openspec_cmd: String,
+    config: OrchestratorConfig,
+    tx: mpsc::Sender<OrchestratorEvent>,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    use crate::openspec::list_changes_native;
+    use crate::parallel_executor::ParallelEvent;
+    use crate::parallel_run_service::ParallelRunService;
+    use std::collections::HashSet;
+
+    let _ = tx
+        .send(OrchestratorEvent::Log(LogEntry::info(format!(
+            "Starting parallel processing of {} change(s)",
+            change_ids.len()
+        ))))
+        .await;
+
+    // Get repo root
+    let repo_root = std::env::current_dir()?;
+
+    // Create ParallelRunService
+    let service = ParallelRunService::new(repo_root, config.clone());
+
+    // Check jj availability
+    if !service.check_jj_available().await? {
+        let _ = tx
+            .send(OrchestratorEvent::Log(LogEntry::error(
+                "jj is not available for parallel execution".to_string(),
+            )))
+            .await;
+        return Err(crate::error::OrchestratorError::AgentCommand(
+            "jj not available".to_string(),
+        ));
+    }
+
+    // Load changes with dependencies and filter to selected ones
+    let _ = tx
+        .send(OrchestratorEvent::Log(LogEntry::info(
+            "Loading changes with dependencies...".to_string(),
+        )))
+        .await;
+
+    let all_changes = list_changes_native()?;
+    let selected_set: HashSet<_> = change_ids.iter().collect();
+    let selected_changes: Vec<_> = all_changes
+        .into_iter()
+        .filter(|c| selected_set.contains(&c.id))
+        .collect();
+
+    // Log that LLM analysis will be used (actual grouping happens inside run_parallel_with_channel)
+    let _ = tx
+        .send(OrchestratorEvent::Log(LogEntry::info(format!(
+            "Analyzing {} changes for parallelization...",
+            selected_changes.len()
+        ))))
+        .await;
+
+    // Create event channel for forwarding to TUI
+    let (parallel_tx, mut parallel_rx) = mpsc::channel::<ParallelEvent>(100);
+
+    // Spawn event forwarding task using ParallelEventBridge
+    let forward_tx = tx.clone();
+    let forward_cancel = cancel_token.clone();
+    let forward_handle = tokio::spawn(async move {
+        use super::parallel_event_bridge;
+
+        loop {
+            tokio::select! {
+                _ = forward_cancel.cancelled() => {
+                    break;
+                }
+                event = parallel_rx.recv() => {
+                    match event {
+                        Some(ParallelEvent::AllCompleted) => {
+                            // AllCompleted signals loop termination
+                            break;
+                        }
+                        Some(parallel_event) => {
+                            // Convert and forward all events using the bridge
+                            for orchestrator_event in parallel_event_bridge::convert(parallel_event) {
+                                let _ = forward_tx.send(orchestrator_event).await;
+                            }
+                        }
+                        None => {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Execute using ParallelRunService with channel
+    let result = tokio::select! {
+        _ = cancel_token.cancelled() => {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::warn(
+                    "Parallel execution cancelled".to_string(),
+                )))
+                .await;
+            Err(crate::error::OrchestratorError::AgentCommand("Cancelled".to_string()))
+        }
+        result = service.run_parallel_with_channel(selected_changes, parallel_tx) => {
+            result
+        }
+    };
+
+    // Wait for forward task to complete
+    let _ = forward_handle.await;
+
+    match result {
+        Ok(_) => {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::success(
+                    "All parallel changes completed".to_string(),
+                )))
+                .await;
+        }
+        Err(e) => {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::error(format!(
+                    "Parallel execution failed: {}",
+                    e
+                ))))
+                .await;
+        }
     }
 
     let _ = tx.send(OrchestratorEvent::AllCompleted).await;

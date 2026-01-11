@@ -36,6 +36,10 @@ pub struct ChangeState {
     pub last_modified: String,
     /// Whether this change is approved for execution
     pub is_approved: bool,
+    /// When processing started for this change
+    pub started_at: Option<Instant>,
+    /// Elapsed time when processing finished (for display after completion)
+    pub elapsed_time: Option<Duration>,
 }
 
 impl ChangeState {
@@ -50,6 +54,8 @@ impl ChangeState {
             queue_status: QueueStatus::NotQueued,
             last_modified: change.last_modified.clone(),
             is_approved: change.is_approved,
+            started_at: None,
+            elapsed_time: None,
         }
     }
 
@@ -111,6 +117,14 @@ pub struct AppState {
     pub log_auto_scroll: bool,
     /// Current stop mode
     pub stop_mode: StopMode,
+    /// Whether parallel mode is enabled
+    pub parallel_mode: bool,
+    /// Whether jj is available in this repository
+    pub jj_available: bool,
+    /// When orchestration started (for overall elapsed time)
+    pub orchestration_started_at: Option<Instant>,
+    /// Total elapsed time when orchestration finished
+    pub orchestration_elapsed: Option<Duration>,
 }
 
 impl AppState {
@@ -161,7 +175,38 @@ impl AppState {
             log_scroll_offset: 0,
             log_auto_scroll: true,
             stop_mode: StopMode::None,
+            parallel_mode: false,
+            jj_available: crate::cli::check_jj_directory() && crate::cli::check_jj_available(),
+            orchestration_started_at: None,
+            orchestration_elapsed: None,
         }
+    }
+
+    /// Toggle parallel mode (only if jj is available)
+    ///
+    /// Returns true if the mode was toggled, false if jj is not available
+    /// or if the mode cannot be changed in current state.
+    pub fn toggle_parallel_mode(&mut self) -> bool {
+        // Only allow toggling in Select or Stopped mode
+        if !matches!(self.mode, AppMode::Select | AppMode::Stopped) {
+            self.warning_message = Some("Cannot toggle parallel mode while processing".to_string());
+            return false;
+        }
+
+        // Check if jj is available
+        if !self.jj_available {
+            self.warning_message = Some("jj is not available (no .jj directory found)".to_string());
+            return false;
+        }
+
+        self.parallel_mode = !self.parallel_mode;
+        let status = if self.parallel_mode {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        self.add_log(LogEntry::info(format!("Parallel mode {}", status)));
+        true
     }
 
     /// Move cursor up
@@ -292,6 +337,8 @@ impl AppState {
         }
 
         self.mode = AppMode::Running;
+        self.orchestration_started_at = Some(Instant::now());
+        self.orchestration_elapsed = None;
         self.add_log(LogEntry::info(format!(
             "Starting processing {} change(s)",
             selected.len()
@@ -463,6 +510,8 @@ impl AppState {
                 self.current_change = Some(id.clone());
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
                     change.queue_status = QueueStatus::Processing;
+                    change.started_at = Some(Instant::now());
+                    change.elapsed_time = None;
                 }
                 self.add_log(LogEntry::info(format!("Processing: {}", id)));
             }
@@ -472,8 +521,17 @@ impl AppState {
                 total,
             } => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-                    change.completed_tasks = completed;
-                    change.total_tasks = total;
+                    // Only update progress if the change is still being processed
+                    // After Completed, the tasks.md file may be moved/archived
+                    match change.queue_status {
+                        QueueStatus::Completed | QueueStatus::Archiving | QueueStatus::Archived => {
+                            // Don't update progress after completion - file may be moved
+                        }
+                        _ => {
+                            change.completed_tasks = completed;
+                            change.total_tasks = total;
+                        }
+                    }
                 }
             }
             OrchestratorEvent::ProcessingCompleted(id) => {
@@ -482,15 +540,33 @@ impl AppState {
                 }
                 self.add_log(LogEntry::success(format!("Completed: {}", id)));
             }
+            OrchestratorEvent::ArchiveStarted(id) => {
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
+                    change.queue_status = QueueStatus::Archiving;
+                }
+                self.add_log(LogEntry::info(format!("Archiving: {}", id)));
+            }
             OrchestratorEvent::ChangeArchived(id) => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
                     change.queue_status = QueueStatus::Archived;
+                    // Record final elapsed time
+                    if let Some(started) = change.started_at {
+                        change.elapsed_time = Some(started.elapsed());
+                    }
                 }
                 self.add_log(LogEntry::info(format!("Archived: {}", id)));
             }
             OrchestratorEvent::ProcessingError { id, error } => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
                     change.queue_status = QueueStatus::Error(error.clone());
+                    // Record elapsed time on error
+                    if let Some(started) = change.started_at {
+                        change.elapsed_time = Some(started.elapsed());
+                    }
+                }
+                // Record orchestration elapsed time on error
+                if let Some(started) = self.orchestration_started_at {
+                    self.orchestration_elapsed = Some(started.elapsed());
                 }
                 self.add_log(LogEntry::error(format!("Error in {}: {}", id, error)));
                 // Transition to Error mode
@@ -502,12 +578,19 @@ impl AppState {
                 self.mode = AppMode::Select;
                 self.current_change = None;
                 self.stop_mode = StopMode::None;
+                // Record final orchestration time
+                if let Some(started) = self.orchestration_started_at {
+                    self.orchestration_elapsed = Some(started.elapsed());
+                }
                 self.add_log(LogEntry::success("All changes processed successfully"));
             }
             OrchestratorEvent::Stopped => {
                 self.mode = AppMode::Stopped;
                 self.current_change = None;
                 self.stop_mode = StopMode::None;
+                if let Some(started) = self.orchestration_started_at {
+                    self.orchestration_elapsed = Some(started.elapsed());
+                }
                 self.add_log(LogEntry::warn("Processing stopped"));
             }
             OrchestratorEvent::Log(entry) => {
@@ -531,9 +614,19 @@ impl AppState {
         // Update existing changes
         for fetched in &fetched_changes {
             if let Some(existing) = self.changes.iter_mut().find(|c| c.id == fetched.id) {
-                // Update progress
-                existing.completed_tasks = fetched.completed_tasks;
-                existing.total_tasks = fetched.total_tasks;
+                // Only update progress if we have valid data (total > 0)
+                // and the change is still being processed
+                if fetched.total_tasks > 0 {
+                    match existing.queue_status {
+                        QueueStatus::Completed | QueueStatus::Archiving | QueueStatus::Archived => {
+                            // Don't update progress after completion - file may be moved
+                        }
+                        _ => {
+                            existing.completed_tasks = fetched.completed_tasks;
+                            existing.total_tasks = fetched.total_tasks;
+                        }
+                    }
+                }
             }
         }
 
@@ -554,11 +647,14 @@ impl AppState {
         // Remove changes that no longer exist (have been archived externally)
         let current_ids: HashSet<String> = fetched_changes.iter().map(|c| c.id.clone()).collect();
         self.changes.retain(|c| {
-            // Keep if still exists, or if it's in a terminal state (completed/archived/error)
+            // Keep if still exists, or if it's in a terminal state (completed/archiving/archived/error)
             current_ids.contains(&c.id)
                 || matches!(
                     c.queue_status,
-                    QueueStatus::Completed | QueueStatus::Archived | QueueStatus::Error(_)
+                    QueueStatus::Completed
+                        | QueueStatus::Archiving
+                        | QueueStatus::Archived
+                        | QueueStatus::Error(_)
                 )
         });
 
@@ -587,6 +683,7 @@ mod tests {
             total_tasks: total,
             last_modified: "now".to_string(),
             is_approved: false,
+            dependencies: Vec::new(),
         }
     }
 
@@ -597,6 +694,7 @@ mod tests {
             total_tasks: total,
             last_modified: "now".to_string(),
             is_approved: true,
+            dependencies: Vec::new(),
         }
     }
 
@@ -768,6 +866,8 @@ mod tests {
             is_new: false,
             last_modified: "now".to_string(),
             is_approved: false,
+            started_at: None,
+            elapsed_time: None,
         };
 
         assert_eq!(change.progress_percent(), 50.0);

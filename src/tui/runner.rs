@@ -21,12 +21,20 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::events::{LogEntry, OrchestratorEvent, TuiCommand};
-use super::orchestrator::run_orchestrator;
+use super::orchestrator::{run_orchestrator, run_orchestrator_parallel};
 use super::queue::DynamicQueue;
 use super::render::{render, SPINNER_CHARS};
 use super::state::{AppState, AUTO_REFRESH_INTERVAL_SECS};
 use super::types::{AppMode, QueueStatus, StopMode};
 use super::utils::clear_screen;
+
+/// Restore terminal state (called on panic or normal exit)
+fn restore_terminal() {
+    // Always try to disable mouse capture, even if it wasn't enabled
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = clear_screen();
+    ratatui::restore();
+}
 
 /// Run the TUI application
 pub async fn run_tui(
@@ -35,19 +43,23 @@ pub async fn run_tui(
     _opencode_path: String, // Deprecated - use config instead
     config: OrchestratorConfig,
 ) -> Result<()> {
+    // Set up panic hook to restore terminal on panic
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        restore_terminal();
+        original_hook(panic_info);
+    }));
+
     let mut terminal = ratatui::init();
 
-    // Enable mouse capture for scroll wheel support
-    execute!(std::io::stdout(), EnableMouseCapture)?;
+    // Mouse capture disabled due to terminal compatibility issues
+    // Use PageUp/PageDown or k/j keys for scrolling instead
+    // execute!(std::io::stdout(), EnableMouseCapture)?;
 
     let result = run_tui_loop(&mut terminal, initial_changes, openspec_cmd, config).await;
 
-    // Disable mouse capture before restoring terminal
-    execute!(std::io::stdout(), DisableMouseCapture)?;
-
-    // Clear screen before restoring terminal
-    clear_screen()?;
-    ratatui::restore();
+    // Restore terminal state
+    restore_terminal();
 
     result
 }
@@ -250,18 +262,41 @@ async fn run_tui_loop(
                                     let orch_dynamic_queue = dynamic_queue.clone();
                                     let orch_graceful_stop = graceful_stop_flag.clone();
                                     orchestrator_cancel = Some(orch_cancel.clone());
+                                    let use_parallel = app.parallel_mode;
 
                                     orchestrator_handle = Some(tokio::spawn(async move {
-                                        run_orchestrator(
-                                            selected_ids,
-                                            orch_openspec_cmd,
-                                            orch_config,
-                                            orch_tx,
-                                            orch_cancel,
-                                            orch_dynamic_queue,
-                                            orch_graceful_stop,
-                                        )
-                                        .await
+                                        let result = if use_parallel {
+                                            run_orchestrator_parallel(
+                                                selected_ids,
+                                                orch_openspec_cmd,
+                                                orch_config,
+                                                orch_tx.clone(),
+                                                orch_cancel,
+                                            )
+                                            .await
+                                        } else {
+                                            run_orchestrator(
+                                                selected_ids,
+                                                orch_openspec_cmd,
+                                                orch_config,
+                                                orch_tx.clone(),
+                                                orch_cancel,
+                                                orch_dynamic_queue,
+                                                orch_graceful_stop,
+                                            )
+                                            .await
+                                        };
+
+                                        // Log any errors from the orchestrator
+                                        if let Err(ref e) = result {
+                                            let _ = orch_tx
+                                                .send(OrchestratorEvent::Log(LogEntry::error(
+                                                    format!("Orchestrator error: {}", e),
+                                                )))
+                                                .await;
+                                        }
+
+                                        result
                                     }));
                                 }
                             }
@@ -281,6 +316,10 @@ async fn run_tui_loop(
                         (KeyCode::End, _) => {
                             // Jump to newest log entry and re-enable auto-scroll
                             app.scroll_logs_to_bottom();
+                        }
+                        (KeyCode::Char('='), _) => {
+                            // Toggle parallel mode (only if jj is available)
+                            app.toggle_parallel_mode();
                         }
                         _ => {}
                     }

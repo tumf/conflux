@@ -9,10 +9,27 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
 };
+use std::time::Duration;
 
 use super::state::AppState;
 use super::types::{AppMode, QueueStatus};
 use super::utils::{get_version_string, truncate_to_display_width};
+
+/// Format a duration as a human-readable string (e.g., "1m 23s", "45s")
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs >= 3600 {
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        format!("{}h {:02}m", hours, mins)
+    } else if secs >= 60 {
+        let mins = secs / 60;
+        let remaining_secs = secs % 60;
+        format!("{}m {:02}s", mins, remaining_secs)
+    } else {
+        format!("{}s", secs)
+    }
+}
 
 /// Spinner characters for processing animation (Braille dot pattern)
 pub const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -97,14 +114,28 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Error => Color::Red,
     };
 
-    let header_text = Line::from(vec![
+    // Build header spans
+    let mut header_spans = vec![
         Span::styled("OpenSpec Orchestrator", Style::default().fg(Color::White)),
         Span::raw("  "),
         Span::styled(
             format!("[{}]", mode_text),
             Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
         ),
-    ]);
+    ];
+
+    // Add parallel mode badge if enabled
+    if app.parallel_mode {
+        header_spans.push(Span::raw(" "));
+        header_spans.push(Span::styled(
+            "[parallel]",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let header_text = Line::from(header_spans);
 
     let version = get_version_string();
     let version_width = version.len() as u16 + 2; // +2 for padding
@@ -141,16 +172,16 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
         .iter()
         .enumerate()
         .map(|(i, change)| {
-            // Checkbox display:
+            // Checkbox display (Select mode):
             // [ ] - unapproved (cannot be selected)
-            // [@] - approved but not queued
-            // [x] - queued (approved and selected)
+            // [@] - approved but not selected (ready to select)
+            // [x] - selected/reserved (will become Queued when F5 is pressed)
             let (checkbox, checkbox_color) = if !change.is_approved {
                 ("[ ]", Color::Gray) // Unapproved
             } else if change.selected {
-                ("[x]", Color::Green) // Queued
+                ("[x]", Color::Green) // Selected (reserved for queue)
             } else {
-                ("[@]", Color::Yellow) // Approved but not queued
+                ("[@]", Color::Yellow) // Approved but not selected
             };
 
             let cursor = if i == app.cursor_index { "►" } else { " " };
@@ -215,6 +246,14 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
     if has_queue {
         keys.push("F5: run");
     }
+    // Show parallel toggle hint only if jj is available
+    if app.jj_available {
+        keys.push(if app.parallel_mode {
+            "=: sequential"
+        } else {
+            "=: parallel"
+        });
+    }
     keys.push("q: quit");
 
     let title = format!(" Changes ({}) ", keys.join(", "));
@@ -244,16 +283,17 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
         .iter()
         .enumerate()
         .map(|(i, change)| {
-            // Checkbox display (same as select mode):
-            // [ ] - unapproved (cannot be selected)
-            // [@] - approved but not queued
-            // [x] - queued (approved and selected)
+            // Checkbox display (Running mode - same symbols, different meaning):
+            // [ ] - unapproved (cannot be added to queue)
+            // [@] - approved but not in queue
+            // [x] - in queue or being processed
+            // Note: In Running mode, queue_status shows actual state (Queued/Processing/etc.)
             let (checkbox, checkbox_color) = if !change.is_approved {
                 ("[ ]", Color::Gray) // Unapproved
             } else if change.selected {
-                ("[x]", Color::Green) // Queued
+                ("[x]", Color::Green) // In queue
             } else {
-                ("[@]", Color::Yellow) // Approved but not queued
+                ("[@]", Color::Yellow) // Approved but not in queue
             };
 
             let cursor = if i == app.cursor_index { "►" } else { " " };
@@ -263,10 +303,21 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 QueueStatus::Processing => {
                     format!("{} [{:>3.0}%]", spinner_char, change.progress_percent())
                 }
+                QueueStatus::Archiving => {
+                    format!("{} [{}]", spinner_char, change.queue_status.display())
+                }
                 QueueStatus::Completed | QueueStatus::Archived | QueueStatus::Error(_) => {
                     format!("[{}]", change.queue_status.display())
                 }
                 status => format!("[{}]", status.display()),
+            };
+
+            let elapsed_text = if let Some(elapsed) = change.elapsed_time {
+                format_duration(elapsed)
+            } else if let Some(started) = change.started_at {
+                format_duration(started.elapsed())
+            } else {
+                "--".to_string()
             };
 
             let line = Line::from(vec![
@@ -294,6 +345,10 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 ),
                 Span::styled(
                     format!("  {}/{}", change.completed_tasks, change.total_tasks),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("  {:>7}", elapsed_text),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]);
@@ -366,10 +421,40 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
             (format!("Error in: {}", error_id), Color::Red)
         }
         AppMode::Select if all_completed => ("Done".to_string(), Color::Green),
-        _ => match &app.current_change {
-            Some(id) => (format!("Current: {}", id), Color::White),
-            None => ("Waiting...".to_string(), Color::White),
-        },
+        AppMode::Select => ("Ready".to_string(), Color::DarkGray),
+        AppMode::Stopped => ("Stopped".to_string(), Color::DarkGray),
+        AppMode::Running | AppMode::Stopping => {
+            // Count changes that are currently processing or archiving
+            let processing_count = app
+                .changes
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.queue_status,
+                        QueueStatus::Processing | QueueStatus::Archiving
+                    )
+                })
+                .count();
+            if processing_count > 1 {
+                (format!("Running {}", processing_count), Color::Cyan)
+            } else if processing_count == 1 {
+                // Show the single change being processed
+                let current = app
+                    .changes
+                    .iter()
+                    .find(|c| {
+                        matches!(
+                            c.queue_status,
+                            QueueStatus::Processing | QueueStatus::Archiving
+                        )
+                    })
+                    .map(|c| c.id.as_str())
+                    .unwrap_or("unknown");
+                (format!("Status: {}", current), Color::White)
+            } else {
+                ("Waiting...".to_string(), Color::White)
+            }
+        }
     };
 
     let (status_text, status_color) = match app.mode {
@@ -441,6 +526,20 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         ));
     }
 
+    if let Some(started) = app.orchestration_started_at {
+        let elapsed = if matches!(app.mode, AppMode::Running | AppMode::Stopping) {
+            started.elapsed()
+        } else {
+            app.orchestration_elapsed
+                .unwrap_or_else(|| started.elapsed())
+        };
+        spans.push(Span::raw("  |  "));
+        spans.push(Span::styled(
+            format!("Elapsed {}", format_duration(elapsed)),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
     let content = Line::from(spans);
 
     let status = Paragraph::new(content).block(
@@ -468,23 +567,54 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
     let end_index = total_logs.saturating_sub(app.log_scroll_offset);
     let start_index = end_index.saturating_sub(visible_height);
 
+    // Colors for change_id prefixes (cycling through distinct colors)
+    let change_colors = [
+        Color::Cyan,
+        Color::Magenta,
+        Color::LightBlue,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightMagenta,
+        Color::LightCyan,
+    ];
+
     let log_items: Vec<Line> = app
         .logs
         .iter()
         .skip(start_index)
         .take(end_index - start_index)
         .map(|entry| {
+            let mut spans = vec![Span::styled(
+                format!("{} ", entry.timestamp),
+                Style::default().fg(Color::DarkGray),
+            )];
+
+            // Add change_id prefix with color if present
+            let msg_width = if let Some(ref change_id) = entry.change_id {
+                // Use hash of change_id to pick a consistent color
+                let color_index = change_id
+                    .bytes()
+                    .fold(0usize, |acc, b| acc.wrapping_add(b as usize))
+                    % change_colors.len();
+                let prefix_color = change_colors[color_index];
+                spans.push(Span::styled(
+                    format!("[{}] ", change_id),
+                    Style::default()
+                        .fg(prefix_color)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                // Reduce available width by prefix length
+                available_width.saturating_sub(change_id.len() + 3) // "[" + "]" + " "
+            } else {
+                available_width
+            };
+
             // Truncate message to fit in available width using Unicode display width
             // This correctly handles CJK characters that occupy 2 terminal columns
-            let message = truncate_to_display_width(&entry.message, available_width);
+            let message = truncate_to_display_width(&entry.message, msg_width);
+            spans.push(Span::styled(message, Style::default().fg(entry.color)));
 
-            Line::from(vec![
-                Span::styled(
-                    format!("{} ", entry.timestamp),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(message, Style::default().fg(entry.color)),
-            ])
+            Line::from(spans)
         })
         .collect();
 

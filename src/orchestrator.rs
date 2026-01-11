@@ -1,8 +1,10 @@
 use crate::agent::AgentRunner;
+use crate::analyzer::ParallelGroup;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
+use crate::parallel_run_service::ParallelRunService;
 use crate::progress::ProgressDisplay;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -10,6 +12,7 @@ use tracing::{debug, error, info, warn};
 
 pub struct Orchestrator {
     agent: AgentRunner,
+    config: OrchestratorConfig,
     progress: Option<ProgressDisplay>,
     /// Target changes specified by --change option (comma-separated)
     target_changes: Option<Vec<String>>,
@@ -31,6 +34,12 @@ pub struct Orchestrator {
     max_iterations: u32,
     /// Current iteration number (for max_iterations check)
     iteration: u32,
+    /// Enable parallel execution mode
+    parallel: bool,
+    /// Maximum concurrent workspaces for parallel execution
+    max_concurrent: Option<usize>,
+    /// Dry run mode (preview without execution)
+    dry_run: bool,
 }
 
 impl Orchestrator {
@@ -39,15 +48,19 @@ impl Orchestrator {
         target_changes: Option<Vec<String>>,
         config_path: Option<PathBuf>,
         max_iterations_override: Option<u32>,
+        parallel: bool,
+        max_concurrent: Option<usize>,
+        dry_run: bool,
     ) -> Result<Self> {
         let config = OrchestratorConfig::load(config_path.as_deref())?;
         let hooks = HookRunner::new(config.get_hooks());
         // CLI override takes precedence over config file value
         let max_iterations = max_iterations_override.unwrap_or_else(|| config.get_max_iterations());
-        let agent = AgentRunner::new(config);
+        let agent = AgentRunner::new(config.clone());
 
         Ok(Self {
             agent,
+            config,
             progress: None,
             target_changes,
             initial_change_ids: None,
@@ -58,6 +71,9 @@ impl Orchestrator {
             changes_processed: 0,
             max_iterations,
             iteration: 0,
+            parallel,
+            max_concurrent,
+            dry_run,
         })
     }
 
@@ -69,10 +85,11 @@ impl Orchestrator {
     ) -> Result<Self> {
         let hooks = HookRunner::new(config.get_hooks());
         let max_iterations = config.get_max_iterations();
-        let agent = AgentRunner::new(config);
+        let agent = AgentRunner::new(config.clone());
 
         Ok(Self {
             agent,
+            config,
             progress: None,
             target_changes,
             initial_change_ids: None,
@@ -83,6 +100,9 @@ impl Orchestrator {
             changes_processed: 0,
             max_iterations,
             iteration: 0,
+            parallel: false,
+            max_concurrent: None,
+            dry_run: false,
         })
     }
 
@@ -94,6 +114,16 @@ impl Orchestrator {
         // Only changes present at this point will be processed during the run.
         // This prevents mid-run proposals from being processed before they are ready.
         let initial_changes = openspec::list_changes_native()?;
+
+        // Handle parallel mode with dry_run
+        if self.parallel && self.dry_run {
+            return self.run_parallel_dry_run(&initial_changes).await;
+        }
+
+        // Handle parallel execution mode
+        if self.parallel {
+            return self.run_parallel(&initial_changes).await;
+        }
 
         if initial_changes.is_empty() {
             info!("No changes found");
@@ -575,6 +605,153 @@ impl Orchestrator {
     pub fn set_initial_change_ids(&mut self, ids: HashSet<String>) {
         self.initial_change_ids = Some(ids);
     }
+
+    /// Run parallel mode with dry run (preview parallelization groups)
+    async fn run_parallel_dry_run(&self, changes: &[Change]) -> Result<()> {
+        info!("Running parallel mode dry run (preview only)");
+
+        // Filter to approved changes only
+        let approved: Vec<_> = changes.iter().filter(|c| c.is_approved).cloned().collect();
+
+        if approved.is_empty() {
+            println!("No approved changes found for parallel execution.");
+            for change in changes {
+                println!(
+                    "  - {} (unapproved) - use: openspec-orchestrator approve set {}",
+                    change.id, change.id
+                );
+            }
+            return Ok(());
+        }
+
+        // Use ParallelRunService to analyze groups (uses LLM if enabled)
+        let repo_root = std::env::current_dir()?;
+        let service = ParallelRunService::new(repo_root, self.config.clone());
+        let groups = service.analyze_and_group_public(&approved).await;
+
+        // Display parallelization groups
+        println!("\n=== Parallel Execution Plan (Dry Run) ===\n");
+        println!("Total changes: {}", approved.len());
+        println!("Parallelization groups: {}\n", groups.len());
+
+        for group in &groups {
+            println!("Group {} (can run in parallel):", group.id);
+            for change_id in &group.changes {
+                let change = approved.iter().find(|c| c.id == *change_id);
+                if let Some(c) = change {
+                    println!(
+                        "  - {} ({}/{} tasks, {:.1}%)",
+                        c.id,
+                        c.completed_tasks,
+                        c.total_tasks,
+                        c.progress_percent()
+                    );
+                } else {
+                    println!("  - {}", change_id);
+                }
+            }
+            if !group.depends_on.is_empty() {
+                println!("  (depends on group(s): {:?})", group.depends_on);
+            }
+            println!();
+        }
+
+        println!(
+            "Max concurrent workspaces: {}",
+            self.max_concurrent.unwrap_or(4)
+        );
+        println!("\nTo execute, run without --dry-run flag.");
+
+        Ok(())
+    }
+
+    /// Run parallel execution mode
+    async fn run_parallel(&mut self, changes: &[Change]) -> Result<()> {
+        info!("Running parallel execution mode");
+
+        // Filter to approved changes only
+        let approved: Vec<_> = changes.iter().filter(|c| c.is_approved).cloned().collect();
+
+        if approved.is_empty() {
+            info!("No approved changes found for parallel execution");
+            return Ok(());
+        }
+
+        // Store snapshot of change IDs
+        let snapshot_ids: HashSet<String> = approved.iter().map(|c| c.id.clone()).collect();
+        self.initial_change_ids = Some(snapshot_ids);
+
+        // Use ParallelRunService for the common parallel execution flow
+        let repo_root = std::env::current_dir()?;
+        let service = ParallelRunService::new(repo_root.clone(), self.config.clone());
+
+        // Check if jj is available for true parallel execution
+        match service.check_jj_available().await {
+            Ok(true) => {
+                info!("jj available, executing changes in parallel using workspaces");
+
+                // Run with a simple logging event handler for CLI mode
+                service
+                    .run_parallel(approved, |event| {
+                        // Log events for CLI mode (no TUI)
+                        use crate::parallel_executor::ParallelEvent;
+                        match event {
+                            ParallelEvent::GroupStarted { group_id, changes } => {
+                                info!("Starting group {} with {} changes", group_id, changes.len());
+                            }
+                            ParallelEvent::GroupCompleted { group_id } => {
+                                info!("Group {} completed", group_id);
+                            }
+                            ParallelEvent::ApplyCompleted { change_id, .. } => {
+                                info!("Apply completed for {}", change_id);
+                            }
+                            ParallelEvent::ApplyFailed { change_id, error } => {
+                                error!("Apply failed for {}: {}", change_id, error);
+                            }
+                            ParallelEvent::ChangeArchived { change_id } => {
+                                info!("Archived {}", change_id);
+                            }
+                            ParallelEvent::AllCompleted => {
+                                info!("All parallel execution completed");
+                            }
+                            ParallelEvent::Error { message } => {
+                                error!("Parallel execution error: {}", message);
+                            }
+                            _ => {}
+                        }
+                    })
+                    .await?;
+            }
+            Ok(false) | Err(_) => {
+                warn!("jj not available, falling back to sequential execution");
+                let groups = ParallelRunService::group_by_dependencies(&approved);
+                self.run_sequential(&approved, groups).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_sequential(
+        &mut self,
+        approved: &[Change],
+        groups: Vec<ParallelGroup>,
+    ) -> Result<()> {
+        for group in groups {
+            info!("Processing group {} sequentially", group.id);
+            for change_id in group.changes {
+                if let Some(change) = approved.iter().find(|c| c.id == change_id) {
+                    info!("Processing change: {}", change.id);
+                    if change.is_complete() {
+                        self.archive_change(change).await?;
+                    } else {
+                        self.apply_change(change).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -588,6 +765,7 @@ mod tests {
             total_tasks: total,
             last_modified: "1m ago".to_string(),
             is_approved: false,
+            dependencies: Vec::new(),
         }
     }
 

@@ -44,6 +44,16 @@ pub enum OrchestratorError {
 
     #[error("Change directory not found: {0}")]
     ChangeNotFound(String),
+
+    #[error("jj command failed: {0}")]
+    JjCommand(String),
+
+    #[error("jj conflict detected: {0}")]
+    JjConflict(String),
+
+    #[error("jj not available: {0}")]
+    #[allow(dead_code)]
+    JjNotAvailable(String),
 }
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;

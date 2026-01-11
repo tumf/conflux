@@ -9,8 +9,17 @@ use crate::config::OrchestratorConfig;
 /// Hardcoded system prompt for apply commands.
 /// This is always appended after the user-configurable apply_prompt.
 /// These instructions are non-negotiable and cannot be disabled.
-pub const APPLY_SYSTEM_PROMPT: &str =
-    "Remove out-of-scope tasks. Remove tasks that wait for or require user action.";
+pub const APPLY_SYSTEM_PROMPT: &str = "\
+Remove tasks only if they meet one of these criteria:
+- Out-of-scope: belongs to a different change/proposal
+- Requires human decision or external action (e.g., 'Ask user...', 'Deploy to production', 'Get API key')
+- Requires long waiting periods (e.g., 'Check after one week', 'Wait for approval')
+
+Do NOT remove:
+- Tests (unit/integration) - agent can write and run them
+- Linting/formatting (cargo clippy, cargo fmt) - agent can execute
+- Documentation updates - agent can write
+- Any task the agent can execute autonomously";
 use crate::error::{OrchestratorError, Result};
 use crate::history::{ApplyAttempt, ApplyHistory};
 use std::process::{ExitStatus, Stdio};
@@ -159,12 +168,12 @@ impl AgentRunner {
         self.execute_shell_command(&command).await
     }
 
-    /// Analyze dependencies using the configured analyze command
+    /// Analyze dependencies using the configured analyze command (blocking)
     pub async fn analyze_dependencies(&self, prompt: &str) -> Result<String> {
         let template = self.config.get_analyze_command();
         let command = OrchestratorConfig::expand_prompt(template, prompt);
-        info!("Running analyze command");
-        debug!("Analyze command: {}", command);
+        info!("Running analyze command: {}", template);
+        info!("Expanded command length: {} chars", command.len());
 
         let output = self.execute_shell_command_with_output(&command).await?;
 
@@ -177,8 +186,78 @@ impl AgentRunner {
         }
 
         let stdout = String::from_utf8(output.stdout)?;
-        debug!("Analysis result: {}", stdout);
-        Ok(stdout)
+        info!(
+            "Analyze command completed, output length: {} chars",
+            stdout.len()
+        );
+        debug!("Raw analysis output: {}", stdout);
+
+        // Extract result from stream-json format if applicable
+        let result = self.extract_stream_json_result(&stdout);
+        info!("Extracted result length: {} chars", result.len());
+        debug!("Extracted analysis result: {}", result);
+        Ok(result)
+    }
+
+    /// Analyze dependencies using the configured analyze command with streaming output
+    /// Returns a child process handle and a receiver for output lines
+    pub async fn analyze_dependencies_streaming(
+        &self,
+        prompt: &str,
+    ) -> Result<(Child, mpsc::Receiver<OutputLine>)> {
+        let template = self.config.get_analyze_command();
+        let command = OrchestratorConfig::expand_prompt(template, prompt);
+        info!("Running analyze command (streaming): {}", template);
+        self.execute_shell_command_streaming(&command).await
+    }
+
+    /// Execute resolve command with streaming output
+    /// Returns a child process handle and a receiver for output lines
+    pub async fn run_resolve_streaming(
+        &self,
+        prompt: &str,
+    ) -> Result<(Child, mpsc::Receiver<OutputLine>)> {
+        let template = self.config.get_resolve_command();
+        let command = OrchestratorConfig::expand_prompt(template, prompt);
+        info!("Running resolve command (streaming): {}", command);
+        self.execute_shell_command_streaming(&command).await
+    }
+
+    /// Extract the result from stream-json output format
+    /// stream-json outputs multiple JSON lines, the last one with type="result" contains the actual result
+    fn extract_stream_json_result(&self, output: &str) -> String {
+        // Try to find and parse the result line from stream-json output
+        for line in output.lines().rev() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            // Try to parse as JSON
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+                // Check if this is a result message
+                if json.get("type").and_then(|t| t.as_str()) == Some("result") {
+                    if let Some(result) = json.get("result").and_then(|r| r.as_str()) {
+                        return result.to_string();
+                    }
+                }
+                // Also check for assistant message content
+                if json.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                    if let Some(message) = json.get("message") {
+                        if let Some(content) = message.get("content").and_then(|c| c.as_array()) {
+                            for item in content {
+                                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                    return text.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If not stream-json format, return as-is
+        output.to_string()
     }
 
     /// Execute a shell command with output streaming
@@ -324,6 +403,7 @@ impl AgentRunner {
                 .arg(command)
                 .env_clear()
                 .envs(std::env::vars())
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
@@ -334,11 +414,12 @@ impl AgentRunner {
         } else {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
             Command::new(&shell)
-                .arg("-i")
+                .arg("-l")
                 .arg("-c")
                 .arg(command)
                 .env_clear()
                 .envs(std::env::vars())
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
@@ -363,6 +444,7 @@ impl AgentRunner {
                 .arg(command)
                 .env_clear()
                 .envs(std::env::vars())
+                .stdin(Stdio::null())
                 .output()
                 .await
                 .map_err(|e| {
@@ -371,11 +453,12 @@ impl AgentRunner {
         } else {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
             Command::new(&shell)
-                .arg("-i")
+                .arg("-l")
                 .arg("-c")
                 .arg(command)
                 .env_clear()
                 .envs(std::env::vars())
+                .stdin(Stdio::null())
                 .output()
                 .await
                 .map_err(|e| {
@@ -668,7 +751,8 @@ mod tests {
     #[test]
     fn test_apply_system_prompt_content() {
         // Verify the hardcoded system prompt contains expected instructions
-        assert!(APPLY_SYSTEM_PROMPT.contains("out-of-scope"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("user action"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("Out-of-scope"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("human decision"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("Do NOT remove"));
     }
 }
