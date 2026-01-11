@@ -175,6 +175,24 @@ When auto-refresh detects new changes, they SHALL be displayed appropriately.
 - **THEN** a "NEW" badge is displayed next to the change name
 - **AND** the badge is displayed in a visually prominent color
 
+#### Scenario: NEW badge cleared on selection
+
+- **WHEN** user toggles selection on a change with NEW badge in Select mode
+- **THEN** the NEW badge is removed
+- **AND** the new count in the footer is decremented
+
+#### Scenario: NEW badge cleared on approval
+
+- **WHEN** user approves a change with NEW badge (via @ key)
+- **THEN** the NEW badge is removed
+- **AND** the new count in the footer is decremented
+
+#### Scenario: NEW badge cleared on queue addition
+
+- **WHEN** user adds a change with NEW badge to the queue (Running/Stopped mode)
+- **THEN** the NEW badge is removed
+- **AND** the new count in the footer is decremented
+
 ### Requirement: Dynamic Execution Queue
 
 In running mode, unselected changes can be added to the queue, and queued changes can be removed. Added changes SHALL be processed by the orchestrator.

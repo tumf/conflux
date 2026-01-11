@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: Auto-refresh and New Change Detection
+### Requirement: New Change Detection
 
 When auto-refresh detects new changes, they SHALL be displayed appropriately.
 
