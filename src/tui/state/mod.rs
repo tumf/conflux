@@ -193,6 +193,11 @@ impl AppState {
                         // Add to queue
                         change.queue_status = QueueStatus::Queued;
                         change.selected = true;
+                        // Clear NEW flag when user adds to queue
+                        if change.is_new {
+                            change.is_new = false;
+                            self.new_change_count = self.new_change_count.saturating_sub(1);
+                        }
                         let id = change.id.clone();
                         self.add_log(LogEntry::info(format!("Added to queue: {}", id)));
                         Some(TuiCommand::AddToQueue(id))
@@ -215,6 +220,11 @@ impl AppState {
                     QueueStatus::NotQueued => {
                         change.queue_status = QueueStatus::Queued;
                         change.selected = true;
+                        // Clear NEW flag when user adds to queue
+                        if change.is_new {
+                            change.is_new = false;
+                            self.new_change_count = self.new_change_count.saturating_sub(1);
+                        }
                         let id = change.id.clone();
                         self.add_log(LogEntry::info(format!("Added to queue: {}", id)));
                         Some(TuiCommand::AddToQueue(id))
@@ -292,6 +302,11 @@ impl AppState {
     pub fn update_approval_status(&mut self, change_id: &str, is_approved: bool) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.is_approved = is_approved;
+            // Clear NEW flag when user approves/unapproves the change
+            if change.is_new {
+                change.is_new = false;
+                self.new_change_count = self.new_change_count.saturating_sub(1);
+            }
             let status_msg = if is_approved {
                 "approved"
             } else {
@@ -754,5 +769,101 @@ mod tests {
             "[@]"
         };
         assert_eq!(checkbox, "[x]");
+    }
+
+    #[test]
+    fn test_toggle_selection_clears_new_badge_in_running_mode() {
+        // Test that adding to queue in Running mode clears the NEW badge
+        let changes = vec![create_approved_change("new-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Mark as new and set new_change_count
+        app.changes[0].is_new = true;
+        app.new_change_count = 1;
+
+        // Start processing to enter Running mode
+        app.start_processing();
+        assert_eq!(app.mode, AppMode::Running);
+
+        // Remove from queue first so we can test adding
+        let _ = app.toggle_selection();
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+
+        // Reset new state for the add-to-queue test
+        app.changes[0].is_new = true;
+        app.new_change_count = 1;
+
+        // Add to queue should clear NEW flag
+        let cmd = app.toggle_selection();
+        assert!(matches!(cmd, Some(TuiCommand::AddToQueue(_))));
+        assert!(!app.changes[0].is_new);
+        assert_eq!(app.new_change_count, 0);
+    }
+
+    #[test]
+    fn test_toggle_selection_clears_new_badge_in_stopped_mode() {
+        // Test that adding to queue in Stopped mode clears the NEW badge
+        let changes = vec![create_approved_change("new-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Mark as new and set new_change_count
+        app.changes[0].is_new = true;
+        app.new_change_count = 1;
+
+        // Start processing and then stop
+        app.start_processing();
+        app.mode = AppMode::Stopped;
+
+        // Remove from queue first
+        let _ = app.toggle_selection();
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+
+        // Reset new state for the add-to-queue test
+        app.changes[0].is_new = true;
+        app.new_change_count = 1;
+
+        // Add to queue should clear NEW flag
+        let cmd = app.toggle_selection();
+        assert!(matches!(cmd, Some(TuiCommand::AddToQueue(_))));
+        assert!(!app.changes[0].is_new);
+        assert_eq!(app.new_change_count, 0);
+    }
+
+    #[test]
+    fn test_update_approval_status_clears_new_badge_on_approve() {
+        // Test that approving a change clears the NEW badge
+        let changes = vec![create_test_change("new-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Mark as new and set new_change_count
+        app.changes[0].is_new = true;
+        app.new_change_count = 1;
+
+        // Approve the change
+        app.update_approval_status("new-change", true);
+
+        // NEW flag should be cleared
+        assert!(!app.changes[0].is_new);
+        assert_eq!(app.new_change_count, 0);
+        assert!(app.changes[0].is_approved);
+    }
+
+    #[test]
+    fn test_update_approval_status_clears_new_badge_on_unapprove() {
+        // Test that unapproving a change also clears the NEW badge
+        let changes = vec![create_approved_change("new-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Mark as new and set new_change_count
+        app.changes[0].is_new = true;
+        app.new_change_count = 1;
+
+        // Unapprove the change
+        app.update_approval_status("new-change", false);
+
+        // NEW flag should be cleared
+        assert!(!app.changes[0].is_new);
+        assert_eq!(app.new_change_count, 0);
+        assert!(!app.changes[0].is_approved);
     }
 }
