@@ -1,0 +1,23 @@
+## 1. AGENTS.md の Project Structure 更新
+
+- [ ] 1.1 現在の src/ ディレクトリ構造を反映
+- [ ] 1.2 存在しないモジュール（`opencode.rs`, `state.rs`）を削除
+- [ ] 1.3 新規モジュールを追加し説明を付与:
+  - `analyzer.rs` - Change dependency analyzer for parallel execution
+  - `config.rs` - Configuration file loading and management
+  - `hooks.rs` - Lifecycle hook execution
+  - `vcs_backend.rs` - VCS backend trait abstraction
+  - `jj_commands.rs` - jj command wrappers
+  - `git_commands.rs` - Git command wrappers
+  - `history.rs` - Apply context history management
+  - `task_parser.rs` - Native task.md parser
+  - `jj_workspace.rs` - jj workspace management
+  - `git_workspace.rs` - Git worktree management
+  - `parallel_run_service.rs` - Parallel execution service
+  - `agent.rs` - AI agent command execution
+  - `approval.rs` - Change approval management
+  - `parallel_executor.rs` - Parallel change executor
+  - `templates.rs` - Configuration templates
+- [ ] 1.4 tui/ サブディレクトリ構造を追加
+- [ ] 1.5 Key Dependencies 表に `async-trait` を追加
+- [ ] 1.6 State File Location セクションを現状に合わせて更新
