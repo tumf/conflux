@@ -96,6 +96,7 @@ pub async fn get_current_revision<P: AsRef<Path>>(cwd: P) -> Result<String> {
 }
 
 /// Check if jj is available and the directory is a jj repository.
+#[allow(dead_code)] // Reserved for future use in workspace initialization
 pub async fn check_jj_repo<P: AsRef<Path>>(cwd: P) -> Result<bool> {
     // Check jj --version
     let version_result = Command::new("jj")

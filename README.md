@@ -14,7 +14,7 @@ Automates the OpenSpec change workflow: list → dependency analysis → apply �
 - 🔌 **Multi-Agent Support**: Works with Claude Code, OpenCode, and Codex
 - 🪝 **Lifecycle Hooks**: Configurable hooks for custom actions at each workflow stage
 - ✅ **Approval Workflow**: Approve changes with checksum validation before processing
-- ⚡ **Parallel Execution**: Process multiple independent changes simultaneously using jj workspaces
+- ⚡ **Parallel Execution**: Process multiple independent changes simultaneously using jj workspaces or Git worktrees
 
 ## Architecture
 
@@ -409,7 +409,70 @@ Options:
   --change <ID,...>     Process only specified changes (comma-separated)
   -c, --config <PATH>   Custom configuration file path (JSONC)
   --openspec-cmd <CMD>  Custom openspec command [env: OPENSPEC_CMD]
+  --parallel            Enable parallel execution mode
+  --max-concurrent <N>  Maximum concurrent workspaces (default: 3)
+  --vcs <BACKEND>       VCS backend: auto, jj, or git (default: auto)
+  --dry-run             Preview parallelization groups without executing
 ```
+
+### Parallel Execution
+
+The orchestrator supports parallel execution of independent changes using either jj workspaces or Git worktrees.
+
+**VCS Backend Selection:**
+
+| Backend | Description | Requirements |
+|---------|-------------|--------------|
+| `auto` | Auto-detect (jj preferred, then Git) | Either jj or Git repository |
+| `jj` | Use jj workspaces | jj repository (.jj directory) |
+| `git` | Use Git worktrees | Git repository with clean working directory |
+
+**Usage:**
+
+```bash
+# Auto-detect VCS backend (default)
+openspec-orchestrator run --parallel
+
+# Force Git worktrees
+openspec-orchestrator run --parallel --vcs git
+
+# Force jj workspaces
+openspec-orchestrator run --parallel --vcs jj
+
+# Preview parallelization groups without executing
+openspec-orchestrator run --parallel --dry-run
+
+# Limit concurrent workspaces
+openspec-orchestrator run --parallel --max-concurrent 5
+```
+
+**Configuration:**
+
+You can also set the VCS backend in your configuration file:
+
+```jsonc
+{
+  // VCS backend for parallel execution: "auto", "jj", or "git"
+  "vcs_backend": "auto",
+
+  // Maximum concurrent workspaces
+  "max_concurrent_workspaces": 3
+}
+```
+
+**Git Requirements:**
+
+When using Git worktrees:
+- Working directory must be clean (no uncommitted changes)
+- Each change runs in an isolated worktree with its own branch
+- Changes are merged back sequentially after completion
+
+**jj Requirements:**
+
+When using jj workspaces:
+- Working copy changes are automatically snapshotted
+- Each change runs in an isolated workspace
+- Changes are merged using jj's conflict-free merge
 
 **Init subcommand options:**
 ```
@@ -463,7 +526,7 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for build instructions, testing, and projec
 ## Future Enhancements
 
 - [ ] State persistence for recovery and resumption
-- [x] Parallel execution for independent changes (using jj workspaces)
+- [x] Parallel execution for independent changes (using jj workspaces or Git worktrees)
 - [ ] Slack/Discord notifications
 - [ ] Maximum iteration limit (prevent infinite loops)
 - [ ] Manual priority override

@@ -74,6 +74,7 @@ async fn run_tui_loop(
     use crate::openspec;
 
     let mut app = AppState::new(initial_changes);
+    app.max_concurrent = config.get_max_concurrent_workspaces();
     let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(100);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<TuiCommand>(100);
 
@@ -204,9 +205,12 @@ async fn run_tui_loop(
                                     if let Some(cancel) = &orchestrator_cancel {
                                         cancel.cancel();
                                     }
-                                    // Reset any Processing change back to Queued
+                                    // Reset any in-flight change back to Queued
                                     for change in &mut app.changes {
-                                        if matches!(change.queue_status, QueueStatus::Processing) {
+                                        if matches!(
+                                            change.queue_status,
+                                            QueueStatus::Processing | QueueStatus::Archiving
+                                        ) {
                                             change.queue_status = QueueStatus::Queued;
                                         }
                                     }

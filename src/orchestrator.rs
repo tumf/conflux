@@ -6,6 +6,7 @@ use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::parallel_run_service::ParallelRunService;
 use crate::progress::ProgressDisplay;
+use crate::vcs_backend::VcsBackend;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
@@ -40,6 +41,9 @@ pub struct Orchestrator {
     max_concurrent: Option<usize>,
     /// Dry run mode (preview without execution)
     dry_run: bool,
+    /// VCS backend for parallel execution
+    #[allow(dead_code)] // Will be passed to ParallelRunService in future
+    vcs_backend: VcsBackend,
 }
 
 impl Orchestrator {
@@ -51,12 +55,15 @@ impl Orchestrator {
         parallel: bool,
         max_concurrent: Option<usize>,
         dry_run: bool,
+        vcs_override: Option<VcsBackend>,
     ) -> Result<Self> {
         let config = OrchestratorConfig::load(config_path.as_deref())?;
         let hooks = HookRunner::new(config.get_hooks());
         // CLI override takes precedence over config file value
         let max_iterations = max_iterations_override.unwrap_or_else(|| config.get_max_iterations());
         let agent = AgentRunner::new(config.clone());
+        // VCS backend: CLI override takes precedence, then config, then auto
+        let vcs_backend = vcs_override.unwrap_or_else(|| config.get_vcs_backend());
 
         Ok(Self {
             agent,
@@ -74,6 +81,7 @@ impl Orchestrator {
             parallel,
             max_concurrent,
             dry_run,
+            vcs_backend,
         })
     }
 
@@ -103,6 +111,7 @@ impl Orchestrator {
             parallel: false,
             max_concurrent: None,
             dry_run: false,
+            vcs_backend: VcsBackend::Auto,
         })
     }
 
@@ -685,8 +694,8 @@ impl Orchestrator {
         let repo_root = std::env::current_dir()?;
         let service = ParallelRunService::new(repo_root.clone(), self.config.clone());
 
-        // Check if jj is available for true parallel execution
-        match service.check_jj_available().await {
+        // Check if VCS is available for true parallel execution
+        match service.check_vcs_available().await {
             Ok(true) => {
                 info!("jj available, executing changes in parallel using workspaces");
 

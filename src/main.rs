@@ -4,6 +4,8 @@ mod approval;
 mod cli;
 mod config;
 mod error;
+mod git_commands;
+mod git_workspace;
 mod history;
 mod hooks;
 mod jj_commands;
@@ -16,6 +18,7 @@ mod progress;
 mod task_parser;
 mod templates;
 mod tui;
+mod vcs_backend;
 
 use clap::Parser;
 use cli::{ApproveAction, Cli, Commands};
@@ -96,6 +99,9 @@ async fn main() -> Result<()> {
             // Initialize tracing for non-interactive mode
             tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
+            // Parse VCS backend from CLI option
+            let vcs_override = args.vcs.parse().ok();
+
             info!("Starting orchestrator");
             let mut orchestrator = Orchestrator::new(
                 args.change,
@@ -104,6 +110,7 @@ async fn main() -> Result<()> {
                 args.parallel,
                 args.max_concurrent,
                 args.dry_run,
+                vcs_override,
             )?;
             orchestrator.run().await?;
         }

@@ -8,6 +8,7 @@
 
 use crate::error::{OrchestratorError, Result};
 use crate::hooks::HooksConfig;
+use crate::vcs_backend::VcsBackend;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -126,6 +127,14 @@ pub struct OrchestratorConfig {
     /// When false, skips analysis and runs all changes in parallel (no dependency inference).
     #[serde(default)]
     pub use_llm_analysis: Option<bool>,
+
+    /// VCS backend to use for parallel execution.
+    /// Options: "auto" (default), "jj", "git"
+    /// - auto: Automatically detect (jj preferred, then Git)
+    /// - jj: Use jj workspaces (requires jj repository)
+    /// - git: Use git worktrees (requires clean working directory)
+    #[serde(default)]
+    pub vcs_backend: Option<VcsBackend>,
 }
 
 impl OrchestratorConfig {
@@ -212,6 +221,12 @@ impl OrchestratorConfig {
     /// Set to false to skip LLM analysis and run all changes in parallel.
     pub fn use_llm_analysis(&self) -> bool {
         self.use_llm_analysis.unwrap_or(true)
+    }
+
+    /// Get the VCS backend to use for parallel execution.
+    /// Default: Auto (automatically detect jj or Git)
+    pub fn get_vcs_backend(&self) -> VcsBackend {
+        self.vcs_backend.unwrap_or(VcsBackend::Auto)
     }
 
     /// Expand `{conflict_files}` placeholder in a command template
