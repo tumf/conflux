@@ -19,6 +19,3 @@
 - [ ] 4.2 Implement `run_parallel()` method with callback-based events
 - [ ] 4.3 Migrate CLI `run_parallel()` to use service
 - [ ] 4.4 Migrate TUI `run_orchestrator_parallel()` to use service
-
-## 5. Cleanup
-- [ ] 5.1 Remove duplicate `group_by_dependencies()` implementations
