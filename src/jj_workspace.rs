@@ -197,7 +197,15 @@ impl JjWorkspaceManager {
     /// Get the current jj revision
     pub async fn get_current_revision(&self) -> Result<String> {
         let output = Command::new("jj")
-            .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
+            .args([
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "--ignore-working-copy",
+                "-T",
+                "change_id",
+            ])
             .current_dir(&self.repo_root)
             .stdin(Stdio::null())
             .output()
@@ -312,7 +320,15 @@ impl JjWorkspaceManager {
     #[allow(dead_code)]
     pub async fn get_workspace_revision(&self, workspace: &JjWorkspace) -> Result<String> {
         let output = Command::new("jj")
-            .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
+            .args([
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "--ignore-working-copy",
+                "-T",
+                "change_id",
+            ])
             .current_dir(&workspace.path)
             .stdin(Stdio::null())
             .output()

@@ -585,17 +585,28 @@ impl ParallelExecutor {
         }
 
         // Get the resulting revision
+        // Use --ignore-working-copy to avoid triggering automatic snapshot
         let revision_output = Command::new("jj")
-            .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
+            .args([
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "--ignore-working-copy",
+                "-T",
+                "change_id",
+            ])
             .current_dir(workspace_path)
             .output()
             .await
             .map_err(|e| OrchestratorError::JjCommand(format!("Failed to get revision: {}", e)))?;
 
         if !revision_output.status.success() {
-            return Err(OrchestratorError::JjCommand(
-                "Failed to get workspace revision".to_string(),
-            ));
+            let stderr = String::from_utf8_lossy(&revision_output.stderr);
+            return Err(OrchestratorError::JjCommand(format!(
+                "Failed to get workspace revision: {}",
+                stderr
+            )));
         }
 
         Ok(String::from_utf8_lossy(&revision_output.stdout)
@@ -798,8 +809,17 @@ impl ParallelExecutor {
             .await;
 
         // Get the new revision
+        // Use --ignore-working-copy to avoid triggering automatic snapshot
         let revision_output = Command::new("jj")
-            .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
+            .args([
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "--ignore-working-copy",
+                "-T",
+                "change_id",
+            ])
             .current_dir(workspace_path)
             .stdin(Stdio::null())
             .output()
@@ -807,9 +827,11 @@ impl ParallelExecutor {
             .map_err(|e| OrchestratorError::JjCommand(format!("Failed to get revision: {}", e)))?;
 
         if !revision_output.status.success() {
-            return Err(OrchestratorError::JjCommand(
-                "Failed to get workspace revision after archive".to_string(),
-            ));
+            let stderr = String::from_utf8_lossy(&revision_output.stderr);
+            return Err(OrchestratorError::JjCommand(format!(
+                "Failed to get workspace revision after archive: {}",
+                stderr
+            )));
         }
 
         Ok(String::from_utf8_lossy(&revision_output.stdout)
