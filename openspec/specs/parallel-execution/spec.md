@@ -60,6 +60,27 @@ The bridge SHALL be a pure function with no side effects, enabling isolated test
   - `OrchestratorEvent::Log(LogEntry::error("Apply failed: {error}").with_change_id(&change_id))`
   - `OrchestratorEvent::ProcessingError { id: change_id, error }`
 
+#### Scenario: ArchiveStarted event mapping
+
+- **WHEN** a `ParallelEvent::ArchiveStarted { change_id }` is received
+- **THEN** the bridge SHALL return:
+  - `OrchestratorEvent::Log(LogEntry::info("Archiving...").with_change_id(&change_id))`
+  - `OrchestratorEvent::ArchiveStarted(change_id)`
+
+#### Scenario: ChangeArchived event mapping
+
+- **WHEN** a `ParallelEvent::ChangeArchived { change_id }` is received
+- **THEN** the bridge SHALL return:
+  - `OrchestratorEvent::Log(LogEntry::success("Archived").with_change_id(&change_id))`
+  - `OrchestratorEvent::ChangeArchived(change_id)`
+
+#### Scenario: ArchiveFailed event mapping
+
+- **WHEN** a `ParallelEvent::ArchiveFailed { change_id, error }` is received
+- **THEN** the bridge SHALL return:
+  - `OrchestratorEvent::Log(LogEntry::error("Archive failed: {error}").with_change_id(&change_id))`
+  - `OrchestratorEvent::ProcessingError { id: change_id, error }`
+
 ### Requirement: Apply Loop Helper Functions
 
 The system SHALL provide helper functions to separate concerns in the apply loop:

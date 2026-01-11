@@ -163,9 +163,15 @@ pub fn convert(event: ParallelEvent) -> Vec<OrchestratorEvent> {
             OrchestratorEvent::ChangeArchived(change_id),
         ],
 
-        ParallelEvent::ArchiveFailed { change_id, error } => vec![OrchestratorEvent::Log(
-            LogEntry::error(format!("Archive failed: {}", error)).with_change_id(&change_id),
-        )],
+        ParallelEvent::ArchiveFailed { change_id, error } => vec![
+            OrchestratorEvent::Log(
+                LogEntry::error(format!("Archive failed: {}", error)).with_change_id(&change_id),
+            ),
+            OrchestratorEvent::ProcessingError {
+                id: change_id,
+                error,
+            },
+        ],
 
         ParallelEvent::AllCompleted => {
             // This is handled specially in the orchestrator
@@ -249,5 +255,35 @@ mod tests {
         let event = ParallelEvent::AllCompleted;
         let events = convert(event);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_convert_archive_failed_generates_log_and_processing_error() {
+        let event = ParallelEvent::ArchiveFailed {
+            change_id: "test-change".to_string(),
+            error: "disk full".to_string(),
+        };
+
+        let events = convert(event);
+        assert_eq!(events.len(), 2);
+
+        // First event should be a log with error message
+        match &events[0] {
+            OrchestratorEvent::Log(entry) => {
+                assert!(entry.message.contains("Archive failed"));
+                assert!(entry.message.contains("disk full"));
+                assert_eq!(entry.change_id, Some("test-change".to_string()));
+            }
+            _ => panic!("Expected Log event"),
+        }
+
+        // Second event should be ProcessingError
+        match &events[1] {
+            OrchestratorEvent::ProcessingError { id, error } => {
+                assert_eq!(id, "test-change");
+                assert_eq!(error, "disk full");
+            }
+            _ => panic!("Expected ProcessingError event"),
+        }
     }
 }
