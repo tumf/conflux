@@ -107,6 +107,12 @@ pub struct OrchestratorConfig {
     /// - git: Use git worktrees (requires clean working directory)
     #[serde(default)]
     pub vcs_backend: Option<VcsBackend>,
+
+    /// Command template for proposing new changes from TUI.
+    /// Supports `{proposal}` placeholder for the proposal text.
+    /// Example: "opencode run '{proposal}'"
+    #[serde(default)]
+    pub propose_command: Option<String>,
 }
 
 impl OrchestratorConfig {
@@ -199,6 +205,17 @@ impl OrchestratorConfig {
     /// Default: Auto (automatically detect jj or Git)
     pub fn get_vcs_backend(&self) -> VcsBackend {
         self.vcs_backend.unwrap_or(VcsBackend::Auto)
+    }
+
+    /// Get the propose command template, if configured.
+    /// Returns None if not set (propose feature is disabled).
+    pub fn get_propose_command(&self) -> Option<&str> {
+        self.propose_command.as_deref()
+    }
+
+    /// Expand `{proposal}` placeholder in a command template.
+    pub fn expand_proposal(template: &str, proposal: &str) -> String {
+        expand::expand_proposal(template, proposal)
     }
 
     /// Expand `{conflict_files}` placeholder in a command template
@@ -637,5 +654,50 @@ mod tests {
         let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
         assert_eq!(config.max_iterations, Some(0));
         assert_eq!(config.get_max_iterations(), 0);
+    }
+
+    #[test]
+    fn test_get_propose_command_default() {
+        let config = OrchestratorConfig::default();
+        assert!(config.get_propose_command().is_none());
+    }
+
+    #[test]
+    fn test_get_propose_command_configured() {
+        let config = OrchestratorConfig {
+            propose_command: Some("claude -p '/openspec:proposal {proposal}'".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.get_propose_command(),
+            Some("claude -p '/openspec:proposal {proposal}'")
+        );
+    }
+
+    #[test]
+    fn test_parse_jsonc_with_propose_command() {
+        let jsonc = r#"{
+            "propose_command": "opencode run '/openspec:proposal {proposal}'"
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        assert_eq!(
+            config.propose_command,
+            Some("opencode run '/openspec:proposal {proposal}'".to_string())
+        );
+    }
+
+    #[test]
+    fn test_expand_proposal_simple() {
+        let template = "claude -p '{proposal}'";
+        let result = OrchestratorConfig::expand_proposal(template, "Add login feature");
+        assert_eq!(result, "claude -p 'Add login feature'");
+    }
+
+    #[test]
+    fn test_expand_proposal_multiline() {
+        let template = "claude -p '{proposal}'";
+        let proposal = "Add login feature\n- Username\n- Password";
+        let result = OrchestratorConfig::expand_proposal(template, proposal);
+        assert_eq!(result, "claude -p 'Add login feature\n- Username\n- Password'");
     }
 }

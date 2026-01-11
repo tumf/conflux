@@ -29,6 +29,10 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
 
+  // Command to propose new changes from TUI (+ key)
+  // Supports {proposal} placeholder for the proposal text
+  // "propose_command": "claude --dangerously-skip-permissions --verbose -p '/openspec:proposal {proposal}'",
+
   // Lifecycle hooks (optional)
   // Available hooks:
   //   Run lifecycle: on_start, on_finish, on_error
@@ -69,6 +73,10 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
 
+  // Command to propose new changes from TUI (+ key)
+  // Supports {proposal} placeholder for the proposal text
+  // "propose_command": "opencode run '/openspec:proposal {proposal}'",
+
   // Lifecycle hooks (optional)
   // Available hooks:
   //   Run lifecycle: on_start, on_finish, on_error
@@ -108,6 +116,10 @@ pub const CODEX_TEMPLATE: &str = r#"{
 
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
+
+  // Command to propose new changes from TUI (+ key)
+  // Supports {proposal} placeholder for the proposal text
+  // "propose_command": "codex '/openspec:proposal {proposal}'",
 
   // Lifecycle hooks (optional)
   // Available hooks:

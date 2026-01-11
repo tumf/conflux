@@ -12,6 +12,7 @@ use crate::openspec::Change;
 use ratatui::widgets::ListState;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
+use tui_textarea::TextArea;
 
 use super::events::{LogEntry, TuiCommand};
 use super::types::{AppMode, QueueStatus, StopMode};
@@ -68,6 +69,10 @@ pub struct AppState {
     pub orchestration_started_at: Option<Instant>,
     /// Total elapsed time when orchestration finished
     pub orchestration_elapsed: Option<Duration>,
+    /// Text area for proposal input (only present in Proposing mode)
+    pub propose_textarea: Option<TextArea<'static>>,
+    /// Mode to return to after exiting Proposing mode
+    pub previous_mode: Option<AppMode>,
 }
 
 impl AppState {
@@ -128,6 +133,58 @@ impl AppState {
             max_concurrent: 4, // Default value, can be overridden from config
             orchestration_started_at: None,
             orchestration_elapsed: None,
+            propose_textarea: None,
+            previous_mode: None,
+        }
+    }
+
+    /// Create a new TextArea for proposal input
+    fn create_propose_textarea() -> TextArea<'static> {
+        TextArea::default()
+    }
+
+    /// Start proposing mode (enter text input for new proposal)
+    pub fn start_proposing(&mut self) {
+        self.previous_mode = Some(self.mode.clone());
+        self.mode = AppMode::Proposing;
+        self.propose_textarea = Some(Self::create_propose_textarea());
+    }
+
+    /// Cancel proposing mode and return to previous mode
+    pub fn cancel_proposing(&mut self) {
+        self.propose_textarea = None;
+        if let Some(mode) = self.previous_mode.take() {
+            self.mode = mode;
+        } else {
+            self.mode = AppMode::Select;
+        }
+    }
+
+    /// Submit proposal and return the proposal text
+    /// Returns None if textarea is empty or not in Proposing mode
+    pub fn submit_proposal(&mut self) -> Option<String> {
+        if self.mode != AppMode::Proposing {
+            return None;
+        }
+
+        let text = self
+            .propose_textarea
+            .as_ref()
+            .map(|ta| ta.lines().join("\n"))
+            .unwrap_or_default();
+
+        // Cancel proposing mode
+        self.propose_textarea = None;
+        if let Some(mode) = self.previous_mode.take() {
+            self.mode = mode;
+        } else {
+            self.mode = AppMode::Select;
+        }
+
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
         }
     }
 
@@ -239,7 +296,7 @@ impl AppState {
                     _ => None,
                 }
             }
-            AppMode::Stopping | AppMode::Error => None,
+            AppMode::Stopping | AppMode::Error | AppMode::Proposing => None,
         }
     }
 
@@ -294,7 +351,7 @@ impl AppState {
                     Some(TuiCommand::UnapproveAndDequeue(id))
                 }
             }
-            AppMode::Stopping | AppMode::Error => None,
+            AppMode::Stopping | AppMode::Error | AppMode::Proposing => None,
         }
     }
 
@@ -906,5 +963,117 @@ mod tests {
             cmd,
             Some(TuiCommand::UnapproveAndDequeue(ref id)) if id == "approved-change"
         ));
+    }
+
+    #[test]
+    fn test_start_proposing_mode_transition() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        assert_eq!(app.mode, AppMode::Select);
+        assert!(app.propose_textarea.is_none());
+        assert!(app.previous_mode.is_none());
+
+        app.start_proposing();
+
+        assert_eq!(app.mode, AppMode::Proposing);
+        assert!(app.propose_textarea.is_some());
+        assert_eq!(app.previous_mode, Some(AppMode::Select));
+    }
+
+    #[test]
+    fn test_cancel_proposing_returns_to_previous_mode() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start from Running mode
+        app.mode = AppMode::Running;
+        app.start_proposing();
+
+        assert_eq!(app.mode, AppMode::Proposing);
+        assert_eq!(app.previous_mode, Some(AppMode::Running));
+
+        app.cancel_proposing();
+
+        assert_eq!(app.mode, AppMode::Running);
+        assert!(app.propose_textarea.is_none());
+        assert!(app.previous_mode.is_none());
+    }
+
+    #[test]
+    fn test_submit_proposal_returns_text() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_proposing();
+
+        // Insert some text into the textarea
+        if let Some(ref mut textarea) = app.propose_textarea {
+            textarea.insert_str("Add authentication feature");
+        }
+
+        let result = app.submit_proposal();
+
+        assert_eq!(result, Some("Add authentication feature".to_string()));
+        assert_eq!(app.mode, AppMode::Select);
+        assert!(app.propose_textarea.is_none());
+    }
+
+    #[test]
+    fn test_submit_proposal_returns_none_for_empty_text() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_proposing();
+
+        // Don't insert any text
+
+        let result = app.submit_proposal();
+
+        assert!(result.is_none());
+        assert_eq!(app.mode, AppMode::Select);
+    }
+
+    #[test]
+    fn test_submit_proposal_trims_whitespace() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_proposing();
+
+        // Insert only whitespace
+        if let Some(ref mut textarea) = app.propose_textarea {
+            textarea.insert_str("   \n\t  ");
+        }
+
+        let result = app.submit_proposal();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_toggle_selection_does_nothing_in_proposing_mode() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_proposing();
+        assert_eq!(app.mode, AppMode::Proposing);
+
+        // Toggle should return None in Proposing mode
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+    }
+
+    #[test]
+    fn test_toggle_approval_does_nothing_in_proposing_mode() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_proposing();
+        assert_eq!(app.mode, AppMode::Proposing);
+
+        // Toggle approval should return None in Proposing mode
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_none());
     }
 }

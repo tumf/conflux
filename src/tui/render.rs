@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
     Frame,
 };
 use std::time::Duration;
@@ -73,6 +73,11 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
     } else {
         render_running_mode(frame, app, area);
     }
+
+    // Render proposal modal on top if in Proposing mode
+    if app.mode == AppMode::Proposing {
+        render_propose_modal(frame, app, area);
+    }
 }
 
 /// Render selection mode
@@ -125,6 +130,7 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Stopping => "Stopping...",
         AppMode::Stopped => "Stopped",
         AppMode::Error => "Error",
+        AppMode::Proposing => "Proposing",
     };
 
     let mode_color = match app.mode {
@@ -133,6 +139,7 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Stopping => Color::Yellow,
         AppMode::Stopped => Color::DarkGray,
         AppMode::Error => Color::Red,
+        AppMode::Proposing => Color::Magenta,
     };
 
     // Build header spans
@@ -430,6 +437,7 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Select if all_completed => ("Done".to_string(), Color::Green),
         AppMode::Select => ("Ready".to_string(), Color::DarkGray),
         AppMode::Stopped => ("Stopped".to_string(), Color::DarkGray),
+        AppMode::Proposing => ("Proposing".to_string(), Color::Magenta),
         AppMode::Running | AppMode::Stopping => {
             // Count changes that are currently processing or archiving
             let processing_count = app
@@ -479,6 +487,7 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         ),
         AppMode::Select => ("", Color::White),
         AppMode::Error => ("Press F5 to retry, or 'q' to quit.", Color::Yellow),
+        AppMode::Proposing => ("Ctrl+S: submit, Esc: cancel", Color::Magenta),
     };
 
     // Calculate overall progress for all queued changes (including completed/archived)
@@ -706,6 +715,42 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
             .border_style(Style::default().fg(Color::Blue)),
     );
     frame.render_widget(footer, area);
+}
+
+/// Render the proposal input modal
+fn render_propose_modal(frame: &mut Frame, app: &mut AppState, area: Rect) {
+    // Calculate modal dimensions (centered, 60% width, 50% height)
+    let modal_width = (area.width * 60 / 100).min(80).max(40);
+    let modal_height = (area.height * 50 / 100).min(20).max(8);
+    let modal_x = (area.width - modal_width) / 2;
+    let modal_y = (area.height - modal_height) / 2;
+
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+    // Clear the modal area background
+    frame.render_widget(Clear, modal_area);
+
+    // Render textarea if available
+    if let Some(ref textarea) = app.propose_textarea {
+        // Build the border block first
+        let block = Block::default()
+            .title(" New Proposal (Ctrl+S: submit, Esc: cancel) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta));
+
+        // Calculate inner area for text content
+        let inner_area = block.inner(modal_area);
+        frame.render_widget(block, modal_area);
+
+        // Render text content line by line
+        let lines: Vec<Line> = textarea
+            .lines()
+            .iter()
+            .map(|s| Line::from(s.as_str()))
+            .collect();
+        let text = Paragraph::new(lines);
+        frame.render_widget(text, inner_area);
+    }
 }
 
 #[cfg(test)]

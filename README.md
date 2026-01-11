@@ -94,11 +94,18 @@ Changes have two independent states: **approval** and **selection/queue**.
 | `Space` | Toggle selection | Add/remove from queue |
 | `@` | Toggle approval | Toggle approval |
 | `e` | Open editor | Open editor |
+| `+` | New proposal | New proposal |
 | `F5` | Start processing | - |
 | `=` | Toggle parallel mode | - |
 | `Esc` | - | Stop (graceful/force) |
 | `q` | Quit | Quit |
 | `PageUp/Down` | - | Scroll logs |
+
+**Proposal Mode:**
+| Key | Action |
+|-----|--------|
+| `Ctrl+S` | Submit proposal |
+| `Esc` | Cancel and return |
 
 ### Initialize Configuration
 
@@ -238,6 +245,10 @@ This allows you to use different AI tools (Claude Code, OpenCode, Codex, etc.) w
   // System prompt for archive command (injected into {prompt} placeholder)
   "archive_prompt": "",
 
+  // Command to propose new changes from TUI (+ key)
+  // Supports {proposal} placeholder for the proposal text
+  "propose_command": "claude --dangerously-skip-permissions --verbose -p '/openspec:proposal {proposal}'",
+
   // Lifecycle hooks (optional)
   "hooks": {
     // "pre_apply": "echo 'Starting {change_id}'",
@@ -252,6 +263,7 @@ This allows you to use different AI tools (Claude Code, OpenCode, Codex, etc.) w
 |-------------|-------------|---------|
 | `{change_id}` | The change ID being processed | apply_command, archive_command |
 | `{prompt}` | System prompt for agent commands | apply_command, archive_command, analyze_command |
+| `{proposal}` | Proposal text from TUI input | propose_command |
 
 **System Prompts:**
 

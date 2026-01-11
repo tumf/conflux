@@ -32,6 +32,19 @@ pub fn expand_conflict_files(template: &str, conflict_files: &str) -> String {
     template.replace("{conflict_files}", conflict_files)
 }
 
+/// Expand `{proposal}` placeholder in a command template for proposing new changes.
+///
+/// # Example
+///
+/// ```ignore
+/// let template = "opencode run '{proposal}'";
+/// let result = expand_proposal(template, "Add user authentication feature");
+/// assert_eq!(result, "opencode run 'Add user authentication feature'");
+/// ```
+pub fn expand_proposal(template: &str, proposal: &str) -> String {
+    template.replace("{proposal}", proposal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +104,20 @@ mod tests {
         let template = "resolve --files {conflict_files}";
         let result = expand_conflict_files(template, "file1.rs,file2.rs");
         assert_eq!(result, "resolve --files file1.rs,file2.rs");
+    }
+
+    #[test]
+    fn test_expand_proposal() {
+        let template = "opencode run '{proposal}'";
+        let result = expand_proposal(template, "Add user authentication feature");
+        assert_eq!(result, "opencode run 'Add user authentication feature'");
+    }
+
+    #[test]
+    fn test_expand_proposal_multiline() {
+        let template = "claude '{proposal}'";
+        let text = "Feature request:\n- Add login\n- Add logout";
+        let result = expand_proposal(template, text);
+        assert_eq!(result, "claude 'Feature request:\n- Add login\n- Add logout'");
     }
 }

@@ -29,6 +29,8 @@ pub enum AppMode {
     Stopped,
     /// Error mode - an error occurred during processing
     Error,
+    /// Proposing mode - user is entering a new proposal
+    Proposing,
 }
 
 /// Queue status for a change

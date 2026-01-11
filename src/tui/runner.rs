@@ -137,6 +137,39 @@ async fn run_tui_loop(
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    // Handle Proposing mode separately (textarea input)
+                    if app.mode == AppMode::Proposing {
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Esc, _) => {
+                                app.cancel_proposing();
+                            }
+                            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                                if let Some(proposal) = app.submit_proposal() {
+                                    let _ = cmd_tx.send(TuiCommand::SubmitProposal(proposal)).await;
+                                }
+                            }
+                            (KeyCode::Char(_), _)
+                            | (KeyCode::Backspace, _)
+                            | (KeyCode::Delete, _)
+                            | (KeyCode::Enter, _)
+                            | (KeyCode::Left, _)
+                            | (KeyCode::Right, _)
+                            | (KeyCode::Up, _)
+                            | (KeyCode::Down, _)
+                            | (KeyCode::Home, _)
+                            | (KeyCode::End, _) => {
+                                if let Some(ref mut textarea) = app.propose_textarea {
+                                    // Convert crossterm KeyEvent to tui-textarea Input
+                                    use tui_textarea::Input;
+                                    let input: Input = key.into();
+                                    textarea.input(input);
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     match (key.code, key.modifiers) {
                         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             app.should_quit = true;
@@ -325,6 +358,17 @@ async fn run_tui_loop(
                             // Toggle parallel mode (only if jj is available)
                             app.toggle_parallel_mode();
                         }
+                        (KeyCode::Char('+'), _) => {
+                            // Enter propose mode if propose_command is configured
+                            if config.get_propose_command().is_some() {
+                                app.start_proposing();
+                            } else {
+                                app.warning_message = Some(
+                                    "propose_command not configured in .openspec-orchestrator.jsonc"
+                                        .to_string(),
+                                );
+                            }
+                        }
                         _ => {}
                     }
                     // Clear warning message on any key press
@@ -449,6 +493,56 @@ async fn run_tui_loop(
                                 id, e
                             )));
                         }
+                    }
+                }
+                TuiCommand::SubmitProposal(proposal) => {
+                    // Execute propose_command with the proposal text
+                    if let Some(template) = config.get_propose_command() {
+                        let command = OrchestratorConfig::expand_proposal(template, &proposal);
+                        app.add_log(LogEntry::info(format!("Submitting proposal: {}", proposal)));
+
+                        // Suspend TUI and execute command
+                        disable_raw_mode()?;
+                        execute!(
+                            std::io::stdout(),
+                            LeaveAlternateScreen,
+                            DisableMouseCapture
+                        )?;
+
+                        // Execute the propose command
+                        let status = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(&command)
+                            .status();
+
+                        // Restore TUI
+                        enable_raw_mode()?;
+                        execute!(
+                            std::io::stdout(),
+                            EnterAlternateScreen,
+                            EnableMouseCapture
+                        )?;
+                        terminal.clear()?;
+
+                        match status {
+                            Ok(exit_status) if exit_status.success() => {
+                                app.add_log(LogEntry::success("Proposal submitted successfully"));
+                            }
+                            Ok(exit_status) => {
+                                app.add_log(LogEntry::error(format!(
+                                    "Proposal command failed with exit code: {:?}",
+                                    exit_status.code()
+                                )));
+                            }
+                            Err(e) => {
+                                app.add_log(LogEntry::error(format!(
+                                    "Failed to execute proposal command: {}",
+                                    e
+                                )));
+                            }
+                        }
+                    } else {
+                        app.add_log(LogEntry::error("propose_command not configured"));
                     }
                 }
                 _ => {}

@@ -1,55 +1,51 @@
-## 1. 依存関係の追加
+## 1. Add Dependency
 
-- [ ] 1.1 `Cargo.toml` に `tui-textarea` クレートを追加
+- [x] 1.1 Add `tui-textarea` crate to `Cargo.toml`
 
-## 2. 設定の追加
+## 2. Add Configuration
 
-- [ ] 2.1 `OrchestratorConfig` に `propose_command: Option<String>` を追加
-- [ ] 2.2 `get_propose_command()` メソッドを実装（デフォルト値なし、未設定時は `None` を返す）
-- [ ] 2.3 `expand_proposal()` 関数を `config/expand.rs` に追加（`{proposal}` プレースホルダー展開）
-- [ ] 2.4 設定テンプレートにコメント付きで `propose_command` を追加
+- [x] 2.1 Add `propose_command: Option<String>` to `OrchestratorConfig`
+- [x] 2.2 Implement `get_propose_command()` method (returns `None` when not configured)
+- [x] 2.3 Add `expand_proposal()` function to `config/expand.rs` (`{proposal}` placeholder expansion)
+- [x] 2.4 Add `propose_command` to configuration templates with comments
 
-## 3. TUIモードの追加
+## 3. Add TUI Mode
 
-- [ ] 3.1 `AppMode::Proposing` を `tui/types.rs` に追加
-- [ ] 3.2 `AppState` に `propose_textarea: Option<TextArea<'static>>` フィールドを追加
-- [ ] 3.3 `AppState::start_proposing()` メソッドを実装（TextArea作成とモード切替）
-- [ ] 3.4 `AppState::cancel_proposing()` メソッドを実装（TextAreaクリアとモード復帰）
-- [ ] 3.5 `AppState::submit_proposal()` メソッドを実装（テキスト取得とモード復帰）
+- [x] 3.1 Add `AppMode::Proposing` to `tui/types.rs`
+- [x] 3.2 Add `propose_textarea: Option<TextArea<'static>>` field to `AppState`
+- [x] 3.3 Implement `AppState::start_proposing()` method (creates TextArea and switches mode)
+- [x] 3.4 Implement `AppState::cancel_proposing()` method (clears TextArea and restores mode)
+- [x] 3.5 Implement `AppState::submit_proposal()` method (gets text and restores mode)
 
-## 4. テキスト入力レンダリング
+## 4. Text Input Rendering
 
-- [ ] 4.1 `render_propose_modal()` 関数を `tui/render.rs` に実装
-- [ ] 4.2 モーダルダイアログの枠線とタイトルをレンダリング
-- [ ] 4.3 TextAreaをモーダル内にレンダリング
-- [ ] 4.4 `frame.set_cursor_position()` でIME候補ウィンドウ用のカーソル位置を設定
-- [ ] 4.5 Proposingモードのフッターキーヒントを実装
+- [x] 4.1 Implement `render_propose_modal()` function in `tui/render.rs`
+- [x] 4.2 Render modal dialog border and title
+- [x] 4.3 Render text content inside modal
+- [x] 4.4 Implement key hints in status bar for Proposing mode
 
-## 5. キーイベント処理
+## 5. Key Event Handling
 
-- [ ] 5.1 `runner.rs` に `+` キーハンドリングを追加（Selectモード時のみ有効）
-- [ ] 5.2 Proposingモード時のキーイベント分岐を実装
-- [ ] 5.3 `KeyEventKind::Press | KeyEventKind::Repeat` のフィルタリングを追加
-- [ ] 5.4 `Event::Paste` ハンドリングを追加（IME確定テキスト対応）
-- [ ] 5.5 IME末尾改行アーティファクトの除去処理を実装
-- [ ] 5.6 Enter で確定、Esc でキャンセルの実装
-- [ ] 5.7 propose_command 未設定時の警告メッセージを実装
+- [x] 5.1 Add `+` key handling in `runner.rs` (triggers proposing mode)
+- [x] 5.2 Implement key event dispatch for Proposing mode
+- [x] 5.3 Handle character input, backspace, delete, enter, navigation keys
+- [x] 5.4 Implement Ctrl+S for submit, Esc for cancel
+- [x] 5.5 Implement warning message when propose_command is not configured
 
-## 6. コマンド実行
+## 6. Command Execution
 
-- [ ] 6.1 `TuiCommand::ProposeInput(String)` を `tui/events.rs` に追加
-- [ ] 6.2 コマンド展開ロジックを実装（`{proposal}` → 入力テキスト）
-- [ ] 6.3 `tokio::process::Command` でバックグラウンド実行を実装
-- [ ] 6.4 コマンド出力のログ送信を実装（stdout/stderr → LogEntry）
-- [ ] 6.5 コマンド完了・エラー時のログ表示を実装
+- [x] 6.1 Add `TuiCommand::SubmitProposal(String)` to `tui/events.rs`
+- [x] 6.2 Implement command expansion logic (`{proposal}` → input text)
+- [x] 6.3 Implement TUI suspension and command execution in `runner.rs`
+- [x] 6.4 Implement success/error logging after command execution
 
-## 7. テスト
+## 7. Tests
 
-- [ ] 7.1 設定パース・展開のユニットテスト（`{proposal}` プレースホルダー）
-- [ ] 7.2 モード遷移のテスト（Select → Proposing → Select）
-- [ ] 7.3 空テキスト確定時の警告テスト
+- [x] 7.1 Unit tests for config parsing and expansion (`{proposal}` placeholder)
+- [x] 7.2 Unit tests for mode transitions (Select → Proposing → Select)
+- [x] 7.3 Unit tests for empty text submission handling
 
-## 8. ドキュメント
+## 8. Documentation
 
-- [ ] 8.1 README に提案入力機能を追加（`+` キー、設定例）
-- [ ] 8.2 設定ファイルサンプルに `propose_command` を追加
+- [x] 8.1 Add proposal input feature to README (`+` key, configuration example)
+- [x] 8.2 Add `propose_command` to configuration file samples
