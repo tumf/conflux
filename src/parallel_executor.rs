@@ -887,59 +887,75 @@ impl ParallelExecutor {
             debug!("Workspace path: {:?}", workspace_path);
             debug!("Apply command: {}", command);
 
-            // Execute command in workspace directory
+            // Execute command in workspace directory with streaming output
             // Use null stdin to prevent any interactive behavior
             use std::process::Stdio;
-            let output = Command::new("sh")
+            use tokio::io::{AsyncBufReadExt, BufReader};
+
+            let mut child = Command::new("sh")
                 .arg("-c")
                 .arg(&command)
                 .current_dir(workspace_path)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .output()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::AgentCommand(format!("Failed to execute: {}", e))
-                })?;
+                .spawn()
+                .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to spawn: {}", e)))?;
 
-            // Combine stdout and stderr for summary
-            let stdout_str = String::from_utf8_lossy(&output.stdout);
-            let stderr_str = String::from_utf8_lossy(&output.stderr);
-            let combined_output = if !stdout_str.is_empty() && !stderr_str.is_empty() {
-                format!("{}\n{}", stdout_str, stderr_str)
-            } else if !stdout_str.is_empty() {
-                stdout_str.to_string()
-            } else {
-                stderr_str.to_string()
-            };
+            // Stream stdout and stderr in real-time
+            let stdout = child.stdout.take().ok_or_else(|| {
+                OrchestratorError::AgentCommand("Failed to capture stdout".to_string())
+            })?;
+            let stderr = child.stderr.take().ok_or_else(|| {
+                OrchestratorError::AgentCommand("Failed to capture stderr".to_string())
+            })?;
 
-            // Send summarized output through event channel
-            let summary = Self::summarize_output(&combined_output, 10);
-            if !summary.is_empty() {
-                let line_count = combined_output.lines().count();
-                info!(
-                    "Sending ApplyOutput for {} ({} lines)",
-                    change_id, line_count
-                );
-                if let Some(ref tx) = event_tx {
-                    let _ = tx
-                        .send(ParallelEvent::ApplyOutput {
-                            change_id: change_id.to_string(),
-                            output: summary.clone(),
-                        })
-                        .await;
+            let change_id_for_stdout = change_id.to_string();
+            let event_tx_for_stdout = event_tx.clone();
+            let stdout_handle = tokio::spawn(async move {
+                let mut reader = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    if let Some(ref tx) = event_tx_for_stdout {
+                        let _ = tx
+                            .send(ParallelEvent::ApplyOutput {
+                                change_id: change_id_for_stdout.clone(),
+                                output: line,
+                            })
+                            .await;
+                    }
                 }
-                debug!("Apply output for {}: {}", change_id, summary);
-            } else {
-                info!("No output captured for {} apply command", change_id);
-            }
+            });
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+            let change_id_for_stderr = change_id.to_string();
+            let event_tx_for_stderr = event_tx.clone();
+            let stderr_handle = tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    if let Some(ref tx) = event_tx_for_stderr {
+                        let _ = tx
+                            .send(ParallelEvent::ApplyOutput {
+                                change_id: change_id_for_stderr.clone(),
+                                output: line,
+                            })
+                            .await;
+                    }
+                }
+            });
+
+            // Wait for streams to complete
+            let _ = stdout_handle.await;
+            let _ = stderr_handle.await;
+
+            // Wait for process to finish
+            let status = child
+                .wait()
+                .await
+                .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to wait: {}", e)))?;
+
+            if !status.success() {
                 return Err(OrchestratorError::AgentCommand(format!(
-                    "Apply command failed: {}",
-                    stderr
+                    "Apply command failed with exit code: {:?}",
+                    status.code()
                 )));
             }
 
