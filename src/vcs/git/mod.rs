@@ -3,10 +3,10 @@
 //! This module provides workspace creation, merge, and cleanup functionality
 //! to enable parallel execution of changes in isolated Git worktrees.
 
+pub mod commands;
+
 use crate::config::OrchestratorConfig;
-use crate::error::{OrchestratorError, Result};
-use crate::git_commands;
-use crate::vcs_backend::{VcsBackend, Workspace, WorkspaceManager, WorkspaceStatus};
+use crate::vcs::{VcsBackend, VcsError, VcsResult, Workspace, WorkspaceManager, WorkspaceStatus};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -76,16 +76,16 @@ impl GitWorkspaceManager {
     }
 
     /// Check if Git is available and the repo is a Git repository
-    #[allow(dead_code)] // Part of WorkspaceManager trait implementation
-    pub async fn check_git_available(&self) -> Result<bool> {
-        git_commands::check_git_repo(&self.repo_root).await
+    #[allow(dead_code)]
+    pub async fn check_git_available(&self) -> VcsResult<bool> {
+        commands::check_git_repo(&self.repo_root).await
     }
 
     /// Check if working directory is clean (no uncommitted changes or untracked files).
     ///
     /// Returns an error with detailed message if there are uncommitted changes.
-    pub async fn check_clean_working_directory(&self) -> Result<()> {
-        let (has_changes, status) = git_commands::has_uncommitted_changes(&self.repo_root).await?;
+    pub async fn check_clean_working_directory(&self) -> VcsResult<()> {
+        let (has_changes, status) = commands::has_uncommitted_changes(&self.repo_root).await?;
 
         if has_changes {
             let mut error_msg =
@@ -99,15 +99,15 @@ impl GitWorkspaceManager {
             error_msg.push_str("  git add -A && git commit -m 'WIP'  # Commit changes\n");
             error_msg.push_str("  git stash                          # Or stash changes\n");
 
-            return Err(OrchestratorError::GitUncommittedChanges(error_msg));
+            return Err(VcsError::UncommittedChanges(error_msg));
         }
 
         Ok(())
     }
 
     /// Get the current commit hash
-    pub async fn get_current_commit(&self) -> Result<String> {
-        git_commands::get_current_commit(&self.repo_root).await
+    pub async fn get_current_commit(&self) -> VcsResult<String> {
+        commands::get_current_commit(&self.repo_root).await
     }
 
     /// Create a new worktree for a change from a specific base commit
@@ -115,15 +115,16 @@ impl GitWorkspaceManager {
         &mut self,
         change_id: &str,
         base_commit: Option<&str>,
-    ) -> Result<GitWorkspace> {
+    ) -> VcsResult<GitWorkspace> {
         // Store original branch if not already stored
         if self.original_branch.is_none() {
-            self.original_branch = match git_commands::get_current_branch(&self.repo_root).await? {
+            self.original_branch = match commands::get_current_branch(&self.repo_root).await? {
                 Some(branch) => Some(branch),
-                None => return Err(OrchestratorError::GitCommand(
-                    "Detached HEAD state detected. Checkout a branch before running parallel mode."
-                        .to_string(),
-                )),
+                None => {
+                    return Err(VcsError::git_command(
+                        "Detached HEAD state detected. Checkout a branch before running parallel mode.",
+                    ))
+                }
             };
         }
 
@@ -144,7 +145,7 @@ impl GitWorkspaceManager {
 
         // Ensure base directory exists
         if !self.base_dir.exists() {
-            std::fs::create_dir_all(&self.base_dir).map_err(OrchestratorError::Io)?;
+            std::fs::create_dir_all(&self.base_dir)?;
         }
 
         // Get base commit (use HEAD if not specified)
@@ -161,7 +162,7 @@ impl GitWorkspaceManager {
         );
 
         // Create worktree with new branch
-        git_commands::worktree_add(
+        commands::worktree_add(
             &self.repo_root,
             worktree_path.to_str().unwrap(),
             &branch_name,
@@ -197,11 +198,9 @@ impl GitWorkspaceManager {
     /// Merge multiple workspace branches into the original branch (sequential merge).
     ///
     /// Returns the final commit hash after all merges.
-    pub async fn merge_branches(&self, branch_names: &[String]) -> Result<String> {
+    pub async fn merge_branches(&self, branch_names: &[String]) -> VcsResult<String> {
         if branch_names.is_empty() {
-            return Err(OrchestratorError::GitCommand(
-                "No branches to merge".to_string(),
-            ));
+            return Err(VcsError::git_command("No branches to merge"));
         }
 
         // Determine the target for merge
@@ -209,12 +208,12 @@ impl GitWorkspaceManager {
 
         // Always merge into the original branch
         info!("Checking out original branch '{}' for merge", original);
-        git_commands::checkout(&self.repo_root, original).await?;
+        commands::checkout(&self.repo_root, original).await?;
 
         // Sequential merge: merge each branch one at a time
         for branch_name in branch_names {
             info!("Merging branch '{}'", branch_name);
-            git_commands::merge(&self.repo_root, branch_name).await?;
+            commands::merge(&self.repo_root, branch_name).await?;
         }
 
         // Get the final commit hash
@@ -228,7 +227,7 @@ impl GitWorkspaceManager {
     }
 
     /// Cleanup a single worktree (remove worktree + delete branch)
-    pub async fn cleanup_worktree(&mut self, workspace_name: &str) -> Result<()> {
+    pub async fn cleanup_worktree(&mut self, workspace_name: &str) -> VcsResult<()> {
         let workspace = self
             .workspaces
             .iter()
@@ -245,8 +244,7 @@ impl GitWorkspaceManager {
         // Remove worktree
         if workspace.path.exists() {
             if let Err(e) =
-                git_commands::worktree_remove(&self.repo_root, workspace.path.to_str().unwrap())
-                    .await
+                commands::worktree_remove(&self.repo_root, workspace.path.to_str().unwrap()).await
             {
                 warn!("Failed to remove worktree '{}': {}", workspace_name, e);
                 // Try force removal via filesystem
@@ -260,7 +258,7 @@ impl GitWorkspaceManager {
         }
 
         // Delete branch (ignore errors - branch may have been merged)
-        if let Err(e) = git_commands::branch_delete(&self.repo_root, workspace_name).await {
+        if let Err(e) = commands::branch_delete(&self.repo_root, workspace_name).await {
             debug!(
                 "Failed to delete branch '{}': {} (may have been merged)",
                 workspace_name, e
@@ -275,7 +273,7 @@ impl GitWorkspaceManager {
     }
 
     /// Cleanup all worktrees
-    pub async fn cleanup_all_worktrees(&mut self) -> Result<()> {
+    pub async fn cleanup_all_worktrees(&mut self) -> VcsResult<()> {
         let workspace_names: Vec<String> = self.workspaces.iter().map(|w| w.name.clone()).collect();
 
         for name in workspace_names {
@@ -304,16 +302,16 @@ impl WorkspaceManager for GitWorkspaceManager {
         VcsBackend::Git
     }
 
-    async fn check_available(&self) -> Result<bool> {
+    async fn check_available(&self) -> VcsResult<bool> {
         self.check_git_available().await
     }
 
-    async fn prepare_for_parallel(&self) -> Result<()> {
+    async fn prepare_for_parallel(&self) -> VcsResult<()> {
         // Git requires a clean working directory
         self.check_clean_working_directory().await
     }
 
-    async fn get_current_revision(&self) -> Result<String> {
+    async fn get_current_revision(&self) -> VcsResult<String> {
         self.get_current_commit().await
     }
 
@@ -321,7 +319,7 @@ impl WorkspaceManager for GitWorkspaceManager {
         &mut self,
         change_id: &str,
         base_revision: Option<&str>,
-    ) -> Result<Workspace> {
+    ) -> VcsResult<Workspace> {
         let git_ws = self.create_worktree(change_id, base_revision).await?;
         Ok(git_ws.into())
     }
@@ -330,16 +328,16 @@ impl WorkspaceManager for GitWorkspaceManager {
         self.update_git_workspace_status(workspace_name, status);
     }
 
-    async fn merge_workspaces(&self, revisions: &[String]) -> Result<String> {
+    async fn merge_workspaces(&self, revisions: &[String]) -> VcsResult<String> {
         // For Git, revisions are branch names
         self.merge_branches(revisions).await
     }
 
-    async fn cleanup_workspace(&mut self, workspace_name: &str) -> Result<()> {
+    async fn cleanup_workspace(&mut self, workspace_name: &str) -> VcsResult<()> {
         self.cleanup_worktree(workspace_name).await
     }
 
-    async fn cleanup_all(&mut self) -> Result<()> {
+    async fn cleanup_all(&mut self) -> VcsResult<()> {
         self.cleanup_all_worktrees().await
     }
 
@@ -375,21 +373,20 @@ impl WorkspaceManager for GitWorkspaceManager {
          4. Running `git commit` to complete the merge"
     }
 
-    async fn snapshot_working_copy(&self, _workspace_path: &Path) -> Result<()> {
+    async fn snapshot_working_copy(&self, _workspace_path: &Path) -> VcsResult<()> {
         // Git doesn't have automatic snapshotting like jj
         // No-op for Git
         Ok(())
     }
 
-    async fn set_commit_message(&self, workspace_path: &Path, message: &str) -> Result<()> {
+    async fn set_commit_message(&self, workspace_path: &Path, message: &str) -> VcsResult<()> {
         // First check if there are any changes to commit
-        if git_commands::has_changes_to_commit(workspace_path).await? {
+        if commands::has_changes_to_commit(workspace_path).await? {
             // Stage all changes and create a commit
-            git_commands::add_and_commit(workspace_path, message).await?;
+            commands::add_and_commit(workspace_path, message).await?;
         } else {
             // Try to amend the last commit with the new message
-            let result =
-                git_commands::run_git(&["commit", "--amend", "-m", message], workspace_path).await;
+            let result = commands::run_git(&["commit", "--amend", "-m", message], workspace_path).await;
             if let Err(e) = result {
                 warn!("Failed to amend commit message: {}", e);
             }
@@ -397,15 +394,15 @@ impl WorkspaceManager for GitWorkspaceManager {
         Ok(())
     }
 
-    async fn get_revision_in_workspace(&self, workspace_path: &Path) -> Result<String> {
-        git_commands::get_current_commit(workspace_path).await
+    async fn get_revision_in_workspace(&self, workspace_path: &Path) -> VcsResult<String> {
+        commands::get_current_commit(workspace_path).await
     }
 
-    async fn get_status(&self) -> Result<String> {
-        git_commands::get_status(&self.repo_root).await
+    async fn get_status(&self) -> VcsResult<String> {
+        commands::get_status(&self.repo_root).await
     }
 
-    async fn get_log_for_revisions(&self, revisions: &[String]) -> Result<String> {
+    async fn get_log_for_revisions(&self, revisions: &[String]) -> VcsResult<String> {
         if revisions.is_empty() {
             return Ok(String::new());
         }
@@ -413,16 +410,15 @@ impl WorkspaceManager for GitWorkspaceManager {
         // Get log for each revision
         let mut logs = Vec::new();
         for rev in revisions {
-            let log =
-                git_commands::run_git(&["log", "-1", "--oneline", rev], &self.repo_root).await?;
+            let log = commands::run_git(&["log", "-1", "--oneline", rev], &self.repo_root).await?;
             logs.push(log);
         }
 
         Ok(logs.join("\n"))
     }
 
-    async fn detect_conflicts(&self) -> Result<Vec<String>> {
-        git_commands::get_conflict_files(&self.repo_root).await
+    async fn detect_conflicts(&self) -> VcsResult<Vec<String>> {
+        commands::get_conflict_files(&self.repo_root).await
     }
 
     fn forget_workspace_sync(&self, workspace_name: &str) {

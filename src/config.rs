@@ -8,7 +8,7 @@
 
 use crate::error::{OrchestratorError, Result};
 use crate::hooks::HooksConfig;
-use crate::vcs_backend::VcsBackend;
+use crate::vcs::VcsBackend;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
