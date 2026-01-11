@@ -14,7 +14,7 @@ OpenSpec変更ワークフローを自動化: list → 依存関係分析 → ap
 - 🔌 **マルチエージェント対応**: Claude Code、OpenCode、Codexに対応
 - 🪝 **ライフサイクルフック**: ワークフロー各段階でのカスタムアクション設定
 - ✅ **承認ワークフロー**: チェックサム検証による変更の承認管理
-- ⚡ **並列実行**: jjワークスペースを使用した複数の独立した変更の同時処理
+- ⚡ **並列実行**: jjワークスペースまたはGit worktreesを使用した複数の独立した変更の同時処理
 
 ## アーキテクチャ
 
@@ -294,43 +294,69 @@ openspec-orchestrator
       "timeout": 300                 // タイムアウト（秒）
     },
 
-    // 利用可能なフック:
-    "on_first_apply": "git checkout -b feature/orchestrator-run",
-    "pre_apply": "echo 'Applying {change_id}'",
+    // 実行ライフサイクルフック
+    "on_start": "echo 'Starting orchestration with {total_changes} changes'",
+    "on_finish": "echo 'Finished with status: {status}'",
+    "on_error": "echo 'Error in {change_id}: {error}' >> errors.log",
+
+    // 変更ライフサイクルフック
+    "on_change_start": "echo 'Starting {change_id}'",
+    "pre_apply": "echo 'Applying {change_id} (attempt {apply_count})'",
+    "post_apply": "cargo test",
     "on_change_complete": "echo '{change_id} is 100% complete'",
     "pre_archive": "cargo clippy -- -D warnings",
     "post_archive": "echo '{change_id} archived successfully'",
-    "on_finish": "echo 'Finished with status: {status}'",
-    "on_error": "echo 'Error in {change_id}: {error}' >> errors.log"
+    "on_change_end": "echo 'Finished processing {change_id}'",
+
+    // TUI専用フック（ユーザー操作）
+    "on_queue_add": "echo 'Added {change_id} to queue'",
+    "on_queue_remove": "echo 'Removed {change_id} from queue'",
+    "on_approve": "echo 'Approved {change_id}'",
+    "on_unapprove": "echo 'Unapproved {change_id}'"
   }
 }
 ```
 
 **利用可能なフック:**
 
+*実行ライフサイクルフック:*
+
 | フック名 | トリガー | 説明 |
 |-----------|---------|-------------|
 | `on_start` | 開始 | オーケストレーター開始時 |
-| `on_first_apply` | 最初のApply前 | 最初のapply前に一度だけ実行 |
-| `on_iteration_start` | イテレーション開始 | 各イテレーションループの開始 |
+| `on_finish` | 終了 | オーケストレーター完了（成功またはリミット） |
+| `on_error` | エラー | applyまたはarchive中にエラー発生時 |
+
+*変更ライフサイクルフック:*
+
+| フック名 | トリガー | 説明 |
+|-----------|---------|-------------|
+| `on_change_start` | 変更開始 | 新しい変更の処理開始時 |
 | `pre_apply` | Apply前 | 変更適用前 |
 | `post_apply` | Apply後 | 変更適用成功後 |
 | `on_change_complete` | タスク100% | 変更が100%タスク完了に達した時 |
 | `pre_archive` | Archive前 | 変更アーカイブ前 |
 | `post_archive` | Archive後 | 変更アーカイブ成功後 |
-| `on_iteration_end` | イテレーション終了 | 各イテレーションループの終了 |
-| `on_queue_change` | キュー変更 | 保留中の変更数が変わった時 |
-| `on_finish` | 終了 | オーケストレーター完了（成功またはリミット） |
-| `on_error` | エラー | applyまたはarchive中にエラー発生時 |
+| `on_change_end` | 変更終了 | 変更が正常にアーカイブされた後 |
+
+*TUI専用フック（ユーザー操作）:*
+
+| フック名 | トリガー | 説明 |
+|-----------|---------|-------------|
+| `on_queue_add` | キュー追加 | ユーザーが変更をキューに追加した時（Spaceキー） |
+| `on_queue_remove` | キュー削除 | ユーザーが変更をキューから削除した時（Spaceキー） |
+| `on_approve` | 承認 | ユーザーが変更を承認した時（@キー） |
+| `on_unapprove` | 承認解除 | ユーザーが変更の承認を解除した時（@キー） |
 
 **プレースホルダー:**
 
 | プレースホルダー | 説明 |
 |-------------|-------------|
 | `{change_id}` | 現在の変更ID |
-| `{iteration}` | 現在のイテレーション番号 |
+| `{changes_processed}` | これまでに処理された変更数 |
 | `{total_changes}` | 初期スナップショットの変更総数 |
-| `{queue_size}` | 現在のキューサイズ |
+| `{remaining_changes}` | キュー内の残り変更数 |
+| `{apply_count}` | 現在の変更のapply試行回数 |
 | `{completed_tasks}` | 現在の変更の完了タスク数 |
 | `{total_tasks}` | 現在の変更の総タスク数 |
 | `{status}` | 終了ステータス（completed/iteration_limit） |
@@ -339,7 +365,7 @@ openspec-orchestrator
 **環境変数:**
 
 フックは環境変数経由でコンテキストを受け取ります:
-`OPENSPEC_CHANGE_ID`, `OPENSPEC_ITERATION`, `OPENSPEC_TOTAL_CHANGES`, `OPENSPEC_QUEUE_SIZE`, `OPENSPEC_COMPLETED_TASKS`, `OPENSPEC_TOTAL_TASKS`, `OPENSPEC_STATUS`, `OPENSPEC_ERROR`, `OPENSPEC_DRY_RUN`
+`OPENSPEC_CHANGE_ID`, `OPENSPEC_CHANGES_PROCESSED`, `OPENSPEC_TOTAL_CHANGES`, `OPENSPEC_REMAINING_CHANGES`, `OPENSPEC_APPLY_COUNT`, `OPENSPEC_COMPLETED_TASKS`, `OPENSPEC_TOTAL_TASKS`, `OPENSPEC_STATUS`, `OPENSPEC_ERROR`, `OPENSPEC_DRY_RUN`
 
 ### 環境変数
 
@@ -383,7 +409,70 @@ openspec-orchestrator
   --change <ID,...>     指定した変更のみを処理（カンマ区切り）
   -c, --config <PATH>   カスタム設定ファイルパス（JSONC）
   --openspec-cmd <CMD>  カスタムopenspecコマンド [env: OPENSPEC_CMD]
+  --parallel            並列実行モードを有効化
+  --max-concurrent <N>  最大同時ワークスペース数（デフォルト: 3）
+  --vcs <BACKEND>       VCSバックエンド: auto, jj, または git（デフォルト: auto）
+  --dry-run             実行せずに並列化グループをプレビュー
 ```
+
+### 並列実行
+
+オーケストレーターはjjワークスペースまたはGit worktreesを使用した独立した変更の並列実行をサポートします。
+
+**VCSバックエンドの選択:**
+
+| バックエンド | 説明 | 要件 |
+|---------|-------------|--------------|
+| `auto` | 自動検出（jj優先、次にGit） | jjまたはGitリポジトリ |
+| `jj` | jjワークスペースを使用 | jjリポジトリ（.jjディレクトリ） |
+| `git` | Git worktreesを使用 | クリーンな作業ディレクトリを持つGitリポジトリ |
+
+**使用法:**
+
+```bash
+# VCSバックエンドを自動検出（デフォルト）
+openspec-orchestrator run --parallel
+
+# Git worktreesを強制
+openspec-orchestrator run --parallel --vcs git
+
+# jjワークスペースを強制
+openspec-orchestrator run --parallel --vcs jj
+
+# 実行せずに並列化グループをプレビュー
+openspec-orchestrator run --parallel --dry-run
+
+# 同時ワークスペース数を制限
+openspec-orchestrator run --parallel --max-concurrent 5
+```
+
+**設定:**
+
+設定ファイルでVCSバックエンドを設定することもできます:
+
+```jsonc
+{
+  // 並列実行用のVCSバックエンド: "auto", "jj", または "git"
+  "vcs_backend": "auto",
+
+  // 最大同時ワークスペース数
+  "max_concurrent_workspaces": 3
+}
+```
+
+**Git要件:**
+
+Git worktrees使用時:
+- 作業ディレクトリがクリーンである必要があります（未コミットの変更がないこと）
+- 各変更は独自のブランチを持つ独立したworktreeで実行されます
+- 変更は完了後に順次マージされます
+
+**jj要件:**
+
+jjワークスペース使用時:
+- 作業コピーの変更は自動的にスナップショットされます
+- 各変更は独立したワークスペースで実行されます
+- 変更はjjのコンフリクトフリーマージを使用してマージされます
 
 **initサブコマンドのオプション:**
 ```
@@ -437,7 +526,7 @@ openspec-orchestrator
 ## 今後の機能強化
 
 - [ ] リカバリと再開のための状態永続化
-- [x] 独立した変更の並列実行（jjワークスペース使用）
+- [x] 独立した変更の並列実行（jjワークスペースまたはGit worktrees使用）
 - [ ] Slack/Discord通知
 - [ ] 最大イテレーション制限（無限ループ防止）
 - [ ] 手動優先度オーバーライド
