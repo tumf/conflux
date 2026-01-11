@@ -269,8 +269,8 @@ impl AppState {
         let is_approved = change.is_approved;
 
         match self.mode {
-            AppMode::Select | AppMode::Stopped => {
-                // In select/stopped mode:
+            AppMode::Select => {
+                // In select mode:
                 // [ ] (unapproved) → @ → [x] (approved + selected)
                 // [x] (approved + selected) → @ → [ ] (unapproved + not selected)
                 if !is_approved {
@@ -281,8 +281,8 @@ impl AppState {
                     Some(TuiCommand::UnapproveAndDequeue(id))
                 }
             }
-            AppMode::Running => {
-                // In running mode:
+            AppMode::Running | AppMode::Stopped => {
+                // In running/stopped mode:
                 // [ ] (unapproved) → @ → [@] (approved only, NOT queued)
                 // [@] (approved, not queued) → @ → [ ] (unapproved)
                 // [x] (queued, not processing) → @ → [ ] (unapproved + removed from queue)
@@ -865,5 +865,46 @@ mod tests {
         assert!(!app.changes[0].is_new);
         assert_eq!(app.new_change_count, 0);
         assert!(!app.changes[0].is_approved);
+    }
+
+    #[test]
+    fn test_toggle_approval_in_stopped_mode_returns_approve_only() {
+        // Test that toggle_approval in Stopped mode returns ApproveOnly for unapproved change
+        // (not ApproveAndQueue, which would incorrectly add to queue while stopped)
+        let changes = vec![create_test_change("unapproved-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Enter Running mode first, then stop
+        app.start_processing();
+        app.mode = AppMode::Stopped;
+        assert_eq!(app.mode, AppMode::Stopped);
+        assert!(!app.changes[0].is_approved);
+
+        // Toggle approval should return ApproveOnly (not ApproveAndQueue)
+        let cmd = app.toggle_approval();
+        assert!(matches!(
+            cmd,
+            Some(TuiCommand::ApproveOnly(ref id)) if id == "unapproved-change"
+        ));
+    }
+
+    #[test]
+    fn test_toggle_approval_in_stopped_mode_unapproves_correctly() {
+        // Test that toggle_approval in Stopped mode returns UnapproveAndDequeue for approved change
+        let changes = vec![create_approved_change("approved-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Enter Running mode first, then stop
+        app.start_processing();
+        app.mode = AppMode::Stopped;
+        assert_eq!(app.mode, AppMode::Stopped);
+        assert!(app.changes[0].is_approved);
+
+        // Toggle approval should return UnapproveAndDequeue
+        let cmd = app.toggle_approval();
+        assert!(matches!(
+            cmd,
+            Some(TuiCommand::UnapproveAndDequeue(ref id)) if id == "approved-change"
+        ));
     }
 }
