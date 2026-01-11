@@ -40,8 +40,10 @@ pub enum QueueStatus {
     Queued,
     /// Currently being processed
     Processing,
-    /// Processing completed
+    /// Processing completed, waiting for archive
     Completed,
+    /// Currently being archived
+    Archiving,
     /// Archived after completion
     Archived,
     /// Error occurred during processing
@@ -56,6 +58,7 @@ impl QueueStatus {
             QueueStatus::Queued => "queued",
             QueueStatus::Processing => "processing",
             QueueStatus::Completed => "completed",
+            QueueStatus::Archiving => "archiving",
             QueueStatus::Archived => "archived",
             QueueStatus::Error(_) => "error",
         }
@@ -68,6 +71,7 @@ impl QueueStatus {
             QueueStatus::Queued => Color::Yellow,
             QueueStatus::Processing => Color::Cyan,
             QueueStatus::Completed => Color::Green,
+            QueueStatus::Archiving => Color::Magenta,
             QueueStatus::Archived => Color::Blue,
             QueueStatus::Error(_) => Color::Red,
         }
@@ -84,7 +88,19 @@ mod tests {
         assert_eq!(QueueStatus::Queued.display(), "queued");
         assert_eq!(QueueStatus::Processing.display(), "processing");
         assert_eq!(QueueStatus::Completed.display(), "completed");
+        assert_eq!(QueueStatus::Archiving.display(), "archiving");
         assert_eq!(QueueStatus::Archived.display(), "archived");
         assert_eq!(QueueStatus::Error("err".to_string()).display(), "error");
+    }
+
+    #[test]
+    fn test_queue_status_color() {
+        assert_eq!(QueueStatus::NotQueued.color(), Color::DarkGray);
+        assert_eq!(QueueStatus::Queued.color(), Color::Yellow);
+        assert_eq!(QueueStatus::Processing.color(), Color::Cyan);
+        assert_eq!(QueueStatus::Completed.color(), Color::Green);
+        assert_eq!(QueueStatus::Archiving.color(), Color::Magenta);
+        assert_eq!(QueueStatus::Archived.color(), Color::Blue);
+        assert_eq!(QueueStatus::Error("err".to_string()).color(), Color::Red);
     }
 }

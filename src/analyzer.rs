@@ -3,7 +3,7 @@
 //! Uses LLM-based analysis to determine which changes can be executed
 //! in parallel and what dependencies exist between them.
 
-use crate::agent::AgentRunner;
+use crate::agent::{AgentRunner, OutputLine};
 use crate::error::{OrchestratorError, Result};
 use crate::openspec::Change;
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,21 @@ impl ParallelizationAnalyzer {
     ///
     /// Returns groups in topological order (dependencies first).
     pub async fn analyze_groups(&self, changes: &[Change]) -> Result<Vec<ParallelGroup>> {
+        self.analyze_groups_with_callback(changes, |_| {}).await
+    }
+
+    /// Analyze changes and return parallel execution groups with output callback
+    ///
+    /// The callback is called for each line of output from the analysis command.
+    /// Returns groups in topological order (dependencies first).
+    pub async fn analyze_groups_with_callback<F>(
+        &self,
+        changes: &[Change],
+        mut on_output: F,
+    ) -> Result<Vec<ParallelGroup>>
+    where
+        F: FnMut(String),
+    {
         if changes.is_empty() {
             return Ok(Vec::new());
         }
@@ -63,20 +78,39 @@ impl ParallelizationAnalyzer {
         // Build prompt for LLM analysis
         let prompt = self.build_parallelization_prompt(changes);
         info!("Analyzing {} changes for parallelization", changes.len());
-
-        // Log dependencies for each change
         for c in changes {
-            if c.dependencies.is_empty() {
-                info!("  - {}: no dependencies", c.id);
-            } else {
-                info!("  - {}: depends on [{}]", c.id, c.dependencies.join(", "));
-            }
+            info!("  - {}", c.id);
         }
-
         debug!("Analysis prompt: {}", prompt);
 
-        // Call LLM for analysis
-        let response = self.agent.analyze_dependencies(&prompt).await?;
+        // Call LLM for analysis with streaming output
+        let (mut child, mut rx) = self.agent.analyze_dependencies_streaming(&prompt).await?;
+
+        // Collect output while streaming to callback
+        let mut full_output = String::new();
+        while let Some(line) = rx.recv().await {
+            let text = match &line {
+                OutputLine::Stdout(s) | OutputLine::Stderr(s) => s.clone(),
+            };
+            full_output.push_str(&text);
+            full_output.push('\n');
+            on_output(text);
+        }
+
+        // Wait for process to complete
+        let status = child.wait().await.map_err(|e| {
+            OrchestratorError::AgentCommand(format!("Analysis process failed: {}", e))
+        })?;
+
+        if !status.success() {
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Analysis failed with exit code: {:?}",
+                status.code()
+            )));
+        }
+
+        // Extract result from stream-json format if applicable
+        let response = self.extract_stream_json_result(&full_output);
         debug!("LLM response: {}", response);
 
         // Parse JSON response
@@ -93,51 +127,77 @@ impl ParallelizationAnalyzer {
         Ok(sorted)
     }
 
+    /// Extract the result from stream-json output format
+    fn extract_stream_json_result(&self, output: &str) -> String {
+        // Try to find and parse the result line from stream-json output
+        for line in output.lines().rev() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            // Try to parse as JSON
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+                // Check if this is a result message
+                if json.get("type").and_then(|t| t.as_str()) == Some("result") {
+                    if let Some(result) = json.get("result").and_then(|r| r.as_str()) {
+                        return result.to_string();
+                    }
+                }
+                // Also check for assistant message content
+                if json.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                    if let Some(message) = json.get("message") {
+                        if let Some(content) = message.get("content").and_then(|c| c.as_array()) {
+                            for item in content {
+                                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                    return text.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: return entire output if not stream-json format
+        output.to_string()
+    }
+
     /// Build the prompt for parallelization analysis
     fn build_parallelization_prompt(&self, changes: &[Change]) -> String {
-        let change_list: String = changes
+        let change_ids: String = changes
             .iter()
-            .map(|c| {
-                let deps_str = if c.dependencies.is_empty() {
-                    "none".to_string()
-                } else {
-                    c.dependencies.join(", ")
-                };
-                format!(
-                    "- {}: {}/{} tasks completed, depends on: [{}]",
-                    c.id, c.completed_tasks, c.total_tasks, deps_str
-                )
-            })
+            .map(|c| format!("- {}", c.id))
             .collect::<Vec<_>>()
             .join("\n");
 
         format!(
-            r#"Analyze the following OpenSpec changes and group them for parallel execution.
+            r#"You are planning the execution order for OpenSpec changes.
 
-Changes to analyze:
-{change_list}
+Read the proposal files for these changes in openspec/changes/<change_id>/ and analyze their dependencies:
 
-Instructions:
-1. RESPECT EXPLICIT DEPENDENCIES: Changes with declared dependencies MUST wait for those dependencies to complete
-2. Group changes that have no dependencies on each other for parallel execution
-3. Changes with the same dependencies can be grouped together
-4. A change can only start after ALL its dependencies are complete
+{change_ids}
 
-Return JSON in this exact format:
+Your task:
+1. Read each change proposal.md to understand what it does
+2. Identify dependencies between changes based on what each module uses or builds upon
+3. Group changes that can run in parallel (no dependencies on each other)
+4. Order groups so dependencies are completed before dependents
+
+Return ONLY valid JSON in this exact format:
 {{
   "groups": [
-    {{"id": 1, "changes": ["change-id-1", "change-id-2"], "depends_on": []}},
-    {{"id": 2, "changes": ["change-id-3"], "depends_on": [1]}}
+    {{"id": 1, "changes": ["change-a", "change-b"], "depends_on": []}},
+    {{"id": 2, "changes": ["change-c"], "depends_on": [1]}}
   ]
 }}
 
 Rules:
 - Every change ID must appear exactly once
-- Group IDs start at 1 and increase
-- depends_on references group IDs, not change IDs
-- Groups with empty depends_on can start immediately (no dependencies)
-- A change with dependency X must be in a group that depends_on the group containing X
-- Return valid JSON only, no additional text"#
+- Group IDs start at 1 and increment
+- depends_on lists group IDs (not change IDs) that must complete first
+- Groups with empty depends_on can start immediately
+- Changes with no dependencies on each other should be in the same group
+- Return valid JSON only, no markdown, no explanation"#
         )
     }
 

@@ -9,8 +9,17 @@ use crate::config::OrchestratorConfig;
 /// Hardcoded system prompt for apply commands.
 /// This is always appended after the user-configurable apply_prompt.
 /// These instructions are non-negotiable and cannot be disabled.
-pub const APPLY_SYSTEM_PROMPT: &str =
-    "Remove out-of-scope tasks. Remove tasks that wait for or require user action.";
+pub const APPLY_SYSTEM_PROMPT: &str = "\
+Remove tasks only if they meet one of these criteria:
+- Out-of-scope: belongs to a different change/proposal
+- Requires human decision or external action (e.g., 'Ask user...', 'Deploy to production', 'Get API key')
+- Requires long waiting periods (e.g., 'Check after one week', 'Wait for approval')
+
+Do NOT remove:
+- Tests (unit/integration) - agent can write and run them
+- Linting/formatting (cargo clippy, cargo fmt) - agent can execute
+- Documentation updates - agent can write
+- Any task the agent can execute autonomously";
 use crate::error::{OrchestratorError, Result};
 use crate::history::{ApplyAttempt, ApplyHistory};
 use std::process::{ExitStatus, Stdio};
@@ -159,12 +168,12 @@ impl AgentRunner {
         self.execute_shell_command(&command).await
     }
 
-    /// Analyze dependencies using the configured analyze command
+    /// Analyze dependencies using the configured analyze command (blocking)
     pub async fn analyze_dependencies(&self, prompt: &str) -> Result<String> {
         let template = self.config.get_analyze_command();
         let command = OrchestratorConfig::expand_prompt(template, prompt);
-        info!("Running analyze command");
-        debug!("Analyze command: {}", command);
+        info!("Running analyze command: {}", template);
+        info!("Expanded command length: {} chars", command.len());
 
         let output = self.execute_shell_command_with_output(&command).await?;
 
@@ -177,12 +186,41 @@ impl AgentRunner {
         }
 
         let stdout = String::from_utf8(output.stdout)?;
+        info!(
+            "Analyze command completed, output length: {} chars",
+            stdout.len()
+        );
         debug!("Raw analysis output: {}", stdout);
 
         // Extract result from stream-json format if applicable
         let result = self.extract_stream_json_result(&stdout);
+        info!("Extracted result length: {} chars", result.len());
         debug!("Extracted analysis result: {}", result);
         Ok(result)
+    }
+
+    /// Analyze dependencies using the configured analyze command with streaming output
+    /// Returns a child process handle and a receiver for output lines
+    pub async fn analyze_dependencies_streaming(
+        &self,
+        prompt: &str,
+    ) -> Result<(Child, mpsc::Receiver<OutputLine>)> {
+        let template = self.config.get_analyze_command();
+        let command = OrchestratorConfig::expand_prompt(template, prompt);
+        info!("Running analyze command (streaming): {}", template);
+        self.execute_shell_command_streaming(&command).await
+    }
+
+    /// Execute resolve command with streaming output
+    /// Returns a child process handle and a receiver for output lines
+    pub async fn run_resolve_streaming(
+        &self,
+        prompt: &str,
+    ) -> Result<(Child, mpsc::Receiver<OutputLine>)> {
+        let template = self.config.get_resolve_command();
+        let command = OrchestratorConfig::expand_prompt(template, prompt);
+        info!("Running resolve command (streaming): {}", command);
+        self.execute_shell_command_streaming(&command).await
     }
 
     /// Extract the result from stream-json output format
@@ -713,7 +751,8 @@ mod tests {
     #[test]
     fn test_apply_system_prompt_content() {
         // Verify the hardcoded system prompt contains expected instructions
-        assert!(APPLY_SYSTEM_PROMPT.contains("out-of-scope"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("user action"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("Out-of-scope"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("human decision"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("Do NOT remove"));
     }
 }

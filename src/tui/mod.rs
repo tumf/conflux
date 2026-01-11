@@ -8,6 +8,7 @@
 
 mod events;
 mod orchestrator;
+mod parallel_event_bridge;
 mod queue;
 mod render;
 mod runner;

@@ -93,7 +93,6 @@ pub enum OrchestratorEvent {
     /// Processing started for a change
     ProcessingStarted(String),
     /// Progress updated for a change
-    #[allow(dead_code)]
     ProgressUpdated {
         id: String,
         completed: u32,
@@ -101,6 +100,8 @@ pub enum OrchestratorEvent {
     },
     /// Processing completed for a change
     ProcessingCompleted(String),
+    /// Archive started for a change
+    ArchiveStarted(String),
     /// Change archived
     ChangeArchived(String),
     /// Error occurred for a change

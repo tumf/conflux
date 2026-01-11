@@ -93,6 +93,10 @@ pub struct TuiArgs {
         default_value = "npx @fission-ai/openspec@latest"
     )]
     pub openspec_cmd: String,
+
+    /// Write debug logs to the specified file (e.g., --logs debug.log)
+    #[arg(long)]
+    pub logs: Option<PathBuf>,
 }
 
 /// Template options for init command
@@ -570,6 +574,30 @@ mod tests {
                 assert!(args.dry_run);
             }
             _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_tui_subcommand_logs_option() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "tui", "--logs", "debug.log"]);
+
+        match cli.command {
+            Some(Commands::Tui(args)) => {
+                assert_eq!(args.logs, Some(PathBuf::from("debug.log")));
+            }
+            _ => panic!("Expected Tui subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_tui_subcommand_no_logs_option() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "tui"]);
+
+        match cli.command {
+            Some(Commands::Tui(args)) => {
+                assert!(args.logs.is_none());
+            }
+            _ => panic!("Expected Tui subcommand"),
         }
     }
 }

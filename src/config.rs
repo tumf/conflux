@@ -28,9 +28,8 @@ pub const DEFAULT_APPLY_COMMAND: &str = "opencode run '/openspec-apply {change_i
 pub const DEFAULT_ARCHIVE_COMMAND: &str = "opencode run '/openspec-archive {change_id}'";
 
 /// Default resolve command template (OpenCode)
-/// Supports `{conflict_files}` placeholder for the list of conflicting files
-pub const DEFAULT_RESOLVE_COMMAND: &str =
-    "opencode run 'Resolve conflicts in the following files: {conflict_files}'";
+/// Supports `{prompt}` placeholder for the resolve prompt
+pub const DEFAULT_RESOLVE_COMMAND: &str = "opencode run '{prompt}'";
 
 /// Default analyze command template (OpenCode)
 pub const DEFAULT_ANALYZE_COMMAND: &str = "opencode run --format json '{prompt}'";
@@ -121,6 +120,12 @@ pub struct OrchestratorConfig {
     /// If not set, uses automatic AI-based resolution.
     #[serde(default)]
     pub resolve_command: Option<String>,
+
+    /// Enable LLM-based analysis for parallelization.
+    /// When true (default), uses analyze_command to determine dependencies between changes.
+    /// When false, skips analysis and runs all changes in parallel (no dependency inference).
+    #[serde(default)]
+    pub use_llm_analysis: Option<bool>,
 }
 
 impl OrchestratorConfig {
@@ -202,7 +207,15 @@ impl OrchestratorConfig {
             .unwrap_or(DEFAULT_RESOLVE_COMMAND)
     }
 
+    /// Check if LLM-based analysis is enabled for parallelization.
+    /// Default: true (use LLM to analyze dependencies between changes)
+    /// Set to false to skip LLM analysis and run all changes in parallel.
+    pub fn use_llm_analysis(&self) -> bool {
+        self.use_llm_analysis.unwrap_or(true)
+    }
+
     /// Expand `{conflict_files}` placeholder in a command template
+    #[allow(dead_code)]
     pub fn expand_conflict_files(template: &str, conflict_files: &str) -> String {
         template.replace("{conflict_files}", conflict_files)
     }

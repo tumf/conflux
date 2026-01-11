@@ -223,8 +223,15 @@ impl JjWorkspaceManager {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// Create a new workspace for a change
-    pub async fn create_workspace(&mut self, change_id: &str) -> Result<JjWorkspace> {
+    /// Create a new workspace for a change from a specific base revision
+    ///
+    /// If `base_revision` is provided, the workspace will be created from that revision.
+    /// Otherwise, it uses the current `@` revision.
+    pub async fn create_workspace_from(
+        &mut self,
+        change_id: &str,
+        base_revision: Option<&str>,
+    ) -> Result<JjWorkspace> {
         // Sanitize change_id and add unique suffix for workspace name
         let unique_suffix = format!(
             "{:x}",
@@ -277,7 +284,15 @@ impl JjWorkspaceManager {
             workspace_name, workspace_path
         );
 
-        // Create workspace: jj workspace add <path> --name <name>
+        // Create workspace: jj workspace add <path> --name <name> -r <revision>
+        // Using explicit revision ensures all workspaces in a group share the same base
+        let revision = base_revision.unwrap_or("@");
+        info!(
+            "Creating workspace '{}' from revision '{}'",
+            workspace_name,
+            &revision[..8.min(revision.len())]
+        );
+
         let output = Command::new("jj")
             .args([
                 "workspace",
@@ -285,6 +300,8 @@ impl JjWorkspaceManager {
                 workspace_path.to_str().unwrap(),
                 "--name",
                 &workspace_name,
+                "-r",
+                revision,
             ])
             .current_dir(&self.repo_root)
             .stdin(Stdio::null())
@@ -361,8 +378,9 @@ impl JjWorkspaceManager {
 
     /// Merge multiple workspace revisions into main
     ///
-    /// Creates a merge commit with all successful workspace revisions as parents.
-    /// For single revision, updates the working copy to point to that revision.
+    /// For single revision: Uses `jj edit` to switch to that revision without creating empty commits.
+    /// For multiple revisions: Uses `jj new --no-edit` to create a merge commit without creating
+    /// an additional empty working copy commit, then uses `jj edit` to switch to the merge commit.
     pub async fn merge_workspaces(&self, revisions: &[String]) -> Result<String> {
         if revisions.is_empty() {
             return Err(OrchestratorError::JjCommand(
@@ -371,14 +389,13 @@ impl JjWorkspaceManager {
         }
 
         if revisions.len() == 1 {
-            // Single revision - update working copy to this revision
-            // This ensures subsequent groups can access this revision's changes
-            info!(
-                "Single revision, updating working copy to: {}",
-                &revisions[0][..8.min(revisions[0].len())]
-            );
+            // Single revision - use `jj edit` to switch to the revision directly
+            // This avoids creating empty commits unlike `jj new`
+            let rev_short = &revisions[0][..8.min(revisions[0].len())];
+            info!("Single revision, editing directly: {}", rev_short);
+
             let output = Command::new("jj")
-                .args(["new", &revisions[0], "-m", "Continue from workspace change"])
+                .args(["edit", &revisions[0]])
                 .current_dir(&self.repo_root)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -386,30 +403,31 @@ impl JjWorkspaceManager {
                 .output()
                 .await
                 .map_err(|e| {
-                    OrchestratorError::JjCommand(format!("Failed to update to revision: {}", e))
+                    OrchestratorError::JjCommand(format!("Failed to edit revision: {}", e))
                 })?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(OrchestratorError::JjCommand(format!(
-                    "Failed to update to revision: {}",
+                    "Failed to edit revision: {}",
                     stderr
                 )));
             }
 
-            // Return the new current revision (which is a child of the workspace revision)
-            return self.get_current_revision().await;
+            // Return the revision we just switched to
+            return Ok(revisions[0].clone());
         }
 
         info!("Merging {} revisions", revisions.len());
         debug!("Revisions to merge: {:?}", revisions);
 
-        // Create merge commit: jj new <rev1> <rev2> ... -m "Merge parallel changes"
-        let mut args = vec!["new"];
+        // For multiple revisions, create a merge commit with `jj new --no-edit`
+        // Using --no-edit prevents creating an additional empty working copy commit
+        let mut args = vec!["new", "--no-edit"];
         for rev in revisions {
             args.push(rev.as_str());
         }
-        args.extend(&["-m", "Merge parallel changes from openspec-orchestrator"]);
+        args.extend(&["-m", "Merge parallel changes"]);
 
         let output = Command::new("jj")
             .args(&args)
@@ -435,8 +453,89 @@ impl JjWorkspaceManager {
             )));
         }
 
-        // Get the new merge revision
-        self.get_current_revision().await
+        // Parse the merge commit revision from the output
+        // Note: jj outputs "Created new commit" to stderr, not stdout
+        // Output format: "Created new commit <change_id> <commit_id> ..."
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let merge_rev = self.parse_created_commit_id(&stderr).await?;
+
+        // Switch to the merge commit using `jj edit`
+        let edit_output = Command::new("jj")
+            .args(["edit", &merge_rev])
+            .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| {
+                OrchestratorError::JjCommand(format!("Failed to edit merge commit: {}", e))
+            })?;
+
+        if !edit_output.status.success() {
+            let stderr = String::from_utf8_lossy(&edit_output.stderr);
+            return Err(OrchestratorError::JjCommand(format!(
+                "Failed to edit merge commit: {}",
+                stderr
+            )));
+        }
+
+        Ok(merge_rev)
+    }
+
+    /// Parse the change_id from `jj new --no-edit` output
+    /// Output format: "Created new commit <change_id> <commit_id> ..."
+    async fn parse_created_commit_id(&self, output: &str) -> Result<String> {
+        // Try to parse from output first
+        for line in output.lines() {
+            if line.contains("Created new commit") {
+                // Format: "Created new commit <change_id> <commit_id> ..."
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 4 {
+                    return Ok(parts[3].to_string());
+                }
+            }
+        }
+
+        // Fallback: get the latest commit that matches merge pattern
+        // This is less reliable but works as a fallback
+        debug!("Could not parse commit id from output, using fallback query");
+        let log_output = Command::new("jj")
+            .args([
+                "log",
+                "-r",
+                "heads(all())",
+                "--no-graph",
+                "--ignore-working-copy",
+                "-T",
+                "change_id ++ \"\\n\"",
+                "-l",
+                "1",
+            ])
+            .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| {
+                OrchestratorError::JjCommand(format!("Failed to get merge revision: {}", e))
+            })?;
+
+        if !log_output.status.success() {
+            return Err(OrchestratorError::JjCommand(
+                "Failed to get merge revision".to_string(),
+            ));
+        }
+
+        let rev = String::from_utf8_lossy(&log_output.stdout)
+            .trim()
+            .to_string();
+        if rev.is_empty() {
+            return Err(OrchestratorError::JjCommand(
+                "Could not determine merge revision".to_string(),
+            ));
+        }
+
+        Ok(rev)
     }
 
     /// Resolve conflicts using the configured resolve command
@@ -451,7 +550,14 @@ impl JjWorkspaceManager {
             }
         };
 
-        let command = resolve_command.replace("{conflict_info}", conflict_info);
+        // Build the resolve prompt with conflict info
+        let resolve_prompt = format!(
+            "Resolve merge conflicts in the following files: {}. \
+             Review the conflict markers and resolve them appropriately.",
+            conflict_info
+        );
+
+        let command = resolve_command.replace("{prompt}", &resolve_prompt);
         info!("Running resolve command: {}", command);
 
         let output = Command::new("sh")

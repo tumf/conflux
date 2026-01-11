@@ -515,6 +515,12 @@ impl AppState {
                 }
                 self.add_log(LogEntry::success(format!("Completed: {}", id)));
             }
+            OrchestratorEvent::ArchiveStarted(id) => {
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
+                    change.queue_status = QueueStatus::Archiving;
+                }
+                self.add_log(LogEntry::info(format!("Archiving: {}", id)));
+            }
             OrchestratorEvent::ChangeArchived(id) => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
                     change.queue_status = QueueStatus::Archived;
@@ -587,11 +593,14 @@ impl AppState {
         // Remove changes that no longer exist (have been archived externally)
         let current_ids: HashSet<String> = fetched_changes.iter().map(|c| c.id.clone()).collect();
         self.changes.retain(|c| {
-            // Keep if still exists, or if it's in a terminal state (completed/archived/error)
+            // Keep if still exists, or if it's in a terminal state (completed/archiving/archived/error)
             current_ids.contains(&c.id)
                 || matches!(
                     c.queue_status,
-                    QueueStatus::Completed | QueueStatus::Archived | QueueStatus::Error(_)
+                    QueueStatus::Completed
+                        | QueueStatus::Archiving
+                        | QueueStatus::Archived
+                        | QueueStatus::Error(_)
                 )
         });
 

@@ -86,12 +86,9 @@ pub async fn archive_single_change(
             .await;
     }
 
-    // Archive the change
+    // Archive the change - send ArchiveStarted event
     let _ = tx
-        .send(OrchestratorEvent::Log(LogEntry::info(format!(
-            "Archiving: {}",
-            change_id
-        ))))
+        .send(OrchestratorEvent::ArchiveStarted(change_id.to_string()))
         .await;
 
     // Run archive command with streaming output
@@ -690,7 +687,7 @@ pub async fn run_orchestrator(
 }
 
 /// Run the orchestrator in parallel mode using jj workspaces
-/// This function executes all changes in parallel using ParallelExecutor
+/// This function executes all changes in parallel using ParallelRunService
 pub async fn run_orchestrator_parallel(
     change_ids: Vec<String>,
     _openspec_cmd: String,
@@ -699,7 +696,8 @@ pub async fn run_orchestrator_parallel(
     cancel_token: CancellationToken,
 ) -> Result<()> {
     use crate::openspec::list_changes_native;
-    use crate::parallel_executor::{ParallelEvent, ParallelExecutor};
+    use crate::parallel_executor::ParallelEvent;
+    use crate::parallel_run_service::ParallelRunService;
     use std::collections::HashSet;
 
     let _ = tx
@@ -709,19 +707,14 @@ pub async fn run_orchestrator_parallel(
         ))))
         .await;
 
-    // Changes remain in Queued state until ApplyStarted event marks them as Processing
-
     // Get repo root
     let repo_root = std::env::current_dir()?;
 
-    // Create event channel for ParallelExecutor
-    let (parallel_tx, mut parallel_rx) = mpsc::channel::<ParallelEvent>(100);
-
-    // Create ParallelExecutor
-    let mut executor = ParallelExecutor::new(repo_root, config.clone(), Some(parallel_tx));
+    // Create ParallelRunService
+    let service = ParallelRunService::new(repo_root, config.clone());
 
     // Check jj availability
-    if !executor.check_jj_available().await? {
+    if !service.check_jj_available().await? {
         let _ = tx
             .send(OrchestratorEvent::Log(LogEntry::error(
                 "jj is not available for parallel execution".to_string(),
@@ -746,26 +739,23 @@ pub async fn run_orchestrator_parallel(
         .filter(|c| selected_set.contains(&c.id))
         .collect();
 
-    // Use deterministic dependency-based grouping (no LLM)
+    // Log that LLM analysis will be used (actual grouping happens inside run_parallel_with_channel)
     let _ = tx
         .send(OrchestratorEvent::Log(LogEntry::info(format!(
-            "Grouping {} changes by dependencies...",
+            "Analyzing {} changes for parallelization...",
             selected_changes.len()
         ))))
         .await;
 
-    let groups = group_by_dependencies(&selected_changes);
-    let _ = tx
-        .send(OrchestratorEvent::Log(LogEntry::info(format!(
-            "Created {} groups based on dependencies",
-            groups.len()
-        ))))
-        .await;
+    // Create event channel for forwarding to TUI
+    let (parallel_tx, mut parallel_rx) = mpsc::channel::<ParallelEvent>(100);
 
-    // Spawn event forwarding task
+    // Spawn event forwarding task using ParallelEventBridge
     let forward_tx = tx.clone();
     let forward_cancel = cancel_token.clone();
     let forward_handle = tokio::spawn(async move {
+        use super::parallel_event_bridge;
+
         loop {
             tokio::select! {
                 _ = forward_cancel.cancelled() => {
@@ -773,145 +763,15 @@ pub async fn run_orchestrator_parallel(
                 }
                 event = parallel_rx.recv() => {
                     match event {
-                        Some(ParallelEvent::WorkspaceCreated { change_id, workspace }) => {
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::Log(
-                                    LogEntry::info(format!("Created workspace: {}", workspace))
-                                        .with_change_id(&change_id),
-                                ))
-                                .await;
-                        }
-                        Some(ParallelEvent::ApplyStarted { change_id }) => {
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::Log(
-                                    LogEntry::info("Apply started".to_string())
-                                        .with_change_id(&change_id),
-                                ))
-                                .await;
-                            // Mark as Processing when apply actually starts
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::ProcessingStarted(change_id))
-                                .await;
-                        }
-                        Some(ParallelEvent::ApplyOutput { change_id, output }) => {
-                            // Split output into multiple log entries for each line
-                            for line in output.lines() {
-                                if !line.trim().is_empty() {
-                                    let _ = forward_tx
-                                        .send(OrchestratorEvent::Log(
-                                            LogEntry::info(line.to_string())
-                                                .with_change_id(&change_id),
-                                        ))
-                                        .await;
-                                }
-                            }
-                        }
-                        Some(ParallelEvent::ApplyCompleted { change_id, .. }) => {
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::Log(
-                                    LogEntry::success("Apply completed".to_string())
-                                        .with_change_id(&change_id),
-                                ))
-                                .await;
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::ProcessingCompleted(change_id))
-                                .await;
-                        }
-                        Some(ParallelEvent::ApplyFailed { change_id, error }) => {
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::Log(
-                                    LogEntry::error(format!("Apply failed: {}", error))
-                                        .with_change_id(&change_id),
-                                ))
-                                .await;
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::ProcessingError {
-                                    id: change_id,
-                                    error,
-                                })
-                                .await;
-                        }
-                        Some(ParallelEvent::MergeStarted { revisions }) => {
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                                    "Merging {} revisions",
-                                    revisions.len()
-                                ))))
-                                .await;
-                        }
-                        Some(ParallelEvent::MergeCompleted { .. }) => {
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::Log(LogEntry::success(
-                                    "Merge completed".to_string(),
-                                )))
-                                .await;
-                        }
-                        Some(ParallelEvent::MergeConflict { files }) => {
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                                    "Merge conflicts in {} files",
-                                    files.len()
-                                ))))
-                                .await;
-                        }
-                        Some(ParallelEvent::CleanupStarted { workspace }) => {
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                                    "Cleaning up workspace: {}",
-                                    workspace
-                                ))))
-                                .await;
-                        }
-                        Some(ParallelEvent::CleanupCompleted { .. }) => {
-                            // Silent cleanup completion
-                        }
-                        Some(ParallelEvent::GroupStarted { group_id, changes }) => {
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                                    "Starting group {} with {} change(s): {}",
-                                    group_id,
-                                    changes.len(),
-                                    changes.join(", ")
-                                ))))
-                                .await;
-                        }
-                        Some(ParallelEvent::GroupCompleted { group_id }) => {
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::Log(LogEntry::success(format!(
-                                    "Group {} completed",
-                                    group_id
-                                ))))
-                                .await;
-                        }
-                        Some(ParallelEvent::ChangeArchived { change_id }) => {
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::Log(
-                                    LogEntry::success("Archived".to_string())
-                                        .with_change_id(&change_id),
-                                ))
-                                .await;
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::ChangeArchived(change_id))
-                                .await;
-                        }
-                        Some(ParallelEvent::ArchiveFailed { change_id, error }) => {
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::Log(
-                                    LogEntry::error(format!("Archive failed: {}", error))
-                                        .with_change_id(&change_id),
-                                ))
-                                .await;
-                        }
                         Some(ParallelEvent::AllCompleted) => {
+                            // AllCompleted signals loop termination
                             break;
                         }
-                        Some(ParallelEvent::Error { message }) => {
-                            let _ = forward_tx
-                                .send(OrchestratorEvent::Log(LogEntry::error(message)))
-                                .await;
-                        }
-                        Some(_) => {
-                            // Other events - ignore
+                        Some(parallel_event) => {
+                            // Convert and forward all events using the bridge
+                            for orchestrator_event in parallel_event_bridge::convert(parallel_event) {
+                                let _ = forward_tx.send(orchestrator_event).await;
+                            }
                         }
                         None => {
                             break;
@@ -922,7 +782,7 @@ pub async fn run_orchestrator_parallel(
         }
     });
 
-    // Execute groups sequentially (groups are already ordered by dependencies)
+    // Execute using ParallelRunService with channel
     let result = tokio::select! {
         _ = cancel_token.cancelled() => {
             let _ = tx
@@ -932,7 +792,7 @@ pub async fn run_orchestrator_parallel(
                 .await;
             Err(crate::error::OrchestratorError::AgentCommand("Cancelled".to_string()))
         }
-        result = executor.execute_groups(groups) => {
+        result = service.run_parallel_with_channel(selected_changes, parallel_tx) => {
             result
         }
     };
@@ -944,41 +804,9 @@ pub async fn run_orchestrator_parallel(
         Ok(_) => {
             let _ = tx
                 .send(OrchestratorEvent::Log(LogEntry::success(
-                    "All parallel changes completed, archiving...".to_string(),
+                    "All parallel changes completed".to_string(),
                 )))
                 .await;
-
-            // Actually archive completed changes
-            let agent = crate::agent::AgentRunner::new(config);
-            for id in &change_ids {
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                        "Archiving: {}",
-                        id
-                    ))))
-                    .await;
-
-                // Run archive command
-                match agent.run_archive(id).await {
-                    Ok(_) => {
-                        let _ = tx.send(OrchestratorEvent::ChangeArchived(id.clone())).await;
-                        let _ = tx
-                            .send(OrchestratorEvent::Log(LogEntry::success(format!(
-                                "Archived: {}",
-                                id
-                            ))))
-                            .await;
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(OrchestratorEvent::Log(LogEntry::error(format!(
-                                "Failed to archive {}: {}",
-                                id, e
-                            ))))
-                            .await;
-                    }
-                }
-            }
         }
         Err(e) => {
             let _ = tx
@@ -992,88 +820,4 @@ pub async fn run_orchestrator_parallel(
 
     let _ = tx.send(OrchestratorEvent::AllCompleted).await;
     Ok(())
-}
-
-/// Group changes by their declared dependencies (deterministic, no LLM)
-///
-/// Returns groups in topological order where:
-/// - Group 1: Changes with no dependencies
-/// - Group 2: Changes that depend only on Group 1 changes
-/// - And so on...
-fn group_by_dependencies(changes: &[Change]) -> Vec<crate::analyzer::ParallelGroup> {
-    use std::collections::{HashMap, HashSet};
-
-    if changes.is_empty() {
-        return Vec::new();
-    }
-
-    // Build lookup maps with owned strings to avoid lifetime issues
-    let change_ids: HashSet<String> = changes.iter().map(|c| c.id.clone()).collect();
-    let mut remaining: HashSet<String> = change_ids.clone();
-    let mut completed_changes: HashSet<String> = HashSet::new();
-
-    // Map from change_id to its dependencies (filtered to only include changes in our set)
-    let deps_map: HashMap<String, Vec<String>> = changes
-        .iter()
-        .map(|c| {
-            let deps: Vec<String> = c
-                .dependencies
-                .iter()
-                .filter(|d| change_ids.contains(*d))
-                .cloned()
-                .collect();
-            (c.id.clone(), deps)
-        })
-        .collect();
-
-    let mut groups: Vec<crate::analyzer::ParallelGroup> = Vec::new();
-    let mut group_id = 1u32;
-
-    // Iteratively find changes whose dependencies are all complete
-    while !remaining.is_empty() {
-        let mut current_group: Vec<String> = Vec::new();
-
-        for change_id in &remaining {
-            let deps = deps_map.get(change_id).map(|d| d.as_slice()).unwrap_or(&[]);
-            // A change can be in this group if all its dependencies are completed
-            if deps.iter().all(|d| completed_changes.contains(d)) {
-                current_group.push(change_id.clone());
-            }
-        }
-
-        if current_group.is_empty() {
-            // Circular dependency or missing dependency - add remaining changes to last group
-            tracing::warn!(
-                "Unable to resolve dependencies for: {:?}",
-                remaining.iter().collect::<Vec<_>>()
-            );
-            current_group = remaining.iter().cloned().collect();
-        }
-
-        // Calculate depends_on (previous group if any)
-        let depends_on = if group_id > 1 {
-            vec![group_id - 1]
-        } else {
-            Vec::new()
-        };
-
-        // Remove completed changes from remaining
-        for change_id in &current_group {
-            remaining.remove(change_id);
-            completed_changes.insert(change_id.clone());
-        }
-
-        // Sort for deterministic output
-        current_group.sort();
-
-        groups.push(crate::analyzer::ParallelGroup {
-            id: group_id,
-            changes: current_group,
-            depends_on,
-        });
-
-        group_id += 1;
-    }
-
-    groups
 }

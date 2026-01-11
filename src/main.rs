@@ -11,6 +11,7 @@ mod opencode;
 mod openspec;
 mod orchestrator;
 mod parallel_executor;
+mod parallel_run_service;
 mod progress;
 mod task_parser;
 mod templates;
@@ -23,6 +24,32 @@ use error::Result;
 use orchestrator::Orchestrator;
 use std::path::Path;
 use tracing::{info, Level};
+use tracing_subscriber::prelude::*;
+
+/// Initialize file-based logging for TUI mode
+fn init_file_logging(log_path: &Path) -> Result<()> {
+    use std::fs::File;
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+
+    let file = File::create(log_path).map_err(|e| {
+        error::OrchestratorError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to create log file '{}': {}", log_path.display(), e),
+        ))
+    })?;
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(file.with_max_level(Level::DEBUG))
+        .with_ansi(false)
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_file(true)
+        .with_line_number(true);
+
+    tracing_subscriber::registry().with(file_layer).init();
+
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -48,6 +75,11 @@ async fn main() -> Result<()> {
 
         // Explicit TUI subcommand
         Some(Commands::Tui(args)) => {
+            // Initialize file logging if --logs is specified
+            if let Some(log_path) = &args.logs {
+                init_file_logging(log_path)?;
+            }
+
             // Get initial changes using native implementation
             let changes = openspec::list_changes_native()?;
 
