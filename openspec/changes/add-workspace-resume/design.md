@@ -35,30 +35,30 @@ fn find_existing_workspace(&self, change_id: &str) -> Option<WorkspaceInfo>;
 
 ### 2. 再利用判断基準
 
-**決定**: 以下の条件を満たす場合に再利用可能と判断
+**決定**: workspaceディレクトリが存在すれば再利用可能と判断
 
-1. workspaceディレクトリが存在する
-2. tasks.mdが存在し、進捗が0%より大きい、または
-3. VCSで未コミットの変更がある
+tasks.mdの進捗状況やVCSの変更状態は判断基準に含めない。workspaceが存在すること自体が再利用の条件となる。
 
 ```rust
 pub struct WorkspaceInfo {
     pub path: PathBuf,
     pub change_id: String,
     pub workspace_name: String,
-    pub progress: Option<TaskProgress>,  // tasks.mdから読み取り
-    pub has_uncommitted_changes: bool,   // VCS status確認
     pub last_modified: SystemTime,
 }
 ```
+
+**理由**:
+- シンプルな判断基準により実装が簡潔になる
+- workspaceが存在する = 何らかの作業が行われた可能性がある
+- 進捗確認は再利用後のapply loopで自動的に行われる
 
 ### 3. 自動レジューム
 
 **決定**: 既存workspaceが検出された場合、確認なしで自動的に再利用する
 
 ```
-[INFO] Resuming existing workspace for 'add-feature-x':
-       Progress: 5/10 tasks (50%)
+[INFO] Resuming existing workspace for 'add-feature-x'
        Last modified: 2 hours ago
 ```
 
