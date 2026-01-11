@@ -1,12 +1,12 @@
-//! jj (Jujutsu) workspace management for parallel change execution.
+//! Jujutsu (jj) workspace management for parallel change execution.
 //!
 //! This module provides workspace creation, merge, and cleanup functionality
 //! to enable parallel execution of changes in isolated workspaces.
 
+pub mod commands;
+
 use crate::config::OrchestratorConfig;
-use crate::error::{OrchestratorError, Result};
-use crate::jj_commands;
-use crate::vcs_backend::{VcsBackend, Workspace, WorkspaceManager, WorkspaceStatus};
+use crate::vcs::{VcsBackend, VcsError, VcsResult, Workspace, WorkspaceManager, WorkspaceStatus};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -61,21 +61,21 @@ impl JjWorkspaceManager {
     }
 
     /// Get the maximum concurrent workspaces limit
-    #[allow(dead_code)] // Part of workspace manager pattern
+    #[allow(dead_code)]
     pub fn max_concurrent(&self) -> usize {
         self.max_concurrent
     }
 
     /// Get list of active workspaces
     #[allow(dead_code)]
-    pub fn workspaces(&self) -> &[JjWorkspace] {
+    pub fn jj_workspaces(&self) -> &[JjWorkspace] {
         &self.workspaces
     }
 
     /// Check if jj is available and the repo is a jj repository
-    #[allow(dead_code)] // Part of WorkspaceManager trait implementation
-    pub async fn check_jj_available(&self) -> Result<bool> {
-        jj_commands::check_jj_repo(&self.repo_root).await
+    #[allow(dead_code)]
+    pub async fn check_jj_available(&self) -> VcsResult<bool> {
+        commands::check_jj_repo(&self.repo_root).await
     }
 
     /// Snapshot the current working copy to ensure changes are visible in new workspaces.
@@ -83,7 +83,7 @@ impl JjWorkspaceManager {
     /// In jj, uncommitted changes in the working copy are not visible in new workspaces.
     /// This function creates a snapshot by running `jj new` to start a new change,
     /// which effectively commits the current state and makes it available to workspaces.
-    pub async fn snapshot_working_copy(&self) -> Result<()> {
+    pub async fn snapshot_working_copy(&self) -> VcsResult<()> {
         info!("Snapshotting working copy for parallel execution");
 
         // First, check if there are any changes to snapshot
@@ -93,7 +93,7 @@ impl JjWorkspaceManager {
             .stdin(Stdio::null())
             .output()
             .await
-            .map_err(|e| OrchestratorError::JjCommand(format!("Failed to check status: {}", e)))?;
+            .map_err(|e| VcsError::jj_command(format!("Failed to check status: {}", e)))?;
 
         let status_str = String::from_utf8_lossy(&status_output.stdout);
 
@@ -112,13 +112,11 @@ impl JjWorkspaceManager {
                 .stdin(Stdio::null())
                 .output()
                 .await
-                .map_err(|e| {
-                    OrchestratorError::JjCommand(format!("Failed to create snapshot: {}", e))
-                })?;
+                .map_err(|e| VcsError::jj_command(format!("Failed to create snapshot: {}", e)))?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(OrchestratorError::JjCommand(format!(
+                return Err(VcsError::jj_command(format!(
                     "Failed to create snapshot: {}",
                     stderr
                 )));
@@ -133,8 +131,8 @@ impl JjWorkspaceManager {
     }
 
     /// Get the current jj revision
-    pub async fn get_current_revision(&self) -> Result<String> {
-        jj_commands::get_current_revision(&self.repo_root).await
+    pub async fn get_current_revision(&self) -> VcsResult<String> {
+        commands::get_current_revision(&self.repo_root).await
     }
 
     /// Create a new workspace for a change from a specific base revision
@@ -145,7 +143,7 @@ impl JjWorkspaceManager {
         &mut self,
         change_id: &str,
         base_revision: Option<&str>,
-    ) -> Result<JjWorkspace> {
+    ) -> VcsResult<JjWorkspace> {
         // Sanitize change_id and add unique suffix for workspace name
         let unique_suffix = format!(
             "{:x}",
@@ -163,7 +161,7 @@ impl JjWorkspaceManager {
 
         // Ensure base directory exists
         if !self.base_dir.exists() {
-            std::fs::create_dir_all(&self.base_dir).map_err(OrchestratorError::Io)?;
+            std::fs::create_dir_all(&self.base_dir)?;
         }
 
         // Check if workspace already exists and clean it up
@@ -221,13 +219,11 @@ impl JjWorkspaceManager {
             .stdin(Stdio::null())
             .output()
             .await
-            .map_err(|e| {
-                OrchestratorError::JjCommand(format!("Failed to create workspace: {}", e))
-            })?;
+            .map_err(|e| VcsError::jj_command(format!("Failed to create workspace: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(OrchestratorError::JjCommand(format!(
+            return Err(VcsError::jj_command(format!(
                 "Workspace creation failed: {}",
                 stderr
             )));
@@ -241,13 +237,11 @@ impl JjWorkspaceManager {
             .stdin(Stdio::null())
             .output()
             .await
-            .map_err(|e| {
-                OrchestratorError::JjCommand(format!("Failed to initialize workspace: {}", e))
-            })?;
+            .map_err(|e| VcsError::jj_command(format!("Failed to initialize workspace: {}", e)))?;
 
         if !init_output.status.success() {
             let stderr = String::from_utf8_lossy(&init_output.stderr);
-            return Err(OrchestratorError::JjCommand(format!(
+            return Err(VcsError::jj_command(format!(
                 "Workspace initialization failed: {}",
                 stderr
             )));
@@ -269,12 +263,12 @@ impl JjWorkspaceManager {
 
     /// Get the current revision in a workspace
     #[allow(dead_code)]
-    pub async fn get_workspace_revision(&self, workspace: &JjWorkspace) -> Result<String> {
-        jj_commands::get_current_revision(&workspace.path).await
+    pub async fn get_workspace_revision(&self, workspace: &JjWorkspace) -> VcsResult<String> {
+        commands::get_current_revision(&workspace.path).await
     }
 
     /// Update workspace status
-    pub fn update_workspace_status(&mut self, workspace_name: &str, status: WorkspaceStatus) {
+    pub fn update_jj_workspace_status(&mut self, workspace_name: &str, status: WorkspaceStatus) {
         if let Some(ws) = self
             .workspaces
             .iter_mut()
@@ -289,11 +283,9 @@ impl JjWorkspaceManager {
     /// For single revision: Uses `jj edit` to switch to that revision without creating empty commits.
     /// For multiple revisions: Uses `jj new --no-edit` to create a merge commit without creating
     /// an additional empty working copy commit, then uses `jj edit` to switch to the merge commit.
-    pub async fn merge_workspaces(&self, revisions: &[String]) -> Result<String> {
+    pub async fn merge_jj_workspaces(&self, revisions: &[String]) -> VcsResult<String> {
         if revisions.is_empty() {
-            return Err(OrchestratorError::JjCommand(
-                "No revisions to merge".to_string(),
-            ));
+            return Err(VcsError::jj_command("No revisions to merge"));
         }
 
         if revisions.len() == 1 {
@@ -310,13 +302,11 @@ impl JjWorkspaceManager {
                 .stderr(Stdio::piped())
                 .output()
                 .await
-                .map_err(|e| {
-                    OrchestratorError::JjCommand(format!("Failed to edit revision: {}", e))
-                })?;
+                .map_err(|e| VcsError::jj_command(format!("Failed to edit revision: {}", e)))?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(OrchestratorError::JjCommand(format!(
+                return Err(VcsError::jj_command(format!(
                     "Failed to edit revision: {}",
                     stderr
                 )));
@@ -345,20 +335,17 @@ impl JjWorkspaceManager {
             .stderr(Stdio::piped())
             .output()
             .await
-            .map_err(|e| OrchestratorError::JjCommand(format!("Merge failed: {}", e)))?;
+            .map_err(|e| VcsError::jj_command(format!("Merge failed: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
 
             // Check for conflicts
             if stderr.contains("conflict") || stderr.contains("Conflict") {
-                return Err(OrchestratorError::JjConflict(stderr.to_string()));
+                return Err(VcsError::jj_conflict(stderr.to_string()));
             }
 
-            return Err(OrchestratorError::JjCommand(format!(
-                "Merge failed: {}",
-                stderr
-            )));
+            return Err(VcsError::jj_command(format!("Merge failed: {}", stderr)));
         }
 
         // Parse the merge commit revision from the output
@@ -376,13 +363,11 @@ impl JjWorkspaceManager {
             .stderr(Stdio::piped())
             .output()
             .await
-            .map_err(|e| {
-                OrchestratorError::JjCommand(format!("Failed to edit merge commit: {}", e))
-            })?;
+            .map_err(|e| VcsError::jj_command(format!("Failed to edit merge commit: {}", e)))?;
 
         if !edit_output.status.success() {
             let stderr = String::from_utf8_lossy(&edit_output.stderr);
-            return Err(OrchestratorError::JjCommand(format!(
+            return Err(VcsError::jj_command(format!(
                 "Failed to edit merge commit: {}",
                 stderr
             )));
@@ -393,7 +378,7 @@ impl JjWorkspaceManager {
 
     /// Parse the change_id from `jj new --no-edit` output
     /// Output format: "Created new commit <change_id> <commit_id> ..."
-    async fn parse_created_commit_id(&self, output: &str) -> Result<String> {
+    async fn parse_created_commit_id(&self, output: &str) -> VcsResult<String> {
         // Try to parse from output first
         for line in output.lines() {
             if line.contains("Created new commit") {
@@ -424,30 +409,24 @@ impl JjWorkspaceManager {
             .stdin(Stdio::null())
             .output()
             .await
-            .map_err(|e| {
-                OrchestratorError::JjCommand(format!("Failed to get merge revision: {}", e))
-            })?;
+            .map_err(|e| VcsError::jj_command(format!("Failed to get merge revision: {}", e)))?;
 
         if !log_output.status.success() {
-            return Err(OrchestratorError::JjCommand(
-                "Failed to get merge revision".to_string(),
-            ));
+            return Err(VcsError::jj_command("Failed to get merge revision"));
         }
 
         let rev = String::from_utf8_lossy(&log_output.stdout)
             .trim()
             .to_string();
         if rev.is_empty() {
-            return Err(OrchestratorError::JjCommand(
-                "Could not determine merge revision".to_string(),
-            ));
+            return Err(VcsError::jj_command("Could not determine merge revision"));
         }
 
         Ok(rev)
     }
 
     /// Cleanup a single workspace (forget + delete directory)
-    pub async fn cleanup_workspace(&mut self, workspace_name: &str) -> Result<()> {
+    pub async fn cleanup_jj_workspace(&mut self, workspace_name: &str) -> VcsResult<()> {
         let workspace = self
             .workspaces
             .iter()
@@ -484,18 +463,18 @@ impl JjWorkspaceManager {
         }
 
         // Update status
-        self.update_workspace_status(workspace_name, WorkspaceStatus::Cleaned);
+        self.update_jj_workspace_status(workspace_name, WorkspaceStatus::Cleaned);
 
         debug!("Workspace '{}' cleaned up", workspace_name);
         Ok(())
     }
 
     /// Cleanup all workspaces
-    pub async fn cleanup_all(&mut self) -> Result<()> {
+    pub async fn cleanup_all_jj_workspaces(&mut self) -> VcsResult<()> {
         let workspace_names: Vec<String> = self.workspaces.iter().map(|w| w.name.clone()).collect();
 
         for name in workspace_names {
-            let _ = self.cleanup_workspace(&name).await;
+            let _ = self.cleanup_jj_workspace(&name).await;
         }
 
         // Clear the workspace list
@@ -515,8 +494,8 @@ impl JjWorkspaceManager {
 
     /// List all jj workspaces in the repository
     #[allow(dead_code)]
-    pub async fn list_jj_workspaces(&self) -> Result<Vec<String>> {
-        let output = jj_commands::run_jj(&["workspace", "list"], &self.repo_root).await?;
+    pub async fn list_jj_workspaces(&self) -> VcsResult<Vec<String>> {
+        let output = commands::run_jj(&["workspace", "list"], &self.repo_root).await?;
         let workspaces: Vec<String> = output
             .lines()
             .filter_map(|line| {
@@ -535,16 +514,16 @@ impl WorkspaceManager for JjWorkspaceManager {
         VcsBackend::Jj
     }
 
-    async fn check_available(&self) -> Result<bool> {
+    async fn check_available(&self) -> VcsResult<bool> {
         self.check_jj_available().await
     }
 
-    async fn prepare_for_parallel(&self) -> Result<()> {
+    async fn prepare_for_parallel(&self) -> VcsResult<()> {
         // jj snapshots working copy changes automatically
         self.snapshot_working_copy().await
     }
 
-    async fn get_current_revision(&self) -> Result<String> {
+    async fn get_current_revision(&self) -> VcsResult<String> {
         JjWorkspaceManager::get_current_revision(self).await
     }
 
@@ -552,7 +531,7 @@ impl WorkspaceManager for JjWorkspaceManager {
         &mut self,
         change_id: &str,
         base_revision: Option<&str>,
-    ) -> Result<Workspace> {
+    ) -> VcsResult<Workspace> {
         let jj_ws = self.create_workspace_from(change_id, base_revision).await?;
         Ok(Workspace {
             name: jj_ws.name,
@@ -564,19 +543,19 @@ impl WorkspaceManager for JjWorkspaceManager {
     }
 
     fn update_workspace_status(&mut self, workspace_name: &str, status: WorkspaceStatus) {
-        JjWorkspaceManager::update_workspace_status(self, workspace_name, status);
+        self.update_jj_workspace_status(workspace_name, status);
     }
 
-    async fn merge_workspaces(&self, revisions: &[String]) -> Result<String> {
-        JjWorkspaceManager::merge_workspaces(self, revisions).await
+    async fn merge_workspaces(&self, revisions: &[String]) -> VcsResult<String> {
+        self.merge_jj_workspaces(revisions).await
     }
 
-    async fn cleanup_workspace(&mut self, workspace_name: &str) -> Result<()> {
-        JjWorkspaceManager::cleanup_workspace(self, workspace_name).await
+    async fn cleanup_workspace(&mut self, workspace_name: &str) -> VcsResult<()> {
+        self.cleanup_jj_workspace(workspace_name).await
     }
 
-    async fn cleanup_all(&mut self) -> Result<()> {
-        JjWorkspaceManager::cleanup_all(self).await
+    async fn cleanup_all(&mut self) -> VcsResult<()> {
+        self.cleanup_all_jj_workspaces().await
     }
 
     fn max_concurrent(&self) -> usize {
@@ -603,7 +582,7 @@ impl WorkspaceManager for JjWorkspaceManager {
          jj will automatically detect the resolution."
     }
 
-    async fn snapshot_working_copy(&self, workspace_path: &Path) -> Result<()> {
+    async fn snapshot_working_copy(&self, workspace_path: &Path) -> VcsResult<()> {
         // jj snapshots working copy changes when running status
         let _ = tokio::process::Command::new("jj")
             .arg("status")
@@ -613,15 +592,14 @@ impl WorkspaceManager for JjWorkspaceManager {
         Ok(())
     }
 
-    async fn set_commit_message(&self, workspace_path: &Path, message: &str) -> Result<()> {
-        use std::process::Stdio;
+    async fn set_commit_message(&self, workspace_path: &Path, message: &str) -> VcsResult<()> {
         let output = tokio::process::Command::new("jj")
             .args(["describe", "-m", message])
             .current_dir(workspace_path)
             .stdin(Stdio::null())
             .output()
             .await
-            .map_err(|e| OrchestratorError::JjCommand(format!("Failed to describe: {}", e)))?;
+            .map_err(|e| VcsError::jj_command(format!("Failed to describe: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -630,7 +608,7 @@ impl WorkspaceManager for JjWorkspaceManager {
         Ok(())
     }
 
-    async fn get_revision_in_workspace(&self, workspace_path: &Path) -> Result<String> {
+    async fn get_revision_in_workspace(&self, workspace_path: &Path) -> VcsResult<String> {
         let output = tokio::process::Command::new("jj")
             .args([
                 "log",
@@ -644,11 +622,11 @@ impl WorkspaceManager for JjWorkspaceManager {
             .current_dir(workspace_path)
             .output()
             .await
-            .map_err(|e| OrchestratorError::JjCommand(format!("Failed to get revision: {}", e)))?;
+            .map_err(|e| VcsError::jj_command(format!("Failed to get revision: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(OrchestratorError::JjCommand(format!(
+            return Err(VcsError::jj_command(format!(
                 "Failed to get workspace revision: {}",
                 stderr
             )));
@@ -657,15 +635,15 @@ impl WorkspaceManager for JjWorkspaceManager {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    async fn get_status(&self) -> Result<String> {
-        jj_commands::get_status(&self.repo_root).await
+    async fn get_status(&self) -> VcsResult<String> {
+        commands::get_status(&self.repo_root).await
     }
 
-    async fn get_log_for_revisions(&self, revisions: &[String]) -> Result<String> {
-        jj_commands::get_log_for_revisions(revisions, &self.repo_root).await
+    async fn get_log_for_revisions(&self, revisions: &[String]) -> VcsResult<String> {
+        commands::get_log_for_revisions(revisions, &self.repo_root).await
     }
 
-    async fn detect_conflicts(&self) -> Result<Vec<String>> {
+    async fn detect_conflicts(&self) -> VcsResult<Vec<String>> {
         let stdout = self.get_status().await?;
         let mut conflict_files = Vec::new();
 
@@ -744,7 +722,7 @@ mod tests {
     fn test_manager_creation() {
         let (manager, _temp) = create_test_manager();
         assert_eq!(manager.max_concurrent(), 3);
-        assert!(manager.workspaces().is_empty());
+        assert!(manager.jj_workspaces().is_empty());
     }
 
     #[test]

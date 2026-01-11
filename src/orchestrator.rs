@@ -6,7 +6,7 @@ use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::parallel_run_service::ParallelRunService;
 use crate::progress::ProgressDisplay;
-use crate::vcs_backend::VcsBackend;
+use crate::vcs::VcsBackend;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};

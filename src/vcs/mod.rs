@@ -3,20 +3,90 @@
 //! This module provides a trait-based abstraction for VCS operations,
 //! allowing parallel execution to work with both jj and Git.
 //!
-//! Note: Some trait methods are reserved for future use in workspace
-//! orchestration and parallel execution improvements.
+//! ## Module Structure
+//!
+//! - `mod.rs` - Public API, traits, and VcsError
+//! - `commands.rs` - Common command execution helpers
+//! - `jj/` - Jujutsu-specific implementation
+//! - `git/` - Git-specific implementation
 
-// Allow unused trait methods - they are part of the VCS abstraction layer
-// and will be used as the implementation matures
-#![allow(dead_code)]
+pub mod commands;
+pub mod git;
+pub mod jj;
 
-use crate::error::{OrchestratorError, Result};
-use crate::git_commands;
-use crate::jj_commands;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use thiserror::Error;
 use tracing::{debug, info};
+
+/// VCS-specific error type.
+///
+/// Wraps all VCS-related errors with backend context for better error messages.
+#[derive(Error, Debug)]
+pub enum VcsError {
+    #[error("{backend} command failed: {message}")]
+    Command {
+        backend: VcsBackend,
+        message: String,
+    },
+
+    #[error("Merge conflict in {backend}: {details}")]
+    Conflict {
+        backend: VcsBackend,
+        details: String,
+    },
+
+    #[error("{backend} not available: {reason}")]
+    #[allow(dead_code)] // Reserved for future VCS availability checks
+    NotAvailable { backend: VcsBackend, reason: String },
+
+    #[error("Uncommitted changes detected: {0}")]
+    UncommittedChanges(String),
+
+    #[error("No VCS backend available for parallel execution")]
+    NoBackend,
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl VcsError {
+    /// Create a command error for jj backend.
+    pub fn jj_command(message: impl Into<String>) -> Self {
+        VcsError::Command {
+            backend: VcsBackend::Jj,
+            message: message.into(),
+        }
+    }
+
+    /// Create a command error for Git backend.
+    pub fn git_command(message: impl Into<String>) -> Self {
+        VcsError::Command {
+            backend: VcsBackend::Git,
+            message: message.into(),
+        }
+    }
+
+    /// Create a conflict error for jj backend.
+    pub fn jj_conflict(details: impl Into<String>) -> Self {
+        VcsError::Conflict {
+            backend: VcsBackend::Jj,
+            details: details.into(),
+        }
+    }
+
+    /// Create a conflict error for Git backend.
+    pub fn git_conflict(details: impl Into<String>) -> Self {
+        VcsError::Conflict {
+            backend: VcsBackend::Git,
+            details: details.into(),
+        }
+    }
+}
+
+/// Result type for VCS operations.
+pub type VcsResult<T> = std::result::Result<T, VcsError>;
 
 /// VCS backend type for parallel execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -96,28 +166,29 @@ pub struct Workspace {
 /// This trait abstracts VCS-specific operations needed for parallel execution,
 /// allowing both jj and Git backends to be used interchangeably.
 #[async_trait]
+#[allow(dead_code)] // Some trait methods are reserved for future use
 pub trait WorkspaceManager: Send + Sync {
     /// Get the VCS backend type
     fn backend_type(&self) -> VcsBackend;
 
     /// Check if this VCS is available for parallel execution
-    async fn check_available(&self) -> Result<bool>;
+    async fn check_available(&self) -> VcsResult<bool>;
 
     /// Prepare for parallel execution.
     ///
     /// For jj: Creates a snapshot of working copy changes.
     /// For Git: Verifies working directory is clean (returns error if not).
-    async fn prepare_for_parallel(&self) -> Result<()>;
+    async fn prepare_for_parallel(&self) -> VcsResult<()>;
 
     /// Get the current revision/commit
-    async fn get_current_revision(&self) -> Result<String>;
+    async fn get_current_revision(&self) -> VcsResult<String>;
 
     /// Create a new workspace for a change
     async fn create_workspace(
         &mut self,
         change_id: &str,
         base_revision: Option<&str>,
-    ) -> Result<Workspace>;
+    ) -> VcsResult<Workspace>;
 
     /// Update workspace status
     fn update_workspace_status(&mut self, workspace_name: &str, status: WorkspaceStatus);
@@ -125,13 +196,13 @@ pub trait WorkspaceManager: Send + Sync {
     /// Merge multiple workspace revisions into main.
     ///
     /// Returns the final revision after merge.
-    async fn merge_workspaces(&self, revisions: &[String]) -> Result<String>;
+    async fn merge_workspaces(&self, revisions: &[String]) -> VcsResult<String>;
 
     /// Cleanup a single workspace
-    async fn cleanup_workspace(&mut self, workspace_name: &str) -> Result<()>;
+    async fn cleanup_workspace(&mut self, workspace_name: &str) -> VcsResult<()>;
 
     /// Cleanup all workspaces
-    async fn cleanup_all(&mut self) -> Result<()>;
+    async fn cleanup_all(&mut self) -> VcsResult<()>;
 
     /// Get the maximum concurrent workspaces limit
     fn max_concurrent(&self) -> usize;
@@ -148,30 +219,30 @@ pub trait WorkspaceManager: Send + Sync {
     ///
     /// For jj: Runs `jj status` to trigger automatic snapshotting.
     /// For Git: No-op (Git doesn't auto-snapshot).
-    async fn snapshot_working_copy(&self, workspace_path: &Path) -> Result<()>;
+    async fn snapshot_working_copy(&self, workspace_path: &Path) -> VcsResult<()>;
 
     /// Set the commit message for a workspace.
     ///
     /// For jj: `jj describe -m <message>`
     /// For Git: `git commit --amend -m <message>` (if there's a commit)
-    async fn set_commit_message(&self, workspace_path: &Path, message: &str) -> Result<()>;
+    async fn set_commit_message(&self, workspace_path: &Path, message: &str) -> VcsResult<()>;
 
     /// Get the current revision in a workspace.
     ///
     /// For jj: `jj log -r @ -T change_id`
     /// For Git: `git rev-parse HEAD`
-    async fn get_revision_in_workspace(&self, workspace_path: &Path) -> Result<String>;
+    async fn get_revision_in_workspace(&self, workspace_path: &Path) -> VcsResult<String>;
 
     /// Get VCS status output for context in error messages.
-    async fn get_status(&self) -> Result<String>;
+    async fn get_status(&self) -> VcsResult<String>;
 
     /// Get log output for specific revisions (used for conflict resolution context).
-    async fn get_log_for_revisions(&self, revisions: &[String]) -> Result<String>;
+    async fn get_log_for_revisions(&self, revisions: &[String]) -> VcsResult<String>;
 
     /// Detect conflicted files.
     ///
     /// Returns a list of file paths that have conflicts.
-    async fn detect_conflicts(&self) -> Result<Vec<String>>;
+    async fn detect_conflicts(&self) -> VcsResult<Vec<String>>;
 
     /// Forget/cleanup a workspace by name (used in emergency cleanup).
     ///
@@ -193,26 +264,26 @@ pub trait WorkspaceManager: Send + Sync {
 pub async fn detect_vcs_backend<P: AsRef<Path>>(
     requested: VcsBackend,
     cwd: P,
-) -> Result<VcsBackend> {
+) -> VcsResult<VcsBackend> {
     let cwd = cwd.as_ref();
 
     match requested {
         VcsBackend::Jj => {
             // Explicit jj requested, verify it's available
-            if jj_commands::check_jj_repo(cwd).await? {
+            if jj::commands::check_jj_repo(cwd).await? {
                 info!("Using explicitly requested jj backend");
                 Ok(VcsBackend::Jj)
             } else {
-                Err(OrchestratorError::NoVcsBackend)
+                Err(VcsError::NoBackend)
             }
         }
         VcsBackend::Git => {
             // Explicit Git requested, verify it's available
-            if git_commands::check_git_repo(cwd).await? {
+            if git::commands::check_git_repo(cwd).await? {
                 info!("Using explicitly requested Git backend");
                 Ok(VcsBackend::Git)
             } else {
-                Err(OrchestratorError::NoVcsBackend)
+                Err(VcsError::NoBackend)
             }
         }
         VcsBackend::Auto => {
@@ -220,22 +291,26 @@ pub async fn detect_vcs_backend<P: AsRef<Path>>(
             debug!("Auto-detecting VCS backend...");
 
             // Check for jj first (preferred)
-            if jj_commands::check_jj_repo(cwd).await? {
+            if jj::commands::check_jj_repo(cwd).await? {
                 info!("Auto-detected jj backend");
                 return Ok(VcsBackend::Jj);
             }
 
             // Check for Git
-            if git_commands::check_git_repo(cwd).await? {
+            if git::commands::check_git_repo(cwd).await? {
                 info!("Auto-detected Git backend");
                 return Ok(VcsBackend::Git);
             }
 
             // No VCS found
-            Err(OrchestratorError::NoVcsBackend)
+            Err(VcsError::NoBackend)
         }
     }
 }
+
+// Re-export workspace managers for convenience
+pub use git::GitWorkspaceManager;
+pub use jj::JjWorkspaceManager;
 
 #[cfg(test)]
 mod tests {
@@ -266,5 +341,44 @@ mod tests {
             WorkspaceStatus::Applied("rev1".to_string()),
             WorkspaceStatus::Applied("rev1".to_string())
         );
+    }
+
+    #[test]
+    fn test_vcs_error_constructors() {
+        let err = VcsError::jj_command("test error");
+        assert!(matches!(
+            err,
+            VcsError::Command {
+                backend: VcsBackend::Jj,
+                ..
+            }
+        ));
+
+        let err = VcsError::git_command("test error");
+        assert!(matches!(
+            err,
+            VcsError::Command {
+                backend: VcsBackend::Git,
+                ..
+            }
+        ));
+
+        let err = VcsError::jj_conflict("conflict details");
+        assert!(matches!(
+            err,
+            VcsError::Conflict {
+                backend: VcsBackend::Jj,
+                ..
+            }
+        ));
+
+        let err = VcsError::git_conflict("conflict details");
+        assert!(matches!(
+            err,
+            VcsError::Conflict {
+                backend: VcsBackend::Git,
+                ..
+            }
+        ));
     }
 }

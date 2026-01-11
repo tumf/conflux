@@ -18,7 +18,7 @@ pub mod jsonc;
 
 use crate::error::{OrchestratorError, Result};
 use crate::hooks::HooksConfig;
-use crate::vcs_backend::VcsBackend;
+use crate::vcs::VcsBackend;
 use defaults::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -273,9 +273,9 @@ pub fn get_global_config_path() -> Option<PathBuf> {
 
 // Re-export commonly used items for convenience
 pub use defaults::{
-    DEFAULT_ANALYZE_COMMAND, DEFAULT_APPLY_COMMAND, DEFAULT_APPLY_PROMPT,
-    DEFAULT_ARCHIVE_COMMAND, DEFAULT_ARCHIVE_PROMPT, DEFAULT_MAX_CONCURRENT_WORKSPACES,
-    DEFAULT_MAX_ITERATIONS, GLOBAL_CONFIG_DIR, GLOBAL_CONFIG_FILE, PROJECT_CONFIG_FILE,
+    DEFAULT_ANALYZE_COMMAND, DEFAULT_APPLY_COMMAND, DEFAULT_APPLY_PROMPT, DEFAULT_ARCHIVE_COMMAND,
+    DEFAULT_ARCHIVE_PROMPT, DEFAULT_MAX_CONCURRENT_WORKSPACES, DEFAULT_MAX_ITERATIONS,
+    GLOBAL_CONFIG_DIR, GLOBAL_CONFIG_FILE, PROJECT_CONFIG_FILE,
 };
 
 #[cfg(test)]

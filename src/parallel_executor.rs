@@ -7,9 +7,10 @@ use crate::agent::AgentRunner;
 use crate::analyzer::ParallelGroup;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
-use crate::git_workspace::GitWorkspaceManager;
-use crate::jj_workspace::JjWorkspaceManager;
-use crate::vcs_backend::{VcsBackend, Workspace, WorkspaceManager, WorkspaceStatus};
+use crate::vcs::{
+    GitWorkspaceManager, JjWorkspaceManager, VcsBackend, Workspace, WorkspaceManager,
+    WorkspaceStatus,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
@@ -339,7 +340,10 @@ impl ParallelExecutor {
     /// Check if VCS is available for parallel execution
     #[allow(dead_code)] // Public API, used via ParallelRunService
     pub async fn check_vcs_available(&self) -> Result<bool> {
-        self.workspace_manager.check_available().await
+        self.workspace_manager
+            .check_available()
+            .await
+            .map_err(Into::into)
     }
 
     /// Check if jj is available for parallel execution (deprecated, use check_vcs_available)
@@ -365,7 +369,7 @@ impl ParallelExecutor {
             error!("{}", error_msg);
             self.send_event(ParallelEvent::Error { message: error_msg })
                 .await;
-            return Err(e);
+            return Err(e.into());
         }
         info!("Preparation complete");
 
@@ -411,7 +415,7 @@ impl ParallelExecutor {
             error!("{}", error_msg);
             self.send_event(ParallelEvent::Error { message: error_msg })
                 .await;
-            return Err(e);
+            return Err(e.into());
         }
         info!("Preparation complete");
 
@@ -465,7 +469,11 @@ impl ParallelExecutor {
     /// Execute a single group of changes
     async fn execute_group(&mut self, group: &ParallelGroup) -> Result<()> {
         // Get current base revision for this group's workspaces
-        let base_revision = self.workspace_manager.get_current_revision().await?;
+        let base_revision = self
+            .workspace_manager
+            .get_current_revision()
+            .await
+            .map_err(OrchestratorError::from)?;
         info!(
             "Executing group {} with {} changes: {:?} (base revision: {})",
             group.id,
@@ -514,7 +522,7 @@ impl ParallelExecutor {
                     })
                     .await;
                     // cleanup_guard will clean up previously created workspaces on drop
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         }
@@ -571,7 +579,8 @@ impl ParallelExecutor {
             .await;
             self.workspace_manager
                 .cleanup_workspace(&workspace.name)
-                .await?;
+                .await
+                .map_err(OrchestratorError::from)?;
             self.send_event(ParallelEvent::CleanupCompleted {
                 workspace: workspace.name.clone(),
             })
@@ -1375,6 +1384,8 @@ impl ParallelExecutor {
 
     /// Merge revisions and resolve any conflicts
     async fn merge_and_resolve(&self, revisions: &[String]) -> Result<()> {
+        use crate::vcs::VcsError;
+
         self.send_event(ParallelEvent::MergeStarted {
             revisions: revisions.to_vec(),
         })
@@ -1391,8 +1402,7 @@ impl ParallelExecutor {
                 .await;
                 Ok(())
             }
-            Err(OrchestratorError::JjConflict(conflict_info))
-            | Err(OrchestratorError::GitConflict(conflict_info)) => {
+            Err(VcsError::Conflict { details, .. }) => {
                 // Detect conflict files
                 let conflict_files = self.detect_conflicts().await?;
                 self.send_event(ParallelEvent::MergeConflict {
@@ -1401,21 +1411,26 @@ impl ParallelExecutor {
                 .await;
 
                 // Attempt automatic resolution with VCS context
-                self.resolve_conflicts_with_retry(revisions, &conflict_info)
-                    .await
+                self.resolve_conflicts_with_retry(revisions, &details).await
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
     /// Detect conflicted files
     async fn detect_conflicts(&self) -> Result<Vec<String>> {
-        self.workspace_manager.detect_conflicts().await
+        self.workspace_manager
+            .detect_conflicts()
+            .await
+            .map_err(OrchestratorError::from)
     }
 
     /// Get VCS status output for context
     async fn get_vcs_status(&self) -> Result<String> {
-        self.workspace_manager.get_status().await
+        self.workspace_manager
+            .get_status()
+            .await
+            .map_err(OrchestratorError::from)
     }
 
     /// Get VCS log for specific revisions
@@ -1423,6 +1438,7 @@ impl ParallelExecutor {
         self.workspace_manager
             .get_log_for_revisions(revisions)
             .await
+            .map_err(OrchestratorError::from)
     }
 
     /// Attempt to resolve conflicts with retries using the configured resolve command
@@ -1551,7 +1567,10 @@ impl ParallelExecutor {
     /// This method is provided for manual cleanup in error recovery scenarios.
     #[allow(dead_code)] // Public API for manual cleanup in error recovery
     pub async fn cleanup(&mut self) -> Result<()> {
-        self.workspace_manager.cleanup_all().await
+        self.workspace_manager
+            .cleanup_all()
+            .await
+            .map_err(OrchestratorError::from)
     }
 }
 
