@@ -15,6 +15,27 @@ use super::state::AppState;
 use super::types::{AppMode, QueueStatus};
 use super::utils::{get_version_string, truncate_to_display_width};
 
+/// Determine checkbox display and color for a change item
+///
+/// Returns (checkbox_text, checkbox_color) based on the change's status.
+/// Archived changes are always shown as gray "[x]" to indicate they are
+/// no longer actionable.
+fn get_checkbox_display(
+    queue_status: &QueueStatus,
+    is_approved: bool,
+    is_selected: bool,
+) -> (&'static str, Color) {
+    if matches!(queue_status, QueueStatus::Archived) {
+        ("[x]", Color::DarkGray) // Archived - grayed out
+    } else if !is_approved {
+        ("[ ]", Color::Gray) // Unapproved
+    } else if is_selected {
+        ("[x]", Color::Green) // Selected/In queue
+    } else {
+        ("[@]", Color::Yellow) // Approved but not selected
+    }
+}
+
 /// Format a duration as a human-readable string (e.g., "1m 23s", "45s")
 fn format_duration(duration: Duration) -> String {
     let secs = duration.as_secs();
@@ -176,13 +197,9 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             // [ ] - unapproved (cannot be selected)
             // [@] - approved but not selected (ready to select)
             // [x] - selected/reserved (will become Queued when F5 is pressed)
-            let (checkbox, checkbox_color) = if !change.is_approved {
-                ("[ ]", Color::Gray) // Unapproved
-            } else if change.selected {
-                ("[x]", Color::Green) // Selected (reserved for queue)
-            } else {
-                ("[@]", Color::Yellow) // Approved but not selected
-            };
+            // [x] (gray) - archived (processing complete, no longer actionable)
+            let (checkbox, checkbox_color) =
+                get_checkbox_display(&change.queue_status, change.is_approved, change.selected);
 
             let cursor = if i == app.cursor_index { "►" } else { " " };
             let new_badge = if change.is_new { " NEW" } else { "" };
@@ -286,14 +303,10 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             // [ ] - unapproved (cannot be added to queue)
             // [@] - approved but not in queue
             // [x] - in queue or being processed
+            // [x] (gray) - archived (processing complete, no longer actionable)
             // Note: In Running mode, queue_status shows actual state (Queued/Processing/etc.)
-            let (checkbox, checkbox_color) = if !change.is_approved {
-                ("[ ]", Color::Gray) // Unapproved
-            } else if change.selected {
-                ("[x]", Color::Green) // In queue
-            } else {
-                ("[@]", Color::Yellow) // Approved but not in queue
-            };
+            let (checkbox, checkbox_color) =
+                get_checkbox_display(&change.queue_status, change.is_approved, change.selected);
 
             let cursor = if i == app.cursor_index { "►" } else { " " };
             let new_badge = if change.is_new { " NEW" } else { "" };
@@ -693,4 +706,67 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
             .border_style(Style::default().fg(Color::Blue)),
     );
     frame.render_widget(footer, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_checkbox_display_archived_always_gray() {
+        // Archived status should always result in gray checkbox,
+        // regardless of is_approved or is_selected values
+        let (text, color) = get_checkbox_display(&QueueStatus::Archived, true, true);
+        assert_eq!(text, "[x]");
+        assert_eq!(color, Color::DarkGray);
+
+        let (text, color) = get_checkbox_display(&QueueStatus::Archived, true, false);
+        assert_eq!(text, "[x]");
+        assert_eq!(color, Color::DarkGray);
+
+        let (text, color) = get_checkbox_display(&QueueStatus::Archived, false, true);
+        assert_eq!(text, "[x]");
+        assert_eq!(color, Color::DarkGray);
+
+        let (text, color) = get_checkbox_display(&QueueStatus::Archived, false, false);
+        assert_eq!(text, "[x]");
+        assert_eq!(color, Color::DarkGray);
+    }
+
+    #[test]
+    fn test_get_checkbox_display_unapproved() {
+        let (text, color) = get_checkbox_display(&QueueStatus::NotQueued, false, false);
+        assert_eq!(text, "[ ]");
+        assert_eq!(color, Color::Gray);
+    }
+
+    #[test]
+    fn test_get_checkbox_display_approved_selected() {
+        let (text, color) = get_checkbox_display(&QueueStatus::NotQueued, true, true);
+        assert_eq!(text, "[x]");
+        assert_eq!(color, Color::Green);
+
+        let (text, color) = get_checkbox_display(&QueueStatus::Queued, true, true);
+        assert_eq!(text, "[x]");
+        assert_eq!(color, Color::Green);
+    }
+
+    #[test]
+    fn test_get_checkbox_display_approved_not_selected() {
+        let (text, color) = get_checkbox_display(&QueueStatus::NotQueued, true, false);
+        assert_eq!(text, "[@]");
+        assert_eq!(color, Color::Yellow);
+    }
+
+    #[test]
+    fn test_get_checkbox_display_processing_states() {
+        // Processing and Completed states should show green when selected
+        let (text, color) = get_checkbox_display(&QueueStatus::Processing, true, true);
+        assert_eq!(text, "[x]");
+        assert_eq!(color, Color::Green);
+
+        let (text, color) = get_checkbox_display(&QueueStatus::Completed, true, true);
+        assert_eq!(text, "[x]");
+        assert_eq!(color, Color::Green);
+    }
 }
