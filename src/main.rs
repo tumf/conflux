@@ -8,7 +8,7 @@ mod history;
 mod hooks;
 mod openspec;
 mod orchestrator;
-mod parallel_executor;
+mod parallel;
 mod parallel_run_service;
 mod progress;
 mod task_parser;

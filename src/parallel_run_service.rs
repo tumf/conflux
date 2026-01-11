@@ -9,7 +9,7 @@ use crate::analyzer::{ParallelGroup, ParallelizationAnalyzer};
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::openspec::Change;
-use crate::parallel_executor::{ParallelEvent, ParallelExecutor};
+use crate::parallel::{ParallelEvent, ParallelExecutor};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tokio::sync::mpsc;

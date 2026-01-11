@@ -703,7 +703,7 @@ impl Orchestrator {
                 service
                     .run_parallel(approved, |event| {
                         // Log events for CLI mode (no TUI)
-                        use crate::parallel_executor::ParallelEvent;
+                        use crate::parallel::ParallelEvent;
                         match event {
                             ParallelEvent::GroupStarted { group_id, changes } => {
                                 info!("Starting group {} with {} changes", group_id, changes.len());

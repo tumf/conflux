@@ -1,0 +1,660 @@
+//! Parallel execution coordinator for VCS workspace-based parallel change application.
+//!
+//! This module manages the parallel execution of changes using VCS workspaces (jj or Git),
+//! including workspace creation, apply command execution, merge, and cleanup.
+
+mod cleanup;
+mod conflict;
+mod events;
+mod executor;
+mod types;
+
+pub use events::ParallelEvent;
+pub use types::WorkspaceResult;
+
+use crate::analyzer::ParallelGroup;
+use crate::config::OrchestratorConfig;
+use crate::error::{OrchestratorError, Result};
+use crate::vcs::{
+    GitWorkspaceManager, JjWorkspaceManager, VcsBackend, VcsError, Workspace, WorkspaceManager,
+    WorkspaceStatus,
+};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinSet;
+use tracing::{error, info, warn};
+
+use cleanup::WorkspaceCleanupGuard;
+use events::send_event;
+use executor::{execute_apply_in_workspace, execute_archive_in_workspace};
+
+/// Parallel executor for running changes in jj workspaces
+pub struct ParallelExecutor {
+    /// Workspace manager (VCS-agnostic)
+    workspace_manager: Box<dyn WorkspaceManager>,
+    /// Configuration (used for AgentRunner and resolve operations)
+    config: OrchestratorConfig,
+    /// Apply command template
+    apply_command: String,
+    /// Archive command template
+    archive_command: String,
+    /// Event sender
+    event_tx: Option<mpsc::Sender<ParallelEvent>>,
+    /// Maximum retries for conflict resolution
+    max_conflict_retries: u32,
+    /// Repository root path for archive operations
+    repo_root: PathBuf,
+}
+
+impl ParallelExecutor {
+    /// Create a new parallel executor with automatic VCS detection
+    pub fn new(
+        repo_root: PathBuf,
+        config: OrchestratorConfig,
+        event_tx: Option<mpsc::Sender<ParallelEvent>>,
+    ) -> Self {
+        // Auto-detect VCS backend
+        let vcs_backend = config.get_vcs_backend();
+        Self::with_backend(repo_root, config, event_tx, vcs_backend)
+    }
+
+    /// Create a new parallel executor with a specific VCS backend
+    pub fn with_backend(
+        repo_root: PathBuf,
+        config: OrchestratorConfig,
+        event_tx: Option<mpsc::Sender<ParallelEvent>>,
+        vcs_backend: VcsBackend,
+    ) -> Self {
+        // Create a unique temp directory for this execution
+        let base_dir = if let Some(configured_dir) = config.get_workspace_base_dir() {
+            // User configured a specific directory
+            PathBuf::from(configured_dir)
+        } else {
+            // Use tempfile to create a unique temp directory
+            match tempfile::Builder::new().prefix("openspec-ws-").tempdir() {
+                Ok(temp_dir) => {
+                    // Keep the path but leak the TempDir so it doesn't get cleaned up immediately
+                    let path = temp_dir.path().to_path_buf();
+                    std::mem::forget(temp_dir);
+                    path
+                }
+                Err(e) => {
+                    error!("Failed to create temp directory: {}", e);
+                    // Fallback to a fixed temp directory
+                    std::env::temp_dir().join("openspec-workspaces-fallback")
+                }
+            }
+        };
+        info!("Using workspace base directory: {:?}", base_dir);
+
+        let max_concurrent = config.get_max_concurrent_workspaces();
+        let apply_command = config.get_apply_command().to_string();
+        let archive_command = config.get_archive_command().to_string();
+
+        // Resolve the VCS backend (handle Auto)
+        let resolved_backend = Self::resolve_backend(vcs_backend, &repo_root);
+        info!("Using VCS backend: {:?}", resolved_backend);
+
+        let workspace_manager: Box<dyn WorkspaceManager> = match resolved_backend {
+            VcsBackend::Git => Box::new(GitWorkspaceManager::new(
+                base_dir,
+                repo_root.clone(),
+                max_concurrent,
+                config.clone(),
+            )),
+            VcsBackend::Jj | VcsBackend::Auto => Box::new(JjWorkspaceManager::new(
+                base_dir,
+                repo_root.clone(),
+                max_concurrent,
+                config.clone(),
+            )),
+        };
+
+        Self {
+            workspace_manager,
+            config,
+            apply_command,
+            archive_command,
+            event_tx,
+            max_conflict_retries: 3,
+            repo_root,
+        }
+    }
+
+    /// Resolve VCS backend (convert Auto to concrete backend)
+    fn resolve_backend(backend: VcsBackend, repo_root: &Path) -> VcsBackend {
+        match backend {
+            VcsBackend::Auto => {
+                // Check for jj first (preferred)
+                if repo_root.join(".jj").exists() {
+                    VcsBackend::Jj
+                } else if repo_root.join(".git").exists() {
+                    VcsBackend::Git
+                } else {
+                    // Default to jj
+                    VcsBackend::Jj
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Get the VCS backend type
+    #[allow(dead_code)] // Public API for external callers
+    pub fn backend_type(&self) -> VcsBackend {
+        self.workspace_manager.backend_type()
+    }
+
+    /// Check if VCS is available for parallel execution
+    #[allow(dead_code)] // Public API, used via ParallelRunService
+    pub async fn check_vcs_available(&self) -> Result<bool> {
+        self.workspace_manager
+            .check_available()
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Check if jj is available for parallel execution (deprecated, use check_vcs_available)
+    #[deprecated(note = "Use check_vcs_available instead")]
+    #[allow(dead_code)] // Deprecated but kept for backward compatibility
+    pub async fn check_jj_available(&self) -> Result<bool> {
+        self.check_vcs_available().await
+    }
+
+    /// Execute groups in topological order
+    pub async fn execute_groups(&mut self, groups: Vec<ParallelGroup>) -> Result<()> {
+        if groups.is_empty() {
+            send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+            return Ok(());
+        }
+
+        info!("Executing {} groups in parallel mode", groups.len());
+
+        // Prepare for parallel execution (snapshot for jj, clean check for git)
+        info!("Preparing for parallel execution...");
+        if let Err(e) = self.workspace_manager.prepare_for_parallel().await {
+            let error_msg = format!("Failed to prepare for parallel execution: {}", e);
+            error!("{}", error_msg);
+            send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
+            return Err(e.into());
+        }
+        info!("Preparation complete");
+
+        for group in groups {
+            self.execute_group(&group).await?;
+        }
+
+        send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+        Ok(())
+    }
+
+    /// Execute changes with dynamic re-analysis after each group completes.
+    ///
+    /// This method analyzes the remaining changes after each group completes,
+    /// allowing the LLM to reconsider dependencies based on the current state.
+    pub async fn execute_with_reanalysis<F>(
+        &mut self,
+        mut changes: Vec<crate::openspec::Change>,
+        analyzer: F,
+    ) -> Result<()>
+    where
+        F: Fn(
+                &[crate::openspec::Change],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Vec<ParallelGroup>> + Send + '_>,
+            > + Send
+            + Sync,
+    {
+        if changes.is_empty() {
+            send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+            return Ok(());
+        }
+
+        info!(
+            "Starting execution with re-analysis for {} changes",
+            changes.len()
+        );
+
+        // Prepare for parallel execution (snapshot for jj, clean check for git)
+        info!("Preparing for parallel execution...");
+        if let Err(e) = self.workspace_manager.prepare_for_parallel().await {
+            let error_msg = format!("Failed to prepare for parallel execution: {}", e);
+            error!("{}", error_msg);
+            send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
+            return Err(e.into());
+        }
+        info!("Preparation complete");
+
+        let mut group_counter = 1u32;
+
+        while !changes.is_empty() {
+            // Analyze remaining changes to get the next group
+            info!(
+                "Analyzing {} remaining changes for next group",
+                changes.len()
+            );
+            send_event(
+                &self.event_tx,
+                ParallelEvent::AnalysisStarted {
+                    remaining_changes: changes.len(),
+                },
+            )
+            .await;
+
+            let groups = analyzer(&changes).await;
+
+            if groups.is_empty() {
+                warn!("No groups returned from analysis");
+                break;
+            }
+
+            // Execute only the first group (no dependencies)
+            let first_group = ParallelGroup {
+                id: group_counter,
+                changes: groups[0].changes.clone(),
+                depends_on: Vec::new(),
+            };
+
+            info!(
+                "Executing group {} with {} changes: {:?}",
+                first_group.id,
+                first_group.changes.len(),
+                first_group.changes
+            );
+
+            self.execute_group(&first_group).await?;
+
+            // Remove completed changes from the list
+            let completed_set: std::collections::HashSet<_> = first_group.changes.iter().collect();
+            changes.retain(|c| !completed_set.contains(&c.id));
+
+            group_counter += 1;
+        }
+
+        send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+        Ok(())
+    }
+
+    /// Execute a single group of changes
+    async fn execute_group(&mut self, group: &ParallelGroup) -> Result<()> {
+        // Get current base revision for this group's workspaces
+        let base_revision = self
+            .workspace_manager
+            .get_current_revision()
+            .await
+            .map_err(OrchestratorError::from)?;
+        info!(
+            "Executing group {} with {} changes: {:?} (base revision: {})",
+            group.id,
+            group.changes.len(),
+            group.changes,
+            &base_revision[..8.min(base_revision.len())]
+        );
+
+        send_event(
+            &self.event_tx,
+            ParallelEvent::GroupStarted {
+                group_id: group.id,
+                changes: group.changes.clone(),
+            },
+        )
+        .await;
+
+        // Create cleanup guard to ensure workspaces are cleaned up on early errors
+        let mut cleanup_guard = WorkspaceCleanupGuard::new(
+            self.workspace_manager.backend_type(),
+            self.repo_root.clone(),
+        );
+
+        // Create workspaces for all changes in the group from the SAME base revision
+        // This ensures all changes in the group branch from the same point (true parallel)
+        let mut workspaces: Vec<Workspace> = Vec::new();
+        for change_id in &group.changes {
+            match self
+                .workspace_manager
+                .create_workspace(change_id, Some(&base_revision))
+                .await
+            {
+                Ok(workspace) => {
+                    // Track workspace in cleanup guard before adding to list
+                    cleanup_guard.track(workspace.name.clone());
+
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::WorkspaceCreated {
+                            change_id: change_id.clone(),
+                            workspace: workspace.name.clone(),
+                        },
+                    )
+                    .await;
+                    workspaces.push(workspace);
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to create workspace: {}", e);
+                    error!("{} for {}", error_msg, change_id);
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::Error {
+                            message: format!("[{}] {}", change_id, error_msg),
+                        },
+                    )
+                    .await;
+                    // cleanup_guard will clean up previously created workspaces on drop
+                    return Err(e.into());
+                }
+            }
+        }
+
+        // Execute apply + archive in parallel with concurrency limit
+        // Each task: apply -> (if success) -> archive
+        let results = match self.execute_apply_and_archive_parallel(&workspaces).await {
+            Ok(r) => r,
+            Err(e) => {
+                let error_msg = format!("Failed to execute applies: {}", e);
+                error!("{}", error_msg);
+                send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
+                return Err(e);
+            }
+        };
+
+        // Collect successful results (those with final_revision set)
+        let successful: Vec<&WorkspaceResult> = results
+            .iter()
+            .filter(|r| r.final_revision.is_some())
+            .collect();
+        let failed: Vec<&WorkspaceResult> = results.iter().filter(|r| r.error.is_some()).collect();
+
+        // Report failures (already reported in parallel execution, but log summary)
+        for result in &failed {
+            if let Some(ref err) = result.error {
+                error!("Failed for {}: {}", result.change_id, err);
+            }
+        }
+
+        // If all failed, return error
+        if successful.is_empty() {
+            return Err(OrchestratorError::AgentCommand(
+                "All changes in group failed".to_string(),
+            ));
+        }
+
+        // Collect final revisions (post-archive revisions)
+        let revisions: Vec<String> = successful
+            .iter()
+            .filter_map(|r| r.final_revision.clone())
+            .collect();
+
+        if !revisions.is_empty() {
+            self.merge_and_resolve(&revisions).await?;
+        }
+
+        // Cleanup workspaces
+        for workspace in &workspaces {
+            send_event(
+                &self.event_tx,
+                ParallelEvent::CleanupStarted {
+                    workspace: workspace.name.clone(),
+                },
+            )
+            .await;
+            self.workspace_manager
+                .cleanup_workspace(&workspace.name)
+                .await
+                .map_err(OrchestratorError::from)?;
+            send_event(
+                &self.event_tx,
+                ParallelEvent::CleanupCompleted {
+                    workspace: workspace.name.clone(),
+                },
+            )
+            .await;
+        }
+
+        // Commit the cleanup guard since normal cleanup succeeded
+        // This prevents double-cleanup on drop
+        cleanup_guard.commit();
+
+        send_event(
+            &self.event_tx,
+            ParallelEvent::GroupCompleted { group_id: group.id },
+        )
+        .await;
+
+        Ok(())
+    }
+
+    /// Execute apply + archive in parallel across workspaces
+    /// Each task: apply -> (if success) -> archive
+    /// Archive starts immediately after apply completes for each change
+    async fn execute_apply_and_archive_parallel(
+        &mut self,
+        workspaces: &[Workspace],
+    ) -> Result<Vec<WorkspaceResult>> {
+        let max_concurrent = self.workspace_manager.max_concurrent();
+        let semaphore = Arc::new(Semaphore::new(max_concurrent));
+        let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+
+        for workspace in workspaces {
+            let sem = semaphore.clone();
+            let change_id = workspace.change_id.clone();
+            let workspace_path = workspace.path.clone();
+            let workspace_name = workspace.name.clone();
+            let apply_cmd = self.apply_command.clone();
+            let archive_cmd = self.archive_command.clone();
+            let config = self.config.clone();
+            let event_tx = self.event_tx.clone();
+            let vcs_backend = self.workspace_manager.backend_type();
+
+            // Update status
+            self.workspace_manager
+                .update_workspace_status(&workspace_name, WorkspaceStatus::Applying);
+
+            join_set.spawn(async move {
+                // Acquire semaphore inside spawn to allow all tasks to be created
+                let _permit = sem.acquire_owned().await.unwrap();
+
+                // Step 1: Execute apply
+                let apply_result = execute_apply_in_workspace(
+                    &change_id,
+                    &workspace_path,
+                    &apply_cmd,
+                    event_tx.clone(),
+                    vcs_backend,
+                )
+                .await;
+
+                match apply_result {
+                    Ok(apply_revision) => {
+                        // Send ApplyCompleted event
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::ApplyCompleted {
+                                    change_id: change_id.clone(),
+                                    revision: apply_revision.clone(),
+                                })
+                                .await;
+                        }
+
+                        // Step 2: Execute archive immediately after apply succeeds
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::ArchiveStarted {
+                                    change_id: change_id.clone(),
+                                })
+                                .await;
+                        }
+
+                        let archive_result = execute_archive_in_workspace(
+                            &change_id,
+                            &workspace_path,
+                            &archive_cmd,
+                            &config,
+                            event_tx.clone(),
+                            vcs_backend,
+                        )
+                        .await;
+
+                        match archive_result {
+                            Ok(archive_revision) => {
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::ChangeArchived {
+                                            change_id: change_id.clone(),
+                                        })
+                                        .await;
+                                }
+                                WorkspaceResult {
+                                    change_id,
+                                    workspace_name,
+                                    final_revision: Some(archive_revision),
+                                    error: None,
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Archive failed for {}: {}", change_id, e);
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::ArchiveFailed {
+                                            change_id: change_id.clone(),
+                                            error: e.to_string(),
+                                        })
+                                        .await;
+                                }
+                                // Archive failed - do not merge unarchived changes
+                                WorkspaceResult {
+                                    change_id,
+                                    workspace_name,
+                                    final_revision: None,
+                                    error: Some(format!("Archive failed: {}", e)),
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::ApplyFailed {
+                                    change_id: change_id.clone(),
+                                    error: e.to_string(),
+                                })
+                                .await;
+                        }
+                        WorkspaceResult {
+                            change_id,
+                            workspace_name,
+                            final_revision: None,
+                            error: Some(e.to_string()),
+                        }
+                    }
+                }
+                // _permit is dropped here, releasing semaphore
+            });
+        }
+
+        // Collect results
+        let mut results = Vec::new();
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(workspace_result) => {
+                    // Update workspace status
+                    if workspace_result.error.is_some() {
+                        self.workspace_manager.update_workspace_status(
+                            &workspace_result.workspace_name,
+                            WorkspaceStatus::Failed(
+                                workspace_result.error.clone().unwrap_or_default(),
+                            ),
+                        );
+                    } else if let Some(ref rev) = workspace_result.final_revision {
+                        self.workspace_manager.update_workspace_status(
+                            &workspace_result.workspace_name,
+                            WorkspaceStatus::Applied(rev.clone()),
+                        );
+                    }
+                    results.push(workspace_result);
+                }
+                Err(e) => {
+                    warn!("Task join error: {}", e);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Merge revisions and resolve any conflicts
+    async fn merge_and_resolve(&self, revisions: &[String]) -> Result<()> {
+        send_event(
+            &self.event_tx,
+            ParallelEvent::MergeStarted {
+                revisions: revisions.to_vec(),
+            },
+        )
+        .await;
+
+        // Attempt merge
+        let merge_result = self.workspace_manager.merge_workspaces(revisions).await;
+
+        match merge_result {
+            Ok(merge_revision) => {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::MergeCompleted {
+                        revision: merge_revision,
+                    },
+                )
+                .await;
+                Ok(())
+            }
+            Err(VcsError::Conflict { details, .. }) => {
+                // Detect conflict files
+                let conflict_files = conflict::detect_conflicts(self.workspace_manager.as_ref()).await?;
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::MergeConflict {
+                        files: conflict_files.clone(),
+                    },
+                )
+                .await;
+
+                // Attempt automatic resolution with VCS context
+                conflict::resolve_conflicts_with_retry(
+                    self.workspace_manager.as_ref(),
+                    &self.config,
+                    &self.event_tx,
+                    revisions,
+                    &details,
+                    self.max_conflict_retries,
+                )
+                .await
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Cleanup all workspaces.
+    ///
+    /// Note: Currently cleanup is handled automatically in execute_group.
+    /// This method is provided for manual cleanup in error recovery scenarios.
+    #[allow(dead_code)] // Public API for manual cleanup in error recovery
+    pub async fn cleanup(&mut self) -> Result<()> {
+        self.workspace_manager
+            .cleanup_all()
+            .await
+            .map_err(OrchestratorError::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parallel_executor_creation() {
+        let config = OrchestratorConfig::default();
+        let repo_root = PathBuf::from("/tmp/test-repo");
+        let executor = ParallelExecutor::new(repo_root, config, None);
+
+        assert_eq!(executor.max_conflict_retries, 3);
+    }
+}

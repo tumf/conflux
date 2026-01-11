@@ -1,0 +1,119 @@
+//! Workspace cleanup guard for RAII-based cleanup on partial failures.
+
+use crate::vcs::VcsBackend;
+use std::path::PathBuf;
+use tracing::{debug, warn};
+
+/// RAII guard for workspace cleanup on partial failures.
+///
+/// This guard tracks created workspaces and ensures they are cleaned up
+/// on drop if not explicitly committed. This prevents workspace leaks
+/// when errors occur during workspace creation or apply phases.
+pub(crate) struct WorkspaceCleanupGuard {
+    /// Workspace names to clean up
+    workspace_names: Vec<String>,
+    /// VCS backend type
+    vcs_backend: VcsBackend,
+    /// Repository root for cleanup commands
+    repo_root: PathBuf,
+    /// Whether cleanup has been committed (skipped)
+    committed: bool,
+}
+
+impl WorkspaceCleanupGuard {
+    /// Create a new cleanup guard
+    pub fn new(vcs_backend: VcsBackend, repo_root: PathBuf) -> Self {
+        Self {
+            workspace_names: Vec::new(),
+            vcs_backend,
+            repo_root,
+            committed: false,
+        }
+    }
+
+    /// Add a workspace to be tracked for cleanup
+    pub fn track(&mut self, workspace_name: String) {
+        self.workspace_names.push(workspace_name);
+    }
+
+    /// Commit the guard, preventing cleanup on drop
+    ///
+    /// Call this when all workspaces have been successfully processed
+    /// and cleanup will be handled through the normal path.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for WorkspaceCleanupGuard {
+    fn drop(&mut self) {
+        if self.committed || self.workspace_names.is_empty() {
+            return;
+        }
+
+        warn!(
+            "Cleaning up {} workspace(s) due to early error",
+            self.workspace_names.len()
+        );
+
+        // Use synchronous cleanup since we're in Drop
+        // This is a best-effort cleanup - errors are logged but not propagated
+        for workspace_name in &self.workspace_names {
+            debug!(
+                "Emergency cleanup: forgetting workspace '{}'",
+                workspace_name
+            );
+
+            match self.vcs_backend {
+                VcsBackend::Jj => {
+                    // Forget the workspace in jj
+                    let result = std::process::Command::new("jj")
+                        .args(["workspace", "forget", workspace_name])
+                        .current_dir(&self.repo_root)
+                        .output();
+
+                    match result {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            debug!(
+                                "Failed to forget jj workspace '{}': {}",
+                                workspace_name, stderr
+                            );
+                        }
+                        Err(e) => {
+                            debug!("Failed to run jj workspace forget: {}", e);
+                        }
+                        _ => {
+                            debug!("Successfully forgot jj workspace '{}'", workspace_name);
+                        }
+                    }
+                }
+                VcsBackend::Git | VcsBackend::Auto => {
+                    // For Git, we need the worktree path, but we only have the name
+                    // This is a best-effort cleanup; the worktree will be orphaned
+                    // but can be cleaned up later with `git worktree prune`
+                    let result = std::process::Command::new("git")
+                        .args(["branch", "-D", workspace_name])
+                        .current_dir(&self.repo_root)
+                        .output();
+
+                    match result {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            debug!(
+                                "Failed to delete git branch '{}': {}",
+                                workspace_name, stderr
+                            );
+                        }
+                        Err(e) => {
+                            debug!("Failed to run git branch -D: {}", e);
+                        }
+                        _ => {
+                            debug!("Successfully deleted git branch '{}'", workspace_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

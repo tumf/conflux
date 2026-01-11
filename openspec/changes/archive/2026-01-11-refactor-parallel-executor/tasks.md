@@ -1,21 +1,44 @@
-# Tasks: Refactor Parallel Executor
+## 1. Preparation
 
-## 1. Extract ParallelEventBridge
-- [x] 1.1 Create `src/tui/parallel_event_bridge.rs` with `convert()` function
-- [x] 1.2 Update `src/tui/orchestrator.rs` to use `ParallelEventBridge::convert()`
-- [x] 1.3 Remove old inline match block from orchestrator
+- [x] 1.1 Create `src/parallel/` directory
+- [x] 1.2 Move common types to `src/parallel/types.rs` (WorkspaceResult)
 
-## 2. Add WorkspaceCleanupGuard
-- [x] 2.1 Implement `WorkspaceCleanupGuard` struct in `src/parallel_executor.rs`
-- [x] 2.2 Integrate guard into `execute_group()` method
+## 2. Event-related Separation
 
-## 3. Extract Apply Loop Helpers
-- [x] 3.1 Extract `check_task_progress()` helper function
-- [x] 3.2 Extract `summarize_output()` helper function
-- [x] 3.3 Refactor `execute_apply_in_workspace()` to use helpers
+- [x] 2.1 Move `ParallelEvent` enum to `src/parallel/events.rs`
+- [x] 2.2 Move `send_event` helper method to events module
 
-## 4. Create ParallelRunService
-- [x] 4.1 Create `src/parallel_run_service.rs` with service struct
-- [x] 4.2 Implement `run_parallel()` method with callback-based events
-- [x] 4.3 Migrate CLI `run_parallel()` to use service
-- [x] 4.4 Migrate TUI `run_orchestrator_parallel()` to use service
+## 3. Cleanup Guard Separation
+
+- [x] 3.1 Move `WorkspaceCleanupGuard` to `src/parallel/cleanup.rs`
+- [x] 3.2 Include Drop implementation
+
+## 4. Conflict Handling Separation
+
+- [x] 4.1 Move `detect_conflicts` to `src/parallel/conflict.rs`
+- [x] 4.2 Move `resolve_conflicts_with_retry`
+- [x] 4.3 Move related helper functions
+
+## 5. Execution Logic Separation
+
+- [x] 5.1 Move `execute_apply_in_workspace` to `src/parallel/executor.rs`
+- [x] 5.2 Move `execute_archive_in_workspace`
+- [x] 5.3 Move `check_task_progress`
+
+## 6. Orchestration Layer Organization
+
+- [x] 6.1 Place remaining `ParallelExecutor` methods in `src/parallel/mod.rs`
+- [x] 6.2 Delete `src/parallel_executor.rs`
+- [x] 6.3 Re-export necessary types from `src/parallel/mod.rs`
+
+## 7. Dependency Updates
+
+- [x] 7.1 Update imports in `parallel_run_service.rs`
+- [x] 7.2 Update imports in `tui/parallel_event_bridge.rs`
+- [x] 7.3 Update other references (`orchestrator.rs`, `tui/orchestrator.rs`, `main.rs`)
+
+## 8. Testing and Verification
+
+- [x] 8.1 Tests moved to appropriate modules (events.rs, mod.rs)
+- [x] 8.2 All tests pass with `cargo test` (264 tests)
+- [x] 8.3 No warnings with `cargo clippy`

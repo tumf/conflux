@@ -4,7 +4,7 @@
 //! events into TUI-compatible events, separating event transformation logic
 //! from the orchestrator control flow.
 
-use crate::parallel_executor::ParallelEvent;
+use crate::parallel::ParallelEvent;
 use crate::tui::events::{LogEntry, OrchestratorEvent};
 
 /// Converts a ParallelEvent into a list of OrchestratorEvents

@@ -1,4 +1,3 @@
-b878a2b08505c9f50a20f25a2e0f8453  openspec/changes/refactor-parallel-executor/design.md
-35136bee6211c3969b0673015160d9f2  openspec/changes/refactor-parallel-executor/proposal.md
-363693235bd4ac063b248e962dc04541  openspec/changes/refactor-parallel-executor/specs/parallel-execution/spec.md
-a230095deccbe30c754adab8b84455c8  openspec/changes/refactor-parallel-executor/specs/workspace-cleanup/spec.md
+4bf5a87f5a02686319868f4521b40044  openspec/changes/refactor-parallel-executor/design.md
+15c4d7778d38e7592923fad894f2aefa  openspec/changes/refactor-parallel-executor/proposal.md
+359cb8ed48e5b6e9829382548607efec  openspec/changes/refactor-parallel-executor/specs/code-maintenance/spec.md

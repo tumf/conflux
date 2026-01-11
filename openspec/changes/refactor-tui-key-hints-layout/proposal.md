@@ -13,7 +13,7 @@
   - `e: edit` - 編集
   - `F5: run` - 実行開始
   - `=: parallel/sequential` - 並列モード切替
-- Statusパネルの横に**アプリ全体の制御キー**を表示する
+- Statusパネルのタイトル横に**アプリ全体の制御キー**を表示する
   - `Esc: stop` - 実行停止（Running/Stoppingモード時）
   - `q: quit` - 終了
   - `F5: resume` - 再開（Stoppedモード時）
@@ -25,4 +25,3 @@
   - `render_changes_list_select` 関数
   - `render_changes_list_running` 関数
   - `render_status` 関数
-  - `render_footer_select` 関数

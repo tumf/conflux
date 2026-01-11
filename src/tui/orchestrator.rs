@@ -717,7 +717,7 @@ pub async fn run_orchestrator_parallel(
     cancel_token: CancellationToken,
 ) -> Result<()> {
     use crate::openspec::list_changes_native;
-    use crate::parallel_executor::ParallelEvent;
+    use crate::parallel::ParallelEvent;
     use crate::parallel_run_service::ParallelRunService;
     use std::collections::HashSet;
 

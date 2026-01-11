@@ -1,195 +1,74 @@
-# Design: Parallel Executor Refactoring
-
 ## Context
 
-The parallel execution system was added to enable concurrent change processing using jj workspaces. Over time, both CLI and TUI modes developed their own parallel orchestration implementations, leading to code duplication and inconsistent behavior.
+`parallel_executor.rs` は並列実行機能の中核だが、1580 行という規模になっている。
+コード行数の内訳：
 
-**Stakeholders:**
-- Developers maintaining the parallel execution code
-- Users relying on consistent behavior between CLI and TUI modes
+- `ParallelExecutor` 構造体とメソッド: ~1000 行
+- `WorkspaceCleanupGuard`: ~100 行
+- コンフリクト関連処理: ~200 行
+- テスト: ~200 行
 
-**Constraints:**
-- Must maintain backward compatibility with existing configurations
-- Cannot break current parallel execution behavior
-- Changes should be incremental and testable
+一つのファイルでこれらすべてを管理しているため、変更時の認知負荷が高い。
 
 ## Goals / Non-Goals
 
 ### Goals
-- Reduce code duplication between CLI and TUI parallel paths
-- Improve resource cleanup reliability on failures
-- Make event mapping testable in isolation
-- Improve code organization for maintainability
+
+- 各責務を独立したモジュールに分離し、可読性を向上
+- モジュール単位でのテストを容易に
+- 将来的な機能追加時の影響範囲を明確化
 
 ### Non-Goals
-- Full decomposition of ParallelExecutor into ApplyRunner, MergeCoordinator, etc. (deferred)
-- Adding new parallel execution features
-- Changing jj workspace interaction patterns
-- Runtime dependency validation (deferred)
+
+- 機能変更（リファクタリングのみ）
+- パフォーマンス最適化
 
 ## Decisions
 
-### Decision 1: Extract ParallelRunService
+### ディレクトリ構造
 
-**What:** Create a shared `ParallelRunService` that handles parallel analysis, grouping, and executor coordination.
-
-**Why:** Both CLI (`orchestrator.rs:666-815`) and TUI (`tui/orchestrator.rs:692-995`) implement the same flow:
-1. Create ParallelExecutor
-2. Check jj availability
-3. Group changes by dependencies
-4. Execute groups
-5. Handle archiving
-
-**Alternatives considered:**
-- Keep duplication but add more tests: Rejected - maintenance burden too high
-- Trait-based abstraction: Rejected - adds complexity for two consumers
-
-**Implementation:**
-```rust
-// src/parallel_run_service.rs
-pub struct ParallelRunService {
-    config: OrchestratorConfig,
-    repo_root: PathBuf,
-}
-
-impl ParallelRunService {
-    pub async fn run_parallel<F>(
-        &self,
-        changes: Vec<Change>,
-        event_handler: F,
-    ) -> Result<()>
-    where
-        F: Fn(ParallelEvent) + Send + Sync,
-    {
-        // Shared implementation
-    }
-}
+```
+src/parallel/
+├── mod.rs              # ParallelExecutor (オーケストレーション層)
+├── cleanup.rs          # WorkspaceCleanupGuard
+├── conflict.rs         # detect_conflicts, resolve_conflicts_with_retry
+├── events.rs           # ParallelEvent, send_event
+├── executor.rs         # execute_apply_in_workspace, execute_archive_in_workspace
+└── types.rs            # WorkspaceResult, 共通型
 ```
 
-### Decision 2: Add WorkspaceCleanupGuard (RAII)
+### モジュール責務
 
-**What:** Implement a cleanup guard that tracks created workspaces and cleans them up on drop if not committed.
+| モジュール | 責務 | 行数目安 |
+|-----------|------|---------|
+| `mod.rs` | グループ実行、マージ、高レベルオーケストレーション | 300-400 行 |
+| `cleanup.rs` | ワークスペースのクリーンアップ保証 | 100 行 |
+| `conflict.rs` | コンフリクト検出と解決ロジック | 200 行 |
+| `events.rs` | イベント定義と送信ヘルパー | 100 行 |
+| `executor.rs` | ワークスペース内での apply/archive 実行 | 300 行 |
+| `types.rs` | 共通型定義 | 50 行 |
 
-**Why:** Current code at `parallel_executor.rs:171` can leak workspaces on partial failures:
-```rust
-for change_id in &group.changes {
-    match self.workspace_manager.create_workspace(change_id).await {
-        Ok(workspace) => workspaces.push(workspace),
-        Err(e) => return Err(e), // Leaks previous workspaces!
-    }
-}
-```
+### 代替案と根拠
 
-**Implementation:**
-```rust
-struct WorkspaceCleanupGuard<'a> {
-    manager: &'a JjWorkspaceManager,
-    workspaces: Vec<String>,
-    committed: bool,
-}
-
-impl Drop for WorkspaceCleanupGuard<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            // Cleanup all tracked workspaces
-            for ws in &self.workspaces {
-                // Spawn cleanup (async in sync drop requires runtime)
-                let _ = std::process::Command::new("jj")
-                    .args(["workspace", "forget", ws])
-                    .output();
-            }
-        }
-    }
-}
-```
-
-### Decision 3: Extract ParallelEventBridge
-
-**What:** Move the 200+ line event forwarding match block to a dedicated module.
-
-**Why:** The current implementation in `tui/orchestrator.rs:768-923` mixes:
-- Event transformation logic
-- Channel sending
-- Logging
-
-**Implementation:**
-```rust
-// src/tui/parallel_event_bridge.rs
-pub struct ParallelEventBridge;
-
-impl ParallelEventBridge {
-    pub fn convert(event: ParallelEvent) -> Vec<OrchestratorEvent> {
-        match event {
-            ParallelEvent::ApplyStarted { change_id } => vec![
-                OrchestratorEvent::Log(
-                    LogEntry::info("Apply started".to_string())
-                        .with_change_id(&change_id),
-                ),
-                OrchestratorEvent::ProcessingStarted(change_id),
-            ],
-            // ... other mappings
-        }
-    }
-}
-```
-
-### Decision 4: Extract Apply Loop Helpers
-
-**What:** Split `execute_apply_in_workspace` (190 lines) into focused helpers.
-
-**Why:** The function currently handles:
-- Task progress file parsing
-- Command execution
-- Output capture and formatting
-- Retry/iteration logic
-- Progress validation
-
-**Implementation:**
-```rust
-// Keep in parallel_executor.rs as private helpers
-
-fn check_task_progress(workspace_path: &Path, change_id: &str) -> TaskProgress {
-    // Only responsible for reading and parsing progress
-}
-
-fn summarize_output(output: &str, max_lines: usize) -> String {
-    // Only responsible for formatting output
-}
-
-// Main loop becomes:
-async fn execute_apply_in_workspace(...) -> Result<String> {
-    loop {
-        let progress = check_task_progress(...);
-        if progress.is_complete() { break; }
-
-        let output = run_command(...).await?;
-        let summary = summarize_output(&output, 5);
-        // ...
-    }
-}
-```
+1. **そのまま維持** - 可読性が悪化し続けるため却下
+2. **一部のみ分離** - 中途半端になるため却下
+3. **完全分離（採用）** - 責務が明確で保守しやすい
 
 ## Risks / Trade-offs
 
-| Risk | Mitigation |
-|------|------------|
-| Regression in parallel execution | Add integration tests before refactoring |
-| Drop-based cleanup may fail silently | Log cleanup errors, add monitoring |
-| Service abstraction may not fit future needs | Keep it minimal, evolve as needed |
+- **リスク**: 分割によるインポート関係の複雑化
+  - **緩和策**: `mod.rs` で必要な型を re-export
+- **トレードオフ**: ファイル数増加 vs 個々のファイルの理解しやすさ
 
 ## Migration Plan
 
-1. Add tests for current parallel behavior (baseline)
-2. Extract ParallelEventBridge (isolated, low risk)
-3. Add WorkspaceCleanupGuard (improves safety immediately)
-4. Extract apply loop helpers (refactoring only)
-5. Extract ParallelRunService and migrate CLI first
-6. Migrate TUI to use ParallelRunService
-7. Remove duplicate code
-
-**Rollback:** Each step is independent. Revert specific commits if issues arise.
+1. `src/parallel/` ディレクトリを作成
+2. 型定義を `types.rs`, `events.rs` に移動
+3. `cleanup.rs`, `conflict.rs`, `executor.rs` を順次作成
+4. 残りのロジックを `mod.rs` に配置
+5. 既存テストを各モジュールに移動
+6. `parallel_executor.rs` を削除し、`mod.rs` から re-export
 
 ## Open Questions
 
-1. Should the cleanup guard be async-aware? Current design uses sync drop with std::process::Command fallback.
-2. Should we add metrics/logging for cleanup operations to monitor resource leaks?
+- なし

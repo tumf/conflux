@@ -5,7 +5,7 @@
 The TUI SHALL display only actionable key hints based on current state in selection mode.
 
 Changes panel title SHALL show only change-related keys.
-App-level control keys SHALL be shown in Footer/Status panel instead of Changes panel.
+App-level control keys SHALL be shown in Status panel title instead of Changes panel.
 
 #### Scenario: Empty changes list hides selection keys
 
@@ -16,7 +16,6 @@ App-level control keys SHALL be shown in Footer/Status panel instead of Changes 
 - **AND** the Changes panel key hints SHALL NOT show "e: edit"
 - **AND** the Changes panel key hints SHALL show "↑↓/jk: move"
 - **AND** the Changes panel title SHALL NOT show "q: quit"
-- **AND** the Footer panel SHALL show "q: quit"
 
 #### Scenario: No queued changes hides F5 key
 
@@ -25,7 +24,6 @@ App-level control keys SHALL be shown in Footer/Status panel instead of Changes 
 - **THEN** the Changes panel key hints SHALL NOT show "F5: run"
 - **AND** the Changes panel key hints SHALL show selection keys (Space/@/e)
 - **AND** the Changes panel title SHALL NOT show "q: quit"
-- **AND** the Footer panel SHALL show "q: quit"
 
 #### Scenario: Queued changes shows F5 key
 
@@ -33,14 +31,13 @@ App-level control keys SHALL be shown in Footer/Status panel instead of Changes 
 - **AND** at least one change is selected for queue
 - **THEN** the Changes panel key hints SHALL show "F5: run"
 - **AND** the Changes panel title SHALL NOT show "q: quit"
-- **AND** the Footer panel SHALL show "q: quit"
 
 ### Requirement: Context-Aware Key Hints in Running Mode
 
 The TUI SHALL display dynamic key hints in running mode consistent with select mode.
 
 Changes panel title SHALL show only change-related keys.
-App-level control keys (Esc, q) SHALL be shown in Status panel instead of Changes panel.
+App-level control keys (Esc, q) SHALL be shown in Status panel title instead of Changes panel.
 
 #### Scenario: Running mode shows appropriate keys
 
@@ -49,8 +46,6 @@ App-level control keys (Esc, q) SHALL be shown in Status panel instead of Change
 - **THEN** the Changes panel key hints SHALL show selection keys based on current item state
 - **AND** the Changes panel title SHALL NOT show "Esc: stop"
 - **AND** the Changes panel title SHALL NOT show "q: quit"
-- **AND** the Status panel SHALL show "Esc: stop"
-- **AND** the Status panel SHALL show "q: quit"
 
 #### Scenario: Running mode with empty list
 
@@ -59,39 +54,32 @@ App-level control keys (Esc, q) SHALL be shown in Status panel instead of Change
 - **THEN** the Changes panel key hints SHALL NOT show selection keys
 - **AND** the Changes panel title SHALL NOT show "Esc: stop"
 - **AND** the Changes panel title SHALL NOT show "q: quit"
-- **AND** the Status panel SHALL show "Esc: stop"
-- **AND** the Status panel SHALL show "q: quit"
 
 ## ADDED Requirements
 
-### Requirement: App Control Keys in Status Panel
+### Requirement: App Control Keys in Status Panel Title
 
-The TUI SHALL display app-level control keys in the Status panel when in running/stopping/stopped modes.
+The TUI SHALL display app-level control keys in the Status panel title based on current mode.
 
-#### Scenario: Status panel shows stop and quit keys in Running mode
-
-- **GIVEN** the TUI is in running mode
-- **THEN** the Status panel text SHALL include "Esc: stop"
-- **AND** the Status panel text SHALL include "q: quit"
-
-#### Scenario: Status panel shows force stop in Stopping mode
-
-- **GIVEN** the TUI is in stopping mode
-- **THEN** the Status panel text SHALL include "Esc: force stop"
-- **AND** the Status panel text SHALL include "q: quit"
-
-#### Scenario: Status panel shows resume key in Stopped mode
-
-- **GIVEN** the TUI is in stopped mode
-- **THEN** the Status panel text SHALL include "F5: resume"
-- **AND** the Status panel text SHALL include "q: quit"
-
-### Requirement: App Control Keys in Footer Panel
-
-The TUI SHALL display app-level control keys in the Footer panel when in select mode without logs.
-
-#### Scenario: Footer panel shows quit key in Select mode
+#### Scenario: Status panel title shows quit key in Select mode
 
 - **GIVEN** the TUI is in select mode
-- **AND** the Logs panel is not visible (no logs yet)
-- **THEN** the Footer panel SHALL show "q: quit"
+- **THEN** the Status panel title SHALL show "q: quit"
+
+#### Scenario: Status panel title shows stop and quit keys in Running mode
+
+- **GIVEN** the TUI is in running mode
+- **THEN** the Status panel title SHALL show "Esc: stop"
+- **AND** the Status panel title SHALL show "q: quit"
+
+#### Scenario: Status panel title shows force stop in Stopping mode
+
+- **GIVEN** the TUI is in stopping mode
+- **THEN** the Status panel title SHALL show "Esc: force stop"
+- **AND** the Status panel title SHALL show "q: quit"
+
+#### Scenario: Status panel title shows resume key in Stopped mode
+
+- **GIVEN** the TUI is in stopped mode
+- **THEN** the Status panel title SHALL show "F5: resume"
+- **AND** the Status panel title SHALL show "q: quit"
