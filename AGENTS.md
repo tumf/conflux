@@ -93,14 +93,70 @@ cargo run --release -- run
 
 ```
 src/
-  main.rs           # Entry point, CLI dispatching
-  cli.rs            # CLI argument parsing (clap)
-  error.rs          # Error types (thiserror)
-  openspec.rs       # OpenSpec CLI wrapper
-  opencode.rs       # OpenCode runner for headless execution
-  state.rs          # State persistence (JSON)
-  progress.rs       # Progress display (indicatif)
-  orchestrator.rs   # Main orchestration loop
+  main.rs               # Entry point, CLI dispatching
+  cli.rs                # CLI argument parsing (clap)
+  error.rs              # Error types (thiserror)
+  openspec.rs           # OpenSpec CLI wrapper
+  orchestrator.rs       # Main orchestration loop
+  progress.rs           # Progress display (indicatif)
+
+  # Core modules
+  agent.rs              # AI agent command execution
+  analyzer.rs           # Change dependency analyzer for parallel execution
+  approval.rs           # Change approval management
+  history.rs            # Apply context history management
+  hooks.rs              # Lifecycle hook execution
+  parallel_run_service.rs # Parallel execution service
+  task_parser.rs        # Native task.md parser
+  templates.rs          # Configuration templates
+
+  # Configuration
+  config/
+    mod.rs              # Configuration module root
+    defaults.rs         # Default configuration values
+    expand.rs           # Environment variable expansion
+    jsonc.rs            # JSONC parser (JSON with comments)
+
+  # VCS (Version Control System) abstraction
+  vcs/
+    mod.rs              # VCS module root, backend trait abstraction
+    commands.rs         # Common VCS command interface
+
+    git/
+      mod.rs            # Git backend implementation
+      commands.rs       # Git command wrappers
+
+    jj/
+      mod.rs            # jj backend implementation
+      commands.rs       # jj command wrappers
+
+  # Parallel execution
+  parallel/
+    mod.rs              # Parallel execution module root
+    executor.rs         # Parallel change executor
+    types.rs            # Shared types for parallel execution
+    events.rs           # Event types for progress reporting
+    conflict.rs         # Conflict detection and resolution
+    cleanup.rs          # Workspace cleanup utilities
+
+  # TUI (Terminal User Interface)
+  tui/
+    mod.rs              # TUI module root
+    events.rs           # TUI event types
+    orchestrator.rs     # TUI orchestration integration
+    parallel_event_bridge.rs # Bridge between parallel executor and TUI
+    queue.rs            # Event queue management
+    render.rs           # Terminal rendering
+    runner.rs           # TUI runner/main loop
+    types.rs            # TUI-specific types
+    utils.rs            # TUI utility functions
+
+    state/
+      mod.rs            # TUI state module root
+      change.rs         # Change state management
+      events.rs         # State event handling
+      logs.rs           # Log state management
+      modes.rs          # TUI mode state
 
 tests/
   e2e_tests.rs           # End-to-end tests with mock scripts
@@ -220,11 +276,12 @@ mod tests {
 | regex | Pattern matching |
 | chrono | Date/time handling |
 | tempfile | Test fixtures |
+| async-trait | Async trait definitions |
 
-## State File Location
+## Configuration Files
 
-- Orchestrator state: `.opencode/orchestrator-state.json`
-- Ralph plugin state: `.opencode/ralph-loop.local.json` (separate, no conflict)
+- Project config: `.openspec-orchestrator.jsonc` (JSONC format with comments)
+- Global config: `~/.openspec-orchestrator.jsonc`
 
 ## Common Patterns
 
