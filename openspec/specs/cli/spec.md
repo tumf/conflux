@@ -3,110 +3,122 @@
 ## Purpose
 TBD - created by archiving change add-run-subcommand. Update Purpose after archive.
 ## Requirements
-### Requirement: サブコマンド構造
+### Requirement: Subcommand Structure
 
-CLI はサブコマンド構造を持ち、将来的なコマンド拡張に対応できなければならない（SHALL）。
+CLI SHALL have a subcommand structure that supports future command extensions.
 
-#### Scenario: サブコマンドなしで実行
-- **WHEN** ユーザーが引数なしで `openspec-orchestrator` を実行する
-- **THEN** 利用可能なサブコマンド一覧を含むヘルプメッセージを表示する
+#### Scenario: Run without subcommand
 
-#### Scenario: 不明なサブコマンドで実行
-- **WHEN** ユーザーが存在しないサブコマンドで実行する
-- **THEN** エラーメッセージと利用可能なサブコマンド一覧を表示する
+- **WHEN** user runs `openspec-orchestrator` without arguments
+- **THEN** the interactive TUI is launched
+- **AND** the change list is displayed in selection mode
 
-### Requirement: run サブコマンド
+#### Scenario: Run with unknown subcommand
 
-`run` サブコマンドは OpenSpec 変更ワークフローのオーケストレーションループを実行しなければならない（SHALL）。
+- **WHEN** user runs with a non-existent subcommand
+- **THEN** an error message with available subcommands is displayed
 
-#### Scenario: 特定の変更を指定して実行
-- **WHEN** ユーザーが `openspec-orchestrator run --change <id>` を実行する
-- **THEN** 指定された変更のみを処理する
-- **AND** スナップショットログには指定された変更のみが表示される
+### Requirement: run Subcommand
 
-#### Scenario: 複数の変更をカンマ区切りで指定
-- **WHEN** ユーザーが `openspec-orchestrator run --change a,b,c` を実行する
-- **THEN** `a`, `b`, `c` の変更のみを処理する
-- **AND** スナップショットログには `a`, `b`, `c` のみが表示される
+The `run` subcommand SHALL execute the OpenSpec change workflow orchestration loop.
 
-#### Scenario: 存在しない変更を指定した場合
-- **WHEN** ユーザーが `openspec-orchestrator run --change nonexistent` を実行する
-- **AND** `nonexistent` という変更が存在しない
-- **THEN** 警告メッセージ "Specified change 'nonexistent' not found, skipping" が出力される
-- **AND** 「No changes found」と表示されて終了する
+#### Scenario: Run with specific change
 
-#### Scenario: 有効な変更と無効な変更を混在して指定
-- **WHEN** ユーザーが `openspec-orchestrator run --change a,nonexistent,c` を実行する
-- **AND** `a` と `c` は存在するが `nonexistent` は存在しない
-- **THEN** 警告メッセージ "Specified change 'nonexistent' not found, skipping" が出力される
-- **AND** `a` と `c` のみを処理する
-- **AND** スナップショットログには `a` と `c` のみが表示される
+- **WHEN** user runs `openspec-orchestrator run --change <id>`
+- **THEN** only the specified change is processed
+- **AND** the snapshot log shows only the specified change
 
-### Requirement: デフォルトTUI起動
+#### Scenario: Run with comma-separated changes
 
-サブコマンドなしで起動した場合、インタラクティブTUIを表示しなければならない（SHALL）。
+- **WHEN** user runs `openspec-orchestrator run --change a,b,c`
+- **THEN** only changes `a`, `b`, `c` are processed
+- **AND** the snapshot log shows only `a`, `b`, `c`
 
-#### Scenario: サブコマンドなしでの起動
-- **WHEN** ユーザーが `openspec-orchestrator` を引数なしで実行する
-- **THEN** インタラクティブTUIが起動する
-- **AND** 選択モードで変更一覧が表示される
+#### Scenario: Run with non-existent change
 
-#### Scenario: runサブコマンドでの起動（後方互換性）
-- **WHEN** ユーザーが `openspec-orchestrator run` を実行する
-- **THEN** 従来通りオーケストレーションループが直接実行される
+- **WHEN** user runs `openspec-orchestrator run --change nonexistent`
+- **AND** no change named `nonexistent` exists
+- **THEN** a warning message "Specified change 'nonexistent' not found, skipping" is displayed
+- **AND** exits with "No changes found"
 
-### Requirement: 変更選択モード
+#### Scenario: Run with mixed valid and invalid changes
 
-TUI起動時、変更選択モードを表示し、ユーザーが処理する変更を選択できなければならない（SHALL）。
+- **WHEN** user runs `openspec-orchestrator run --change a,nonexistent,c`
+- **AND** `a` and `c` exist but `nonexistent` does not
+- **THEN** a warning message "Specified change 'nonexistent' not found, skipping" is displayed
+- **AND** only `a` and `c` are processed
+- **AND** the snapshot log shows only `a` and `c`
 
-#### Scenario: 終了
-- **WHEN** ユーザーが `q` キーまたは `Ctrl+C` を押す
-- **THEN** TUIが終了し、ターミナルが元の状態に復元される
+### Requirement: Default TUI Launch
 
-### Requirement: 選択変更の実行開始
+When launched without a subcommand, the interactive TUI SHALL be displayed.
 
-選択モードでF5キーを押すと、選択された変更の処理を開始しなければならない（SHALL）。
+#### Scenario: Launch without subcommand
 
-#### Scenario: F5キーで実行開始
-- **WHEN** ユーザーがF5キーを押す
-- **AND** 1つ以上の変更が選択されている
-- **THEN** TUIが実行モードに切り替わる
-- **AND** 選択された変更がキューに追加される
+- **WHEN** user runs `openspec-orchestrator` without arguments
+- **THEN** the interactive TUI is launched
+- **AND** the change list is displayed in selection mode
 
-#### Scenario: 選択なしでF5キー
-- **WHEN** ユーザーがF5キーを押す
-- **AND** 変更が1つも選択されていない
-- **THEN** 実行は開始されない
-- **AND** 警告メッセージが表示される
+#### Scenario: Launch with run subcommand (backward compatibility)
 
-### Requirement: 実行モードダッシュボード
+- **WHEN** user runs `openspec-orchestrator run`
+- **THEN** the orchestration loop is executed directly as before
 
-TUIは実行モードでダッシュボード形式のUIを表示しなければならない（SHALL）。
+### Requirement: Change Selection Mode
 
-#### Scenario: 処理完了時の表示
+At TUI launch, the change selection mode SHALL be displayed, allowing users to select changes for processing.
 
-- **WHEN** 全てのキュー内変更の処理が完了する
-- **THEN** ヘッダーのステータスが「Completed」に変更される
-- **AND** ステータスパネルの左側に「Done」が緑色で表示される
-- **AND** TUIは表示を維持し、ユーザーが `q` キーで終了できる
+#### Scenario: Exit
 
-#### Scenario: 完了後のキュー変更
+- **WHEN** user presses `q` key or `Ctrl+C`
+- **THEN** TUI exits and the terminal is restored to its original state
 
-- **WHEN** AppModeがCompletedである
-- **AND** ユーザーがSpaceキーを押す
-- **THEN** NotQueued状態の変更はQueuedに変更できる
-- **AND** Queued状態の変更はNotQueuedに変更できる
-- **AND** Completed/Archived/Error状態の変更は変更できない
+### Requirement: Start Execution of Selected Changes
 
-#### Scenario: 完了後の再実行
+When F5 key is pressed in selection mode, processing of selected changes SHALL begin.
 
-- **WHEN** AppModeがCompletedである
-- **AND** キューに変更が追加されている
-- **AND** ユーザーがF5キーを押す
-- **THEN** AppModeがRunningに変更される
-- **AND** キュー内の変更の処理が開始される
+#### Scenario: Start execution with F5 key
 
-### Requirement: TUIレイアウト構成
+- **WHEN** user presses F5 key
+- **AND** one or more changes are selected
+- **THEN** TUI switches to running mode
+- **AND** selected changes are added to the queue
+
+#### Scenario: F5 key with no selection
+
+- **WHEN** user presses F5 key
+- **AND** no changes are selected
+- **THEN** execution does not start
+- **AND** a warning message is displayed
+
+### Requirement: Running Mode Dashboard
+
+TUI SHALL display a dashboard-style UI in running mode.
+
+#### Scenario: Display on processing completion
+
+- **WHEN** all queued changes have been processed
+- **THEN** the header status changes to "Completed"
+- **AND** "Done" is displayed in green on the left side of the status panel
+- **AND** TUI maintains display, allowing user to exit with `q` key
+
+#### Scenario: Queue modification after completion
+
+- **WHEN** AppMode is Completed
+- **AND** user presses Space key
+- **THEN** NotQueued changes can be changed to Queued
+- **AND** Queued changes can be changed to NotQueued
+- **AND** Completed/Archived/Error changes cannot be modified
+
+#### Scenario: Re-run after completion
+
+- **WHEN** AppMode is Completed
+- **AND** changes are added to the queue
+- **AND** user presses F5 key
+- **THEN** AppMode changes to Running
+- **AND** processing of queued changes begins
+
+### Requirement: TUI Layout Structure
 
 The TUI SHALL display appropriate layout for Stopping and Stopped modes in addition to existing modes.
 
@@ -124,144 +136,149 @@ The TUI SHALL display appropriate layout for Stopping and Stopped modes in addit
 - **AND** status panel shows summary of completed/queued changes
 - **AND** footer shows available actions (F5: resume, q: quit)
 
-### Requirement: 自動更新機能
+### Requirement: Auto-refresh Feature
 
-TUIは定期的に変更一覧を自動更新しなければならない（SHALL）。
+TUI SHALL periodically auto-refresh the change list.
 
-#### Scenario: 定期的な自動更新
-- **WHEN** TUIが表示されている
-- **THEN** 5秒間隔で `openspec list` が実行される
-- **AND** 変更一覧の進捗状況が更新される
+#### Scenario: Periodic auto-refresh
 
-#### Scenario: 更新中の表示継続
-- **WHEN** 自動更新が実行中である
-- **THEN** TUIの表示は中断されない
-- **AND** 更新完了後に変更一覧が反映される
+- **WHEN** TUI is displayed
+- **THEN** the change list is refreshed every 5 seconds
+- **AND** progress status is updated
 
-### Requirement: 新規変更検出
+#### Scenario: Display continues during refresh
 
-自動更新時に新しい変更が検出された場合、適切に表示しなければならない（SHALL）。
+- **WHEN** auto-refresh is in progress
+- **THEN** TUI display is not interrupted
+- **AND** changes are reflected after refresh completes
 
-#### Scenario: 新規変更の検出
-- **WHEN** 自動更新により新しい変更が検出される
-- **THEN** 新しい変更が変更一覧に追加される
-- **AND** 「NEW」バッジが表示される
-- **AND** ログに「Discovered new change: <id>」と出力される
+### Requirement: New Change Detection
 
-#### Scenario: 新規変更のデフォルト状態
-- **WHEN** 新しい変更が検出される
-- **THEN** その変更はデフォルトで未選択状態（`[ ]`）である
-- **AND** フッターの新規件数が更新される
+When auto-refresh detects new changes, they SHALL be displayed appropriately.
 
-#### Scenario: NEWバッジの表示
-- **WHEN** 変更が新規検出されたものである
-- **THEN** 変更名の横に「NEW」バッジが表示される
-- **AND** バッジは視覚的に目立つ色で表示される
+#### Scenario: New change detection
 
-### Requirement: 動的実行キュー
+- **WHEN** auto-refresh detects a new change
+- **THEN** the new change is added to the change list
+- **AND** a "NEW" badge is displayed
+- **AND** "Discovered new change: <id>" is logged
 
-実行モードで未選択の変更を選択するとキューに追加でき、キュー待機中の変更を解除できなければならない（SHALL）。追加された変更はオーケストレータによって実際に処理されなければならない。
+#### Scenario: Default state of new changes
 
-#### Scenario: 実行中のキュー追加
+- **WHEN** a new change is detected
+- **THEN** it is unselected by default (`[ ]`)
+- **AND** the new count in the footer is updated
 
-- **WHEN** TUIが実行モードである
-- **AND** ユーザーが未選択の変更（NotQueued）にカーソルを合わせてSpaceキーを押す
-- **THEN** その変更が実行キューに追加される
-- **AND** 表示が「not queued」から「queued」に更新される
-- **AND** 共有キューにその変更IDがプッシュされる
+#### Scenario: NEW badge display
 
-#### Scenario: キュー待機中の変更を解除
+- **WHEN** a change is newly detected
+- **THEN** a "NEW" badge is displayed next to the change name
+- **AND** the badge is displayed in a visually prominent color
 
-- **WHEN** TUIが実行モードである
-- **AND** ユーザーがキュー待機中（Queued）の変更にカーソルを合わせてSpaceキーを押す
-- **THEN** その変更がキューから取り除かれる
-- **AND** 表示が「queued」から「not queued」に更新される
-- **AND** 選択状態が解除される
+### Requirement: Dynamic Execution Queue
 
-#### Scenario: キュー追加後の処理順序
+In running mode, unselected changes can be added to the queue, and queued changes can be removed. Added changes SHALL be processed by the orchestrator.
 
-- **WHEN** 変更が動的にキューに追加される
-- **THEN** その変更は現在処理中の変更の完了後に処理される
-- **AND** 既にキュー内にある変更の順序は変わらない
+#### Scenario: Queue addition during execution
 
-#### Scenario: 処理中の変更は変更不可
+- **WHEN** TUI is in running mode
+- **AND** user moves cursor to an unselected change (NotQueued) and presses Space key
+- **THEN** the change is added to the execution queue
+- **AND** display updates from "not queued" to "queued"
+- **AND** the change ID is pushed to the shared queue
 
-- **WHEN** 変更が処理中（Processing）である
-- **THEN** その変更の選択状態は変更できない
-- **AND** Spaceキーを押しても何も起こらない
+#### Scenario: Remove queued change
 
-#### Scenario: アーカイブ中の変更は変更不可
+- **WHEN** TUI is in running mode
+- **AND** user moves cursor to a queued change (Queued) and presses Space key
+- **THEN** the change is removed from the queue
+- **AND** display updates from "queued" to "not queued"
+- **AND** the selection is cleared
 
-- **WHEN** 変更がアーカイブ処理中である
-- **THEN** その変更の選択状態は変更できない
-- **AND** Spaceキーを押しても何も起こらない
+#### Scenario: Processing order after queue addition
 
-#### Scenario: Waiting状態での動的キュー追加
+- **WHEN** a change is dynamically added to the queue
+- **THEN** it is processed after the currently processing change completes
+- **AND** the order of existing queued changes is unchanged
 
-- **WHEN** TUIが実行モードであり「Waiting...」と表示されている
-- **AND** 現在処理中の変更がない状態である
-- **AND** ユーザーが未選択の変更（NotQueued）にカーソルを合わせてSpaceキーを押す
-- **THEN** その変更が実行キューに追加される
-- **AND** オーケストレータがその変更を検出して処理を開始する
-- **AND** ログに「Processing dynamically added: <change-id>」と表示される
+#### Scenario: Processing change cannot be modified
 
-#### Scenario: 動的に追加された変更の処理完了
+- **WHEN** a change is Processing
+- **THEN** its selection state cannot be changed
+- **AND** pressing Space key has no effect
 
-- **WHEN** 動的に追加された変更の処理が完了する
-- **THEN** その変更のステータスが「completed」または「archived」に更新される
-- **AND** 残りの動的キューがあれば続けて処理される
-- **AND** 初期キューと動的キューの両方が空になったら「AllCompleted」イベントが送信される
+#### Scenario: Archiving change cannot be modified
 
-#### Scenario: 重複追加の防止
+- **WHEN** a change is being archived
+- **THEN** its selection state cannot be changed
+- **AND** pressing Space key has no effect
 
-- **WHEN** 既にキューに存在する変更を再度追加しようとする
-- **THEN** 追加は無視される
-- **AND** 警告ログが表示される
+#### Scenario: Dynamic queue addition in Waiting state
 
-### Requirement: エラー状態の表示
+- **WHEN** TUI is in running mode showing "Waiting..."
+- **AND** no change is currently processing
+- **AND** user moves cursor to an unselected change (NotQueued) and presses Space key
+- **THEN** the change is added to the execution queue
+- **AND** the orchestrator detects and starts processing the change
+- **AND** log displays "Processing dynamically added: <change-id>"
 
-エラー発生時、TUIはエラー状態を明示的に表示しなければならない（SHALL）。
+#### Scenario: Dynamically added change processing completion
 
-#### Scenario: エラー発生時のモード遷移
+- **WHEN** processing of a dynamically added change completes
+- **THEN** the change status updates to "completed" or "archived"
+- **AND** remaining dynamic queue items continue processing
+- **AND** "AllCompleted" event is sent when both initial and dynamic queues are empty
 
-- **WHEN** opencode実行がエラー（LLMエラー、料金不足等）で失敗する
-- **THEN** TUIのモードが「Error」に遷移する
-- **AND** ヘッダーのステータスが「Error」と赤色で表示される
+#### Scenario: Prevent duplicate addition
 
-#### Scenario: ステータスパネルのエラー表示
+- **WHEN** attempting to add a change that already exists in the queue
+- **THEN** the addition is ignored
+- **AND** a warning log is displayed
 
-- **WHEN** TUIがエラー状態である
-- **THEN** ステータスパネルに「Error in <change_id>」と表示される
-- **AND** 「Press F5 to retry」のガイダンスが表示される
+### Requirement: Error State Display
 
-#### Scenario: エラー状態でのChange表示
+When an error occurs, TUI SHALL explicitly display the error state.
 
-- **WHEN** TUIがエラー状態である
-- **THEN** エラーが発生したChangeのステータスは「[error]」と赤色で表示される
-- **AND** 他のqueued状態のChangeはそのまま維持される
+#### Scenario: Mode transition on error
 
-### Requirement: F5キーでのエラーリトライ
+- **WHEN** opencode execution fails with an error (LLM error, insufficient credits, etc.)
+- **THEN** TUI mode transitions to "Error"
+- **AND** header status displays "Error" in red
 
-エラー状態でF5キーを押すと、エラーが発生したChangeの処理をリトライできなければならない（SHALL）。
+#### Scenario: Status panel error display
 
-#### Scenario: F5キーでリトライ開始
+- **WHEN** TUI is in error state
+- **THEN** status panel displays "Error in <change_id>"
+- **AND** "Press F5 to retry" guidance is displayed
 
-- **WHEN** TUIがエラー状態である
-- **AND** ユーザーがF5キーを押す
-- **THEN** エラー状態のChangeが再度キューに追加される
-- **AND** TUIが「Running」モードに遷移する
-- **AND** 処理が再開される
+#### Scenario: Change display in error state
 
-#### Scenario: リトライ時のログ表示
+- **WHEN** TUI is in error state
+- **THEN** the errored Change status shows "[error]" in red
+- **AND** other queued Changes maintain their state
 
-- **WHEN** ユーザーがF5キーでリトライを開始する
-- **THEN** ログパネルに「Retrying: <change_id>」と表示される
+### Requirement: Error Retry with F5 Key
 
-#### Scenario: リトライ成功後の状態
+In error state, pressing F5 key SHALL retry processing of the failed Change.
 
-- **WHEN** リトライした処理が成功する
-- **THEN** Changeのステータスが「completed」または「archived」に更新される
-- **AND** 残りのキュー内Changeがあれば続けて処理される
+#### Scenario: Retry with F5 key
+
+- **WHEN** TUI is in error state
+- **AND** user presses F5 key
+- **THEN** the errored Change is added back to the queue
+- **AND** TUI transitions to "Running" mode
+- **AND** processing resumes
+
+#### Scenario: Log display on retry
+
+- **WHEN** user initiates retry with F5 key
+- **THEN** log panel displays "Retrying: <change_id>"
+
+#### Scenario: State after successful retry
+
+- **WHEN** the retried processing succeeds
+- **THEN** the Change status updates to "completed" or "archived"
+- **AND** remaining queued Changes continue processing
 
 ### Requirement: init Subcommand
 
@@ -316,52 +333,59 @@ TUIは定期的に変更一覧を自動更新しなければならない（SHALL
 - **THEN** the command exits with an error
 - **AND** an error message lists valid template options (opencode, claude, codex)
 
-### Requirement: フッターの動的ガイダンス表示
+### Requirement: Footer Dynamic Guidance Display
 
-選択モードのフッターは、アプリケーションの状態に応じて適切なガイダンスメッセージを表示しなければならない（SHALL）。
+The selection mode footer SHALL display appropriate guidance messages based on application state.
 
-#### Scenario: 変更がない場合のガイダンス
-- **WHEN** TUIが選択モードである
-- **AND** 変更リストが空である
-- **THEN** フッターに "Add new proposals to get started" と表示される
+#### Scenario: Guidance when no changes
 
-#### Scenario: 変更が未選択の場合のガイダンス
-- **WHEN** TUIが選択モードである
-- **AND** 変更が1つ以上存在する
-- **AND** 選択されている変更が0件である
-- **THEN** フッターに "Select changes with Space to process" と表示される
+- **WHEN** TUI is in selection mode
+- **AND** the change list is empty
+- **THEN** the footer displays "Add new proposals to get started"
 
-#### Scenario: 変更が選択済みの場合のガイダンス
-- **WHEN** TUIが選択モードである
-- **AND** 1つ以上の変更が選択されている
-- **THEN** フッターに "Press F5 to start processing" と表示される
+#### Scenario: Guidance when no changes selected
 
-### Requirement: 実行中フッターの進捗バー表示
+- **WHEN** TUI is in selection mode
+- **AND** one or more changes exist
+- **AND** no changes are selected
+- **THEN** the footer displays "Select changes with Space to process"
 
-実行モードのフッターには、全体の処理進捗をバーで表示しなければならない（SHALL）。
+#### Scenario: Guidance when changes are selected
 
-#### Scenario: 実行中の進捗バー表示
-- **WHEN** TUIが実行モードである
-- **THEN** フッターにキュー内全タスクの進捗バーが表示される
-- **AND** 進捗バーは完了タスク数/総タスク数に基づいて計算される
-- **AND** パーセンテージが数値で表示される
+- **WHEN** TUI is in selection mode
+- **AND** one or more changes are selected
+- **THEN** the footer displays "Press F5 to start processing"
 
-#### Scenario: 進捗バーの計算方法
-- **WHEN** 進捗バーを表示する
-- **THEN** 総タスク数は処理対象全変更（Queued, Processing, Completed, Archived）の `total_tasks` の合計である
-- **AND** 完了タスク数は処理対象全変更の `completed_tasks` の合計である
-- **AND** 進捗率は `completed_tasks / total_tasks * 100` で計算される
-- **AND** NotQueued および Error 状態の変更は進捗計算に含まれない
+### Requirement: Running Footer Progress Bar Display
 
-#### Scenario: 完了タスクの進捗保持
-- **WHEN** 変更が Completed または Archived 状態に遷移する
-- **THEN** その変更のタスク進捗は引き続き進捗バーの計算に含まれる
-- **AND** 進捗パーセンテージは減少しない（単調増加）
+The running mode footer SHALL display a progress bar for overall processing progress.
 
-#### Scenario: タスク数が0の場合
-- **WHEN** 進捗バーを表示する
-- **AND** 総タスク数が0である
-- **THEN** 進捗バーは0%として表示される
+#### Scenario: Progress bar display during execution
+
+- **WHEN** TUI is in running mode
+- **THEN** the footer displays a progress bar for all tasks in the queue
+- **AND** the progress bar is calculated based on completed tasks / total tasks
+- **AND** the percentage is displayed numerically
+
+#### Scenario: Progress bar calculation method
+
+- **WHEN** displaying the progress bar
+- **THEN** total tasks is the sum of `total_tasks` for all target changes (Queued, Processing, Completed, Archived)
+- **AND** completed tasks is the sum of `completed_tasks` for all target changes
+- **AND** progress rate is calculated as `completed_tasks / total_tasks * 100`
+- **AND** NotQueued and Error state changes are NOT included in progress calculation
+
+#### Scenario: Completed task progress retention
+
+- **WHEN** a change transitions to Completed or Archived state
+- **THEN** its task progress continues to be included in progress bar calculation
+- **AND** progress percentage does not decrease (monotonically increasing)
+
+#### Scenario: When task count is 0
+
+- **WHEN** displaying the progress bar
+- **AND** total task count is 0
+- **THEN** the progress bar displays as 0%
 
 ### Requirement: Processing Item Spinner Animation
 
@@ -384,22 +408,22 @@ The TUI SHALL display an animated spinner next to items with `Processing` status
 - **AND** an item has status other than `Processing` (Queued, Completed, Error)
 - **THEN** no spinner is displayed for that item
 
-### Requirement: 完了検出のリトライ設定
+### Requirement: Completion Detection Retry Settings
 
-完了状態の検出においてリトライ動作を実装しなければならない（SHALL）。
+Retry behavior SHALL be implemented for completion state detection.
 
-#### Scenario: デフォルトのリトライ設定
+#### Scenario: Default retry settings
 
-- **WHEN** 設定ファイルにリトライ設定がない
-- **THEN** 最大リトライ回数は3回である
-- **AND** リトライ間隔は500ミリ秒である
+- **WHEN** no retry settings exist in configuration file
+- **THEN** maximum retry count is 3
+- **AND** retry interval is 500 milliseconds
 
-#### Scenario: キャンセル時のリトライ中断
+#### Scenario: Cancel during retry
 
-- **WHEN** リトライループ実行中である
-- **AND** キャンセルトークンがキャンセルされる
-- **THEN** リトライループは即座に終了する
-- **AND** プロセスは適切にクリーンアップされる
+- **WHEN** retry loop is in progress
+- **AND** cancellation token is cancelled
+- **THEN** retry loop terminates immediately
+- **AND** process is cleaned up properly
 
 ### Requirement: TUI Unicode Display Width Support
 
@@ -931,12 +955,12 @@ The apply history context MUST be formatted as XML-like tags containing the agen
 
 #### Scenario: Context appended to base prompt
 
-- **GIVEN** base apply_prompt is "スコープ外タスクは削除せよ"
+- **GIVEN** base apply_prompt is "Delete out-of-scope tasks"
 - **AND** there is one previous attempt with agent summary "Task 1.1 completed."
 - **WHEN** the full prompt is built
 - **THEN** the prompt format is:
   ```
-  スコープ外タスクは削除せよ
+  Delete out-of-scope tasks
 
   <last_apply attempt="1">
   Task 1.1 completed.
@@ -1142,63 +1166,63 @@ The CLI SHALL support `--dry-run` to preview parallelization groups without exec
 
 ### Requirement: VCS Backend Selection Flag
 
-CLI は `--vcs` フラグで VCS バックエンドを明示的に選択できなければならない（SHALL）。
+CLI SHALL allow explicit VCS backend selection via `--vcs` flag.
 
 #### Scenario: Default auto detection
 
-- **WHEN** `--parallel` フラグが指定される
-- **AND** `--vcs` フラグが指定されない
-- **THEN** VCS バックエンドが自動検出される（jj 優先）
+- **WHEN** `--parallel` flag is specified
+- **AND** `--vcs` flag is not specified
+- **THEN** VCS backend is auto-detected (jj preferred)
 
 #### Scenario: Explicit jj selection
 
-- **WHEN** `openspec-orchestrator run --parallel --vcs jj` が実行される
-- **THEN** jj バックエンドが使用される
-- **AND** jj が利用不可の場合はエラーが表示される
+- **WHEN** `openspec-orchestrator run --parallel --vcs jj` is executed
+- **THEN** jj backend is used
+- **AND** an error is displayed if jj is not available
 
 #### Scenario: Explicit git selection
 
-- **WHEN** `openspec-orchestrator run --parallel --vcs git` が実行される
-- **THEN** Git バックエンドが使用される
-- **AND** jj が存在しても Git が使用される
-- **AND** Git が利用不可の場合はエラーが表示される
+- **WHEN** `openspec-orchestrator run --parallel --vcs git` is executed
+- **THEN** Git backend is used
+- **AND** Git is used even if jj exists
+- **AND** an error is displayed if Git is not available
 
 #### Scenario: Explicit auto selection
 
-- **WHEN** `openspec-orchestrator run --parallel --vcs auto` が実行される
-- **THEN** VCS バックエンドが自動検出される
-- **AND** jj が優先され、なければ Git が使用される
+- **WHEN** `openspec-orchestrator run --parallel --vcs auto` is executed
+- **THEN** VCS backend is auto-detected
+- **AND** jj is preferred, Git is used if jj is not available
 
 #### Scenario: Invalid VCS value
 
-- **WHEN** `openspec-orchestrator run --parallel --vcs invalid` が実行される
-- **THEN** エラーメッセージ "Invalid VCS backend: invalid. Valid options: auto, jj, git" が表示される
-- **AND** 終了コードは非ゼロである
+- **WHEN** `openspec-orchestrator run --parallel --vcs invalid` is executed
+- **THEN** error message "Invalid VCS backend: invalid. Valid options: auto, jj, git" is displayed
+- **AND** exit code is non-zero
 
 #### Scenario: --vcs without --parallel
 
-- **WHEN** `openspec-orchestrator run --vcs git` が実行される
-- **AND** `--parallel` フラグが指定されない
-- **THEN** `--vcs` オプションは無視される
-- **AND** 通常の逐次実行が行われる
+- **WHEN** `openspec-orchestrator run --vcs git` is executed
+- **AND** `--parallel` flag is not specified
+- **THEN** `--vcs` option is ignored
+- **AND** normal sequential execution proceeds
 
 ### Requirement: Git Uncommitted Changes Error Message
 
-Git バックエンドで未コミット変更がある場合、CLI は詳細なエラーメッセージを表示しなければならない（SHALL）。
+When uncommitted changes exist with Git backend, CLI SHALL display a detailed error message.
 
 #### Scenario: Error message format
 
-- **WHEN** Git バックエンドで並列実行が試行される
-- **AND** 未コミット変更が存在する
-- **THEN** エラーメッセージに以下が含まれる:
-  - 問題の説明
-  - 解決方法（commit または stash）
-  - 具体的なコマンド例
+- **WHEN** parallel execution is attempted with Git backend
+- **AND** uncommitted changes exist
+- **THEN** the error message includes:
+  - Problem description
+  - Resolution method (commit or stash)
+  - Specific command examples
 
 #### Scenario: Untracked files also trigger error
 
-- **WHEN** Git バックエンドで並列実行が試行される
-- **AND** 未追跡ファイル（untracked files）のみが存在する
-- **THEN** 同様のエラーメッセージが表示される
-- **AND** `.gitignore` に含まれるファイルは対象外である
+- **WHEN** parallel execution is attempted with Git backend
+- **AND** only untracked files exist
+- **THEN** the same error message is displayed
+- **AND** files in `.gitignore` are excluded
 
