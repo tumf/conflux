@@ -6,28 +6,12 @@
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::jj_commands;
-use std::path::PathBuf;
+use crate::vcs_backend::{VcsBackend, Workspace, WorkspaceManager, WorkspaceStatus};
+use async_trait::async_trait;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
-
-/// Status of a jj workspace
-#[derive(Debug, Clone, PartialEq)]
-pub enum WorkspaceStatus {
-    /// Workspace created but not yet used
-    Created,
-    /// Apply command is running
-    Applying,
-    /// Apply completed successfully with resulting revision
-    Applied(String),
-    /// Apply failed with error message
-    Failed(String),
-    /// Workspace merged into main (reserved for future merge tracking)
-    #[allow(dead_code)]
-    Merged,
-    /// Workspace cleaned up
-    Cleaned,
-}
 
 /// Represents a jj workspace for parallel execution
 #[derive(Debug, Clone)]
@@ -43,19 +27,6 @@ pub struct JjWorkspace {
     pub base_revision: String,
     /// Current status (managed via update_workspace_status)
     pub status: WorkspaceStatus,
-}
-
-/// Result of a workspace execution
-#[derive(Debug, Clone)]
-pub struct WorkspaceResult {
-    /// OpenSpec change ID
-    pub change_id: String,
-    /// Workspace name
-    pub workspace_name: String,
-    /// Final revision if successful
-    pub final_revision: Option<String>,
-    /// Error message if failed
-    pub error: Option<String>,
 }
 
 /// Manages jj workspaces for parallel execution
@@ -90,6 +61,7 @@ impl JjWorkspaceManager {
     }
 
     /// Get the maximum concurrent workspaces limit
+    #[allow(dead_code)] // Part of workspace manager pattern
     pub fn max_concurrent(&self) -> usize {
         self.max_concurrent
     }
@@ -101,6 +73,7 @@ impl JjWorkspaceManager {
     }
 
     /// Check if jj is available and the repo is a jj repository
+    #[allow(dead_code)] // Part of WorkspaceManager trait implementation
     pub async fn check_jj_available(&self) -> Result<bool> {
         jj_commands::check_jj_repo(&self.repo_root).await
     }
@@ -553,6 +526,192 @@ impl JjWorkspaceManager {
             .collect();
 
         Ok(workspaces)
+    }
+}
+
+#[async_trait]
+impl WorkspaceManager for JjWorkspaceManager {
+    fn backend_type(&self) -> VcsBackend {
+        VcsBackend::Jj
+    }
+
+    async fn check_available(&self) -> Result<bool> {
+        self.check_jj_available().await
+    }
+
+    async fn prepare_for_parallel(&self) -> Result<()> {
+        // jj snapshots working copy changes automatically
+        self.snapshot_working_copy().await
+    }
+
+    async fn get_current_revision(&self) -> Result<String> {
+        JjWorkspaceManager::get_current_revision(self).await
+    }
+
+    async fn create_workspace(
+        &mut self,
+        change_id: &str,
+        base_revision: Option<&str>,
+    ) -> Result<Workspace> {
+        let jj_ws = self.create_workspace_from(change_id, base_revision).await?;
+        Ok(Workspace {
+            name: jj_ws.name,
+            path: jj_ws.path,
+            change_id: jj_ws.change_id,
+            base_revision: jj_ws.base_revision,
+            status: jj_ws.status,
+        })
+    }
+
+    fn update_workspace_status(&mut self, workspace_name: &str, status: WorkspaceStatus) {
+        JjWorkspaceManager::update_workspace_status(self, workspace_name, status);
+    }
+
+    async fn merge_workspaces(&self, revisions: &[String]) -> Result<String> {
+        JjWorkspaceManager::merge_workspaces(self, revisions).await
+    }
+
+    async fn cleanup_workspace(&mut self, workspace_name: &str) -> Result<()> {
+        JjWorkspaceManager::cleanup_workspace(self, workspace_name).await
+    }
+
+    async fn cleanup_all(&mut self) -> Result<()> {
+        JjWorkspaceManager::cleanup_all(self).await
+    }
+
+    fn max_concurrent(&self) -> usize {
+        self.max_concurrent
+    }
+
+    fn workspaces(&self) -> Vec<Workspace> {
+        self.workspaces
+            .iter()
+            .map(|w| Workspace {
+                name: w.name.clone(),
+                path: w.path.clone(),
+                change_id: w.change_id.clone(),
+                base_revision: w.base_revision.clone(),
+                status: w.status.clone(),
+            })
+            .collect()
+    }
+
+    fn conflict_resolution_prompt(&self) -> &'static str {
+        "This project uses jj (Jujutsu) for version control, not git.\n\n\
+         A merge conflict occurred. The files contain jj conflict markers.\n\
+         After editing the conflicting files to resolve conflicts, \
+         jj will automatically detect the resolution."
+    }
+
+    async fn snapshot_working_copy(&self, workspace_path: &Path) -> Result<()> {
+        // jj snapshots working copy changes when running status
+        let _ = tokio::process::Command::new("jj")
+            .arg("status")
+            .current_dir(workspace_path)
+            .output()
+            .await;
+        Ok(())
+    }
+
+    async fn set_commit_message(&self, workspace_path: &Path, message: &str) -> Result<()> {
+        use std::process::Stdio;
+        let output = tokio::process::Command::new("jj")
+            .args(["describe", "-m", message])
+            .current_dir(workspace_path)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| OrchestratorError::JjCommand(format!("Failed to describe: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("Failed to set commit message: {}", stderr);
+        }
+        Ok(())
+    }
+
+    async fn get_revision_in_workspace(&self, workspace_path: &Path) -> Result<String> {
+        let output = tokio::process::Command::new("jj")
+            .args([
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "--ignore-working-copy",
+                "-T",
+                "change_id",
+            ])
+            .current_dir(workspace_path)
+            .output()
+            .await
+            .map_err(|e| OrchestratorError::JjCommand(format!("Failed to get revision: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(OrchestratorError::JjCommand(format!(
+                "Failed to get workspace revision: {}",
+                stderr
+            )));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    async fn get_status(&self) -> Result<String> {
+        jj_commands::get_status(&self.repo_root).await
+    }
+
+    async fn get_log_for_revisions(&self, revisions: &[String]) -> Result<String> {
+        jj_commands::get_log_for_revisions(revisions, &self.repo_root).await
+    }
+
+    async fn detect_conflicts(&self) -> Result<Vec<String>> {
+        let stdout = self.get_status().await?;
+        let mut conflict_files = Vec::new();
+
+        for line in stdout.lines() {
+            // jj status shows conflicts with "C " prefix or "Conflict" marker
+            if line.contains("Conflict") || line.starts_with("C ") {
+                // Extract filename
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if let Some(filename) = parts.last() {
+                    conflict_files.push(filename.to_string());
+                }
+            }
+        }
+
+        Ok(conflict_files)
+    }
+
+    fn forget_workspace_sync(&self, workspace_name: &str) {
+        debug!(
+            "Emergency cleanup: forgetting jj workspace '{}'",
+            workspace_name
+        );
+        let result = std::process::Command::new("jj")
+            .args(["workspace", "forget", workspace_name])
+            .current_dir(&self.repo_root)
+            .output();
+
+        match result {
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                debug!(
+                    "Failed to forget workspace '{}': {}",
+                    workspace_name, stderr
+                );
+            }
+            Err(e) => {
+                debug!("Failed to run jj workspace forget: {}", e);
+            }
+            _ => {
+                debug!("Successfully forgot workspace '{}'", workspace_name);
+            }
+        }
+    }
+
+    fn repo_root(&self) -> &Path {
+        &self.repo_root
     }
 }
 

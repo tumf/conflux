@@ -36,9 +36,16 @@ impl ParallelRunService {
     }
 
     /// Check if jj is available for parallel execution
+    #[deprecated(note = "Use check_vcs_available instead")]
+    #[allow(dead_code)] // Deprecated but kept for backward compatibility
     pub async fn check_jj_available(&self) -> Result<bool> {
-        let executor = ParallelExecutor::new(self.repo_root.clone(), self.config.clone(), None);
-        executor.check_jj_available().await
+        self.check_vcs_available().await
+    }
+
+    /// Check if VCS (jj or git) is available for parallel execution
+    pub async fn check_vcs_available(&self) -> Result<bool> {
+        // Check if either jj or git is available
+        Ok(crate::cli::check_parallel_available())
     }
 
     /// Run parallel execution with an event callback

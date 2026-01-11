@@ -1,20 +1,34 @@
-//! Parallel execution coordinator for jj workspace-based parallel change application.
+//! Parallel execution coordinator for VCS workspace-based parallel change application.
 //!
-//! This module manages the parallel execution of changes using jj workspaces,
+//! This module manages the parallel execution of changes using VCS workspaces (jj or Git),
 //! including workspace creation, apply command execution, merge, and cleanup.
 
 use crate::agent::AgentRunner;
 use crate::analyzer::ParallelGroup;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
-use crate::jj_commands;
-use crate::jj_workspace::{JjWorkspace, JjWorkspaceManager, WorkspaceResult, WorkspaceStatus};
+use crate::git_workspace::GitWorkspaceManager;
+use crate::jj_workspace::JjWorkspaceManager;
+use crate::vcs_backend::{VcsBackend, Workspace, WorkspaceManager, WorkspaceStatus};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
+
+/// Result of a workspace execution (VCS-agnostic)
+#[derive(Debug, Clone)]
+pub struct WorkspaceResult {
+    /// OpenSpec change ID
+    pub change_id: String,
+    /// Workspace name
+    pub workspace_name: String,
+    /// Final revision if successful
+    pub final_revision: Option<String>,
+    /// Error message if failed
+    pub error: Option<String>,
+}
 
 /// RAII guard for workspace cleanup on partial failures.
 ///
@@ -24,6 +38,8 @@ use tracing::{debug, error, info, warn};
 struct WorkspaceCleanupGuard {
     /// Workspace names to clean up
     workspace_names: Vec<String>,
+    /// VCS backend type
+    vcs_backend: VcsBackend,
     /// Repository root for cleanup commands
     repo_root: PathBuf,
     /// Whether cleanup has been committed (skipped)
@@ -32,9 +48,10 @@ struct WorkspaceCleanupGuard {
 
 impl WorkspaceCleanupGuard {
     /// Create a new cleanup guard
-    fn new(repo_root: PathBuf) -> Self {
+    fn new(vcs_backend: VcsBackend, repo_root: PathBuf) -> Self {
         Self {
             workspace_names: Vec::new(),
+            vcs_backend,
             repo_root,
             committed: false,
         }
@@ -73,25 +90,54 @@ impl Drop for WorkspaceCleanupGuard {
                 workspace_name
             );
 
-            // Forget the workspace in jj
-            let result = std::process::Command::new("jj")
-                .args(["workspace", "forget", workspace_name])
-                .current_dir(&self.repo_root)
-                .output();
+            match self.vcs_backend {
+                VcsBackend::Jj => {
+                    // Forget the workspace in jj
+                    let result = std::process::Command::new("jj")
+                        .args(["workspace", "forget", workspace_name])
+                        .current_dir(&self.repo_root)
+                        .output();
 
-            match result {
-                Ok(output) if !output.status.success() => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    debug!(
-                        "Failed to forget workspace '{}': {}",
-                        workspace_name, stderr
-                    );
+                    match result {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            debug!(
+                                "Failed to forget jj workspace '{}': {}",
+                                workspace_name, stderr
+                            );
+                        }
+                        Err(e) => {
+                            debug!("Failed to run jj workspace forget: {}", e);
+                        }
+                        _ => {
+                            debug!("Successfully forgot jj workspace '{}'", workspace_name);
+                        }
+                    }
                 }
-                Err(e) => {
-                    debug!("Failed to run jj workspace forget: {}", e);
-                }
-                _ => {
-                    debug!("Successfully forgot workspace '{}'", workspace_name);
+                VcsBackend::Git | VcsBackend::Auto => {
+                    // For Git, we need the worktree path, but we only have the name
+                    // This is a best-effort cleanup; the worktree will be orphaned
+                    // but can be cleaned up later with `git worktree prune`
+                    let result = std::process::Command::new("git")
+                        .args(["branch", "-D", workspace_name])
+                        .current_dir(&self.repo_root)
+                        .output();
+
+                    match result {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            debug!(
+                                "Failed to delete git branch '{}': {}",
+                                workspace_name, stderr
+                            );
+                        }
+                        Err(e) => {
+                            debug!("Failed to run git branch -D: {}", e);
+                        }
+                        _ => {
+                            debug!("Successfully deleted git branch '{}'", workspace_name);
+                        }
+                    }
                 }
             }
         }
@@ -175,8 +221,8 @@ pub enum ParallelEvent {
 
 /// Parallel executor for running changes in jj workspaces
 pub struct ParallelExecutor {
-    /// Workspace manager
-    workspace_manager: JjWorkspaceManager,
+    /// Workspace manager (VCS-agnostic)
+    workspace_manager: Box<dyn WorkspaceManager>,
     /// Configuration (used for AgentRunner and resolve operations)
     config: OrchestratorConfig,
     /// Apply command template
@@ -192,11 +238,23 @@ pub struct ParallelExecutor {
 }
 
 impl ParallelExecutor {
-    /// Create a new parallel executor
+    /// Create a new parallel executor with automatic VCS detection
     pub fn new(
         repo_root: PathBuf,
         config: OrchestratorConfig,
         event_tx: Option<mpsc::Sender<ParallelEvent>>,
+    ) -> Self {
+        // Auto-detect VCS backend
+        let vcs_backend = config.get_vcs_backend();
+        Self::with_backend(repo_root, config, event_tx, vcs_backend)
+    }
+
+    /// Create a new parallel executor with a specific VCS backend
+    pub fn with_backend(
+        repo_root: PathBuf,
+        config: OrchestratorConfig,
+        event_tx: Option<mpsc::Sender<ParallelEvent>>,
+        vcs_backend: VcsBackend,
     ) -> Self {
         // Create a unique temp directory for this execution
         let base_dir = if let Some(configured_dir) = config.get_workspace_base_dir() {
@@ -224,8 +282,24 @@ impl ParallelExecutor {
         let apply_command = config.get_apply_command().to_string();
         let archive_command = config.get_archive_command().to_string();
 
-        let workspace_manager =
-            JjWorkspaceManager::new(base_dir, repo_root.clone(), max_concurrent, config.clone());
+        // Resolve the VCS backend (handle Auto)
+        let resolved_backend = Self::resolve_backend(vcs_backend, &repo_root);
+        info!("Using VCS backend: {:?}", resolved_backend);
+
+        let workspace_manager: Box<dyn WorkspaceManager> = match resolved_backend {
+            VcsBackend::Git => Box::new(GitWorkspaceManager::new(
+                base_dir,
+                repo_root.clone(),
+                max_concurrent,
+                config.clone(),
+            )),
+            VcsBackend::Jj | VcsBackend::Auto => Box::new(JjWorkspaceManager::new(
+                base_dir,
+                repo_root.clone(),
+                max_concurrent,
+                config.clone(),
+            )),
+        };
 
         Self {
             workspace_manager,
@@ -238,9 +312,41 @@ impl ParallelExecutor {
         }
     }
 
-    /// Check if jj is available for parallel execution
+    /// Resolve VCS backend (convert Auto to concrete backend)
+    fn resolve_backend(backend: VcsBackend, repo_root: &Path) -> VcsBackend {
+        match backend {
+            VcsBackend::Auto => {
+                // Check for jj first (preferred)
+                if repo_root.join(".jj").exists() {
+                    VcsBackend::Jj
+                } else if repo_root.join(".git").exists() {
+                    VcsBackend::Git
+                } else {
+                    // Default to jj
+                    VcsBackend::Jj
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Get the VCS backend type
+    #[allow(dead_code)] // Public API for external callers
+    pub fn backend_type(&self) -> VcsBackend {
+        self.workspace_manager.backend_type()
+    }
+
+    /// Check if VCS is available for parallel execution
+    #[allow(dead_code)] // Public API, used via ParallelRunService
+    pub async fn check_vcs_available(&self) -> Result<bool> {
+        self.workspace_manager.check_available().await
+    }
+
+    /// Check if jj is available for parallel execution (deprecated, use check_vcs_available)
+    #[deprecated(note = "Use check_vcs_available instead")]
+    #[allow(dead_code)] // Deprecated but kept for backward compatibility
     pub async fn check_jj_available(&self) -> Result<bool> {
-        self.workspace_manager.check_jj_available().await
+        self.check_vcs_available().await
     }
 
     /// Execute groups in topological order
@@ -252,17 +358,16 @@ impl ParallelExecutor {
 
         info!("Executing {} groups in parallel mode", groups.len());
 
-        // Snapshot working copy to ensure all changes are visible in workspaces
-        // In jj, uncommitted changes are not visible in new workspaces
-        info!("Snapshotting working copy for parallel execution...");
-        if let Err(e) = self.workspace_manager.snapshot_working_copy().await {
-            let error_msg = format!("Failed to snapshot working copy: {}", e);
+        // Prepare for parallel execution (snapshot for jj, clean check for git)
+        info!("Preparing for parallel execution...");
+        if let Err(e) = self.workspace_manager.prepare_for_parallel().await {
+            let error_msg = format!("Failed to prepare for parallel execution: {}", e);
             error!("{}", error_msg);
             self.send_event(ParallelEvent::Error { message: error_msg })
                 .await;
             return Err(e);
         }
-        info!("Working copy snapshot complete");
+        info!("Preparation complete");
 
         for group in groups {
             self.execute_group(&group).await?;
@@ -299,16 +404,16 @@ impl ParallelExecutor {
             changes.len()
         );
 
-        // Snapshot working copy
-        info!("Snapshotting working copy for parallel execution...");
-        if let Err(e) = self.workspace_manager.snapshot_working_copy().await {
-            let error_msg = format!("Failed to snapshot working copy: {}", e);
+        // Prepare for parallel execution (snapshot for jj, clean check for git)
+        info!("Preparing for parallel execution...");
+        if let Err(e) = self.workspace_manager.prepare_for_parallel().await {
+            let error_msg = format!("Failed to prepare for parallel execution: {}", e);
             error!("{}", error_msg);
             self.send_event(ParallelEvent::Error { message: error_msg })
                 .await;
             return Err(e);
         }
-        info!("Working copy snapshot complete");
+        info!("Preparation complete");
 
         let mut group_counter = 1u32;
 
@@ -376,15 +481,18 @@ impl ParallelExecutor {
         .await;
 
         // Create cleanup guard to ensure workspaces are cleaned up on early errors
-        let mut cleanup_guard = WorkspaceCleanupGuard::new(self.repo_root.clone());
+        let mut cleanup_guard = WorkspaceCleanupGuard::new(
+            self.workspace_manager.backend_type(),
+            self.repo_root.clone(),
+        );
 
         // Create workspaces for all changes in the group from the SAME base revision
         // This ensures all changes in the group branch from the same point (true parallel)
-        let mut workspaces: Vec<JjWorkspace> = Vec::new();
+        let mut workspaces: Vec<Workspace> = Vec::new();
         for change_id in &group.changes {
             match self
                 .workspace_manager
-                .create_workspace_from(change_id, Some(&base_revision))
+                .create_workspace(change_id, Some(&base_revision))
                 .await
             {
                 Ok(workspace) => {
@@ -485,7 +593,7 @@ impl ParallelExecutor {
     /// Archive starts immediately after apply completes for each change
     async fn execute_apply_and_archive_parallel(
         &mut self,
-        workspaces: &[JjWorkspace],
+        workspaces: &[Workspace],
     ) -> Result<Vec<WorkspaceResult>> {
         let max_concurrent = self.workspace_manager.max_concurrent();
         let semaphore = Arc::new(Semaphore::new(max_concurrent));
@@ -500,6 +608,7 @@ impl ParallelExecutor {
             let archive_cmd = self.archive_command.clone();
             let config = self.config.clone();
             let event_tx = self.event_tx.clone();
+            let vcs_backend = self.workspace_manager.backend_type();
 
             // Update status
             self.workspace_manager
@@ -515,6 +624,7 @@ impl ParallelExecutor {
                     &workspace_path,
                     &apply_cmd,
                     event_tx.clone(),
+                    vcs_backend,
                 )
                 .await;
 
@@ -545,6 +655,7 @@ impl ParallelExecutor {
                             &archive_cmd,
                             &config,
                             event_tx.clone(),
+                            vcs_backend,
                         )
                         .await;
 
@@ -574,12 +685,12 @@ impl ParallelExecutor {
                                         })
                                         .await;
                                 }
-                                // Fall back to apply revision if archive fails
+                                // Archive failed - do not merge unarchived changes
                                 WorkspaceResult {
                                     change_id,
                                     workspace_name,
-                                    final_revision: Some(apply_revision),
-                                    error: None,
+                                    final_revision: None,
+                                    error: Some(format!("Archive failed: {}", e)),
                                 }
                             }
                         }
@@ -642,6 +753,7 @@ impl ParallelExecutor {
         archive_cmd_template: &str,
         config: &OrchestratorConfig,
         event_tx: Option<mpsc::Sender<ParallelEvent>>,
+        vcs_backend: VcsBackend,
     ) -> Result<String> {
         // Verify task completion before archiving
         let tasks_path = workspace_path
@@ -748,25 +860,168 @@ impl ParallelExecutor {
             )));
         }
 
-        // Get the current revision after archive
-        let revision_output = Command::new("jj")
-            .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
-            .current_dir(workspace_path)
-            .output()
-            .await
-            .map_err(|e| OrchestratorError::JjCommand(format!("Failed to get revision: {}", e)))?;
+        // Verify that the change was actually archived
+        // The change directory should no longer exist in openspec/changes/ (except in archive/)
+        let change_path = workspace_path.join("openspec/changes").join(change_id);
+        let archive_dir = workspace_path.join("openspec/changes/archive");
 
-        if !revision_output.status.success() {
-            let stderr = String::from_utf8_lossy(&revision_output.stderr);
-            return Err(OrchestratorError::JjCommand(format!(
-                "Failed to get revision: {}",
-                stderr
+        // Check if change was moved: original path should not exist,
+        // and there should be an archive entry (format: {date}-{change_id} or just {change_id})
+        let archived = if change_path.exists() {
+            false
+        } else if archive_dir.exists() {
+            // Look for any directory in archive that ends with the change_id
+            std::fs::read_dir(&archive_dir)
+                .map(|entries| {
+                    entries.filter_map(|e| e.ok()).any(|entry| {
+                        let name = entry.file_name();
+                        let name_str = name.to_string_lossy();
+                        name_str == change_id || name_str.ends_with(&format!("-{}", change_id))
+                    })
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if !archived {
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Archive command succeeded but change '{}' was not actually archived. \
+                 The change directory still exists in openspec/changes/. \
+                 The archive command may not have executed 'openspec archive' correctly.",
+                change_id
             )));
         }
 
-        Ok(String::from_utf8_lossy(&revision_output.stdout)
-            .trim()
-            .to_string())
+        info!(
+            "Archive verification passed for {}: change moved to archive",
+            change_id
+        );
+
+        // Commit the archive changes if there are uncommitted changes
+        // openspec archive moves files but doesn't commit them
+        match vcs_backend {
+            VcsBackend::Git | VcsBackend::Auto => {
+                // Check for uncommitted changes
+                let status_output = Command::new("git")
+                    .args(["status", "--porcelain"])
+                    .current_dir(workspace_path)
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::GitCommand(format!("Failed to check git status: {}", e))
+                    })?;
+
+                let status = String::from_utf8_lossy(&status_output.stdout);
+                if !status.trim().is_empty() {
+                    debug!("Committing archive changes for {}", change_id);
+
+                    // Stage all changes
+                    let add_output = Command::new("git")
+                        .args(["add", "-A"])
+                        .current_dir(workspace_path)
+                        .output()
+                        .await
+                        .map_err(|e| {
+                            OrchestratorError::GitCommand(format!("Failed to stage changes: {}", e))
+                        })?;
+
+                    if !add_output.status.success() {
+                        let stderr = String::from_utf8_lossy(&add_output.stderr);
+                        return Err(OrchestratorError::GitCommand(format!(
+                            "Failed to stage archive changes: {}",
+                            stderr
+                        )));
+                    }
+
+                    // Commit
+                    let commit_output = Command::new("git")
+                        .args(["commit", "-m", &format!("Archive: {}", change_id)])
+                        .current_dir(workspace_path)
+                        .output()
+                        .await
+                        .map_err(|e| {
+                            OrchestratorError::GitCommand(format!("Failed to commit: {}", e))
+                        })?;
+
+                    if !commit_output.status.success() {
+                        let stderr = String::from_utf8_lossy(&commit_output.stderr);
+                        return Err(OrchestratorError::GitCommand(format!(
+                            "Failed to commit archive changes: {}",
+                            stderr
+                        )));
+                    }
+
+                    info!("Committed archive changes for {}", change_id);
+                }
+            }
+            VcsBackend::Jj => {
+                // jj automatically tracks changes, just need to snapshot
+                let snapshot_output = Command::new("jj")
+                    .args(["describe", "-m", &format!("Archive: {}", change_id)])
+                    .current_dir(workspace_path)
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::JjCommand(format!("Failed to describe: {}", e))
+                    })?;
+
+                if !snapshot_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&snapshot_output.stderr);
+                    warn!("Failed to describe jj revision: {}", stderr);
+                }
+            }
+        }
+
+        // Get the current revision after archive
+        let revision = match vcs_backend {
+            VcsBackend::Jj => {
+                let revision_output = Command::new("jj")
+                    .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
+                    .current_dir(workspace_path)
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::JjCommand(format!("Failed to get revision: {}", e))
+                    })?;
+
+                if !revision_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&revision_output.stderr);
+                    return Err(OrchestratorError::JjCommand(format!(
+                        "Failed to get revision: {}",
+                        stderr
+                    )));
+                }
+
+                String::from_utf8_lossy(&revision_output.stdout)
+                    .trim()
+                    .to_string()
+            }
+            VcsBackend::Git | VcsBackend::Auto => {
+                let revision_output = Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(workspace_path)
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::GitCommand(format!("Failed to get revision: {}", e))
+                    })?;
+
+                if !revision_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&revision_output.stderr);
+                    return Err(OrchestratorError::GitCommand(format!(
+                        "Failed to get revision: {}",
+                        stderr
+                    )));
+                }
+
+                String::from_utf8_lossy(&revision_output.stdout)
+                    .trim()
+                    .to_string()
+            }
+        };
+
+        Ok(revision)
     }
 
     /// Check task progress for a change in the given workspace.
@@ -800,6 +1055,7 @@ impl ParallelExecutor {
     /// Summarize command output for logging and event reporting.
     ///
     /// If output exceeds max_lines, returns the last few lines with a count prefix.
+    #[allow(dead_code)] // Utility function for future use
     fn summarize_output(output: &str, max_lines: usize) -> String {
         if output.is_empty() {
             return String::new();
@@ -825,6 +1081,7 @@ impl ParallelExecutor {
         workspace_path: &Path,
         apply_cmd_template: &str,
         event_tx: Option<mpsc::Sender<ParallelEvent>>,
+        vcs_backend: VcsBackend,
     ) -> Result<String> {
         const MAX_ITERATIONS: u32 = 50;
         let mut iteration = 0;
@@ -959,13 +1216,15 @@ impl ParallelExecutor {
                 )));
             }
 
-            // Run jj status to snapshot working copy changes
+            // Snapshot working copy changes (for jj; no-op for git)
             // This ensures file modifications are visible for task progress check
-            let _ = Command::new("jj")
-                .arg("status")
-                .current_dir(workspace_path)
-                .output()
-                .await;
+            if vcs_backend == VcsBackend::Jj {
+                let _ = Command::new("jj")
+                    .arg("status")
+                    .current_dir(workspace_path)
+                    .output()
+                    .await;
+            }
 
             // Check task progress after apply using helper
             let new_progress =
@@ -1009,50 +1268,109 @@ impl ParallelExecutor {
 
         // Set a meaningful commit message for the completed change
         use std::process::Stdio as StdStdio;
-        let describe_output = Command::new("jj")
-            .args(["describe", "-m", &format!("Apply: {}", change_id)])
-            .current_dir(workspace_path)
-            .stdin(StdStdio::null())
-            .output()
-            .await;
+        let commit_message = format!("Apply: {}", change_id);
 
-        if let Err(e) = describe_output {
-            warn!("Failed to set commit message for {}: {}", change_id, e);
-        } else if let Ok(output) = describe_output {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!("Failed to set commit message for {}: {}", change_id, stderr);
+        match vcs_backend {
+            VcsBackend::Jj => {
+                let describe_output = Command::new("jj")
+                    .args(["describe", "-m", &commit_message])
+                    .current_dir(workspace_path)
+                    .stdin(StdStdio::null())
+                    .output()
+                    .await;
+
+                if let Err(e) = describe_output {
+                    warn!("Failed to set commit message for {}: {}", change_id, e);
+                } else if let Ok(output) = describe_output {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        warn!("Failed to set commit message for {}: {}", change_id, stderr);
+                    }
+                }
+            }
+            VcsBackend::Git | VcsBackend::Auto => {
+                // For Git: stage all changes and commit (or amend if changes exist)
+                let add_output = Command::new("git")
+                    .args(["add", "-A"])
+                    .current_dir(workspace_path)
+                    .stdin(StdStdio::null())
+                    .output()
+                    .await;
+
+                if add_output.is_ok() {
+                    // Try to commit; if nothing to commit, that's fine
+                    let commit_output = Command::new("git")
+                        .args(["commit", "-m", &commit_message, "--allow-empty"])
+                        .current_dir(workspace_path)
+                        .stdin(StdStdio::null())
+                        .output()
+                        .await;
+
+                    if let Err(e) = commit_output {
+                        warn!("Failed to commit for {}: {}", change_id, e);
+                    }
+                }
             }
         }
 
         // Get the resulting revision
-        // Use --ignore-working-copy to avoid triggering automatic snapshot
-        let revision_output = Command::new("jj")
-            .args([
-                "log",
-                "-r",
-                "@",
-                "--no-graph",
-                "--ignore-working-copy",
-                "-T",
-                "change_id",
-            ])
-            .current_dir(workspace_path)
-            .output()
-            .await
-            .map_err(|e| OrchestratorError::JjCommand(format!("Failed to get revision: {}", e)))?;
+        let revision = match vcs_backend {
+            VcsBackend::Jj => {
+                // Use --ignore-working-copy to avoid triggering automatic snapshot
+                let revision_output = Command::new("jj")
+                    .args([
+                        "log",
+                        "-r",
+                        "@",
+                        "--no-graph",
+                        "--ignore-working-copy",
+                        "-T",
+                        "change_id",
+                    ])
+                    .current_dir(workspace_path)
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::JjCommand(format!("Failed to get revision: {}", e))
+                    })?;
 
-        if !revision_output.status.success() {
-            let stderr = String::from_utf8_lossy(&revision_output.stderr);
-            return Err(OrchestratorError::JjCommand(format!(
-                "Failed to get workspace revision: {}",
-                stderr
-            )));
-        }
+                if !revision_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&revision_output.stderr);
+                    return Err(OrchestratorError::JjCommand(format!(
+                        "Failed to get workspace revision: {}",
+                        stderr
+                    )));
+                }
 
-        Ok(String::from_utf8_lossy(&revision_output.stdout)
-            .trim()
-            .to_string())
+                String::from_utf8_lossy(&revision_output.stdout)
+                    .trim()
+                    .to_string()
+            }
+            VcsBackend::Git | VcsBackend::Auto => {
+                let revision_output = Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(workspace_path)
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::GitCommand(format!("Failed to get revision: {}", e))
+                    })?;
+
+                if !revision_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&revision_output.stderr);
+                    return Err(OrchestratorError::GitCommand(format!(
+                        "Failed to get workspace revision: {}",
+                        stderr
+                    )));
+                }
+
+                String::from_utf8_lossy(&revision_output.stdout)
+                    .trim()
+                    .to_string()
+            }
+        };
+
+        Ok(revision)
     }
 
     /// Merge revisions and resolve any conflicts
@@ -1073,7 +1391,8 @@ impl ParallelExecutor {
                 .await;
                 Ok(())
             }
-            Err(OrchestratorError::JjConflict(conflict_info)) => {
+            Err(OrchestratorError::JjConflict(conflict_info))
+            | Err(OrchestratorError::GitConflict(conflict_info)) => {
                 // Detect conflict files
                 let conflict_files = self.detect_conflicts().await?;
                 self.send_event(ParallelEvent::MergeConflict {
@@ -1081,7 +1400,7 @@ impl ParallelExecutor {
                 })
                 .await;
 
-                // Attempt automatic resolution with jj context
+                // Attempt automatic resolution with VCS context
                 self.resolve_conflicts_with_retry(revisions, &conflict_info)
                     .await
             }
@@ -1089,40 +1408,28 @@ impl ParallelExecutor {
         }
     }
 
-    /// Detect conflicted files from jj status
+    /// Detect conflicted files
     async fn detect_conflicts(&self) -> Result<Vec<String>> {
-        let stdout = jj_commands::get_status(&self.repo_root).await?;
-        let mut conflict_files = Vec::new();
-
-        for line in stdout.lines() {
-            // jj status shows conflicts with "C " prefix or "Conflict" marker
-            if line.contains("Conflict") || line.starts_with("C ") {
-                // Extract filename
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if let Some(filename) = parts.last() {
-                    conflict_files.push(filename.to_string());
-                }
-            }
-        }
-
-        Ok(conflict_files)
+        self.workspace_manager.detect_conflicts().await
     }
 
-    /// Get jj status output for context
-    async fn get_jj_status(&self) -> Result<String> {
-        jj_commands::get_status(&self.repo_root).await
+    /// Get VCS status output for context
+    async fn get_vcs_status(&self) -> Result<String> {
+        self.workspace_manager.get_status().await
     }
 
-    /// Get jj log for specific revisions
-    async fn get_jj_log_for_revisions(&self, revisions: &[String]) -> Result<String> {
-        jj_commands::get_log_for_revisions(revisions, &self.repo_root).await
+    /// Get VCS log for specific revisions
+    async fn get_vcs_log_for_revisions(&self, revisions: &[String]) -> Result<String> {
+        self.workspace_manager
+            .get_log_for_revisions(revisions)
+            .await
     }
 
     /// Attempt to resolve conflicts with retries using the configured resolve command
     async fn resolve_conflicts_with_retry(
         &self,
         revisions: &[String],
-        jj_error: &str,
+        vcs_error: &str,
     ) -> Result<()> {
         self.send_event(ParallelEvent::ConflictResolutionStarted)
             .await;
@@ -1131,14 +1438,17 @@ impl ParallelExecutor {
         let conflict_files = self.detect_conflicts().await?;
         let conflict_files_str = conflict_files.join(", ");
 
-        // Get jj status for context
-        let jj_status = self.get_jj_status().await.unwrap_or_default();
+        // Get VCS status for context
+        let vcs_status = self.get_vcs_status().await.unwrap_or_default();
 
-        // Get jj log for the conflicting revisions
-        let jj_log = self
-            .get_jj_log_for_revisions(revisions)
+        // Get VCS log for the conflicting revisions
+        let vcs_log = self
+            .get_vcs_log_for_revisions(revisions)
             .await
             .unwrap_or_default();
+
+        // Get the VCS-specific conflict resolution prompt prefix
+        let vcs_prompt_prefix = self.workspace_manager.conflict_resolution_prompt();
 
         for attempt in 1..=self.max_conflict_retries {
             info!(
@@ -1146,24 +1456,24 @@ impl ParallelExecutor {
                 attempt, self.max_conflict_retries, conflict_files_str
             );
 
-            // Build the resolve prompt with full jj context
+            // Build the resolve prompt with VCS-specific context
             let resolve_prompt = format!(
-                "This project uses jj (Jujutsu) for version control, not git.\n\n\
+                "{}\n\n\
                  A merge conflict occurred while trying to merge the following revisions:\n\
                  {}\n\n\
-                 jj error output:\n\
+                 VCS error output:\n\
                  {}\n\n\
-                 Current jj status:\n\
+                 Current VCS status:\n\
                  {}\n\n\
-                 jj log for conflicting changes:\n\
+                 VCS log for conflicting changes:\n\
                  {}\n\n\
                  Conflicting files: {}\n\n\
-                 Please resolve the merge conflicts in the listed files. \
-                 The files contain jj conflict markers. After editing, jj will automatically detect the resolution.",
+                 Please resolve the merge conflicts in the listed files.",
+                vcs_prompt_prefix,
                 revisions.join(", "),
-                jj_error,
-                jj_status,
-                jj_log,
+                vcs_error,
+                vcs_status,
+                vcs_log,
                 conflict_files_str
             );
 
@@ -1219,7 +1529,11 @@ impl ParallelExecutor {
         })
         .await;
 
-        Err(OrchestratorError::JjConflict(error_msg))
+        // Return VCS-specific error
+        match self.workspace_manager.backend_type() {
+            VcsBackend::Jj => Err(OrchestratorError::JjConflict(error_msg)),
+            VcsBackend::Git | VcsBackend::Auto => Err(OrchestratorError::GitConflict(error_msg)),
+        }
     }
 
     /// Send an event to the event channel

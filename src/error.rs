@@ -52,6 +52,19 @@ pub enum OrchestratorError {
     #[error("jj not available: {0}")]
     #[allow(dead_code)] // Kept for future use in stricter jj availability checks
     JjNotAvailable(String),
+
+    #[error("Git command failed: {0}")]
+    GitCommand(String),
+
+    #[error("Git merge conflict: {0}")]
+    GitConflict(String),
+
+    #[error("Git has uncommitted changes: {0}")]
+    GitUncommittedChanges(String),
+
+    #[error("No VCS backend available for parallel execution")]
+    #[allow(dead_code)] // Reserved for future use when both jj and git are unavailable
+    NoVcsBackend,
 }
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;

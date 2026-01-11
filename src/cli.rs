@@ -62,7 +62,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub max_iterations: Option<u32>,
 
-    /// Enable parallel execution mode using jj workspaces (requires jj repository)
+    /// Enable parallel execution mode using jj workspaces or git worktrees
     #[arg(long)]
     pub parallel: bool,
 
@@ -73,6 +73,11 @@ pub struct RunArgs {
     /// Preview parallelization groups without executing (dry run)
     #[arg(long)]
     pub dry_run: bool,
+
+    /// VCS backend for parallel execution: auto, jj, or git
+    /// Default: auto (detects jj first, then falls back to git)
+    #[arg(long, default_value = "auto")]
+    pub vcs: String,
 }
 
 /// Arguments for the TUI subcommand
@@ -164,6 +169,26 @@ pub fn check_jj_available() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Check if git directory exists
+pub fn check_git_directory() -> bool {
+    std::path::Path::new(".git").exists()
+}
+
+/// Check if git CLI is available
+pub fn check_git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Check if parallel execution is available (jj or git)
+pub fn check_parallel_available() -> bool {
+    (check_jj_directory() && check_jj_available())
+        || (check_git_directory() && check_git_available())
 }
 
 #[cfg(test)]

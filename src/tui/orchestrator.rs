@@ -126,6 +126,27 @@ pub async fn archive_single_change(
     })?;
 
     if status.success() {
+        // Verify that the change was actually archived
+        // The change directory should no longer exist in openspec/changes/
+        let change_path = std::path::Path::new("openspec/changes").join(change_id);
+        let archive_path = std::path::Path::new("openspec/archive").join(change_id);
+
+        if change_path.exists() && !archive_path.exists() {
+            let error_msg = format!(
+                "Archive command succeeded but change '{}' was not actually archived. \
+                 The change directory still exists in openspec/changes/. \
+                 The archive command may not have executed 'openspec archive' correctly.",
+                change_id
+            );
+            let _ = tx
+                .send(OrchestratorEvent::ProcessingError {
+                    id: change_id.to_string(),
+                    error: error_msg,
+                })
+                .await;
+            return Ok(ArchiveResult::Failed);
+        }
+
         // Clear apply history for the archived change
         agent.clear_apply_history(change_id);
 
@@ -713,15 +734,15 @@ pub async fn run_orchestrator_parallel(
     // Create ParallelRunService
     let service = ParallelRunService::new(repo_root, config.clone());
 
-    // Check jj availability
-    if !service.check_jj_available().await? {
+    // Check VCS availability (jj or git)
+    if !service.check_vcs_available().await? {
         let _ = tx
             .send(OrchestratorEvent::Log(LogEntry::error(
-                "jj is not available for parallel execution".to_string(),
+                "VCS (jj or git) is not available for parallel execution".to_string(),
             )))
             .await;
         return Err(crate::error::OrchestratorError::AgentCommand(
-            "jj not available".to_string(),
+            "VCS not available".to_string(),
         ));
     }
 

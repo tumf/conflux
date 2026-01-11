@@ -128,7 +128,7 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
     if app.parallel_mode {
         header_spans.push(Span::raw(" "));
         header_spans.push(Span::styled(
-            "[parallel]",
+            format!("[parallel:{}:{}]", app.max_concurrent, app.vcs_backend),
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
@@ -246,8 +246,8 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
     if has_queue {
         keys.push("F5: run");
     }
-    // Show parallel toggle hint only if jj is available
-    if app.jj_available {
+    // Show parallel toggle hint only if parallel execution is available
+    if app.parallel_available {
         keys.push(if app.parallel_mode {
             "=: sequential"
         } else {

@@ -119,8 +119,12 @@ pub struct AppState {
     pub stop_mode: StopMode,
     /// Whether parallel mode is enabled
     pub parallel_mode: bool,
-    /// Whether jj is available in this repository
-    pub jj_available: bool,
+    /// Whether parallel execution is available (jj or git)
+    pub parallel_available: bool,
+    /// VCS backend being used (jj or git)
+    pub vcs_backend: String,
+    /// Max concurrent workspaces for parallel execution
+    pub max_concurrent: usize,
     /// When orchestration started (for overall elapsed time)
     pub orchestration_started_at: Option<Instant>,
     /// Total elapsed time when orchestration finished
@@ -176,7 +180,13 @@ impl AppState {
             log_auto_scroll: true,
             stop_mode: StopMode::None,
             parallel_mode: false,
-            jj_available: crate::cli::check_jj_directory() && crate::cli::check_jj_available(),
+            parallel_available: crate::cli::check_parallel_available(),
+            vcs_backend: if crate::cli::check_jj_directory() {
+                "jj".to_string()
+            } else {
+                "git".to_string()
+            },
+            max_concurrent: 4, // Default value, can be overridden from config
             orchestration_started_at: None,
             orchestration_elapsed: None,
         }
@@ -193,9 +203,10 @@ impl AppState {
             return false;
         }
 
-        // Check if jj is available
-        if !self.jj_available {
-            self.warning_message = Some("jj is not available (no .jj directory found)".to_string());
+        // Check if parallel execution is available (jj or git)
+        if !self.parallel_available {
+            self.warning_message =
+                Some("Parallel mode not available (requires jj or git)".to_string());
             return false;
         }
 
@@ -615,11 +626,16 @@ impl AppState {
         for fetched in &fetched_changes {
             if let Some(existing) = self.changes.iter_mut().find(|c| c.id == fetched.id) {
                 // Only update progress if we have valid data (total > 0)
-                // and the change is still being processed
+                // and the change is NOT being processed (parallel mode uses workspace)
                 if fetched.total_tasks > 0 {
                     match existing.queue_status {
-                        QueueStatus::Completed | QueueStatus::Archiving | QueueStatus::Archived => {
-                            // Don't update progress after completion - file may be moved
+                        QueueStatus::Completed
+                        | QueueStatus::Archiving
+                        | QueueStatus::Archived
+                        | QueueStatus::Processing => {
+                            // Don't update progress after completion or during processing
+                            // - After completion: file may be moved
+                            // - During processing: parallel mode uses workspace, not main repo
                         }
                         _ => {
                             existing.completed_tasks = fetched.completed_tasks;
