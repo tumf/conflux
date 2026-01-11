@@ -43,4 +43,3 @@ The project SHALL provide README.ja.md as a complete Japanese translation.
 - **THEN** code examples are identical
 - **AND** command-line examples are identical
 - **AND** only prose text is translated to Japanese
-

@@ -192,4 +192,3 @@ The TUI SHALL detect jj availability at startup and cache the result.
 - **THEN** jj_available flag is set to false
 - **AND** parallel mode features are hidden
 - **AND** no error is displayed (silent degradation)
-

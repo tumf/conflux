@@ -1139,4 +1139,3 @@ The CLI SHALL support `--dry-run` to preview parallelization groups without exec
 - **THEN** the analyzer determines parallelization groups
 - **AND** the groups are displayed without executing any changes
 - **AND** no workspaces are created
-

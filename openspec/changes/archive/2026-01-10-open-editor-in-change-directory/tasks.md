@@ -23,4 +23,3 @@
 - [x] 4. Add error type `EditorLaunchFailed` to `src/error.rs`
   - New variant for editor launch errors
   - Implement Display for error message
-

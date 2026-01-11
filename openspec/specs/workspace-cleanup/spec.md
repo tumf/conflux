@@ -64,4 +64,3 @@ The cleanup guard SHALL log cleanup operations for debugging and monitoring.
 - **WHEN** workspace cleanup fails (e.g., workspace already deleted)
 - **THEN** the error SHALL be logged but not propagated
 - **AND** cleanup SHALL continue for remaining workspaces
-

@@ -86,4 +86,3 @@ These helpers SHALL be pure functions where possible, enabling unit testing.
 - **GIVEN** command output with 20 lines
 - **WHEN** `summarize_output(output, 5)` is called
 - **THEN** it SHALL return the last 5 lines prefixed with a line count indicator
-

@@ -140,4 +140,3 @@ The project SHALL include a cargo-dist configuration file.
 #### Scenario: Platform targets
 - When cargo-dist runs
 - Then it SHALL build for the targets specified in dist-workspace.toml
-

@@ -134,7 +134,7 @@ use tracing::{debug, info};
 pub enum OrchestratorError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     #[error("OpenSpec command failed: {0}")]
     OpenSpecCommand(String),
 }

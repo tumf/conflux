@@ -52,10 +52,10 @@ OpenSpec Orchestrator は現在 OpenCode に密結合されている。他のエ
 {
   // apply コマンド: {change_id} は実行時に置換される
   "apply_command": "codex run 'openspec-apply {change_id}'",
-  
+
   // archive コマンド
   "archive_command": "codex run 'openspec-archive {change_id}'",
-  
+
   // 依存関係分析コマンド: {prompt} は分析プロンプトに置換される
   "analyze_command": "claude '{prompt}'"
 }

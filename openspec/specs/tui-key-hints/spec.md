@@ -83,4 +83,3 @@ The TUI SHALL allow approval without auto-queuing in running mode.
 - **WHEN** the user presses `@`
 - **THEN** the change SHALL become approved but NOT queued showing `[@]`
 - **AND** a log message "Approved (not queued): {id}" SHALL appear
-

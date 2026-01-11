@@ -28,4 +28,3 @@ The TUI selection mode footer no longer displays the application version. Versio
 - **WHEN** TUI is in selection mode
 - **THEN** the footer does NOT display the application version
 - **AND** the footer contains only status information and guidance messages
-

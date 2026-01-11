@@ -1,0 +1,5 @@
+b61598980cac5aeddf6283b5271cc3e5  openspec/changes/add-git-worktree-parallel/design.md
+93836e05768fd118e7341ecdfb81feb9  openspec/changes/add-git-worktree-parallel/proposal.md
+e85637a0873ec82e419b4c3e19b9b7da  openspec/changes/add-git-worktree-parallel/specs/cli/spec.md
+3ed235264886de037d50abe2d4264d82  openspec/changes/add-git-worktree-parallel/specs/configuration/spec.md
+cab4e1b5093a5664ebf1a71fabbb3980  openspec/changes/add-git-worktree-parallel/specs/parallel-execution/spec.md

@@ -370,4 +370,3 @@ Templates SHALL use simple string format (not object format with timeout/continu
 - **GIVEN** the generated template
 - **THEN** on_queue_add example is `echo '[on_queue_add] change={change_id} tasks={completed_tasks}/{total_tasks}'`
 - **AND** on_approve example is `echo '[on_approve] change={change_id} tasks={completed_tasks}/{total_tasks}'`
-

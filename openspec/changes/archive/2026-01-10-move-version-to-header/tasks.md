@@ -15,4 +15,3 @@
 - [x] Update tests
   - Existing `test_get_version_string_format` remains valid (function unchanged)
   - No additional header tests required (rendering tests are integration-level)
-

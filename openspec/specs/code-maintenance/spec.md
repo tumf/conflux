@@ -23,4 +23,3 @@ TBD - created by archiving change refactor-codebase-cleanup. Update Purpose afte
 #### Scenario: 既存の検証が通過する
 - **WHEN** `cargo fmt` / `cargo clippy -- -D warnings` / `cargo test` を実行する
 - **THEN** すべて成功する
-

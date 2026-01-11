@@ -155,7 +155,7 @@ impl ApplyLoopController {
         loop {
             let progress = ProgressProbe::check_progress(...);
             if progress.is_complete() { break; }
-            
+
             let output = CommandRunner::run_apply(...).await?;
             let summary = OutputSummarizer::summarize(...);
             // ...
@@ -212,11 +212,11 @@ impl<'a> WorkspaceCleanupGuard<'a> {
             committed: false,
         }
     }
-    
+
     fn track(&mut self, workspace_name: String) {
         self.workspaces.push(workspace_name);
     }
-    
+
     fn commit(mut self) {
         self.committed = true;
     }
@@ -236,15 +236,15 @@ impl<'a> Drop for WorkspaceCleanupGuard<'a> {
 // Usage:
 async fn execute_group(&mut self, group: &ParallelGroup) -> Result<()> {
     let mut cleanup_guard = WorkspaceCleanupGuard::new(&mut self.workspace_manager);
-    
+
     for change_id in &group.changes {
         let workspace = self.workspace_manager.create_workspace(change_id).await?;
         cleanup_guard.track(workspace.name.clone());
         workspaces.push(workspace);
     }
-    
+
     // ... rest of execution ...
-    
+
     cleanup_guard.commit(); // Success - don't clean up
     Ok(())
 }
@@ -371,43 +371,43 @@ Add runtime validation or enforce ordering:
 pub async fn execute_groups(&mut self, groups: Vec<ParallelGroup>) -> Result<()> {
     // Validate topological order before execution
     self.validate_group_ordering(&groups)?;
-    
+
     let mut completed_groups: HashSet<u32> = HashSet::new();
-    
+
     for group in groups {
         // Runtime check: ensure all dependencies are satisfied
         for dep_id in &group.depends_on {
             if !completed_groups.contains(dep_id) {
                 return Err(OrchestratorError::DependencyNotSatisfied(
-                    format!("Group {} depends on {}, but it hasn't completed", 
+                    format!("Group {} depends on {}, but it hasn't completed",
                             group.id, dep_id)
                 ));
             }
         }
-        
+
         self.execute_group(&group).await?;
         completed_groups.insert(group.id);
     }
-    
+
     Ok(())
 }
 
 fn validate_group_ordering(&self, groups: &[ParallelGroup]) -> Result<()> {
     let mut seen: HashSet<u32> = HashSet::new();
-    
+
     for group in groups {
         // All dependencies must appear before this group
         for dep_id in &group.depends_on {
             if !seen.contains(dep_id) {
                 return Err(OrchestratorError::InvalidGroupOrder(
-                    format!("Group {} appears before its dependency {}", 
+                    format!("Group {} appears before its dependency {}",
                             group.id, dep_id)
                 ));
             }
         }
         seen.insert(group.id);
     }
-    
+
     Ok(())
 }
 ```

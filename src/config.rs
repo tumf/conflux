@@ -492,10 +492,10 @@ mod tests {
         let jsonc = r#"{
             // Apply command configuration
             "apply_command": "codex run 'openspec-apply {change_id}'",
-            
+
             /* Archive command - used after change completion */
             "archive_command": "codex run 'openspec-archive {change_id}'",
-            
+
             // Dependency analysis command
             "analyze_command": "claude '{prompt}'",
         }"#;

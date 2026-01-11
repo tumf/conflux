@@ -14,6 +14,6 @@
 ## Impact
 
 - Affected specs: `cli/spec.md` (実行モードダッシュボード関連)
-- Affected code: 
+- Affected code:
   - `src/tui.rs` - AppMode、render_status、F5キーハンドリング
   - `src/tui.rs` - OrchestratorEvent処理、run_orchestrator関数

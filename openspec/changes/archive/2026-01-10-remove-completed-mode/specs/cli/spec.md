@@ -30,4 +30,3 @@ TUI layout SHALL be determined by log existence, not by mode.
 - **THEN** TUI transitions to Select mode
 - **AND** completion message is added to logs
 - **AND** log panel remains visible (logs exist)
-

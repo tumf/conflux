@@ -43,4 +43,3 @@ This matches common TUI patterns where version information appears in the title 
 
 - **Low risk**: UI-only change with no functional impact
 - **Testing**: Visual verification required in TUI
-

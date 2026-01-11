@@ -169,17 +169,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Install dependencies
         run: |
           cargo install --path openspec-orchestrator
-          
+
       - name: Run orchestrator
         run: |
           openspec-orchestrator run
         env:
           RUST_LOG: info
-          
+
       - name: Upload state
         if: always()
         uses: actions/upload-artifact@v3

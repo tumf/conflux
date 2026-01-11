@@ -67,4 +67,3 @@ The TUI module refactoring SHALL NOT change any runtime behavior.
 - **THEN** all keyboard shortcuts work as before
 - **AND** all display elements render identically
 - **AND** all state transitions behave identically
-
