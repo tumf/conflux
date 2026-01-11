@@ -1,7 +1,7 @@
 # code-maintenance Specification
 
 ## Purpose
-TBD - created by archiving change refactor-codebase-cleanup. Update Purpose after archive.
+Defines code maintenance guidelines and codebase health requirements.
 ## Requirements
 ### Requirement: コマンド実行ロジックの共通化
 オーケストレーターは `jj`/シェル実行に関する重複ロジックを共通ヘルパーへ集約し、既存の出力・エラー扱いを維持するために SHALL 共通ヘルパーを使用しなければならない。

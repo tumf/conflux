@@ -1,7 +1,7 @@
 # configuration Specification
 
 ## Purpose
-TBD - created by archiving change add-env-openspec-cmd. Update Purpose after archive.
+Defines the configuration file format, agent command templates, and settings for the orchestrator.
 ## Requirements
 ### Requirement: Environment Variable Configuration for OpenSpec Command
 

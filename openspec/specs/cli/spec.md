@@ -1,7 +1,7 @@
 # cli Specification
 
 ## Purpose
-TBD - created by archiving change add-run-subcommand. Update Purpose after archive.
+Defines CLI commands, subcommands, flags, and their behaviors for the openspec-orchestrator binary.
 ## Requirements
 ### Requirement: サブコマンド構造
 

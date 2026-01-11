@@ -1,7 +1,7 @@
 # testing Specification
 
 ## Purpose
-TBD - created by archiving change add-test-coverage-analysis. Update Purpose after archive.
+Defines testing strategy, coverage requirements, and test organization.
 ## Requirements
 ### Requirement: カバレッジ測定コマンド
 

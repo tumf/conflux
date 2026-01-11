@@ -1,7 +1,7 @@
 # tui-editor Specification
 
 ## Purpose
-TBD - created by archiving change open-editor-in-change-directory. Update Purpose after archive.
+Defines TUI editor integration for opening change files in external editors.
 ## Requirements
 ### Requirement: エディタ起動キーバインド
 

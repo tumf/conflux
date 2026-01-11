@@ -1,7 +1,7 @@
 # tui-key-hints Specification
 
 ## Purpose
-TBD - created by archiving change improve-dynamic-key-hints. Update Purpose after archive.
+Defines TUI key binding hints display based on application mode.
 ## Requirements
 ### Requirement: Context-Aware Key Hints in Select Mode
 
