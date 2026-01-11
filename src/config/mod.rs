@@ -5,52 +5,24 @@
 //! 1. Project config: `.openspec-orchestrator.jsonc`
 //! 2. Global config: `~/.config/openspec-orchestrator/config.jsonc`
 //! 3. Default values (OpenCode-based commands)
+//!
+//! # Module Structure
+//!
+//! - `defaults` - Default values and path constants
+//! - `expand` - Placeholder expansion utilities
+//! - `jsonc` - JSONC parser (reusable by other modules)
+
+pub mod defaults;
+pub mod expand;
+pub mod jsonc;
 
 use crate::error::{OrchestratorError, Result};
 use crate::hooks::HooksConfig;
 use crate::vcs_backend::VcsBackend;
+use defaults::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
-
-/// Project-level configuration file name
-pub const PROJECT_CONFIG_FILE: &str = ".openspec-orchestrator.jsonc";
-
-/// Global configuration directory name
-pub const GLOBAL_CONFIG_DIR: &str = "openspec-orchestrator";
-
-/// Global configuration file name within the config directory
-pub const GLOBAL_CONFIG_FILE: &str = "config.jsonc";
-
-/// Default apply command template (OpenCode)
-pub const DEFAULT_APPLY_COMMAND: &str = "opencode run '/openspec-apply {change_id}'";
-
-/// Default archive command template (OpenCode)
-pub const DEFAULT_ARCHIVE_COMMAND: &str = "opencode run '/openspec-archive {change_id}'";
-
-/// Default resolve command template (OpenCode)
-/// Supports `{prompt}` placeholder for the resolve prompt
-pub const DEFAULT_RESOLVE_COMMAND: &str = "opencode run '{prompt}'";
-
-/// Default analyze command template (OpenCode)
-pub const DEFAULT_ANALYZE_COMMAND: &str = "opencode run --format json '{prompt}'";
-
-/// Default prompt for apply command - empty by default.
-/// The hardcoded system prompt in agent.rs is always appended.
-pub const DEFAULT_APPLY_PROMPT: &str = "";
-
-/// Default prompt for archive command - empty (no additional instructions)
-pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
-
-/// Default maximum iterations for the orchestration loop
-pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
-
-/// Default maximum concurrent workspaces for parallel execution
-pub const DEFAULT_MAX_CONCURRENT_WORKSPACES: usize = 3;
-
-/// Default workspace base directory (uses system temp)
-#[allow(dead_code)]
-pub const DEFAULT_WORKSPACE_BASE_DIR: &str = "";
 
 /// Orchestrator configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -232,17 +204,17 @@ impl OrchestratorConfig {
     /// Expand `{conflict_files}` placeholder in a command template
     #[allow(dead_code)]
     pub fn expand_conflict_files(template: &str, conflict_files: &str) -> String {
-        template.replace("{conflict_files}", conflict_files)
+        expand::expand_conflict_files(template, conflict_files)
     }
 
     /// Expand `{change_id}` placeholder in a command template
     pub fn expand_change_id(template: &str, change_id: &str) -> String {
-        template.replace("{change_id}", change_id)
+        expand::expand_change_id(template, change_id)
     }
 
     /// Expand `{prompt}` placeholder in a command template
     pub fn expand_prompt(template: &str, prompt: &str) -> String {
-        template.replace("{prompt}", prompt)
+        expand::expand_prompt(template, prompt)
     }
 
     /// Load configuration from a JSONC file
@@ -256,9 +228,7 @@ impl OrchestratorConfig {
 
     /// Parse JSONC content (JSON with Comments)
     pub fn parse_jsonc(content: &str) -> Result<Self> {
-        let json = strip_jsonc_features(content);
-        serde_json::from_str(&json)
-            .map_err(|e| OrchestratorError::ConfigParse(format!("Failed to parse config: {}", e)))
+        jsonc::parse(content)
     }
 
     /// Load configuration with priority:
@@ -301,101 +271,12 @@ pub fn get_global_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|config_dir| config_dir.join(GLOBAL_CONFIG_DIR).join(GLOBAL_CONFIG_FILE))
 }
 
-/// Strip JSONC features (comments and trailing commas) from content
-///
-/// This function handles:
-/// - Single-line comments (`// ...`)
-/// - Multi-line comments (`/* ... */`)
-/// - Trailing commas before `]` or `}`
-fn strip_jsonc_features(content: &str) -> String {
-    let mut result = String::with_capacity(content.len());
-    let mut chars = content.chars().peekable();
-    let mut in_string = false;
-    let mut escape_next = false;
-
-    while let Some(c) = chars.next() {
-        if escape_next {
-            result.push(c);
-            escape_next = false;
-            continue;
-        }
-
-        if in_string {
-            result.push(c);
-            if c == '\\' {
-                escape_next = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        match c {
-            '"' => {
-                in_string = true;
-                result.push(c);
-            }
-            '/' => {
-                if chars.peek() == Some(&'/') {
-                    // Single-line comment: skip until end of line
-                    chars.next(); // consume second '/'
-                    while let Some(&next) = chars.peek() {
-                        if next == '\n' {
-                            break;
-                        }
-                        chars.next();
-                    }
-                } else if chars.peek() == Some(&'*') {
-                    // Multi-line comment: skip until '*/'
-                    chars.next(); // consume '*'
-                    while let Some(next) = chars.next() {
-                        if next == '*' && chars.peek() == Some(&'/') {
-                            chars.next(); // consume '/'
-                            break;
-                        }
-                    }
-                } else {
-                    result.push(c);
-                }
-            }
-            _ => {
-                result.push(c);
-            }
-        }
-    }
-
-    // Remove trailing commas before ] or }
-    remove_trailing_commas(&result)
-}
-
-/// Remove trailing commas before `]` or `}`
-fn remove_trailing_commas(content: &str) -> String {
-    let mut result = String::with_capacity(content.len());
-    let chars: Vec<char> = content.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        let c = chars[i];
-
-        if c == ',' {
-            // Look ahead, skipping whitespace, for ] or }
-            let mut j = i + 1;
-            while j < chars.len() && chars[j].is_whitespace() {
-                j += 1;
-            }
-            if j < chars.len() && (chars[j] == ']' || chars[j] == '}') {
-                // Skip the comma (trailing comma)
-                i += 1;
-                continue;
-            }
-        }
-
-        result.push(c);
-        i += 1;
-    }
-
-    result
-}
+// Re-export commonly used items for convenience
+pub use defaults::{
+    DEFAULT_ANALYZE_COMMAND, DEFAULT_APPLY_COMMAND, DEFAULT_APPLY_PROMPT,
+    DEFAULT_ARCHIVE_COMMAND, DEFAULT_ARCHIVE_PROMPT, DEFAULT_MAX_CONCURRENT_WORKSPACES,
+    DEFAULT_MAX_ITERATIONS, GLOBAL_CONFIG_DIR, GLOBAL_CONFIG_FILE, PROJECT_CONFIG_FILE,
+};
 
 #[cfg(test)]
 mod tests {
@@ -539,13 +420,6 @@ mod tests {
             config.apply_command,
             Some("opencode run '/openspec-apply {change_id}'".to_string())
         );
-    }
-
-    #[test]
-    fn test_strip_jsonc_preserves_url_in_string() {
-        let jsonc = r#"{"url": "https://example.com/path"}"#;
-        let stripped = strip_jsonc_features(jsonc);
-        assert!(stripped.contains("https://example.com/path"));
     }
 
     #[test]
