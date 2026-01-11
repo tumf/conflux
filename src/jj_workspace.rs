@@ -260,6 +260,26 @@ impl JjWorkspaceManager {
             )));
         }
 
+        // Initialize working copy in the new workspace
+        // This ensures the workspace has a working-copy commit
+        let init_output = Command::new("jj")
+            .arg("status")
+            .current_dir(&workspace_path)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| {
+                OrchestratorError::JjCommand(format!("Failed to initialize workspace: {}", e))
+            })?;
+
+        if !init_output.status.success() {
+            let stderr = String::from_utf8_lossy(&init_output.stderr);
+            return Err(OrchestratorError::JjCommand(format!(
+                "Workspace initialization failed: {}",
+                stderr
+            )));
+        }
+
         let workspace = JjWorkspace {
             name: workspace_name,
             path: workspace_path,
