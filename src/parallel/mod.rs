@@ -608,7 +608,8 @@ impl ParallelExecutor {
             }
             Err(VcsError::Conflict { details, .. }) => {
                 // Detect conflict files
-                let conflict_files = conflict::detect_conflicts(self.workspace_manager.as_ref()).await?;
+                let conflict_files =
+                    conflict::detect_conflicts(self.workspace_manager.as_ref()).await?;
                 send_event(
                     &self.event_tx,
                     ParallelEvent::MergeConflict {

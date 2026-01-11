@@ -596,8 +596,9 @@ impl WorkspaceManager for JjWorkspaceManager {
     }
 
     async fn set_commit_message(&self, workspace_path: &Path, message: &str) -> VcsResult<()> {
+        // Use --ignore-working-copy to avoid stale working copy errors in workspaces
         let output = tokio::process::Command::new("jj")
-            .args(["describe", "-m", message])
+            .args(["describe", "--ignore-working-copy", "-m", message])
             .current_dir(workspace_path)
             .stdin(Stdio::null())
             .output()
