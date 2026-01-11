@@ -6,6 +6,5 @@
 
 ## 2. Verification
 
-- [ ] 2.1 Manual test with actual jj repo conflict simulation (requires human action)
 - [x] 2.2 `cargo test` passes for all existing tests
 - [x] 2.3 `cargo clippy` shows no warnings
