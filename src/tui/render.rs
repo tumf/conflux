@@ -9,10 +9,27 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
 };
+use std::time::Duration;
 
 use super::state::AppState;
 use super::types::{AppMode, QueueStatus};
 use super::utils::{get_version_string, truncate_to_display_width};
+
+/// Format a duration as a human-readable string (e.g., "1m 23s", "45s")
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs >= 3600 {
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        format!("{}h {:02}m", hours, mins)
+    } else if secs >= 60 {
+        let mins = secs / 60;
+        let remaining_secs = secs % 60;
+        format!("{}m {:02}s", mins, remaining_secs)
+    } else {
+        format!("{}s", secs)
+    }
+}
 
 /// Spinner characters for processing animation (Braille dot pattern)
 pub const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -295,6 +312,14 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 status => format!("[{}]", status.display()),
             };
 
+            let elapsed_text = if let Some(elapsed) = change.elapsed_time {
+                format_duration(elapsed)
+            } else if let Some(started) = change.started_at {
+                format_duration(started.elapsed())
+            } else {
+                "--".to_string()
+            };
+
             let line = Line::from(vec![
                 Span::styled(
                     format!("{} {} ", checkbox, cursor),
@@ -320,6 +345,10 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 ),
                 Span::styled(
                     format!("  {}/{}", change.completed_tasks, change.total_tasks),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("  {:>7}", elapsed_text),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]);
@@ -394,10 +423,38 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Select if all_completed => ("Done".to_string(), Color::Green),
         AppMode::Select => ("Ready".to_string(), Color::DarkGray),
         AppMode::Stopped => ("Stopped".to_string(), Color::DarkGray),
-        _ => match &app.current_change {
-            Some(id) => (format!("Current: {}", id), Color::White),
-            None => ("Waiting...".to_string(), Color::White),
-        },
+        AppMode::Running | AppMode::Stopping => {
+            // Count changes that are currently processing or archiving
+            let processing_count = app
+                .changes
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.queue_status,
+                        QueueStatus::Processing | QueueStatus::Archiving
+                    )
+                })
+                .count();
+            if processing_count > 1 {
+                (format!("Running {}", processing_count), Color::Cyan)
+            } else if processing_count == 1 {
+                // Show the single change being processed
+                let current = app
+                    .changes
+                    .iter()
+                    .find(|c| {
+                        matches!(
+                            c.queue_status,
+                            QueueStatus::Processing | QueueStatus::Archiving
+                        )
+                    })
+                    .map(|c| c.id.as_str())
+                    .unwrap_or("unknown");
+                (format!("Status: {}", current), Color::White)
+            } else {
+                ("Waiting...".to_string(), Color::White)
+            }
+        }
     };
 
     let (status_text, status_color) = match app.mode {
@@ -466,6 +523,20 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         spans.push(Span::styled(
             progress_text,
             Style::default().fg(progress_color),
+        ));
+    }
+
+    if let Some(started) = app.orchestration_started_at {
+        let elapsed = if matches!(app.mode, AppMode::Running | AppMode::Stopping) {
+            started.elapsed()
+        } else {
+            app.orchestration_elapsed
+                .unwrap_or_else(|| started.elapsed())
+        };
+        spans.push(Span::raw("  |  "));
+        spans.push(Span::styled(
+            format!("Elapsed {}", format_duration(elapsed)),
+            Style::default().fg(Color::DarkGray),
         ));
     }
 

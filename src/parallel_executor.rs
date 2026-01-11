@@ -766,11 +766,11 @@ impl ParallelExecutor {
     /// Check task progress for a change in the given workspace.
     ///
     /// Reads and parses the tasks.md file to determine completion status.
-    /// Returns default progress if the file doesn't exist or can't be parsed.
+    /// Returns None if the file doesn't exist (e.g., after archiving).
     fn check_task_progress(
         workspace_path: &PathBuf,
         change_id: &str,
-    ) -> crate::task_parser::TaskProgress {
+    ) -> Option<crate::task_parser::TaskProgress> {
         let tasks_path = workspace_path
             .join("openspec/changes")
             .join(change_id)
@@ -781,13 +781,13 @@ impl ParallelExecutor {
         if tasks_path.exists() {
             let progress = crate::task_parser::parse_file(&tasks_path).unwrap_or_default();
             debug!(
-                "Tasks file found: {}/{} complete",
-                progress.completed, progress.total
+                "Tasks file found for {}: {}/{} complete",
+                change_id, progress.completed, progress.total
             );
-            progress
+            Some(progress)
         } else {
             debug!("Tasks file not found at {:?}", tasks_path);
-            crate::task_parser::TaskProgress::default()
+            None
         }
     }
 
@@ -834,17 +834,19 @@ impl ParallelExecutor {
             }
 
             // Check current task progress using helper
-            let progress = Self::check_task_progress(workspace_path, change_id);
+            let progress = Self::check_task_progress(workspace_path, change_id).unwrap_or_default();
 
-            // Send progress event
-            if let Some(ref tx) = event_tx {
-                let _ = tx
-                    .send(ParallelEvent::ProgressUpdated {
-                        change_id: change_id.to_string(),
-                        completed: progress.completed,
-                        total: progress.total,
-                    })
-                    .await;
+            // Send progress event only if we have valid progress data
+            if progress.total > 0 {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::ProgressUpdated {
+                            change_id: change_id.to_string(),
+                            completed: progress.completed,
+                            total: progress.total,
+                        })
+                        .await;
+                }
             }
 
             // Check if already complete
@@ -944,17 +946,20 @@ impl ParallelExecutor {
                 .await;
 
             // Check task progress after apply using helper
-            let new_progress = Self::check_task_progress(workspace_path, change_id);
+            let new_progress =
+                Self::check_task_progress(workspace_path, change_id).unwrap_or_default();
 
-            // Send progress event after apply
-            if let Some(ref tx) = event_tx {
-                let _ = tx
-                    .send(ParallelEvent::ProgressUpdated {
-                        change_id: change_id.to_string(),
-                        completed: new_progress.completed,
-                        total: new_progress.total,
-                    })
-                    .await;
+            // Send progress event after apply only if we have valid progress data
+            if new_progress.total > 0 {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::ProgressUpdated {
+                            change_id: change_id.to_string(),
+                            completed: new_progress.completed,
+                            total: new_progress.total,
+                        })
+                        .await;
+                }
             }
 
             info!(

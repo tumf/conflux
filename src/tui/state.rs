@@ -36,6 +36,10 @@ pub struct ChangeState {
     pub last_modified: String,
     /// Whether this change is approved for execution
     pub is_approved: bool,
+    /// When processing started for this change
+    pub started_at: Option<Instant>,
+    /// Elapsed time when processing finished (for display after completion)
+    pub elapsed_time: Option<Duration>,
 }
 
 impl ChangeState {
@@ -50,6 +54,8 @@ impl ChangeState {
             queue_status: QueueStatus::NotQueued,
             last_modified: change.last_modified.clone(),
             is_approved: change.is_approved,
+            started_at: None,
+            elapsed_time: None,
         }
     }
 
@@ -115,6 +121,10 @@ pub struct AppState {
     pub parallel_mode: bool,
     /// Whether jj is available in this repository
     pub jj_available: bool,
+    /// When orchestration started (for overall elapsed time)
+    pub orchestration_started_at: Option<Instant>,
+    /// Total elapsed time when orchestration finished
+    pub orchestration_elapsed: Option<Duration>,
 }
 
 impl AppState {
@@ -167,6 +177,8 @@ impl AppState {
             stop_mode: StopMode::None,
             parallel_mode: false,
             jj_available: crate::cli::check_jj_directory() && crate::cli::check_jj_available(),
+            orchestration_started_at: None,
+            orchestration_elapsed: None,
         }
     }
 
@@ -325,6 +337,8 @@ impl AppState {
         }
 
         self.mode = AppMode::Running;
+        self.orchestration_started_at = Some(Instant::now());
+        self.orchestration_elapsed = None;
         self.add_log(LogEntry::info(format!(
             "Starting processing {} change(s)",
             selected.len()
@@ -496,6 +510,8 @@ impl AppState {
                 self.current_change = Some(id.clone());
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
                     change.queue_status = QueueStatus::Processing;
+                    change.started_at = Some(Instant::now());
+                    change.elapsed_time = None;
                 }
                 self.add_log(LogEntry::info(format!("Processing: {}", id)));
             }
@@ -505,8 +521,17 @@ impl AppState {
                 total,
             } => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-                    change.completed_tasks = completed;
-                    change.total_tasks = total;
+                    // Only update progress if the change is still being processed
+                    // After Completed, the tasks.md file may be moved/archived
+                    match change.queue_status {
+                        QueueStatus::Completed | QueueStatus::Archiving | QueueStatus::Archived => {
+                            // Don't update progress after completion - file may be moved
+                        }
+                        _ => {
+                            change.completed_tasks = completed;
+                            change.total_tasks = total;
+                        }
+                    }
                 }
             }
             OrchestratorEvent::ProcessingCompleted(id) => {
@@ -524,12 +549,24 @@ impl AppState {
             OrchestratorEvent::ChangeArchived(id) => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
                     change.queue_status = QueueStatus::Archived;
+                    // Record final elapsed time
+                    if let Some(started) = change.started_at {
+                        change.elapsed_time = Some(started.elapsed());
+                    }
                 }
                 self.add_log(LogEntry::info(format!("Archived: {}", id)));
             }
             OrchestratorEvent::ProcessingError { id, error } => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
                     change.queue_status = QueueStatus::Error(error.clone());
+                    // Record elapsed time on error
+                    if let Some(started) = change.started_at {
+                        change.elapsed_time = Some(started.elapsed());
+                    }
+                }
+                // Record orchestration elapsed time on error
+                if let Some(started) = self.orchestration_started_at {
+                    self.orchestration_elapsed = Some(started.elapsed());
                 }
                 self.add_log(LogEntry::error(format!("Error in {}: {}", id, error)));
                 // Transition to Error mode
@@ -541,12 +578,19 @@ impl AppState {
                 self.mode = AppMode::Select;
                 self.current_change = None;
                 self.stop_mode = StopMode::None;
+                // Record final orchestration time
+                if let Some(started) = self.orchestration_started_at {
+                    self.orchestration_elapsed = Some(started.elapsed());
+                }
                 self.add_log(LogEntry::success("All changes processed successfully"));
             }
             OrchestratorEvent::Stopped => {
                 self.mode = AppMode::Stopped;
                 self.current_change = None;
                 self.stop_mode = StopMode::None;
+                if let Some(started) = self.orchestration_started_at {
+                    self.orchestration_elapsed = Some(started.elapsed());
+                }
                 self.add_log(LogEntry::warn("Processing stopped"));
             }
             OrchestratorEvent::Log(entry) => {
@@ -570,9 +614,19 @@ impl AppState {
         // Update existing changes
         for fetched in &fetched_changes {
             if let Some(existing) = self.changes.iter_mut().find(|c| c.id == fetched.id) {
-                // Update progress
-                existing.completed_tasks = fetched.completed_tasks;
-                existing.total_tasks = fetched.total_tasks;
+                // Only update progress if we have valid data (total > 0)
+                // and the change is still being processed
+                if fetched.total_tasks > 0 {
+                    match existing.queue_status {
+                        QueueStatus::Completed | QueueStatus::Archiving | QueueStatus::Archived => {
+                            // Don't update progress after completion - file may be moved
+                        }
+                        _ => {
+                            existing.completed_tasks = fetched.completed_tasks;
+                            existing.total_tasks = fetched.total_tasks;
+                        }
+                    }
+                }
             }
         }
 
@@ -812,6 +866,8 @@ mod tests {
             is_new: false,
             last_modified: "now".to_string(),
             is_approved: false,
+            started_at: None,
+            elapsed_time: None,
         };
 
         assert_eq!(change.progress_percent(), 50.0);
