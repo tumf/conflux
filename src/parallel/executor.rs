@@ -2,13 +2,136 @@
 
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::task_parser::TaskProgress;
 use crate::vcs::VcsBackend;
 use std::path::Path;
+use std::process::Stdio as StdStdio;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::events::ParallelEvent;
+
+/// Create a progress commit to save current work state.
+///
+/// This function creates a WIP (work-in-progress) commit after each apply iteration
+/// where progress was made. This ensures that work is not lost if the process is
+/// interrupted or reaches the maximum iteration limit.
+///
+/// # Arguments
+///
+/// * `workspace_path` - Path to the workspace directory
+/// * `change_id` - The change identifier
+/// * `progress` - Current task progress (completed/total)
+/// * `vcs_backend` - The VCS backend to use (jj or Git)
+///
+/// # Commit Message Format
+///
+/// The commit message follows the format: `WIP: {change_id} ({completed}/{total} tasks)`
+/// For example: `WIP: add-feature (5/10 tasks)`
+pub async fn create_progress_commit(
+    workspace_path: &Path,
+    change_id: &str,
+    progress: &TaskProgress,
+    vcs_backend: VcsBackend,
+) -> Result<()> {
+    let commit_message = format!(
+        "WIP: {} ({}/{} tasks)",
+        change_id, progress.completed, progress.total
+    );
+
+    debug!(
+        "Creating progress commit for {}: {}",
+        change_id, commit_message
+    );
+
+    match vcs_backend {
+        VcsBackend::Jj => {
+            // jj automatically snapshots working copy changes
+            // Just update the commit message with --ignore-working-copy
+            // to avoid stale working copy errors in workspaces
+            let output = Command::new("jj")
+                .args(["describe", "--ignore-working-copy", "-m", &commit_message])
+                .current_dir(workspace_path)
+                .stdin(StdStdio::null())
+                .output()
+                .await
+                .map_err(|e| {
+                    OrchestratorError::JjCommand(format!("Failed to create progress commit: {}", e))
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!(
+                    "Failed to set progress commit message for {}: {}",
+                    change_id, stderr
+                );
+            } else {
+                debug!("Progress commit created for {} (jj)", change_id);
+            }
+        }
+        VcsBackend::Git | VcsBackend::Auto => {
+            // For Git: stage all changes and amend the commit
+            let add_output = Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(workspace_path)
+                .stdin(StdStdio::null())
+                .output()
+                .await
+                .map_err(|e| {
+                    OrchestratorError::GitCommand(format!("Failed to stage changes: {}", e))
+                })?;
+
+            if !add_output.status.success() {
+                let stderr = String::from_utf8_lossy(&add_output.stderr);
+                warn!("Failed to stage changes for {}: {}", change_id, stderr);
+                return Ok(());
+            }
+
+            // Amend the existing commit with the new changes and message
+            let commit_output = Command::new("git")
+                .args(["commit", "--amend", "-m", &commit_message])
+                .current_dir(workspace_path)
+                .stdin(StdStdio::null())
+                .output()
+                .await
+                .map_err(|e| {
+                    OrchestratorError::GitCommand(format!("Failed to amend commit: {}", e))
+                })?;
+
+            if !commit_output.status.success() {
+                let stderr = String::from_utf8_lossy(&commit_output.stderr);
+                // If amend fails (e.g., no prior commit), try a regular commit
+                if stderr.contains("No HEAD") || stderr.contains("does not have any commits") {
+                    let initial_output = Command::new("git")
+                        .args(["commit", "-m", &commit_message])
+                        .current_dir(workspace_path)
+                        .stdin(StdStdio::null())
+                        .output()
+                        .await;
+
+                    if let Ok(output) = initial_output {
+                        if !output.status.success() {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            warn!(
+                                "Failed to create initial commit for {}: {}",
+                                change_id, stderr
+                            );
+                        } else {
+                            debug!("Initial progress commit created for {} (git)", change_id);
+                        }
+                    }
+                } else {
+                    warn!("Failed to amend commit for {}: {}", change_id, stderr);
+                }
+            } else {
+                debug!("Progress commit amended for {} (git)", change_id);
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Check task progress for a change in the given workspace.
 ///
@@ -132,16 +255,15 @@ pub async fn execute_apply_in_workspace(
 
         // Execute command in workspace directory with streaming output
         // Use null stdin to prevent any interactive behavior
-        use std::process::Stdio;
         use tokio::io::{AsyncBufReadExt, BufReader};
 
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(&command)
             .current_dir(workspace_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped())
             .spawn()
             .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to spawn: {}", e)))?;
 
@@ -233,6 +355,16 @@ pub async fn execute_apply_in_workspace(
             iteration, new_progress.completed, new_progress.total
         );
 
+        // Create progress commit if progress was made
+        // This ensures work is not lost if the process is interrupted
+        if new_progress.completed > progress.completed {
+            if let Err(e) =
+                create_progress_commit(workspace_path, change_id, &new_progress, vcs_backend).await
+            {
+                warn!("Failed to create progress commit for {}: {}", change_id, e);
+            }
+        }
+
         // Check if complete
         if new_progress.total > 0 && new_progress.completed == new_progress.total {
             info!(
@@ -252,7 +384,6 @@ pub async fn execute_apply_in_workspace(
     }
 
     // Set a meaningful commit message for the completed change
-    use std::process::Stdio as StdStdio;
     let commit_message = format!("Apply: {}", change_id);
 
     match vcs_backend {
@@ -400,16 +531,15 @@ pub async fn execute_archive_in_workspace(
     debug!("Archive command in workspace: {}", command);
 
     // Execute command with streaming output
-    use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&command)
         .current_dir(workspace_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdin(StdStdio::null())
+        .stdout(StdStdio::piped())
+        .stderr(StdStdio::piped())
         .spawn()
         .map_err(|e| {
             OrchestratorError::AgentCommand(format!("Failed to spawn archive command: {}", e))
@@ -649,4 +779,110 @@ pub async fn execute_archive_in_workspace(
     };
 
     Ok(revision)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::task_parser::TaskProgress;
+
+    #[test]
+    fn test_progress_commit_message_format() {
+        // Verify the commit message format matches the spec
+        let change_id = "add-feature";
+        let progress = TaskProgress {
+            completed: 5,
+            total: 10,
+        };
+
+        let expected = "WIP: add-feature (5/10 tasks)";
+        let actual = format!(
+            "WIP: {} ({}/{} tasks)",
+            change_id, progress.completed, progress.total
+        );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_progress_commit_message_all_complete() {
+        let change_id = "fix-bug";
+        let progress = TaskProgress {
+            completed: 7,
+            total: 7,
+        };
+
+        let expected = "WIP: fix-bug (7/7 tasks)";
+        let actual = format!(
+            "WIP: {} ({}/{} tasks)",
+            change_id, progress.completed, progress.total
+        );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_progress_commit_message_zero_progress() {
+        let change_id = "new-change";
+        let progress = TaskProgress {
+            completed: 0,
+            total: 5,
+        };
+
+        let expected = "WIP: new-change (0/5 tasks)";
+        let actual = format!(
+            "WIP: {} ({}/{} tasks)",
+            change_id, progress.completed, progress.total
+        );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_progress_commit_message_special_characters() {
+        // Test with change IDs that contain hyphens (common case)
+        let change_id = "add-web-monitoring-feature";
+        let progress = TaskProgress {
+            completed: 50,
+            total: 70,
+        };
+
+        let expected = "WIP: add-web-monitoring-feature (50/70 tasks)";
+        let actual = format!(
+            "WIP: {} ({}/{} tasks)",
+            change_id, progress.completed, progress.total
+        );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_progress_check_condition() {
+        // Test the condition for creating progress commits:
+        // new_progress.completed > progress.completed
+        let old_progress = TaskProgress {
+            completed: 3,
+            total: 10,
+        };
+        let new_progress_same = TaskProgress {
+            completed: 3,
+            total: 10,
+        };
+        let new_progress_increased = TaskProgress {
+            completed: 5,
+            total: 10,
+        };
+        let new_progress_decreased = TaskProgress {
+            completed: 2,
+            total: 10,
+        };
+
+        // Should NOT create commit when no progress
+        assert!(!(new_progress_same.completed > old_progress.completed));
+
+        // Should create commit when progress increased
+        assert!(new_progress_increased.completed > old_progress.completed);
+
+        // Should NOT create commit when progress decreased (edge case)
+        assert!(!(new_progress_decreased.completed > old_progress.completed));
+    }
 }

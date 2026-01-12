@@ -410,8 +410,15 @@ async fn run_tui_loop(
                     }
                 }
                 TuiCommand::RemoveFromQueue(id) => {
-                    // Log the removal (orchestrator will see the updated status)
-                    app.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
+                    // Remove from dynamic queue so orchestrator won't process it
+                    if dynamic_queue.remove(&id).await {
+                        app.add_log(LogEntry::info(format!(
+                            "Removed from queue: {} (also removed from dynamic queue)",
+                            id
+                        )));
+                    } else {
+                        app.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
+                    }
                 }
                 TuiCommand::ApproveAndQueue(id) => {
                     // Approve and add to queue (used in select/stopped/completed mode)
@@ -482,8 +489,17 @@ async fn run_tui_loop(
                                 }
                                 change.selected = false;
                             }
+                            // Remove from dynamic queue so orchestrator won't process it
+                            let removed_from_dynamic = dynamic_queue.remove(&id).await;
                             let msg = if was_queued {
-                                format!("Unapproved and removed from queue: {}", id)
+                                if removed_from_dynamic {
+                                    format!(
+                                        "Unapproved and removed from queue: {} (also removed from dynamic queue)",
+                                        id
+                                    )
+                                } else {
+                                    format!("Unapproved and removed from queue: {}", id)
+                                }
                             } else {
                                 format!("Unapproved: {}", id)
                             };
