@@ -56,6 +56,76 @@ pub async fn get_change(
     }
 }
 
+/// Approve a change by ID
+///
+/// # Endpoint
+/// POST /api/changes/{id}/approve
+///
+/// # Returns
+/// - 200 OK with updated change status on success
+/// - 404 Not Found if change doesn't exist
+/// - 500 Internal Server Error if approval operation fails
+pub async fn approve_change(
+    State(state): State<Arc<WebState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ChangeStatus>, (StatusCode, Json<ErrorResponse>)> {
+    match state.approve_change(&id).await {
+        Ok(change) => Ok(Json(change)),
+        Err(e) => {
+            if e.to_string().contains("not found") {
+                Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("Change '{}' not found", id),
+                    }),
+                ))
+            } else {
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to approve change: {}", e),
+                    }),
+                ))
+            }
+        }
+    }
+}
+
+/// Unapprove a change by ID
+///
+/// # Endpoint
+/// POST /api/changes/{id}/unapprove
+///
+/// # Returns
+/// - 200 OK with updated change status on success
+/// - 404 Not Found if change doesn't exist
+/// - 500 Internal Server Error if unapproval operation fails
+pub async fn unapprove_change(
+    State(state): State<Arc<WebState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ChangeStatus>, (StatusCode, Json<ErrorResponse>)> {
+    match state.unapprove_change(&id).await {
+        Ok(change) => Ok(Json(change)),
+        Err(e) => {
+            if e.to_string().contains("not found") {
+                Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("Change '{}' not found", id),
+                    }),
+                ))
+            } else {
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to unapprove change: {}", e),
+                    }),
+                ))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +184,30 @@ mod tests {
         let web_state = Arc::new(WebState::new(&[]));
 
         let result = get_change(State(web_state), Path("nonexistent".to_string())).await;
+        assert!(result.is_err());
+
+        let (status, error) = result.unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(error.error.contains("nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn test_approve_change_not_found() {
+        let web_state = Arc::new(WebState::new(&[]));
+
+        let result = approve_change(State(web_state), Path("nonexistent".to_string())).await;
+        assert!(result.is_err());
+
+        let (status, error) = result.unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(error.error.contains("nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn test_unapprove_change_not_found() {
+        let web_state = Arc::new(WebState::new(&[]));
+
+        let result = unapprove_change(State(web_state), Path("nonexistent".to_string())).await;
         assert!(result.is_err());
 
         let (status, error) = result.unwrap_err();

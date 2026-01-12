@@ -403,6 +403,48 @@ main {
     align-items: center;
 }
 
+/* Approval Actions */
+.approval-actions {
+    margin-top: var(--space-md);
+    display: flex;
+    justify-content: flex-end;
+}
+
+.approval-button {
+    min-height: var(--touch-target);
+    padding: var(--space-sm) var(--space-lg);
+    background-color: var(--accent-blue);
+    color: var(--text-primary);
+    border: none;
+    border-radius: 8px;
+    font-size: 0.875rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-xs);
+}
+
+.approval-button:hover {
+    background-color: var(--accent-green);
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(6, 214, 160, 0.3);
+}
+
+.approval-button:active {
+    transform: translateY(0);
+}
+
+.approval-button.approved {
+    background-color: var(--accent-green);
+}
+
+.approval-button.approved:hover {
+    background-color: var(--accent-red);
+}
+
 /* Change Details - Collapsible on mobile */
 .change-details {
     max-height: 0;

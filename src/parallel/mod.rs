@@ -825,7 +825,7 @@ impl ParallelExecutor {
                         )
                         .await;
 
-                        match self.merge_and_resolve(&[rev.clone()]).await {
+                        match self.merge_and_resolve(std::slice::from_ref(rev)).await {
                             Ok(_) => {
                                 info!(
                                     "Successfully merged {} (revision: {})",

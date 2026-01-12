@@ -60,6 +60,7 @@ class WebMonitor {
         this.elements.changesList.addEventListener('touchmove', this.handleTouchMove.bind(this), { passive: true });
         this.elements.changesList.addEventListener('touchend', this.handleTouchEnd.bind(this));
         this.elements.changesList.addEventListener('click', this.handleCardClick.bind(this));
+        this.elements.changesList.addEventListener('click', this.handleApprovalClick.bind(this));
     }
 
     setupPullToRefresh() {
@@ -217,6 +218,69 @@ class WebMonitor {
         if (e.target.closest('a, button')) return;
 
         card.classList.toggle('expanded');
+    }
+
+    handleApprovalClick(e) {
+        const approvalBtn = e.target.closest('.approval-button');
+        if (!approvalBtn) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        const changeId = approvalBtn.dataset.changeId;
+        const isApproved = approvalBtn.dataset.approved === 'true';
+
+        this.toggleApproval(changeId, isApproved);
+    }
+
+    async toggleApproval(changeId, isCurrentlyApproved) {
+        const endpoint = isCurrentlyApproved ? 'unapprove' : 'approve';
+        const url = `/api/changes/${encodeURIComponent(changeId)}/${endpoint}`;
+
+        try {
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.error || 'Failed to update approval status');
+            }
+
+            const updatedChange = await response.json();
+
+            // Update the UI immediately
+            this.updateChangeInUI(updatedChange);
+
+            const action = isCurrentlyApproved ? 'unapproved' : 'approved';
+            this.showToast(`Change ${changeId} ${action}`, 'success');
+        } catch (error) {
+            console.error('Failed to toggle approval:', error);
+            this.showToast(`Error: ${error.message}`, 'error');
+        }
+    }
+
+    updateChangeInUI(change) {
+        const card = document.querySelector(`[data-change-id="${this.escapeHtml(change.id)}"]`);
+        if (!card) return;
+
+        // Update approval badge
+        const badge = card.querySelector('.badge-approval');
+        if (badge) {
+            badge.className = change.is_approved ? 'badge badge-approved badge-approval' : 'badge badge-unapproved badge-approval';
+            badge.textContent = change.is_approved ? 'Approved' : 'Pending Approval';
+        }
+
+        // Update approval button
+        const button = card.querySelector('.approval-button');
+        if (button) {
+            button.dataset.approved = change.is_approved;
+            button.textContent = change.is_approved ? '✓ Approved' : '○ Approve';
+            button.className = change.is_approved ? 'approval-button approved' : 'approval-button';
+        }
     }
 
     connect() {
@@ -397,6 +461,18 @@ class WebMonitor {
                </div>`
             : '';
 
+        const approvalButtonHtml = `
+            <div class="approval-actions">
+                <button
+                    class="approval-button ${change.is_approved ? 'approved' : ''}"
+                    data-change-id="${this.escapeHtml(change.id)}"
+                    data-approved="${change.is_approved}"
+                    aria-label="${change.is_approved ? 'Unapprove change' : 'Approve change'}">
+                    ${change.is_approved ? '✓ Approved' : '○ Approve'}
+                </button>
+            </div>
+        `;
+
         const expandHintHtml = this.isMobile
             ? `<div class="expand-hint">
                 <span class="expand-hint-icon" aria-hidden="true">▼</span>
@@ -410,7 +486,7 @@ class WebMonitor {
                     <span class="change-id">${this.escapeHtml(change.id)}</span>
                     <div class="change-badges">
                         <span class="badge badge-status ${change.status}">${change.status.replace('_', ' ')}</span>
-                        <span class="badge ${change.is_approved ? 'badge-approved' : 'badge-unapproved'}">
+                        <span class="badge ${change.is_approved ? 'badge-approved' : 'badge-unapproved'} badge-approval">
                             ${change.is_approved ? 'Approved' : 'Pending Approval'}
                         </span>
                     </div>
@@ -425,6 +501,7 @@ class WebMonitor {
                         <span>${progressPercent}%</span>
                     </div>
                 </div>
+                ${approvalButtonHtml}
                 <div class="change-details">
                     ${dependenciesHtml}
                 </div>

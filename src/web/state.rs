@@ -212,6 +212,106 @@ impl WebState {
     pub async fn list_changes(&self) -> Vec<ChangeStatus> {
         self.state.read().await.changes.clone()
     }
+
+    /// Approve a change and broadcast the update to WebSocket clients
+    ///
+    /// # Arguments
+    /// * `id` - The ID of the change to approve
+    ///
+    /// # Returns
+    /// The updated change status, or an error if the change is not found
+    pub async fn approve_change(
+        &self,
+        id: &str,
+    ) -> Result<ChangeStatus, Box<dyn std::error::Error + Send + Sync>> {
+        use crate::approval;
+
+        // Verify change exists in state
+        let change_exists = {
+            let state = self.state.read().await;
+            state.changes.iter().any(|c| c.id == id)
+        };
+
+        if !change_exists {
+            return Err(format!("Change '{}' not found", id).into());
+        }
+
+        // Perform approval operation
+        approval::approve_change(id)?;
+
+        // Update the approval status in state and get the updated change
+        let updated_change = {
+            let mut state = self.state.write().await;
+            if let Some(change) = state.changes.iter_mut().find(|c| c.id == id) {
+                change.is_approved = true;
+                change.clone()
+            } else {
+                return Err(format!("Change '{}' not found after approval", id).into());
+            }
+        };
+
+        // Broadcast the update
+        let update = StateUpdate {
+            msg_type: "state_update".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            changes: vec![updated_change.clone()],
+        };
+
+        // Ignore send errors (no subscribers)
+        let _ = self.tx.send(update);
+
+        Ok(updated_change)
+    }
+
+    /// Unapprove a change and broadcast the update to WebSocket clients
+    ///
+    /// # Arguments
+    /// * `id` - The ID of the change to unapprove
+    ///
+    /// # Returns
+    /// The updated change status, or an error if the change is not found
+    pub async fn unapprove_change(
+        &self,
+        id: &str,
+    ) -> Result<ChangeStatus, Box<dyn std::error::Error + Send + Sync>> {
+        use crate::approval;
+
+        // Verify change exists in state
+        let change_exists = {
+            let state = self.state.read().await;
+            state.changes.iter().any(|c| c.id == id)
+        };
+
+        if !change_exists {
+            return Err(format!("Change '{}' not found", id).into());
+        }
+
+        // Perform unapproval operation
+        approval::unapprove_change(id)?;
+
+        // Update the approval status in state and get the updated change
+        let updated_change = {
+            let mut state = self.state.write().await;
+            if let Some(change) = state.changes.iter_mut().find(|c| c.id == id) {
+                change.is_approved = false;
+                change.clone()
+            } else {
+                return Err(format!("Change '{}' not found after unapproval", id).into());
+            }
+        };
+
+        // Broadcast the update
+        let update = StateUpdate {
+            msg_type: "state_update".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            changes: vec![updated_change.clone()],
+        };
+
+        // Ignore send errors (no subscribers)
+        let _ = self.tx.send(update);
+
+        Ok(updated_change)
+    }
 }
 
 impl Default for WebState {

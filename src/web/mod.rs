@@ -127,6 +127,14 @@ pub async fn start_server(
         .route("/api/state", get(api::get_state))
         .route("/api/changes", get(api::list_changes))
         .route("/api/changes/{id}", get(api::get_change))
+        .route(
+            "/api/changes/{id}/approve",
+            axum::routing::post(api::approve_change),
+        )
+        .route(
+            "/api/changes/{id}/unapprove",
+            axum::routing::post(api::unapprove_change),
+        )
         // WebSocket route
         .route("/ws", get(websocket::ws_handler))
         .layer(cors)
@@ -201,6 +209,14 @@ pub async fn spawn_server_with_url(
         .route("/api/state", get(api::get_state))
         .route("/api/changes", get(api::list_changes))
         .route("/api/changes/{id}", get(api::get_change))
+        .route(
+            "/api/changes/{id}/approve",
+            axum::routing::post(api::approve_change),
+        )
+        .route(
+            "/api/changes/{id}/unapprove",
+            axum::routing::post(api::unapprove_change),
+        )
         // WebSocket route
         .route("/ws", get(websocket::ws_handler))
         .layer(cors)
