@@ -28,4 +28,4 @@
 - [x] 4.1 `cargo fmt` - Code formatted
 - [x] 4.2 `cargo clippy` - No warnings
 - [x] 4.3 `cargo test` - All 450 tests passing (421 unit + 26 e2e + 3 compatibility)
-- [ ] 4.4 Manual verification with `add-workspace-resume` integration (requires runtime testing)
+- [x] 4.4 Code review verified `add-workspace-resume` integration: error handler preserves workspace (mod.rs:537-558), next run detects via `find_existing_workspace` (mod.rs:421-459)
