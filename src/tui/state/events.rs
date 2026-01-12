@@ -142,9 +142,19 @@ impl AppState {
         // Update existing changes
         for fetched in &fetched_changes {
             if let Some(existing) = self.changes.iter_mut().find(|c| c.id == fetched.id) {
-                // Only update progress if we have valid data (total > 0)
-                // and the change is NOT being processed (parallel mode uses workspace)
-                if fetched.total_tasks > 0 {
+                let was_archived = existing.queue_status == QueueStatus::Archived;
+
+                if was_archived {
+                    existing.queue_status = if fetched.is_complete() {
+                        QueueStatus::Completed
+                    } else {
+                        QueueStatus::NotQueued
+                    };
+                    existing.completed_tasks = fetched.completed_tasks;
+                    existing.total_tasks = fetched.total_tasks;
+                } else if fetched.total_tasks > 0 {
+                    // Only update progress if we have valid data (total > 0)
+                    // and the change is NOT being processed (parallel mode uses workspace)
                     match existing.queue_status {
                         QueueStatus::Completed
                         | QueueStatus::Archiving
@@ -358,6 +368,81 @@ mod tests {
         assert!(app.changes[1].is_new);
         assert!(!app.changes[1].selected); // New changes are not selected
         assert_eq!(app.new_change_count, 1);
+    }
+
+    #[test]
+    fn test_update_changes_unarchives_when_change_still_exists() {
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        app.changes[0].queue_status = QueueStatus::Archived;
+
+        let fetched = vec![create_approved_change("change-a", 5, 5)];
+        app.update_changes(fetched);
+
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Completed);
+    }
+
+    /// Test that Archiving state preserves progress when tasks.md is not found (0/0)
+    /// This is a regression test for the bug where archiving would reset progress to 0.
+    #[test]
+    fn test_archiving_preserves_progress_when_tasks_not_found() {
+        // Setup: change with 5/7 tasks completed, in Archiving state
+        let changes = vec![create_approved_change("change-a", 5, 7)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::Archiving;
+        app.changes[0].completed_tasks = 5;
+        app.changes[0].total_tasks = 7;
+
+        // Simulate auto-refresh returning 0/0 (tasks.md moved during archive)
+        let fetched = vec![Change {
+            id: "change-a".to_string(),
+            completed_tasks: 0,
+            total_tasks: 0,
+            last_modified: "now".to_string(),
+            is_approved: true,
+            dependencies: Vec::new(),
+        }];
+        app.update_changes(fetched);
+
+        // Progress should be preserved (not reset to 0)
+        assert_eq!(
+            app.changes[0].completed_tasks, 5,
+            "completed_tasks should be preserved during archiving"
+        );
+        assert_eq!(
+            app.changes[0].total_tasks, 7,
+            "total_tasks should be preserved during archiving"
+        );
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archiving);
+    }
+
+    /// Test that Archiving state preserves progress when ProgressUpdated event has 0/0
+    #[test]
+    fn test_archiving_preserves_progress_on_progress_updated_event() {
+        // Setup: change with 5/7 tasks completed, in Archiving state
+        let changes = vec![create_approved_change("change-a", 5, 7)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::Archiving;
+        app.changes[0].completed_tasks = 5;
+        app.changes[0].total_tasks = 7;
+
+        // Simulate ProgressUpdated event with 0/0 (should not happen in practice, but test anyway)
+        app.handle_orchestrator_event(OrchestratorEvent::ProgressUpdated {
+            id: "change-a".to_string(),
+            completed: 0,
+            total: 0,
+        });
+
+        // Progress should be preserved
+        assert_eq!(
+            app.changes[0].completed_tasks, 5,
+            "completed_tasks should be preserved during archiving"
+        );
+        assert_eq!(
+            app.changes[0].total_tasks, 7,
+            "total_tasks should be preserved during archiving"
+        );
     }
 
     #[test]
