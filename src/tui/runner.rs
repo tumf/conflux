@@ -160,8 +160,13 @@ async fn run_tui_loop(
                                 app.cancel_proposing();
                             }
                             (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                                // Try to submit proposal
                                 if let Some(proposal) = app.submit_proposal() {
+                                    // Submission successful, send command
                                     let _ = cmd_tx.send(TuiCommand::SubmitProposal(proposal)).await;
+                                } else {
+                                    // Submission failed (empty input), stay in Proposing mode
+                                    // No action needed - submit_proposal() already keeps mode and input
                                 }
                             }
                             (KeyCode::Char(_), _)
@@ -559,18 +564,33 @@ async fn run_tui_loop(
                         match status {
                             Ok(exit_status) if exit_status.success() => {
                                 app.add_log(LogEntry::success("Proposal submitted successfully"));
+                                // Success: mode was already changed by submit_proposal()
                             }
                             Ok(exit_status) => {
                                 app.add_log(LogEntry::error(format!(
                                     "Proposal command failed with exit code: {:?}",
                                     exit_status.code()
                                 )));
+                                // Failure: return to Proposing mode to allow retry
+                                app.mode = AppMode::Proposing;
+                                // Recreate textarea with previous input
+                                app.propose_textarea = Some(AppState::create_propose_textarea());
+                                if let Some(ref mut textarea) = app.propose_textarea {
+                                    textarea.insert_str(&proposal);
+                                }
                             }
                             Err(e) => {
                                 app.add_log(LogEntry::error(format!(
                                     "Failed to execute proposal command: {}",
                                     e
                                 )));
+                                // Failure: return to Proposing mode to allow retry
+                                app.mode = AppMode::Proposing;
+                                // Recreate textarea with previous input
+                                app.propose_textarea = Some(AppState::create_propose_textarea());
+                                if let Some(ref mut textarea) = app.propose_textarea {
+                                    textarea.insert_str(&proposal);
+                                }
                             }
                         }
                     } else {

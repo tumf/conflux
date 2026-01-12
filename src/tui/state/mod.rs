@@ -142,7 +142,7 @@ impl AppState {
     }
 
     /// Create a new TextArea for proposal input
-    fn create_propose_textarea() -> TextArea<'static> {
+    pub fn create_propose_textarea() -> TextArea<'static> {
         TextArea::default()
     }
 
@@ -182,6 +182,8 @@ impl AppState {
 
     /// Submit proposal and return the proposal text
     /// Returns None if textarea is empty or not in Proposing mode
+    /// On successful submission, returns to previous mode
+    /// On failure (empty text), remains in Proposing mode with input retained
     pub fn submit_proposal(&mut self) -> Option<String> {
         if self.mode != AppMode::Proposing {
             return None;
@@ -193,17 +195,17 @@ impl AppState {
             .map(|ta| ta.lines().join("\n"))
             .unwrap_or_default();
 
-        // Cancel proposing mode
-        self.propose_textarea = None;
-        if let Some(mode) = self.previous_mode.take() {
-            self.mode = mode;
-        } else {
-            self.mode = AppMode::Select;
-        }
-
         if text.trim().is_empty() {
+            // Keep in Proposing mode with input retained
             None
         } else {
+            // Success: clear textarea and return to previous mode
+            self.propose_textarea = None;
+            if let Some(mode) = self.previous_mode.take() {
+                self.mode = mode;
+            } else {
+                self.mode = AppMode::Select;
+            }
             Some(text)
         }
     }
@@ -1051,7 +1053,9 @@ mod tests {
         let result = app.submit_proposal();
 
         assert!(result.is_none());
-        assert_eq!(app.mode, AppMode::Select);
+        // Should remain in Proposing mode with input retained
+        assert_eq!(app.mode, AppMode::Proposing);
+        assert!(app.propose_textarea.is_some());
     }
 
     #[test]
@@ -1069,6 +1073,9 @@ mod tests {
         let result = app.submit_proposal();
 
         assert!(result.is_none());
+        // Should remain in Proposing mode with input retained
+        assert_eq!(app.mode, AppMode::Proposing);
+        assert!(app.propose_textarea.is_some());
     }
 
     #[test]

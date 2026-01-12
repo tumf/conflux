@@ -519,7 +519,7 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         ),
         AppMode::Select => ("", Color::White),
         AppMode::Error => ("Press F5 to retry, or 'q' to quit.", Color::Yellow),
-        AppMode::Proposing => ("Ctrl+S: submit, Esc: cancel", Color::Magenta),
+        AppMode::Proposing => ("Enter: newline, Ctrl+S: submit, Esc: cancel", Color::Magenta),
         AppMode::QrPopup => ("Esc: close QR code", Color::Green),
     };
 
@@ -767,7 +767,7 @@ fn render_propose_modal(frame: &mut Frame, app: &mut AppState, area: Rect) {
     if let Some(ref textarea) = app.propose_textarea {
         // Build the border block first
         let block = Block::default()
-            .title(" New Proposal (Ctrl+S: submit, Esc: cancel) ")
+            .title(" New Proposal (Enter: newline, Ctrl+S: submit, Esc: cancel) ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Magenta));
 
