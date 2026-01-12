@@ -1,0 +1,41 @@
+{
+  // OpenSpec Orchestrator Configuration
+  // Template: OpenCode
+
+  // Command to analyze dependencies and select next change
+  "analyze_command": "opencode run --model openai/gpt-5.2-codex --format json {prompt}",
+
+  // Command to apply a change (supports {change_id} and {prompt} placeholders)
+  "apply_command": "opencode run --model openai/gpt-5.2-codex --format json '/openspec-apply {change_id} {prompt}'",
+
+  // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
+  "archive_command": "opencode run --model openai/gpt-5.2-codex --format json '/openspec-archive {change_id} {prompt}'",
+
+  // Command to resolve conflicts (supports {prompt} placeholder)
+  "resolve_command": "opencode run --model openai/gpt-5.2-codex --format json '{prompt}'",
+
+  // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
+  // Note: A hardcoded system prompt is always appended after this value
+  "apply_prompt": "",
+
+  // System prompt for archive command (injected into {prompt} placeholder)
+  "archive_prompt": "",
+
+  // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
+  // "max_iterations": 50,
+
+  // Command to propose new changes from TUI (+ key)
+  // Supports {proposal} placeholder for the proposal text
+  // "propose_command": "opencode run '/openspec:proposal {proposal}'",
+
+  // Lifecycle hooks (optional)
+  // Available hooks:
+  //   Run lifecycle: on_start, on_finish, on_error
+  //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end
+  //   TUI interaction: on_queue_add, on_queue_remove, on_approve, on_unapprove
+  // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}
+  "hooks": {
+    // "on_change_start": "echo 'Starting {change_id}'",
+    // "post_apply": "echo 'Applied {change_id} (attempt {apply_count})'"
+  }
+}
