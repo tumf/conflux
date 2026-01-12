@@ -13,6 +13,7 @@ mod orchestration;
 mod orchestrator;
 mod parallel;
 mod parallel_run_service;
+mod process_manager;
 mod progress;
 mod task_parser;
 mod templates;
@@ -181,7 +182,31 @@ async fn main() -> Result<()> {
                 orchestrator.set_web_state(web_state);
             }
 
-            orchestrator.run().await?;
+            // Setup signal handling for graceful shutdown
+            let cancel_token = tokio_util::sync::CancellationToken::new();
+            let cancel_for_signal = cancel_token.clone();
+
+            // Spawn signal handler task
+            #[cfg(unix)]
+            {
+                let cancel_for_sigterm = cancel_for_signal.clone();
+                tokio::spawn(async move {
+                    let mut sigterm =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                            .expect("Failed to install SIGTERM handler");
+                    sigterm.recv().await;
+                    info!("Received SIGTERM, shutting down gracefully...");
+                    cancel_for_sigterm.cancel();
+                });
+            }
+
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                info!("Received SIGINT (Ctrl+C), shutting down gracefully...");
+                cancel_for_signal.cancel();
+            });
+
+            orchestrator.run(cancel_token).await?;
         }
 
         // Init subcommand: generate configuration file

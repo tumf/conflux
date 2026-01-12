@@ -99,6 +99,7 @@ pub async fn archive_single_change(
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
+                let _ = child.terminate();
                 let _ = child.kill().await;
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::warn(
@@ -564,6 +565,7 @@ pub async fn run_orchestrator(
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
+                    let _ = child.terminate();
                     let _ = child.kill().await;
                     let _ = tx
                         .send(OrchestratorEvent::Log(LogEntry::warn(

@@ -192,6 +192,7 @@ where
     // Stream output
     loop {
         if cancel_check() {
+            let _ = child.terminate();
             let _ = child.kill().await;
             output.on_warn("Process killed due to cancellation");
             return Ok(ApplyResult::Cancelled);
