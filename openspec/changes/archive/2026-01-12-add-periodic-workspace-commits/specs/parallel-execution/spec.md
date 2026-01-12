@@ -1,6 +1,6 @@
 # Spec: parallel-execution (Delta)
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Periodic Progress Commits
 
