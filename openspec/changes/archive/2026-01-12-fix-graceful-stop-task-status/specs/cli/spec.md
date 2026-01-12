@@ -4,9 +4,9 @@
 
 ## MODIFIED Requirements
 
-### Requirement: Escape Key Stop Behavior
+### Requirement: TUI Stop Processing with Escape Key
 
-TUI SHALL allow users to stop ongoing processing using the Escape key.
+The TUI SHALL allow users to stop ongoing processing using the Escape key.
 
 #### Scenario: Graceful stop completes naturally
 

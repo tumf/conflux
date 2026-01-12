@@ -995,16 +995,24 @@ The apply history context MUST be formatted as XML-like tags containing the agen
 
 The TUI SHALL allow users to stop ongoing processing using the Escape key.
 
-#### Scenario: First Esc press initiates graceful stop
+#### Scenario: Graceful stop completes naturally
 
-- **WHEN** TUI is in Running mode
-- **AND** an agent process is actively running
-- **AND** user presses Escape key
-- **THEN** the TUI transitions to Stopping mode
-- **AND** header status displays "Stopping..." in yellow
-- **AND** log displays "Stopping after current change completes..."
-- **AND** current agent process continues to completion
-- **AND** no new changes are picked up for processing
+- **WHEN** TUI is in Stopping mode
+- **AND** the current agent process completes successfully
+- **THEN** the TUI transitions to Stopped mode
+- **AND** the completed change transitions to appropriate status (completed/archived)
+- **AND** log displays "Stopped - processing halted"
+
+#### Scenario: Graceful stop with incomplete processing (NEW)
+
+- **WHEN** TUI is in Stopping mode
+- **AND** the orchestrator stops without completing the current change
+- **OR** the current change is still in Processing/Archiving state when stop completes
+- **THEN** the TUI transitions to Stopped mode
+- **AND** any changes in Processing or Archiving status SHALL transition to Queued status
+- **AND** elapsed time for interrupted changes SHALL be recorded
+- **AND** log displays "Processing stopped"
+- **AND** interrupted changes can be resumed with F5 key
 
 #### Scenario: Second Esc press forces immediate stop
 
@@ -1014,25 +1022,15 @@ The TUI SHALL allow users to stop ongoing processing using the Escape key.
 - **AND** the TUI transitions to Stopped mode
 - **AND** log displays "Force stopped - process terminated"
 - **AND** the interrupted change status becomes "queued" (not error)
+- **AND** elapsed time for interrupted changes SHALL be recorded
 
-#### Scenario: Graceful stop completes naturally
+**Note**: Graceful stopとForce stopは、中断された変更の状態遷移において同じ動作をします（両方ともQueuedに戻す）。
 
-- **WHEN** TUI is in Stopping mode
-- **AND** the current agent process completes successfully
-- **THEN** the TUI transitions to Stopped mode
-- **AND** the completed change transitions to appropriate status (completed/archived)
-- **AND** log displays "Stopped - processing halted"
-
-#### Scenario: Esc has no effect in selection mode
-
-- **WHEN** TUI is in Selecting mode
-- **AND** user presses Escape key
-- **THEN** nothing happens
-- **AND** the TUI remains in Selecting mode
+---
 
 ### Requirement: TUI Stopped Mode
 
-The TUI SHALL provide a Stopped mode where users can review progress and manage the queue before resuming.
+The TUI SHALL provide a Stopped mode where users can review progress and manage the queue before resuming. Task completion in Stopped mode SHALL NOT automatically add changes to the queue.
 
 #### Scenario: Stopped mode display
 
@@ -1053,6 +1051,14 @@ The TUI SHALL provide a Stopped mode where users can review progress and manage 
 - **WHEN** TUI is in Stopped mode
 - **AND** user presses Space on a not-queued change
 - **THEN** the change is added to the queue
+
+#### Scenario: Task completion in Stopped mode does not auto-queue
+
+- **WHEN** TUI is in Stopped mode
+- **AND** a change's tasks are updated (e.g., all tasks marked complete)
+- **THEN** the change queue_status SHALL remain unchanged
+- **AND** the change SHALL NOT be automatically added to the queue
+- **AND** the change SHALL only be queued when user explicitly presses Space key
 
 #### Scenario: Resume processing from Stopped mode
 

@@ -797,6 +797,10 @@ pub async fn run_orchestrator_parallel(
     // Track pending change IDs (initial + dynamically added)
     let mut pending_ids: HashSet<String> = change_ids.into_iter().collect();
 
+    // Track loop termination reason for correct completion message
+    let mut stopped_or_cancelled = false;
+    let mut had_errors = false;
+
     // Main loop: process batches until no more pending changes
     loop {
         // Check for cancellation
@@ -806,6 +810,7 @@ pub async fn run_orchestrator_parallel(
                     "Parallel execution cancelled".to_string(),
                 )))
                 .await;
+            stopped_or_cancelled = true;
             break;
         }
 
@@ -817,6 +822,7 @@ pub async fn run_orchestrator_parallel(
                 )))
                 .await;
             let _ = tx.send(OrchestratorEvent::Stopped).await;
+            stopped_or_cancelled = true;
             break;
         }
 
@@ -946,6 +952,7 @@ pub async fn run_orchestrator_parallel(
                     .await;
             }
             Err(e) => {
+                had_errors = true;
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::error(format!(
                         "Batch execution failed: {}",
@@ -957,13 +964,23 @@ pub async fn run_orchestrator_parallel(
         }
     }
 
-    let _ = tx
-        .send(OrchestratorEvent::Log(LogEntry::success(
-            "All parallel changes completed".to_string(),
-        )))
-        .await;
-
-    let _ = tx.send(OrchestratorEvent::AllCompleted).await;
+    // Only send completion message and AllCompleted event if not stopped/cancelled
+    if !stopped_or_cancelled {
+        if had_errors {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::warn(
+                    "Processing completed with errors".to_string(),
+                )))
+                .await;
+        } else {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::success(
+                    "All parallel changes completed".to_string(),
+                )))
+                .await;
+        }
+        let _ = tx.send(OrchestratorEvent::AllCompleted).await;
+    }
     Ok(())
 }
 
