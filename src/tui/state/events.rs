@@ -562,4 +562,135 @@ mod tests {
         assert!(app.changes[0].elapsed_time.is_some());
         assert!(app.changes[0].elapsed_time.unwrap().as_nanos() > 0);
     }
+
+    // === Tests for update-tui-archived-retention ===
+
+    /// Test that archived changes remain in the list when they no longer exist in fetched_changes.
+    /// This covers the case where a change has been successfully archived (moved to archive directory)
+    /// and is no longer returned by the file system scan.
+    #[test]
+    fn test_archived_changes_retained_after_removal_from_filesystem() {
+        // Setup: two changes, one archived
+        let changes = vec![
+            create_approved_change("change-a", 5, 5),
+            create_approved_change("change-b", 3, 3),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Mark change-a as archived (simulating successful archive operation)
+        app.changes[0].queue_status = QueueStatus::Archived;
+
+        // Simulate refresh where archived change no longer exists in filesystem
+        // (it has been moved to archive directory)
+        let fetched = vec![create_approved_change("change-b", 3, 3)];
+        app.update_changes(fetched);
+
+        // Archived change should still be in the list
+        assert_eq!(app.changes.len(), 2, "Archived change should be retained");
+        assert_eq!(app.changes[0].id, "change-a");
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archived);
+
+        // Non-archived change should still be present
+        assert_eq!(app.changes[1].id, "change-b");
+    }
+
+    /// Test that multiple archived changes are all retained after filesystem removal.
+    #[test]
+    fn test_multiple_archived_changes_retained() {
+        let changes = vec![
+            create_approved_change("change-a", 5, 5),
+            create_approved_change("change-b", 3, 3),
+            create_approved_change("change-c", 2, 2),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Mark all as archived
+        app.changes[0].queue_status = QueueStatus::Archived;
+        app.changes[1].queue_status = QueueStatus::Archived;
+        app.changes[2].queue_status = QueueStatus::Archived;
+
+        // Simulate refresh with empty fetched list (all archived)
+        let fetched: Vec<Change> = vec![];
+        app.update_changes(fetched);
+
+        // All archived changes should be retained
+        assert_eq!(app.changes.len(), 3, "All archived changes should be retained");
+        for change in &app.changes {
+            assert_eq!(change.queue_status, QueueStatus::Archived);
+        }
+    }
+
+    /// Test that archived changes preserve their display state (progress info).
+    #[test]
+    fn test_archived_changes_preserve_display_state() {
+        let changes = vec![create_approved_change("change-a", 7, 10)];
+        let mut app = AppState::new(changes);
+
+        // Set progress and mark as archived
+        app.changes[0].completed_tasks = 7;
+        app.changes[0].total_tasks = 10;
+        app.changes[0].queue_status = QueueStatus::Archived;
+        app.changes[0].selected = true;
+        app.changes[0].is_approved = true;
+
+        // Simulate refresh with change no longer in filesystem
+        let fetched: Vec<Change> = vec![];
+        app.update_changes(fetched);
+
+        // Archived change should retain all display state
+        assert_eq!(app.changes.len(), 1);
+        assert_eq!(app.changes[0].completed_tasks, 7);
+        assert_eq!(app.changes[0].total_tasks, 10);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archived);
+        assert!(app.changes[0].selected);
+        assert!(app.changes[0].is_approved);
+    }
+
+    /// Test that Completed and Error states are also retained (terminal states).
+    #[test]
+    fn test_terminal_states_retained_after_removal() {
+        let changes = vec![
+            create_approved_change("archived", 5, 5),
+            create_approved_change("completed", 3, 3),
+            create_approved_change("error", 1, 2),
+        ];
+        let mut app = AppState::new(changes);
+
+        app.changes[0].queue_status = QueueStatus::Archived;
+        app.changes[1].queue_status = QueueStatus::Completed;
+        app.changes[2].queue_status = QueueStatus::Error("Test error".to_string());
+
+        // Simulate refresh with all changes removed from filesystem
+        let fetched: Vec<Change> = vec![];
+        app.update_changes(fetched);
+
+        // All terminal state changes should be retained
+        assert_eq!(app.changes.len(), 3, "All terminal state changes should be retained");
+        assert!(matches!(app.changes[0].queue_status, QueueStatus::Archived));
+        assert!(matches!(app.changes[1].queue_status, QueueStatus::Completed));
+        assert!(matches!(app.changes[2].queue_status, QueueStatus::Error(_)));
+    }
+
+    /// Test that non-terminal state changes are removed when not in fetched_changes.
+    #[test]
+    fn test_non_terminal_changes_removed_when_not_fetched() {
+        let changes = vec![
+            create_approved_change("archived", 5, 5),
+            create_approved_change("not-queued", 1, 3),
+            create_approved_change("queued", 2, 4),
+        ];
+        let mut app = AppState::new(changes);
+
+        app.changes[0].queue_status = QueueStatus::Archived;
+        app.changes[1].queue_status = QueueStatus::NotQueued;
+        app.changes[2].queue_status = QueueStatus::Queued;
+
+        // Simulate refresh with only archived change present
+        let fetched: Vec<Change> = vec![];
+        app.update_changes(fetched);
+
+        // Only archived change should remain; NotQueued and Queued should be removed
+        assert_eq!(app.changes.len(), 1, "Only archived change should be retained");
+        assert_eq!(app.changes[0].id, "archived");
+    }
 }
