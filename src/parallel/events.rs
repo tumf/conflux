@@ -88,6 +88,22 @@ pub enum ParallelEvent {
     },
     /// Error during parallel execution
     Error { message: String },
+    /// Hook execution started
+    HookStarted {
+        change_id: String,
+        hook_type: String,
+    },
+    /// Hook execution completed successfully
+    HookCompleted {
+        change_id: String,
+        hook_type: String,
+    },
+    /// Hook execution failed
+    HookFailed {
+        change_id: String,
+        hook_type: String,
+        error: String,
+    },
 }
 
 /// Helper to send events through the channel.
@@ -113,5 +129,41 @@ mod tests {
         };
         let debug_str = format!("{:?}", event);
         assert!(debug_str.contains("WorkspaceCreated"));
+    }
+
+    #[test]
+    fn test_hook_started_event() {
+        let event = ParallelEvent::HookStarted {
+            change_id: "test-change".to_string(),
+            hook_type: "pre_apply".to_string(),
+        };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("HookStarted"));
+        assert!(debug_str.contains("test-change"));
+        assert!(debug_str.contains("pre_apply"));
+    }
+
+    #[test]
+    fn test_hook_completed_event() {
+        let event = ParallelEvent::HookCompleted {
+            change_id: "test-change".to_string(),
+            hook_type: "post_apply".to_string(),
+        };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("HookCompleted"));
+        assert!(debug_str.contains("post_apply"));
+    }
+
+    #[test]
+    fn test_hook_failed_event() {
+        let event = ParallelEvent::HookFailed {
+            change_id: "test-change".to_string(),
+            hook_type: "pre_archive".to_string(),
+            error: "Hook timed out".to_string(),
+        };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("HookFailed"));
+        assert!(debug_str.contains("pre_archive"));
+        assert!(debug_str.contains("Hook timed out"));
     }
 }

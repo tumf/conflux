@@ -201,6 +201,29 @@ pub fn convert(event: ParallelEvent) -> Vec<OrchestratorEvent> {
             LogEntry::warn(format!("Workspace preserved: {}", workspace_name))
                 .with_change_id(&change_id),
         )],
+
+        ParallelEvent::HookStarted {
+            change_id,
+            hook_type,
+        } => vec![OrchestratorEvent::Log(
+            LogEntry::info(format!("[hook] {} started", hook_type)).with_change_id(&change_id),
+        )],
+
+        ParallelEvent::HookCompleted {
+            change_id,
+            hook_type,
+        } => vec![OrchestratorEvent::Log(
+            LogEntry::success(format!("[hook] {} completed", hook_type)).with_change_id(&change_id),
+        )],
+
+        ParallelEvent::HookFailed {
+            change_id,
+            hook_type,
+            error,
+        } => vec![OrchestratorEvent::Log(
+            LogEntry::error(format!("[hook] {} failed: {}", hook_type, error))
+                .with_change_id(&change_id),
+        )],
     }
 }
 
@@ -358,6 +381,71 @@ mod tests {
             OrchestratorEvent::Log(entry) => {
                 assert!(entry.message.contains("Workspace preserved"));
                 assert!(entry.message.contains("ws-test-1234"));
+                assert_eq!(entry.change_id, Some("test-change".to_string()));
+            }
+            _ => panic!("Expected Log event"),
+        }
+    }
+
+    #[test]
+    fn test_convert_hook_started() {
+        let event = ParallelEvent::HookStarted {
+            change_id: "test-change".to_string(),
+            hook_type: "pre_apply".to_string(),
+        };
+
+        let events = convert(event);
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            OrchestratorEvent::Log(entry) => {
+                assert!(entry.message.contains("[hook]"));
+                assert!(entry.message.contains("pre_apply"));
+                assert!(entry.message.contains("started"));
+                assert_eq!(entry.change_id, Some("test-change".to_string()));
+            }
+            _ => panic!("Expected Log event"),
+        }
+    }
+
+    #[test]
+    fn test_convert_hook_completed() {
+        let event = ParallelEvent::HookCompleted {
+            change_id: "test-change".to_string(),
+            hook_type: "post_archive".to_string(),
+        };
+
+        let events = convert(event);
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            OrchestratorEvent::Log(entry) => {
+                assert!(entry.message.contains("[hook]"));
+                assert!(entry.message.contains("post_archive"));
+                assert!(entry.message.contains("completed"));
+                assert_eq!(entry.change_id, Some("test-change".to_string()));
+            }
+            _ => panic!("Expected Log event"),
+        }
+    }
+
+    #[test]
+    fn test_convert_hook_failed() {
+        let event = ParallelEvent::HookFailed {
+            change_id: "test-change".to_string(),
+            hook_type: "on_change_complete".to_string(),
+            error: "Command exited with status 1".to_string(),
+        };
+
+        let events = convert(event);
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            OrchestratorEvent::Log(entry) => {
+                assert!(entry.message.contains("[hook]"));
+                assert!(entry.message.contains("on_change_complete"));
+                assert!(entry.message.contains("failed"));
+                assert!(entry.message.contains("Command exited"));
                 assert_eq!(entry.change_id, Some("test-change".to_string()));
             }
             _ => panic!("Expected Log event"),

@@ -370,3 +370,20 @@ Templates SHALL use simple string format (not object format with timeout/continu
 - **GIVEN** the generated template
 - **THEN** on_queue_add example is `echo '[on_queue_add] change={change_id} tasks={completed_tasks}/{total_tasks}'`
 - **AND** on_approve example is `echo '[on_approve] change={change_id} tasks={completed_tasks}/{total_tasks}'`
+
+### Requirement: Parallel Mode Hook Context
+
+parallel mode での hook 実行時、`HookContext` には workspace 固有の情報が含まれなければならない（SHALL）。
+
+#### Scenario: Workspace path の提供
+
+- **GIVEN** parallel mode で hook が実行される
+- **WHEN** `HookContext` が構築される
+- **THEN** 環境変数 `OPENSPEC_WORKSPACE_PATH` に workspace のパスが設定される
+
+#### Scenario: Group 情報の提供
+
+- **GIVEN** parallel mode で複数の change がグループとして処理されている
+- **WHEN** hook が実行される
+- **THEN** 環境変数 `OPENSPEC_GROUP_INDEX` に現在のグループインデックスが設定される
+

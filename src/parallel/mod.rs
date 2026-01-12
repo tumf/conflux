@@ -20,14 +20,18 @@ use crate::vcs::{
     WorkspaceStatus,
 };
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use cleanup::WorkspaceCleanupGuard;
 use events::send_event;
-use executor::{execute_apply_in_workspace, execute_archive_in_workspace};
+use executor::{execute_apply_in_workspace, execute_archive_in_workspace, ParallelHookContext};
+
+use crate::hooks::HookRunner;
 
 /// Parallel executor for running changes in jj workspaces
 pub struct ParallelExecutor {
@@ -49,6 +53,8 @@ pub struct ParallelExecutor {
     no_resume: bool,
     /// Tracker for failed changes to enable skipping dependent changes
     failed_tracker: FailedChangeTracker,
+    /// Hook runner for executing hooks (optional)
+    hooks: Option<Arc<HookRunner>>,
 }
 
 impl ParallelExecutor {
@@ -125,7 +131,14 @@ impl ParallelExecutor {
             repo_root,
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
+            hooks: None,
         }
+    }
+
+    /// Set the hook runner for executing hooks during parallel execution.
+    #[allow(dead_code)] // Public API for future integration with CLI/TUI
+    pub fn set_hooks(&mut self, hooks: HookRunner) {
+        self.hooks = Some(Arc::new(hooks));
     }
 
     /// Set whether to disable automatic workspace resume.
@@ -190,6 +203,10 @@ impl ParallelExecutor {
         let change_deps = extract_change_dependencies(&groups);
         self.failed_tracker.set_dependencies(change_deps);
 
+        // Calculate total changes count
+        let total_changes: usize = groups.iter().map(|g| g.changes.len()).sum();
+        let mut changes_processed: usize = 0;
+
         // Prepare for parallel execution (snapshot for jj, clean check for git)
         info!("Preparing for parallel execution...");
         if let Err(e) = self.workspace_manager.prepare_for_parallel().await {
@@ -201,7 +218,10 @@ impl ParallelExecutor {
         info!("Preparation complete");
 
         for group in groups {
-            self.execute_group(&group).await?;
+            let group_size = group.changes.len();
+            self.execute_group(&group, total_changes, changes_processed)
+                .await?;
+            changes_processed += group_size;
         }
 
         send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
@@ -246,6 +266,8 @@ impl ParallelExecutor {
         info!("Preparation complete");
 
         let mut group_counter = 1u32;
+        let initial_total_changes = changes.len();
+        let mut changes_processed: usize = 0;
 
         while !changes.is_empty() {
             // Filter out changes that depend on failed changes
@@ -320,19 +342,20 @@ impl ParallelExecutor {
                 depends_on: Vec::new(),
             };
 
+            let group_size = first_group.changes.len();
             info!(
                 "Executing group {} with {} changes: {:?}",
-                first_group.id,
-                first_group.changes.len(),
-                first_group.changes
+                first_group.id, group_size, first_group.changes
             );
 
-            self.execute_group(&first_group).await?;
+            self.execute_group(&first_group, initial_total_changes, changes_processed)
+                .await?;
 
             // Remove completed changes from the list
             let completed_set: std::collections::HashSet<_> = first_group.changes.iter().collect();
             changes.retain(|c| !completed_set.contains(&c.id));
 
+            changes_processed += group_size;
             group_counter += 1;
         }
 
@@ -341,7 +364,12 @@ impl ParallelExecutor {
     }
 
     /// Execute a single group of changes
-    async fn execute_group(&mut self, group: &ParallelGroup) -> Result<()> {
+    async fn execute_group(
+        &mut self,
+        group: &ParallelGroup,
+        total_changes: usize,
+        changes_processed: usize,
+    ) -> Result<()> {
         // First, check which changes should be skipped due to failed dependencies
         let mut changes_to_execute: Vec<String> = Vec::new();
         let mut skipped_changes: Vec<(String, String)> = Vec::new();
@@ -515,7 +543,15 @@ impl ParallelExecutor {
 
         // Execute apply + archive in parallel with concurrency limit
         // Each task: apply -> (if success) -> archive
-        let results = match self.execute_apply_and_archive_parallel(&workspaces).await {
+        let results = match self
+            .execute_apply_and_archive_parallel(
+                &workspaces,
+                Some(group.id),
+                total_changes,
+                changes_processed,
+            )
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 let error_msg = format!("Failed to execute applies: {}", e);
@@ -629,10 +665,14 @@ impl ParallelExecutor {
     async fn execute_apply_and_archive_parallel(
         &mut self,
         workspaces: &[Workspace],
+        group_index: Option<u32>,
+        total_changes: usize,
+        changes_processed: usize,
     ) -> Result<Vec<WorkspaceResult>> {
         let max_concurrent = self.workspace_manager.max_concurrent();
         let semaphore = Arc::new(Semaphore::new(max_concurrent));
         let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+        let total_changes_in_group = workspaces.len();
 
         for workspace in workspaces {
             let sem = semaphore.clone();
@@ -644,6 +684,16 @@ impl ParallelExecutor {
             let config = self.config.clone();
             let event_tx = self.event_tx.clone();
             let vcs_backend = self.workspace_manager.backend_type();
+            let hooks = self.hooks.clone();
+
+            // Build parallel hook context
+            let parallel_ctx = ParallelHookContext {
+                workspace_path: workspace_path.to_string_lossy().to_string(),
+                group_index,
+                total_changes_in_group,
+                total_changes,
+                changes_processed,
+            };
 
             // Update status
             self.workspace_manager
@@ -661,6 +711,8 @@ impl ParallelExecutor {
                     &config,
                     event_tx.clone(),
                     vcs_backend,
+                    hooks.as_ref().map(|h| h.as_ref()),
+                    Some(&parallel_ctx),
                 )
                 .await;
 
@@ -692,6 +744,8 @@ impl ParallelExecutor {
                             &config,
                             event_tx.clone(),
                             vcs_backend,
+                            hooks.as_ref().map(|h| h.as_ref()),
+                            Some(&parallel_ctx),
                         )
                         .await;
 
@@ -795,7 +849,7 @@ impl ParallelExecutor {
         // Attempt merge
         let merge_result = self.workspace_manager.merge_workspaces(revisions).await;
 
-        match merge_result {
+        let result = match merge_result {
             Ok(merge_revision) => {
                 send_event(
                     &self.event_tx,
@@ -830,7 +884,21 @@ impl ParallelExecutor {
                 .await
             }
             Err(e) => Err(e.into()),
+        };
+
+        if result.is_ok() && self.workspace_manager.backend_type() == VcsBackend::Jj {
+            if let Err(e) = Command::new("jj")
+                .args(["workspace", "update-stale"])
+                .current_dir(&self.repo_root)
+                .stdin(Stdio::null())
+                .output()
+                .await
+            {
+                warn!("Failed to update stale workspace after merge: {}", e);
+            }
         }
+
+        result
     }
 
     /// Cleanup all workspaces.

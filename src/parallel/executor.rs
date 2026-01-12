@@ -4,13 +4,14 @@ use crate::agent::build_apply_prompt;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::execution::apply as common_apply;
+use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::task_parser::TaskProgress;
 use crate::vcs::VcsBackend;
 use std::path::Path;
 use std::process::Stdio as StdStdio;
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::events::ParallelEvent;
 
@@ -162,7 +163,54 @@ pub fn summarize_output(output: &str, max_lines: usize) -> String {
     common_apply::summarize_output(output, max_lines)
 }
 
+/// Parallel execution context for hooks
+#[derive(Debug, Clone, Default)]
+pub struct ParallelHookContext {
+    /// Workspace path (set as OPENSPEC_WORKSPACE_PATH env var)
+    pub workspace_path: String,
+    /// Group index (set as OPENSPEC_GROUP_INDEX env var)
+    pub group_index: Option<u32>,
+    /// Total changes being processed in this group
+    #[allow(dead_code)] // Available for future use in hook context
+    pub total_changes_in_group: usize,
+    /// Total changes in the run
+    pub total_changes: usize,
+    /// Changes processed so far
+    pub changes_processed: usize,
+}
+
+/// Build a HookContext for parallel mode with workspace-specific environment variables.
+fn build_parallel_hook_context(
+    change_id: &str,
+    completed_tasks: u32,
+    total_tasks: u32,
+    apply_count: u32,
+    parallel_ctx: Option<&ParallelHookContext>,
+) -> HookContext {
+    let (changes_processed, total_changes, remaining_changes) = match parallel_ctx {
+        Some(ctx) => (
+            ctx.changes_processed,
+            ctx.total_changes,
+            ctx.total_changes.saturating_sub(ctx.changes_processed),
+        ),
+        None => (0, 0, 0),
+    };
+
+    let mut ctx = HookContext::new(changes_processed, total_changes, remaining_changes, false)
+        .with_change(change_id, completed_tasks, total_tasks)
+        .with_apply_count(apply_count);
+
+    // Add parallel-specific environment variables
+    if let Some(parallel_ctx) = parallel_ctx {
+        // These will be added to env_vars through a custom method
+        ctx = ctx.with_parallel_context(&parallel_ctx.workspace_path, parallel_ctx.group_index);
+    }
+
+    ctx
+}
+
 /// Execute apply command in a single workspace, repeating until tasks are 100% complete
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_apply_in_workspace(
     change_id: &str,
     workspace_path: &Path,
@@ -170,6 +218,8 @@ pub async fn execute_apply_in_workspace(
     config: &OrchestratorConfig,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
     vcs_backend: VcsBackend,
+    hooks: Option<&HookRunner>,
+    parallel_ctx: Option<&ParallelHookContext>,
 ) -> Result<String> {
     const MAX_ITERATIONS: u32 = 50;
     let mut iteration = 0;
@@ -178,6 +228,19 @@ pub async fn execute_apply_in_workspace(
     loop {
         iteration += 1;
         if iteration > MAX_ITERATIONS {
+            // Run on_error hook if configured
+            if let Some(hook_runner) = hooks {
+                let error_msg = format!(
+                    "Max iterations ({}) reached for change {}",
+                    MAX_ITERATIONS, change_id
+                );
+                let error_ctx =
+                    build_parallel_hook_context(change_id, 0, 0, iteration, parallel_ctx)
+                        .with_error(&error_msg);
+                if let Err(e) = hook_runner.run_hook(HookType::OnError, &error_ctx).await {
+                    error!("on_error hook failed: {}", e);
+                }
+            }
             return Err(OrchestratorError::AgentCommand(format!(
                 "Max iterations ({}) reached for change {}",
                 MAX_ITERATIONS, change_id
@@ -223,6 +286,54 @@ pub async fn execute_apply_in_workspace(
                         change_id: change_id.to_string(),
                     })
                     .await;
+            }
+        }
+
+        // Run pre_apply hook
+        if let Some(hook_runner) = hooks {
+            let hook_ctx = build_parallel_hook_context(
+                change_id,
+                progress.completed,
+                progress.total,
+                iteration,
+                parallel_ctx,
+            );
+
+            // Send hook started event
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::HookStarted {
+                        change_id: change_id.to_string(),
+                        hook_type: "pre_apply".to_string(),
+                    })
+                    .await;
+            }
+
+            match hook_runner.run_hook(HookType::PreApply, &hook_ctx).await {
+                Ok(()) => {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::HookCompleted {
+                                change_id: change_id.to_string(),
+                                hook_type: "pre_apply".to_string(),
+                            })
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    error!("pre_apply hook failed for {}: {}", change_id, e);
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::HookFailed {
+                                change_id: change_id.to_string(),
+                                hook_type: "pre_apply".to_string(),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                    // Hook failure with continue_on_failure=false returns error
+                    return Err(e);
+                }
             }
         }
 
@@ -338,6 +449,54 @@ pub async fn execute_apply_in_workspace(
             iteration, new_progress.completed, new_progress.total
         );
 
+        // Run post_apply hook
+        if let Some(hook_runner) = hooks {
+            let hook_ctx = build_parallel_hook_context(
+                change_id,
+                new_progress.completed,
+                new_progress.total,
+                iteration,
+                parallel_ctx,
+            );
+
+            // Send hook started event
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::HookStarted {
+                        change_id: change_id.to_string(),
+                        hook_type: "post_apply".to_string(),
+                    })
+                    .await;
+            }
+
+            match hook_runner.run_hook(HookType::PostApply, &hook_ctx).await {
+                Ok(()) => {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::HookCompleted {
+                                change_id: change_id.to_string(),
+                                hook_type: "post_apply".to_string(),
+                            })
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    error!("post_apply hook failed for {}: {}", change_id, e);
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::HookFailed {
+                                change_id: change_id.to_string(),
+                                hook_type: "post_apply".to_string(),
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                    // Hook failure with continue_on_failure=false returns error
+                    return Err(e);
+                }
+            }
+        }
+
         // Create progress commit if progress was made
         // This ensures work is not lost if the process is interrupted
         if new_progress.completed > progress.completed {
@@ -350,6 +509,56 @@ pub async fn execute_apply_in_workspace(
 
         // Check if complete
         if new_progress.total > 0 && new_progress.completed == new_progress.total {
+            // Run on_change_complete hook (task 100% completion)
+            if let Some(hook_runner) = hooks {
+                let hook_ctx = build_parallel_hook_context(
+                    change_id,
+                    new_progress.completed,
+                    new_progress.total,
+                    iteration,
+                    parallel_ctx,
+                );
+
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::HookStarted {
+                            change_id: change_id.to_string(),
+                            hook_type: "on_change_complete".to_string(),
+                        })
+                        .await;
+                }
+
+                match hook_runner
+                    .run_hook(HookType::OnChangeComplete, &hook_ctx)
+                    .await
+                {
+                    Ok(()) => {
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::HookCompleted {
+                                    change_id: change_id.to_string(),
+                                    hook_type: "on_change_complete".to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        error!("on_change_complete hook failed for {}: {}", change_id, e);
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::HookFailed {
+                                    change_id: change_id.to_string(),
+                                    hook_type: "on_change_complete".to_string(),
+                                    error: e.to_string(),
+                                })
+                                .await;
+                        }
+                        // Hook failure with continue_on_failure=false returns error
+                        return Err(e);
+                    }
+                }
+            }
+
             info!(
                 "Change {} completed after {} iteration(s)",
                 change_id, iteration
@@ -474,6 +683,7 @@ pub async fn execute_apply_in_workspace(
 }
 
 /// Execute archive command in a workspace with streaming output
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_archive_in_workspace(
     change_id: &str,
     workspace_path: &Path,
@@ -481,11 +691,13 @@ pub async fn execute_archive_in_workspace(
     config: &OrchestratorConfig,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
     vcs_backend: VcsBackend,
+    hooks: Option<&HookRunner>,
+    parallel_ctx: Option<&ParallelHookContext>,
 ) -> Result<String> {
     // Verify task completion before archiving using common function
     use crate::execution::archive::get_task_progress;
 
-    match get_task_progress(change_id, Some(workspace_path)) {
+    let progress = match get_task_progress(change_id, Some(workspace_path)) {
         Ok(Some(progress)) => {
             if progress.total > 0 && progress.completed < progress.total {
                 return Err(OrchestratorError::AgentCommand(format!(
@@ -497,18 +709,67 @@ pub async fn execute_archive_in_workspace(
                 "Task verification passed for {}: {}/{}",
                 change_id, progress.completed, progress.total
             );
+            progress
         }
         Ok(None) => {
             warn!(
                 "Tasks file not found for {} in workspace, proceeding with archive",
                 change_id
             );
+            TaskProgress::default()
         }
         Err(e) => {
             warn!(
                 "Failed to parse tasks for {}: {}, proceeding with archive",
                 change_id, e
             );
+            TaskProgress::default()
+        }
+    };
+
+    // Run pre_archive hook
+    if let Some(hook_runner) = hooks {
+        let hook_ctx = build_parallel_hook_context(
+            change_id,
+            progress.completed,
+            progress.total,
+            0, // apply_count not relevant for archive
+            parallel_ctx,
+        );
+
+        if let Some(ref tx) = event_tx {
+            let _ = tx
+                .send(ParallelEvent::HookStarted {
+                    change_id: change_id.to_string(),
+                    hook_type: "pre_archive".to_string(),
+                })
+                .await;
+        }
+
+        match hook_runner.run_hook(HookType::PreArchive, &hook_ctx).await {
+            Ok(()) => {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::HookCompleted {
+                            change_id: change_id.to_string(),
+                            hook_type: "pre_archive".to_string(),
+                        })
+                        .await;
+                }
+            }
+            Err(e) => {
+                error!("pre_archive hook failed for {}: {}", change_id, e);
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::HookFailed {
+                            change_id: change_id.to_string(),
+                            hook_type: "pre_archive".to_string(),
+                            error: e.to_string(),
+                        })
+                        .await;
+                }
+                return Err(e);
+            }
         }
     }
 
@@ -761,6 +1022,52 @@ pub async fn execute_archive_in_workspace(
                 .to_string()
         }
     };
+
+    // Run post_archive hook
+    if let Some(hook_runner) = hooks {
+        let hook_ctx = build_parallel_hook_context(
+            change_id,
+            progress.completed,
+            progress.total,
+            0, // apply_count not relevant for archive
+            parallel_ctx,
+        );
+
+        if let Some(ref tx) = event_tx {
+            let _ = tx
+                .send(ParallelEvent::HookStarted {
+                    change_id: change_id.to_string(),
+                    hook_type: "post_archive".to_string(),
+                })
+                .await;
+        }
+
+        match hook_runner.run_hook(HookType::PostArchive, &hook_ctx).await {
+            Ok(()) => {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::HookCompleted {
+                            change_id: change_id.to_string(),
+                            hook_type: "post_archive".to_string(),
+                        })
+                        .await;
+                }
+            }
+            Err(e) => {
+                error!("post_archive hook failed for {}: {}", change_id, e);
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::HookFailed {
+                            change_id: change_id.to_string(),
+                            hook_type: "post_archive".to_string(),
+                            error: e.to_string(),
+                        })
+                        .await;
+                }
+                return Err(e);
+            }
+        }
+    }
 
     Ok(revision)
 }

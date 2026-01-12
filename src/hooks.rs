@@ -288,6 +288,10 @@ pub struct HookContext {
     pub error: Option<String>,
     /// Whether running in dry-run mode
     pub dry_run: bool,
+    /// Workspace path (for parallel mode)
+    pub workspace_path: Option<String>,
+    /// Group index (for parallel mode)
+    pub group_index: Option<u32>,
 }
 
 impl HookContext {
@@ -333,6 +337,13 @@ impl HookContext {
         self
     }
 
+    /// Set parallel execution context (workspace path and group index)
+    pub fn with_parallel_context(mut self, workspace_path: &str, group_index: Option<u32>) -> Self {
+        self.workspace_path = Some(workspace_path.to_string());
+        self.group_index = group_index;
+        self
+    }
+
     /// Convert context to environment variables
     pub fn to_env_vars(&self) -> HashMap<String, String> {
         let mut vars = HashMap::new();
@@ -372,6 +383,17 @@ impl HookContext {
             vars.insert("OPENSPEC_ERROR".to_string(), error.clone());
         }
         vars.insert("OPENSPEC_DRY_RUN".to_string(), self.dry_run.to_string());
+
+        // Parallel mode specific variables
+        if let Some(ref workspace_path) = self.workspace_path {
+            vars.insert(
+                "OPENSPEC_WORKSPACE_PATH".to_string(),
+                workspace_path.clone(),
+            );
+        }
+        if let Some(group_index) = self.group_index {
+            vars.insert("OPENSPEC_GROUP_INDEX".to_string(), group_index.to_string());
+        }
 
         vars
     }
@@ -1097,5 +1119,79 @@ mod tests {
         assert!(runner.has_hook(HookType::OnQueueRemove));
         assert!(runner.has_hook(HookType::OnApprove));
         assert!(runner.has_hook(HookType::OnUnapprove));
+    }
+
+    // === Tests for parallel mode context (add-parallel-hooks spec) ===
+
+    #[test]
+    fn test_hook_context_with_parallel_context() {
+        let context = HookContext::new(1, 5, 4, false)
+            .with_change("test-change", 3, 10)
+            .with_parallel_context("/tmp/workspace-test", Some(2));
+
+        assert_eq!(
+            context.workspace_path,
+            Some("/tmp/workspace-test".to_string())
+        );
+        assert_eq!(context.group_index, Some(2));
+    }
+
+    #[test]
+    fn test_hook_context_parallel_env_vars() {
+        let context = HookContext::new(2, 8, 6, false)
+            .with_change("parallel-change", 5, 10)
+            .with_parallel_context("/workspace/change-1", Some(3));
+
+        let vars = context.to_env_vars();
+
+        // Verify parallel-mode specific env vars
+        assert_eq!(
+            vars.get("OPENSPEC_WORKSPACE_PATH"),
+            Some(&"/workspace/change-1".to_string())
+        );
+        assert_eq!(vars.get("OPENSPEC_GROUP_INDEX"), Some(&"3".to_string()));
+
+        // Verify standard env vars are still present
+        assert_eq!(
+            vars.get("OPENSPEC_CHANGE_ID"),
+            Some(&"parallel-change".to_string())
+        );
+        assert_eq!(
+            vars.get("OPENSPEC_CHANGES_PROCESSED"),
+            Some(&"2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_hook_context_parallel_env_vars_without_group_index() {
+        let context = HookContext::new(0, 3, 3, false)
+            .with_change("single-change", 0, 5)
+            .with_parallel_context("/workspace/single", None);
+
+        let vars = context.to_env_vars();
+
+        assert_eq!(
+            vars.get("OPENSPEC_WORKSPACE_PATH"),
+            Some(&"/workspace/single".to_string())
+        );
+        // group_index is None, so no OPENSPEC_GROUP_INDEX
+        assert!(vars.get("OPENSPEC_GROUP_INDEX").is_none());
+    }
+
+    #[test]
+    fn test_hook_context_no_parallel_context() {
+        let context = HookContext::new(0, 1, 1, false).with_change("sequential-change", 0, 3);
+
+        let vars = context.to_env_vars();
+
+        // Neither workspace_path nor group_index should be set
+        assert!(vars.get("OPENSPEC_WORKSPACE_PATH").is_none());
+        assert!(vars.get("OPENSPEC_GROUP_INDEX").is_none());
+
+        // Standard env vars should still work
+        assert_eq!(
+            vars.get("OPENSPEC_CHANGE_ID"),
+            Some(&"sequential-change".to_string())
+        );
     }
 }

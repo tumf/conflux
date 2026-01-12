@@ -1,6 +1,6 @@
 # hooks spec delta
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Hook Execution Modes
 
