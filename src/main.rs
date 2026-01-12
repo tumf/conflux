@@ -15,6 +15,8 @@ mod task_parser;
 mod templates;
 mod tui;
 mod vcs;
+#[cfg(feature = "web-monitoring")]
+mod web;
 
 use clap::Parser;
 use cli::{ApproveAction, Cli, Commands};
@@ -86,6 +88,28 @@ async fn main() -> Result<()> {
             // Load config
             let config = OrchestratorConfig::load(args.config.as_deref())?;
 
+            // Start web monitoring server if enabled
+            #[cfg(feature = "web-monitoring")]
+            let _web_handle = if args.web {
+                let web_state = std::sync::Arc::new(web::WebState::new(&changes));
+                let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone());
+                tracing::info!(
+                    "Starting web monitoring server on http://{}:{}",
+                    web_config.bind,
+                    web_config.port
+                );
+                Some(web::spawn_server(web_config, web_state))
+            } else {
+                None
+            };
+
+            #[cfg(not(feature = "web-monitoring"))]
+            if args.web {
+                eprintln!(
+                    "Warning: Web monitoring is not enabled. Compile with --features web-monitoring"
+                );
+            }
+
             // Run TUI
             tui::run_tui(changes, args.openspec_cmd, args.opencode_path, config).await?;
         }
@@ -94,6 +118,29 @@ async fn main() -> Result<()> {
         Some(Commands::Run(args)) => {
             // Initialize tracing for non-interactive mode
             tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+
+            // Start web monitoring server if enabled
+            #[cfg(feature = "web-monitoring")]
+            let web_state_arc = if args.web {
+                let initial_changes = openspec::list_changes_native()?;
+                let web_state = std::sync::Arc::new(web::WebState::new(&initial_changes));
+                let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone());
+                info!(
+                    "Starting web monitoring server on http://{}:{}",
+                    web_config.bind, web_config.port
+                );
+                let _handle = web::spawn_server(web_config, web_state.clone());
+                Some(web_state)
+            } else {
+                None
+            };
+
+            #[cfg(not(feature = "web-monitoring"))]
+            if args.web {
+                eprintln!(
+                    "Warning: Web monitoring is not enabled. Compile with --features web-monitoring"
+                );
+            }
 
             // Parse VCS backend from CLI option
             let vcs_override = args.vcs.parse().ok();
@@ -109,6 +156,13 @@ async fn main() -> Result<()> {
                 vcs_override,
                 args.no_resume,
             )?;
+
+            // Set web state for broadcasting updates
+            #[cfg(feature = "web-monitoring")]
+            if let Some(web_state) = web_state_arc {
+                orchestrator.set_web_state(web_state);
+            }
+
             orchestrator.run().await?;
         }
 

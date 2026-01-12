@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenSpec Orchestrator - Web Monitor</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>OpenSpec Orchestrator</h1>
+            <div class="connection-status" id="connection-status">
+                <span class="status-dot"></span>
+                <span class="status-text">Connecting...</span>
+            </div>
+        </header>
+
+        <div class="stats-bar" id="stats-bar">
+            <div class="stat">
+                <span class="stat-value" id="total-changes">-</span>
+                <span class="stat-label">Total</span>
+            </div>
+            <div class="stat">
+                <span class="stat-value" id="completed-changes">-</span>
+                <span class="stat-label">Completed</span>
+            </div>
+            <div class="stat">
+                <span class="stat-value" id="in-progress-changes">-</span>
+                <span class="stat-label">In Progress</span>
+            </div>
+            <div class="stat">
+                <span class="stat-value" id="pending-changes">-</span>
+                <span class="stat-label">Pending</span>
+            </div>
+        </div>
+
+        <main id="changes-container">
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p>Loading changes...</p>
+            </div>
+            <div class="changes-list" id="changes-list"></div>
+            <div class="empty-state" id="empty-state" style="display: none;">
+                <p>No changes found.</p>
+            </div>
+        </main>
+
+        <footer>
+            <span id="last-updated">Last updated: -</span>
+        </footer>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>

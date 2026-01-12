@@ -1,0 +1,123 @@
+//! REST API handlers for web monitoring.
+
+use super::state::{ChangeStatus, OrchestratorState, WebState};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Json,
+};
+use serde::Serialize;
+use std::sync::Arc;
+
+/// Health check response
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub version: &'static str,
+}
+
+/// Health check endpoint
+pub async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
+/// Get full orchestrator state
+pub async fn get_state(State(state): State<Arc<WebState>>) -> Json<OrchestratorState> {
+    Json(state.get_state().await)
+}
+
+/// List all changes
+pub async fn list_changes(State(state): State<Arc<WebState>>) -> Json<Vec<ChangeStatus>> {
+    Json(state.list_changes().await)
+}
+
+/// Error response for API errors
+#[derive(Debug, Serialize)]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
+/// Get a specific change by ID
+pub async fn get_change(
+    State(state): State<Arc<WebState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ChangeStatus>, (StatusCode, Json<ErrorResponse>)> {
+    match state.get_change(&id).await {
+        Some(change) => Ok(Json(change)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Change '{}' not found", id),
+            }),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openspec::Change;
+
+    fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
+        Change {
+            id: id.to_string(),
+            completed_tasks: completed,
+            total_tasks: total,
+            last_modified: "1m ago".to_string(),
+            is_approved: true,
+            dependencies: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let response = health().await;
+        assert_eq!(response.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn test_get_state_endpoint() {
+        let changes = vec![create_test_change("test", 2, 5)];
+        let web_state = Arc::new(WebState::new(&changes));
+
+        let response = get_state(State(web_state)).await;
+        assert_eq!(response.total_changes, 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_changes_endpoint() {
+        let changes = vec![
+            create_test_change("change-a", 1, 3),
+            create_test_change("change-b", 2, 4),
+        ];
+        let web_state = Arc::new(WebState::new(&changes));
+
+        let response = list_changes(State(web_state)).await;
+        assert_eq!(response.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_change_found() {
+        let changes = vec![create_test_change("my-change", 3, 5)];
+        let web_state = Arc::new(WebState::new(&changes));
+
+        let result = get_change(State(web_state), Path("my-change".to_string())).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().id, "my-change");
+    }
+
+    #[tokio::test]
+    async fn test_get_change_not_found() {
+        let web_state = Arc::new(WebState::new(&[]));
+
+        let result = get_change(State(web_state), Path("nonexistent".to_string())).await;
+        assert!(result.is_err());
+
+        let (status, error) = result.unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(error.error.contains("nonexistent"));
+    }
+}

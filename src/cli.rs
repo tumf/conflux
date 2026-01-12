@@ -83,6 +83,18 @@ pub struct RunArgs {
     /// workspaces instead of reusing existing ones from interrupted runs.
     #[arg(long)]
     pub no_resume: bool,
+
+    /// Enable web monitoring server for remote status viewing
+    #[arg(long)]
+    pub web: bool,
+
+    /// Port for web monitoring server (default: 8080)
+    #[arg(long, default_value = "8080")]
+    pub web_port: u16,
+
+    /// Bind address for web monitoring server (default: 127.0.0.1)
+    #[arg(long, default_value = "127.0.0.1")]
+    pub web_bind: String,
 }
 
 /// Arguments for the TUI subcommand
@@ -107,6 +119,18 @@ pub struct TuiArgs {
     /// Write debug logs to the specified file (e.g., --logs debug.log)
     #[arg(long)]
     pub logs: Option<PathBuf>,
+
+    /// Enable web monitoring server for remote status viewing
+    #[arg(long)]
+    pub web: bool,
+
+    /// Port for web monitoring server (default: 8080)
+    #[arg(long, default_value = "8080")]
+    pub web_port: u16,
+
+    /// Bind address for web monitoring server (default: 127.0.0.1)
+    #[arg(long, default_value = "127.0.0.1")]
+    pub web_bind: String,
 }
 
 /// Template options for init command

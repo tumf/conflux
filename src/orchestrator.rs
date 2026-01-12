@@ -11,6 +11,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
 
+#[cfg(feature = "web-monitoring")]
+use crate::web::WebState;
+#[cfg(feature = "web-monitoring")]
+use std::sync::Arc;
+
 pub struct Orchestrator {
     agent: AgentRunner,
     config: OrchestratorConfig,
@@ -46,6 +51,9 @@ pub struct Orchestrator {
     vcs_backend: VcsBackend,
     /// Disable automatic workspace resume (always create new workspaces)
     no_resume: bool,
+    /// Web monitoring state (for broadcasting updates to WebSocket clients)
+    #[cfg(feature = "web-monitoring")]
+    web_state: Option<Arc<WebState>>,
 }
 
 impl Orchestrator {
@@ -87,8 +95,28 @@ impl Orchestrator {
             dry_run,
             vcs_backend,
             no_resume,
+            #[cfg(feature = "web-monitoring")]
+            web_state: None,
         })
     }
+
+    /// Set web monitoring state for broadcasting updates to WebSocket clients
+    #[cfg(feature = "web-monitoring")]
+    pub fn set_web_state(&mut self, web_state: Arc<WebState>) {
+        self.web_state = Some(web_state);
+    }
+
+    /// Broadcast state update to web monitoring clients
+    #[cfg(feature = "web-monitoring")]
+    async fn broadcast_state_update(&self, changes: &[Change]) {
+        if let Some(ref web_state) = self.web_state {
+            web_state.update(changes).await;
+        }
+    }
+
+    /// No-op when web monitoring is disabled
+    #[cfg(not(feature = "web-monitoring"))]
+    async fn broadcast_state_update(&self, _changes: &[Change]) {}
 
     /// Create a new orchestrator with explicit configuration (for testing)
     #[cfg(test)]
@@ -118,6 +146,8 @@ impl Orchestrator {
             dry_run: false,
             vcs_backend: VcsBackend::Auto,
             no_resume: false,
+            #[cfg(feature = "web-monitoring")]
+            web_state: None,
         })
     }
 
@@ -249,6 +279,9 @@ impl Orchestrator {
 
             // List all changes from openspec (to get updated progress)
             let changes = openspec::list_changes_native()?;
+
+            // Broadcast state update to web monitoring clients
+            self.broadcast_state_update(&changes).await;
 
             // Filter to only include changes from initial snapshot
             let snapshot_changes = self.filter_to_snapshot(&changes);

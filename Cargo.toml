@@ -3,6 +3,10 @@ name = "openspec-orchestrator"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+web-monitoring = ["axum", "tower", "tower-http"]
+
 [dependencies]
 tokio = { version = "1", features = ["full", "process"] }
 tokio-util = "0.7"
@@ -25,3 +29,8 @@ regex = "1.12.2"
 md5 = "0.8"
 tempfile = "3"
 async-trait = "0.1"
+
+# Web monitoring dependencies (optional)
+axum = { version = "0.8", features = ["ws"], optional = true }
+tower = { version = "0.5", optional = true }
+tower-http = { version = "0.6", features = ["cors", "trace"], optional = true }
