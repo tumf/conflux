@@ -1,6 +1,6 @@
 # Spec: parallel-execution (Delta)
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Workspace Preservation on Error
 
@@ -31,8 +31,6 @@
 - Given: workspaceがエラーにより保持された
 - When: エラーログが出力される
 - Then: `[INFO] To resume: run with the same change_id, workspace will be automatically detected` が出力される
-
-## ADDED Requirements
 
 ### Requirement: WorkspacePreserved Event
 

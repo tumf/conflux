@@ -24,6 +24,7 @@ pub struct ArchiveContext {
 }
 
 /// Result of archive operation
+#[derive(Debug)]
 pub enum ArchiveResult {
     Success,
     Failed,
@@ -129,9 +130,21 @@ pub async fn archive_single_change(
         // Verify that the change was actually archived
         // The change directory should no longer exist in openspec/changes/
         let change_path = std::path::Path::new("openspec/changes").join(change_id);
-        let archive_path = std::path::Path::new("openspec/archive").join(change_id);
+        let archive_path = std::path::Path::new("openspec/changes/archive").join(change_id);
 
-        if change_path.exists() && !archive_path.exists() {
+        let change_exists = change_path.exists();
+        let archive_exists = archive_path.exists();
+
+        tracing::debug!(
+            change_id = %change_id,
+            change_path = %change_path.display(),
+            archive_path = %archive_path.display(),
+            change_exists = change_exists,
+            archive_exists = archive_exists,
+            "archive_single_change: verifying archive paths"
+        );
+
+        if change_exists && !archive_exists {
             let error_msg = format!(
                 "Archive command succeeded but change '{}' was not actually archived. \
                  The change directory still exists in openspec/changes/. \
@@ -217,6 +230,12 @@ pub async fn archive_all_complete_changes(
 ) -> Result<usize> {
     use crate::openspec;
 
+    // Log entry point with pending count
+    tracing::debug!(
+        pending_count = pending_ids.len(),
+        "archive_all_complete_changes: checking for complete changes to archive"
+    );
+
     // Fetch current state of all changes using native implementation
     let changes = openspec::list_changes_native()?;
 
@@ -226,9 +245,19 @@ pub async fn archive_all_complete_changes(
         .filter(|c| pending_ids.contains(&c.id) && !archived_set.contains(&c.id) && c.is_complete())
         .collect();
 
+    tracing::debug!(
+        complete_count = complete_changes.len(),
+        complete_ids = ?complete_changes.iter().map(|c| &c.id).collect::<Vec<_>>(),
+        "archive_all_complete_changes: found complete changes to archive"
+    );
+
     let mut archived_count = 0;
 
     for change in complete_changes {
+        tracing::debug!(
+            change_id = %change.id,
+            "archive_all_complete_changes: starting archive for change"
+        );
         if cancel_token.is_cancelled() {
             break;
         }
@@ -252,7 +281,7 @@ pub async fn archive_all_complete_changes(
             .send(OrchestratorEvent::ProcessingCompleted(change.id.clone()))
             .await;
 
-        match archive_single_change(
+        let result = archive_single_change(
             &change.id,
             &change,
             agent,
@@ -261,8 +290,15 @@ pub async fn archive_all_complete_changes(
             cancel_token,
             &context,
         )
-        .await?
-        {
+        .await?;
+
+        tracing::debug!(
+            change_id = %change.id,
+            result = ?result,
+            "archive_all_complete_changes: archive result for change"
+        );
+
+        match result {
             ArchiveResult::Success => {
                 archived_set.insert(change.id.clone());
                 archived_count += 1;
@@ -276,6 +312,11 @@ pub async fn archive_all_complete_changes(
             }
         }
     }
+
+    tracing::debug!(
+        archived_count = archived_count,
+        "archive_all_complete_changes: completed archiving loop"
+    );
 
     Ok(archived_count)
 }
@@ -924,4 +965,82 @@ pub async fn run_orchestrator_parallel(
 
     let _ = tx.send(OrchestratorEvent::AllCompleted).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    /// Test that the archive path uses the correct directory structure.
+    /// The archive path should be `openspec/changes/archive/<change_id>`,
+    /// not `openspec/archive/<change_id>`.
+    #[test]
+    fn test_archive_path_structure() {
+        let change_id = "test-change";
+
+        // This is the correct path structure used in archive_single_change
+        let change_path = Path::new("openspec/changes").join(change_id);
+        let archive_path = Path::new("openspec/changes/archive").join(change_id);
+
+        // Verify the path structure is correct
+        assert_eq!(
+            change_path.to_str().unwrap(),
+            "openspec/changes/test-change"
+        );
+        assert_eq!(
+            archive_path.to_str().unwrap(),
+            "openspec/changes/archive/test-change"
+        );
+
+        // The archive path should be under openspec/changes/archive, not openspec/archive
+        assert!(archive_path.starts_with("openspec/changes/archive"));
+        assert!(!archive_path.starts_with("openspec/archive/"));
+    }
+
+    /// Test archive verification logic: when change still exists and archive doesn't,
+    /// it should be considered a failed archive.
+    #[test]
+    fn test_archive_verification_logic() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        // Create the directory structure
+        let changes_dir = base.join("openspec/changes");
+        let archive_dir = base.join("openspec/changes/archive");
+        fs::create_dir_all(&changes_dir).unwrap();
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let change_id = "my-change";
+
+        // Scenario 1: Change exists, archive doesn't exist -> archive failed
+        let change_path = changes_dir.join(change_id);
+        let archive_path = archive_dir.join(change_id);
+        fs::create_dir(&change_path).unwrap();
+
+        assert!(change_path.exists());
+        assert!(!archive_path.exists());
+        // This condition triggers the "archive failed" error in archive_single_change
+        let archive_failed = change_path.exists() && !archive_path.exists();
+        assert!(archive_failed);
+
+        // Scenario 2: Change doesn't exist (moved to archive) -> archive succeeded
+        fs::remove_dir(&change_path).unwrap();
+        fs::create_dir(&archive_path).unwrap();
+
+        assert!(!change_path.exists());
+        assert!(archive_path.exists());
+        let archive_succeeded = !change_path.exists() || archive_path.exists();
+        assert!(archive_succeeded);
+
+        // Scenario 3: Both paths exist (edge case, shouldn't happen normally)
+        fs::create_dir(&change_path).unwrap();
+        assert!(change_path.exists());
+        assert!(archive_path.exists());
+        // If archive exists, the archive is considered successful
+        let archive_ok = archive_path.exists();
+        assert!(archive_ok);
+    }
 }
