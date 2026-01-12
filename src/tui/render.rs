@@ -519,7 +519,10 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         ),
         AppMode::Select => ("", Color::White),
         AppMode::Error => ("Press F5 to retry, or 'q' to quit.", Color::Yellow),
-        AppMode::Proposing => ("Enter: newline, Ctrl+S: submit, Esc: cancel", Color::Magenta),
+        AppMode::Proposing => (
+            "Enter: newline, Ctrl+S: submit, Esc: cancel",
+            Color::Magenta,
+        ),
         AppMode::QrPopup => ("Esc: close QR code", Color::Green),
     };
 

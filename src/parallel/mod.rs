@@ -562,7 +562,7 @@ impl ParallelExecutor {
             }
         };
 
-        // Collect successful results (those with final_revision set)
+        // Collect successful and failed results
         let successful: Vec<&WorkspaceResult> = results
             .iter()
             .filter(|r| r.final_revision.is_some())
@@ -609,15 +609,8 @@ impl ParallelExecutor {
             return Ok(());
         }
 
-        // Collect final revisions (post-archive revisions)
-        let revisions: Vec<String> = successful
-            .iter()
-            .filter_map(|r| r.final_revision.clone())
-            .collect();
-
-        if !revisions.is_empty() {
-            self.merge_and_resolve(&revisions).await?;
-        }
+        // Note: Individual merging is now done in execute_apply_and_archive_parallel
+        // immediately after each change is archived. Group-level merge is no longer needed.
 
         // Cleanup only successful workspaces (preserve failed ones)
         let failed_workspace_names: std::collections::HashSet<_> =
@@ -821,6 +814,33 @@ impl ParallelExecutor {
                             &workspace_result.workspace_name,
                             WorkspaceStatus::Applied(rev.clone()),
                         );
+
+                        // Individual merge: merge immediately after archive completes
+                        info!("Merging {} (revision: {})", workspace_result.change_id, rev);
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::MergeStarted {
+                                revisions: vec![rev.clone()],
+                            },
+                        )
+                        .await;
+
+                        match self.merge_and_resolve(&[rev.clone()]).await {
+                            Ok(_) => {
+                                info!(
+                                    "Successfully merged {} (revision: {})",
+                                    workspace_result.change_id, rev
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to merge {} (revision: {}): {}",
+                                    workspace_result.change_id, rev, e
+                                );
+                                // Merge failure is critical - return error immediately
+                                return Err(e);
+                            }
+                        }
                     }
                     results.push(workspace_result);
                 }
