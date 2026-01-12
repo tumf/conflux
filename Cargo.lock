@@ -1237,6 +1237,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "shlex",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",

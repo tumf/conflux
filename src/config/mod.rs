@@ -915,7 +915,12 @@ mod tests {
     #[test]
     fn test_expand_conflict_files_placeholder() {
         let template = "claude resolve {conflict_files}";
-        let result = OrchestratorConfig::expand_conflict_files(template, "src/main.rs src/lib.rs");
-        assert_eq!(result, "claude resolve src/main.rs src/lib.rs");
+        let conflict_files = "src/main.rs src/lib.rs";
+        let result = OrchestratorConfig::expand_conflict_files(template, conflict_files);
+        let expected = format!(
+            "claude resolve {}",
+            shlex::try_quote(conflict_files).unwrap()
+        );
+        assert_eq!(result, expected);
     }
 }

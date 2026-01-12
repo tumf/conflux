@@ -211,6 +211,14 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             let cursor = if i == app.cursor_index { "►" } else { " " };
             let new_badge = if change.is_new { " NEW" } else { "" };
 
+            // Use brighter colors for selected row to ensure visibility on DarkGray background
+            let is_selected_row = i == app.cursor_index;
+            let dim_color = if is_selected_row {
+                Color::Gray // Brighter than DarkGray for visibility on selected row
+            } else {
+                Color::DarkGray
+            };
+
             let line = Line::from(vec![
                 Span::styled(
                     format!("{} {} ", checkbox, cursor),
@@ -232,7 +240,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 ),
                 Span::styled(
                     format!(" {}/{} tasks", change.completed_tasks, change.total_tasks),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(dim_color),
                 ),
                 Span::styled(
                     format!("  {:>5.1}%", change.progress_percent()),
@@ -318,6 +326,14 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             let cursor = if i == app.cursor_index { "►" } else { " " };
             let new_badge = if change.is_new { " NEW" } else { "" };
 
+            // Use brighter colors for selected row to ensure visibility on DarkGray background
+            let is_selected_row = i == app.cursor_index;
+            let dim_color = if is_selected_row {
+                Color::Gray // Brighter than DarkGray for visibility on selected row
+            } else {
+                Color::DarkGray
+            };
+
             let status_text = match &change.queue_status {
                 QueueStatus::Processing => {
                     format!("{} [{:>3.0}%]", spinner_char, change.progress_percent())
@@ -364,11 +380,11 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 ),
                 Span::styled(
                     format!("  {}/{}", change.completed_tasks, change.total_tasks),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(dim_color),
                 ),
                 Span::styled(
                     format!("  {:>7}", elapsed_text),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(dim_color),
                 ),
             ]);
 

@@ -7,6 +7,7 @@ mod error;
 mod history;
 mod hooks;
 mod openspec;
+mod orchestration;
 mod orchestrator;
 mod parallel;
 mod parallel_run_service;

@@ -8,7 +8,7 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // Template: Claude Code
 
   // Command to analyze dependencies and select next change
-  "analyze_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
+  "analyze_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p {prompt}",
 
   // Command to apply a change (supports {change_id} and {prompt} placeholders)
   "apply_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id} {prompt}'",
@@ -17,7 +17,7 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id} {prompt}'",
 
   // Command to resolve conflicts (supports {prompt} placeholder)
-  "resolve_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
+  "resolve_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p {prompt}",
 
   // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
   // Note: A hardcoded system prompt is always appended after this value
@@ -52,7 +52,7 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // Template: OpenCode
 
   // Command to analyze dependencies and select next change
-  "analyze_command": "opencode run --format json '{prompt}'",
+  "analyze_command": "opencode run --format json {prompt}",
 
   // Command to apply a change (supports {change_id} and {prompt} placeholders)
   "apply_command": "opencode run '/openspec-apply {change_id} {prompt}'",
@@ -61,7 +61,7 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   "archive_command": "opencode run '/openspec-archive {change_id} {prompt}'",
 
   // Command to resolve conflicts (supports {prompt} placeholder)
-  "resolve_command": "opencode run '{prompt}'",
+  "resolve_command": "opencode run {prompt}",
 
   // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
   // Note: A hardcoded system prompt is always appended after this value
@@ -96,7 +96,7 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // Template: Codex
 
   // Command to analyze dependencies and select next change
-  "analyze_command": "codex --json '{prompt}'",
+  "analyze_command": "codex --json {prompt}",
 
   // Command to apply a change (supports {change_id} and {prompt} placeholders)
   "apply_command": "codex '/openspec:apply {change_id} {prompt}'",
@@ -105,7 +105,7 @@ pub const CODEX_TEMPLATE: &str = r#"{
   "archive_command": "codex '/openspec:archive {change_id} {prompt}'",
 
   // Command to resolve conflicts (supports {prompt} placeholder)
-  "resolve_command": "codex '{prompt}'",
+  "resolve_command": "codex {prompt}",
 
   // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
   // Note: A hardcoded system prompt is always appended after this value

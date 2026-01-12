@@ -8,16 +8,18 @@
 
   // Apply command template
   // Executed when applying a change (implementing tasks)
+  // Placeholders are shell-escaped automatically
   // Placeholder: {change_id} - replaced with the change ID at runtime
   "apply_command": "opencode run '/openspec-apply {change_id}'",
 
   // Archive command template
   // Executed when archiving a completed change
+  // Placeholders are shell-escaped automatically
   // Placeholder: {change_id} - replaced with the change ID at runtime
   "archive_command": "opencode run '/openspec-archive {change_id}'",
 
   // Analyze command template
   // Executed for dependency analysis using LLM
   // Placeholder: {prompt} - replaced with the analysis prompt at runtime
-  "analyze_command": "opencode run --format json '{prompt}'"
+  "analyze_command": "opencode run --format json {prompt}"
 }

@@ -192,6 +192,13 @@ cargo fmt --check && cargo clippy -- -D warnings && cargo test
 3. Add detection logic in orchestrator to choose the appropriate backend
 4. Update documentation
 
+## Command Template Escaping
+
+- Placeholders like `{prompt}`, `{proposal}`, and `{conflict_files}` are shell-escaped with `shlex` on POSIX systems.
+- Prefer templates without manual quotes, such as `opencode run --format json {prompt}`.
+- If a placeholder must live inside a larger single-quoted string (for example `/openspec:apply {change_id} {prompt}`), keep the surrounding quotes; the expander strips extra outer quotes to avoid double-quoting.
+- Windows builds keep the existing behavior and sanitize null/newline characters.
+
 ## Release Process
 
 1. Update version in `Cargo.toml`

@@ -3,6 +3,7 @@
 //! Provides a system for executing user-defined commands at various stages
 //! of the orchestration process.
 
+use crate::config::expand;
 use crate::error::{OrchestratorError, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -375,28 +376,41 @@ impl HookContext {
         vars
     }
 
-    /// Expand placeholders in a command string
+    /// Expand placeholders in a command string.
+    ///
+    /// Placeholder values are shell-escaped consistently with config command expansion.
     pub fn expand_placeholders(&self, template: &str) -> String {
         let mut result = template.to_string();
 
         if let Some(ref change_id) = self.change_id {
-            result = result.replace("{change_id}", change_id);
+            result = expand::expand_placeholder(&result, "{change_id}", change_id);
         }
-        result = result.replace("{changes_processed}", &self.changes_processed.to_string());
-        result = result.replace("{total_changes}", &self.total_changes.to_string());
-        result = result.replace("{remaining_changes}", &self.remaining_changes.to_string());
+        result = expand::expand_placeholder(
+            &result,
+            "{changes_processed}",
+            &self.changes_processed.to_string(),
+        );
+        result =
+            expand::expand_placeholder(&result, "{total_changes}", &self.total_changes.to_string());
+        result = expand::expand_placeholder(
+            &result,
+            "{remaining_changes}",
+            &self.remaining_changes.to_string(),
+        );
         if let Some(completed) = self.completed_tasks {
-            result = result.replace("{completed_tasks}", &completed.to_string());
+            result =
+                expand::expand_placeholder(&result, "{completed_tasks}", &completed.to_string());
         }
         if let Some(total) = self.total_tasks {
-            result = result.replace("{total_tasks}", &total.to_string());
+            result = expand::expand_placeholder(&result, "{total_tasks}", &total.to_string());
         }
-        result = result.replace("{apply_count}", &self.apply_count.to_string());
+        result =
+            expand::expand_placeholder(&result, "{apply_count}", &self.apply_count.to_string());
         if let Some(ref status) = self.status {
-            result = result.replace("{status}", status);
+            result = expand::expand_placeholder(&result, "{status}", status);
         }
         if let Some(ref error) = self.error {
-            result = result.replace("{error}", error);
+            result = expand::expand_placeholder(&result, "{error}", error);
         }
 
         result

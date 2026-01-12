@@ -17,10 +17,10 @@ pub const DEFAULT_ARCHIVE_COMMAND: &str = "opencode run '/openspec-archive {chan
 
 /// Default resolve command template (OpenCode)
 /// Supports `{prompt}` placeholder for the resolve prompt
-pub const DEFAULT_RESOLVE_COMMAND: &str = "opencode run '{prompt}'";
+pub const DEFAULT_RESOLVE_COMMAND: &str = "opencode run {prompt}";
 
 /// Default analyze command template (OpenCode)
-pub const DEFAULT_ANALYZE_COMMAND: &str = "opencode run --format json '{prompt}'";
+pub const DEFAULT_ANALYZE_COMMAND: &str = "opencode run --format json {prompt}";
 
 /// Default prompt for apply command - empty by default.
 /// The hardcoded system prompt in agent.rs is always appended.

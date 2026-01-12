@@ -4,6 +4,10 @@ use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
+use crate::orchestration::{
+    apply_change, archive_change, selection, ApplyContext, ApplyResult, ArchiveContext,
+    ArchiveResult, LogOutputHandler,
+};
 use crate::parallel_run_service::ParallelRunService;
 use crate::progress::ProgressDisplay;
 use crate::vcs::VcsBackend;
@@ -331,55 +335,26 @@ impl Orchestrator {
 
             // Process the change
             if next.is_complete() {
-                // Archive completed change
+                // Archive completed change using shared function
                 info!("Change {} is complete, archiving...", next.id);
 
-                // Run on_change_complete hook (task 100%)
-                let complete_context = HookContext::new(
+                let archive_ctx = ArchiveContext::new(
                     self.changes_processed,
                     total_changes,
                     remaining_changes,
-                    false,
-                )
-                .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                .with_apply_count(apply_count);
-                self.hooks
-                    .run_hook(HookType::OnChangeComplete, &complete_context)
-                    .await?;
+                    apply_count,
+                );
+                let output = LogOutputHandler::new();
 
-                // Run pre_archive hook
-                let pre_archive_context = HookContext::new(
-                    self.changes_processed,
-                    total_changes,
-                    remaining_changes,
-                    false,
-                )
-                .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                .with_apply_count(apply_count);
-                self.hooks
-                    .run_hook(HookType::PreArchive, &pre_archive_context)
-                    .await?;
-
-                match self.archive_change(&next).await {
-                    Ok(_) => {
+                match archive_change(&next, &mut self.agent, &self.hooks, &archive_ctx, &output)
+                    .await
+                {
+                    Ok(ArchiveResult::Success) => {
                         // Update changes_processed count
                         self.changes_processed += 1;
                         let new_remaining = remaining_changes - 1;
 
-                        // Run post_archive hook
-                        let post_archive_context = HookContext::new(
-                            self.changes_processed,
-                            total_changes,
-                            new_remaining,
-                            false,
-                        )
-                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                        .with_apply_count(apply_count);
-                        self.hooks
-                            .run_hook(HookType::PostArchive, &post_archive_context)
-                            .await?;
-
-                        // Run on_change_end hook
+                        // Run on_change_end hook (not included in shared archive_change)
                         let change_end_context = HookContext::new(
                             self.changes_processed,
                             total_changes,
@@ -401,20 +376,19 @@ impl Orchestrator {
                             progress.archive_change(&next.id);
                         }
                     }
+                    Ok(ArchiveResult::Failed { error }) => {
+                        error!("Archive failed for {}: {}", next.id, error);
+                        if let Some(progress) = &mut self.progress {
+                            progress.error(&format!("Archive failed: {}", next.id));
+                        }
+                        return Err(OrchestratorError::AgentCommand(error));
+                    }
+                    Ok(ArchiveResult::Cancelled) => {
+                        info!("Archive cancelled for {}", next.id);
+                        return Ok(());
+                    }
                     Err(e) => {
-                        // Run on_error hook
-                        let error_context = HookContext::new(
-                            self.changes_processed,
-                            total_changes,
-                            remaining_changes,
-                            false,
-                        )
-                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                        .with_apply_count(apply_count)
-                        .with_error(&e.to_string());
-                        let _ = self.hooks.run_hook(HookType::OnError, &error_context).await;
-
-                        error!("Archive failed for {}: {}", next.id, e);
+                        error!("Archive error for {}: {}", next.id, e);
                         if let Some(progress) = &mut self.progress {
                             progress.error(&format!("Archive failed: {}", next.id));
                         }
@@ -422,59 +396,40 @@ impl Orchestrator {
                     }
                 }
             } else {
-                // Apply change
+                // Apply change using shared function
                 info!("Applying change: {}", next.id);
 
                 // Increment apply count
                 let new_apply_count = apply_count + 1;
                 self.apply_counts.insert(next.id.clone(), new_apply_count);
 
-                // Run pre_apply hook
-                let pre_apply_context = HookContext::new(
+                let apply_ctx = ApplyContext::new(
                     self.changes_processed,
                     total_changes,
                     remaining_changes,
-                    false,
-                )
-                .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                .with_apply_count(new_apply_count);
-                self.hooks
-                    .run_hook(HookType::PreApply, &pre_apply_context)
-                    .await?;
+                    new_apply_count,
+                );
+                let output = LogOutputHandler::new();
 
-                match self.apply_change(&next).await {
-                    Ok(_) => {
-                        // Run post_apply hook
-                        let post_apply_context = HookContext::new(
-                            self.changes_processed,
-                            total_changes,
-                            remaining_changes,
-                            false,
-                        )
-                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                        .with_apply_count(new_apply_count);
-                        self.hooks
-                            .run_hook(HookType::PostApply, &post_apply_context)
-                            .await?;
-
+                match apply_change(&next, &mut self.agent, &self.hooks, &apply_ctx, &output).await {
+                    Ok(ApplyResult::Success) => {
                         if let Some(progress) = &mut self.progress {
                             progress.complete_change(&next.id);
                         }
                     }
+                    Ok(ApplyResult::Failed { error }) => {
+                        error!("Apply failed for {}: {}", next.id, error);
+                        if let Some(progress) = &mut self.progress {
+                            progress.error(&format!("Apply failed: {}", next.id));
+                        }
+                        return Err(OrchestratorError::AgentCommand(error));
+                    }
+                    Ok(ApplyResult::Cancelled) => {
+                        info!("Apply cancelled for {}", next.id);
+                        return Ok(());
+                    }
                     Err(e) => {
-                        // Run on_error hook
-                        let error_context = HookContext::new(
-                            self.changes_processed,
-                            total_changes,
-                            remaining_changes,
-                            false,
-                        )
-                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                        .with_apply_count(new_apply_count)
-                        .with_error(&e.to_string());
-                        let _ = self.hooks.run_hook(HookType::OnError, &error_context).await;
-
-                        error!("Apply failed for {}: {}", next.id, e);
+                        error!("Apply error for {}: {}", next.id, e);
                         if let Some(progress) = &mut self.progress {
                             progress.error(&format!("Apply failed: {}", next.id));
                         }
@@ -495,129 +450,14 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Select the next change to process
+    /// Select the next change to process.
+    ///
+    /// Uses the shared selection module which provides:
+    /// 1. Complete changes first (ready for archive)
+    /// 2. LLM-based selection (via agent)
+    /// 3. Fallback to highest progress
     async fn select_next_change(&self, changes: &[Change]) -> Result<Change> {
-        // Priority 1: Complete changes (ready for archive)
-        if let Some(complete) = changes.iter().find(|c| c.is_complete()) {
-            info!("Found complete change: {}", complete.id);
-            return Ok(complete.clone());
-        }
-
-        // Priority 2: Use LLM for dependency analysis
-        match self.analyze_with_llm(changes).await {
-            Ok(selected) => {
-                info!("LLM selected: {}", selected.id);
-                return Ok(selected);
-            }
-            Err(e) => {
-                warn!("LLM analysis failed, using fallback: {}", e);
-            }
-        }
-
-        // Priority 3: Fallback - highest progress
-        let selected = changes
-            .iter()
-            .max_by(|a, b| {
-                a.progress_percent()
-                    .partial_cmp(&b.progress_percent())
-                    .unwrap()
-            })
-            .cloned()
-            .ok_or(OrchestratorError::NoChanges)?;
-
-        info!(
-            "Fallback selected: {} ({:.1}%)",
-            selected.id,
-            selected.progress_percent()
-        );
-        Ok(selected)
-    }
-
-    /// Analyze dependencies using LLM
-    async fn analyze_with_llm(&self, changes: &[Change]) -> Result<Change> {
-        let prompt = self.build_analysis_prompt(changes);
-        let response = self.agent.analyze_dependencies(&prompt).await?;
-
-        // Parse the response to extract change ID
-        for change in changes {
-            if response.contains(&change.id) {
-                return Ok(change.clone());
-            }
-        }
-
-        Err(OrchestratorError::Parse(
-            "Could not parse LLM response".to_string(),
-        ))
-    }
-
-    /// Build prompt for LLM dependency analysis
-    fn build_analysis_prompt(&self, changes: &[Change]) -> String {
-        let change_list = changes
-            .iter()
-            .map(|c| {
-                format!(
-                    "- {} ({}/{} tasks, {:.1}%)",
-                    c.id,
-                    c.completed_tasks,
-                    c.total_tasks,
-                    c.progress_percent()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        format!(
-            r#"以下のOpenSpec変更から、次に実行すべきものを1つ選んでください。
-
-変更一覧:
-{}
-
-選択基準:
-1. 依存関係がない、または依存先が完了しているもの
-2. 進捗が進んでいるもの（継続性）
-3. 名前から推測される依存関係を考慮
-
-回答は変更IDのみを1行で出力してください。
-"#,
-            change_list
-        )
-    }
-
-    /// Apply a change using the configured agent
-    async fn apply_change(&mut self, change: &Change) -> Result<()> {
-        info!("Applying change: {}", change.id);
-
-        let status = self.agent.run_apply(&change.id).await?;
-
-        if !status.success() {
-            return Err(OrchestratorError::AgentCommand(format!(
-                "Apply command failed with exit code: {:?}",
-                status.code()
-            )));
-        }
-
-        info!("Successfully applied: {}", change.id);
-        Ok(())
-    }
-
-    /// Archive a change using the configured agent
-    async fn archive_change(&mut self, change: &Change) -> Result<()> {
-        info!("Archiving change: {}", change.id);
-
-        let status = self.agent.run_archive(&change.id).await?;
-
-        if !status.success() {
-            return Err(OrchestratorError::AgentCommand(format!(
-                "Archive command failed with exit code: {:?}",
-                status.code()
-            )));
-        }
-
-        // Clear apply history for the archived change
-        self.agent.clear_apply_history(&change.id);
-
-        info!("Successfully archived: {}", change.id);
-        Ok(())
+        selection::select_next_change(changes, Some(&self.agent)).await
     }
 
     /// Filter changes to only include those present in the initial snapshot.
@@ -786,15 +626,74 @@ impl Orchestrator {
         approved: &[Change],
         groups: Vec<ParallelGroup>,
     ) -> Result<()> {
+        let total_changes = approved.len();
+        let output = LogOutputHandler::new();
+
         for group in groups {
             info!("Processing group {} sequentially", group.id);
             for change_id in group.changes {
                 if let Some(change) = approved.iter().find(|c| c.id == change_id) {
                     info!("Processing change: {}", change.id);
+                    let apply_count = *self.apply_counts.get(&change.id).unwrap_or(&0);
+                    let remaining_changes = approved
+                        .iter()
+                        .filter(|c| !self.completed_change_ids.contains(&c.id))
+                        .count();
+
                     if change.is_complete() {
-                        self.archive_change(change).await?;
+                        let archive_ctx = ArchiveContext::new(
+                            self.changes_processed,
+                            total_changes,
+                            remaining_changes,
+                            apply_count,
+                        );
+                        match archive_change(
+                            change,
+                            &mut self.agent,
+                            &self.hooks,
+                            &archive_ctx,
+                            &output,
+                        )
+                        .await?
+                        {
+                            ArchiveResult::Success => {
+                                self.changes_processed += 1;
+                                self.completed_change_ids.insert(change.id.clone());
+                            }
+                            ArchiveResult::Failed { error } => {
+                                return Err(OrchestratorError::AgentCommand(error));
+                            }
+                            ArchiveResult::Cancelled => {
+                                return Ok(());
+                            }
+                        }
                     } else {
-                        self.apply_change(change).await?;
+                        let new_apply_count = apply_count + 1;
+                        self.apply_counts.insert(change.id.clone(), new_apply_count);
+
+                        let apply_ctx = ApplyContext::new(
+                            self.changes_processed,
+                            total_changes,
+                            remaining_changes,
+                            new_apply_count,
+                        );
+                        match apply_change(
+                            change,
+                            &mut self.agent,
+                            &self.hooks,
+                            &apply_ctx,
+                            &output,
+                        )
+                        .await?
+                        {
+                            ApplyResult::Success => {}
+                            ApplyResult::Failed { error } => {
+                                return Err(OrchestratorError::AgentCommand(error));
+                            }
+                            ApplyResult::Cancelled => {
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
@@ -923,58 +822,7 @@ mod tests {
         assert_eq!(filtered[0].completed_tasks, 4); // Progress should be updated
     }
 
-    #[test]
-    fn test_build_analysis_prompt_format() {
-        let config = OrchestratorConfig::default();
-        let orchestrator = Orchestrator::with_config(None, config).unwrap();
-
-        let changes = vec![
-            create_test_change("add-feature", 2, 5),
-            create_test_change("fix-bug", 4, 4),
-        ];
-
-        let prompt = orchestrator.build_analysis_prompt(&changes);
-
-        // Verify prompt contains change IDs
-        assert!(prompt.contains("add-feature"));
-        assert!(prompt.contains("fix-bug"));
-
-        // Verify prompt contains progress info
-        assert!(prompt.contains("2/5 tasks"));
-        assert!(prompt.contains("40.0%"));
-        assert!(prompt.contains("4/4 tasks"));
-        assert!(prompt.contains("100.0%"));
-
-        // Verify prompt contains instruction header
-        assert!(prompt.contains("変更一覧"));
-        assert!(prompt.contains("選択基準"));
-    }
-
-    #[test]
-    fn test_build_analysis_prompt_with_empty_changes() {
-        let config = OrchestratorConfig::default();
-        let orchestrator = Orchestrator::with_config(None, config).unwrap();
-
-        let changes: Vec<Change> = vec![];
-        let prompt = orchestrator.build_analysis_prompt(&changes);
-
-        // Prompt should still have structure even with no changes
-        assert!(prompt.contains("変更一覧"));
-        assert!(prompt.contains("選択基準"));
-    }
-
-    #[test]
-    fn test_build_analysis_prompt_with_single_change() {
-        let config = OrchestratorConfig::default();
-        let orchestrator = Orchestrator::with_config(None, config).unwrap();
-
-        let changes = vec![create_test_change("only-change", 1, 3)];
-        let prompt = orchestrator.build_analysis_prompt(&changes);
-
-        assert!(prompt.contains("only-change"));
-        assert!(prompt.contains("1/3 tasks"));
-        assert!(prompt.contains("33.3%"));
-    }
+    // Note: build_analysis_prompt tests moved to src/orchestration/selection.rs
 
     #[test]
     fn test_orchestrator_creation() {
