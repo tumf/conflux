@@ -1032,7 +1032,7 @@ The TUI SHALL allow users to stop ongoing processing using the Escape key.
 
 ### Requirement: TUI Stopped Mode
 
-The TUI SHALL provide a Stopped mode where users can review progress and manage the queue before resuming.
+The TUI SHALL provide a Stopped mode where users can review progress and manage the queue before resuming. Task completion in Stopped mode SHALL NOT automatically add changes to the queue.
 
 #### Scenario: Stopped mode display
 
@@ -1053,6 +1053,14 @@ The TUI SHALL provide a Stopped mode where users can review progress and manage 
 - **WHEN** TUI is in Stopped mode
 - **AND** user presses Space on a not-queued change
 - **THEN** the change is added to the queue
+
+#### Scenario: Task completion in Stopped mode does not auto-queue
+
+- **WHEN** TUI is in Stopped mode
+- **AND** a change's tasks are updated (e.g., all tasks marked complete)
+- **THEN** the change queue_status SHALL remain unchanged
+- **AND** the change SHALL NOT be automatically added to the queue
+- **AND** the change SHALL only be queued when user explicitly presses Space key
 
 #### Scenario: Resume processing from Stopped mode
 
