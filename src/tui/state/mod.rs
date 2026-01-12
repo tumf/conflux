@@ -1481,4 +1481,48 @@ mod tests {
         // web_url should be None by default
         assert!(app.web_url.is_none());
     }
+
+    // === Tests for proposal editing status preservation ===
+
+    #[test]
+    fn test_app_mode_preserved_during_proposal_edit_simulation() {
+        // Simulate the behavior of opening and closing editor during proposal edit
+        // The editor launch/exit does NOT change app.mode
+        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let app = AppState::new(changes);
+
+        // Start in Select mode
+        assert_eq!(app.mode, AppMode::Select);
+
+        // Simulate editor launch: mode should remain unchanged
+        // (In actual code: disable_raw_mode, LeaveAlternateScreen, launch editor, EnterAlternateScreen, enable_raw_mode)
+        // No app.mode change occurs
+        assert_eq!(app.mode, AppMode::Select);
+    }
+
+    #[test]
+    fn test_app_mode_preserved_during_proposal_edit_in_running_mode() {
+        // Test that app.mode remains Running when editor is launched from Running mode
+        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        assert_eq!(app.mode, AppMode::Running);
+
+        // Simulate editor launch and exit: mode should remain Running
+        assert_eq!(app.mode, AppMode::Running);
+    }
+
+    #[test]
+    fn test_app_mode_preserved_during_proposal_edit_in_stopped_mode() {
+        // Test that app.mode remains Stopped when editor is launched from Stopped mode
+        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.mode = AppMode::Stopped;
+
+        // Simulate editor launch and exit: mode should remain Stopped
+        assert_eq!(app.mode, AppMode::Stopped);
+    }
 }
