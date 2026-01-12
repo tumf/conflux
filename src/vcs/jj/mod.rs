@@ -344,7 +344,7 @@ impl JjWorkspaceManager {
 
         // Switch to the merge commit using `jj edit`
         let edit_output = Command::new("jj")
-            .args(["edit", "--ignore-working-copy", &merge_rev])
+            .args(["edit", &merge_rev])
             .current_dir(&self.repo_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -359,17 +359,6 @@ impl JjWorkspaceManager {
                 "Failed to edit merge commit: {}",
                 stderr
             )));
-        }
-
-        // Refresh working copy to avoid stale workspace after --ignore-working-copy
-        if let Err(e) = Command::new("jj")
-            .args(["workspace", "update-stale"])
-            .current_dir(&self.repo_root)
-            .stdin(Stdio::null())
-            .output()
-            .await
-        {
-            warn!("Failed to update stale workspace after merge edit: {}", e);
         }
 
         Ok(merge_rev)
@@ -398,7 +387,6 @@ impl JjWorkspaceManager {
                 "-r",
                 "heads(all())",
                 "--no-graph",
-                "--ignore-working-copy",
                 "-T",
                 "change_id ++ \"\\n\"",
                 "-l",
@@ -680,9 +668,8 @@ impl WorkspaceManager for JjWorkspaceManager {
     }
 
     async fn set_commit_message(&self, workspace_path: &Path, message: &str) -> VcsResult<()> {
-        // Use --ignore-working-copy to avoid stale working copy errors in workspaces
         let output = tokio::process::Command::new("jj")
-            .args(["describe", "--ignore-working-copy", "-m", message])
+            .args(["describe", "-m", message])
             .current_dir(workspace_path)
             .stdin(Stdio::null())
             .output()
@@ -698,15 +685,7 @@ impl WorkspaceManager for JjWorkspaceManager {
 
     async fn get_revision_in_workspace(&self, workspace_path: &Path) -> VcsResult<String> {
         let output = tokio::process::Command::new("jj")
-            .args([
-                "log",
-                "-r",
-                "@",
-                "--no-graph",
-                "--ignore-working-copy",
-                "-T",
-                "change_id",
-            ])
+            .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
             .current_dir(workspace_path)
             .output()
             .await

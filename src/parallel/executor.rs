@@ -51,10 +51,8 @@ pub async fn create_progress_commit(
     match vcs_backend {
         VcsBackend::Jj => {
             // jj automatically snapshots working copy changes
-            // Just update the commit message with --ignore-working-copy
-            // to avoid stale working copy errors in workspaces
             let output = Command::new("jj")
-                .args(["describe", "--ignore-working-copy", "-m", &commit_message])
+                .args(["describe", "-m", &commit_message])
                 .current_dir(workspace_path)
                 .stdin(StdStdio::null())
                 .output()
@@ -580,9 +578,8 @@ pub async fn execute_apply_in_workspace(
 
     match vcs_backend {
         VcsBackend::Jj => {
-            // Use --ignore-working-copy to avoid stale working copy errors in workspaces
             let describe_output = Command::new("jj")
-                .args(["describe", "--ignore-working-copy", "-m", &commit_message])
+                .args(["describe", "-m", &commit_message])
                 .current_dir(workspace_path)
                 .stdin(StdStdio::null())
                 .output()
@@ -625,17 +622,8 @@ pub async fn execute_apply_in_workspace(
     // Get the resulting revision
     let revision = match vcs_backend {
         VcsBackend::Jj => {
-            // Use --ignore-working-copy to avoid triggering automatic snapshot
             let revision_output = Command::new("jj")
-                .args([
-                    "log",
-                    "-r",
-                    "@",
-                    "--no-graph",
-                    "--ignore-working-copy",
-                    "-T",
-                    "commit_id",
-                ])
+                .args(["log", "-r", "@", "--no-graph", "-T", "commit_id"])
                 .current_dir(workspace_path)
                 .output()
                 .await
@@ -949,14 +937,8 @@ pub async fn execute_archive_in_workspace(
                 )));
             }
 
-            // Use --ignore-working-copy to avoid stale working copy errors in workspaces
             let describe_output = Command::new("jj")
-                .args([
-                    "describe",
-                    "--ignore-working-copy",
-                    "-m",
-                    &format!("Archive: {}", change_id),
-                ])
+                .args(["describe", "-m", &format!("Archive: {}", change_id)])
                 .current_dir(workspace_path)
                 .output()
                 .await
@@ -978,15 +960,7 @@ pub async fn execute_archive_in_workspace(
     let revision = match vcs_backend {
         VcsBackend::Jj => {
             let revision_output = Command::new("jj")
-                .args([
-                    "log",
-                    "-r",
-                    "@",
-                    "--no-graph",
-                    "--ignore-working-copy",
-                    "-T",
-                    "commit_id",
-                ])
+                .args(["log", "-r", "@", "--no-graph", "-T", "commit_id"])
                 .current_dir(workspace_path)
                 .output()
                 .await

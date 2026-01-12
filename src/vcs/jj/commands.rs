@@ -42,19 +42,7 @@ pub async fn run_jj_ignore_error<P: AsRef<Path>>(args: &[&str], cwd: P) {
 
 /// Get the current revision (change_id) at @ in the given directory.
 pub async fn get_current_revision<P: AsRef<Path>>(cwd: P) -> VcsResult<String> {
-    run_jj(
-        &[
-            "log",
-            "-r",
-            "@",
-            "--no-graph",
-            "--ignore-working-copy",
-            "-T",
-            "change_id",
-        ],
-        cwd,
-    )
-    .await
+    run_jj(&["log", "-r", "@", "--no-graph", "-T", "change_id"], cwd).await
 }
 
 /// Check if jj is available and the directory is a jj repository.
