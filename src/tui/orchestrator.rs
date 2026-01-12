@@ -127,30 +127,13 @@ pub async fn archive_single_change(
     })?;
 
     if status.success() {
-        // Verify that the change was actually archived
-        // The change directory should no longer exist in openspec/changes/
-        let change_path = std::path::Path::new("openspec/changes").join(change_id);
-        let archive_path = std::path::Path::new("openspec/changes/archive").join(change_id);
+        // Verify that the change was actually archived using common function
+        use crate::execution::archive::{build_archive_error_message, verify_archive_completion};
 
-        let change_exists = change_path.exists();
-        let archive_exists = archive_path.exists();
+        let verification = verify_archive_completion(change_id, None);
 
-        tracing::debug!(
-            change_id = %change_id,
-            change_path = %change_path.display(),
-            archive_path = %archive_path.display(),
-            change_exists = change_exists,
-            archive_exists = archive_exists,
-            "archive_single_change: verifying archive paths"
-        );
-
-        if change_exists && !archive_exists {
-            let error_msg = format!(
-                "Archive command succeeded but change '{}' was not actually archived. \
-                 The change directory still exists in openspec/changes/. \
-                 The archive command may not have executed 'openspec archive' correctly.",
-                change_id
-            );
+        if !verification.is_success() {
+            let error_msg = build_archive_error_message(change_id);
             let _ = tx
                 .send(OrchestratorEvent::ProcessingError {
                     id: change_id.to_string(),

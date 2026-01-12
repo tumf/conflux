@@ -138,27 +138,42 @@ pub async fn create_progress_commit(
 ///
 /// Reads and parses the tasks.md file to determine completion status.
 /// Returns None if the file doesn't exist (e.g., after archiving).
+///
+/// This function delegates to `crate::execution::archive::get_task_progress`
+/// for the actual implementation.
 pub fn check_task_progress(
     workspace_path: &Path,
     change_id: &str,
 ) -> Option<crate::task_parser::TaskProgress> {
-    let tasks_path = workspace_path
-        .join("openspec/changes")
-        .join(change_id)
-        .join("tasks.md");
+    use crate::execution::archive::get_task_progress;
 
-    debug!("Checking tasks at: {:?}", tasks_path);
+    debug!(
+        "Checking tasks at: {:?}",
+        workspace_path
+            .join("openspec/changes")
+            .join(change_id)
+            .join("tasks.md")
+    );
 
-    if tasks_path.exists() {
-        let progress = crate::task_parser::parse_file(&tasks_path).unwrap_or_default();
-        debug!(
-            "Tasks file found for {}: {}/{} complete",
-            change_id, progress.completed, progress.total
-        );
-        Some(progress)
-    } else {
-        debug!("Tasks file not found at {:?}", tasks_path);
-        None
+    match get_task_progress(change_id, Some(workspace_path)) {
+        Ok(Some(progress)) => {
+            debug!(
+                "Tasks file found for {}: {}/{} complete",
+                change_id, progress.completed, progress.total
+            );
+            Some(progress)
+        }
+        Ok(None) => {
+            debug!(
+                "Tasks file not found for {} in {:?}",
+                change_id, workspace_path
+            );
+            None
+        }
+        Err(e) => {
+            debug!("Failed to parse tasks for {}: {}", change_id, e);
+            None
+        }
     }
 }
 
@@ -505,29 +520,34 @@ pub async fn execute_archive_in_workspace(
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
     vcs_backend: VcsBackend,
 ) -> Result<String> {
-    // Verify task completion before archiving
-    let tasks_path = workspace_path
-        .join("openspec/changes")
-        .join(change_id)
-        .join("tasks.md");
+    // Verify task completion before archiving using common function
+    use crate::execution::archive::get_task_progress;
 
-    if tasks_path.exists() {
-        let progress = crate::task_parser::parse_file(&tasks_path).unwrap_or_default();
-        if progress.total > 0 && progress.completed < progress.total {
-            return Err(OrchestratorError::AgentCommand(format!(
-                "Cannot archive {}: tasks not complete ({}/{})",
+    match get_task_progress(change_id, Some(workspace_path)) {
+        Ok(Some(progress)) => {
+            if progress.total > 0 && progress.completed < progress.total {
+                return Err(OrchestratorError::AgentCommand(format!(
+                    "Cannot archive {}: tasks not complete ({}/{})",
+                    change_id, progress.completed, progress.total
+                )));
+            }
+            info!(
+                "Task verification passed for {}: {}/{}",
                 change_id, progress.completed, progress.total
-            )));
+            );
         }
-        info!(
-            "Task verification passed for {}: {}/{}",
-            change_id, progress.completed, progress.total
-        );
-    } else {
-        warn!(
-            "Tasks file not found for {} in workspace, proceeding with archive",
-            change_id
-        );
+        Ok(None) => {
+            warn!(
+                "Tasks file not found for {} in workspace, proceeding with archive",
+                change_id
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Failed to parse tasks for {}: {}, proceeding with archive",
+                change_id, e
+            );
+        }
     }
 
     // Expand change_id and prompt in archive command
@@ -610,36 +630,13 @@ pub async fn execute_archive_in_workspace(
         )));
     }
 
-    // Verify that the change was actually archived
-    // The change directory should no longer exist in openspec/changes/ (except in archive/)
-    let change_path = workspace_path.join("openspec/changes").join(change_id);
-    let archive_dir = workspace_path.join("openspec/changes/archive");
+    // Verify that the change was actually archived using common function
+    use crate::execution::archive::{build_archive_error_message, verify_archive_completion};
 
-    // Check if change was moved: original path should not exist,
-    // and there should be an archive entry (format: {date}-{change_id} or just {change_id})
-    let archived = if change_path.exists() {
-        false
-    } else if archive_dir.exists() {
-        // Look for any directory in archive that ends with the change_id
-        std::fs::read_dir(&archive_dir)
-            .map(|entries| {
-                entries.filter_map(|e| e.ok()).any(|entry| {
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    name_str == change_id || name_str.ends_with(&format!("-{}", change_id))
-                })
-            })
-            .unwrap_or(false)
-    } else {
-        false
-    };
-
-    if !archived {
-        return Err(OrchestratorError::AgentCommand(format!(
-            "Archive command succeeded but change '{}' was not actually archived. \
-             The change directory still exists in openspec/changes/. \
-             The archive command may not have executed 'openspec archive' correctly.",
-            change_id
+    let verification = verify_archive_completion(change_id, Some(workspace_path));
+    if !verification.is_success() {
+        return Err(OrchestratorError::AgentCommand(build_archive_error_message(
+            change_id,
         )));
     }
 
