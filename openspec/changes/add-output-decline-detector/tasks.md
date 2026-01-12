@@ -7,7 +7,7 @@
 - [ ] `detect_output_decline()`メソッドで前回比70%減少を検出
 - [ ] configに`output_decline_detector.enabled`と`output_decline_detector.threshold_percent`を追加
 - [ ] orchestrator.rsのapply後に出力履歴を更新
-- [ ] 出力減少検出時にwarningログを出力
+- [ ] 出力減少検出時にwarningログを出力しchangeをスキップ
 
 ## テストタスク
 

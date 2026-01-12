@@ -92,6 +92,48 @@ fn render_qr_popup(f: &mut Frame, area: Rect, url: &str) {
 }
 ```
 
+## URL変換ロジック
+
+### 自動割当ポートとバインドアドレスからアクセスURLへの変換
+
+Webサーバーはポート0を指定した場合、OSが空いているポートを自動割当する。
+サーバー起動後に実際のポートを取得し、モバイルデバイスからアクセス可能なURLを構築する:
+
+```rust
+/// サーバー起動後に実際のポートを取得してURLを構築
+fn build_access_url(bind_addr: &str, actual_port: u16) -> String {
+    let host = match bind_addr {
+        "0.0.0.0" => get_local_ip().unwrap_or_else(|| {
+            tracing::warn!("Could not determine local IP, using localhost (limited accessibility)");
+            "localhost".to_string()
+        }),
+        "127.0.0.1" | "localhost" => "localhost".to_string(),
+        addr => addr.to_string(),
+    };
+    format!("http://{}:{}", host, actual_port)
+}
+
+fn get_local_ip() -> Option<String> {
+    // ローカルネットワークのIPアドレスを取得
+    // 例: 192.168.1.100
+    local_ip_address::local_ip().ok().map(|ip| ip.to_string())
+}
+
+/// サーバー起動後に実際のポートを取得
+async fn get_actual_port(listener: &TcpListener) -> u16 {
+    listener.local_addr().unwrap().port()
+}
+```
+
+### 変換ルール
+
+| バインドアドレス | 実際のポート | 変換後のURL |
+|------------------|--------------|-------------|
+| `0.0.0.0:0` (自動) | 54321 | `http://192.168.1.100:54321` |
+| `127.0.0.1:0` (自動) | 54321 | `http://localhost:54321` |
+| `0.0.0.0:8080` (固定) | 8080 | `http://192.168.1.100:8080` |
+| `127.0.0.1:8080` (固定) | 8080 | `http://localhost:8080` |
+
 ## キーバインド設計
 
 | キー | モード | アクション |
@@ -111,6 +153,7 @@ fn render_qr_popup(f: &mut Frame, area: Rect, url: &str) {
 ```toml
 [dependencies]
 qrcode = "0.14"  # QRコード生成
+local-ip-address = "0.6"  # ローカルIP取得
 ```
 
 ### フィーチャーフラグ
@@ -119,7 +162,7 @@ QRコード機能は `web-monitoring` フィーチャーに含める:
 
 ```toml
 [features]
-web-monitoring = ["axum", "tower", "tower-http", "qrcode"]
+web-monitoring = ["axum", "tower", "tower-http", "qrcode", "local-ip-address"]
 ```
 
 ## エラーハンドリング
@@ -133,10 +176,14 @@ web-monitoring = ["axum", "tower", "tower-http", "qrcode"]
 3. **ターミナルサイズ不足**: QRコードが収まらない
    - 小さいバージョンのQRコードを生成（エラー訂正レベル調整）
 
+4. **ローカルIP取得失敗**: ネットワークインターフェースがない場合
+   - `localhost` にフォールバック（モバイルからはアクセス不可の警告表示）
+
 ## テスト戦略
 
 1. **ユニットテスト**:
    - QRコード生成関数のテスト
+   - URL変換ロジックのテスト
    - AppMode遷移のテスト
 
 2. **統合テスト**:

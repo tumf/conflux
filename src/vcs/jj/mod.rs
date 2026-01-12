@@ -315,6 +315,17 @@ impl JjWorkspaceManager {
                 )));
             }
 
+            // Refresh working copy to avoid stale workspace after --ignore-working-copy
+            if let Err(e) = Command::new("jj")
+                .args(["workspace", "update-stale"])
+                .current_dir(&self.repo_root)
+                .stdin(Stdio::null())
+                .output()
+                .await
+            {
+                warn!("Failed to update stale workspace after edit: {}", e);
+            }
+
             // Return the revision we just switched to
             return Ok(revisions[0].clone());
         }
@@ -378,6 +389,17 @@ impl JjWorkspaceManager {
                 "Failed to edit merge commit: {}",
                 stderr
             )));
+        }
+
+        // Refresh working copy to avoid stale workspace after --ignore-working-copy
+        if let Err(e) = Command::new("jj")
+            .args(["workspace", "update-stale"])
+            .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
+            .output()
+            .await
+        {
+            warn!("Failed to update stale workspace after merge edit: {}", e);
         }
 
         Ok(merge_rev)

@@ -94,17 +94,13 @@ async fn main() -> Result<()> {
             let web_url = if args.web {
                 let web_state = std::sync::Arc::new(web::WebState::new(&changes));
                 let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone());
-                let url = format!("http://{}:{}", web_config.bind, web_config.port);
-                if web_config.port == 0 {
-                    tracing::info!(
-                        "Starting web monitoring server on {}:<auto-assigned port>",
-                        web_config.bind
-                    );
-                } else {
-                    tracing::info!("Starting web monitoring server on {}", url);
+                match web::spawn_server_with_url(web_config, web_state).await {
+                    Ok((_web_handle, url)) => Some(url),
+                    Err(e) => {
+                        tracing::warn!("Failed to start web monitoring server: {}", e);
+                        None
+                    }
                 }
-                let _web_handle = web::spawn_server(web_config, web_state);
-                Some(url)
             } else {
                 None
             };
@@ -141,19 +137,16 @@ async fn main() -> Result<()> {
                 let initial_changes = openspec::list_changes_native()?;
                 let web_state = std::sync::Arc::new(web::WebState::new(&initial_changes));
                 let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone());
-                if web_config.port == 0 {
-                    info!(
-                        "Starting web monitoring server on {}:<auto-assigned port>",
-                        web_config.bind
-                    );
-                } else {
-                    info!(
-                        "Starting web monitoring server on http://{}:{}",
-                        web_config.bind, web_config.port
-                    );
+                match web::spawn_server_with_url(web_config, web_state.clone()).await {
+                    Ok((_handle, url)) => {
+                        info!("Web monitoring available at: {}", url);
+                        Some(web_state)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to start web monitoring server: {}", e);
+                        None
+                    }
                 }
-                let _handle = web::spawn_server(web_config, web_state.clone());
-                Some(web_state)
             } else {
                 None
             };

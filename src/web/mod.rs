@@ -3,6 +3,8 @@
 //! Provides an optional HTTP server with REST API and WebSocket support
 //! for monitoring orchestration state remotely via web browser.
 
+mod url;
+
 #[cfg(feature = "web-monitoring")]
 pub mod api;
 #[cfg(feature = "web-monitoring")]
@@ -30,6 +32,8 @@ use tracing::info;
 
 #[cfg(feature = "web-monitoring")]
 pub use state::WebState;
+
+pub use url::build_access_url;
 
 /// Web server configuration
 #[derive(Debug, Clone)]
@@ -99,6 +103,7 @@ async fn serve_js() -> Response {
 
 /// Start the web monitoring server
 #[cfg(feature = "web-monitoring")]
+#[allow(dead_code)]
 pub async fn start_server(
     config: WebConfig,
     state: Arc<WebState>,
@@ -151,11 +156,76 @@ async fn shutdown_signal() {
 
 /// Start the web server in a background task (non-blocking)
 #[cfg(feature = "web-monitoring")]
+#[allow(dead_code)]
 pub fn spawn_server(
     config: WebConfig,
     state: Arc<WebState>,
 ) -> tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
     tokio::spawn(async move { start_server(config, state).await })
+}
+
+/// Start the web server and return the accessible URL.
+///
+/// This function binds to the specified address, determines the actual port
+/// (important when port 0 is used for auto-assignment), and constructs an
+/// accessible URL that can be used for QR code generation.
+///
+/// Returns a tuple of (JoinHandle, accessible_url).
+#[cfg(feature = "web-monitoring")]
+pub async fn spawn_server_with_url(
+    config: WebConfig,
+    state: Arc<WebState>,
+) -> Result<
+    (
+        tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+        String,
+    ),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let addr: SocketAddr = format!("{}:{}", config.bind, config.port).parse()?;
+
+    // CORS configuration for local development
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    // Build router with API and static routes
+    let app = Router::new()
+        // Static file routes
+        .route("/", get(serve_index))
+        .route("/style.css", get(serve_css))
+        .route("/app.js", get(serve_js))
+        // API routes
+        .route("/api/health", get(api::health))
+        .route("/api/state", get(api::get_state))
+        .route("/api/changes", get(api::list_changes))
+        .route("/api/changes/{id}", get(api::get_change))
+        // WebSocket route
+        .route("/ws", get(websocket::ws_handler))
+        .layer(cors)
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+
+    // Bind to the specified address (port 0 = OS auto-assign)
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Get the actual bound address (includes OS-assigned port if port was 0)
+    let actual_addr = listener.local_addr()?;
+    let actual_port = actual_addr.port();
+
+    // Build accessible URL using local IP for 0.0.0.0 bind
+    let url = build_access_url(&config.bind, actual_port);
+    info!("Web monitoring server listening on {}", url);
+
+    // Spawn the server in a background task
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+        Ok(())
+    });
+
+    Ok((handle, url))
 }
 
 // Stub implementations for when web-monitoring feature is disabled

@@ -1,8 +1,11 @@
 # tui-qr-popup Specification
 
 ## Purpose
-TBD - created by archiving change add-tui-qr-popup. Update Purpose after archive.
+
+Defines the QR code popup feature for displaying Web UI access URL in TUI mode.
+
 ## Requirements
+
 ### Requirement: QR Code Popup Display
 
 The TUI SHALL provide a QR code popup overlay to display the Web UI access URL when web monitoring is enabled.
@@ -45,7 +48,7 @@ The TUI SHALL generate valid QR codes from Web UI URLs using ASCII/Unicode rende
 
 #### Scenario: Generate QR code from valid URL
 
-- **GIVEN** a valid Web UI URL like "http://127.0.0.1:8080"
+- **GIVEN** a valid Web UI URL like "http://192.168.1.100:54321"
 - **WHEN** QR code generation is requested
 - **THEN** a valid QR code string SHALL be generated
 - **AND** the QR code SHALL be scannable by standard QR code readers
@@ -81,21 +84,57 @@ The TUI SHALL display appropriate key hints for the QR popup feature based on we
 
 ### Requirement: Web URL State Management
 
-The TUI SHALL maintain the Web UI URL in application state when web monitoring is enabled.
+The TUI SHALL receive the actual Web UI URL after server startup, including the auto-assigned port.
 
-#### Scenario: Set web URL on TUI startup with web flag
+#### Scenario: Set web URL after server binds to auto-assigned port
 
 - **GIVEN** the orchestrator is started with `--web` flag
-- **AND** `--web-port` is set to 3000
-- **AND** `--web-bind` is set to "0.0.0.0"
-- **WHEN** the TUI initializes
-- **THEN** AppState.web_url SHALL be set to "http://0.0.0.0:3000"
+- **AND** the web server binds to an auto-assigned port
+- **AND** the bind address is "0.0.0.0"
+- **WHEN** the web server successfully starts
+- **THEN** AppState.web_url SHALL be set to "http://<local-ip>:<actual-port>"
+- **AND** the actual port SHALL be the port assigned by the OS
+
+#### Scenario: Set web URL with localhost bind
+
+- **GIVEN** the orchestrator is started with `--web` flag
+- **AND** the bind address is "127.0.0.1"
+- **WHEN** the web server successfully starts
+- **THEN** AppState.web_url SHALL be set to "http://localhost:<actual-port>"
 
 #### Scenario: Web URL is None without web flag
 
 - **GIVEN** the orchestrator is started without `--web` flag
 - **WHEN** the TUI initializes
 - **THEN** AppState.web_url SHALL be None
+
+### Requirement: Access URL Construction
+
+The TUI SHALL construct an accessible URL from bind address and actual port.
+
+#### Scenario: Convert 0.0.0.0 bind to local IP
+
+- **GIVEN** the web server binds to "0.0.0.0"
+- **AND** the local network IP is "192.168.1.100"
+- **AND** the actual assigned port is 54321
+- **WHEN** the access URL is constructed
+- **THEN** the URL SHALL be "http://192.168.1.100:54321"
+
+#### Scenario: Keep localhost for 127.0.0.1 bind
+
+- **GIVEN** the web server binds to "127.0.0.1"
+- **AND** the actual assigned port is 54321
+- **WHEN** the access URL is constructed
+- **THEN** the URL SHALL be "http://localhost:54321"
+
+#### Scenario: Fallback to localhost when local IP unavailable
+
+- **GIVEN** the web server binds to "0.0.0.0"
+- **AND** no local network IP can be determined
+- **AND** the actual assigned port is 54321
+- **WHEN** the access URL is constructed
+- **THEN** the URL SHALL be "http://localhost:54321"
+- **AND** a warning SHALL be logged about limited accessibility
 
 ### Requirement: QR Popup Layout
 
@@ -115,4 +154,3 @@ The TUI SHALL render the QR popup with proper centering and sizing.
 - **WHEN** the QR popup is displayed
 - **THEN** the popup SHALL display with reduced QR code size if possible
 - **OR** display URL text only with a message about terminal size
-
