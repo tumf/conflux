@@ -1,4 +1,5 @@
 // OpenSpec Orchestrator Web Monitor - Client Application
+// Responsive mobile-first implementation with touch support
 
 class WebMonitor {
     constructor() {
@@ -6,6 +7,8 @@ class WebMonitor {
         this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 10;
         this.reconnectDelay = 1000;
+        this.isMobile = window.matchMedia('(max-width: 767px)').matches;
+        this.previousConnectionStatus = null;
 
         this.elements = {
             connectionStatus: document.getElementById('connection-status'),
@@ -18,9 +21,202 @@ class WebMonitor {
             changesList: document.getElementById('changes-list'),
             emptyState: document.getElementById('empty-state'),
             lastUpdated: document.getElementById('last-updated'),
+            toastContainer: document.getElementById('toast-container'),
+            ptrIndicator: document.getElementById('ptr-indicator'),
+            ptrText: document.querySelector('.ptr-text'),
         };
 
+        this.touchState = {
+            startX: 0,
+            startY: 0,
+            currentX: 0,
+            currentY: 0,
+            isDragging: false,
+            element: null,
+        };
+
+        this.ptrState = {
+            startY: 0,
+            isPulling: false,
+            isRefreshing: false,
+            threshold: 80,
+        };
+
+        this.setupMediaQueryListener();
+        this.setupTouchHandlers();
+        this.setupPullToRefresh();
         this.connect();
+    }
+
+    setupMediaQueryListener() {
+        const mq = window.matchMedia('(max-width: 767px)');
+        mq.addEventListener('change', (e) => {
+            this.isMobile = e.matches;
+        });
+    }
+
+    setupTouchHandlers() {
+        this.elements.changesList.addEventListener('touchstart', this.handleTouchStart.bind(this), { passive: true });
+        this.elements.changesList.addEventListener('touchmove', this.handleTouchMove.bind(this), { passive: true });
+        this.elements.changesList.addEventListener('touchend', this.handleTouchEnd.bind(this));
+        this.elements.changesList.addEventListener('click', this.handleCardClick.bind(this));
+    }
+
+    setupPullToRefresh() {
+        document.addEventListener('touchstart', this.handlePtrStart.bind(this), { passive: true });
+        document.addEventListener('touchmove', this.handlePtrMove.bind(this), { passive: false });
+        document.addEventListener('touchend', this.handlePtrEnd.bind(this));
+    }
+
+    handlePtrStart(e) {
+        if (!this.isMobile || this.ptrState.isRefreshing) return;
+        if (window.scrollY > 0) return;
+
+        this.ptrState.startY = e.touches[0].clientY;
+        this.ptrState.isPulling = true;
+    }
+
+    handlePtrMove(e) {
+        if (!this.ptrState.isPulling || this.ptrState.isRefreshing) return;
+
+        const currentY = e.touches[0].clientY;
+        const pullDistance = currentY - this.ptrState.startY;
+
+        if (pullDistance > 0 && window.scrollY === 0) {
+            e.preventDefault();
+
+            const indicator = this.elements.ptrIndicator;
+            const progress = Math.min(pullDistance / this.ptrState.threshold, 1);
+
+            if (pullDistance > 10) {
+                indicator.classList.add('visible');
+            }
+
+            if (pullDistance >= this.ptrState.threshold) {
+                this.elements.ptrText.textContent = 'Release to refresh';
+            } else {
+                this.elements.ptrText.textContent = 'Pull to refresh';
+            }
+
+            const icon = indicator.querySelector('.ptr-icon');
+            icon.style.transform = `rotate(${progress * 180}deg)`;
+        }
+    }
+
+    handlePtrEnd() {
+        if (!this.ptrState.isPulling || this.ptrState.isRefreshing) return;
+
+        const indicator = this.elements.ptrIndicator;
+        const currentY = this.ptrState.startY;
+
+        this.ptrState.isPulling = false;
+
+        const touchEndY = event.changedTouches?.[0]?.clientY || currentY;
+        const pullDistance = touchEndY - this.ptrState.startY;
+
+        if (pullDistance >= this.ptrState.threshold) {
+            this.triggerRefresh();
+        } else {
+            indicator.classList.remove('visible');
+            this.elements.ptrText.textContent = 'Pull to refresh';
+            const icon = indicator.querySelector('.ptr-icon');
+            icon.style.transform = '';
+        }
+    }
+
+    triggerRefresh() {
+        this.ptrState.isRefreshing = true;
+        const indicator = this.elements.ptrIndicator;
+        indicator.classList.add('refreshing');
+        this.elements.ptrText.textContent = 'Refreshing...';
+
+        const icon = indicator.querySelector('.ptr-icon');
+        icon.style.transform = '';
+
+        // Request fresh data from server
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({ type: 'refresh' }));
+            this.showToast('Refreshing data...', 'info');
+        } else {
+            this.showToast('Not connected. Reconnecting...', 'warning');
+            this.connect();
+        }
+
+        // Reset after a delay
+        setTimeout(() => {
+            indicator.classList.remove('visible', 'refreshing');
+            this.elements.ptrText.textContent = 'Pull to refresh';
+            this.ptrState.isRefreshing = false;
+        }, 1500);
+    }
+
+    handleTouchStart(e) {
+        const card = e.target.closest('.change-card');
+        if (!card) return;
+
+        const touch = e.touches[0];
+        this.touchState = {
+            startX: touch.clientX,
+            startY: touch.clientY,
+            currentX: touch.clientX,
+            currentY: touch.clientY,
+            isDragging: true,
+            element: card,
+        };
+    }
+
+    handleTouchMove(e) {
+        if (!this.touchState.isDragging) return;
+
+        const touch = e.touches[0];
+        this.touchState.currentX = touch.clientX;
+        this.touchState.currentY = touch.clientY;
+
+        const deltaX = this.touchState.currentX - this.touchState.startX;
+        const deltaY = this.touchState.currentY - this.touchState.startY;
+
+        // Only trigger horizontal swipe if movement is primarily horizontal
+        if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) > 10) {
+            this.touchState.element.classList.add('swiping');
+        }
+    }
+
+    handleTouchEnd() {
+        if (!this.touchState.isDragging) return;
+
+        const deltaX = this.touchState.currentX - this.touchState.startX;
+        const deltaY = this.touchState.currentY - this.touchState.startY;
+        const card = this.touchState.element;
+
+        card.classList.remove('swiping');
+
+        // Swipe right to expand, left to collapse
+        if (Math.abs(deltaX) > 50 && Math.abs(deltaX) > Math.abs(deltaY)) {
+            if (deltaX > 0) {
+                card.classList.add('expanded');
+            } else {
+                card.classList.remove('expanded');
+            }
+        }
+
+        this.touchState = {
+            startX: 0,
+            startY: 0,
+            currentX: 0,
+            currentY: 0,
+            isDragging: false,
+            element: null,
+        };
+    }
+
+    handleCardClick(e) {
+        const card = e.target.closest('.change-card');
+        if (!card || !this.isMobile) return;
+
+        // Don't toggle if clicking on an interactive element
+        if (e.target.closest('a, button')) return;
+
+        card.classList.toggle('expanded');
     }
 
     connect() {
@@ -68,6 +264,7 @@ class WebMonitor {
         if (this.reconnectAttempts >= this.maxReconnectAttempts) {
             console.log('Max reconnect attempts reached');
             this.elements.statusText.textContent = 'Connection failed';
+            this.showToast('Connection failed. Please refresh the page.', 'error');
             return;
         }
 
@@ -84,6 +281,16 @@ class WebMonitor {
         const el = this.elements.connectionStatus;
         el.classList.remove('connected', 'disconnected');
 
+        // Show toast on status change
+        if (this.previousConnectionStatus !== null && this.previousConnectionStatus !== status) {
+            if (status === 'connected') {
+                this.showToast('Connected to server', 'success');
+            } else if (status === 'disconnected') {
+                this.showToast('Disconnected from server', 'warning');
+            }
+        }
+        this.previousConnectionStatus = status;
+
         switch (status) {
             case 'connected':
                 el.classList.add('connected');
@@ -96,6 +303,21 @@ class WebMonitor {
             default:
                 this.elements.statusText.textContent = 'Connecting...';
         }
+    }
+
+    showToast(message, type = 'info') {
+        const toast = document.createElement('div');
+        toast.className = `toast ${type}`;
+        toast.textContent = message;
+        toast.setAttribute('role', 'alert');
+
+        this.elements.toastContainer.appendChild(toast);
+
+        // Auto-remove after 4 seconds
+        setTimeout(() => {
+            toast.style.animation = 'slideOut 0.3s ease-out forwards';
+            setTimeout(() => toast.remove(), 300);
+        }, 4000);
     }
 
     handleMessage(data) {
@@ -175,8 +397,15 @@ class WebMonitor {
                </div>`
             : '';
 
+        const expandHintHtml = this.isMobile
+            ? `<div class="expand-hint">
+                <span class="expand-hint-icon" aria-hidden="true">▼</span>
+                <span>Tap or swipe to expand</span>
+               </div>`
+            : '';
+
         return `
-            <div class="change-card" data-change-id="${this.escapeHtml(change.id)}">
+            <article class="change-card" data-change-id="${this.escapeHtml(change.id)}" role="listitem" tabindex="0">
                 <div class="change-header">
                     <span class="change-id">${this.escapeHtml(change.id)}</span>
                     <div class="change-badges">
@@ -187,7 +416,7 @@ class WebMonitor {
                     </div>
                 </div>
                 <div class="progress-container">
-                    <div class="progress-bar">
+                    <div class="progress-bar" role="progressbar" aria-valuenow="${progressPercent}" aria-valuemin="0" aria-valuemax="100">
                         <div class="progress-fill ${isComplete ? 'complete' : ''}"
                              style="width: ${progressPercent}%"></div>
                     </div>
@@ -196,8 +425,11 @@ class WebMonitor {
                         <span>${progressPercent}%</span>
                     </div>
                 </div>
-                ${dependenciesHtml}
-            </div>
+                <div class="change-details">
+                    ${dependenciesHtml}
+                </div>
+                ${expandHintHtml}
+            </article>
         `;
     }
 
@@ -214,6 +446,27 @@ class WebMonitor {
         div.textContent = text;
         return div.innerHTML;
     }
+}
+
+// Throttle utility for performance optimization
+function throttle(func, limit) {
+    let inThrottle;
+    return function(...args) {
+        if (!inThrottle) {
+            func.apply(this, args);
+            inThrottle = true;
+            setTimeout(() => inThrottle = false, limit);
+        }
+    };
+}
+
+// Debounce utility for performance optimization
+function debounce(func, wait) {
+    let timeout;
+    return function(...args) {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => func.apply(this, args), wait);
+    };
 }
 
 // Initialize on page load

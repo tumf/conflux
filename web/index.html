@@ -2,45 +2,54 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#1a1a2e">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>OpenSpec Orchestrator - Web Monitor</title>
     <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+    <div class="pull-to-refresh-indicator" id="ptr-indicator" aria-live="polite">
+        <div class="ptr-icon" aria-hidden="true"></div>
+        <span class="ptr-text">Pull to refresh</span>
+    </div>
     <div class="container">
         <header>
             <h1>OpenSpec Orchestrator</h1>
-            <div class="connection-status" id="connection-status">
-                <span class="status-dot"></span>
+            <div class="connection-status" id="connection-status" role="status" aria-live="polite">
+                <span class="status-dot" aria-hidden="true"></span>
                 <span class="status-text">Connecting...</span>
             </div>
         </header>
 
-        <div class="stats-bar" id="stats-bar">
+        <div id="toast-container" class="toast-container" aria-live="assertive"></div>
+
+        <section class="stats-bar" id="stats-bar" aria-label="Statistics">
             <div class="stat">
-                <span class="stat-value" id="total-changes">-</span>
+                <span class="stat-value" id="total-changes" aria-label="Total changes">-</span>
                 <span class="stat-label">Total</span>
             </div>
             <div class="stat">
-                <span class="stat-value" id="completed-changes">-</span>
+                <span class="stat-value" id="completed-changes" aria-label="Completed changes">-</span>
                 <span class="stat-label">Completed</span>
             </div>
             <div class="stat">
-                <span class="stat-value" id="in-progress-changes">-</span>
+                <span class="stat-value" id="in-progress-changes" aria-label="In progress changes">-</span>
                 <span class="stat-label">In Progress</span>
             </div>
             <div class="stat">
-                <span class="stat-value" id="pending-changes">-</span>
+                <span class="stat-value" id="pending-changes" aria-label="Pending changes">-</span>
                 <span class="stat-label">Pending</span>
             </div>
-        </div>
+        </section>
 
-        <main id="changes-container">
-            <div class="loading" id="loading">
-                <div class="spinner"></div>
+        <main id="changes-container" role="main">
+            <div class="loading" id="loading" aria-busy="true">
+                <div class="spinner" aria-hidden="true"></div>
                 <p>Loading changes...</p>
             </div>
-            <div class="changes-list" id="changes-list"></div>
+            <div class="changes-list" id="changes-list" role="list"></div>
             <div class="empty-state" id="empty-state" style="display: none;">
                 <p>No changes found.</p>
             </div>
