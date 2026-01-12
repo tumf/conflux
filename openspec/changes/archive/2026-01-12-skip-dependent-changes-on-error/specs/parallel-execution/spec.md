@@ -59,8 +59,6 @@
 - When: `ChangeSkipped` イベントを受信
 - Then: ログペインに「Skipped: change-B (Dependency 'change-A' failed)」が表示される
 
-## MODIFIED Requirements
-
 ### Requirement: Group Execution with Skip Check
 
 グループ実行時に、各変更について依存先の失敗をチェックしなければならない（MUST）。

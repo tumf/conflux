@@ -754,10 +754,7 @@ async fn init_git_repo(path: &Path) -> bool {
         .output()
         .await;
 
-    match commit_result {
-        Ok(output) if output.status.success() => true,
-        _ => false,
-    }
+    matches!(commit_result, Ok(output) if output.status.success())
 }
 
 #[tokio::test]
@@ -1354,5 +1351,5 @@ fn test_jj_tests_structure_exists() {
     // 4. workspace_name_sanitization test should exist
 
     // These are validated by the compilation of jj_workspace.rs
-    assert!(true, "JJ workspace module should exist and compile");
+    // The test itself validates that the module compiles correctly
 }

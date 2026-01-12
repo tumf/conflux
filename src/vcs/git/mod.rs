@@ -341,12 +341,12 @@ impl GitWorkspaceManager {
         let mut current_branch: Option<String> = None;
 
         for line in output.lines() {
-            if line.starts_with("worktree ") {
+            if let Some(worktree_path) = line.strip_prefix("worktree ") {
                 // New worktree entry
-                current_worktree_path = Some(PathBuf::from(&line[9..]));
-            } else if line.starts_with("branch refs/heads/") {
+                current_worktree_path = Some(PathBuf::from(worktree_path));
+            } else if let Some(branch_name) = line.strip_prefix("branch refs/heads/") {
                 // Branch name
-                current_branch = Some(line[18..].to_string());
+                current_branch = Some(branch_name.to_string());
             } else if line.is_empty() {
                 // End of entry, process if we have both path and branch
                 if let (Some(path), Some(branch)) = (&current_worktree_path, &current_branch) {

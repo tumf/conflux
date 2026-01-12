@@ -50,6 +50,7 @@ pub struct Orchestrator {
 
 impl Orchestrator {
     /// Create a new orchestrator with optional custom config path and max iterations override
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         target_changes: Option<Vec<String>>,
         config_path: Option<PathBuf>,

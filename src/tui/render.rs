@@ -720,8 +720,8 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
 /// Render the proposal input modal
 fn render_propose_modal(frame: &mut Frame, app: &mut AppState, area: Rect) {
     // Calculate modal dimensions (centered, 60% width, 50% height)
-    let modal_width = (area.width * 60 / 100).min(80).max(40);
-    let modal_height = (area.height * 50 / 100).min(20).max(8);
+    let modal_width = (area.width * 60 / 100).clamp(40, 80);
+    let modal_height = (area.height * 50 / 100).clamp(8, 20);
     let modal_x = (area.width - modal_width) / 2;
     let modal_y = (area.height - modal_height) / 2;
 
