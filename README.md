@@ -96,11 +96,14 @@ Changes have two independent states: **approval** and **selection/queue**.
 | `@` | Toggle approval | Toggle approval |
 | `e` | Open editor | Open editor |
 | `+` | New proposal | New proposal |
+| `w` | Show QR code* | Show QR code* |
 | `F5` | Start processing | - |
 | `=` | Toggle parallel mode | - |
 | `Esc` | - | Stop (graceful/force) |
 | `q` | Quit | Quit |
 | `PageUp/Down` | - | Scroll logs |
+
+*QR code is only available when web monitoring is enabled (`--web` flag). Press any key to close the QR popup.
 
 **Proposal Mode:**
 | Key | Action |
@@ -538,6 +541,7 @@ The actual bound address is logged when the server starts.
 - **Dashboard UI**: View progress at `http://localhost:8080/`
 - **Real-time updates**: WebSocket connection for live progress updates
 - **REST API**: Query state programmatically
+- **QR Code Popup**: Press `w` in the TUI to display a QR code for quick mobile access to the dashboard
 
 **REST API Endpoints:**
 
