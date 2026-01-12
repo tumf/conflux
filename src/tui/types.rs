@@ -31,6 +31,8 @@ pub enum AppMode {
     Error,
     /// Proposing mode - user is entering a new proposal
     Proposing,
+    /// QR popup mode - showing Web UI QR code
+    QrPopup,
 }
 
 /// Queue status for a change

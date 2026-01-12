@@ -42,6 +42,7 @@ pub async fn run_tui(
     openspec_cmd: String,
     _opencode_path: String, // Deprecated - use config instead
     config: OrchestratorConfig,
+    web_url: Option<String>,
 ) -> Result<()> {
     // Set up panic hook to restore terminal on panic
     let original_hook = std::panic::take_hook();
@@ -56,7 +57,14 @@ pub async fn run_tui(
     // Use PageUp/PageDown or k/j keys for scrolling instead
     // execute!(std::io::stdout(), EnableMouseCapture)?;
 
-    let result = run_tui_loop(&mut terminal, initial_changes, openspec_cmd, config).await;
+    let result = run_tui_loop(
+        &mut terminal,
+        initial_changes,
+        openspec_cmd,
+        config,
+        web_url,
+    )
+    .await;
 
     // Restore terminal state
     restore_terminal();
@@ -70,11 +78,13 @@ async fn run_tui_loop(
     initial_changes: Vec<Change>,
     openspec_cmd: String,
     config: OrchestratorConfig,
+    web_url: Option<String>,
 ) -> Result<()> {
     use crate::openspec;
 
     let mut app = AppState::new(initial_changes);
     app.max_concurrent = config.get_max_concurrent_workspaces();
+    app.web_url = web_url;
     let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(100);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<TuiCommand>(100);
 
@@ -137,6 +147,12 @@ async fn run_tui_loop(
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    // Handle QrPopup mode - any key closes the popup
+                    if app.mode == AppMode::QrPopup {
+                        app.hide_qr_popup();
+                        continue;
+                    }
+
                     // Handle Proposing mode separately (textarea input)
                     if app.mode == AppMode::Proposing {
                         match (key.code, key.modifiers) {
@@ -369,6 +385,12 @@ async fn run_tui_loop(
                                     "propose_command not configured in .openspec-orchestrator.jsonc"
                                         .to_string(),
                                 );
+                            }
+                        }
+                        (KeyCode::Char('w'), _) => {
+                            // Show QR code popup (only if web_url is set)
+                            if app.web_url.is_some() {
+                                app.show_qr_popup();
                             }
                         }
                         _ => {}

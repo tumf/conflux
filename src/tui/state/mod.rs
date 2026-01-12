@@ -73,6 +73,8 @@ pub struct AppState {
     pub propose_textarea: Option<TextArea<'static>>,
     /// Mode to return to after exiting Proposing mode
     pub previous_mode: Option<AppMode>,
+    /// Web UI URL (set when web server is enabled)
+    pub web_url: Option<String>,
 }
 
 impl AppState {
@@ -135,6 +137,7 @@ impl AppState {
             orchestration_elapsed: None,
             propose_textarea: None,
             previous_mode: None,
+            web_url: None,
         }
     }
 
@@ -153,6 +156,23 @@ impl AppState {
     /// Cancel proposing mode and return to previous mode
     pub fn cancel_proposing(&mut self) {
         self.propose_textarea = None;
+        if let Some(mode) = self.previous_mode.take() {
+            self.mode = mode;
+        } else {
+            self.mode = AppMode::Select;
+        }
+    }
+
+    /// Show QR popup (only when web_url is set)
+    pub fn show_qr_popup(&mut self) {
+        if self.web_url.is_some() {
+            self.previous_mode = Some(self.mode.clone());
+            self.mode = AppMode::QrPopup;
+        }
+    }
+
+    /// Hide QR popup and return to previous mode
+    pub fn hide_qr_popup(&mut self) {
         if let Some(mode) = self.previous_mode.take() {
             self.mode = mode;
         } else {
@@ -296,7 +316,7 @@ impl AppState {
                     _ => None,
                 }
             }
-            AppMode::Stopping | AppMode::Error | AppMode::Proposing => None,
+            AppMode::Stopping | AppMode::Error | AppMode::Proposing | AppMode::QrPopup => None,
         }
     }
 
@@ -351,7 +371,7 @@ impl AppState {
                     Some(TuiCommand::UnapproveAndDequeue(id))
                 }
             }
-            AppMode::Stopping | AppMode::Error | AppMode::Proposing => None,
+            AppMode::Stopping | AppMode::Error | AppMode::Proposing | AppMode::QrPopup => None,
         }
     }
 
@@ -1358,5 +1378,100 @@ mod tests {
         // Should return None and not panic
         let cmd = app.toggle_selection();
         assert!(cmd.is_none());
+    }
+
+    // === Tests for QR popup mode ===
+
+    #[test]
+    fn test_qr_popup_requires_web_url() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Without web_url, show_qr_popup should do nothing
+        assert!(app.web_url.is_none());
+        app.show_qr_popup();
+        assert_eq!(app.mode, AppMode::Select); // Mode unchanged
+    }
+
+    #[test]
+    fn test_qr_popup_mode_transition() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.web_url = Some("http://localhost:8080".to_string());
+
+        // Should transition to QrPopup mode
+        app.show_qr_popup();
+        assert_eq!(app.mode, AppMode::QrPopup);
+        assert_eq!(app.previous_mode, Some(AppMode::Select));
+    }
+
+    #[test]
+    fn test_qr_popup_returns_to_previous_mode() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.web_url = Some("http://localhost:8080".to_string());
+
+        // Start from Running mode
+        app.mode = AppMode::Running;
+        app.show_qr_popup();
+        assert_eq!(app.mode, AppMode::QrPopup);
+        assert_eq!(app.previous_mode, Some(AppMode::Running));
+
+        // Hide should return to Running
+        app.hide_qr_popup();
+        assert_eq!(app.mode, AppMode::Running);
+        assert!(app.previous_mode.is_none());
+    }
+
+    #[test]
+    fn test_qr_popup_from_stopped_mode() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.web_url = Some("http://127.0.0.1:3000".to_string());
+
+        app.mode = AppMode::Stopped;
+        app.show_qr_popup();
+        assert_eq!(app.mode, AppMode::QrPopup);
+        assert_eq!(app.previous_mode, Some(AppMode::Stopped));
+
+        app.hide_qr_popup();
+        assert_eq!(app.mode, AppMode::Stopped);
+    }
+
+    #[test]
+    fn test_toggle_selection_does_nothing_in_qr_popup_mode() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.web_url = Some("http://localhost:8080".to_string());
+
+        app.show_qr_popup();
+        assert_eq!(app.mode, AppMode::QrPopup);
+
+        // Toggle should return None in QrPopup mode
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+    }
+
+    #[test]
+    fn test_toggle_approval_does_nothing_in_qr_popup_mode() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.web_url = Some("http://localhost:8080".to_string());
+
+        app.show_qr_popup();
+        assert_eq!(app.mode, AppMode::QrPopup);
+
+        // Toggle approval should return None in QrPopup mode
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_none());
+    }
+
+    #[test]
+    fn test_web_url_default_none() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let app = AppState::new(changes);
+
+        // web_url should be None by default
+        assert!(app.web_url.is_none());
     }
 }

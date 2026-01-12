@@ -78,6 +78,11 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
     if app.mode == AppMode::Proposing {
         render_propose_modal(frame, app, area);
     }
+
+    // Render QR popup on top if in QrPopup mode
+    if app.mode == AppMode::QrPopup {
+        render_qr_popup(frame, app, area);
+    }
 }
 
 /// Render selection mode
@@ -131,6 +136,7 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Stopped => "Stopped",
         AppMode::Error => "Error",
         AppMode::Proposing => "Proposing",
+        AppMode::QrPopup => "QR Code",
     };
 
     let mode_color = match app.mode {
@@ -140,6 +146,7 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Stopped => Color::DarkGray,
         AppMode::Error => Color::Red,
         AppMode::Proposing => Color::Magenta,
+        AppMode::QrPopup => Color::Green,
     };
 
     // Build header spans
@@ -286,6 +293,10 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             "=: parallel"
         });
     }
+    // Show QR code hint if web server is enabled
+    if app.web_url.is_some() {
+        keys.push("w: QR");
+    }
 
     let title = format!(" Changes ({}) ", keys.join(", "));
 
@@ -414,6 +425,10 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
         });
         keys.push("e: edit");
     }
+    // Show QR code hint if web server is enabled
+    if app.web_url.is_some() {
+        keys.push("w: QR");
+    }
 
     let title = format!(" Changes ({}) ", keys.join(", "));
 
@@ -454,6 +469,7 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Select => ("Ready".to_string(), Color::DarkGray),
         AppMode::Stopped => ("Stopped".to_string(), Color::DarkGray),
         AppMode::Proposing => ("Proposing".to_string(), Color::Magenta),
+        AppMode::QrPopup => ("QR Code".to_string(), Color::Green),
         AppMode::Running | AppMode::Stopping => {
             // Count changes that are currently processing or archiving
             let processing_count = app
@@ -504,6 +520,7 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Select => ("", Color::White),
         AppMode::Error => ("Press F5 to retry, or 'q' to quit.", Color::Yellow),
         AppMode::Proposing => ("Ctrl+S: submit, Esc: cancel", Color::Magenta),
+        AppMode::QrPopup => ("Esc: close QR code", Color::Green),
     };
 
     // Calculate overall progress for all queued changes (including completed/archived)
@@ -767,6 +784,77 @@ fn render_propose_modal(frame: &mut Frame, app: &mut AppState, area: Rect) {
         let text = Paragraph::new(lines);
         frame.render_widget(text, inner_area);
     }
+}
+
+/// Render the QR code popup
+fn render_qr_popup(frame: &mut Frame, app: &AppState, area: Rect) {
+    // Get the web URL
+    let url = match &app.web_url {
+        Some(url) => url.as_str(),
+        None => return,
+    };
+
+    // Generate QR code
+    let qr_content = match super::qr::generate_qr_string(url) {
+        Ok(qr) => qr,
+        Err(e) => format!("Failed to generate QR code: {}", e),
+    };
+
+    // Calculate QR code dimensions
+    let qr_lines: Vec<&str> = qr_content.lines().collect();
+    let qr_height = qr_lines.len() as u16;
+    let qr_width = qr_lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+
+    // Calculate modal dimensions (add padding for borders and title)
+    let modal_width = (qr_width + 4).max(40).min(area.width - 4);
+    let modal_height = (qr_height + 6).max(10).min(area.height - 4); // +6 for borders, title, URL, and instructions
+
+    // Center the modal
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+    // Clear the modal area background
+    frame.render_widget(Clear, modal_area);
+
+    // Build the border block
+    let block = Block::default()
+        .title(" Web UI QR Code (press any key to close) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green));
+
+    // Calculate inner area for content
+    let inner_area = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    // Split inner area into QR code and URL sections
+    let content_chunks = Layout::vertical([
+        Constraint::Min(1),    // QR code
+        Constraint::Length(2), // URL and instructions
+    ])
+    .split(inner_area);
+
+    // Render QR code (centered)
+    let qr_lines: Vec<Line> = qr_content
+        .lines()
+        .map(|line| Line::from(Span::raw(line)))
+        .collect();
+    let qr_paragraph = Paragraph::new(qr_lines)
+        .alignment(ratatui::layout::Alignment::Center)
+        .style(Style::default().fg(Color::White));
+    frame.render_widget(qr_paragraph, content_chunks[0]);
+
+    // Render URL at the bottom
+    let url_text = Line::from(vec![
+        Span::styled("URL: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(url, Style::default().fg(Color::Cyan)),
+    ]);
+    let url_paragraph = Paragraph::new(url_text).alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(url_paragraph, content_chunks[1]);
 }
 
 #[cfg(test)]

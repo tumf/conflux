@@ -72,8 +72,8 @@ async fn main() -> Result<()> {
             // Load config (uses default paths)
             let config = OrchestratorConfig::load(None)?;
 
-            // Run TUI
-            tui::run_tui(changes, openspec_cmd, opencode_path, config).await?;
+            // Run TUI (no web server in default mode)
+            tui::run_tui(changes, openspec_cmd, opencode_path, config, None).await?;
         }
 
         // Explicit TUI subcommand
@@ -89,30 +89,38 @@ async fn main() -> Result<()> {
             // Load config
             let config = OrchestratorConfig::load(args.config.as_deref())?;
 
-            // Start web monitoring server if enabled
+            // Start web monitoring server if enabled and build URL
             #[cfg(feature = "web-monitoring")]
-            let _web_handle = if args.web {
+            let web_url = if args.web {
                 let web_state = std::sync::Arc::new(web::WebState::new(&changes));
                 let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone());
-                tracing::info!(
-                    "Starting web monitoring server on http://{}:{}",
-                    web_config.bind,
-                    web_config.port
-                );
-                Some(web::spawn_server(web_config, web_state))
+                let url = format!("http://{}:{}", web_config.bind, web_config.port);
+                tracing::info!("Starting web monitoring server on {}", url);
+                let _web_handle = web::spawn_server(web_config, web_state);
+                Some(url)
             } else {
                 None
             };
 
             #[cfg(not(feature = "web-monitoring"))]
-            if args.web {
-                eprintln!(
-                    "Warning: Web monitoring is not enabled. Compile with --features web-monitoring"
-                );
-            }
+            let web_url: Option<String> = {
+                if args.web {
+                    eprintln!(
+                        "Warning: Web monitoring is not enabled. Compile with --features web-monitoring"
+                    );
+                }
+                None
+            };
 
             // Run TUI
-            tui::run_tui(changes, args.openspec_cmd, args.opencode_path, config).await?;
+            tui::run_tui(
+                changes,
+                args.openspec_cmd,
+                args.opencode_path,
+                config,
+                web_url,
+            )
+            .await?;
         }
 
         // Run subcommand: non-interactive orchestration
