@@ -4,7 +4,7 @@
 
 ### Requirement: Periodic Progress Commits
 
-並列実行のapplyループにおいて、各イテレーション終了後に進捗をコミットとして保存する。
+並列実行のapplyループにおいて、各イテレーション終了後に進捗をコミットとして保存しなければならない（MUST）。
 
 #### Scenario: Progress commit created after successful apply
 

@@ -4,7 +4,7 @@
 
 ### Requirement: Workspace Preservation on Error
 
-並列実行においてエラーが発生した場合、workspaceを削除せずに保持する。
+並列実行においてエラーが発生した場合、workspaceを削除せずに保持しなければならない（MUST）。
 
 #### Scenario: Workspace preserved on max iterations
 
@@ -36,7 +36,7 @@
 
 ### Requirement: WorkspacePreserved Event
 
-エラー時にworkspaceが保持された場合、TUIに通知するイベントを発行する。
+エラー時にworkspaceが保持された場合、TUIに通知するイベントを発行しなければならない（MUST）。
 
 #### Scenario: WorkspacePreserved event emitted
 
