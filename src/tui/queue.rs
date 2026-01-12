@@ -42,6 +42,18 @@ impl DynamicQueue {
         queue.pop_front()
     }
 
+    /// Remove a specific change ID from the queue
+    /// Returns true if the ID was found and removed, false otherwise
+    pub async fn remove(&self, id: &str) -> bool {
+        let mut queue = self.inner.lock().await;
+        if let Some(pos) = queue.iter().position(|i| i == id) {
+            queue.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Check if the queue is empty
     #[cfg(test)]
     pub async fn is_empty(&self) -> bool {
@@ -113,5 +125,72 @@ mod tests {
 
         assert!(queue.contains("a").await);
         assert!(!queue.contains("b").await);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_queue_remove() {
+        let queue = DynamicQueue::new();
+
+        queue.push("a".to_string()).await;
+        queue.push("b".to_string()).await;
+        queue.push("c".to_string()).await;
+
+        assert_eq!(queue.len().await, 3);
+
+        // Remove middle item
+        assert!(queue.remove("b").await);
+        assert_eq!(queue.len().await, 2);
+        assert!(!queue.contains("b").await);
+
+        // Order preserved: a, c
+        assert_eq!(queue.pop().await, Some("a".to_string()));
+        assert_eq!(queue.pop().await, Some("c".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_queue_remove_nonexistent() {
+        let queue = DynamicQueue::new();
+
+        queue.push("a".to_string()).await;
+
+        // Remove non-existent item returns false
+        assert!(!queue.remove("nonexistent").await);
+        assert_eq!(queue.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_queue_remove_from_empty() {
+        let queue = DynamicQueue::new();
+
+        // Remove from empty queue returns false
+        assert!(!queue.remove("a").await);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_queue_remove_multiple() {
+        let queue = DynamicQueue::new();
+
+        queue.push("a".to_string()).await;
+        queue.push("b".to_string()).await;
+        queue.push("c".to_string()).await;
+
+        // Remove first and last
+        assert!(queue.remove("a").await);
+        assert!(queue.remove("c").await);
+
+        assert_eq!(queue.len().await, 1);
+        assert_eq!(queue.pop().await, Some("b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_queue_remove_then_push_same() {
+        let queue = DynamicQueue::new();
+
+        queue.push("a".to_string()).await;
+        assert!(queue.remove("a").await);
+
+        // Should be able to push the same item again
+        assert!(queue.push("a".to_string()).await);
+        assert_eq!(queue.len().await, 1);
     }
 }
