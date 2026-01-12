@@ -27,12 +27,27 @@ pub struct ParallelRunService {
     config: OrchestratorConfig,
     /// Repository root directory
     repo_root: PathBuf,
+    /// Disable automatic workspace resume (always create new workspaces)
+    no_resume: bool,
 }
 
 impl ParallelRunService {
     /// Create a new parallel run service
     pub fn new(repo_root: PathBuf, config: OrchestratorConfig) -> Self {
-        Self { config, repo_root }
+        Self {
+            config,
+            repo_root,
+            no_resume: false,
+        }
+    }
+
+    /// Set whether to disable automatic workspace resume.
+    ///
+    /// When `no_resume` is true, existing workspaces are always deleted
+    /// and new ones are created. When false (default), existing workspaces
+    /// are reused to resume interrupted work.
+    pub fn set_no_resume(&mut self, no_resume: bool) {
+        self.no_resume = no_resume;
     }
 
     /// Check if jj is available for parallel execution
@@ -79,6 +94,7 @@ impl ParallelRunService {
         // Create and run executor
         let mut executor =
             ParallelExecutor::new(self.repo_root.clone(), self.config.clone(), Some(event_tx));
+        executor.set_no_resume(self.no_resume);
 
         let result = executor.execute_groups(groups).await;
 
@@ -111,6 +127,7 @@ impl ParallelRunService {
             self.config.clone(),
             Some(event_tx.clone()),
         );
+        executor.set_no_resume(self.no_resume);
 
         // Clone config for the analyzer closure
         let config = self.config.clone();

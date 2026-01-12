@@ -6,6 +6,11 @@ use tracing::debug;
 /// Events emitted during parallel execution
 #[derive(Debug, Clone)]
 pub enum ParallelEvent {
+    /// An existing workspace was found and is being reused
+    WorkspaceResumed {
+        change_id: String,
+        workspace: String,
+    },
     /// A workspace was created
     WorkspaceCreated {
         change_id: String,

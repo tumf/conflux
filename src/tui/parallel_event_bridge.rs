@@ -13,6 +13,13 @@ use crate::tui::events::{LogEntry, OrchestratorEvent};
 /// generates both a log entry and a ProcessingStarted event).
 pub fn convert(event: ParallelEvent) -> Vec<OrchestratorEvent> {
     match event {
+        ParallelEvent::WorkspaceResumed {
+            change_id,
+            workspace,
+        } => vec![OrchestratorEvent::Log(
+            LogEntry::info(format!("Resuming workspace: {}", workspace)).with_change_id(&change_id),
+        )],
+
         ParallelEvent::WorkspaceCreated {
             change_id,
             workspace,
@@ -201,6 +208,24 @@ mod tests {
         match &events[0] {
             OrchestratorEvent::Log(entry) => {
                 assert!(entry.message.contains("Created workspace"));
+                assert_eq!(entry.change_id, Some("test-change".to_string()));
+            }
+            _ => panic!("Expected Log event"),
+        }
+    }
+
+    #[test]
+    fn test_convert_workspace_resumed() {
+        let event = ParallelEvent::WorkspaceResumed {
+            change_id: "test-change".to_string(),
+            workspace: "ws-test".to_string(),
+        };
+
+        let events = convert(event);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            OrchestratorEvent::Log(entry) => {
+                assert!(entry.message.contains("Resuming workspace"));
                 assert_eq!(entry.change_id, Some("test-change".to_string()));
             }
             _ => panic!("Expected Log event"),

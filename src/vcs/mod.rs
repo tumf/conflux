@@ -16,7 +16,8 @@ pub mod jj;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -152,13 +153,29 @@ pub struct Workspace {
     /// Workspace name (used by VCS)
     pub name: String,
     /// Path to workspace directory
-    pub path: std::path::PathBuf,
+    pub path: PathBuf,
     /// Associated OpenSpec change ID
     pub change_id: String,
     /// Base revision workspace was created from
     pub base_revision: String,
     /// Current status
     pub status: WorkspaceStatus,
+}
+
+/// Information about an existing workspace found during resume detection.
+///
+/// This struct contains the minimal information needed to decide whether
+/// to reuse an existing workspace.
+#[derive(Debug, Clone)]
+pub struct WorkspaceInfo {
+    /// Path to the workspace directory
+    pub path: PathBuf,
+    /// Associated OpenSpec change ID (extracted from workspace name)
+    pub change_id: String,
+    /// Workspace name (used by VCS)
+    pub workspace_name: String,
+    /// Last modification time of the workspace directory
+    pub last_modified: SystemTime,
 }
 
 /// Trait for VCS workspace management.
@@ -251,6 +268,20 @@ pub trait WorkspaceManager: Send + Sync {
 
     /// Get the repository root path.
     fn repo_root(&self) -> &Path;
+
+    /// Find an existing workspace for the given change ID.
+    ///
+    /// If multiple workspaces exist for the same change_id, returns the newest
+    /// one (by last_modified time) and cleans up older ones.
+    ///
+    /// Returns None if no workspace exists for the given change_id.
+    async fn find_existing_workspace(&mut self, change_id: &str) -> VcsResult<Option<WorkspaceInfo>>;
+
+    /// Reuse an existing workspace, registering it with the workspace manager.
+    ///
+    /// This is called after `find_existing_workspace` returns a workspace to reuse.
+    /// It registers the workspace with the manager so it can be tracked, merged, and cleaned up.
+    async fn reuse_workspace(&mut self, workspace_info: &WorkspaceInfo) -> VcsResult<Workspace>;
 }
 
 /// Detect the VCS backend to use based on configuration and repository state.

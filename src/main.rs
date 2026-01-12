@@ -107,6 +107,7 @@ async fn main() -> Result<()> {
                 args.max_concurrent,
                 args.dry_run,
                 vcs_override,
+                args.no_resume,
             )?;
             orchestrator.run().await?;
         }

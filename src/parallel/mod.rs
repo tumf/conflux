@@ -45,6 +45,8 @@ pub struct ParallelExecutor {
     max_conflict_retries: u32,
     /// Repository root path for archive operations
     repo_root: PathBuf,
+    /// Disable automatic workspace resume (always create new workspaces)
+    no_resume: bool,
 }
 
 impl ParallelExecutor {
@@ -119,7 +121,17 @@ impl ParallelExecutor {
             event_tx,
             max_conflict_retries: 3,
             repo_root,
+            no_resume: false,
         }
+    }
+
+    /// Set whether to disable automatic workspace resume.
+    ///
+    /// When `no_resume` is true, existing workspaces are always deleted
+    /// and new ones are created. When false (default), existing workspaces
+    /// are reused to resume interrupted work.
+    pub fn set_no_resume(&mut self, no_resume: bool) {
+        self.no_resume = no_resume;
     }
 
     /// Resolve VCS backend (convert Auto to concrete backend)
@@ -307,43 +319,100 @@ impl ParallelExecutor {
             self.repo_root.clone(),
         );
 
-        // Create workspaces for all changes in the group from the SAME base revision
-        // This ensures all changes in the group branch from the same point (true parallel)
+        // Create or reuse workspaces for all changes in the group
+        // If resume is enabled (default), try to find existing workspaces first
         let mut workspaces: Vec<Workspace> = Vec::new();
         for change_id in &group.changes {
-            match self
-                .workspace_manager
-                .create_workspace(change_id, Some(&base_revision))
-                .await
-            {
-                Ok(workspace) => {
+            // Try to find and reuse existing workspace (unless --no-resume is set)
+            let workspace = if self.no_resume {
+                None
+            } else {
+                match self
+                    .workspace_manager
+                    .find_existing_workspace(change_id)
+                    .await
+                {
+                    Ok(Some(workspace_info)) => {
+                        // Found existing workspace, reuse it
+                        info!(
+                            "Resuming existing workspace for '{}' (last modified: {:?})",
+                            change_id, workspace_info.last_modified
+                        );
+                        match self.workspace_manager.reuse_workspace(&workspace_info).await {
+                            Ok(ws) => Some(ws),
+                            Err(e) => {
+                                warn!(
+                                    "Failed to reuse workspace for '{}': {}, creating new",
+                                    change_id, e
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        warn!(
+                            "Failed to find existing workspace for '{}': {}, creating new",
+                            change_id, e
+                        );
+                        None
+                    }
+                }
+            };
+
+            let workspace = match workspace {
+                Some(ws) => {
                     // Track workspace in cleanup guard before adding to list
-                    cleanup_guard.track(workspace.name.clone());
+                    cleanup_guard.track(ws.name.clone());
 
                     send_event(
                         &self.event_tx,
-                        ParallelEvent::WorkspaceCreated {
+                        ParallelEvent::WorkspaceResumed {
                             change_id: change_id.clone(),
-                            workspace: workspace.name.clone(),
+                            workspace: ws.name.clone(),
                         },
                     )
                     .await;
-                    workspaces.push(workspace);
+                    ws
                 }
-                Err(e) => {
-                    let error_msg = format!("Failed to create workspace: {}", e);
-                    error!("{} for {}", error_msg, change_id);
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::Error {
-                            message: format!("[{}] {}", change_id, error_msg),
-                        },
-                    )
-                    .await;
-                    // cleanup_guard will clean up previously created workspaces on drop
-                    return Err(e.into());
+                None => {
+                    // Create new workspace from the base revision
+                    match self
+                        .workspace_manager
+                        .create_workspace(change_id, Some(&base_revision))
+                        .await
+                    {
+                        Ok(ws) => {
+                            // Track workspace in cleanup guard before adding to list
+                            cleanup_guard.track(ws.name.clone());
+
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::WorkspaceCreated {
+                                    change_id: change_id.clone(),
+                                    workspace: ws.name.clone(),
+                                },
+                            )
+                            .await;
+                            ws
+                        }
+                        Err(e) => {
+                            let error_msg = format!("Failed to create workspace: {}", e);
+                            error!("{} for {}", error_msg, change_id);
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::Error {
+                                    message: format!("[{}] {}", change_id, error_msg),
+                                },
+                            )
+                            .await;
+                            // cleanup_guard will clean up previously created workspaces on drop
+                            return Err(e.into());
+                        }
+                    }
                 }
-            }
+            };
+            workspaces.push(workspace);
         }
 
         // Execute apply + archive in parallel with concurrency limit
