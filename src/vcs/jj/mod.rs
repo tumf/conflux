@@ -298,7 +298,7 @@ impl JjWorkspaceManager {
             info!("Single revision, editing directly: {}", rev_short);
 
             let output = Command::new("jj")
-                .args(["edit", &revisions[0]])
+                .args(["edit", "--ignore-working-copy", &revisions[0]])
                 .current_dir(&self.repo_root)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -324,7 +324,8 @@ impl JjWorkspaceManager {
 
         // For multiple revisions, create a merge commit with `jj new --no-edit`
         // Using --no-edit prevents creating an additional empty working copy commit
-        let mut args = vec!["new", "--no-edit"];
+        // Using --ignore-working-copy to avoid stale working copy errors after workspace operations
+        let mut args = vec!["new", "--no-edit", "--ignore-working-copy"];
         for rev in revisions {
             args.push(rev.as_str());
         }
@@ -362,7 +363,7 @@ impl JjWorkspaceManager {
 
         // Switch to the merge commit using `jj edit`
         let edit_output = Command::new("jj")
-            .args(["edit", &merge_rev])
+            .args(["edit", "--ignore-working-copy", &merge_rev])
             .current_dir(&self.repo_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

@@ -658,6 +658,7 @@ impl ParallelExecutor {
                     &change_id,
                     &workspace_path,
                     &apply_cmd,
+                    &config,
                     event_tx.clone(),
                     vcs_backend,
                 )

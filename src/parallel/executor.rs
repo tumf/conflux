@@ -1,5 +1,6 @@
 //! Workspace execution logic for apply and archive operations.
 
+use crate::agent::build_apply_prompt;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::task_parser::TaskProgress;
@@ -189,6 +190,7 @@ pub async fn execute_apply_in_workspace(
     change_id: &str,
     workspace_path: &Path,
     apply_cmd_template: &str,
+    config: &OrchestratorConfig,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
     vcs_backend: VcsBackend,
 ) -> Result<String> {
@@ -247,9 +249,13 @@ pub async fn execute_apply_in_workspace(
             }
         }
 
+        // Build prompt with system instructions
+        let user_prompt = config.get_apply_prompt();
+        let full_prompt = build_apply_prompt(user_prompt, ""); // No history in parallel mode
+
         // Expand change_id and prompt in command
         let command = OrchestratorConfig::expand_change_id(apply_cmd_template, change_id);
-        let command = OrchestratorConfig::expand_prompt(&command, "");
+        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
         debug!("Workspace path: {:?}", workspace_path);
         debug!("Apply command: {}", command);
 
@@ -700,16 +706,18 @@ pub async fn execute_archive_in_workspace(
             }
         }
         VcsBackend::Jj => {
-            // jj automatically snapshots working copy at the beginning of each command
-            // Since we're running from within the workspace, no --ignore-working-copy needed
+            // Use --ignore-working-copy to avoid stale working copy errors in workspaces
             let describe_output = Command::new("jj")
-                .args(["describe", "-m", &format!("Archive: {}", change_id)])
+                .args([
+                    "describe",
+                    "--ignore-working-copy",
+                    "-m",
+                    &format!("Archive: {}", change_id),
+                ])
                 .current_dir(workspace_path)
                 .output()
                 .await
-                .map_err(|e| {
-                    OrchestratorError::JjCommand(format!("Failed to describe: {}", e))
-                })?;
+                .map_err(|e| OrchestratorError::JjCommand(format!("Failed to describe: {}", e)))?;
 
             if !describe_output.status.success() {
                 let stderr = String::from_utf8_lossy(&describe_output.stderr);
@@ -727,7 +735,15 @@ pub async fn execute_archive_in_workspace(
     let revision = match vcs_backend {
         VcsBackend::Jj => {
             let revision_output = Command::new("jj")
-                .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
+                .args([
+                    "log",
+                    "-r",
+                    "@",
+                    "--no-graph",
+                    "--ignore-working-copy",
+                    "-T",
+                    "change_id",
+                ])
                 .current_dir(workspace_path)
                 .output()
                 .await
