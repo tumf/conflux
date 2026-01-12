@@ -914,13 +914,6 @@ pub async fn execute_archive_in_workspace(
             }
         }
         VcsBackend::Jj => {
-            // Refresh stale working copy before snapshotting archive changes.
-            let _ = Command::new("jj")
-                .args(["workspace", "update-stale"])
-                .current_dir(workspace_path)
-                .output()
-                .await;
-
             // Snapshot working copy changes so archive results are part of the revision.
             let status_output = Command::new("jj")
                 .args(["status"])

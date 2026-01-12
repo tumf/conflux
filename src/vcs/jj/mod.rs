@@ -44,6 +44,36 @@ pub struct JjWorkspaceManager {
     max_concurrent: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeMode {
+    EditOnly,
+    MergeCommit,
+}
+
+fn merge_mode(revisions: &[String]) -> MergeMode {
+    if revisions.len() == 1 {
+        MergeMode::EditOnly
+    } else {
+        MergeMode::MergeCommit
+    }
+}
+
+fn build_merge_commit_args(base_revision: &str, revisions: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "new".to_string(),
+        "--no-edit".to_string(),
+        base_revision.to_string(),
+    ];
+
+    for rev in revisions {
+        args.push(rev.clone());
+    }
+
+    args.push("-m".to_string());
+    args.push("Merge parallel changes".to_string());
+    args
+}
+
 impl JjWorkspaceManager {
     /// Create a new workspace manager
     ///
@@ -283,88 +313,136 @@ impl JjWorkspaceManager {
 
     /// Merge multiple workspace revisions into main
     ///
-    /// For single revision: Uses `jj edit` to switch to that revision without creating empty commits.
-    /// For multiple revisions: Uses `jj new --no-edit` to create a merge commit without creating
-    /// an additional empty working copy commit, then uses `jj edit` to switch to the merge commit.
+    /// For a single revision: uses `jj edit` to switch to the revision without creating a merge commit.
+    /// For multiple revisions: creates a merge commit with `jj new --no-edit`, switches to it with
+    /// `jj edit`, then creates a new empty working copy commit via `jj new` to keep the merge commit
+    /// empty while continuing work on a fresh revision.
     pub async fn merge_jj_workspaces(&self, revisions: &[String]) -> VcsResult<String> {
         if revisions.is_empty() {
             return Err(VcsError::jj_command("No revisions to merge"));
         }
 
-        // Always create a merge commit to integrate changes into the current workspace
-        // This ensures all changes are properly integrated into git_head()
-
         info!("Merging {} revisions", revisions.len());
         debug!("Revisions to merge: {:?}", revisions);
 
-        // Get current @ as base for merge
-        // This ensures all individual merges use the same base (the snapshot)
-        let base_rev = self.get_current_revision().await?;
-        let base_short = &base_rev[..8.min(base_rev.len())];
-        info!("Using base revision for merge: {}", base_short);
-
-        // For multiple revisions, create a merge commit with `jj new --no-edit`
-        // Using --no-edit prevents creating an additional empty working copy commit
-        // Always include base revision first to ensure consistent merge base
-        let mut args = vec!["new", "--no-edit", &base_rev];
-        for rev in revisions {
-            args.push(rev.as_str());
-        }
-        args.extend(&["-m", "Merge parallel changes"]);
-
-        let output = Command::new("jj")
-            .args(&args)
-            .current_dir(&self.repo_root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| VcsError::jj_command(format!("Merge failed: {}", e)))?;
-
-        // Parse stderr for conflict detection and commit parsing
-        // Note: jj outputs "Created new commit" to stderr, not stdout
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        if !output.status.success() {
-            // Check for conflicts in failure case
-            if stderr.contains("conflict") || stderr.contains("Conflict") {
-                return Err(VcsError::jj_conflict(stderr.to_string()));
+        match merge_mode(revisions) {
+            MergeMode::EditOnly => {
+                let revision = revisions[0].clone();
+                info!(
+                    "Switching to single revision via jj edit: {}",
+                    &revision[..8.min(revision.len())]
+                );
+                self.edit_revision(&revision).await?;
+                Ok(revision)
             }
+            MergeMode::MergeCommit => {
+                // Get current @ as base for merge
+                // This ensures all individual merges use the same base (the snapshot)
+                let base_rev = self.get_current_revision().await?;
+                let base_short = &base_rev[..8.min(base_rev.len())];
+                info!("Using base revision for merge: {}", base_short);
 
-            return Err(VcsError::jj_command(format!("Merge failed: {}", stderr)));
+                // For multiple revisions, create a merge commit with `jj new --no-edit`
+                // Always include base revision first to ensure consistent merge base
+                let args = build_merge_commit_args(&base_rev, revisions);
+
+                let output = Command::new("jj")
+                    .args(&args)
+                    .current_dir(&self.repo_root)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .await
+                    .map_err(|e| VcsError::jj_command(format!("Merge failed: {}", e)))?;
+
+                // Parse stderr for conflict detection and commit parsing
+                // Note: jj outputs "Created new commit" to stderr, not stdout
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                if !output.status.success() {
+                    // Check for conflicts in failure case
+                    if stderr.contains("conflict") || stderr.contains("Conflict") {
+                        return Err(VcsError::jj_conflict(stderr.to_string()));
+                    }
+
+                    return Err(VcsError::jj_command(format!("Merge failed: {}", stderr)));
+                }
+
+                // IMPORTANT: jj may succeed (exit code 0) even when conflicts occur.
+                // Check stderr for conflict markers on success as well.
+                if stderr.contains("conflict") || stderr.contains("Conflict") {
+                    return Err(VcsError::jj_conflict(stderr.to_string()));
+                }
+                let merge_rev = self.parse_created_commit_id(&stderr).await?;
+
+                info!(
+                    "Switching to merge commit via jj edit: {}",
+                    &merge_rev[..8.min(merge_rev.len())]
+                );
+                self.edit_revision(&merge_rev).await?;
+
+                let working_copy_rev = self.create_working_copy_commit().await?;
+                info!(
+                    "Created new working copy commit after merge: {}",
+                    &working_copy_rev[..8.min(working_copy_rev.len())]
+                );
+
+                Ok(merge_rev)
+            }
         }
+    }
 
-        // IMPORTANT: jj may succeed (exit code 0) even when conflicts occur.
-        // Check stderr for conflict markers on success as well.
-        if stderr.contains("conflict") || stderr.contains("Conflict") {
-            return Err(VcsError::jj_conflict(stderr.to_string()));
-        }
-        let merge_rev = self.parse_created_commit_id(&stderr).await?;
-
-        // Switch to the merge commit using `jj edit`
+    async fn edit_revision(&self, revision: &str) -> VcsResult<()> {
         let edit_output = Command::new("jj")
-            .args(["edit", &merge_rev])
+            .args(["edit", revision])
             .current_dir(&self.repo_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
             .await
-            .map_err(|e| VcsError::jj_command(format!("Failed to edit merge commit: {}", e)))?;
+            .map_err(|e| VcsError::jj_command(format!("Failed to edit revision: {}", e)))?;
 
         if !edit_output.status.success() {
             let stderr = String::from_utf8_lossy(&edit_output.stderr);
             return Err(VcsError::jj_command(format!(
-                "Failed to edit merge commit: {}",
+                "Failed to edit revision: {}",
                 stderr
             )));
         }
 
-        Ok(merge_rev)
+        Ok(())
     }
 
-    /// Parse the change_id from `jj new --no-edit` output
+    async fn create_working_copy_commit(&self) -> VcsResult<String> {
+        let output = Command::new("jj")
+            .args([
+                "new",
+                "-m",
+                "Parallel execution working copy (auto-created by openspec-orchestrator)",
+            ])
+            .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| VcsError::jj_command(format!("Failed to create working copy: {}", e)))?;
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !output.status.success() {
+            return Err(VcsError::jj_command(format!(
+                "Failed to create working copy: {}",
+                stderr
+            )));
+        }
+
+        self.parse_created_commit_id(&stderr).await
+    }
+
+    /// Parse the change_id from `jj new` output
     /// Output format: "Created new commit <change_id> <commit_id> ..."
     async fn parse_created_commit_id(&self, output: &str) -> VcsResult<String> {
         // Try to parse from output first
@@ -1000,5 +1078,35 @@ mod tests {
         let result =
             JjWorkspaceManager::extract_change_id_from_workspace_name("ws-feature-login-fedcba98");
         assert_eq!(result, Some("feature-login".to_string()));
+    }
+
+    #[test]
+    fn test_merge_mode_for_single_revision() {
+        let revisions = vec!["rev1".to_string()];
+        assert_eq!(merge_mode(&revisions), MergeMode::EditOnly);
+    }
+
+    #[test]
+    fn test_merge_mode_for_multiple_revisions() {
+        let revisions = vec!["rev1".to_string(), "rev2".to_string()];
+        assert_eq!(merge_mode(&revisions), MergeMode::MergeCommit);
+    }
+
+    #[test]
+    fn test_build_merge_commit_args() {
+        let revisions = vec!["rev1".to_string(), "rev2".to_string()];
+        let args = build_merge_commit_args("base", &revisions);
+        assert_eq!(
+            args,
+            vec![
+                "new".to_string(),
+                "--no-edit".to_string(),
+                "base".to_string(),
+                "rev1".to_string(),
+                "rev2".to_string(),
+                "-m".to_string(),
+                "Merge parallel changes".to_string(),
+            ]
+        );
     }
 }
