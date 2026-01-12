@@ -1,6 +1,6 @@
 # TUI Architecture - Delta Spec
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Dynamic Queue Management
 システムは、実行中にchangeを動的にキューへ追加・削除できる機能を提供しなければならない（SHALL）。
