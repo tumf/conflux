@@ -81,6 +81,11 @@ pub enum ParallelEvent {
     ResolveOutput { output: String },
     /// All groups completed
     AllCompleted,
+    /// A workspace was preserved due to an error (not cleaned up)
+    WorkspacePreserved {
+        change_id: String,
+        workspace_name: String,
+    },
     /// Error during parallel execution
     Error { message: String },
 }

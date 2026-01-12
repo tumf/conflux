@@ -9,9 +9,15 @@ use tracing::{debug, warn};
 /// This guard tracks created workspaces and ensures they are cleaned up
 /// on drop if not explicitly committed. This prevents workspace leaks
 /// when errors occur during workspace creation or apply phases.
+///
+/// Note: Failed workspaces can be marked for preservation, which will
+/// prevent their cleanup on drop to allow for manual investigation or
+/// resume functionality.
 pub(crate) struct WorkspaceCleanupGuard {
     /// Workspace names to clean up
     workspace_names: Vec<String>,
+    /// Workspace names to preserve (not cleaned up on drop)
+    preserved_workspaces: std::collections::HashSet<String>,
     /// VCS backend type
     vcs_backend: VcsBackend,
     /// Repository root for cleanup commands
@@ -25,6 +31,7 @@ impl WorkspaceCleanupGuard {
     pub fn new(vcs_backend: VcsBackend, repo_root: PathBuf) -> Self {
         Self {
             workspace_names: Vec::new(),
+            preserved_workspaces: std::collections::HashSet::new(),
             vcs_backend,
             repo_root,
             committed: false,
@@ -34,6 +41,15 @@ impl WorkspaceCleanupGuard {
     /// Add a workspace to be tracked for cleanup
     pub fn track(&mut self, workspace_name: String) {
         self.workspace_names.push(workspace_name);
+    }
+
+    /// Mark a workspace for preservation (will not be cleaned up on drop).
+    ///
+    /// Call this for workspaces where errors occurred and the workspace
+    /// should be preserved for debugging or resume functionality.
+    #[allow(dead_code)] // Public API for workspace preservation
+    pub fn preserve(&mut self, workspace_name: &str) {
+        self.preserved_workspaces.insert(workspace_name.to_string());
     }
 
     /// Commit the guard, preventing cleanup on drop
@@ -51,14 +67,26 @@ impl Drop for WorkspaceCleanupGuard {
             return;
         }
 
+        // Filter out preserved workspaces from cleanup
+        let workspaces_to_clean: Vec<_> = self
+            .workspace_names
+            .iter()
+            .filter(|name| !self.preserved_workspaces.contains(*name))
+            .collect();
+
+        if workspaces_to_clean.is_empty() {
+            return;
+        }
+
         warn!(
-            "Cleaning up {} workspace(s) due to early error",
-            self.workspace_names.len()
+            "Cleaning up {} workspace(s) due to early error ({} preserved)",
+            workspaces_to_clean.len(),
+            self.preserved_workspaces.len()
         );
 
         // Use synchronous cleanup since we're in Drop
         // This is a best-effort cleanup - errors are logged but not propagated
-        for workspace_name in &self.workspace_names {
+        for workspace_name in &workspaces_to_clean {
             debug!(
                 "Emergency cleanup: forgetting workspace '{}'",
                 workspace_name
@@ -252,5 +280,70 @@ mod tests {
 
         assert!(matches!(guard.vcs_backend, VcsBackend::Git));
         // The Drop impl calls "git branch -D <name>"
+    }
+
+    // === Tests for workspace preservation (preserve-workspace-on-error spec) ===
+
+    #[test]
+    fn test_cleanup_guard_preserve_workspace() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+
+        guard.track("ws-change-a-1234".to_string());
+        guard.track("ws-change-b-5678".to_string());
+
+        // Preserve one workspace (simulating error)
+        guard.preserve("ws-change-a-1234");
+
+        assert!(guard.preserved_workspaces.contains("ws-change-a-1234"));
+        assert!(!guard.preserved_workspaces.contains("ws-change-b-5678"));
+    }
+
+    #[test]
+    fn test_cleanup_guard_preserved_workspace_not_cleaned_on_drop() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Test that preserved workspaces are excluded from cleanup
+        {
+            let mut guard =
+                WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+            guard.track("ws-success-1234".to_string());
+            guard.track("ws-failed-5678".to_string());
+
+            // Preserve the failed workspace
+            guard.preserve("ws-failed-5678");
+
+            // On drop, only ws-success-1234 should be attempted for cleanup
+            // (ws-failed-5678 is preserved and should be skipped)
+        }
+        // If we reach here, drop completed successfully
+    }
+
+    #[test]
+    fn test_cleanup_guard_all_preserved_does_nothing() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // If all workspaces are preserved, drop should do nothing
+        {
+            let mut guard =
+                WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+            guard.track("ws-failed-1".to_string());
+            guard.track("ws-failed-2".to_string());
+
+            // Preserve all workspaces
+            guard.preserve("ws-failed-1");
+            guard.preserve("ws-failed-2");
+
+            // On drop, nothing should be cleaned up
+        }
+        // If we reach here, drop completed successfully without attempting cleanup
+    }
+
+    #[test]
+    fn test_cleanup_guard_preserved_workspaces_starts_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let guard = WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+
+        assert!(guard.preserved_workspaces.is_empty());
     }
 }

@@ -193,6 +193,14 @@ pub fn convert(event: ParallelEvent) -> Vec<OrchestratorEvent> {
         ParallelEvent::Error { message } => {
             vec![OrchestratorEvent::Log(LogEntry::error(message))]
         }
+
+        ParallelEvent::WorkspacePreserved {
+            change_id,
+            workspace_name,
+        } => vec![OrchestratorEvent::Log(
+            LogEntry::warn(format!("Workspace preserved: {}", workspace_name))
+                .with_change_id(&change_id),
+        )],
     }
 }
 
@@ -330,6 +338,26 @@ mod tests {
             OrchestratorEvent::Log(entry) => {
                 assert!(entry.message.contains("Skipped"));
                 assert!(entry.message.contains("Dependency"));
+                assert_eq!(entry.change_id, Some("test-change".to_string()));
+            }
+            _ => panic!("Expected Log event"),
+        }
+    }
+
+    #[test]
+    fn test_convert_workspace_preserved() {
+        let event = ParallelEvent::WorkspacePreserved {
+            change_id: "test-change".to_string(),
+            workspace_name: "ws-test-1234".to_string(),
+        };
+
+        let events = convert(event);
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            OrchestratorEvent::Log(entry) => {
+                assert!(entry.message.contains("Workspace preserved"));
+                assert!(entry.message.contains("ws-test-1234"));
                 assert_eq!(entry.change_id, Some("test-change".to_string()));
             }
             _ => panic!("Expected Log event"),

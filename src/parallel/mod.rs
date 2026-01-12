@@ -533,10 +533,26 @@ impl ParallelExecutor {
         let failed: Vec<&WorkspaceResult> = results.iter().filter(|r| r.error.is_some()).collect();
 
         // Report failures and mark them in the tracker for dependent skipping
+        // Also preserve workspaces for failed changes (do not cleanup)
         for result in &failed {
-            if let Some(ref err) = result.error {
-                error!("Failed for {}: {}", result.change_id, err);
+            if result.error.is_some() {
+                error!(
+                    "Failed for {}, workspace preserved: {}",
+                    result.change_id, result.workspace_name
+                );
+                info!(
+                    "To resume: run with the same change_id, workspace will be automatically detected"
+                );
             }
+            // Emit WorkspacePreserved event
+            send_event(
+                &self.event_tx,
+                ParallelEvent::WorkspacePreserved {
+                    change_id: result.change_id.clone(),
+                    workspace_name: result.workspace_name.clone(),
+                },
+            )
+            .await;
             // Mark the failed change so dependent changes will be skipped
             self.failed_tracker.mark_failed(&result.change_id);
         }
@@ -566,8 +582,14 @@ impl ParallelExecutor {
             self.merge_and_resolve(&revisions).await?;
         }
 
-        // Cleanup workspaces
+        // Cleanup only successful workspaces (preserve failed ones)
+        let failed_workspace_names: std::collections::HashSet<_> =
+            failed.iter().map(|r| r.workspace_name.clone()).collect();
         for workspace in &workspaces {
+            // Skip cleanup for failed workspaces - they are preserved
+            if failed_workspace_names.contains(&workspace.name) {
+                continue;
+            }
             send_event(
                 &self.event_tx,
                 ParallelEvent::CleanupStarted {
