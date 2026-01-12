@@ -4,6 +4,7 @@ mod approval;
 mod cli;
 mod config;
 mod error;
+mod execution;
 mod history;
 mod hooks;
 mod openspec;
