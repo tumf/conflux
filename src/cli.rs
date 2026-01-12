@@ -88,8 +88,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub web: bool,
 
-    /// Port for web monitoring server (default: 8080)
-    #[arg(long, default_value = "8080")]
+    /// Port for web monitoring server (default: 0 = auto-assign by OS)
+    #[arg(long, default_value = "0")]
     pub web_port: u16,
 
     /// Bind address for web monitoring server (default: 127.0.0.1)
@@ -124,8 +124,8 @@ pub struct TuiArgs {
     #[arg(long)]
     pub web: bool,
 
-    /// Port for web monitoring server (default: 8080)
-    #[arg(long, default_value = "8080")]
+    /// Port for web monitoring server (default: 0 = auto-assign by OS)
+    #[arg(long, default_value = "0")]
     pub web_port: u16,
 
     /// Bind address for web monitoring server (default: 127.0.0.1)
@@ -650,6 +650,53 @@ mod tests {
         match cli.command {
             Some(Commands::Tui(args)) => {
                 assert!(args.logs.is_none());
+            }
+            _ => panic!("Expected Tui subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_run_subcommand_web_port_default_auto_assign() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--web"]);
+
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert!(args.web);
+                assert_eq!(args.web_port, 0); // Default: OS auto-assigns port
+                assert_eq!(args.web_bind, "127.0.0.1");
+            }
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_run_subcommand_web_port_explicit() {
+        let cli = Cli::parse_from([
+            "openspec-orchestrator",
+            "run",
+            "--web",
+            "--web-port",
+            "9000",
+        ]);
+
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert!(args.web);
+                assert_eq!(args.web_port, 9000);
+            }
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_tui_subcommand_web_port_default_auto_assign() {
+        let cli = Cli::parse_from(["openspec-orchestrator", "tui", "--web"]);
+
+        match cli.command {
+            Some(Commands::Tui(args)) => {
+                assert!(args.web);
+                assert_eq!(args.web_port, 0); // Default: OS auto-assigns port
+                assert_eq!(args.web_bind, "127.0.0.1");
             }
             _ => panic!("Expected Tui subcommand"),
         }

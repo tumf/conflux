@@ -428,7 +428,7 @@ Options:
   --no-resume           Disable workspace resume (always create new workspaces)
   --dry-run             Preview parallelization groups without executing
   --web                 Enable web monitoring server
-  --web-port <PORT>     Web server port (default: 8080)
+  --web-port <PORT>     Web server port (default: 0 = auto-assign by OS)
   --web-bind <ADDR>     Web server bind address (default: 127.0.0.1)
 ```
 
@@ -520,7 +520,7 @@ cargo build --release --features web-monitoring
 **Usage:**
 
 ```bash
-# Enable web monitoring on default port (8080)
+# Enable web monitoring (OS auto-assigns an available port)
 openspec-orchestrator run --web
 
 # Custom port and bind address
@@ -529,6 +529,9 @@ openspec-orchestrator run --web --web-port 9000 --web-bind 0.0.0.0
 # With TUI mode
 openspec-orchestrator tui --web
 ```
+
+When using the default port (0), the OS automatically assigns an available port.
+The actual bound address is logged when the server starts.
 
 **Features:**
 
@@ -614,7 +617,7 @@ The web dashboard provides a visual overview of orchestration progress:
 
 | Issue | Solution |
 |-------|----------|
-| "Address already in use" | Another process is using port 8080. Use `--web-port` to specify a different port |
+| "Address already in use" | Use `--web-port 0` (default) to let the OS auto-assign an available port, or specify a specific unused port |
 | Dashboard not loading | Ensure `--web` flag is enabled. Verify the URL includes the correct port |
 | WebSocket disconnects frequently | Check network stability. The dashboard auto-reconnects on disconnection |
 | Changes not updating | Refresh the page or check that the orchestrator is actively processing |

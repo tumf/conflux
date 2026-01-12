@@ -94,11 +94,18 @@ async fn main() -> Result<()> {
             let _web_handle = if args.web {
                 let web_state = std::sync::Arc::new(web::WebState::new(&changes));
                 let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone());
-                tracing::info!(
-                    "Starting web monitoring server on http://{}:{}",
-                    web_config.bind,
-                    web_config.port
-                );
+                if web_config.port == 0 {
+                    tracing::info!(
+                        "Starting web monitoring server on {}:<auto-assigned port>",
+                        web_config.bind
+                    );
+                } else {
+                    tracing::info!(
+                        "Starting web monitoring server on http://{}:{}",
+                        web_config.bind,
+                        web_config.port
+                    );
+                }
                 Some(web::spawn_server(web_config, web_state))
             } else {
                 None
@@ -126,10 +133,17 @@ async fn main() -> Result<()> {
                 let initial_changes = openspec::list_changes_native()?;
                 let web_state = std::sync::Arc::new(web::WebState::new(&initial_changes));
                 let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone());
-                info!(
-                    "Starting web monitoring server on http://{}:{}",
-                    web_config.bind, web_config.port
-                );
+                if web_config.port == 0 {
+                    info!(
+                        "Starting web monitoring server on {}:<auto-assigned port>",
+                        web_config.bind
+                    );
+                } else {
+                    info!(
+                        "Starting web monitoring server on http://{}:{}",
+                        web_config.bind, web_config.port
+                    );
+                }
                 let _handle = web::spawn_server(web_config, web_state.clone());
                 Some(web_state)
             } else {

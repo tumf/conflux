@@ -4,45 +4,46 @@
 TBD - created by archiving change add-web-monitoring. Update Purpose after archive.
 ## Requirements
 ### Requirement: HTTP Server Lifecycle
-The orchestrator SHALL provide an optional HTTP server for web-based monitoring of orchestration state.
+オーケストレーターは、オーケストレーション状態を監視するための任意のHTTPサーバーを提供しなければならない（SHALL）。
 
 #### Scenario: Server enabled via CLI flag
-- **WHEN** user runs orchestrator with `--web` flag
-- **THEN** HTTP server starts on configured port (default 8080)
-- **AND** server binds to configured address (default 127.0.0.1)
-- **AND** orchestrator continues normal operation
+- **WHEN** ユーザーが`--web`を指定し、CLIおよび設定ファイルでポートが未指定
+- **THEN** HTTPサーバーはOSが割り当てる未使用ポート（ポート0による自動割り当て）で起動する
+- **AND** 実際のバインド先（アドレス/ポート）がログに表示される
+- **AND** オーケストレーターは通常通り動作を継続する
 
 #### Scenario: Server disabled by default
-- **WHEN** user runs orchestrator without `--web` flag
-- **THEN** no HTTP server is started
-- **AND** no network ports are bound
+- **WHEN** ユーザーが`--web`を指定せずに実行する
+- **THEN** HTTPサーバーは起動しない
+- **AND** ネットワークポートはバインドされない
 
 #### Scenario: Port already in use
-- **WHEN** HTTP server tries to bind to a port that is already in use
-- **THEN** orchestrator logs clear error message with port number
-- **AND** orchestrator exits with non-zero status code
+- **WHEN** HTTPサーバーが明示指定されたポートにバインドしようとして、そのポートが使用中
+- **THEN** オーケストレーターはポート番号を含む明確なエラーメッセージを出力する
+- **AND** オーケストレーターは非ゼロのステータスで終了する
 
 #### Scenario: Graceful shutdown
-- **WHEN** orchestrator receives shutdown signal (Ctrl+C)
-- **THEN** HTTP server closes all active connections gracefully
-- **AND** orchestrator waits for in-flight requests to complete
-- **AND** orchestrator exits cleanly
+- **WHEN** オーケストレーターが終了シグナル（Ctrl+C）を受信する
+- **THEN** HTTPサーバーはアクティブな接続を穏やかに閉じる
+- **AND** オーケストレーターは進行中のリクエスト完了を待機する
+- **AND** オーケストレーターは正常に終了する
 
 ### Requirement: Configuration Options
-The orchestrator SHALL support configuration of web monitoring parameters via CLI and config file.
+オーケストレーターは、CLIと設定ファイルでWeb監視のパラメータを設定できなければならない（SHALL）。
 
 #### Scenario: Port configuration via CLI
-- **WHEN** user runs with `--web --web-port 3000`
-- **THEN** HTTP server binds to port 3000 instead of default
+- **WHEN** ユーザーが`--web --web-port 3000`で実行する
+- **THEN** HTTPサーバーはデフォルトではなくポート3000にバインドする
 
-#### Scenario: Bind address configuration via CLI
-- **WHEN** user runs with `--web --web-bind 0.0.0.0`
-- **THEN** HTTP server accepts connections from any network interface
+#### Scenario: Auto port selection by default
+- **WHEN** CLIと設定ファイルの両方でポートが未指定
+- **THEN** HTTPサーバーはOSが割り当てる未使用ポートで起動する
+- **AND** 実際のバインド先がログに表示される
 
 #### Scenario: Configuration via config file
-- **WHEN** config file contains `web.enabled = true` and `web.port = 9000`
-- **THEN** HTTP server starts on port 9000 even without CLI flag
-- **AND** CLI flags override config file values
+- **WHEN** 設定ファイルに`web.enabled = true`と`web.port = 9000`がある
+- **THEN** CLIフラグがなくてもHTTPサーバーはポート9000で起動する
+- **AND** CLIで指定した値は設定ファイルより優先される
 
 ### Requirement: REST API - Health Check
 The HTTP server SHALL provide a health check endpoint for monitoring service availability.

@@ -47,7 +47,7 @@ impl Default for WebConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            port: 8080,
+            port: 0, // Auto-assign by OS
             bind: "127.0.0.1".to_string(),
         }
     }
@@ -128,9 +128,12 @@ pub async fn start_server(
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    info!("Starting web monitoring server on http://{}", addr);
-
+    // Bind to the specified address (port 0 = OS auto-assign)
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Get the actual bound address (includes OS-assigned port if port was 0)
+    let actual_addr = listener.local_addr()?;
+    info!("Web monitoring server listening on http://{}", actual_addr);
+
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -172,7 +175,7 @@ mod tests {
     fn test_web_config_default() {
         let config = WebConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.port, 8080);
+        assert_eq!(config.port, 0); // Auto-assign by OS
         assert_eq!(config.bind, "127.0.0.1");
     }
 
@@ -182,5 +185,14 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.port, 9000);
         assert_eq!(config.bind, "0.0.0.0");
+    }
+
+    #[test]
+    fn test_web_config_auto_assign_port() {
+        // When port is 0, OS will auto-assign an available port
+        let config = WebConfig::enabled(0, "127.0.0.1".to_string());
+        assert!(config.enabled);
+        assert_eq!(config.port, 0);
+        assert_eq!(config.bind, "127.0.0.1");
     }
 }
