@@ -448,7 +448,7 @@ pub async fn execute_apply_in_workspace(
                     "--no-graph",
                     "--ignore-working-copy",
                     "-T",
-                    "change_id",
+                    "commit_id",
                 ])
                 .current_dir(workspace_path)
                 .output()
@@ -706,6 +706,22 @@ pub async fn execute_archive_in_workspace(
             }
         }
         VcsBackend::Jj => {
+            // Snapshot working copy changes so archive results are part of the revision.
+            let status_output = Command::new("jj")
+                .args(["status"])
+                .current_dir(workspace_path)
+                .output()
+                .await
+                .map_err(|e| OrchestratorError::JjCommand(format!("Failed to snapshot: {}", e)))?;
+
+            if !status_output.status.success() {
+                let stderr = String::from_utf8_lossy(&status_output.stderr);
+                return Err(OrchestratorError::JjCommand(format!(
+                    "Failed to snapshot working copy: {}",
+                    stderr
+                )));
+            }
+
             // Use --ignore-working-copy to avoid stale working copy errors in workspaces
             let describe_output = Command::new("jj")
                 .args([
@@ -742,7 +758,7 @@ pub async fn execute_archive_in_workspace(
                     "--no-graph",
                     "--ignore-working-copy",
                     "-T",
-                    "change_id",
+                    "commit_id",
                 ])
                 .current_dir(workspace_path)
                 .output()
