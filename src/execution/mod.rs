@@ -14,11 +14,17 @@
 //! - `archive` - Common archive operation logic (from `refactor-archive-common`)
 //! - `apply` - Common apply operation logic (from `refactor-apply-common`)
 
+pub mod apply;
 pub mod types;
 
 // Re-export commonly used items for convenience.
-// Note: These are currently unused but will be used by subsequent changes:
-// - refactor-archive-common
-// - refactor-apply-common
+// Note: Some items are currently unused but will be used as the refactoring progresses
+// in parallel/executor.rs and other modules.
+// Allow unused_imports as these are public API exports for future use.
+#[allow(unused_imports)]
+pub use apply::{
+    check_task_progress, create_final_commit, create_progress_commit, is_progress_complete,
+    progress_increased, ApplyConfig, ApplyIterationResult, DEFAULT_MAX_ITERATIONS,
+};
 #[allow(unused_imports)]
 pub use types::{ExecutionContext, ExecutionResult, ProgressInfo};

@@ -3,6 +3,7 @@
 use crate::agent::build_apply_prompt;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::execution::apply as common_apply;
 use crate::task_parser::TaskProgress;
 use crate::vcs::VcsBackend;
 use std::path::Path;
@@ -138,51 +139,27 @@ pub async fn create_progress_commit(
 ///
 /// Reads and parses the tasks.md file to determine completion status.
 /// Returns None if the file doesn't exist (e.g., after archiving).
+///
+/// This function delegates to `crate::execution::apply::check_task_progress`
+/// for the actual implementation.
+#[inline]
 pub fn check_task_progress(
     workspace_path: &Path,
     change_id: &str,
 ) -> Option<crate::task_parser::TaskProgress> {
-    let tasks_path = workspace_path
-        .join("openspec/changes")
-        .join(change_id)
-        .join("tasks.md");
-
-    debug!("Checking tasks at: {:?}", tasks_path);
-
-    if tasks_path.exists() {
-        let progress = crate::task_parser::parse_file(&tasks_path).unwrap_or_default();
-        debug!(
-            "Tasks file found for {}: {}/{} complete",
-            change_id, progress.completed, progress.total
-        );
-        Some(progress)
-    } else {
-        debug!("Tasks file not found at {:?}", tasks_path);
-        None
-    }
+    common_apply::check_task_progress(workspace_path, change_id)
 }
 
 /// Summarize command output for logging and event reporting.
 ///
 /// If output exceeds max_lines, returns the last few lines with a count prefix.
+///
+/// This function delegates to `crate::execution::apply::summarize_output`
+/// for the actual implementation.
 #[allow(dead_code)] // Utility function for future use
+#[inline]
 pub fn summarize_output(output: &str, max_lines: usize) -> String {
-    if output.is_empty() {
-        return String::new();
-    }
-
-    let lines: Vec<&str> = output.lines().collect();
-    if lines.len() > max_lines {
-        // Show last 5 lines with total count
-        let tail_lines = 5.min(lines.len());
-        format!(
-            "... ({} lines) ...\n{}",
-            lines.len(),
-            lines[lines.len() - tail_lines..].join("\n")
-        )
-    } else {
-        output.to_string()
-    }
+    common_apply::summarize_output(output, max_lines)
 }
 
 /// Execute apply command in a single workspace, repeating until tasks are 100% complete
