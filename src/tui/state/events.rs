@@ -101,6 +101,19 @@ impl AppState {
                 if let Some(started) = self.orchestration_started_at {
                     self.orchestration_elapsed = Some(started.elapsed());
                 }
+                // Reset any in-flight change back to Queued (same as force stop)
+                for change in &mut self.changes {
+                    if matches!(
+                        change.queue_status,
+                        QueueStatus::Processing | QueueStatus::Archiving
+                    ) {
+                        // Record elapsed time before resetting status
+                        if let Some(started) = change.started_at {
+                            change.elapsed_time = Some(started.elapsed());
+                        }
+                        change.queue_status = QueueStatus::Queued;
+                    }
+                }
                 self.add_log(LogEntry::warn("Processing stopped"));
             }
             OrchestratorEvent::Log(entry) => {
@@ -291,5 +304,56 @@ mod tests {
 
         // Should have 2 new changes
         assert_eq!(app.new_change_count, 2);
+    }
+
+    #[test]
+    fn test_stopped_event_cleans_up_processing_changes() {
+        let changes = vec![
+            create_approved_change("a", 0, 3),
+            create_approved_change("b", 0, 2),
+            create_approved_change("c", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Simulate processing state for multiple changes
+        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[0].started_at = Some(Instant::now());
+        app.changes[1].queue_status = QueueStatus::Archiving;
+        app.changes[1].started_at = Some(Instant::now());
+        app.changes[2].queue_status = QueueStatus::Queued;
+
+        // Handle Stopped event (graceful stop)
+        app.handle_orchestrator_event(OrchestratorEvent::Stopped);
+
+        // Processing and Archiving should be reset to Queued
+        assert!(matches!(app.changes[0].queue_status, QueueStatus::Queued));
+        assert!(matches!(app.changes[1].queue_status, QueueStatus::Queued));
+        // Queued should remain Queued
+        assert!(matches!(app.changes[2].queue_status, QueueStatus::Queued));
+        // Mode should be Stopped
+        assert_eq!(app.mode, AppMode::Stopped);
+        // current_change should be cleared
+        assert!(app.current_change.is_none());
+    }
+
+    #[test]
+    fn test_stopped_event_records_elapsed_time() {
+        let changes = vec![create_approved_change("a", 0, 3)];
+        let mut app = AppState::new(changes);
+
+        // Simulate processing state with started_at
+        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[0].started_at = Some(Instant::now());
+        assert!(app.changes[0].elapsed_time.is_none());
+
+        // Wait a tiny bit to ensure elapsed time is non-zero
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        // Handle Stopped event
+        app.handle_orchestrator_event(OrchestratorEvent::Stopped);
+
+        // Elapsed time should be recorded
+        assert!(app.changes[0].elapsed_time.is_some());
+        assert!(app.changes[0].elapsed_time.unwrap().as_nanos() > 0);
     }
 }
