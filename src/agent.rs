@@ -27,10 +27,11 @@ Special handling for 'future work' tasks:
 - This indicates deferred work, not current implementation scope";
 use crate::error::{OrchestratorError, Result};
 use crate::history::{ApplyAttempt, ApplyHistory};
+use crate::process_manager::ManagedChild;
 use std::process::{ExitStatus, Stdio};
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
@@ -69,7 +70,7 @@ impl AgentRunner {
     pub async fn run_apply_streaming(
         &self,
         change_id: &str,
-    ) -> Result<(Child, mpsc::Receiver<OutputLine>, Instant)> {
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
         let start = Instant::now();
         let template = self.config.get_apply_command();
         let user_prompt = self.config.get_apply_prompt();
@@ -108,7 +109,7 @@ impl AgentRunner {
     pub async fn run_archive_streaming(
         &self,
         change_id: &str,
-    ) -> Result<(Child, mpsc::Receiver<OutputLine>)> {
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
         let template = self.config.get_archive_command();
         let prompt = self.config.get_archive_prompt();
         let command = OrchestratorConfig::expand_change_id(template, change_id);
@@ -209,7 +210,7 @@ impl AgentRunner {
     pub async fn analyze_dependencies_streaming(
         &self,
         prompt: &str,
-    ) -> Result<(Child, mpsc::Receiver<OutputLine>)> {
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
         let template = self.config.get_analyze_command();
         let command = OrchestratorConfig::expand_prompt(template, prompt);
         info!("Running analyze command (streaming): {}", template);
@@ -221,7 +222,7 @@ impl AgentRunner {
     pub async fn run_resolve_streaming(
         &self,
         prompt: &str,
-    ) -> Result<(Child, mpsc::Receiver<OutputLine>)> {
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
         let template = self.config.get_resolve_command();
         let command = OrchestratorConfig::expand_prompt(template, prompt);
         info!("Running resolve command (streaming): {}", command);
@@ -270,7 +271,7 @@ impl AgentRunner {
     async fn execute_shell_command_streaming(
         &self,
         command: &str,
-    ) -> Result<(Child, mpsc::Receiver<OutputLine>)> {
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
         let mut child = if cfg!(target_os = "windows") {
             Command::new("cmd")
                 .arg("/C")
@@ -329,17 +330,16 @@ impl AgentRunner {
 
             #[cfg(unix)]
             {
-                // Detach from controlling terminal completely
+                // Detach from controlling terminal and create new process group
                 unsafe {
                     #[allow(unused_imports)]
                     use std::os::unix::process::CommandExt;
                     cmd.pre_exec(|| {
+                        use nix::unistd::{setpgid, Pid};
                         use std::os::unix::io::RawFd;
 
-                        // Create a new session - this detaches from the controlling terminal
-                        if libc::setsid() == -1 {
-                            return Err(std::io::Error::last_os_error());
-                        }
+                        // Create a new process group (replacing setsid for better cleanup)
+                        setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(std::io::Error::other)?;
 
                         // Close /dev/tty to prevent any direct terminal access
                         // Open /dev/null and redirect any attempts to access /dev/tty
@@ -397,7 +397,12 @@ impl AgentRunner {
             });
         }
 
-        Ok((child, rx))
+        // Wrap child in ManagedChild for reliable cleanup
+        let managed_child = ManagedChild::new(child).map_err(|e| {
+            OrchestratorError::AgentCommand(format!("Failed to create managed child: {}", e))
+        })?;
+
+        Ok((managed_child, rx))
     }
 
     /// Execute a shell command and wait for completion (blocking, no streaming)

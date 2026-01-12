@@ -277,6 +277,42 @@ mod tests {
 | chrono | Date/time handling |
 | tempfile | Test fixtures |
 | async-trait | Async trait definitions |
+| nix (Unix) | Process group management |
+| windows (Windows) | Job object management |
+
+## Process Management
+
+The orchestrator uses platform-specific process management to ensure reliable cleanup of child processes:
+
+### Unix (macOS/Linux)
+
+- **Process Groups**: Child processes are spawned in their own process group using `setpgid(0, 0)`
+- **Cleanup**: On termination, `killpg()` sends SIGTERM to the entire process group
+- **Implementation**: See `src/process_manager.rs` and `src/agent.rs`
+
+### Windows
+
+- **Job Objects**: Child processes are assigned to a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+- **Cleanup**: When the job handle is closed, Windows automatically terminates all processes in the job
+- **Implementation**: See `src/process_manager.rs`
+
+### Signal Handling (Run Mode)
+
+The `run` mode includes signal handlers for graceful shutdown:
+- **SIGINT (Ctrl+C)**: Handled on all platforms
+- **SIGTERM**: Handled on Unix platforms
+- **Behavior**: Cancels running operations and waits for child processes to terminate
+
+### Troubleshooting
+
+**Issue**: Child processes remain after orchestrator exit
+- **Unix**: Check if process group was created: `ps -o pid,pgid -p <pid>`
+- **Windows**: Verify job object assignment (use Process Explorer)
+- **Solution**: Ensure `ManagedChild` is properly created and terminated
+
+**Issue**: Timeout waiting for process cleanup
+- **TUI Mode**: Default timeout is 5 seconds
+- **Solution**: If processes take longer, check for hung child processes or increase timeout in `src/tui/runner.rs`
 
 ## Configuration Files
 
