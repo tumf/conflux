@@ -111,12 +111,17 @@ pub async fn archive_single_change(
             line = output_rx.recv() => {
                 match line {
                     Some(OutputLine::Stdout(s)) => {
+                        tracing::debug!("Archive stdout: {}", s);
                         let _ = tx.send(OrchestratorEvent::Log(LogEntry::info(s))).await;
                     }
                     Some(OutputLine::Stderr(s)) => {
+                        tracing::debug!("Archive stderr: {}", s);
                         let _ = tx.send(OrchestratorEvent::Log(LogEntry::warn(s))).await;
                     }
-                    None => break,
+                    None => {
+                        tracing::debug!("Archive output stream closed");
+                        break;
+                    }
                 }
             }
         }

@@ -1,0 +1,15 @@
+{
+  // OpenSpec Orchestrator Configuration
+  // Template: Claude Code
+  // Agent command configuration
+  "propose_command": "claude --model sonnet --dangerously-skip-permissions --verbose -p '/openspec:proposal {proposal}'",
+  "analyze_command": "claude --model sonnet --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
+  "apply_command": "claude --model sonnet --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id} {prompt}'",
+  "archive_command": "claude --model sonnet --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id} {prompt}'",
+  "resolve_command": "claude --model sonnet --dangerously-skip-permissions --verbose -p '{prompt}'",
+  // Lifecycle hooks (optional)
+  "hooks": {
+    // Create a new jj change for each changeset before applying
+    //"pre_apply": "jj new -m 'changeset: {change_id}'"
+  },
+}

@@ -25,6 +25,16 @@ impl AppState {
                 }
                 self.add_log(LogEntry::info(format!("Processing: {}", id)));
             }
+            OrchestratorEvent::ApplyStarted { change_id } => {
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+                    if change.started_at.is_none() {
+                        change.started_at = Some(Instant::now());
+                    }
+                    change.queue_status = QueueStatus::Processing;
+                    change.elapsed_time = None;
+                }
+                self.add_log(LogEntry::info(format!("Apply started: {}", change_id)));
+            }
             OrchestratorEvent::ProgressUpdated {
                 change_id,
                 completed,
@@ -53,6 +63,9 @@ impl AppState {
             }
             OrchestratorEvent::ArchiveStarted(id) => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
+                    if change.started_at.is_none() {
+                        change.started_at = Some(Instant::now());
+                    }
                     change.queue_status = QueueStatus::Archiving;
                 }
                 self.add_log(LogEntry::info(format!("Archiving: {}", id)));
@@ -123,10 +136,23 @@ impl AppState {
             OrchestratorEvent::ChangesRefreshed(changes) => {
                 self.update_changes(changes);
             }
-            // Ignore parallel-specific events that don't affect TUI state in serial mode
+            // Output events - add to log
+            OrchestratorEvent::ApplyOutput { change_id, output } => {
+                self.add_log(LogEntry::info(format!("[{}] {}", change_id, output)));
+            }
+            OrchestratorEvent::ArchiveOutput { change_id, output } => {
+                self.add_log(LogEntry::info(format!("[{}] {}", change_id, output)));
+            }
+            OrchestratorEvent::AnalysisOutput { output } => {
+                self.add_log(LogEntry::info(format!("[Analysis] {}", output)));
+            }
+            OrchestratorEvent::ResolveOutput { output } => {
+                self.add_log(LogEntry::info(format!("[Resolve] {}", output)));
+            }
+            // Ignore other parallel-specific events that don't affect TUI state
             _ => {
-                // Log the event for debugging but don't update state
-                // These events are primarily for parallel mode and are handled by the bridge
+                // Other events (workspace, merge, group events) are for status tracking
+                // and don't need to be displayed in the log
             }
         }
     }
@@ -239,6 +265,85 @@ mod tests {
             is_approved: true,
             dependencies: Vec::new(),
         }
+    }
+
+    #[test]
+    fn test_apply_started_sets_started_at() {
+        let changes = vec![create_approved_change("change-a", 0, 5)];
+        let mut app = AppState::new(changes);
+        let initial_log_count = app.logs.len();
+
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyStarted {
+            change_id: "change-a".to_string(),
+        });
+
+        assert!(app.changes[0].started_at.is_some());
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Processing);
+        assert!(app.changes[0].elapsed_time.is_none());
+        assert_eq!(app.logs.len(), initial_log_count + 1);
+        assert!(app.logs.last().unwrap().message.contains("Apply started"));
+    }
+
+    #[test]
+    fn test_apply_started_preserves_existing_started_at() {
+        let changes = vec![create_approved_change("change-a", 0, 5)];
+        let mut app = AppState::new(changes);
+        let started_at = Instant::now();
+        app.changes[0].started_at = Some(started_at);
+
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyStarted {
+            change_id: "change-a".to_string(),
+        });
+
+        assert_eq!(app.changes[0].started_at, Some(started_at));
+    }
+
+    #[test]
+    fn test_archive_started_sets_started_at_when_none() {
+        let changes = vec![create_approved_change("change-a", 0, 5)];
+        let mut app = AppState::new(changes);
+
+        app.handle_orchestrator_event(OrchestratorEvent::ArchiveStarted("change-a".to_string()));
+
+        assert!(app.changes[0].started_at.is_some());
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archiving);
+    }
+
+    #[test]
+    fn test_archive_started_preserves_started_at() {
+        let changes = vec![create_approved_change("change-a", 0, 5)];
+        let mut app = AppState::new(changes);
+        let started_at = Instant::now();
+        app.changes[0].started_at = Some(started_at);
+
+        app.handle_orchestrator_event(OrchestratorEvent::ArchiveStarted("change-a".to_string()));
+
+        assert_eq!(app.changes[0].started_at, Some(started_at));
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archiving);
+    }
+
+    #[test]
+    fn test_parallel_execution_elapsed_time_flow() {
+        let changes = vec![create_approved_change("change-a", 0, 5)];
+        let mut app = AppState::new(changes);
+
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyStarted {
+            change_id: "change-a".to_string(),
+        });
+
+        let started_at = app.changes[0].started_at;
+        assert!(started_at.is_some());
+
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        app.handle_orchestrator_event(OrchestratorEvent::ArchiveStarted("change-a".to_string()));
+        assert_eq!(app.changes[0].started_at, started_at);
+
+        app.handle_orchestrator_event(OrchestratorEvent::ChangeArchived("change-a".to_string()));
+
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archived);
+        assert!(app.changes[0].elapsed_time.is_some());
+        assert!(app.changes[0].elapsed_time.unwrap().as_nanos() > 0);
     }
 
     // === Tests for fix-stopped-task-complete-queued ===
@@ -712,5 +817,123 @@ mod tests {
             "Only archived change should be retained"
         );
         assert_eq!(app.changes[0].id, "archived");
+    }
+
+    /// Test that ApplyOutput events are logged correctly
+    #[test]
+    fn test_apply_output_event_logged() {
+        let changes = vec![create_approved_change("change-a", 0, 5)];
+        let mut app = AppState::new(changes);
+        let initial_log_count = app.logs.len();
+
+        // Send ApplyOutput event
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyOutput {
+            change_id: "change-a".to_string(),
+            output: "Test output line".to_string(),
+        });
+
+        // Log should be added
+        assert_eq!(app.logs.len(), initial_log_count + 1);
+        assert!(app.logs.last().unwrap().message.contains("change-a"));
+        assert!(app
+            .logs
+            .last()
+            .unwrap()
+            .message
+            .contains("Test output line"));
+    }
+
+    /// Test that ArchiveOutput events are logged correctly
+    #[test]
+    fn test_archive_output_event_logged() {
+        let changes = vec![create_approved_change("change-b", 5, 5)];
+        let mut app = AppState::new(changes);
+        let initial_log_count = app.logs.len();
+
+        // Send ArchiveOutput event
+        app.handle_orchestrator_event(OrchestratorEvent::ArchiveOutput {
+            change_id: "change-b".to_string(),
+            output: "Archive output line".to_string(),
+        });
+
+        // Log should be added
+        assert_eq!(app.logs.len(), initial_log_count + 1);
+        assert!(app.logs.last().unwrap().message.contains("change-b"));
+        assert!(app
+            .logs
+            .last()
+            .unwrap()
+            .message
+            .contains("Archive output line"));
+    }
+
+    /// Test that AnalysisOutput events are logged correctly
+    #[test]
+    fn test_analysis_output_event_logged() {
+        let changes = vec![create_approved_change("change-c", 0, 3)];
+        let mut app = AppState::new(changes);
+        let initial_log_count = app.logs.len();
+
+        // Send AnalysisOutput event
+        app.handle_orchestrator_event(OrchestratorEvent::AnalysisOutput {
+            output: "Analyzing dependencies...".to_string(),
+        });
+
+        // Log should be added
+        assert_eq!(app.logs.len(), initial_log_count + 1);
+        assert!(app.logs.last().unwrap().message.contains("Analysis"));
+        assert!(app
+            .logs
+            .last()
+            .unwrap()
+            .message
+            .contains("Analyzing dependencies"));
+    }
+
+    /// Test that ResolveOutput events are logged correctly
+    #[test]
+    fn test_resolve_output_event_logged() {
+        let changes = vec![create_approved_change("change-d", 1, 4)];
+        let mut app = AppState::new(changes);
+        let initial_log_count = app.logs.len();
+
+        // Send ResolveOutput event
+        app.handle_orchestrator_event(OrchestratorEvent::ResolveOutput {
+            output: "Resolving conflicts...".to_string(),
+        });
+
+        // Log should be added
+        assert_eq!(app.logs.len(), initial_log_count + 1);
+        assert!(app.logs.last().unwrap().message.contains("Resolve"));
+        assert!(app
+            .logs
+            .last()
+            .unwrap()
+            .message
+            .contains("Resolving conflicts"));
+    }
+
+    /// Test that Log events with stdout/stderr content are processed correctly
+    #[test]
+    fn test_log_event_with_stdout_content() {
+        let changes = vec![create_approved_change("change-e", 0, 2)];
+        let mut app = AppState::new(changes);
+        let initial_log_count = app.logs.len();
+
+        // Send Log event with stdout content (simulating serial mode)
+        app.handle_orchestrator_event(OrchestratorEvent::Log(LogEntry::info(
+            "Claude output line 1".to_string(),
+        )));
+        app.handle_orchestrator_event(OrchestratorEvent::Log(LogEntry::info(
+            "Claude output line 2".to_string(),
+        )));
+
+        // Logs should be added
+        assert_eq!(app.logs.len(), initial_log_count + 2);
+        assert_eq!(app.logs[initial_log_count].message, "Claude output line 1");
+        assert_eq!(
+            app.logs[initial_log_count + 1].message,
+            "Claude output line 2"
+        );
     }
 }

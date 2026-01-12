@@ -15,17 +15,27 @@
 - [ ] 1.3 `jj edit` 使用時のログメッセージを追加
 - [ ] 1.4 docstring を更新して、単一変更と複数変更の処理の違いを明記
 
-## 2. `workspace update-stale` の削除
+## 2. `--ignore-working-copy` フラグの完全削除（完了）
 
-- [ ] 2.1 `src/vcs/jj/mod.rs` の `merge_jj_workspaces()` メソッドから `workspace update-stale` の呼び出しを削除（行 365-373）
-- [ ] 2.2 `src/parallel/mod.rs` の `merge_and_resolve()` メソッドからも `workspace update-stale` の呼び出しを削除（行 906-916）
-- [ ] 2.3 関連するコメントも更新
+- [x] 2.1 `src/vcs/jj/mod.rs` からすべての `--ignore-working-copy` を削除
+  - [x] `merge_jj_workspaces`: `jj edit` コマンドから削除
+  - [x] `merge_jj_workspaces`: `workspace update-stale` の呼び出しを完全削除
+  - [x] `parse_created_commit_id`: `jj log` コマンドから削除
+  - [x] `set_commit_message`: `jj describe` コマンドから削除
+  - [x] `get_revision_in_workspace`: `jj log` コマンドから削除
+- [x] 2.2 `src/vcs/jj/commands.rs` からすべての `--ignore-working-copy` を削除
+  - [x] `get_current_revision`: `jj log` コマンドから削除
+- [x] 2.3 `src/parallel/executor.rs` からすべての `--ignore-working-copy` を削除
+  - [x] `create_progress_commit`: `jj describe` コマンドから削除
+  - [x] `execute_apply_in_workspace`: `jj describe` と `jj log` コマンドから削除
+  - [x] `execute_archive_in_workspace`: `jj describe` と `jj log` コマンドから削除
+- [x] 2.4 コミット: "fix: Remove all --ignore-working-copy flags from jj commands"
 
 ## 3. 関連箇所の確認と修正
 
 - [ ] 3.1 `src/parallel/mod.rs` で個別マージの動作が正しいか確認
-- [ ] 3.2 `workspace update-stale` が他の場所で使われていないか確認（`rg "workspace update-stale"` で検索）
-- [ ] 3.3 他の箇所で使われている場合、同様の問題がないか確認し、必要に応じて修正
+- [x] 3.2 `--ignore-working-copy` が完全に削除されたことを確認（`rg "ignore-working-copy"` で検索）
+- [ ] 3.3 並列実行で重複コミットが発生しないか確認
 
 ## 4. テストの追加・更新
 

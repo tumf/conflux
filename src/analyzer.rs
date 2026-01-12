@@ -163,23 +163,32 @@ impl ParallelizationAnalyzer {
     }
 
     /// Build the prompt for parallelization analysis
+    ///
+    /// Formats selected changes (with `is_approved = true`) as a list with:
+    /// - `[x]` marker to indicate selection status
+    /// - Directory path for each change (e.g., `openspec/changes/{id}/`)
+    ///
+    /// This makes it clear to the LLM which changes need analysis and where
+    /// to find their proposal files.
     fn build_parallelization_prompt(&self, changes: &[Change]) -> String {
-        let change_ids: String = changes
+        let change_list: String = changes
             .iter()
-            .map(|c| format!("- {}", c.id))
+            .filter(|c| c.is_approved) // Only selected/approved changes
+            .map(|c| format!("[x] {} (openspec/changes/{}/)", c.id, c.id))
             .collect::<Vec<_>>()
             .join("\n");
 
         format!(
             r#"You are planning the execution order for OpenSpec changes.
 
-Read the proposal files for these changes in openspec/changes/<change_id>/ and analyze their dependencies:
+Analyze these selected changes (marked with [x]).
+Read the proposal files in the specified directories to understand their dependencies:
 
-{change_ids}
+{change_list}
 
 Your task:
-1. Read each change proposal.md to understand what it does
-2. Identify dependencies between changes based on what each module uses or builds upon
+1. Read each change's proposal.md at the given path to understand what it does
+2. Identify dependencies between these changes
 3. Group changes that can run in parallel (no dependencies on each other)
 4. Order groups so dependencies are completed before dependents
 
@@ -761,5 +770,107 @@ That's all."#;
 
         // "a" has no dependencies
         assert!(!deps.contains_key("a"));
+    }
+
+    #[test]
+    fn test_build_prompt_with_selected_markers() {
+        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
+        let analyzer = ParallelizationAnalyzer::new(agent);
+
+        let changes = vec![
+            Change {
+                id: "selected-a".to_string(),
+                is_approved: true,
+                completed_tasks: 0,
+                total_tasks: 5,
+                last_modified: "now".to_string(),
+                dependencies: Vec::new(),
+            },
+            Change {
+                id: "unselected-b".to_string(),
+                is_approved: false,
+                completed_tasks: 0,
+                total_tasks: 5,
+                last_modified: "now".to_string(),
+                dependencies: Vec::new(),
+            },
+            Change {
+                id: "selected-c".to_string(),
+                is_approved: true,
+                completed_tasks: 0,
+                total_tasks: 5,
+                last_modified: "now".to_string(),
+                dependencies: Vec::new(),
+            },
+        ];
+
+        let prompt = analyzer.build_parallelization_prompt(&changes);
+
+        // Check that selected changes are marked with [x]
+        assert!(prompt.contains("[x] selected-a (openspec/changes/selected-a/)"));
+        assert!(prompt.contains("[x] selected-c (openspec/changes/selected-c/)"));
+
+        // Check that unselected change is NOT included
+        assert!(!prompt.contains("unselected-b"));
+
+        // Check that instruction mentions "marked with [x]"
+        assert!(prompt.contains("marked with [x]"));
+
+        // Check that instruction mentions reading proposal files
+        assert!(prompt.contains("Read the proposal files in the specified directories"));
+    }
+
+    #[test]
+    fn test_build_prompt_all_selected() {
+        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
+        let analyzer = ParallelizationAnalyzer::new(agent);
+
+        let changes = vec![
+            Change {
+                id: "change-1".to_string(),
+                is_approved: true,
+                completed_tasks: 0,
+                total_tasks: 5,
+                last_modified: "now".to_string(),
+                dependencies: Vec::new(),
+            },
+            Change {
+                id: "change-2".to_string(),
+                is_approved: true,
+                completed_tasks: 0,
+                total_tasks: 5,
+                last_modified: "now".to_string(),
+                dependencies: Vec::new(),
+            },
+        ];
+
+        let prompt = analyzer.build_parallelization_prompt(&changes);
+
+        // All should be included with [x] marker
+        assert!(prompt.contains("[x] change-1 (openspec/changes/change-1/)"));
+        assert!(prompt.contains("[x] change-2 (openspec/changes/change-2/)"));
+    }
+
+    #[test]
+    fn test_build_prompt_none_selected() {
+        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
+        let analyzer = ParallelizationAnalyzer::new(agent);
+
+        let changes = vec![Change {
+            id: "change-1".to_string(),
+            is_approved: false,
+            completed_tasks: 0,
+            total_tasks: 5,
+            last_modified: "now".to_string(),
+            dependencies: Vec::new(),
+        }];
+
+        let prompt = analyzer.build_parallelization_prompt(&changes);
+
+        // No changes should be included
+        assert!(!prompt.contains("change-1"));
+
+        // But structure should still be there
+        assert!(prompt.contains("Analyze these selected changes"));
     }
 }
