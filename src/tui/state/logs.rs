@@ -4,6 +4,7 @@
 
 use super::super::events::LogEntry;
 use super::AppState;
+use tracing::debug;
 
 /// Maximum number of log entries to keep
 pub const MAX_LOG_ENTRIES: usize = 1000;
@@ -11,6 +12,7 @@ pub const MAX_LOG_ENTRIES: usize = 1000;
 impl AppState {
     /// Add a log entry
     pub fn add_log(&mut self, entry: LogEntry) {
+        debug!("Adding log entry: {:?}", entry.message);
         self.logs.push(entry);
         if self.logs.len() > MAX_LOG_ENTRIES {
             self.logs.remove(0);

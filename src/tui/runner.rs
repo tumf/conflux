@@ -85,7 +85,7 @@ async fn run_tui_loop(
     let mut app = AppState::new(initial_changes);
     app.max_concurrent = config.get_max_concurrent_workspaces();
     app.web_url = web_url;
-    let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(100);
+    let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(1000);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<TuiCommand>(100);
 
     // Dynamic queue for runtime change additions

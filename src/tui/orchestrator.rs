@@ -868,7 +868,7 @@ pub async fn run_orchestrator_parallel(
             .await;
 
         // Create event channel for forwarding to TUI
-        let (parallel_tx, mut parallel_rx) = mpsc::channel::<ParallelEvent>(100);
+        let (parallel_tx, mut parallel_rx) = mpsc::channel::<ParallelEvent>(1000);
 
         // Spawn event forwarding task
         let forward_tx = tx.clone();

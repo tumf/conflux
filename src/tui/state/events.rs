@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::openspec::Change;
+use tracing::debug;
 
 use super::super::events::{LogEntry, OrchestratorEvent};
 use super::super::types::{AppMode, QueueStatus, StopMode};
@@ -15,6 +16,7 @@ use super::AppState;
 impl AppState {
     /// Handle an event from the orchestrator
     pub fn handle_orchestrator_event(&mut self, event: OrchestratorEvent) {
+        debug!("TUI handling event: {:?}", event);
         match event {
             OrchestratorEvent::ProcessingStarted(id) => {
                 self.current_change = Some(id.clone());
@@ -123,10 +125,23 @@ impl AppState {
             OrchestratorEvent::ChangesRefreshed(changes) => {
                 self.update_changes(changes);
             }
-            // Ignore parallel-specific events that don't affect TUI state in serial mode
+            // Output events - add to log
+            OrchestratorEvent::ApplyOutput { change_id, output } => {
+                self.add_log(LogEntry::info(format!("[{}] {}", change_id, output)));
+            }
+            OrchestratorEvent::ArchiveOutput { change_id, output } => {
+                self.add_log(LogEntry::info(format!("[{}] {}", change_id, output)));
+            }
+            OrchestratorEvent::AnalysisOutput { output } => {
+                self.add_log(LogEntry::info(format!("[Analysis] {}", output)));
+            }
+            OrchestratorEvent::ResolveOutput { output } => {
+                self.add_log(LogEntry::info(format!("[Resolve] {}", output)));
+            }
+            // Ignore other parallel-specific events that don't affect TUI state
             _ => {
-                // Log the event for debugging but don't update state
-                // These events are primarily for parallel mode and are handled by the bridge
+                // Other events (workspace, merge, group events) are for status tracking
+                // and don't need to be displayed in the log
             }
         }
     }
@@ -712,5 +727,99 @@ mod tests {
             "Only archived change should be retained"
         );
         assert_eq!(app.changes[0].id, "archived");
+    }
+
+    /// Test that ApplyOutput events are logged correctly
+    #[test]
+    fn test_apply_output_event_logged() {
+        let changes = vec![create_approved_change("change-a", 0, 5)];
+        let mut app = AppState::new(changes);
+        let initial_log_count = app.logs.len();
+
+        // Send ApplyOutput event
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyOutput {
+            change_id: "change-a".to_string(),
+            output: "Test output line".to_string(),
+        });
+
+        // Log should be added
+        assert_eq!(app.logs.len(), initial_log_count + 1);
+        assert!(app.logs.last().unwrap().message.contains("change-a"));
+        assert!(app
+            .logs
+            .last()
+            .unwrap()
+            .message
+            .contains("Test output line"));
+    }
+
+    /// Test that ArchiveOutput events are logged correctly
+    #[test]
+    fn test_archive_output_event_logged() {
+        let changes = vec![create_approved_change("change-b", 5, 5)];
+        let mut app = AppState::new(changes);
+        let initial_log_count = app.logs.len();
+
+        // Send ArchiveOutput event
+        app.handle_orchestrator_event(OrchestratorEvent::ArchiveOutput {
+            change_id: "change-b".to_string(),
+            output: "Archive output line".to_string(),
+        });
+
+        // Log should be added
+        assert_eq!(app.logs.len(), initial_log_count + 1);
+        assert!(app.logs.last().unwrap().message.contains("change-b"));
+        assert!(app
+            .logs
+            .last()
+            .unwrap()
+            .message
+            .contains("Archive output line"));
+    }
+
+    /// Test that AnalysisOutput events are logged correctly
+    #[test]
+    fn test_analysis_output_event_logged() {
+        let changes = vec![create_approved_change("change-c", 0, 3)];
+        let mut app = AppState::new(changes);
+        let initial_log_count = app.logs.len();
+
+        // Send AnalysisOutput event
+        app.handle_orchestrator_event(OrchestratorEvent::AnalysisOutput {
+            output: "Analyzing dependencies...".to_string(),
+        });
+
+        // Log should be added
+        assert_eq!(app.logs.len(), initial_log_count + 1);
+        assert!(app.logs.last().unwrap().message.contains("Analysis"));
+        assert!(app
+            .logs
+            .last()
+            .unwrap()
+            .message
+            .contains("Analyzing dependencies"));
+    }
+
+    /// Test that ResolveOutput events are logged correctly
+    #[test]
+    fn test_resolve_output_event_logged() {
+        let changes = vec![create_approved_change("change-d", 1, 4)];
+        let mut app = AppState::new(changes);
+        let initial_log_count = app.logs.len();
+
+        // Send ResolveOutput event
+        app.handle_orchestrator_event(OrchestratorEvent::ResolveOutput {
+            output: "Resolving conflicts...".to_string(),
+        });
+
+        // Log should be added
+        assert_eq!(app.logs.len(), initial_log_count + 1);
+        assert!(app.logs.last().unwrap().message.contains("Resolve"));
+        assert!(app
+            .logs
+            .last()
+            .unwrap()
+            .message
+            .contains("Resolving conflicts"));
     }
 }
