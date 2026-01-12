@@ -31,8 +31,9 @@ impl AppState {
                 total,
             } => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-                    // Only update progress if the change is still being processed
-                    // After Completed, the tasks.md file may be moved/archived
+                    // Only update progress, never modify queue_status.
+                    // In Stopped mode, task completion does not trigger auto-queue.
+                    // After Completed, the tasks.md file may be moved/archived.
                     match change.queue_status {
                         QueueStatus::Completed | QueueStatus::Archiving | QueueStatus::Archived => {
                             // Don't update progress after completion - file may be moved
@@ -126,6 +127,10 @@ impl AppState {
     }
 
     /// Update changes from a refresh
+    ///
+    /// IMPORTANT: This method only updates task progress (completed_tasks, total_tasks).
+    /// It does NOT modify queue_status. In Stopped mode, task completion does not
+    /// trigger auto-queue. Changes are only queued through explicit user action (Space key).
     pub fn update_changes(&mut self, fetched_changes: Vec<Change>) {
         // Detect new changes
         let new_ids: Vec<String> = fetched_changes
@@ -197,6 +202,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::events::TuiCommand;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -218,6 +224,121 @@ mod tests {
             is_approved: true,
             dependencies: Vec::new(),
         }
+    }
+
+    // === Tests for fix-stopped-task-complete-queued ===
+
+    #[test]
+    fn test_task_completion_in_stopped_mode_does_not_auto_queue() {
+        // Scenario: Task completion in Stopped mode does not auto-queue
+        // WHEN TUI is in Stopped mode
+        // AND a change's tasks are updated (e.g., all tasks marked complete)
+        // THEN the change queue_status SHALL remain unchanged
+        // AND the change SHALL NOT be automatically added to the queue
+
+        let changes = vec![create_approved_change("change-a", 0, 5)];
+        let mut app = AppState::new(changes);
+
+        // Start processing and then stop
+        app.start_processing();
+        app.mode = AppMode::Stopped;
+
+        // Simulate that change was in Queued status before tasks were updated
+        // (This is the expected state after stop - Processing changes go back to Queued)
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+
+        // Simulate task completion via update_changes (auto-refresh)
+        let fetched = vec![create_approved_change("change-a", 5, 5)]; // All tasks complete
+        app.update_changes(fetched);
+
+        // Queue status should remain NotQueued (not auto-queued)
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+        // Tasks should be updated
+        assert_eq!(app.changes[0].completed_tasks, 5);
+        assert_eq!(app.changes[0].total_tasks, 5);
+    }
+
+    #[test]
+    fn test_explicit_queue_addition_in_stopped_mode_works() {
+        // Scenario: Explicit queue addition in Stopped mode works
+        // WHEN TUI is in Stopped mode
+        // AND user presses Space on a not-queued change (even if tasks are 100% complete)
+        // THEN the change SHALL be added to the queue
+        // AND the change queue_status SHALL become Queued
+
+        let changes = vec![create_approved_change("change-a", 5, 5)]; // 100% complete
+        let mut app = AppState::new(changes);
+
+        // Start processing and then stop
+        app.start_processing();
+        app.mode = AppMode::Stopped;
+
+        // Set to NotQueued (simulating user dequeued or it was never queued)
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].selected = false;
+
+        // User explicitly adds to queue via Space key
+        let cmd = app.toggle_selection();
+
+        // Should return AddToQueue command
+        assert!(matches!(cmd, Some(TuiCommand::AddToQueue(_))));
+        // Queue status should become Queued
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+        assert!(app.changes[0].selected);
+    }
+
+    #[test]
+    fn test_progress_update_in_stopped_mode_preserves_not_queued_status() {
+        // Test that ProgressUpdated event in Stopped mode doesn't change queue status
+
+        let changes = vec![create_approved_change("change-a", 2, 5)];
+        let mut app = AppState::new(changes);
+
+        // Enter Stopped mode
+        app.mode = AppMode::Stopped;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+
+        // Receive ProgressUpdated event (simulating tasks being completed externally)
+        app.handle_orchestrator_event(OrchestratorEvent::ProgressUpdated {
+            id: "change-a".to_string(),
+            completed: 5,
+            total: 5,
+        });
+
+        // Queue status should remain NotQueued
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+        // Progress should be updated
+        assert_eq!(app.changes[0].completed_tasks, 5);
+    }
+
+    #[test]
+    fn test_changes_refreshed_in_stopped_mode_preserves_queue_status() {
+        // Test that ChangesRefreshed event in Stopped mode doesn't change queue status
+
+        let changes = vec![
+            create_approved_change("change-a", 2, 5),
+            create_approved_change("change-b", 0, 3),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Enter Stopped mode with specific queue statuses
+        app.mode = AppMode::Stopped;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[1].queue_status = QueueStatus::Queued;
+
+        // Receive ChangesRefreshed event with updated task progress
+        let refreshed = vec![
+            create_approved_change("change-a", 5, 5), // Now complete
+            create_approved_change("change-b", 3, 3), // Now complete
+        ];
+        app.update_changes(refreshed);
+
+        // Queue statuses should remain unchanged
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+        assert_eq!(app.changes[1].queue_status, QueueStatus::Queued);
+        // Progress should be updated
+        assert_eq!(app.changes[0].completed_tasks, 5);
+        assert_eq!(app.changes[1].completed_tasks, 3);
     }
 
     #[test]
