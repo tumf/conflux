@@ -700,41 +700,49 @@ pub async fn execute_archive_in_workspace(
             }
         }
         VcsBackend::Jj => {
-            // jj automatically tracks changes, just need to snapshot
-            // Use --ignore-working-copy to avoid stale working copy errors in workspaces
+            // jj automatically tracks changes in workspaces
+            // First snapshot the working copy to capture archive changes
             let snapshot_output = Command::new("jj")
-                .args([
-                    "describe",
-                    "--ignore-working-copy",
-                    "-m",
-                    &format!("Archive: {}", change_id),
-                ])
+                .args(["workspace", "update-stale"])
                 .current_dir(workspace_path)
                 .output()
                 .await
-                .map_err(|e| OrchestratorError::JjCommand(format!("Failed to describe: {}", e)))?;
+                .map_err(|e| {
+                    OrchestratorError::JjCommand(format!("Failed to update workspace: {}", e))
+                })?;
 
             if !snapshot_output.status.success() {
                 let stderr = String::from_utf8_lossy(&snapshot_output.stderr);
-                warn!("Failed to describe jj revision: {}", stderr);
+                warn!("Failed to update workspace: {}", stderr);
             }
+
+            // Now describe the commit with the archive message
+            let describe_output = Command::new("jj")
+                .args(["describe", "-m", &format!("Archive: {}", change_id)])
+                .current_dir(workspace_path)
+                .output()
+                .await
+                .map_err(|e| {
+                    OrchestratorError::JjCommand(format!("Failed to describe: {}", e))
+                })?;
+
+            if !describe_output.status.success() {
+                let stderr = String::from_utf8_lossy(&describe_output.stderr);
+                return Err(OrchestratorError::JjCommand(format!(
+                    "Failed to describe revision: {}",
+                    stderr
+                )));
+            }
+
+            info!("Committed archive changes for {}", change_id);
         }
     }
 
     // Get the current revision after archive
-    // Use --ignore-working-copy to avoid stale working copy errors in workspaces
     let revision = match vcs_backend {
         VcsBackend::Jj => {
             let revision_output = Command::new("jj")
-                .args([
-                    "log",
-                    "-r",
-                    "@",
-                    "--no-graph",
-                    "--ignore-working-copy",
-                    "-T",
-                    "change_id",
-                ])
+                .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
                 .current_dir(workspace_path)
                 .output()
                 .await
