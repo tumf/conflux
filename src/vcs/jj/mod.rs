@@ -291,52 +291,22 @@ impl JjWorkspaceManager {
             return Err(VcsError::jj_command("No revisions to merge"));
         }
 
-        if revisions.len() == 1 {
-            // Single revision - use `jj edit` to switch to the revision directly
-            // This avoids creating empty commits unlike `jj new`
-            let rev_short = &revisions[0][..8.min(revisions[0].len())];
-            info!("Single revision, editing directly: {}", rev_short);
-
-            let output = Command::new("jj")
-                .args(["edit", "--ignore-working-copy", &revisions[0]])
-                .current_dir(&self.repo_root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .await
-                .map_err(|e| VcsError::jj_command(format!("Failed to edit revision: {}", e)))?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(VcsError::jj_command(format!(
-                    "Failed to edit revision: {}",
-                    stderr
-                )));
-            }
-
-            // Refresh working copy to avoid stale workspace after --ignore-working-copy
-            if let Err(e) = Command::new("jj")
-                .args(["workspace", "update-stale"])
-                .current_dir(&self.repo_root)
-                .stdin(Stdio::null())
-                .output()
-                .await
-            {
-                warn!("Failed to update stale workspace after edit: {}", e);
-            }
-
-            // Return the revision we just switched to
-            return Ok(revisions[0].clone());
-        }
+        // Always create a merge commit to integrate changes into the current workspace
+        // This ensures all changes are properly integrated into git_head()
 
         info!("Merging {} revisions", revisions.len());
         debug!("Revisions to merge: {:?}", revisions);
 
+        // Get current @ as base for merge
+        // This ensures all individual merges use the same base (the snapshot)
+        let base_rev = self.get_current_revision().await?;
+        let base_short = &base_rev[..8.min(base_rev.len())];
+        info!("Using base revision for merge: {}", base_short);
+
         // For multiple revisions, create a merge commit with `jj new --no-edit`
         // Using --no-edit prevents creating an additional empty working copy commit
-        // Using --ignore-working-copy to avoid stale working copy errors after workspace operations
-        let mut args = vec!["new", "--no-edit", "--ignore-working-copy"];
+        // Always include base revision first to ensure consistent merge base
+        let mut args = vec!["new", "--no-edit", &base_rev];
         for rev in revisions {
             args.push(rev.as_str());
         }
