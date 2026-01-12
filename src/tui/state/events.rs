@@ -614,7 +614,11 @@ mod tests {
         app.update_changes(fetched);
 
         // All archived changes should be retained
-        assert_eq!(app.changes.len(), 3, "All archived changes should be retained");
+        assert_eq!(
+            app.changes.len(),
+            3,
+            "All archived changes should be retained"
+        );
         for change in &app.changes {
             assert_eq!(change.queue_status, QueueStatus::Archived);
         }
@@ -665,9 +669,16 @@ mod tests {
         app.update_changes(fetched);
 
         // All terminal state changes should be retained
-        assert_eq!(app.changes.len(), 3, "All terminal state changes should be retained");
+        assert_eq!(
+            app.changes.len(),
+            3,
+            "All terminal state changes should be retained"
+        );
         assert!(matches!(app.changes[0].queue_status, QueueStatus::Archived));
-        assert!(matches!(app.changes[1].queue_status, QueueStatus::Completed));
+        assert!(matches!(
+            app.changes[1].queue_status,
+            QueueStatus::Completed
+        ));
         assert!(matches!(app.changes[2].queue_status, QueueStatus::Error(_)));
     }
 
@@ -690,7 +701,11 @@ mod tests {
         app.update_changes(fetched);
 
         // Only archived change should remain; NotQueued and Queued should be removed
-        assert_eq!(app.changes.len(), 1, "Only archived change should be retained");
+        assert_eq!(
+            app.changes.len(),
+            1,
+            "Only archived change should be retained"
+        );
         assert_eq!(app.changes[0].id, "archived");
     }
 }

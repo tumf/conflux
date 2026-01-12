@@ -3,6 +3,7 @@
 use crate::agent::build_apply_prompt;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::execution::apply as common_apply;
 use crate::task_parser::TaskProgress;
 use crate::vcs::VcsBackend;
 use std::path::Path;
@@ -139,65 +140,26 @@ pub async fn create_progress_commit(
 /// Reads and parses the tasks.md file to determine completion status.
 /// Returns None if the file doesn't exist (e.g., after archiving).
 ///
-/// This function delegates to `crate::execution::archive::get_task_progress`
+/// This function delegates to `crate::execution::apply::check_task_progress`
 /// for the actual implementation.
+#[inline]
 pub fn check_task_progress(
     workspace_path: &Path,
     change_id: &str,
 ) -> Option<crate::task_parser::TaskProgress> {
-    use crate::execution::archive::get_task_progress;
-
-    debug!(
-        "Checking tasks at: {:?}",
-        workspace_path
-            .join("openspec/changes")
-            .join(change_id)
-            .join("tasks.md")
-    );
-
-    match get_task_progress(change_id, Some(workspace_path)) {
-        Ok(Some(progress)) => {
-            debug!(
-                "Tasks file found for {}: {}/{} complete",
-                change_id, progress.completed, progress.total
-            );
-            Some(progress)
-        }
-        Ok(None) => {
-            debug!(
-                "Tasks file not found for {} in {:?}",
-                change_id, workspace_path
-            );
-            None
-        }
-        Err(e) => {
-            debug!("Failed to parse tasks for {}: {}", change_id, e);
-            None
-        }
-    }
+    common_apply::check_task_progress(workspace_path, change_id)
 }
 
 /// Summarize command output for logging and event reporting.
 ///
 /// If output exceeds max_lines, returns the last few lines with a count prefix.
+///
+/// This function delegates to `crate::execution::apply::summarize_output`
+/// for the actual implementation.
 #[allow(dead_code)] // Utility function for future use
+#[inline]
 pub fn summarize_output(output: &str, max_lines: usize) -> String {
-    if output.is_empty() {
-        return String::new();
-    }
-
-    let lines: Vec<&str> = output.lines().collect();
-    if lines.len() > max_lines {
-        // Show last 5 lines with total count
-        let tail_lines = 5.min(lines.len());
-        format!(
-            "... ({} lines) ...\n{}",
-            lines.len(),
-            lines[lines.len() - tail_lines..].join("\n")
-        )
-    } else {
-        output.to_string()
-    }
+    common_apply::summarize_output(output, max_lines)
 }
 
 /// Execute apply command in a single workspace, repeating until tasks are 100% complete
@@ -635,9 +597,9 @@ pub async fn execute_archive_in_workspace(
 
     let verification = verify_archive_completion(change_id, Some(workspace_path));
     if !verification.is_success() {
-        return Err(OrchestratorError::AgentCommand(build_archive_error_message(
-            change_id,
-        )));
+        return Err(OrchestratorError::AgentCommand(
+            build_archive_error_message(change_id),
+        ));
     }
 
     info!(

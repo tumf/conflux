@@ -8,14 +8,21 @@
 //!
 //! - `types` - Common type definitions (`ExecutionContext`, `ExecutionResult`, `ProgressInfo`)
 //! - `archive` - Common archive operation logic (path verification, task completion)
-//!
-//! # Future Additions
-//!
-//! This module will be extended with:
-//! - `apply` - Common apply operation logic (from `refactor-apply-common`)
+//! - `apply` - Common apply operation logic (iteration control, progress commits)
 
+pub mod apply;
 pub mod archive;
 pub mod types;
+
+// Re-export apply items for convenience.
+// Note: Some items are currently unused but will be used as the refactoring progresses
+// in parallel/executor.rs and other modules.
+// Allow unused_imports as these are public API exports for future use.
+#[allow(unused_imports)]
+pub use apply::{
+    check_task_progress, create_final_commit, create_progress_commit, is_progress_complete,
+    progress_increased, ApplyConfig, ApplyIterationResult, DEFAULT_MAX_ITERATIONS,
+};
 
 // Re-export archive items for convenience.
 // Note: Some items are imported directly by modules (tui/orchestrator, parallel/executor)
@@ -27,7 +34,6 @@ pub use archive::{
 };
 
 // Re-export type items for convenience.
-// Note: These are foundation types that will be used by subsequent changes
-// (refactor-apply-common) and external modules.
+// Note: These are foundation types that are used by apply, archive, and external modules.
 #[allow(unused_imports)]
 pub use types::{ExecutionContext, ExecutionResult, ProgressInfo};
