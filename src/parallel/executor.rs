@@ -700,23 +700,8 @@ pub async fn execute_archive_in_workspace(
             }
         }
         VcsBackend::Jj => {
-            // jj automatically tracks changes in workspaces
-            // First snapshot the working copy to capture archive changes
-            let snapshot_output = Command::new("jj")
-                .args(["workspace", "update-stale"])
-                .current_dir(workspace_path)
-                .output()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::JjCommand(format!("Failed to update workspace: {}", e))
-                })?;
-
-            if !snapshot_output.status.success() {
-                let stderr = String::from_utf8_lossy(&snapshot_output.stderr);
-                warn!("Failed to update workspace: {}", stderr);
-            }
-
-            // Now describe the commit with the archive message
+            // jj automatically snapshots working copy at the beginning of each command
+            // Since we're running from within the workspace, no --ignore-working-copy needed
             let describe_output = Command::new("jj")
                 .args(["describe", "-m", &format!("Archive: {}", change_id)])
                 .current_dir(workspace_path)
