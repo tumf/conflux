@@ -1,71 +1,13 @@
 //! Event and command types for TUI communication
 //!
 //! Contains types for communication between TUI and orchestrator.
+//! This module now re-exports the unified ExecutionEvent type.
 
-use crate::openspec::Change;
-use chrono::Local;
-use ratatui::style::Color;
+// Re-export unified event types
+pub use crate::events::{ExecutionEvent, LogEntry};
 
-/// Log entry for the TUI
-#[derive(Debug, Clone)]
-pub struct LogEntry {
-    /// Timestamp
-    pub timestamp: String,
-    /// Log message
-    pub message: String,
-    /// Log level color
-    pub color: Color,
-    /// Optional change_id for parallel mode logs
-    pub change_id: Option<String>,
-}
-
-impl LogEntry {
-    /// Create a new info log entry
-    pub fn info(message: impl Into<String>) -> Self {
-        Self {
-            timestamp: Local::now().format("%H:%M:%S").to_string(),
-            message: message.into(),
-            color: Color::White,
-            change_id: None,
-        }
-    }
-
-    /// Create a new success log entry
-    pub fn success(message: impl Into<String>) -> Self {
-        Self {
-            timestamp: Local::now().format("%H:%M:%S").to_string(),
-            message: message.into(),
-            color: Color::Green,
-            change_id: None,
-        }
-    }
-
-    /// Create a new warning log entry
-    pub fn warn(message: impl Into<String>) -> Self {
-        Self {
-            timestamp: Local::now().format("%H:%M:%S").to_string(),
-            message: message.into(),
-            color: Color::Yellow,
-            change_id: None,
-        }
-    }
-
-    /// Create a new error log entry
-    pub fn error(message: impl Into<String>) -> Self {
-        Self {
-            timestamp: Local::now().format("%H:%M:%S").to_string(),
-            message: message.into(),
-            color: Color::Red,
-            change_id: None,
-        }
-    }
-
-    /// Set change_id for parallel mode logs
-    pub fn with_change_id(mut self, change_id: impl Into<String>) -> Self {
-        self.change_id = Some(change_id.into());
-        self
-    }
-}
+// Alias for backward compatibility
+pub type OrchestratorEvent = ExecutionEvent;
 
 /// Commands sent from TUI to orchestrator
 #[derive(Debug, Clone)]
@@ -87,33 +29,4 @@ pub enum TuiCommand {
     Stop,
     /// Submit a new proposal (execute propose_command with the given text)
     SubmitProposal(String),
-}
-
-/// Events sent from orchestrator to TUI
-#[derive(Debug, Clone)]
-pub enum OrchestratorEvent {
-    /// Processing started for a change
-    ProcessingStarted(String),
-    /// Progress updated for a change
-    ProgressUpdated {
-        id: String,
-        completed: u32,
-        total: u32,
-    },
-    /// Processing completed for a change
-    ProcessingCompleted(String),
-    /// Archive started for a change
-    ArchiveStarted(String),
-    /// Change archived
-    ChangeArchived(String),
-    /// Error occurred for a change
-    ProcessingError { id: String, error: String },
-    /// All processing completed
-    AllCompleted,
-    /// Processing stopped (graceful stop completed)
-    Stopped,
-    /// Log message
-    Log(LogEntry),
-    /// Changes list refreshed
-    ChangesRefreshed(Vec<Change>),
 }

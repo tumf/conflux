@@ -597,7 +597,7 @@ impl Orchestrator {
                             ParallelEvent::ApplyFailed { change_id, error } => {
                                 error!("Apply failed for {}: {}", change_id, error);
                             }
-                            ParallelEvent::ChangeArchived { change_id } => {
+                            ParallelEvent::ChangeArchived(change_id) => {
                                 info!("Archived {}", change_id);
                             }
                             ParallelEvent::AllCompleted => {

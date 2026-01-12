@@ -872,8 +872,6 @@ pub async fn run_orchestrator_parallel(
         let forward_tx = tx.clone();
         let forward_cancel = cancel_token.clone();
         let forward_handle = tokio::spawn(async move {
-            use super::parallel_event_bridge;
-
             loop {
                 tokio::select! {
                     _ = forward_cancel.cancelled() => {
@@ -886,9 +884,8 @@ pub async fn run_orchestrator_parallel(
                                 break;
                             }
                             Some(parallel_event) => {
-                                for orchestrator_event in parallel_event_bridge::convert(parallel_event) {
-                                    let _ = forward_tx.send(orchestrator_event).await;
-                                }
+                                // No conversion needed - both are ExecutionEvent
+                                let _ = forward_tx.send(parallel_event).await;
                             }
                             None => {
                                 break;

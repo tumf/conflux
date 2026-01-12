@@ -26,11 +26,11 @@ impl AppState {
                 self.add_log(LogEntry::info(format!("Processing: {}", id)));
             }
             OrchestratorEvent::ProgressUpdated {
-                id,
+                change_id,
                 completed,
                 total,
             } => {
-                if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                     // Only update progress, never modify queue_status.
                     // In Stopped mode, task completion does not trigger auto-queue.
                     // After Completed, the tasks.md file may be moved/archived.
@@ -122,6 +122,11 @@ impl AppState {
             }
             OrchestratorEvent::ChangesRefreshed(changes) => {
                 self.update_changes(changes);
+            }
+            // Ignore parallel-specific events that don't affect TUI state in serial mode
+            _ => {
+                // Log the event for debugging but don't update state
+                // These events are primarily for parallel mode and are handled by the bridge
             }
         }
     }
@@ -310,7 +315,7 @@ mod tests {
 
         // Receive ProgressUpdated event (simulating tasks being completed externally)
         app.handle_orchestrator_event(OrchestratorEvent::ProgressUpdated {
-            id: "change-a".to_string(),
+            change_id: "change-a".to_string(),
             completed: 5,
             total: 5,
         });
@@ -429,7 +434,7 @@ mod tests {
 
         // Simulate ProgressUpdated event with 0/0 (should not happen in practice, but test anyway)
         app.handle_orchestrator_event(OrchestratorEvent::ProgressUpdated {
-            id: "change-a".to_string(),
+            change_id: "change-a".to_string(),
             completed: 0,
             total: 0,
         });

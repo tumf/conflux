@@ -9,7 +9,8 @@ mod events;
 mod executor;
 mod types;
 
-pub use events::ParallelEvent;
+// Re-export ExecutionEvent as ParallelEvent for backward compatibility
+pub use crate::events::ExecutionEvent as ParallelEvent;
 pub use types::{FailedChangeTracker, WorkspaceResult};
 
 use crate::analyzer::{extract_change_dependencies, ParallelGroup};
@@ -731,9 +732,7 @@ impl ParallelExecutor {
                         // Step 2: Execute archive immediately after apply succeeds
                         if let Some(ref tx) = event_tx {
                             let _ = tx
-                                .send(ParallelEvent::ArchiveStarted {
-                                    change_id: change_id.clone(),
-                                })
+                                .send(ParallelEvent::ArchiveStarted(change_id.clone()))
                                 .await;
                         }
 
@@ -753,9 +752,7 @@ impl ParallelExecutor {
                             Ok(archive_revision) => {
                                 if let Some(ref tx) = event_tx {
                                     let _ = tx
-                                        .send(ParallelEvent::ChangeArchived {
-                                            change_id: change_id.clone(),
-                                        })
+                                        .send(ParallelEvent::ChangeArchived(change_id.clone()))
                                         .await;
                                 }
                                 WorkspaceResult {
