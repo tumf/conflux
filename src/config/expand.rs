@@ -118,6 +118,9 @@ mod tests {
         let template = "claude '{proposal}'";
         let text = "Feature request:\n- Add login\n- Add logout";
         let result = expand_proposal(template, text);
-        assert_eq!(result, "claude 'Feature request:\n- Add login\n- Add logout'");
+        assert_eq!(
+            result,
+            "claude 'Feature request:\n- Add login\n- Add logout'"
+        );
     }
 }

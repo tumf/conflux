@@ -1076,4 +1076,287 @@ mod tests {
         let cmd = app.toggle_approval();
         assert!(cmd.is_none());
     }
+
+    // === Tests for tui-editor spec (Proposing mode) ===
+
+    #[test]
+    fn test_proposing_mode_from_running_mode() {
+        // Test that proposing can be started from Running mode
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        assert_eq!(app.mode, AppMode::Running);
+
+        app.start_proposing();
+        assert_eq!(app.mode, AppMode::Proposing);
+        assert_eq!(app.previous_mode, Some(AppMode::Running));
+    }
+
+    #[test]
+    fn test_proposing_mode_from_stopped_mode() {
+        // Test that proposing can be started from Stopped mode
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.mode = AppMode::Stopped;
+
+        app.start_proposing();
+        assert_eq!(app.mode, AppMode::Proposing);
+        assert_eq!(app.previous_mode, Some(AppMode::Stopped));
+    }
+
+    #[test]
+    fn test_proposing_mode_cancel_returns_to_running() {
+        // Test that canceling Proposing returns to Running
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Running;
+        app.start_proposing();
+        app.cancel_proposing();
+
+        assert_eq!(app.mode, AppMode::Running);
+    }
+
+    #[test]
+    fn test_proposing_mode_textarea_cleared_on_cancel() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_proposing();
+        assert!(app.propose_textarea.is_some());
+
+        app.cancel_proposing();
+        assert!(app.propose_textarea.is_none());
+    }
+
+    #[test]
+    fn test_submit_proposal_multiline_text() {
+        // Test that multiline proposals are preserved
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_proposing();
+
+        if let Some(ref mut textarea) = app.propose_textarea {
+            textarea.insert_str("Add authentication\nwith OAuth support\nand MFA");
+        }
+
+        let result = app.submit_proposal();
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.contains("authentication"));
+        assert!(text.contains("OAuth"));
+        assert!(text.contains("MFA"));
+    }
+
+    #[test]
+    fn test_submit_proposal_not_in_proposing_mode_returns_none() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Try to submit without entering Proposing mode
+        let result = app.submit_proposal();
+        assert!(result.is_none());
+    }
+
+    // === Tests for tui-key-hints spec (Footer messages) ===
+
+    #[test]
+    fn test_selected_count_reflects_approved_only() {
+        // Only approved changes can be selected
+        let changes = vec![
+            create_approved_change("approved", 0, 1),
+            create_test_change("unapproved", 0, 1),
+        ];
+        let app = AppState::new(changes);
+
+        // Only approved change should be auto-selected
+        assert_eq!(app.selected_count(), 1);
+        assert!(app.changes[0].selected);
+        assert!(!app.changes[1].selected);
+    }
+
+    #[test]
+    fn test_warning_message_on_unapproved_selection() {
+        let changes = vec![create_test_change("unapproved", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Try to select unapproved change
+        let cmd = app.toggle_selection();
+
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("unapproved"));
+    }
+
+    #[test]
+    fn test_cursor_up_wraps_around() {
+        let changes = vec![
+            create_test_change("a", 0, 1),
+            create_test_change("b", 0, 1),
+            create_test_change("c", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        assert_eq!(app.cursor_index, 0);
+        app.cursor_up();
+        assert_eq!(app.cursor_index, 2); // Wraps to last
+    }
+
+    #[test]
+    fn test_cursor_down_wraps_around() {
+        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.cursor_index = 1;
+        app.cursor_down();
+        assert_eq!(app.cursor_index, 0); // Wraps to first
+    }
+
+    // === Tests for approval state management ===
+
+    #[test]
+    fn test_unapprove_removes_from_queue() {
+        // Simulating UnapproveAndDequeue behavior
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start processing
+        app.start_processing();
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+
+        // Simulate unapprove handler
+        app.update_approval_status("test", false);
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].selected = false;
+
+        assert!(!app.changes[0].is_approved);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+        assert!(!app.changes[0].selected);
+    }
+
+    #[test]
+    fn test_approval_toggle_blocked_for_processing_change() {
+        let changes = vec![create_approved_change("processing", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Processing;
+
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+    }
+
+    // === Tests for orchestration timing ===
+
+    #[test]
+    fn test_orchestration_started_at_set_on_start() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        assert!(app.orchestration_started_at.is_none());
+
+        app.start_processing();
+
+        assert!(app.orchestration_started_at.is_some());
+    }
+
+    #[test]
+    fn test_orchestration_elapsed_initially_none() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let app = AppState::new(changes);
+
+        assert!(app.orchestration_elapsed.is_none());
+    }
+
+    // === Tests for parallel mode state ===
+
+    #[test]
+    fn test_parallel_mode_default_false() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let app = AppState::new(changes);
+
+        assert!(!app.parallel_mode);
+    }
+
+    #[test]
+    fn test_max_concurrent_default() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let app = AppState::new(changes);
+
+        // Default max concurrent is 4
+        assert_eq!(app.max_concurrent, 4);
+    }
+
+    // === Tests for log auto-scroll ===
+
+    #[test]
+    fn test_log_auto_scroll_enabled_by_default() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let app = AppState::new(changes);
+
+        assert!(app.log_auto_scroll);
+        assert_eq!(app.log_scroll_offset, 0);
+    }
+
+    // === Tests for stop mode ===
+
+    #[test]
+    fn test_stop_mode_initially_none() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let app = AppState::new(changes);
+
+        assert!(matches!(app.stop_mode, StopMode::None));
+    }
+
+    // === Tests for known_change_ids tracking ===
+
+    #[test]
+    fn test_known_change_ids_populated_on_creation() {
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ];
+        let app = AppState::new(changes);
+
+        assert!(app.known_change_ids.contains("change-a"));
+        assert!(app.known_change_ids.contains("change-b"));
+        assert_eq!(app.known_change_ids.len(), 2);
+    }
+
+    // === Tests for empty state handling ===
+
+    #[test]
+    fn test_empty_changes_list_handling() {
+        let app = AppState::new(vec![]);
+
+        assert!(app.changes.is_empty());
+        assert_eq!(app.cursor_index, 0);
+        assert_eq!(app.selected_count(), 0);
+    }
+
+    #[test]
+    fn test_cursor_navigation_with_empty_list() {
+        let mut app = AppState::new(vec![]);
+
+        // Should not panic with empty list
+        app.cursor_up();
+        assert_eq!(app.cursor_index, 0);
+
+        app.cursor_down();
+        assert_eq!(app.cursor_index, 0);
+    }
+
+    #[test]
+    fn test_toggle_selection_with_empty_list() {
+        let mut app = AppState::new(vec![]);
+
+        // Should return None and not panic
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+    }
 }

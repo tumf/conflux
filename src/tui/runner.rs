@@ -309,6 +309,8 @@ async fn run_tui_loop(
                                                 orch_config,
                                                 orch_tx.clone(),
                                                 orch_cancel,
+                                                orch_dynamic_queue,
+                                                orch_graceful_stop,
                                             )
                                             .await
                                         } else {
@@ -503,11 +505,7 @@ async fn run_tui_loop(
 
                         // Suspend TUI and execute command
                         disable_raw_mode()?;
-                        execute!(
-                            std::io::stdout(),
-                            LeaveAlternateScreen,
-                            DisableMouseCapture
-                        )?;
+                        execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
 
                         // Execute the propose command
                         let status = std::process::Command::new("sh")
@@ -517,11 +515,7 @@ async fn run_tui_loop(
 
                         // Restore TUI
                         enable_raw_mode()?;
-                        execute!(
-                            std::io::stdout(),
-                            EnterAlternateScreen,
-                            EnableMouseCapture
-                        )?;
+                        execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                         terminal.clear()?;
 
                         match status {

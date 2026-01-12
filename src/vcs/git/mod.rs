@@ -6,9 +6,12 @@
 pub mod commands;
 
 use crate::config::OrchestratorConfig;
-use crate::vcs::{VcsBackend, VcsError, VcsResult, Workspace, WorkspaceManager, WorkspaceStatus};
+use crate::vcs::{
+    VcsBackend, VcsError, VcsResult, Workspace, WorkspaceInfo, WorkspaceManager, WorkspaceStatus,
+};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
 /// Represents a Git worktree for parallel execution
@@ -292,6 +295,118 @@ impl GitWorkspaceManager {
 
         Ok(())
     }
+
+    /// Extract the change_id from a worktree name/branch name.
+    ///
+    /// Worktree names are in format: "ws-{sanitized_change_id}-{unique_suffix}"
+    /// This function extracts the change_id portion.
+    fn extract_change_id_from_worktree_name(worktree_name: &str) -> Option<String> {
+        // Expected format: ws-{change_id}-{hex_suffix}
+        if !worktree_name.starts_with("ws-") {
+            return None;
+        }
+
+        let without_prefix = &worktree_name[3..]; // Remove "ws-"
+
+        // Find the last dash followed by hex digits (the unique suffix)
+        // The suffix is 8 hex characters
+        if let Some(last_dash_pos) = without_prefix.rfind('-') {
+            let potential_suffix = &without_prefix[last_dash_pos + 1..];
+            // Check if suffix looks like a hex timestamp (at least 7 hex chars)
+            if potential_suffix.len() >= 7
+                && potential_suffix.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return Some(without_prefix[..last_dash_pos].to_string());
+            }
+        }
+
+        // Fallback: return everything after "ws-" (worktree might not have suffix)
+        Some(without_prefix.to_string())
+    }
+
+    /// Find all existing worktrees for the given change_id.
+    ///
+    /// Returns workspace info for all matching worktrees, sorted by last_modified (newest first).
+    async fn find_all_worktrees_for_change(
+        &self,
+        change_id: &str,
+    ) -> VcsResult<Vec<WorkspaceInfo>> {
+        // Run git worktree list to get all worktrees
+        let output =
+            commands::run_git(&["worktree", "list", "--porcelain"], &self.repo_root).await?;
+        let sanitized_change_id = change_id.replace(['/', '\\', ' '], "-");
+
+        let mut candidates = Vec::new();
+        let mut current_worktree_path: Option<PathBuf> = None;
+        let mut current_branch: Option<String> = None;
+
+        for line in output.lines() {
+            if line.starts_with("worktree ") {
+                // New worktree entry
+                current_worktree_path = Some(PathBuf::from(&line[9..]));
+            } else if line.starts_with("branch refs/heads/") {
+                // Branch name
+                current_branch = Some(line[18..].to_string());
+            } else if line.is_empty() {
+                // End of entry, process if we have both path and branch
+                if let (Some(path), Some(branch)) = (&current_worktree_path, &current_branch) {
+                    // Check if this worktree matches our change_id
+                    if let Some(extracted_change_id) =
+                        Self::extract_change_id_from_worktree_name(branch)
+                    {
+                        if extracted_change_id == sanitized_change_id {
+                            // Get last modified time
+                            let last_modified = if path.exists() {
+                                path.metadata()
+                                    .and_then(|m| m.modified())
+                                    .unwrap_or(SystemTime::UNIX_EPOCH)
+                            } else {
+                                SystemTime::UNIX_EPOCH
+                            };
+
+                            candidates.push(WorkspaceInfo {
+                                path: path.clone(),
+                                change_id: change_id.to_string(),
+                                workspace_name: branch.clone(),
+                                last_modified,
+                            });
+                        }
+                    }
+                }
+
+                // Reset for next entry
+                current_worktree_path = None;
+                current_branch = None;
+            }
+        }
+
+        // Process last entry if exists
+        if let (Some(path), Some(branch)) = (&current_worktree_path, &current_branch) {
+            if let Some(extracted_change_id) = Self::extract_change_id_from_worktree_name(branch) {
+                if extracted_change_id == sanitized_change_id {
+                    let last_modified = if path.exists() {
+                        path.metadata()
+                            .and_then(|m| m.modified())
+                            .unwrap_or(SystemTime::UNIX_EPOCH)
+                    } else {
+                        SystemTime::UNIX_EPOCH
+                    };
+
+                    candidates.push(WorkspaceInfo {
+                        path: path.clone(),
+                        change_id: change_id.to_string(),
+                        workspace_name: branch.clone(),
+                        last_modified,
+                    });
+                }
+            }
+        }
+
+        // Sort by last_modified, newest first
+        candidates.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+
+        Ok(candidates)
+    }
 }
 
 #[async_trait]
@@ -468,6 +583,96 @@ impl WorkspaceManager for GitWorkspaceManager {
     fn repo_root(&self) -> &Path {
         &self.repo_root
     }
+
+    async fn find_existing_workspace(
+        &mut self,
+        change_id: &str,
+    ) -> VcsResult<Option<WorkspaceInfo>> {
+        let mut candidates = self.find_all_worktrees_for_change(change_id).await?;
+
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        // Take the newest worktree (first in sorted list)
+        let newest = candidates.remove(0);
+
+        // Clean up older worktrees
+        for old_ws in candidates {
+            info!(
+                "Cleaning up older worktree '{}' for change '{}'",
+                old_ws.workspace_name, change_id
+            );
+
+            // Remove the worktree
+            if old_ws.path.exists() {
+                if let Err(e) =
+                    commands::worktree_remove(&self.repo_root, old_ws.path.to_str().unwrap()).await
+                {
+                    warn!(
+                        "Failed to remove worktree '{}': {}",
+                        old_ws.workspace_name, e
+                    );
+                    // Try force removal via filesystem
+                    if let Err(e) = std::fs::remove_dir_all(&old_ws.path) {
+                        warn!(
+                            "Failed to force remove worktree directory {:?}: {}",
+                            old_ws.path, e
+                        );
+                    }
+                }
+            }
+
+            // Delete the branch
+            if let Err(e) = commands::branch_delete(&self.repo_root, &old_ws.workspace_name).await {
+                debug!(
+                    "Failed to delete branch '{}': {} (may have been merged)",
+                    old_ws.workspace_name, e
+                );
+            }
+        }
+
+        debug!(
+            "Found existing worktree '{}' for change '{}' (last modified: {:?})",
+            newest.workspace_name, change_id, newest.last_modified
+        );
+
+        Ok(Some(newest))
+    }
+
+    async fn reuse_workspace(&mut self, workspace_info: &WorkspaceInfo) -> VcsResult<Workspace> {
+        info!(
+            "Reusing existing worktree '{}' at {:?}",
+            workspace_info.workspace_name, workspace_info.path
+        );
+
+        // Get the current commit in the worktree
+        let base_revision = if workspace_info.path.exists() {
+            commands::get_current_commit(&workspace_info.path)
+                .await
+                .unwrap_or_else(|_| "unknown".to_string())
+        } else {
+            "unknown".to_string()
+        };
+
+        let workspace = GitWorkspace {
+            name: workspace_info.workspace_name.clone(),
+            path: workspace_info.path.clone(),
+            change_id: workspace_info.change_id.clone(),
+            base_revision,
+            status: WorkspaceStatus::Created,
+        };
+
+        self.workspaces.push(workspace.clone());
+
+        Ok(Workspace {
+            name: workspace.name,
+            path: workspace.path,
+            change_id: workspace.change_id,
+            base_revision: workspace.base_revision,
+            status: workspace.status,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -503,5 +708,64 @@ mod tests {
     fn test_backend_type() {
         let (manager, _temp) = create_test_manager();
         assert_eq!(manager.backend_type(), VcsBackend::Git);
+    }
+
+    #[test]
+    fn test_extract_change_id_from_worktree_name_standard() {
+        // Standard worktree name with hex suffix
+        let result =
+            GitWorkspaceManager::extract_change_id_from_worktree_name("ws-my-change-1234abcd");
+        assert_eq!(result, Some("my-change".to_string()));
+    }
+
+    #[test]
+    fn test_extract_change_id_from_worktree_name_with_dashes() {
+        // Change ID with dashes, plus hex suffix
+        let result =
+            GitWorkspaceManager::extract_change_id_from_worktree_name("ws-add-user-auth-abcdef12");
+        assert_eq!(result, Some("add-user-auth".to_string()));
+    }
+
+    #[test]
+    fn test_extract_change_id_from_worktree_name_no_suffix() {
+        // Worktree name without hex suffix (fallback case)
+        let result = GitWorkspaceManager::extract_change_id_from_worktree_name("ws-my-change");
+        assert_eq!(result, Some("my-change".to_string()));
+    }
+
+    #[test]
+    fn test_extract_change_id_from_worktree_name_not_matching_prefix() {
+        // Not a worktree name (doesn't start with "ws-")
+        let result = GitWorkspaceManager::extract_change_id_from_worktree_name("main");
+        assert_eq!(result, None);
+
+        let result2 = GitWorkspaceManager::extract_change_id_from_worktree_name("feature-test");
+        assert_eq!(result2, None);
+    }
+
+    #[test]
+    fn test_extract_change_id_from_worktree_name_short_suffix() {
+        // Suffix too short to be a hex timestamp (< 7 chars)
+        let result = GitWorkspaceManager::extract_change_id_from_worktree_name("ws-change-abc");
+        // Falls through to the else branch, returns "change-abc"
+        assert_eq!(result, Some("change-abc".to_string()));
+    }
+
+    #[test]
+    fn test_extract_change_id_from_worktree_name_non_hex_suffix() {
+        // Non-hex characters in suffix
+        let result =
+            GitWorkspaceManager::extract_change_id_from_worktree_name("ws-change-notahex!");
+        // Falls through because suffix contains non-hex chars
+        assert_eq!(result, Some("change-notahex!".to_string()));
+    }
+
+    #[test]
+    fn test_extract_change_id_from_worktree_name_path_chars() {
+        // Change ID that was sanitized from path characters
+        // e.g., "feature/login" -> "feature-login"
+        let result =
+            GitWorkspaceManager::extract_change_id_from_worktree_name("ws-feature-login-fedcba98");
+        assert_eq!(result, Some("feature-login".to_string()));
     }
 }

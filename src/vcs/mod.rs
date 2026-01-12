@@ -16,7 +16,8 @@ pub mod jj;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -152,13 +153,29 @@ pub struct Workspace {
     /// Workspace name (used by VCS)
     pub name: String,
     /// Path to workspace directory
-    pub path: std::path::PathBuf,
+    pub path: PathBuf,
     /// Associated OpenSpec change ID
     pub change_id: String,
     /// Base revision workspace was created from
     pub base_revision: String,
     /// Current status
     pub status: WorkspaceStatus,
+}
+
+/// Information about an existing workspace found during resume detection.
+///
+/// This struct contains the minimal information needed to decide whether
+/// to reuse an existing workspace.
+#[derive(Debug, Clone)]
+pub struct WorkspaceInfo {
+    /// Path to the workspace directory
+    pub path: PathBuf,
+    /// Associated OpenSpec change ID (extracted from workspace name)
+    pub change_id: String,
+    /// Workspace name (used by VCS)
+    pub workspace_name: String,
+    /// Last modification time of the workspace directory
+    pub last_modified: SystemTime,
 }
 
 /// Trait for VCS workspace management.
@@ -251,6 +268,23 @@ pub trait WorkspaceManager: Send + Sync {
 
     /// Get the repository root path.
     fn repo_root(&self) -> &Path;
+
+    /// Find an existing workspace for the given change ID.
+    ///
+    /// If multiple workspaces exist for the same change_id, returns the newest
+    /// one (by last_modified time) and cleans up older ones.
+    ///
+    /// Returns None if no workspace exists for the given change_id.
+    async fn find_existing_workspace(
+        &mut self,
+        change_id: &str,
+    ) -> VcsResult<Option<WorkspaceInfo>>;
+
+    /// Reuse an existing workspace, registering it with the workspace manager.
+    ///
+    /// This is called after `find_existing_workspace` returns a workspace to reuse.
+    /// It registers the workspace with the manager so it can be tracked, merged, and cleaned up.
+    async fn reuse_workspace(&mut self, workspace_info: &WorkspaceInfo) -> VcsResult<Workspace>;
 }
 
 /// Detect the VCS backend to use based on configuration and repository state.
@@ -380,5 +414,119 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // === Tests for parallel-execution spec (VCS Backend) ===
+
+    #[test]
+    fn test_vcs_backend_default_is_auto() {
+        let backend: VcsBackend = Default::default();
+        assert_eq!(backend, VcsBackend::Auto);
+    }
+
+    #[test]
+    fn test_vcs_backend_serialization() {
+        // Test serde serialization for config files
+        let backend = VcsBackend::Jj;
+        let json = serde_json::to_string(&backend).unwrap();
+        assert_eq!(json, "\"jj\"");
+
+        let backend = VcsBackend::Git;
+        let json = serde_json::to_string(&backend).unwrap();
+        assert_eq!(json, "\"git\"");
+
+        let backend = VcsBackend::Auto;
+        let json = serde_json::to_string(&backend).unwrap();
+        assert_eq!(json, "\"auto\"");
+    }
+
+    #[test]
+    fn test_vcs_backend_deserialization() {
+        let jj: VcsBackend = serde_json::from_str("\"jj\"").unwrap();
+        assert_eq!(jj, VcsBackend::Jj);
+
+        let git: VcsBackend = serde_json::from_str("\"git\"").unwrap();
+        assert_eq!(git, VcsBackend::Git);
+
+        let auto: VcsBackend = serde_json::from_str("\"auto\"").unwrap();
+        assert_eq!(auto, VcsBackend::Auto);
+    }
+
+    // === Tests for workspace status lifecycle ===
+
+    #[test]
+    fn test_workspace_status_lifecycle() {
+        // Test the expected lifecycle of workspace status
+        let status = WorkspaceStatus::Created;
+        assert_eq!(status, WorkspaceStatus::Created);
+
+        let status = WorkspaceStatus::Applying;
+        assert_eq!(status, WorkspaceStatus::Applying);
+
+        let status = WorkspaceStatus::Applied("abc123".to_string());
+        assert!(matches!(status, WorkspaceStatus::Applied(ref s) if s == "abc123"));
+
+        let status = WorkspaceStatus::Merged;
+        assert_eq!(status, WorkspaceStatus::Merged);
+
+        let status = WorkspaceStatus::Cleaned;
+        assert_eq!(status, WorkspaceStatus::Cleaned);
+    }
+
+    #[test]
+    fn test_workspace_status_failed_includes_message() {
+        let status = WorkspaceStatus::Failed("LLM timeout".to_string());
+        assert!(matches!(status, WorkspaceStatus::Failed(ref msg) if msg == "LLM timeout"));
+    }
+
+    // === Tests for VcsError types ===
+
+    #[test]
+    fn test_vcs_error_uncommitted_changes() {
+        let err = VcsError::UncommittedChanges("staged files exist".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("staged files exist"));
+    }
+
+    #[test]
+    fn test_vcs_error_no_backend() {
+        let err = VcsError::NoBackend;
+        let msg = format!("{}", err);
+        assert!(msg.contains("No VCS backend"));
+    }
+
+    #[test]
+    fn test_vcs_error_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let err: VcsError = io_err.into();
+        assert!(matches!(err, VcsError::Io(_)));
+    }
+
+    // === Tests for Workspace struct ===
+
+    #[test]
+    fn test_workspace_creation() {
+        let ws = Workspace {
+            name: "ws-add-feature-12345".to_string(),
+            path: std::path::PathBuf::from("/tmp/workspaces/ws-add-feature-12345"),
+            change_id: "add-feature".to_string(),
+            base_revision: "abc123def456".to_string(),
+            status: WorkspaceStatus::Created,
+        };
+
+        assert_eq!(ws.name, "ws-add-feature-12345");
+        assert_eq!(ws.change_id, "add-feature");
+        assert!(ws.path.to_str().unwrap().contains("ws-add-feature"));
+    }
+
+    #[test]
+    fn test_workspace_name_sanitization_pattern() {
+        // The workspace naming pattern is "ws-{sanitized_change_id}-{timestamp}"
+        // Verify the expected pattern structure
+        let change_id = "feature/add-login";
+        let sanitized = format!("ws-{}-12345", change_id.replace(['/', '\\', ' '], "-"));
+        assert_eq!(sanitized, "ws-feature-add-login-12345");
+        assert!(!sanitized.contains('/'));
+        assert!(!sanitized.contains('\\'));
     }
 }

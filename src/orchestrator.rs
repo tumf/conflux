@@ -44,6 +44,8 @@ pub struct Orchestrator {
     /// VCS backend for parallel execution
     #[allow(dead_code)] // Will be passed to ParallelRunService in future
     vcs_backend: VcsBackend,
+    /// Disable automatic workspace resume (always create new workspaces)
+    no_resume: bool,
 }
 
 impl Orchestrator {
@@ -56,6 +58,7 @@ impl Orchestrator {
         max_concurrent: Option<usize>,
         dry_run: bool,
         vcs_override: Option<VcsBackend>,
+        no_resume: bool,
     ) -> Result<Self> {
         let config = OrchestratorConfig::load(config_path.as_deref())?;
         let hooks = HookRunner::new(config.get_hooks());
@@ -82,6 +85,7 @@ impl Orchestrator {
             max_concurrent,
             dry_run,
             vcs_backend,
+            no_resume,
         })
     }
 
@@ -112,6 +116,7 @@ impl Orchestrator {
             max_concurrent: None,
             dry_run: false,
             vcs_backend: VcsBackend::Auto,
+            no_resume: false,
         })
     }
 
@@ -692,7 +697,8 @@ impl Orchestrator {
 
         // Use ParallelRunService for the common parallel execution flow
         let repo_root = std::env::current_dir()?;
-        let service = ParallelRunService::new(repo_root.clone(), self.config.clone());
+        let mut service = ParallelRunService::new(repo_root.clone(), self.config.clone());
+        service.set_no_resume(self.no_resume);
 
         // Check if VCS is available for true parallel execution
         match service.check_vcs_available().await {

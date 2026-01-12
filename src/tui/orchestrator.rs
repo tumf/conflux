@@ -709,12 +709,17 @@ pub async fn run_orchestrator(
 
 /// Run the orchestrator in parallel mode using jj workspaces
 /// This function executes all changes in parallel using ParallelRunService
+///
+/// Supports dynamic queue: after each batch completes, checks for newly queued changes
+/// and processes them in subsequent batches.
 pub async fn run_orchestrator_parallel(
     change_ids: Vec<String>,
     _openspec_cmd: String,
     config: OrchestratorConfig,
     tx: mpsc::Sender<OrchestratorEvent>,
     cancel_token: CancellationToken,
+    dynamic_queue: DynamicQueue,
+    graceful_stop_flag: Arc<AtomicBool>,
 ) -> Result<()> {
     use crate::openspec::list_changes_native;
     use crate::parallel::ParallelEvent;
@@ -732,7 +737,7 @@ pub async fn run_orchestrator_parallel(
     let repo_root = std::env::current_dir()?;
 
     // Create ParallelRunService
-    let service = ParallelRunService::new(repo_root, config.clone());
+    let service = ParallelRunService::new(repo_root.clone(), config.clone());
 
     // Check VCS availability (jj or git)
     if !service.check_vcs_available().await? {
@@ -746,98 +751,176 @@ pub async fn run_orchestrator_parallel(
         ));
     }
 
-    // Load changes with dependencies and filter to selected ones
-    let _ = tx
-        .send(OrchestratorEvent::Log(LogEntry::info(
-            "Loading changes with dependencies...".to_string(),
-        )))
-        .await;
+    // Track processed change IDs to avoid re-processing
+    let mut processed_ids: HashSet<String> = HashSet::new();
+    // Track pending change IDs (initial + dynamically added)
+    let mut pending_ids: HashSet<String> = change_ids.into_iter().collect();
 
-    let all_changes = list_changes_native()?;
-    let selected_set: HashSet<_> = change_ids.iter().collect();
-    let selected_changes: Vec<_> = all_changes
-        .into_iter()
-        .filter(|c| selected_set.contains(&c.id))
-        .collect();
-
-    // Log that LLM analysis will be used (actual grouping happens inside run_parallel_with_channel)
-    let _ = tx
-        .send(OrchestratorEvent::Log(LogEntry::info(format!(
-            "Analyzing {} changes for parallelization...",
-            selected_changes.len()
-        ))))
-        .await;
-
-    // Create event channel for forwarding to TUI
-    let (parallel_tx, mut parallel_rx) = mpsc::channel::<ParallelEvent>(100);
-
-    // Spawn event forwarding task using ParallelEventBridge
-    let forward_tx = tx.clone();
-    let forward_cancel = cancel_token.clone();
-    let forward_handle = tokio::spawn(async move {
-        use super::parallel_event_bridge;
-
-        loop {
-            tokio::select! {
-                _ = forward_cancel.cancelled() => {
-                    break;
-                }
-                event = parallel_rx.recv() => {
-                    match event {
-                        Some(ParallelEvent::AllCompleted) => {
-                            // AllCompleted signals loop termination
-                            break;
-                        }
-                        Some(parallel_event) => {
-                            // Convert and forward all events using the bridge
-                            for orchestrator_event in parallel_event_bridge::convert(parallel_event) {
-                                let _ = forward_tx.send(orchestrator_event).await;
-                            }
-                        }
-                        None => {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    // Execute using ParallelRunService with channel
-    let result = tokio::select! {
-        _ = cancel_token.cancelled() => {
+    // Main loop: process batches until no more pending changes
+    loop {
+        // Check for cancellation
+        if cancel_token.is_cancelled() {
             let _ = tx
                 .send(OrchestratorEvent::Log(LogEntry::warn(
                     "Parallel execution cancelled".to_string(),
                 )))
                 .await;
-            Err(crate::error::OrchestratorError::AgentCommand("Cancelled".to_string()))
+            break;
         }
-        result = service.run_parallel_with_channel(selected_changes, parallel_tx) => {
-            result
-        }
-    };
 
-    // Wait for forward task to complete
-    let _ = forward_handle.await;
-
-    match result {
-        Ok(_) => {
+        // Check for graceful stop
+        if graceful_stop_flag.load(Ordering::SeqCst) {
             let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::success(
-                    "All parallel changes completed".to_string(),
+                .send(OrchestratorEvent::Log(LogEntry::info(
+                    "Graceful stop: stopping parallel execution".to_string(),
                 )))
                 .await;
+            let _ = tx.send(OrchestratorEvent::Stopped).await;
+            break;
         }
-        Err(e) => {
+
+        // Check dynamic queue for newly added changes
+        while let Some(dynamic_id) = dynamic_queue.pop().await {
+            if !processed_ids.contains(&dynamic_id) && !pending_ids.contains(&dynamic_id) {
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                        "Dynamically added to parallel queue: {}",
+                        dynamic_id
+                    ))))
+                    .await;
+                pending_ids.insert(dynamic_id);
+            }
+        }
+
+        // Get changes to process in this batch (pending - processed)
+        let batch_ids: Vec<String> = pending_ids.difference(&processed_ids).cloned().collect();
+
+        if batch_ids.is_empty() {
+            // No more changes to process
+            break;
+        }
+
+        let _ = tx
+            .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                "Processing batch of {} change(s)...",
+                batch_ids.len()
+            ))))
+            .await;
+
+        // Load changes with dependencies and filter to batch
+        let all_changes = list_changes_native()?;
+        let batch_set: HashSet<_> = batch_ids.iter().collect();
+        let batch_changes: Vec<_> = all_changes
+            .into_iter()
+            .filter(|c| batch_set.contains(&c.id))
+            .collect();
+
+        if batch_changes.is_empty() {
             let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::error(format!(
-                    "Parallel execution failed: {}",
-                    e
-                ))))
+                .send(OrchestratorEvent::Log(LogEntry::warn(
+                    "No valid changes found in batch (may be already archived)".to_string(),
+                )))
                 .await;
+            // Mark batch_ids as processed to avoid infinite loop
+            for id in batch_ids {
+                processed_ids.insert(id);
+            }
+            continue;
+        }
+
+        let _ = tx
+            .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                "Analyzing {} changes for parallelization...",
+                batch_changes.len()
+            ))))
+            .await;
+
+        // Create event channel for forwarding to TUI
+        let (parallel_tx, mut parallel_rx) = mpsc::channel::<ParallelEvent>(100);
+
+        // Spawn event forwarding task
+        let forward_tx = tx.clone();
+        let forward_cancel = cancel_token.clone();
+        let forward_handle = tokio::spawn(async move {
+            use super::parallel_event_bridge;
+
+            loop {
+                tokio::select! {
+                    _ = forward_cancel.cancelled() => {
+                        break;
+                    }
+                    event = parallel_rx.recv() => {
+                        match event {
+                            Some(ParallelEvent::AllCompleted) => {
+                                // AllCompleted signals batch completion
+                                break;
+                            }
+                            Some(parallel_event) => {
+                                for orchestrator_event in parallel_event_bridge::convert(parallel_event) {
+                                    let _ = forward_tx.send(orchestrator_event).await;
+                                }
+                            }
+                            None => {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Create a new service for this batch (to get fresh repo state)
+        let batch_service = ParallelRunService::new(repo_root.clone(), config.clone());
+
+        // Execute batch using ParallelRunService with channel
+        let result = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::warn(
+                        "Parallel execution cancelled".to_string(),
+                    )))
+                    .await;
+                Err(crate::error::OrchestratorError::AgentCommand("Cancelled".to_string()))
+            }
+            result = batch_service.run_parallel_with_channel(batch_changes.clone(), parallel_tx) => {
+                result
+            }
+        };
+
+        // Wait for forward task to complete
+        let _ = forward_handle.await;
+
+        // Mark batch changes as processed
+        for change in &batch_changes {
+            processed_ids.insert(change.id.clone());
+        }
+
+        match result {
+            Ok(_) => {
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::success(format!(
+                        "Batch completed ({} changes processed)",
+                        batch_changes.len()
+                    ))))
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::error(format!(
+                        "Batch execution failed: {}",
+                        e
+                    ))))
+                    .await;
+                // Continue to check for more changes even if this batch failed
+            }
         }
     }
+
+    let _ = tx
+        .send(OrchestratorEvent::Log(LogEntry::success(
+            "All parallel changes completed".to_string(),
+        )))
+        .await;
 
     let _ = tx.send(OrchestratorEvent::AllCompleted).await;
     Ok(())

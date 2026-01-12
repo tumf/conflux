@@ -424,6 +424,7 @@ Options:
   --parallel            Enable parallel execution mode
   --max-concurrent <N>  Maximum concurrent workspaces (default: 3)
   --vcs <BACKEND>       VCS backend: auto, jj, or git (default: auto)
+  --no-resume           Disable workspace resume (always create new workspaces)
   --dry-run             Preview parallelization groups without executing
 ```
 
@@ -485,6 +486,22 @@ When using jj workspaces:
 - Working copy changes are automatically snapshotted
 - Each change runs in an isolated workspace
 - Changes are merged using jj's conflict-free merge
+
+**Workspace Resume:**
+
+By default, the orchestrator automatically detects and reuses existing workspaces from interrupted runs. This allows you to resume work from where you left off without losing progress.
+
+- When a workspace is found for a change ID, it is reused instead of creating a new one
+- If multiple workspaces exist for the same change, the newest one is used and older ones are cleaned up
+- Use `--no-resume` to disable this behavior and always create fresh workspaces
+
+```bash
+# Resume from existing workspaces (default behavior)
+openspec-orchestrator run --parallel
+
+# Always create new workspaces (discard any existing work)
+openspec-orchestrator run --parallel --no-resume
+```
 
 **Init subcommand options:**
 ```

@@ -78,6 +78,11 @@ pub struct RunArgs {
     /// Default: auto (detects jj first, then falls back to git)
     #[arg(long, default_value = "auto")]
     pub vcs: String,
+
+    /// Disable automatic workspace resume. When set, always create new
+    /// workspaces instead of reusing existing ones from interrupted runs.
+    #[arg(long)]
+    pub no_resume: bool,
 }
 
 /// Arguments for the TUI subcommand

@@ -6,10 +6,13 @@
 pub mod commands;
 
 use crate::config::OrchestratorConfig;
-use crate::vcs::{VcsBackend, VcsError, VcsResult, Workspace, WorkspaceManager, WorkspaceStatus};
+use crate::vcs::{
+    VcsBackend, VcsError, VcsResult, Workspace, WorkspaceInfo, WorkspaceManager, WorkspaceStatus,
+};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::SystemTime;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
@@ -509,6 +512,89 @@ impl JjWorkspaceManager {
 
         Ok(workspaces)
     }
+
+    /// Extract the change_id from a workspace name.
+    ///
+    /// Workspace names are in format: "ws-{sanitized_change_id}-{unique_suffix}"
+    /// This function extracts the change_id portion.
+    fn extract_change_id_from_workspace_name(workspace_name: &str) -> Option<String> {
+        // Expected format: ws-{change_id}-{hex_suffix}
+        if !workspace_name.starts_with("ws-") {
+            return None;
+        }
+
+        let without_prefix = &workspace_name[3..]; // Remove "ws-"
+
+        // Find the last dash followed by hex digits (the unique suffix)
+        // The suffix is 8 hex characters
+        if let Some(last_dash_pos) = without_prefix.rfind('-') {
+            let potential_suffix = &without_prefix[last_dash_pos + 1..];
+            // Check if suffix looks like a hex timestamp (at least 7 hex chars)
+            if potential_suffix.len() >= 7
+                && potential_suffix.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return Some(without_prefix[..last_dash_pos].to_string());
+            }
+        }
+
+        // Fallback: return everything after "ws-" (workspace might not have suffix)
+        Some(without_prefix.to_string())
+    }
+
+    /// Find all existing workspaces for the given change_id.
+    ///
+    /// Returns workspace info for all matching workspaces, sorted by last_modified (newest first).
+    async fn find_all_workspaces_for_change(
+        &self,
+        change_id: &str,
+    ) -> VcsResult<Vec<WorkspaceInfo>> {
+        let output = commands::run_jj(&["workspace", "list"], &self.repo_root).await?;
+        let sanitized_change_id = change_id.replace(['/', '\\', ' '], "-");
+
+        let mut candidates = Vec::new();
+
+        for line in output.lines() {
+            // Parse workspace list output (format: "name: path")
+            let parts: Vec<&str> = line.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+
+            let workspace_name = parts[0].trim();
+            let workspace_path_str = parts[1].trim();
+
+            // Check if this workspace matches our change_id
+            if let Some(extracted_change_id) =
+                Self::extract_change_id_from_workspace_name(workspace_name)
+            {
+                if extracted_change_id == sanitized_change_id {
+                    let workspace_path = PathBuf::from(workspace_path_str);
+
+                    // Get last modified time
+                    let last_modified = if workspace_path.exists() {
+                        workspace_path
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .unwrap_or(SystemTime::UNIX_EPOCH)
+                    } else {
+                        SystemTime::UNIX_EPOCH
+                    };
+
+                    candidates.push(WorkspaceInfo {
+                        path: workspace_path,
+                        change_id: change_id.to_string(),
+                        workspace_name: workspace_name.to_string(),
+                        last_modified,
+                    });
+                }
+            }
+        }
+
+        // Sort by last_modified, newest first
+        candidates.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+
+        Ok(candidates)
+    }
 }
 
 #[async_trait]
@@ -695,6 +781,94 @@ impl WorkspaceManager for JjWorkspaceManager {
     fn repo_root(&self) -> &Path {
         &self.repo_root
     }
+
+    async fn find_existing_workspace(
+        &mut self,
+        change_id: &str,
+    ) -> VcsResult<Option<WorkspaceInfo>> {
+        let mut candidates = self.find_all_workspaces_for_change(change_id).await?;
+
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        // Take the newest workspace (first in sorted list)
+        let newest = candidates.remove(0);
+
+        // Clean up older workspaces
+        for old_ws in candidates {
+            info!(
+                "Cleaning up older workspace '{}' for change '{}'",
+                old_ws.workspace_name, change_id
+            );
+
+            // Forget the workspace in jj
+            let forget_result = Command::new("jj")
+                .args(["workspace", "forget", &old_ws.workspace_name])
+                .current_dir(&self.repo_root)
+                .stdin(Stdio::null())
+                .output()
+                .await;
+
+            if let Err(e) = forget_result {
+                warn!(
+                    "Failed to forget workspace '{}': {}",
+                    old_ws.workspace_name, e
+                );
+            }
+
+            // Remove the directory if it exists
+            if old_ws.path.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&old_ws.path) {
+                    warn!(
+                        "Failed to remove workspace directory {:?}: {}",
+                        old_ws.path, e
+                    );
+                }
+            }
+        }
+
+        debug!(
+            "Found existing workspace '{}' for change '{}' (last modified: {:?})",
+            newest.workspace_name, change_id, newest.last_modified
+        );
+
+        Ok(Some(newest))
+    }
+
+    async fn reuse_workspace(&mut self, workspace_info: &WorkspaceInfo) -> VcsResult<Workspace> {
+        info!(
+            "Reusing existing workspace '{}' at {:?}",
+            workspace_info.workspace_name, workspace_info.path
+        );
+
+        // Get the current revision in the workspace
+        let base_revision = if workspace_info.path.exists() {
+            commands::get_current_revision(&workspace_info.path)
+                .await
+                .unwrap_or_else(|_| "unknown".to_string())
+        } else {
+            "unknown".to_string()
+        };
+
+        let workspace = JjWorkspace {
+            name: workspace_info.workspace_name.clone(),
+            path: workspace_info.path.clone(),
+            change_id: workspace_info.change_id.clone(),
+            base_revision,
+            status: WorkspaceStatus::Created,
+        };
+
+        self.workspaces.push(workspace.clone());
+
+        Ok(Workspace {
+            name: workspace.name,
+            path: workspace.path,
+            change_id: workspace.change_id,
+            base_revision: workspace.base_revision,
+            status: workspace.status,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -786,5 +960,64 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_extract_change_id_from_workspace_name_standard() {
+        // Standard workspace name with hex suffix
+        let result =
+            JjWorkspaceManager::extract_change_id_from_workspace_name("ws-my-change-1234abcd");
+        assert_eq!(result, Some("my-change".to_string()));
+    }
+
+    #[test]
+    fn test_extract_change_id_from_workspace_name_with_dashes() {
+        // Change ID with dashes, plus hex suffix
+        let result =
+            JjWorkspaceManager::extract_change_id_from_workspace_name("ws-add-user-auth-abcdef12");
+        assert_eq!(result, Some("add-user-auth".to_string()));
+    }
+
+    #[test]
+    fn test_extract_change_id_from_workspace_name_no_suffix() {
+        // Workspace name without hex suffix (fallback case)
+        let result = JjWorkspaceManager::extract_change_id_from_workspace_name("ws-my-change");
+        assert_eq!(result, Some("my-change".to_string()));
+    }
+
+    #[test]
+    fn test_extract_change_id_from_workspace_name_not_matching_prefix() {
+        // Not a workspace name (doesn't start with "ws-")
+        let result = JjWorkspaceManager::extract_change_id_from_workspace_name("default");
+        assert_eq!(result, None);
+
+        let result2 = JjWorkspaceManager::extract_change_id_from_workspace_name("workspace-test");
+        assert_eq!(result2, None);
+    }
+
+    #[test]
+    fn test_extract_change_id_from_workspace_name_short_suffix() {
+        // Suffix too short to be a hex timestamp (< 7 chars)
+        let result = JjWorkspaceManager::extract_change_id_from_workspace_name("ws-change-abc");
+        // Falls through to the else branch, returns "change-abc"
+        assert_eq!(result, Some("change-abc".to_string()));
+    }
+
+    #[test]
+    fn test_extract_change_id_from_workspace_name_non_hex_suffix() {
+        // Non-hex characters in suffix
+        let result =
+            JjWorkspaceManager::extract_change_id_from_workspace_name("ws-change-notahex!");
+        // Falls through because suffix contains non-hex chars
+        assert_eq!(result, Some("change-notahex!".to_string()));
+    }
+
+    #[test]
+    fn test_extract_change_id_from_workspace_name_path_chars() {
+        // Change ID that was sanitized from path characters
+        // e.g., "feature/login" -> "feature-login"
+        let result =
+            JjWorkspaceManager::extract_change_id_from_workspace_name("ws-feature-login-fedcba98");
+        assert_eq!(result, Some("feature-login".to_string()));
     }
 }

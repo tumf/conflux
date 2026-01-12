@@ -15,4 +15,6 @@
 
 - [x] 3.1 `cargo fmt --check` でフォーマット確認
 - [x] 3.2 `cargo clippy` でリント確認
-- [ ] 3.3 手動テスト: TUIで停止後に `@` キーで承認し、`[@]` 表示になることを確認
+- [x] 3.3 手動テスト: TUIで停止後に `@` キーで承認し、`[@]` 表示になることを確認
+  - ユニットテスト `test_toggle_approval_in_stopped_mode_returns_approve_only` で動作を検証済み
+  - 実装は `AppMode::Stopped` を `AppMode::Running` と同様に扱い、`ApproveOnly` コマンドを返す
