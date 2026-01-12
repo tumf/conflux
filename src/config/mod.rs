@@ -700,4 +700,219 @@ mod tests {
         let result = OrchestratorConfig::expand_proposal(template, proposal);
         assert_eq!(result, "claude -p 'Add login feature\n- Username\n- Password'");
     }
+
+    // === Tests for hooks config in OrchestratorConfig (hooks spec 3.1) ===
+
+    #[test]
+    fn test_hooks_config_can_be_parsed_from_jsonc() {
+        let jsonc = r#"{
+            "hooks": {
+                "on_queue_add": "echo 'Added {change_id}'",
+                "on_queue_remove": "echo 'Removed {change_id}'"
+            }
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        let hooks = config.get_hooks();
+
+        use crate::hooks::HookType;
+        assert!(hooks.get(HookType::OnQueueAdd).is_some());
+        assert!(hooks.get(HookType::OnQueueRemove).is_some());
+    }
+
+    #[test]
+    fn test_hooks_config_with_all_hook_types() {
+        let jsonc = r#"{
+            "hooks": {
+                "on_start": "echo start",
+                "on_finish": "echo finish",
+                "on_error": "echo error",
+                "on_change_start": "echo change_start",
+                "pre_apply": "echo pre_apply",
+                "post_apply": "echo post_apply",
+                "on_change_complete": "echo change_complete",
+                "pre_archive": "echo pre_archive",
+                "post_archive": "echo post_archive",
+                "on_change_end": "echo change_end",
+                "on_queue_add": "echo queue_add",
+                "on_queue_remove": "echo queue_remove",
+                "on_approve": "echo approve",
+                "on_unapprove": "echo unapprove"
+            }
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        let hooks = config.get_hooks();
+
+        use crate::hooks::HookType;
+        assert!(hooks.get(HookType::OnStart).is_some());
+        assert!(hooks.get(HookType::OnFinish).is_some());
+        assert!(hooks.get(HookType::OnError).is_some());
+        assert!(hooks.get(HookType::OnChangeStart).is_some());
+        assert!(hooks.get(HookType::PreApply).is_some());
+        assert!(hooks.get(HookType::PostApply).is_some());
+        assert!(hooks.get(HookType::OnChangeComplete).is_some());
+        assert!(hooks.get(HookType::PreArchive).is_some());
+        assert!(hooks.get(HookType::PostArchive).is_some());
+        assert!(hooks.get(HookType::OnChangeEnd).is_some());
+        assert!(hooks.get(HookType::OnQueueAdd).is_some());
+        assert!(hooks.get(HookType::OnQueueRemove).is_some());
+        assert!(hooks.get(HookType::OnApprove).is_some());
+        assert!(hooks.get(HookType::OnUnapprove).is_some());
+    }
+
+    #[test]
+    fn test_get_hooks_returns_default_when_not_configured() {
+        let config = OrchestratorConfig::default();
+        let hooks = config.get_hooks();
+
+        // Default HooksConfig should have no hooks configured
+        use crate::hooks::HookType;
+        assert!(hooks.get(HookType::OnStart).is_none());
+        assert!(hooks.get(HookType::OnQueueAdd).is_none());
+    }
+
+    // === Tests for parallel execution config (parallel-execution spec) ===
+
+    #[test]
+    fn test_parallel_mode_defaults_to_false() {
+        let config = OrchestratorConfig::default();
+        assert!(!config.get_parallel_mode());
+    }
+
+    #[test]
+    fn test_parallel_mode_can_be_enabled() {
+        let config = OrchestratorConfig {
+            parallel_mode: Some(true),
+            ..Default::default()
+        };
+        assert!(config.get_parallel_mode());
+    }
+
+    #[test]
+    fn test_max_concurrent_workspaces_default() {
+        let config = OrchestratorConfig::default();
+        assert_eq!(
+            config.get_max_concurrent_workspaces(),
+            DEFAULT_MAX_CONCURRENT_WORKSPACES
+        );
+        // Default is 3 according to defaults.rs
+        assert_eq!(config.get_max_concurrent_workspaces(), 3);
+    }
+
+    #[test]
+    fn test_max_concurrent_workspaces_can_be_configured() {
+        let config = OrchestratorConfig {
+            max_concurrent_workspaces: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(config.get_max_concurrent_workspaces(), 8);
+    }
+
+    #[test]
+    fn test_workspace_base_dir_default_is_none() {
+        let config = OrchestratorConfig::default();
+        assert!(config.get_workspace_base_dir().is_none());
+    }
+
+    #[test]
+    fn test_workspace_base_dir_can_be_configured() {
+        let config = OrchestratorConfig {
+            workspace_base_dir: Some("/tmp/ws".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.get_workspace_base_dir(), Some("/tmp/ws"));
+    }
+
+    #[test]
+    fn test_workspace_base_dir_empty_string_treated_as_none() {
+        let config = OrchestratorConfig {
+            workspace_base_dir: Some("".to_string()),
+            ..Default::default()
+        };
+        assert!(config.get_workspace_base_dir().is_none());
+    }
+
+    #[test]
+    fn test_vcs_backend_defaults_to_auto() {
+        let config = OrchestratorConfig::default();
+        assert_eq!(config.get_vcs_backend(), VcsBackend::Auto);
+    }
+
+    #[test]
+    fn test_vcs_backend_can_be_set_to_jj() {
+        let config = OrchestratorConfig {
+            vcs_backend: Some(VcsBackend::Jj),
+            ..Default::default()
+        };
+        assert_eq!(config.get_vcs_backend(), VcsBackend::Jj);
+    }
+
+    #[test]
+    fn test_vcs_backend_can_be_set_to_git() {
+        let config = OrchestratorConfig {
+            vcs_backend: Some(VcsBackend::Git),
+            ..Default::default()
+        };
+        assert_eq!(config.get_vcs_backend(), VcsBackend::Git);
+    }
+
+    #[test]
+    fn test_use_llm_analysis_defaults_to_true() {
+        let config = OrchestratorConfig::default();
+        assert!(config.use_llm_analysis());
+    }
+
+    #[test]
+    fn test_use_llm_analysis_can_be_disabled() {
+        let config = OrchestratorConfig {
+            use_llm_analysis: Some(false),
+            ..Default::default()
+        };
+        assert!(!config.use_llm_analysis());
+    }
+
+    #[test]
+    fn test_parse_jsonc_parallel_config() {
+        let jsonc = r#"{
+            "parallel_mode": true,
+            "max_concurrent_workspaces": 6,
+            "workspace_base_dir": "/custom/path",
+            "vcs_backend": "jj",
+            "use_llm_analysis": false
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+
+        assert!(config.get_parallel_mode());
+        assert_eq!(config.get_max_concurrent_workspaces(), 6);
+        assert_eq!(config.get_workspace_base_dir(), Some("/custom/path"));
+        assert_eq!(config.get_vcs_backend(), VcsBackend::Jj);
+        assert!(!config.use_llm_analysis());
+    }
+
+    // === Tests for resolve_command config ===
+
+    #[test]
+    fn test_resolve_command_has_default() {
+        let config = OrchestratorConfig::default();
+        // Should have a default resolve command
+        assert!(!config.get_resolve_command().is_empty());
+    }
+
+    #[test]
+    fn test_resolve_command_can_be_configured() {
+        let config = OrchestratorConfig {
+            resolve_command: Some("custom-resolver {conflict_files}".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.get_resolve_command(),
+            "custom-resolver {conflict_files}"
+        );
+    }
+
+    #[test]
+    fn test_expand_conflict_files_placeholder() {
+        let template = "claude resolve {conflict_files}";
+        let result = OrchestratorConfig::expand_conflict_files(template, "src/main.rs src/lib.rs");
+        assert_eq!(result, "claude resolve src/main.rs src/lib.rs");
+    }
 }

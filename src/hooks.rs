@@ -749,4 +749,321 @@ mod tests {
         let result = runner.run_hook(HookType::OnStart, &context).await;
         assert!(result.is_ok());
     }
+
+    // === Tests for on_queue_add hook (hooks spec 2.1) ===
+
+    #[test]
+    fn test_hooks_config_on_queue_add() {
+        let json = r#"{"on_queue_add": "echo 'Added {change_id}'"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let hook = config.get(HookType::OnQueueAdd).unwrap();
+        assert_eq!(hook.command, "echo 'Added {change_id}'");
+    }
+
+    #[tokio::test]
+    async fn test_on_queue_add_hook_execution() {
+        let json = r#"{"on_queue_add": "echo added"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config);
+        let context = HookContext::new(0, 5, 5, false).with_change("test-change", 0, 3);
+
+        let result = runner.run_hook(HookType::OnQueueAdd, &context).await;
+        assert!(result.is_ok());
+    }
+
+    // === Tests for on_queue_remove hook (hooks spec 2.2) ===
+
+    #[test]
+    fn test_hooks_config_on_queue_remove() {
+        let json = r#"{"on_queue_remove": "echo 'Removed {change_id}'"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let hook = config.get(HookType::OnQueueRemove).unwrap();
+        assert_eq!(hook.command, "echo 'Removed {change_id}'");
+    }
+
+    #[tokio::test]
+    async fn test_on_queue_remove_hook_execution() {
+        let json = r#"{"on_queue_remove": "echo removed"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config);
+        let context = HookContext::new(0, 5, 5, false).with_change("test-change", 0, 3);
+
+        let result = runner.run_hook(HookType::OnQueueRemove, &context).await;
+        assert!(result.is_ok());
+    }
+
+    // === Tests for on_approve hook (hooks spec 2.3) ===
+
+    #[test]
+    fn test_hooks_config_on_approve() {
+        let json = r#"{"on_approve": "echo 'Approved {change_id}'"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let hook = config.get(HookType::OnApprove).unwrap();
+        assert_eq!(hook.command, "echo 'Approved {change_id}'");
+    }
+
+    #[tokio::test]
+    async fn test_on_approve_hook_execution_with_context() {
+        let json = r#"{"on_approve": "echo approved"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config);
+        // on_approve receives change context including completed_tasks/total_tasks
+        let context = HookContext::new(0, 5, 5, false).with_change("my-change", 2, 5);
+
+        let result = runner.run_hook(HookType::OnApprove, &context).await;
+        assert!(result.is_ok());
+
+        // Verify context has the expected values
+        let vars = context.to_env_vars();
+        assert_eq!(vars.get("OPENSPEC_CHANGE_ID"), Some(&"my-change".to_string()));
+        assert_eq!(vars.get("OPENSPEC_COMPLETED_TASKS"), Some(&"2".to_string()));
+        assert_eq!(vars.get("OPENSPEC_TOTAL_TASKS"), Some(&"5".to_string()));
+    }
+
+    // === Tests for on_unapprove hook (hooks spec 2.4) ===
+
+    #[test]
+    fn test_hooks_config_on_unapprove() {
+        let json = r#"{"on_unapprove": "echo 'Unapproved {change_id}'"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let hook = config.get(HookType::OnUnapprove).unwrap();
+        assert_eq!(hook.command, "echo 'Unapproved {change_id}'");
+    }
+
+    #[tokio::test]
+    async fn test_on_unapprove_hook_execution() {
+        let json = r#"{"on_unapprove": "echo unapproved"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config);
+        let context = HookContext::new(0, 5, 5, false).with_change("my-change", 0, 3);
+
+        let result = runner.run_hook(HookType::OnUnapprove, &context).await;
+        assert!(result.is_ok());
+    }
+
+    // === Tests for on_change_start hook (hooks spec 2.5) ===
+
+    #[test]
+    fn test_hooks_config_on_change_start() {
+        let json = r#"{"on_change_start": "echo 'Starting {change_id}'"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let hook = config.get(HookType::OnChangeStart).unwrap();
+        assert_eq!(hook.command, "echo 'Starting {change_id}'");
+    }
+
+    #[tokio::test]
+    async fn test_on_change_start_hook_receives_change_id() {
+        let json = r#"{"on_change_start": "echo test"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config);
+        let context = HookContext::new(0, 3, 3, false).with_change("add-feature", 0, 5);
+
+        let result = runner.run_hook(HookType::OnChangeStart, &context).await;
+        assert!(result.is_ok());
+
+        // Verify change_id is available in context
+        let vars = context.to_env_vars();
+        assert_eq!(
+            vars.get("OPENSPEC_CHANGE_ID"),
+            Some(&"add-feature".to_string())
+        );
+    }
+
+    #[test]
+    fn test_on_change_start_placeholder_expansion() {
+        let context = HookContext::new(0, 3, 3, false).with_change("my-change", 0, 5);
+        let template = "jj new -m 'changeset: {change_id}'";
+        let result = context.expand_placeholders(template);
+        assert_eq!(result, "jj new -m 'changeset: my-change'");
+    }
+
+    // === Tests for on_change_end hook (hooks spec 2.6) ===
+
+    #[test]
+    fn test_hooks_config_on_change_end() {
+        let json = r#"{"on_change_end": "echo 'Finished {change_id}'"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let hook = config.get(HookType::OnChangeEnd).unwrap();
+        assert_eq!(hook.command, "echo 'Finished {change_id}'");
+    }
+
+    #[tokio::test]
+    async fn test_on_change_end_hook_execution() {
+        let json = r#"{"on_change_end": "echo finished"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config);
+        // After first change is archived: changes_processed=1, remaining=2
+        let context = HookContext::new(1, 3, 2, false).with_change("change-a", 5, 5);
+
+        let result = runner.run_hook(HookType::OnChangeEnd, &context).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_on_change_end_tracks_progress() {
+        // Test that changes_processed/total_changes are correctly available
+        let context = HookContext::new(1, 3, 2, false).with_change("change-a", 5, 5);
+        let template = "echo '{changes_processed}/{total_changes}'";
+        let result = context.expand_placeholders(template);
+        assert_eq!(result, "echo '1/3'");
+    }
+
+    // === Tests for hook execution order (hooks spec 2.7) ===
+
+    #[test]
+    fn test_hook_types_config_key_order() {
+        // Verify that hook config keys are correctly mapped
+        assert_eq!(HookType::OnStart.config_key(), "on_start");
+        assert_eq!(HookType::OnChangeStart.config_key(), "on_change_start");
+        assert_eq!(HookType::PreApply.config_key(), "pre_apply");
+        assert_eq!(HookType::PostApply.config_key(), "post_apply");
+        assert_eq!(HookType::OnChangeComplete.config_key(), "on_change_complete");
+        assert_eq!(HookType::PreArchive.config_key(), "pre_archive");
+        assert_eq!(HookType::PostArchive.config_key(), "post_archive");
+        assert_eq!(HookType::OnChangeEnd.config_key(), "on_change_end");
+        assert_eq!(HookType::OnFinish.config_key(), "on_finish");
+    }
+
+    // === Tests for TUI/CLI hook parity (hooks spec 2.8) ===
+    // Note: Full parity testing requires integration tests.
+    // These unit tests verify the same hook infrastructure is usable.
+
+    #[test]
+    fn test_hook_runner_is_reusable_for_tui_and_cli() {
+        // Same HookRunner can be used in both modes
+        let json = r#"{
+            "on_change_start": "echo start",
+            "on_change_end": "echo end"
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config.clone());
+
+        // TUI mode context
+        let tui_context = HookContext::new(0, 3, 3, false).with_change("change-a", 0, 5);
+        // CLI mode context (same structure)
+        let cli_context = HookContext::new(0, 3, 3, false).with_change("change-a", 0, 5);
+
+        // Both contexts produce identical environment variables
+        assert_eq!(tui_context.to_env_vars(), cli_context.to_env_vars());
+        assert!(runner.has_hook(HookType::OnChangeStart));
+        assert!(runner.has_hook(HookType::OnChangeEnd));
+    }
+
+    // === Tests for apply_count increment (hooks spec context) ===
+
+    #[test]
+    fn test_apply_count_increments() {
+        // Test apply_count is correctly tracked across multiple applies
+        let context1 = HookContext::new(0, 1, 1, false)
+            .with_change("my-change", 1, 3)
+            .with_apply_count(1);
+        let context2 = HookContext::new(0, 1, 1, false)
+            .with_change("my-change", 2, 3)
+            .with_apply_count(2);
+        let context3 = HookContext::new(0, 1, 1, false)
+            .with_change("my-change", 3, 3)
+            .with_apply_count(3);
+
+        let template = "echo 'Apply #{apply_count}'";
+        assert_eq!(context1.expand_placeholders(template), "echo 'Apply #1'");
+        assert_eq!(context2.expand_placeholders(template), "echo 'Apply #2'");
+        assert_eq!(context3.expand_placeholders(template), "echo 'Apply #3'");
+    }
+
+    // === Tests for on_finish hook with status ===
+
+    #[test]
+    fn test_on_finish_with_status_placeholder() {
+        let context = HookContext::new(3, 3, 0, false).with_status("completed");
+        let template = "echo 'Status: {status}, Changes: {changes_processed}/{total_changes}'";
+        let result = context.expand_placeholders(template);
+        assert_eq!(result, "echo 'Status: completed, Changes: 3/3'");
+    }
+
+    #[test]
+    fn test_on_finish_with_iteration_limit_status() {
+        let context = HookContext::new(2, 3, 1, false).with_status("iteration_limit");
+        let vars = context.to_env_vars();
+        assert_eq!(vars.get("OPENSPEC_STATUS"), Some(&"iteration_limit".to_string()));
+    }
+
+    // === Tests for on_error hook with error message ===
+
+    #[test]
+    fn test_on_error_with_error_placeholder() {
+        let context = HookContext::new(1, 3, 2, false)
+            .with_change("failing-change", 2, 5)
+            .with_error("LLM API timeout");
+        let template = "echo '[on_error] change={change_id} error={error}'";
+        let result = context.expand_placeholders(template);
+        assert_eq!(result, "echo '[on_error] change=failing-change error=LLM API timeout'");
+    }
+
+    #[test]
+    fn test_on_error_env_vars() {
+        let context = HookContext::new(1, 3, 2, false)
+            .with_change("failing-change", 2, 5)
+            .with_error("Connection refused");
+        let vars = context.to_env_vars();
+        assert_eq!(vars.get("OPENSPEC_ERROR"), Some(&"Connection refused".to_string()));
+        assert_eq!(vars.get("OPENSPEC_CHANGE_ID"), Some(&"failing-change".to_string()));
+    }
+
+    // === Tests for on_start without change_id ===
+
+    #[test]
+    fn test_on_start_has_no_change_id() {
+        // on_start should NOT have change_id available
+        let context = HookContext::new(0, 3, 3, false);
+        // No with_change() call
+        let template = "echo '{change_id}'";
+        let result = context.expand_placeholders(template);
+        // change_id is not expanded (remains as placeholder)
+        assert_eq!(result, "echo '{change_id}'");
+
+        // But total_changes is available
+        let template2 = "echo 'total={total_changes}'";
+        let result2 = context.expand_placeholders(template2);
+        assert_eq!(result2, "echo 'total=3'");
+    }
+
+    // === Tests for all hook types registered ===
+
+    #[test]
+    fn test_all_hook_types_can_be_configured() {
+        let json = r#"{
+            "on_start": "echo start",
+            "on_finish": "echo finish",
+            "on_error": "echo error",
+            "on_change_start": "echo change_start",
+            "pre_apply": "echo pre_apply",
+            "post_apply": "echo post_apply",
+            "on_change_complete": "echo change_complete",
+            "pre_archive": "echo pre_archive",
+            "post_archive": "echo post_archive",
+            "on_change_end": "echo change_end",
+            "on_queue_add": "echo queue_add",
+            "on_queue_remove": "echo queue_remove",
+            "on_approve": "echo approve",
+            "on_unapprove": "echo unapprove"
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config);
+
+        // All hook types should be configured
+        assert!(runner.has_hook(HookType::OnStart));
+        assert!(runner.has_hook(HookType::OnFinish));
+        assert!(runner.has_hook(HookType::OnError));
+        assert!(runner.has_hook(HookType::OnChangeStart));
+        assert!(runner.has_hook(HookType::PreApply));
+        assert!(runner.has_hook(HookType::PostApply));
+        assert!(runner.has_hook(HookType::OnChangeComplete));
+        assert!(runner.has_hook(HookType::PreArchive));
+        assert!(runner.has_hook(HookType::PostArchive));
+        assert!(runner.has_hook(HookType::OnChangeEnd));
+        assert!(runner.has_hook(HookType::OnQueueAdd));
+        assert!(runner.has_hook(HookType::OnQueueRemove));
+        assert!(runner.has_hook(HookType::OnApprove));
+        assert!(runner.has_hook(HookType::OnUnapprove));
+    }
 }

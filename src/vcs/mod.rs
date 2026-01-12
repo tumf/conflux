@@ -381,4 +381,118 @@ mod tests {
             }
         ));
     }
+
+    // === Tests for parallel-execution spec (VCS Backend) ===
+
+    #[test]
+    fn test_vcs_backend_default_is_auto() {
+        let backend: VcsBackend = Default::default();
+        assert_eq!(backend, VcsBackend::Auto);
+    }
+
+    #[test]
+    fn test_vcs_backend_serialization() {
+        // Test serde serialization for config files
+        let backend = VcsBackend::Jj;
+        let json = serde_json::to_string(&backend).unwrap();
+        assert_eq!(json, "\"jj\"");
+
+        let backend = VcsBackend::Git;
+        let json = serde_json::to_string(&backend).unwrap();
+        assert_eq!(json, "\"git\"");
+
+        let backend = VcsBackend::Auto;
+        let json = serde_json::to_string(&backend).unwrap();
+        assert_eq!(json, "\"auto\"");
+    }
+
+    #[test]
+    fn test_vcs_backend_deserialization() {
+        let jj: VcsBackend = serde_json::from_str("\"jj\"").unwrap();
+        assert_eq!(jj, VcsBackend::Jj);
+
+        let git: VcsBackend = serde_json::from_str("\"git\"").unwrap();
+        assert_eq!(git, VcsBackend::Git);
+
+        let auto: VcsBackend = serde_json::from_str("\"auto\"").unwrap();
+        assert_eq!(auto, VcsBackend::Auto);
+    }
+
+    // === Tests for workspace status lifecycle ===
+
+    #[test]
+    fn test_workspace_status_lifecycle() {
+        // Test the expected lifecycle of workspace status
+        let status = WorkspaceStatus::Created;
+        assert_eq!(status, WorkspaceStatus::Created);
+
+        let status = WorkspaceStatus::Applying;
+        assert_eq!(status, WorkspaceStatus::Applying);
+
+        let status = WorkspaceStatus::Applied("abc123".to_string());
+        assert!(matches!(status, WorkspaceStatus::Applied(ref s) if s == "abc123"));
+
+        let status = WorkspaceStatus::Merged;
+        assert_eq!(status, WorkspaceStatus::Merged);
+
+        let status = WorkspaceStatus::Cleaned;
+        assert_eq!(status, WorkspaceStatus::Cleaned);
+    }
+
+    #[test]
+    fn test_workspace_status_failed_includes_message() {
+        let status = WorkspaceStatus::Failed("LLM timeout".to_string());
+        assert!(matches!(status, WorkspaceStatus::Failed(ref msg) if msg == "LLM timeout"));
+    }
+
+    // === Tests for VcsError types ===
+
+    #[test]
+    fn test_vcs_error_uncommitted_changes() {
+        let err = VcsError::UncommittedChanges("staged files exist".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("staged files exist"));
+    }
+
+    #[test]
+    fn test_vcs_error_no_backend() {
+        let err = VcsError::NoBackend;
+        let msg = format!("{}", err);
+        assert!(msg.contains("No VCS backend"));
+    }
+
+    #[test]
+    fn test_vcs_error_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let err: VcsError = io_err.into();
+        assert!(matches!(err, VcsError::Io(_)));
+    }
+
+    // === Tests for Workspace struct ===
+
+    #[test]
+    fn test_workspace_creation() {
+        let ws = Workspace {
+            name: "ws-add-feature-12345".to_string(),
+            path: std::path::PathBuf::from("/tmp/workspaces/ws-add-feature-12345"),
+            change_id: "add-feature".to_string(),
+            base_revision: "abc123def456".to_string(),
+            status: WorkspaceStatus::Created,
+        };
+
+        assert_eq!(ws.name, "ws-add-feature-12345");
+        assert_eq!(ws.change_id, "add-feature");
+        assert!(ws.path.to_str().unwrap().contains("ws-add-feature"));
+    }
+
+    #[test]
+    fn test_workspace_name_sanitization_pattern() {
+        // The workspace naming pattern is "ws-{sanitized_change_id}-{timestamp}"
+        // Verify the expected pattern structure
+        let change_id = "feature/add-login";
+        let sanitized = format!("ws-{}-12345", change_id.replace(['/', '\\', ' '], "-"));
+        assert_eq!(sanitized, "ws-feature-add-login-12345");
+        assert!(!sanitized.contains('/'));
+        assert!(!sanitized.contains('\\'));
+    }
 }

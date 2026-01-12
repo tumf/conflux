@@ -392,4 +392,284 @@ mod tests {
         let manifest = parse_approved_file(&approved_path).unwrap();
         assert_eq!(manifest.len(), 2);
     }
+
+    // === Tests for approval spec (approval workflow) ===
+
+    #[test]
+    fn test_approved_file_is_md5sum_compatible_format() {
+        // The approved file format should be compatible with md5sum
+        // Format: "{hash}  {path}" (two spaces between hash and path)
+        let temp_dir = TempDir::new().unwrap();
+        let approved_path = temp_dir.path().join("approved");
+
+        // This is the expected format output by md5sum
+        let content = "d41d8cd98f00b204e9800998ecf8427e  openspec/changes/test/proposal.md\n";
+        fs::write(&approved_path, content).unwrap();
+
+        let manifest = parse_approved_file(&approved_path).unwrap();
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(
+            manifest.get(&PathBuf::from("openspec/changes/test/proposal.md")),
+            Some(&"d41d8cd98f00b204e9800998ecf8427e".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compute_md5_produces_32_char_hex() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.md");
+        fs::write(&file_path, "any content here").unwrap();
+
+        let hash = compute_md5(&file_path).unwrap();
+
+        // MD5 hash should be 32 hex characters
+        assert_eq!(hash.len(), 32);
+        // All characters should be hex digits
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_compute_md5_same_content_same_hash() {
+        let temp_dir = TempDir::new().unwrap();
+        let file1 = temp_dir.path().join("file1.md");
+        let file2 = temp_dir.path().join("file2.md");
+
+        let content = "identical content";
+        fs::write(&file1, content).unwrap();
+        fs::write(&file2, content).unwrap();
+
+        let hash1 = compute_md5(&file1).unwrap();
+        let hash2 = compute_md5(&file2).unwrap();
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_compute_md5_different_content_different_hash() {
+        let temp_dir = TempDir::new().unwrap();
+        let file1 = temp_dir.path().join("file1.md");
+        let file2 = temp_dir.path().join("file2.md");
+
+        fs::write(&file1, "content A").unwrap();
+        fs::write(&file2, "content B").unwrap();
+
+        let hash1 = compute_md5(&file1).unwrap();
+        let hash2 = compute_md5(&file2).unwrap();
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_compute_md5_file_not_found() {
+        let result = compute_md5(&PathBuf::from("/nonexistent/path/to/file.md"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_approved_file_not_found() {
+        let result = parse_approved_file(&PathBuf::from("/nonexistent/approved"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_approved_manifest_sorted_by_path() {
+        // BTreeMap keeps keys sorted, verifying the manifest uses BTreeMap
+        let temp_dir = TempDir::new().unwrap();
+        let approved_path = temp_dir.path().join("approved");
+
+        // Write paths in reverse order
+        let content = "ccc333  openspec/changes/test/z.md\nbbb222  openspec/changes/test/m.md\naaa111  openspec/changes/test/a.md\n";
+        fs::write(&approved_path, content).unwrap();
+
+        let manifest = parse_approved_file(&approved_path).unwrap();
+
+        // BTreeMap should iterate in sorted order
+        let paths: Vec<&PathBuf> = manifest.keys().collect();
+        assert_eq!(paths[0].to_str().unwrap(), "openspec/changes/test/a.md");
+        assert_eq!(paths[1].to_str().unwrap(), "openspec/changes/test/m.md");
+        assert_eq!(paths[2].to_str().unwrap(), "openspec/changes/test/z.md");
+    }
+
+    #[test]
+    fn test_discover_md_files_nonexistent_change() {
+        // discover_md_files should return error for nonexistent change
+        let result = discover_md_files("nonexistent-change-xyz");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_approval_missing_approved_file() {
+        // change exists but no approved file -> returns Ok(false)
+        let temp_dir = TempDir::new().unwrap();
+        let changes_dir = temp_dir.path().join("openspec/changes/test-change");
+        fs::create_dir_all(&changes_dir).unwrap();
+        fs::write(changes_dir.join("proposal.md"), "# Proposal").unwrap();
+
+        // Change to the temp dir so relative paths work
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = check_approval("test-change");
+
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // Not approved
+    }
+
+    // === Tests for approval/unapproval workflow ===
+
+    #[test]
+    fn test_approve_creates_approved_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let changes_dir = temp_dir.path().join("openspec/changes/my-change");
+        fs::create_dir_all(&changes_dir).unwrap();
+        fs::write(changes_dir.join("proposal.md"), "# Proposal\nContent").unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = approve_change("my-change");
+
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert!(result.is_ok());
+        assert!(changes_dir.join("approved").exists());
+    }
+
+    #[test]
+    fn test_unapprove_removes_approved_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let changes_dir = temp_dir.path().join("openspec/changes/my-change");
+        fs::create_dir_all(&changes_dir).unwrap();
+        fs::write(changes_dir.join("proposal.md"), "# Proposal\nContent").unwrap();
+        fs::write(
+            changes_dir.join("approved"),
+            "abc123  openspec/changes/my-change/proposal.md\n",
+        )
+        .unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = unapprove_change("my-change");
+
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert!(result.is_ok());
+        assert!(!changes_dir.join("approved").exists());
+    }
+
+    #[test]
+    fn test_unapprove_already_unapproved_is_ok() {
+        let temp_dir = TempDir::new().unwrap();
+        let changes_dir = temp_dir.path().join("openspec/changes/my-change");
+        fs::create_dir_all(&changes_dir).unwrap();
+        fs::write(changes_dir.join("proposal.md"), "# Proposal\nContent").unwrap();
+        // No approved file exists
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = unapprove_change("my-change");
+
+        std::env::set_current_dir(original_dir).unwrap();
+
+        // Should succeed even though no approved file existed
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_approve_nonexistent_change_fails() {
+        let temp_dir = TempDir::new().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = approve_change("nonexistent-change");
+
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_approved_file_content_format() {
+        let temp_dir = TempDir::new().unwrap();
+        let changes_dir = temp_dir.path().join("openspec/changes/test");
+        fs::create_dir_all(&changes_dir).unwrap();
+        fs::write(changes_dir.join("proposal.md"), "content").unwrap();
+        fs::write(changes_dir.join("design.md"), "design").unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        approve_change("test").unwrap();
+
+        let approved_content = fs::read_to_string(changes_dir.join("approved")).unwrap();
+
+        std::env::set_current_dir(original_dir).unwrap();
+
+        // Each line should be "{hash}  {path}" format
+        for line in approved_content.lines() {
+            if !line.is_empty() {
+                let parts: Vec<&str> = line.split("  ").collect();
+                assert_eq!(parts.len(), 2);
+                assert_eq!(parts[0].len(), 32); // MD5 hash length
+            }
+        }
+    }
+
+    // === Tests for tasks.md exclusion ===
+
+    #[test]
+    fn test_discover_md_files_excludes_tasks_md() {
+        let temp_dir = TempDir::new().unwrap();
+        let changes_dir = temp_dir.path().join("openspec/changes/my-change");
+        fs::create_dir_all(&changes_dir).unwrap();
+        fs::write(changes_dir.join("proposal.md"), "# Proposal").unwrap();
+        fs::write(changes_dir.join("tasks.md"), "# Tasks").unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let files = discover_md_files("my-change").unwrap();
+
+        std::env::set_current_dir(original_dir).unwrap();
+
+        // tasks.md should be excluded
+        assert!(!files.iter().any(|f| f
+            .file_name()
+            .map(|n| n == "tasks.md")
+            .unwrap_or(false)));
+        assert!(files.iter().any(|f| f
+            .file_name()
+            .map(|n| n == "proposal.md")
+            .unwrap_or(false)));
+    }
+
+    #[test]
+    fn test_check_approval_ignores_tasks_md_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let changes_dir = temp_dir.path().join("openspec/changes/my-change");
+        fs::create_dir_all(&changes_dir).unwrap();
+
+        // Create proposal.md with known content
+        fs::write(changes_dir.join("proposal.md"), "# Proposal").unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        // Approve the change
+        approve_change("my-change").unwrap();
+
+        // Now modify tasks.md (should not affect approval status)
+        fs::write(changes_dir.join("tasks.md"), "# Tasks\n- [x] Modified").unwrap();
+
+        let is_approved = check_approval("my-change").unwrap();
+
+        std::env::set_current_dir(original_dir).unwrap();
+
+        // Should still be approved since tasks.md is excluded
+        assert!(is_approved);
+    }
 }
