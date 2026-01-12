@@ -571,15 +571,20 @@ impl JjWorkspaceManager {
                 if extracted_change_id == sanitized_change_id {
                     let workspace_path = PathBuf::from(workspace_path_str);
 
+                    // Only include workspaces whose directory actually exists
+                    if !workspace_path.exists() {
+                        debug!(
+                            "Skipping workspace '{}' - directory does not exist: {:?}",
+                            workspace_name, workspace_path
+                        );
+                        continue;
+                    }
+
                     // Get last modified time
-                    let last_modified = if workspace_path.exists() {
-                        workspace_path
-                            .metadata()
-                            .and_then(|m| m.modified())
-                            .unwrap_or(SystemTime::UNIX_EPOCH)
-                    } else {
-                        SystemTime::UNIX_EPOCH
-                    };
+                    let last_modified = workspace_path
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
 
                     candidates.push(WorkspaceInfo {
                         path: workspace_path,
@@ -843,14 +848,18 @@ impl WorkspaceManager for JjWorkspaceManager {
             workspace_info.workspace_name, workspace_info.path
         );
 
+        // Verify the workspace directory exists
+        if !workspace_info.path.exists() {
+            return Err(VcsError::jj_command(format!(
+                "Workspace directory does not exist: {:?}",
+                workspace_info.path
+            )));
+        }
+
         // Get the current revision in the workspace
-        let base_revision = if workspace_info.path.exists() {
-            commands::get_current_revision(&workspace_info.path)
-                .await
-                .unwrap_or_else(|_| "unknown".to_string())
-        } else {
-            "unknown".to_string()
-        };
+        let base_revision = commands::get_current_revision(&workspace_info.path)
+            .await
+            .unwrap_or_else(|_| "unknown".to_string());
 
         let workspace = JjWorkspace {
             name: workspace_info.workspace_name.clone(),
