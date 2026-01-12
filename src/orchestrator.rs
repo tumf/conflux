@@ -155,9 +155,10 @@ impl Orchestrator {
         })
     }
 
-    /// Run the orchestration loop
-    pub async fn run(&mut self) -> Result<()> {
+    /// Run the orchestration loop with cancellation support
+    pub async fn run(&mut self, _cancel_token: tokio_util::sync::CancellationToken) -> Result<()> {
         info!("Starting orchestration loop");
+        // TODO: Integrate cancel_token with apply/archive operations for graceful shutdown
 
         // Capture initial snapshot of change IDs at run start.
         // Only changes present at this point will be processed during the run.

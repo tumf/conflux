@@ -616,7 +616,11 @@ async fn run_tui_loop(
     refresh_handle.abort();
     if let Some(handle) = orchestrator_handle {
         // Give orchestrator time to cleanup child processes
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        // Extended from 2s to 5s for more reliable cleanup (especially on Windows)
+        match tokio::time::timeout(Duration::from_secs(5), handle).await {
+            Ok(_) => tracing::info!("Orchestrator task finished gracefully"),
+            Err(_) => tracing::warn!("Orchestrator task timeout after 5 seconds"),
+        }
     }
 
     Ok(())
