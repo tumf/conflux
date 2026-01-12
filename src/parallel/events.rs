@@ -68,6 +68,8 @@ pub enum ParallelEvent {
     GroupStarted { group_id: u32, changes: Vec<String> },
     /// Group execution completed
     GroupCompleted { group_id: u32 },
+    /// A change was skipped because a dependency failed
+    ChangeSkipped { change_id: String, reason: String },
     /// Analysis started for remaining changes
     AnalysisStarted { remaining_changes: usize },
     /// Analysis output (streaming)

@@ -428,6 +428,45 @@ Rules:
     }
 }
 
+/// Extract change-level dependencies from parallel groups.
+///
+/// Converts group-level dependencies into change-level dependencies.
+/// When a group depends on another group, all changes in the dependent group
+/// are considered to depend on all changes in the prerequisite group.
+///
+/// # Arguments
+///
+/// * `groups` - The parallel execution groups from LLM analysis
+///
+/// # Returns
+///
+/// A HashMap where keys are change IDs and values are lists of change IDs
+/// that the key change depends on.
+pub fn extract_change_dependencies(groups: &[ParallelGroup]) -> HashMap<String, Vec<String>> {
+    let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+    let mut group_changes: HashMap<u32, Vec<String>> = HashMap::new();
+
+    // Collect changes by group ID
+    for group in groups {
+        group_changes.insert(group.id, group.changes.clone());
+    }
+
+    // For each group, map its dependencies to change-level dependencies
+    for group in groups {
+        for dep_group_id in &group.depends_on {
+            if let Some(dep_changes) = group_changes.get(dep_group_id) {
+                for change_id in &group.changes {
+                    deps.entry(change_id.clone())
+                        .or_default()
+                        .extend(dep_changes.iter().cloned());
+                }
+            }
+        }
+    }
+
+    deps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,5 +674,92 @@ That's all."#;
         let middle_ids: Vec<u32> = sorted[1..3].iter().map(|g| g.id).collect();
         assert!(middle_ids.contains(&2));
         assert!(middle_ids.contains(&3));
+    }
+
+    #[test]
+    fn test_extract_change_dependencies_empty() {
+        let groups: Vec<ParallelGroup> = vec![];
+        let deps = extract_change_dependencies(&groups);
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_extract_change_dependencies_no_dependencies() {
+        let groups = vec![
+            ParallelGroup {
+                id: 1,
+                changes: vec!["a".to_string(), "b".to_string()],
+                depends_on: Vec::new(),
+            },
+            ParallelGroup {
+                id: 2,
+                changes: vec!["c".to_string()],
+                depends_on: Vec::new(),
+            },
+        ];
+        let deps = extract_change_dependencies(&groups);
+        // No group depends on another, so no change-level dependencies
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_extract_change_dependencies_simple() {
+        let groups = vec![
+            ParallelGroup {
+                id: 1,
+                changes: vec!["a".to_string(), "b".to_string()],
+                depends_on: Vec::new(),
+            },
+            ParallelGroup {
+                id: 2,
+                changes: vec!["c".to_string()],
+                depends_on: vec![1],
+            },
+        ];
+        let deps = extract_change_dependencies(&groups);
+
+        // "c" depends on "a" and "b" (all changes in group 1)
+        assert!(deps.contains_key("c"));
+        let c_deps = deps.get("c").unwrap();
+        assert!(c_deps.contains(&"a".to_string()));
+        assert!(c_deps.contains(&"b".to_string()));
+
+        // "a" and "b" have no dependencies
+        assert!(!deps.contains_key("a"));
+        assert!(!deps.contains_key("b"));
+    }
+
+    #[test]
+    fn test_extract_change_dependencies_chain() {
+        // Group 1 -> Group 2 -> Group 3
+        let groups = vec![
+            ParallelGroup {
+                id: 1,
+                changes: vec!["a".to_string()],
+                depends_on: Vec::new(),
+            },
+            ParallelGroup {
+                id: 2,
+                changes: vec!["b".to_string()],
+                depends_on: vec![1],
+            },
+            ParallelGroup {
+                id: 3,
+                changes: vec!["c".to_string()],
+                depends_on: vec![2],
+            },
+        ];
+        let deps = extract_change_dependencies(&groups);
+
+        // "b" depends on "a"
+        assert!(deps.contains_key("b"));
+        assert!(deps.get("b").unwrap().contains(&"a".to_string()));
+
+        // "c" depends on "b"
+        assert!(deps.contains_key("c"));
+        assert!(deps.get("c").unwrap().contains(&"b".to_string()));
+
+        // "a" has no dependencies
+        assert!(!deps.contains_key("a"));
     }
 }

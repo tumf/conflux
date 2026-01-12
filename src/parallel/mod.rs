@@ -10,9 +10,9 @@ mod executor;
 mod types;
 
 pub use events::ParallelEvent;
-pub use types::WorkspaceResult;
+pub use types::{FailedChangeTracker, WorkspaceResult};
 
-use crate::analyzer::ParallelGroup;
+use crate::analyzer::{extract_change_dependencies, ParallelGroup};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::vcs::{
@@ -47,6 +47,8 @@ pub struct ParallelExecutor {
     repo_root: PathBuf,
     /// Disable automatic workspace resume (always create new workspaces)
     no_resume: bool,
+    /// Tracker for failed changes to enable skipping dependent changes
+    failed_tracker: FailedChangeTracker,
 }
 
 impl ParallelExecutor {
@@ -122,6 +124,7 @@ impl ParallelExecutor {
             max_conflict_retries: 3,
             repo_root,
             no_resume: false,
+            failed_tracker: FailedChangeTracker::new(),
         }
     }
 
@@ -183,6 +186,10 @@ impl ParallelExecutor {
 
         info!("Executing {} groups in parallel mode", groups.len());
 
+        // Extract change-level dependencies from groups and set them in the tracker
+        let change_deps = extract_change_dependencies(&groups);
+        self.failed_tracker.set_dependencies(change_deps);
+
         // Prepare for parallel execution (snapshot for jj, clean check for git)
         info!("Preparing for parallel execution...");
         if let Err(e) = self.workspace_manager.prepare_for_parallel().await {
@@ -241,6 +248,47 @@ impl ParallelExecutor {
         let mut group_counter = 1u32;
 
         while !changes.is_empty() {
+            // Filter out changes that depend on failed changes
+            let executable_changes: Vec<_> = changes
+                .iter()
+                .filter(|c| {
+                    if let Some(failed_dep) = self.failed_tracker.should_skip(&c.id) {
+                        warn!(
+                            "Excluding '{}' from analysis: dependency '{}' failed",
+                            c.id, failed_dep
+                        );
+                        // Emit skip event
+                        // Note: We can't async here, so we'll emit after filtering
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .cloned()
+                .collect();
+
+            // Emit skip events for filtered changes
+            for change in &changes {
+                if let Some(failed_dep) = self.failed_tracker.should_skip(&change.id) {
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::ChangeSkipped {
+                            change_id: change.id.clone(),
+                            reason: format!("Dependency '{}' failed", failed_dep),
+                        },
+                    )
+                    .await;
+                }
+            }
+
+            // Update changes to only include executable ones
+            changes = executable_changes;
+
+            if changes.is_empty() {
+                info!("All remaining changes depend on failed changes, stopping");
+                break;
+            }
+
             // Analyze remaining changes to get the next group
             info!(
                 "Analyzing {} remaining changes for next group",
@@ -260,6 +308,10 @@ impl ParallelExecutor {
                 warn!("No groups returned from analysis");
                 break;
             }
+
+            // Extract change-level dependencies for this iteration
+            let change_deps = extract_change_dependencies(&groups);
+            self.failed_tracker.set_dependencies(change_deps);
 
             // Execute only the first group (no dependencies)
             let first_group = ParallelGroup {
@@ -290,6 +342,48 @@ impl ParallelExecutor {
 
     /// Execute a single group of changes
     async fn execute_group(&mut self, group: &ParallelGroup) -> Result<()> {
+        // First, check which changes should be skipped due to failed dependencies
+        let mut changes_to_execute: Vec<String> = Vec::new();
+        let mut skipped_changes: Vec<(String, String)> = Vec::new();
+
+        for change_id in &group.changes {
+            if let Some(failed_dep) = self.failed_tracker.should_skip(change_id) {
+                warn!(
+                    "Skipping '{}' because dependency '{}' failed",
+                    change_id, failed_dep
+                );
+                skipped_changes.push((change_id.clone(), failed_dep));
+            } else {
+                changes_to_execute.push(change_id.clone());
+            }
+        }
+
+        // Emit events for skipped changes
+        for (change_id, failed_dep) in &skipped_changes {
+            send_event(
+                &self.event_tx,
+                ParallelEvent::ChangeSkipped {
+                    change_id: change_id.clone(),
+                    reason: format!("Dependency '{}' failed", failed_dep),
+                },
+            )
+            .await;
+        }
+
+        // If all changes are skipped, we're done with this group
+        if changes_to_execute.is_empty() {
+            info!(
+                "All changes in group {} were skipped due to failed dependencies",
+                group.id
+            );
+            send_event(
+                &self.event_tx,
+                ParallelEvent::GroupCompleted { group_id: group.id },
+            )
+            .await;
+            return Ok(());
+        }
+
         // Get current base revision for this group's workspaces
         let base_revision = self
             .workspace_manager
@@ -299,8 +393,8 @@ impl ParallelExecutor {
         info!(
             "Executing group {} with {} changes: {:?} (base revision: {})",
             group.id,
-            group.changes.len(),
-            group.changes,
+            changes_to_execute.len(),
+            changes_to_execute,
             &base_revision[..8.min(base_revision.len())]
         );
 
@@ -308,7 +402,7 @@ impl ParallelExecutor {
             &self.event_tx,
             ParallelEvent::GroupStarted {
                 group_id: group.id,
-                changes: group.changes.clone(),
+                changes: changes_to_execute.clone(),
             },
         )
         .await;
@@ -322,7 +416,7 @@ impl ParallelExecutor {
         // Create or reuse workspaces for all changes in the group
         // If resume is enabled (default), try to find existing workspaces first
         let mut workspaces: Vec<Workspace> = Vec::new();
-        for change_id in &group.changes {
+        for change_id in &changes_to_execute {
             // Try to find and reuse existing workspace (unless --no-resume is set)
             let workspace = if self.no_resume {
                 None
@@ -438,18 +532,28 @@ impl ParallelExecutor {
             .collect();
         let failed: Vec<&WorkspaceResult> = results.iter().filter(|r| r.error.is_some()).collect();
 
-        // Report failures (already reported in parallel execution, but log summary)
+        // Report failures and mark them in the tracker for dependent skipping
         for result in &failed {
             if let Some(ref err) = result.error {
                 error!("Failed for {}: {}", result.change_id, err);
             }
+            // Mark the failed change so dependent changes will be skipped
+            self.failed_tracker.mark_failed(&result.change_id);
         }
 
-        // If all failed, return error
-        if successful.is_empty() {
-            return Err(OrchestratorError::AgentCommand(
-                "All changes in group failed".to_string(),
-            ));
+        // If all failed, we don't have an error but continue to the next group
+        // The dependent changes will be skipped automatically
+        if successful.is_empty() && !results.is_empty() {
+            warn!(
+                "All changes in group {} failed, dependent changes will be skipped",
+                group.id
+            );
+            send_event(
+                &self.event_tx,
+                ParallelEvent::GroupCompleted { group_id: group.id },
+            )
+            .await;
+            return Ok(());
         }
 
         // Collect final revisions (post-archive revisions)

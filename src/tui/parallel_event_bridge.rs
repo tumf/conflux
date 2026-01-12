@@ -122,6 +122,10 @@ pub fn convert(event: ParallelEvent) -> Vec<OrchestratorEvent> {
             LogEntry::success(format!("Group {} completed", group_id)),
         )],
 
+        ParallelEvent::ChangeSkipped { change_id, reason } => vec![OrchestratorEvent::Log(
+            LogEntry::warn(format!("Skipped: {}", reason)).with_change_id(&change_id),
+        )],
+
         ParallelEvent::AnalysisStarted { remaining_changes } => {
             vec![OrchestratorEvent::Log(LogEntry::info(format!(
                 "Analyzing {} remaining change(s)...",
@@ -309,6 +313,26 @@ mod tests {
                 assert_eq!(error, "disk full");
             }
             _ => panic!("Expected ProcessingError event"),
+        }
+    }
+
+    #[test]
+    fn test_convert_change_skipped() {
+        let event = ParallelEvent::ChangeSkipped {
+            change_id: "test-change".to_string(),
+            reason: "Dependency 'other-change' failed".to_string(),
+        };
+
+        let events = convert(event);
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            OrchestratorEvent::Log(entry) => {
+                assert!(entry.message.contains("Skipped"));
+                assert!(entry.message.contains("Dependency"));
+                assert_eq!(entry.change_id, Some("test-change".to_string()));
+            }
+            _ => panic!("Expected Log event"),
         }
     }
 }
