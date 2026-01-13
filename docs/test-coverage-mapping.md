@@ -122,7 +122,6 @@ This document maps specification scenarios to their corresponding test implement
 | Scenario | Test | Status |
 |----------|------|--------|
 | デフォルトは Auto | `src/vcs/mod.rs::test_vcs_backend_default_is_auto` | ✅ NEW |
-| jj バックエンドの設定 | `src/config/mod.rs::test_vcs_backend_can_be_set_to_jj` | ✅ NEW |
 | git バックエンドの設定 | `src/config/mod.rs::test_vcs_backend_can_be_set_to_git` | ✅ NEW |
 | VcsBackend のシリアライズ | `src/vcs/mod.rs::test_vcs_backend_serialization` | ✅ NEW |
 | VcsBackend のデシリアライズ | `src/vcs/mod.rs::test_vcs_backend_deserialization` | ✅ NEW |
@@ -219,7 +218,6 @@ This document maps specification scenarios to their corresponding test implement
 
 | Scenario | Test | Status |
 |----------|------|--------|
-| jj workspace forget コマンド | `src/parallel/cleanup.rs::test_cleanup_guard_jj_workspace_forget_command` | ✅ NEW |
 | git branch -D コマンド | `src/parallel/cleanup.rs::test_cleanup_guard_git_branch_delete_command` | ✅ NEW |
 
 ---
@@ -458,7 +456,6 @@ This document maps specification scenarios to their corresponding test implement
 - `test_workspace_base_dir_can_be_configured` - workspace_base_dir config
 - `test_workspace_base_dir_empty_string_treated_as_none` - empty string handling
 - `test_vcs_backend_defaults_to_auto` - vcs_backend default
-- `test_vcs_backend_can_be_set_to_jj` - jj backend
 - `test_vcs_backend_can_be_set_to_git` - git backend
 - `test_use_llm_analysis_defaults_to_true` - use_llm_analysis default
 - `test_use_llm_analysis_can_be_disabled` - use_llm_analysis disable
@@ -477,7 +474,6 @@ This document maps specification scenarios to their corresponding test implement
 - `test_cleanup_guard_drop_with_committed_guard_does_nothing` - committed drop
 - `test_cleanup_guard_raii_pattern` - RAII pattern
 - `test_cleanup_guard_commit_on_success` - success commit
-- `test_cleanup_guard_jj_workspace_forget_command` - jj cleanup
 - `test_cleanup_guard_git_branch_delete_command` - git cleanup
 
 ### vcs/mod.rs (+12 tests)

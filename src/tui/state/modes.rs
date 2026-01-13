@@ -9,9 +9,9 @@ use super::super::types::{AppMode, QueueStatus};
 use super::AppState;
 
 impl AppState {
-    /// Toggle parallel mode (only if jj is available)
+    /// Toggle parallel mode (only if git is available)
     ///
-    /// Returns true if the mode was toggled, false if jj is not available
+    /// Returns true if the mode was toggled, false if git is not available
     /// or if the mode cannot be changed in current state.
     pub fn toggle_parallel_mode(&mut self) -> bool {
         // Only allow toggling in Select or Stopped mode
@@ -20,10 +20,9 @@ impl AppState {
             return false;
         }
 
-        // Check if parallel execution is available (jj or git)
+        // Check if parallel execution is available (git)
         if !self.parallel_available {
-            self.warning_message =
-                Some("Parallel mode not available (requires jj or git)".to_string());
+            self.warning_message = Some("Parallel mode not available (requires git)".to_string());
             return false;
         }
 

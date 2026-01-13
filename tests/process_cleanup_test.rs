@@ -24,21 +24,21 @@ async fn test_unix_process_group_cleanup() {
     unsafe {
         cmd.pre_exec(|| {
             use nix::unistd::{setpgid, Pid};
-            setpgid(Pid::from_raw(0), Pid::from_raw(0))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(std::io::Error::other)?;
             Ok(())
         });
     }
 
     let mut child = cmd.spawn().expect("Failed to spawn test process");
     let pid = child.id().expect("Failed to get PID");
+    let pid_string = pid.to_string();
 
     // Give processes time to start
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Verify process group exists
     let check_output = std::process::Command::new("ps")
-        .args(&["-o", "pid,pgid", "-p", &pid.to_string()])
+        .args(["-o", "pid,pgid", "-p", &pid_string])
         .output()
         .expect("Failed to check process group");
 
@@ -60,7 +60,7 @@ async fn test_unix_process_group_cleanup() {
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let check_output = std::process::Command::new("ps")
-            .args(&["-p", &pid.to_string()])
+            .args(["-p", &pid_string])
             .output()
             .expect("Failed to check process");
 
@@ -125,8 +125,7 @@ async fn test_process_group_isolation() {
     unsafe {
         cmd.pre_exec(|| {
             use nix::unistd::{setpgid, Pid};
-            setpgid(Pid::from_raw(0), Pid::from_raw(0))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(std::io::Error::other)?;
             Ok(())
         });
     }

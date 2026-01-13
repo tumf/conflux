@@ -9,7 +9,7 @@
   "resolve_command": "claude --model opus --dangerously-skip-permissions --verbose -p '{prompt}'",
   // Lifecycle hooks (optional)
   "hooks": {
-    // Create a new jj change for each changeset before applying
-    //"pre_apply": "jj new -m 'changeset: {change_id}'"
+    // Create a new commit for each changeset before applying
+    //"pre_apply": "git commit --allow-empty -m 'changeset: {change_id}'"
   },
 }

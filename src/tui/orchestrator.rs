@@ -738,7 +738,7 @@ pub async fn run_orchestrator(
     Ok(())
 }
 
-/// Run the orchestrator in parallel mode using jj workspaces
+/// Run the orchestrator in parallel mode using git worktrees
 /// This function executes all changes in parallel using ParallelRunService
 ///
 /// Supports dynamic queue: after each batch completes, checks for newly queued changes
@@ -770,15 +770,15 @@ pub async fn run_orchestrator_parallel(
     // Create ParallelRunService
     let service = ParallelRunService::new(repo_root.clone(), config.clone());
 
-    // Check VCS availability (jj or git)
+    // Check Git availability
     if !service.check_vcs_available().await? {
         let _ = tx
             .send(OrchestratorEvent::Log(LogEntry::error(
-                "VCS (jj or git) is not available for parallel execution".to_string(),
+                "Git repository is not available for parallel execution".to_string(),
             )))
             .await;
         return Err(crate::error::OrchestratorError::AgentCommand(
-            "VCS not available".to_string(),
+            "Git repository not available".to_string(),
         ));
     }
 

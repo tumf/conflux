@@ -16,8 +16,8 @@
 
 #### Scenario: VCSコマンド実行時のログ出力
 
-- **GIVEN** jj workspaceを作成する
-- **WHEN** `jj workspace add` コマンドが実行される
+- **GIVEN** git worktreeを作成する
+- **WHEN** `git worktree add` コマンドが実行される
 - **THEN** ログに `debug!` レベルでコマンドライン全体が記録される
 - **AND** ログに作業ディレクトリが含まれる
 

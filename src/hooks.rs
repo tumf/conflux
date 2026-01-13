@@ -532,12 +532,17 @@ impl HookRunner {
         timeout_duration: Duration,
     ) -> Result<bool> {
         let mut cmd = if cfg!(target_os = "windows") {
+            debug!("Executing {} hook command: cmd /C {}", hook_type, command);
             let mut c = Command::new("cmd");
             c.arg("/C").arg(command);
             c
         } else {
             // Use /bin/sh directly instead of user's $SHELL to avoid job control issues
             // (e.g., zsh's "suspended (tty output)" when running as background process)
+            debug!(
+                "Executing {} hook command: /bin/sh -c {}",
+                hook_type, command
+            );
             let mut c = Command::new("/bin/sh");
             c.arg("-c").arg(command);
             c
@@ -911,9 +916,9 @@ mod tests {
     #[test]
     fn test_on_change_start_placeholder_expansion() {
         let context = HookContext::new(0, 3, 3, false).with_change("my-change", 0, 5);
-        let template = "jj new -m 'changeset: {change_id}'";
+        let template = "git commit -m 'changeset: {change_id}'";
         let result = context.expand_placeholders(template);
-        assert_eq!(result, "jj new -m 'changeset: my-change'");
+        assert_eq!(result, "git commit -m 'changeset: my-change'");
     }
 
     // === Tests for on_change_end hook (hooks spec 2.6) ===
@@ -1175,7 +1180,7 @@ mod tests {
             Some(&"/workspace/single".to_string())
         );
         // group_index is None, so no OPENSPEC_GROUP_INDEX
-        assert!(vars.get("OPENSPEC_GROUP_INDEX").is_none());
+        assert!(!vars.contains_key("OPENSPEC_GROUP_INDEX"));
     }
 
     #[test]
@@ -1185,8 +1190,8 @@ mod tests {
         let vars = context.to_env_vars();
 
         // Neither workspace_path nor group_index should be set
-        assert!(vars.get("OPENSPEC_WORKSPACE_PATH").is_none());
-        assert!(vars.get("OPENSPEC_GROUP_INDEX").is_none());
+        assert!(!vars.contains_key("OPENSPEC_WORKSPACE_PATH"));
+        assert!(!vars.contains_key("OPENSPEC_GROUP_INDEX"));
 
         // Standard env vars should still work
         assert_eq!(

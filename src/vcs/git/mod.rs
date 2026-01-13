@@ -487,7 +487,7 @@ impl WorkspaceManager for GitWorkspaceManager {
     }
 
     async fn snapshot_working_copy(&self, _workspace_path: &Path) -> VcsResult<()> {
-        // Git doesn't have automatic snapshotting like jj
+        // Git doesn't have automatic snapshotting
         // No-op for Git
         Ok(())
     }
@@ -640,6 +640,10 @@ impl WorkspaceManager for GitWorkspaceManager {
             let path = workspace.path.to_str().unwrap_or("");
 
             // Try to remove the worktree
+            debug!(
+                "Executing git command: git worktree remove {} --force (cwd: {:?})",
+                path, self.repo_root
+            );
             let result = std::process::Command::new("git")
                 .args(["worktree", "remove", path, "--force"])
                 .current_dir(&self.repo_root)
@@ -667,6 +671,10 @@ impl WorkspaceManager for GitWorkspaceManager {
             }
 
             // Try to delete the branch
+            debug!(
+                "Executing git command: git branch -D {} (cwd: {:?})",
+                workspace_name, self.repo_root
+            );
             let _ = std::process::Command::new("git")
                 .args(["branch", "-D", workspace_name])
                 .current_dir(&self.repo_root)

@@ -1,17 +1,18 @@
 //! Common command execution helpers for VCS operations.
 //!
 //! This module provides shared utilities for running VCS commands,
-//! reducing code duplication between jj and Git implementations.
+//! reducing code duplication in Git implementations.
 
 use super::{VcsBackend, VcsError, VcsResult};
 use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
+use tracing::debug;
 
 /// Execute a VCS command and return the trimmed stdout output.
 ///
 /// # Arguments
-/// * `program` - The VCS program to run (e.g., "jj", "git")
+/// * `program` - The VCS program to run (e.g., "git")
 /// * `args` - Arguments to pass to the program
 /// * `cwd` - Working directory for the command
 /// * `backend` - VCS backend type for error context
@@ -24,6 +25,12 @@ pub async fn run_vcs_command<P: AsRef<Path>>(
     cwd: P,
     backend: VcsBackend,
 ) -> VcsResult<String> {
+    debug!(
+        "Executing {} command: {} (cwd: {:?})",
+        program,
+        args.join(" "),
+        cwd.as_ref()
+    );
     let output = Command::new(program)
         .args(args)
         .current_dir(cwd.as_ref())
@@ -56,6 +63,12 @@ pub async fn run_vcs_command_silent<P: AsRef<Path>>(
     cwd: P,
     backend: VcsBackend,
 ) -> VcsResult<()> {
+    debug!(
+        "Executing {} command (silent): {} (cwd: {:?})",
+        program,
+        args.join(" "),
+        cwd.as_ref()
+    );
     let output = Command::new(program)
         .args(args)
         .current_dir(cwd.as_ref())
@@ -84,6 +97,12 @@ pub async fn run_vcs_command_silent<P: AsRef<Path>>(
 /// Useful for cleanup operations where failure is acceptable.
 #[allow(dead_code)]
 pub async fn run_vcs_command_ignore_error<P: AsRef<Path>>(program: &str, args: &[&str], cwd: P) {
+    debug!(
+        "Executing {} command (ignore errors): {} (cwd: {:?})",
+        program,
+        args.join(" "),
+        cwd.as_ref()
+    );
     let _ = Command::new(program)
         .args(args)
         .current_dir(cwd.as_ref())
@@ -96,6 +115,12 @@ pub async fn run_vcs_command_ignore_error<P: AsRef<Path>>(program: &str, args: &
 ///
 /// Returns true if the program can be executed with --version.
 pub async fn check_vcs_available<P: AsRef<Path>>(program: &str, cwd: P) -> VcsResult<bool> {
+    debug!(
+        "Executing {} command: {} (cwd: {:?})",
+        program,
+        "--version",
+        cwd.as_ref()
+    );
     let version_result = Command::new(program)
         .arg("--version")
         .current_dir(cwd.as_ref())

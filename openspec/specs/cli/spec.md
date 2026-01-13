@@ -1119,27 +1119,13 @@ Changes interrupted by force stop SHALL be handled gracefully.
 - **AND** the tasks.md file reflects actual progress
 - **AND** resuming continues from the partial state
 
-### Requirement: jj Repository Detection
-
-The CLI SHALL detect whether the current directory is a jj-managed repository by checking for the `.jj` directory.
-
-#### Scenario: jj repository detected
-- **WHEN** a `.jj` directory exists in the current working directory
-- **THEN** jj features (parallel mode) are available
-
-#### Scenario: jj repository not detected
-- **WHEN** no `.jj` directory exists in the current working directory
-- **AND** user runs `openspec-orchestrator run --parallel`
-- **THEN** the command exits with a non-zero exit code
-- **AND** an error message is displayed: "Error: --parallel requires a jj repository (.jj directory not found)"
-
 ### Requirement: Parallel Execution Mode Flag
 
-The CLI SHALL support a `--parallel` flag to enable parallel change execution using jj workspaces. Parallel mode is OFF by default.
+The CLI SHALL support a `--parallel` flag to enable parallel change execution using git worktrees. Parallel mode is OFF by default.
 
 #### Scenario: Enable parallel mode via CLI flag
 - **WHEN** user runs `openspec-orchestrator run --parallel`
-- **AND** a `.jj` directory exists
+- **AND** a `.git` directory exists
 - **THEN** the orchestrator enters parallel execution mode
 - **AND** changes are analyzed for parallelization opportunities
 
@@ -1148,11 +1134,11 @@ The CLI SHALL support a `--parallel` flag to enable parallel change execution us
 - **THEN** the orchestrator uses sequential execution mode
 - **AND** no parallelization analysis is performed
 
-#### Scenario: Parallel mode requires jj directory
+#### Scenario: Parallel mode requires git directory
 - **WHEN** user runs `openspec-orchestrator run --parallel`
-- **AND** no `.jj` directory exists
+- **AND** no `.git` directory exists
 - **THEN** the command exits with error code 1
-- **AND** an error message indicates jj repository is required for parallel mode
+- **AND** an error message indicates git repository is required for parallel mode
 
 #### Scenario: Parallel mode with max concurrent limit
 - **WHEN** user runs `openspec-orchestrator run --parallel --max-concurrent 4`
@@ -1196,31 +1182,25 @@ CLI SHALL allow explicit VCS backend selection via `--vcs` flag.
 
 - **WHEN** `--parallel` flag is specified
 - **AND** `--vcs` flag is not specified
-- **THEN** VCS backend is auto-detected (jj preferred)
-
-#### Scenario: Explicit jj selection
-
-- **WHEN** `openspec-orchestrator run --parallel --vcs jj` is executed
-- **THEN** jj backend is used
-- **AND** an error is displayed if jj is not available
+- **THEN** VCS backend is auto-detected
+- **AND** Git backend is selected when a `.git` directory exists
 
 #### Scenario: Explicit git selection
 
 - **WHEN** `openspec-orchestrator run --parallel --vcs git` is executed
 - **THEN** Git backend is used
-- **AND** Git is used even if jj exists
 - **AND** an error is displayed if Git is not available
 
 #### Scenario: Explicit auto selection
 
 - **WHEN** `openspec-orchestrator run --parallel --vcs auto` is executed
 - **THEN** VCS backend is auto-detected
-- **AND** jj is preferred, Git is used if jj is not available
+- **AND** Git backend is selected when a `.git` directory exists
 
 #### Scenario: Invalid VCS value
 
 - **WHEN** `openspec-orchestrator run --parallel --vcs invalid` is executed
-- **THEN** error message "Invalid VCS backend: invalid. Valid options: auto, jj, git" is displayed
+- **THEN** error message "Invalid VCS backend: invalid. Valid options: auto, git" is displayed
 - **AND** exit code is non-zero
 
 #### Scenario: --vcs without --parallel
@@ -1329,3 +1309,17 @@ TUI は archived 状態になった change をアプリ終了まで Changes 一�
 - **GIVEN** archived change が Changes 一覧に残っている
 - **WHEN** TUI を終了して再起動する
 - **THEN** archived change は Changes 一覧に表示されない
+
+### Requirement: Git Repository Detection
+
+The CLI SHALL detect whether the current directory is a git-managed repository by checking for the `.git` directory.
+
+#### Scenario: git repository detected
+- **WHEN** a `.git` directory exists in the current working directory
+- **THEN** git worktree parallel features are available
+
+#### Scenario: git repository not detected
+- **WHEN** no `.git` directory exists in the current working directory
+- **AND** user runs `openspec-orchestrator run --parallel`
+- **THEN** the command exits with a non-zero exit code
+- **AND** an error message is displayed: "Error: --parallel requires a git repository (.git directory not found)"

@@ -48,12 +48,6 @@
   - Add comments explaining deduplication logic
   - Document configuration options in config schema
 
-- [ ] Manual verification
-  - Run TUI mode for 60+ seconds
-  - Inspect `/tmp/tui-serial-debug.log`
-  - Confirm ~95% log reduction
-  - Verify state changes still appear
-
 ## Acceptance Criteria
 
 - ✓ Repetitive DEBUG logs are suppressed when state unchanged

@@ -59,9 +59,9 @@ pub struct AppState {
     pub stop_mode: StopMode,
     /// Whether parallel mode is enabled
     pub parallel_mode: bool,
-    /// Whether parallel execution is available (jj or git)
+    /// Whether parallel execution is available (git)
     pub parallel_available: bool,
-    /// VCS backend being used (jj or git)
+    /// VCS backend being used (git)
     pub vcs_backend: String,
     /// Max concurrent workspaces for parallel execution
     pub max_concurrent: usize,
@@ -127,11 +127,7 @@ impl AppState {
             stop_mode: StopMode::None,
             parallel_mode: false,
             parallel_available: crate::cli::check_parallel_available(),
-            vcs_backend: if crate::cli::check_jj_directory() {
-                "jj".to_string()
-            } else {
-                "git".to_string()
-            },
+            vcs_backend: "git".to_string(),
             max_concurrent: 4, // Default value, can be overridden from config
             orchestration_started_at: None,
             orchestration_elapsed: None,

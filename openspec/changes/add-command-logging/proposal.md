@@ -10,7 +10,7 @@
 
 - OpenSpec CLI (`openspec list`, `openspec apply` など)
 - OpenCode / Claude Code などのAIエージェントコマンド
-- VCSコマンド（`jj`, `git`）
+- VCSコマンド（`git`）
 - ライフサイクルフック（ユーザー定義シェルコマンド）
 
 しかし、現状では一部のコマンド（特にagent.rsでのapply/archive/analyzeコマンド）しかログに記録されておらず、VCSコマンドやその他の重要な実行はログに残らない。
@@ -42,9 +42,8 @@
 - `src/parallel/executor.rs` - VCSコマンド全般
 - `src/parallel/mod.rs` - workspace初期化コマンド
 - `src/hooks.rs` - 一部対応済み、追加でWindows版コマンド
-- `src/vcs/jj/mod.rs` - すべてのjjコマンド
-- `src/vcs/jj/commands.rs` - jj補助コマンド
-- `src/vcs/git/commands.rs` (存在する場合) - git補助コマンド
+- `src/vcs/git/mod.rs` - すべてのgitコマンド
+- `src/vcs/git/commands.rs` - git補助コマンド
 - `src/parallel/cleanup.rs` - cleanup時のVCSコマンド
 
 ### 既存のログ出力との整合性

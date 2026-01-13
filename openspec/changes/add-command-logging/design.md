@@ -26,7 +26,7 @@
 | レベル | 対象コマンド | 理由 |
 |--------|--------------|------|
 | `info!` | apply, archive, analyze, hooks | ユーザーが意識する主要操作 |
-| `debug!` | VCS (jj/git), 補助コマンド | 内部動作の詳細 |
+| `debug!` | VCS (git), 補助コマンド | 内部動作の詳細 |
 
 **理由**:
 - デフォルト実行時のノイズを抑制しつつ、必要時に詳細ログを有効化できる
@@ -72,26 +72,25 @@ info!("Running {} hook: {}", hook_type, command);
 すべてのVCSコマンド実行前に以下の形式でログ出力：
 
 ```rust
-debug!("Executing jj command: jj workspace add {} (cwd: {:?})", workspace_name, repo_root);
-let output = Command::new("jj")
-    .args(["workspace", "add", workspace_name])
+debug!("Executing git command: git worktree add {} (cwd: {:?})", workspace_name, repo_root);
+let output = Command::new("git")
+    .args(["worktree", "add", workspace_name])
     .current_dir(&repo_root)
     // ...
 ```
 
 **実装箇所**:
-- `src/vcs/jj/mod.rs`: 15箇所程度
-- `src/vcs/jj/commands.rs`: 1-2箇所
-- Git backend（存在する場合）
+- `src/vcs/git/mod.rs`: 15箇所程度
+- `src/vcs/git/commands.rs`: 1-2箇所
 
 ### Parallel Executor (src/parallel/)
 
 progress commit作成、conflict resolution等の重要操作でログ出力：
 
 ```rust
-debug!("Creating progress commit for change {}: jj describe -m '{}'", change_id, message);
-let output = Command::new("jj")
-    .args(["describe", "-m", &message])
+debug!("Creating progress commit for change {}: git commit -m '{}'", change_id, message);
+let output = Command::new("git")
+    .args(["commit", "-m", &message])
     // ...
 ```
 
