@@ -27,7 +27,10 @@ pub fn launch_editor_for_change(change_id: &str) -> Result<()> {
         return Err(OrchestratorError::ChangeNotFound(change_id.to_string()));
     }
 
-    info!("Launching editor: {} (cwd: {:?})", editor, change_dir);
+    info!(
+        module = module_path!(),
+        "Launching editor: {} (cwd: {:?})", editor, change_dir
+    );
     Command::new(&editor)
         .arg(".")
         .current_dir(&change_dir)

@@ -483,7 +483,10 @@ impl HookRunner {
         let env_vars = context.to_env_vars();
         let timeout_duration = Duration::from_secs(hook_config.timeout);
 
-        info!("Running {} hook: {}", hook_type, command);
+        info!(
+            module = module_path!(),
+            "Running {} hook: {}", hook_type, command
+        );
         debug!("Hook timeout: {}s", hook_config.timeout);
 
         match self
@@ -532,7 +535,10 @@ impl HookRunner {
         timeout_duration: Duration,
     ) -> Result<bool> {
         let mut cmd = if cfg!(target_os = "windows") {
-            debug!("Executing {} hook command: cmd /C {}", hook_type, command);
+            debug!(
+                module = module_path!(),
+                "Executing {} hook command: cmd /C {}", hook_type, command
+            );
             let mut c = Command::new("cmd");
             c.arg("/C").arg(command);
             c
@@ -540,8 +546,8 @@ impl HookRunner {
             // Use /bin/sh directly instead of user's $SHELL to avoid job control issues
             // (e.g., zsh's "suspended (tty output)" when running as background process)
             debug!(
-                "Executing {} hook command: /bin/sh -c {}",
-                hook_type, command
+                module = module_path!(),
+                "Executing {} hook command: /bin/sh -c {}", hook_type, command
             );
             let mut c = Command::new("/bin/sh");
             c.arg("-c").arg(command);

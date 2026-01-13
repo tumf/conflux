@@ -196,6 +196,7 @@ pub fn check_git_directory() -> bool {
 /// Check if git CLI is available
 pub fn check_git_available() -> bool {
     debug!(
+        module = module_path!(),
         "Executing git command: git --version (cwd: {:?})",
         std::env::current_dir().ok()
     );

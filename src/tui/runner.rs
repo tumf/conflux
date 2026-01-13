@@ -538,7 +538,10 @@ async fn run_tui_loop(
                         execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
 
                         // Execute the propose command
-                        info!("Running propose command: sh -c {}", command);
+                        info!(
+                            module = module_path!(),
+                            "Running propose command: sh -c {}", command
+                        );
                         let status = std::process::Command::new("sh")
                             .arg("-c")
                             .arg(&command)

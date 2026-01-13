@@ -26,6 +26,7 @@ pub async fn run_vcs_command<P: AsRef<Path>>(
     backend: VcsBackend,
 ) -> VcsResult<String> {
     debug!(
+        module = module_path!(),
         "Executing {} command: {} (cwd: {:?})",
         program,
         args.join(" "),
@@ -64,6 +65,7 @@ pub async fn run_vcs_command_silent<P: AsRef<Path>>(
     backend: VcsBackend,
 ) -> VcsResult<()> {
     debug!(
+        module = module_path!(),
         "Executing {} command (silent): {} (cwd: {:?})",
         program,
         args.join(" "),
@@ -98,6 +100,7 @@ pub async fn run_vcs_command_silent<P: AsRef<Path>>(
 #[allow(dead_code)]
 pub async fn run_vcs_command_ignore_error<P: AsRef<Path>>(program: &str, args: &[&str], cwd: P) {
     debug!(
+        module = module_path!(),
         "Executing {} command (ignore errors): {} (cwd: {:?})",
         program,
         args.join(" "),
@@ -116,6 +119,7 @@ pub async fn run_vcs_command_ignore_error<P: AsRef<Path>>(program: &str, args: &
 /// Returns true if the program can be executed with --version.
 pub async fn check_vcs_available<P: AsRef<Path>>(program: &str, cwd: P) -> VcsResult<bool> {
     debug!(
+        module = module_path!(),
         "Executing {} command: {} (cwd: {:?})",
         program,
         "--version",

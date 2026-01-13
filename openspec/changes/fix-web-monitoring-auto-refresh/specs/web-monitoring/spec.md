@@ -86,7 +86,7 @@ The web dashboard SHALL fall back to polling when WebSocket updates are unavaila
 
 #### Scenario: Polling fallback updates
 - **WHEN** WebSocket is disconnected and reconnection has not succeeded
-- **THEN** dashboard periodically fetches `/api/state` and updates the UI
+- **THEN** dashboard periodically fetches `/api/state` every 5 seconds and updates the UI
 - **AND** updates continue until WebSocket is re-established
 
 #### Scenario: Manual reload shows current state

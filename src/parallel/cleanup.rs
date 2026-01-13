@@ -98,8 +98,10 @@ impl Drop for WorkspaceCleanupGuard {
                     // This is a best-effort cleanup; the worktree will be orphaned
                     // but can be cleaned up later with `git worktree prune`
                     debug!(
+                        module = module_path!(),
                         "Executing git command: git branch -D {} (cwd: {:?})",
-                        workspace_name, self.repo_root
+                        workspace_name,
+                        self.repo_root
                     );
                     let result = std::process::Command::new("git")
                         .args(["branch", "-D", workspace_name])

@@ -56,8 +56,8 @@ async fn create_iteration_snapshot(
         VcsBackend::Git | VcsBackend::Auto => {
             // For Git: stage all changes and create/amend commit
             debug!(
-                "Executing git command: git add -A (cwd: {:?})",
-                workspace_path
+                module = module_path!(),
+                "Executing git command: git add -A (cwd: {:?})", workspace_path
             );
             let add_output = Command::new("git")
                 .args(["add", "-A"])
@@ -80,8 +80,8 @@ async fn create_iteration_snapshot(
 
             // Check if we have commits to amend
             debug!(
-                "Executing git command: git rev-parse HEAD (cwd: {:?})",
-                workspace_path
+                module = module_path!(),
+                "Executing git command: git rev-parse HEAD (cwd: {:?})", workspace_path
             );
             let has_commits = Command::new("git")
                 .args(["rev-parse", "HEAD"])
@@ -186,8 +186,10 @@ async fn squash_wip_commits(
             // For Git, we update the commit message to the final Apply message
             // Since we've been amending the same commit, we just need to update the message
             debug!(
+                module = module_path!(),
                 "Executing git command: git commit --amend -m {} (cwd: {:?})",
-                apply_message, workspace_path
+                apply_message,
+                workspace_path
             );
             let output = Command::new("git")
                 .args(["commit", "--amend", "-m", &apply_message])
@@ -439,8 +441,8 @@ pub async fn execute_apply_in_workspace(
         use tokio::io::{AsyncBufReadExt, BufReader};
 
         debug!(
-            "Executing shell command: sh -c {} (cwd: {:?})",
-            command, workspace_path
+            module = module_path!(),
+            "Executing shell command: sh -c {} (cwd: {:?})", command, workspace_path
         );
         let mut child = Command::new("sh")
             .arg("-c")
@@ -696,8 +698,8 @@ pub async fn execute_apply_in_workspace(
     let revision = match vcs_backend {
         VcsBackend::Git | VcsBackend::Auto => {
             debug!(
-                "Executing git command: git rev-parse HEAD (cwd: {:?})",
-                workspace_path
+                module = module_path!(),
+                "Executing git command: git rev-parse HEAD (cwd: {:?})", workspace_path
             );
             let revision_output = Command::new("git")
                 .args(["rev-parse", "HEAD"])
@@ -921,8 +923,8 @@ pub async fn execute_archive_in_workspace(
         VcsBackend::Git | VcsBackend::Auto => {
             // Check for uncommitted changes
             debug!(
-                "Executing git command: git status --porcelain (cwd: {:?})",
-                workspace_path
+                module = module_path!(),
+                "Executing git command: git status --porcelain (cwd: {:?})", workspace_path
             );
             let status_output = Command::new("git")
                 .args(["status", "--porcelain"])
@@ -990,8 +992,8 @@ pub async fn execute_archive_in_workspace(
     let revision = match vcs_backend {
         VcsBackend::Git | VcsBackend::Auto => {
             debug!(
-                "Executing git command: git rev-parse HEAD (cwd: {:?})",
-                workspace_path
+                module = module_path!(),
+                "Executing git command: git rev-parse HEAD (cwd: {:?})", workspace_path
             );
             let revision_output = Command::new("git")
                 .args(["rev-parse", "HEAD"])

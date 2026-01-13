@@ -88,7 +88,10 @@ impl AgentRunner {
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
-        info!("Running apply command: {}", command);
+        info!(
+            module = module_path!(),
+            "Running apply command: {}", command
+        );
         let (child, rx) = self.execute_shell_command_streaming(&command).await?;
         Ok((child, rx, start))
     }
@@ -121,7 +124,10 @@ impl AgentRunner {
         let prompt = self.config.get_archive_prompt();
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, prompt);
-        info!("Running archive command: {}", command);
+        info!(
+            module = module_path!(),
+            "Running archive command: {}", command
+        );
         self.execute_shell_command_streaming(&command).await
     }
 
@@ -144,7 +150,10 @@ impl AgentRunner {
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
-        info!("Running apply command: {}", command);
+        info!(
+            module = module_path!(),
+            "Running apply command: {}", command
+        );
 
         let status = self.execute_shell_command(&command).await?;
         let duration = start.elapsed();
@@ -177,7 +186,10 @@ impl AgentRunner {
         let prompt = self.config.get_archive_prompt();
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, prompt);
-        info!("Running archive command: {}", command);
+        info!(
+            module = module_path!(),
+            "Running archive command: {}", command
+        );
         self.execute_shell_command(&command).await
     }
 
@@ -185,7 +197,10 @@ impl AgentRunner {
     pub async fn analyze_dependencies(&self, prompt: &str) -> Result<String> {
         let template = self.config.get_analyze_command();
         let command = OrchestratorConfig::expand_prompt(template, prompt);
-        info!("Running analyze command: {}", template);
+        info!(
+            module = module_path!(),
+            "Running analyze command: {}", template
+        );
         info!("Expanded command length: {} chars", command.len());
 
         let output = self.execute_shell_command_with_output(&command).await?;
@@ -220,7 +235,10 @@ impl AgentRunner {
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
         let template = self.config.get_analyze_command();
         let command = OrchestratorConfig::expand_prompt(template, prompt);
-        info!("Running analyze command (streaming): {}", template);
+        info!(
+            module = module_path!(),
+            "Running analyze command (streaming): {}", template
+        );
         self.execute_shell_command_streaming(&command).await
     }
 
@@ -232,7 +250,10 @@ impl AgentRunner {
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
         let template = self.config.get_resolve_command();
         let command = OrchestratorConfig::expand_prompt(template, prompt);
-        info!("Running resolve command (streaming): {}", command);
+        info!(
+            module = module_path!(),
+            "Running resolve command (streaming): {}", command
+        );
         self.execute_shell_command_streaming(&command).await
     }
 
@@ -280,7 +301,10 @@ impl AgentRunner {
         command: &str,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
         let mut child = if cfg!(target_os = "windows") {
-            debug!("Spawning shell command: cmd /C {}", command);
+            debug!(
+                module = module_path!(),
+                "Spawning shell command: cmd /C {}", command
+            );
             Command::new("cmd")
                 .arg("/C")
                 .arg(command)
@@ -307,7 +331,10 @@ impl AgentRunner {
             // Use login shell to load .zprofile/.profile for PATH and environment setup
             // Note: -l (login) instead of -i (interactive) to avoid job control issues with TUI
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            debug!("Spawning shell command: {} -l -c {}", shell, command);
+            debug!(
+                module = module_path!(),
+                "Spawning shell command: {} -l -c {}", shell, command
+            );
             let mut cmd = Command::new(&shell);
             cmd.arg("-l")
                 .arg("-c")
@@ -405,7 +432,10 @@ impl AgentRunner {
     /// Execute a shell command and wait for completion (blocking, no streaming)
     async fn execute_shell_command(&self, command: &str) -> Result<ExitStatus> {
         let output = if cfg!(target_os = "windows") {
-            debug!("Executing shell command: cmd /C {}", command);
+            debug!(
+                module = module_path!(),
+                "Executing shell command: cmd /C {}", command
+            );
             Command::new("cmd")
                 .arg("/C")
                 .arg(command)
@@ -421,7 +451,10 @@ impl AgentRunner {
                 })?
         } else {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            debug!("Executing shell command: {} -l -c {}", shell, command);
+            debug!(
+                module = module_path!(),
+                "Executing shell command: {} -l -c {}", shell, command
+            );
             Command::new(&shell)
                 .arg("-l")
                 .arg("-c")
@@ -448,7 +481,10 @@ impl AgentRunner {
         command: &str,
     ) -> Result<std::process::Output> {
         let output = if cfg!(target_os = "windows") {
-            debug!("Executing shell command: cmd /C {}", command);
+            debug!(
+                module = module_path!(),
+                "Executing shell command: cmd /C {}", command
+            );
             Command::new("cmd")
                 .arg("/C")
                 .arg(command)
@@ -462,7 +498,10 @@ impl AgentRunner {
                 })?
         } else {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            debug!("Executing shell command: {} -l -c {}", shell, command);
+            debug!(
+                module = module_path!(),
+                "Executing shell command: {} -l -c {}", shell, command
+            );
             Command::new(&shell)
                 .arg("-l")
                 .arg("-c")
