@@ -61,6 +61,30 @@ impl AppState {
                 }
                 self.add_log(LogEntry::success(format!("Completed: {}", id)));
             }
+            OrchestratorEvent::ApplyFailed { change_id, error } => {
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+                    change.queue_status = QueueStatus::Error(error.clone());
+                    if let Some(started) = change.started_at {
+                        change.elapsed_time = Some(started.elapsed());
+                    }
+                }
+                self.add_log(LogEntry::error(format!(
+                    "Apply failed for {}: {}",
+                    change_id, error
+                )));
+            }
+            OrchestratorEvent::ArchiveFailed { change_id, error } => {
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+                    change.queue_status = QueueStatus::Error(error.clone());
+                    if let Some(started) = change.started_at {
+                        change.elapsed_time = Some(started.elapsed());
+                    }
+                }
+                self.add_log(LogEntry::error(format!(
+                    "Archive failed for {}: {}",
+                    change_id, error
+                )));
+            }
             OrchestratorEvent::ArchiveStarted(id) => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
                     if change.started_at.is_none() {
@@ -96,6 +120,12 @@ impl AppState {
                 // Transition to Error mode
                 self.mode = AppMode::Error;
                 self.error_change_id = Some(id.clone());
+                self.current_change = None;
+            }
+            OrchestratorEvent::Error { message } => {
+                self.add_log(LogEntry::error(message.clone()));
+                self.mode = AppMode::Error;
+                self.error_change_id = None;
                 self.current_change = None;
             }
             OrchestratorEvent::AllCompleted => {
