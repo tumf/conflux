@@ -195,43 +195,29 @@ Git バックエンド使用時、システムは `git worktree` コマンドを
 - **THEN** `git rev-parse HEAD` の結果が返される
 
 ### Requirement: Git Clean Working Directory Requirement
+When using the Git backend, the system SHALL warn about uncommitted changes and continue parallel execution.
 
-Git バックエンド使用時、システムは未コミット変更がある場合に並列実行を拒否しなければならない（SHALL）。
-
-#### Scenario: CLI error on uncommitted changes
-
-- **WHEN** `--parallel` フラグで実行される
-- **AND** Git バックエンドが選択される
-- **AND** 未コミットまたは未追跡のファイルが存在する
-- **THEN** 以下のエラーメッセージが表示される:
+#### Scenario: CLI warning on uncommitted changes
+- **WHEN** the command runs with `--parallel`
+- **AND** the Git backend is selected
+- **AND** uncommitted or untracked files exist
+- **THEN** the following warning message is displayed:
   ```
-  Error: Cannot start parallel mode with uncommitted changes.
-
-  Your working directory has uncommitted changes. Git worktree requires
-  a clean working directory to create isolated workspaces.
-
-  Please resolve this by either:
-
-    1. Commit your changes:
-       git add -A && git commit -m "WIP: save work before parallel"
-
-    2. Stash your changes:
-       git stash push -u -m "before parallel execution"
-
-  Then run the command again.
+  Warning: Uncommitted changes detected.
+  Parallel mode will continue, but uncommitted changes remain in your working directory.
+  Consider committing or stashing if you need isolated workspaces.
   ```
-- **AND** 終了コードは非ゼロである
+- **AND** parallel execution starts
+- **AND** the warning alone does not produce a non-zero exit code
 
-#### Scenario: TUI popup error on uncommitted changes
-
-- **WHEN** TUI で F5 キーが押される
-- **AND** Git バックエンドが選択される
-- **AND** 未コミットまたは未追跡のファイルが存在する
-- **THEN** ポップアップダイアログが表示される
-- **AND** タイトルは "Uncommitted Changes Detected" である
-- **AND** 本文に解決手順が表示される
-- **AND** Enter キーでダイアログを閉じることができる
-- **AND** 並列実行は開始されない
+#### Scenario: TUI warning on uncommitted changes
+- **WHEN** F5 is pressed in the TUI
+- **AND** the Git backend is selected
+- **AND** uncommitted or untracked files exist
+- **THEN** a popup dialog is displayed
+- **AND** the title is "Uncommitted Changes Detected"
+- **AND** the body explains the warning and that execution continues
+- **AND** parallel execution starts
 
 ### Requirement: Git Sequential Merge
 
