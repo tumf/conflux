@@ -283,19 +283,42 @@ impl JjWorkspaceManager {
 
     /// Merge multiple workspace revisions into main
     ///
-    /// For single revision: Uses `jj edit` to switch to that revision without creating empty commits.
-    /// For multiple revisions: Uses `jj new --no-edit` to create a merge commit without creating
-    /// an additional empty working copy commit, then uses `jj edit` to switch to the merge commit.
+    /// For a single revision: Uses `jj edit` to switch to that revision without creating merge commits.
+    /// For multiple revisions: Uses `jj new --no-edit` to create an empty merge commit, switches to it,
+    /// then creates a new working copy commit with `jj new <merge_rev>` so the merge stays empty.
     pub async fn merge_jj_workspaces(&self, revisions: &[String]) -> VcsResult<String> {
         if revisions.is_empty() {
             return Err(VcsError::jj_command("No revisions to merge"));
         }
 
-        // Always create a merge commit to integrate changes into the current workspace
-        // This ensures all changes are properly integrated into git_head()
-
         info!("Merging {} revisions", revisions.len());
         debug!("Revisions to merge: {:?}", revisions);
+
+        if !Self::should_create_merge_commit(revisions.len()) {
+            let target_rev = revisions[0].clone();
+            let short_rev = &target_rev[..8.min(target_rev.len())];
+            info!("Single revision merge; switching to {}", short_rev);
+
+            let edit_output = Command::new("jj")
+                .args(["edit", &target_rev])
+                .current_dir(&self.repo_root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .map_err(|e| VcsError::jj_command(format!("Failed to edit revision: {}", e)))?;
+
+            if !edit_output.status.success() {
+                let stderr = String::from_utf8_lossy(&edit_output.stderr);
+                return Err(VcsError::jj_command(format!(
+                    "Failed to edit revision: {}",
+                    stderr
+                )));
+            }
+
+            return Ok(target_rev);
+        }
 
         // Get current @ as base for merge
         // This ensures all individual merges use the same base (the snapshot)
@@ -361,7 +384,42 @@ impl JjWorkspaceManager {
             )));
         }
 
+        let new_output = Command::new("jj")
+            .args(["new", &merge_rev])
+            .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| {
+                VcsError::jj_command(format!("Failed to create working copy commit: {}", e))
+            })?;
+
+        if !new_output.status.success() {
+            let stderr = String::from_utf8_lossy(&new_output.stderr);
+            return Err(VcsError::jj_command(format!(
+                "Failed to create working copy commit: {}",
+                stderr
+            )));
+        }
+
+        let new_stderr = String::from_utf8_lossy(&new_output.stderr);
+        match self.parse_created_commit_id(&new_stderr).await {
+            Ok(new_rev) => {
+                let short_rev = &new_rev[..8.min(new_rev.len())];
+                info!("Created working copy commit {} after merge", short_rev);
+            }
+            Err(err) => {
+                warn!("Failed to parse working copy commit after merge: {}", err);
+            }
+        }
+
         Ok(merge_rev)
+    }
+
+    fn should_create_merge_commit(revision_count: usize) -> bool {
+        revision_count > 1
     }
 
     /// Parse the change_id from `jj new --no-edit` output
@@ -928,6 +986,17 @@ mod tests {
                 case
             );
         }
+    }
+
+    #[test]
+    fn test_should_create_merge_commit_single_revision() {
+        assert!(!JjWorkspaceManager::should_create_merge_commit(1));
+    }
+
+    #[test]
+    fn test_should_create_merge_commit_multiple_revisions() {
+        assert!(JjWorkspaceManager::should_create_merge_commit(2));
+        assert!(JjWorkspaceManager::should_create_merge_commit(3));
     }
 
     #[test]

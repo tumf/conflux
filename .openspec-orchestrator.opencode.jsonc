@@ -3,16 +3,16 @@
   // Template: OpenCode
 
   // Command to analyze dependencies and select next change
-  "analyze_command": "opencode run --model openai/gpt-5.2-codex --format json {prompt}",
+  "analyze_command": "opencode run --model openai/gpt-5.2-codex {prompt}",
 
   // Command to apply a change (supports {change_id} and {prompt} placeholders)
-  "apply_command": "opencode run --model openai/gpt-5.2-codex --format json '/openspec-apply {change_id} {prompt}'",
+  "apply_command": "opencode run --model openai/gpt-5.2-codex '/openspec-apply {change_id} {prompt}'",
 
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
-  "archive_command": "opencode run --model openai/gpt-5.2-codex --format json '/openspec-archive {change_id} {prompt}'",
+  "archive_command": "opencode run --model openai/gpt-5.2-codex '/openspec-archive {change_id} {prompt}'",
 
   // Command to resolve conflicts (supports {prompt} placeholder)
-  "resolve_command": "opencode run --model openai/gpt-5.2-codex --format json '{prompt}'",
+  "resolve_command": "opencode run --model openai/gpt-5.2-codex '{prompt}'",
 
   // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
   // Note: A hardcoded system prompt is always appended after this value
