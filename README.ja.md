@@ -167,6 +167,12 @@ openspec-orchestrator approve unset add-feature-x
 
 承認された変更には、すべての仕様ファイル（`tasks.md`を除く）のMD5チェックサムを含む`approved`ファイルが作成されます。これにより、承認後に変更が修正されていないことを保証します。
 
+補足: `approved` ファイルは生成物です。チームで承認状態を共有したい場合はコミットしてもよいですが、コミットの手間や差分ノイズを避けたいなら無視しても構いません。必要に応じて `.gitignore` に追加してください:
+
+```gitignore
+openspec/changes/*/approved
+```
+
 ## 動作原理
 
 ### メインループ

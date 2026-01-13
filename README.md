@@ -178,6 +178,12 @@ openspec-orchestrator approve unset add-feature-x
 
 Approved changes have an `approved` file containing MD5 checksums of all specification files (excluding `tasks.md`). This ensures the change hasn't been modified since approval.
 
+Tip: The `approved` files are generated artifacts. You can commit them to share approvals with your team, but it’s also fine to ignore them. If you prefer to avoid churn/extra commits, add them to `.gitignore`:
+
+```gitignore
+openspec/changes/*/approved
+```
+
 ## How It Works
 
 ### Main Loop
