@@ -281,27 +281,7 @@ async fn run_tui_loop(
                             let cmd = if app.mode == AppMode::Error {
                                 app.retry_error_changes()
                             } else if app.mode == AppMode::Stopped {
-                                // Resume after stop: collect queued changes
-                                let queued: Vec<String> = app
-                                    .changes
-                                    .iter()
-                                    .filter(|c| matches!(c.queue_status, QueueStatus::Queued))
-                                    .map(|c| c.id.clone())
-                                    .collect();
-                                if queued.is_empty() {
-                                    app.warning_message =
-                                        Some("No queued changes to resume".to_string());
-                                    None
-                                } else {
-                                    app.mode = AppMode::Running;
-                                    app.stop_mode = StopMode::None;
-                                    graceful_stop_flag.store(false, Ordering::SeqCst);
-                                    app.add_log(LogEntry::info(format!(
-                                        "Resuming processing {} change(s)",
-                                        queued.len()
-                                    )));
-                                    Some(TuiCommand::StartProcessing(queued))
-                                }
+                                app.resume_processing()
                             } else {
                                 app.start_processing()
                             };
@@ -314,6 +294,7 @@ async fn run_tui_loop(
                                 };
 
                                 if !selected_ids.is_empty() {
+                                    graceful_stop_flag.store(false, Ordering::SeqCst);
                                     let orch_tx = tx.clone();
                                     let orch_openspec_cmd = openspec_cmd.clone();
                                     let orch_config = config.clone();
