@@ -498,6 +498,14 @@ impl ParallelExecutor {
                         },
                     )
                     .await;
+
+                    // Send ProcessingStarted event early to show processing status in TUI
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::ProcessingStarted(change_id.clone()),
+                    )
+                    .await;
+
                     ws
                 }
                 None => {
@@ -519,6 +527,14 @@ impl ParallelExecutor {
                                 },
                             )
                             .await;
+
+                            // Send ProcessingStarted event early to show processing status in TUI
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::ProcessingStarted(change_id.clone()),
+                            )
+                            .await;
+
                             ws
                         }
                         Err(e) => {

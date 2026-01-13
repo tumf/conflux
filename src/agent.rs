@@ -9,8 +9,7 @@ use crate::config::OrchestratorConfig;
 /// Hardcoded system prompt for apply commands.
 /// This is always appended after the user-configurable apply_prompt.
 /// These instructions are non-negotiable and cannot be disabled.
-pub const APPLY_SYSTEM_PROMPT: &str = "\
-
+pub const APPLY_SYSTEM_PROMPT: &str = r#"
 
 <system-reminder>
 Your operational mode has changed from plan to build.
@@ -32,7 +31,7 @@ Do NOT remove:
 
 Special handling for 'future work' tasks:
 - If a task is marked '(future work)', remove it from tasks.md
-- This indicates deferred work, not current implementation scope";
+- This indicates deferred work, not current implementation scope"#;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{ApplyAttempt, ApplyHistory};
 use crate::process_manager::ManagedChild;

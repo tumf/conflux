@@ -22,7 +22,6 @@ async fn test_unix_process_group_cleanup() {
 
     // Configure process group (simulating what agent.rs does)
     unsafe {
-        use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
             use nix::unistd::{setpgid, Pid};
             setpgid(Pid::from_raw(0), Pid::from_raw(0))
@@ -124,7 +123,6 @@ async fn test_process_group_isolation() {
         .stderr(Stdio::null());
 
     unsafe {
-        use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
             use nix::unistd::{setpgid, Pid};
             setpgid(Pid::from_raw(0), Pid::from_raw(0))

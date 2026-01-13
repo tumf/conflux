@@ -713,6 +713,89 @@ impl WorkspaceManager for JjWorkspaceManager {
         Ok(())
     }
 
+    async fn create_iteration_snapshot(
+        &self,
+        workspace_path: &Path,
+        change_id: &str,
+        iteration: u32,
+        completed: u32,
+        total: u32,
+    ) -> VcsResult<()> {
+        // jj automatically snapshots working copy changes
+        // First, ensure working copy is snapshotted with status
+        let _ = tokio::process::Command::new("jj")
+            .arg("status")
+            .current_dir(workspace_path)
+            .output()
+            .await;
+
+        // Set WIP message with iteration number
+        let wip_message = format!(
+            "WIP: {} ({}/{} tasks, apply#{})",
+            change_id, completed, total, iteration
+        );
+
+        debug!(
+            "Creating iteration snapshot #{} for {}",
+            iteration, change_id
+        );
+
+        let output = tokio::process::Command::new("jj")
+            .args(["describe", "-m", &wip_message])
+            .current_dir(workspace_path)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| VcsError::jj_command(format!("Failed to create snapshot: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(
+                "Failed to set WIP message for iteration {}: {}",
+                iteration, stderr
+            );
+        } else {
+            debug!(
+                "Iteration snapshot #{} created for {}",
+                iteration, change_id
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn squash_wip_commits(
+        &self,
+        workspace_path: &Path,
+        change_id: &str,
+        final_iteration: u32,
+    ) -> VcsResult<()> {
+        let apply_message = format!("Apply: {} (apply#{})", change_id, final_iteration);
+
+        debug!("Squashing WIP commits for {} into Apply commit", change_id);
+
+        // For jj, we update the commit message to the final Apply message
+        // jj's automatic snapshotting means the final state is already captured
+        let output = tokio::process::Command::new("jj")
+            .args(["describe", "-m", &apply_message])
+            .current_dir(workspace_path)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| VcsError::jj_command(format!("Failed to squash: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(VcsError::jj_command(format!(
+                "Failed to set Apply message: {}",
+                stderr
+            )));
+        }
+
+        info!("WIP commits squashed into Apply commit for {}", change_id);
+        Ok(())
+    }
+
     async fn get_revision_in_workspace(&self, workspace_path: &Path) -> VcsResult<String> {
         let output = tokio::process::Command::new("jj")
             .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
