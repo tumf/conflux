@@ -21,9 +21,7 @@ use crate::vcs::{
     WorkspaceStatus,
 };
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
@@ -902,18 +900,6 @@ impl ParallelExecutor {
             }
             Err(e) => Err(e.into()),
         };
-
-        if result.is_ok() && self.workspace_manager.backend_type() == VcsBackend::Jj {
-            if let Err(e) = Command::new("jj")
-                .args(["workspace", "update-stale"])
-                .current_dir(&self.repo_root)
-                .stdin(Stdio::null())
-                .output()
-                .await
-            {
-                warn!("Failed to update stale workspace after merge: {}", e);
-            }
-        }
 
         result
     }
