@@ -22,6 +22,7 @@ use crate::vcs::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
@@ -1035,6 +1036,50 @@ impl ParallelExecutor {
         )
         .await;
 
+        if matches!(
+            self.workspace_manager.backend_type(),
+            VcsBackend::Git | VcsBackend::Auto
+        ) {
+            let base_revision = self.workspace_manager.get_current_revision().await?;
+            let target_branch = self
+                .workspace_manager
+                .original_branch()
+                .unwrap_or_else(|| "main".to_string());
+
+            let change_ids = revisions
+                .iter()
+                .map(|rev| {
+                    GitWorkspaceManager::extract_change_id_from_worktree_name(rev)
+                        .unwrap_or_else(|| rev.to_string())
+                })
+                .collect::<Vec<_>>();
+
+            conflict::resolve_merges_with_retry(conflict::ResolveMergesWithRetryArgs {
+                workspace_manager: self.workspace_manager.as_ref(),
+                config: &self.config,
+                event_tx: &self.event_tx,
+                revisions,
+                change_ids: &change_ids,
+                target_branch: target_branch.as_str(),
+                base_revision: base_revision.as_str(),
+                max_retries: max_attempts,
+            })
+            .await?;
+
+            self.verify_merge_commits(&base_revision, &target_branch, &change_ids)
+                .await?;
+
+            let merge_revision = self.workspace_manager.get_current_revision().await?;
+            send_event(
+                &self.event_tx,
+                ParallelEvent::MergeCompleted {
+                    revision: merge_revision,
+                },
+            )
+            .await;
+            return Ok(());
+        }
+
         for attempt in 1..=max_attempts {
             info!(
                 "Merge attempt {}/{} for revisions: {}",
@@ -1112,6 +1157,104 @@ impl ParallelExecutor {
         Ok(())
     }
 
+    async fn verify_merge_commits(
+        &self,
+        base_revision: &str,
+        target_branch: &str,
+        change_ids: &[String],
+    ) -> Result<()> {
+        if change_ids.is_empty() {
+            return Ok(());
+        }
+
+        let repo_root = self.workspace_manager.repo_root();
+
+        let branch_output = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .map_err(|e| OrchestratorError::GitCommand(format!("Failed to get branch: {}", e)))?;
+
+        if !branch_output.status.success() {
+            let stderr = String::from_utf8_lossy(&branch_output.stderr);
+            return Err(OrchestratorError::GitCommand(format!(
+                "Failed to get branch: {}",
+                stderr
+            )));
+        }
+
+        let current_branch = String::from_utf8_lossy(&branch_output.stdout)
+            .trim()
+            .to_string();
+        if current_branch != target_branch {
+            return Err(OrchestratorError::GitCommand(format!(
+                "Expected merge on branch '{}' but found '{}'",
+                target_branch, current_branch
+            )));
+        }
+
+        let parents_output = Command::new("git")
+            .args(["rev-list", "--parents", "-n", "1", "HEAD"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .map_err(|e| {
+                OrchestratorError::GitCommand(format!("Failed to read merge commit: {}", e))
+            })?;
+
+        if !parents_output.status.success() {
+            let stderr = String::from_utf8_lossy(&parents_output.stderr);
+            return Err(OrchestratorError::GitCommand(format!(
+                "Failed to read merge commit: {}",
+                stderr
+            )));
+        }
+
+        let parent_tokens = String::from_utf8_lossy(&parents_output.stdout)
+            .split_whitespace()
+            .count();
+        if parent_tokens < 3 {
+            return Err(OrchestratorError::GitCommand(
+                "Expected a merge commit on HEAD after resolve".to_string(),
+            ));
+        }
+
+        let merge_log_output = Command::new("git")
+            .args([
+                "log",
+                "--merges",
+                "--format=%s",
+                &format!("{}..HEAD", base_revision),
+            ])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .map_err(|e| {
+                OrchestratorError::GitCommand(format!("Failed to read merge log: {}", e))
+            })?;
+
+        if !merge_log_output.status.success() {
+            let stderr = String::from_utf8_lossy(&merge_log_output.stderr);
+            return Err(OrchestratorError::GitCommand(format!(
+                "Failed to read merge log: {}",
+                stderr
+            )));
+        }
+
+        let merge_messages = String::from_utf8_lossy(&merge_log_output.stdout);
+        for change_id in change_ids {
+            if !merge_messages.contains(change_id) {
+                return Err(OrchestratorError::GitCommand(format!(
+                    "Missing merge commit message containing change_id '{}'",
+                    change_id
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Cleanup all workspaces.
     ///
     /// Note: Currently cleanup is handled automatically in execute_group.
@@ -1143,6 +1286,7 @@ mod tests {
         assert_eq!(executor.max_conflict_retries, 3);
     }
 
+    #[allow(dead_code)]
     struct TestWorkspaceManager {
         merge_calls: Arc<AtomicUsize>,
         conflict_files: Vec<String>,
@@ -1151,6 +1295,7 @@ mod tests {
     }
 
     impl TestWorkspaceManager {
+        #[allow(dead_code)]
         fn new(merge_calls: Arc<AtomicUsize>) -> Self {
             Self {
                 merge_calls,
@@ -1280,6 +1425,10 @@ mod tests {
             &self.repo_root
         }
 
+        fn original_branch(&self) -> Option<String> {
+            Some("main".to_string())
+        }
+
         async fn find_existing_workspace(
             &mut self,
             _change_id: &str,
@@ -1302,10 +1451,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_retries_after_conflict() {
-        let merge_calls = Arc::new(AtomicUsize::new(0));
-        let manager = TestWorkspaceManager::new(merge_calls.clone());
-        let config = OrchestratorConfig::default();
+    async fn test_merge_uses_resolve_command_with_change_ids() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        let base_dir = repo_root.join("worktrees");
+
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(repo_root.join("README.md"), "base").unwrap();
+
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["commit", "-m", "Base"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        let config = OrchestratorConfig {
+            resolve_command: Some("sh merge-resolver.sh".to_string()),
+            ..Default::default()
+        };
+        let mut manager =
+            GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
+
+        let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
+        let workspace_b = manager.create_workspace("change-b", None).await.unwrap();
+
+        std::fs::write(workspace_a.path.join("change-a.txt"), "A").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&workspace_a.path)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Apply: change-a"])
+            .current_dir(&workspace_a.path)
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(workspace_b.path.join("change-b.txt"), "B").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&workspace_b.path)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Apply: change-b"])
+            .current_dir(&workspace_b.path)
+            .output()
+            .await
+            .unwrap();
+
+        let resolver_script = repo_root.join("merge-resolver.sh");
+        let script_contents = format!(
+            "#!/bin/sh\nset -e\ngit checkout main\n\
+            git merge --no-ff -m 'Merge change: change-a' {}\n\
+            git merge --no-ff -m 'Merge change: change-b' {}\n",
+            workspace_a.name, workspace_b.name
+        );
+        std::fs::write(&resolver_script, script_contents).unwrap();
+
         let executor = ParallelExecutor {
             workspace_manager: Box::new(manager),
             config,
@@ -1313,28 +1547,17 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
-            repo_root: PathBuf::from("/tmp/test-repo"),
+            repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
         };
 
-        let resolve_calls = Arc::new(AtomicUsize::new(0));
-        let revisions = vec!["rev-1".to_string()];
-        let resolve_calls_clone = resolve_calls.clone();
+        let revisions = vec![workspace_a.name, workspace_b.name];
 
         executor
-            .merge_and_resolve_with(&revisions, move |_, _| {
-                let resolve_calls = resolve_calls_clone.clone();
-                async move {
-                    resolve_calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                }
-            })
+            .merge_and_resolve_with(&revisions, |_revs, _details| async move { Ok(()) })
             .await
             .unwrap();
-
-        assert_eq!(merge_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(resolve_calls.load(Ordering::SeqCst), 1);
     }
 }

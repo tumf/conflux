@@ -35,6 +35,7 @@ Special handling for 'future work' tasks:
 use crate::error::{OrchestratorError, Result};
 use crate::history::{ApplyAttempt, ApplyHistory};
 use crate::process_manager::ManagedChild;
+use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -236,6 +237,23 @@ impl AgentRunner {
         self.execute_shell_command_streaming(&command).await
     }
 
+    /// Execute resolve command with streaming output in a specific directory.
+    /// Returns a child process handle and a receiver for output lines.
+    pub async fn run_resolve_streaming_in_dir(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
+        let template = self.config.get_resolve_command();
+        let command = OrchestratorConfig::expand_prompt(template, prompt);
+        info!(
+            "Running resolve command (streaming) in {:?}: {}",
+            cwd, command
+        );
+        self.execute_shell_command_streaming_in_dir(&command, cwd)
+            .await
+    }
+
     /// Extract the result from stream-json output format
     /// stream-json outputs multiple JSON lines, the last one with type="result" contains the actual result
     fn extract_stream_json_result(&self, output: &str) -> String {
@@ -395,6 +413,133 @@ impl AgentRunner {
         }
 
         // Wrap child in ManagedChild for reliable cleanup
+        let managed_child = ManagedChild::new(child).map_err(|e| {
+            OrchestratorError::AgentCommand(format!("Failed to create managed child: {}", e))
+        })?;
+
+        Ok((managed_child, rx))
+    }
+
+    async fn execute_shell_command_streaming_in_dir(
+        &self,
+        command: &str,
+        cwd: &Path,
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
+        let mut child = if cfg!(target_os = "windows") {
+            debug!("Spawning shell command: cmd /C {}", command);
+            Command::new("cmd")
+                .arg("/C")
+                .arg(command)
+                .current_dir(cwd)
+                .env_clear()
+                .envs(std::env::vars())
+                // Disable terminal-related environment variables
+                .env("NO_COLOR", "1")
+                .env("CLICOLOR", "0")
+                .env("CLICOLOR_FORCE", "0")
+                .env("CI", "true")
+                // Disable pagers
+                .env("PAGER", "type")
+                .env("GIT_PAGER", "type")
+                .env("LESS", "")
+                .env("MORE", "")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| {
+                    OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
+                })?
+        } else {
+            // Use login shell to load .zprofile/.profile for PATH and environment setup
+            // Note: -l (login) instead of -i (interactive) to avoid job control issues with TUI
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            debug!("Spawning shell command: {} -l -c {}", shell, command);
+            let mut cmd = Command::new(&shell);
+            cmd.arg("-l")
+                .arg("-c")
+                .arg(command)
+                .current_dir(cwd)
+                .env_clear()
+                .envs(std::env::vars())
+                // Disable terminal-related environment variables
+                .env("TERM", "dumb")
+                .env("NO_COLOR", "1")
+                .env("CLICOLOR", "0")
+                .env("CLICOLOR_FORCE", "0")
+                // Disable interactive features
+                .env("CI", "true")
+                .env("CONTINUOUS_INTEGRATION", "true")
+                .env("NON_INTERACTIVE", "1")
+                // Disable pagers completely
+                .env("PAGER", "cat")
+                .env("GIT_PAGER", "cat")
+                .env("LESS", "-FX") // -F: quit if one screen, -X: no init
+                .env("MORE", "-E") // -E: quit at EOF
+                // Prevent any pager from being used
+                .env("MANPAGER", "cat")
+                .env("SYSTEMD_PAGER", "cat")
+                // Disable git interactive features
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            #[cfg(unix)]
+            {
+                // Detach from controlling terminal and create new process group
+                unsafe {
+                    #[allow(unused_imports)]
+                    use std::os::unix::process::CommandExt;
+                    cmd.pre_exec(|| {
+                        use nix::unistd::{setpgid, Pid};
+
+                        // Create a new process group (replacing setsid for better cleanup)
+                        setpgid(Pid::from_raw(0), Pid::from_raw(0))
+                            .map_err(std::io::Error::other)?;
+
+                        Ok(())
+                    });
+                }
+            }
+
+            cmd.spawn().map_err(|e| {
+                OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
+            })?
+        };
+
+        let (tx, rx) = mpsc::channel::<OutputLine>(100);
+
+        // Take ownership of stdout and stderr
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        if let Some(stdout) = stdout {
+            let tx_stdout = tx.clone();
+            tokio::spawn(async move {
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if tx_stdout.send(OutputLine::Stdout(line)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        if let Some(stderr) = stderr {
+            let tx_stderr = tx;
+            tokio::spawn(async move {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if tx_stderr.send(OutputLine::Stderr(line)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
         let managed_child = ManagedChild::new(child).map_err(|e| {
             OrchestratorError::AgentCommand(format!("Failed to create managed child: {}", e))
         })?;

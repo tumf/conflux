@@ -273,6 +273,11 @@ pub trait WorkspaceManager: Send + Sync {
     /// Get the repository root path.
     fn repo_root(&self) -> &Path;
 
+    /// Get the original branch name captured for parallel execution.
+    ///
+    /// Returns None if the branch has not been captured yet.
+    fn original_branch(&self) -> Option<String>;
+
     /// Find an existing workspace for the given change ID.
     ///
     /// If multiple workspaces exist for the same change_id, returns the newest

@@ -344,7 +344,7 @@ impl GitWorkspaceManager {
     ///
     /// Worktree names are in format: "ws-{sanitized_change_id}-{unique_suffix}"
     /// This function extracts the change_id portion.
-    fn extract_change_id_from_worktree_name(worktree_name: &str) -> Option<String> {
+    pub(crate) fn extract_change_id_from_worktree_name(worktree_name: &str) -> Option<String> {
         // Expected format: ws-{change_id}-{hex_suffix}
         if !worktree_name.starts_with("ws-") {
             return None;
@@ -792,6 +792,10 @@ impl WorkspaceManager for GitWorkspaceManager {
 
     fn repo_root(&self) -> &Path {
         &self.repo_root
+    }
+
+    fn original_branch(&self) -> Option<String> {
+        self.original_branch.clone()
     }
 
     async fn find_existing_workspace(
