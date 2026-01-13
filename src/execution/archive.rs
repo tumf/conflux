@@ -42,6 +42,53 @@ impl ArchiveVerificationResult {
     }
 }
 
+fn archive_entry_exists(change_id: &str, archive_dir: &Path) -> bool {
+    if !archive_dir.exists() {
+        return false;
+    }
+
+    std::fs::read_dir(archive_dir)
+        .map(|entries| {
+            entries.filter_map(|e| e.ok()).any(|entry| {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                name_str == change_id || name_str.ends_with(&format!("-{}", change_id))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Check if a change has already been archived in the given base path.
+///
+/// This stricter check requires that the change directory is gone and
+/// that an archive entry exists for the change.
+pub fn is_change_archived(change_id: &str, base_path: Option<&Path>) -> bool {
+    let (change_path, archive_dir) = match base_path {
+        Some(base) => (
+            base.join("openspec/changes").join(change_id),
+            base.join("openspec/changes/archive"),
+        ),
+        None => (
+            Path::new("openspec/changes").join(change_id),
+            Path::new("openspec/changes/archive").to_path_buf(),
+        ),
+    };
+
+    let change_exists = change_path.exists();
+    let archive_exists = archive_entry_exists(change_id, &archive_dir);
+
+    debug!(
+        change_id = %change_id,
+        change_path = %change_path.display(),
+        archive_dir = %archive_dir.display(),
+        change_exists = change_exists,
+        archive_exists = archive_exists,
+        "is_change_archived: checking paths"
+    );
+
+    archive_exists && !change_exists
+}
+
 /// Verify that a change was actually archived.
 ///
 /// This function checks that the archive operation actually moved the change
@@ -90,20 +137,7 @@ pub fn verify_archive_completion(
 
     // Check if archive directory contains this change
     // Supports both direct match and date-prefixed format
-    let archive_exists = if archive_dir.exists() {
-        std::fs::read_dir(&archive_dir)
-            .map(|entries| {
-                entries.filter_map(|e| e.ok()).any(|entry| {
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    // Match either exact name or date-prefixed format
-                    name_str == change_id || name_str.ends_with(&format!("-{}", change_id))
-                })
-            })
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let archive_exists = archive_entry_exists(change_id, &archive_dir);
 
     debug!(
         change_id = %change_id,
@@ -359,6 +393,60 @@ mod tests {
         // If archive exists, consider it success even if change also exists
         let result = verify_archive_completion(change_id, Some(base));
         assert!(result.is_success());
+    }
+
+    // ===========================
+    // is_change_archived tests
+    // ===========================
+
+    #[test]
+    fn test_is_change_archived_when_archive_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        let changes_dir = base.join("openspec/changes");
+        let archive_dir = base.join("openspec/changes/archive");
+        fs::create_dir_all(&changes_dir).unwrap();
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let change_id = "archived-change";
+        let archive_path = archive_dir.join(change_id);
+        fs::create_dir(&archive_path).unwrap();
+
+        assert!(is_change_archived(change_id, Some(base)));
+    }
+
+    #[test]
+    fn test_is_change_archived_false_when_change_exists() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        let changes_dir = base.join("openspec/changes");
+        let archive_dir = base.join("openspec/changes/archive");
+        fs::create_dir_all(&changes_dir).unwrap();
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let change_id = "active-change";
+        let change_path = changes_dir.join(change_id);
+        let archive_path = archive_dir.join(change_id);
+        fs::create_dir(&change_path).unwrap();
+        fs::create_dir(&archive_path).unwrap();
+
+        assert!(!is_change_archived(change_id, Some(base)));
+    }
+
+    #[test]
+    fn test_is_change_archived_false_without_archive_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        let changes_dir = base.join("openspec/changes");
+        let archive_dir = base.join("openspec/changes/archive");
+        fs::create_dir_all(&changes_dir).unwrap();
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let change_id = "missing-archive";
+        assert!(!is_change_archived(change_id, Some(base)));
     }
 
     // ===========================

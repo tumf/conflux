@@ -16,6 +16,7 @@ pub use types::{FailedChangeTracker, WorkspaceResult};
 use crate::analyzer::{extract_change_dependencies, ParallelGroup};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::execution::archive::is_change_archived;
 use crate::vcs::{
     GitWorkspaceManager, VcsBackend, VcsError, Workspace, WorkspaceManager, WorkspaceStatus,
 };
@@ -447,6 +448,8 @@ impl ParallelExecutor {
         // Create or reuse workspaces for all changes in the group
         // If resume is enabled (default), try to find existing workspaces first
         let mut workspaces: Vec<Workspace> = Vec::new();
+        let mut archived_results: Vec<WorkspaceResult> = Vec::new();
+        let mut archived_workspaces: Vec<Workspace> = Vec::new();
         for change_id in &changes_to_execute {
             // Try to find and reuse existing workspace (unless --no-resume is set)
             let workspace = if self.no_resume {
@@ -489,7 +492,7 @@ impl ParallelExecutor {
                 }
             };
 
-            let workspace = match workspace {
+            let (workspace, resumed) = match workspace {
                 Some(ws) => {
                     // Track workspace in cleanup guard before adding to list
                     cleanup_guard.track(ws.name.clone());
@@ -510,7 +513,7 @@ impl ParallelExecutor {
                     )
                     .await;
 
-                    ws
+                    (ws, true)
                 }
                 None => {
                     // Create new workspace from the base revision
@@ -539,7 +542,7 @@ impl ParallelExecutor {
                             )
                             .await;
 
-                            ws
+                            (ws, false)
                         }
                         Err(e) => {
                             let error_msg = format!("Failed to create workspace: {}", e);
@@ -557,28 +560,85 @@ impl ParallelExecutor {
                     }
                 }
             };
+
+            if resumed && is_change_archived(change_id, Some(&workspace.path)) {
+                info!(
+                    "Change '{}' already archived in workspace '{}', skipping apply/archive",
+                    change_id, workspace.name
+                );
+
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::ArchiveStarted(change_id.clone()),
+                )
+                .await;
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::ChangeArchived(change_id.clone()),
+                )
+                .await;
+
+                let revision = self
+                    .workspace_manager
+                    .get_revision_in_workspace(&workspace.path)
+                    .await
+                    .map_err(OrchestratorError::from)?;
+                self.workspace_manager.update_workspace_status(
+                    &workspace.name,
+                    WorkspaceStatus::Applied(revision.clone()),
+                );
+
+                archived_results.push(WorkspaceResult {
+                    change_id: change_id.clone(),
+                    workspace_name: workspace.name.clone(),
+                    final_revision: Some(revision),
+                    error: None,
+                });
+                archived_workspaces.push(workspace);
+                continue;
+            }
+
             workspaces.push(workspace);
+        }
+
+        for result in &archived_results {
+            if let Some(ref rev) = result.final_revision {
+                info!("Merging archived {} (revision: {})", result.change_id, rev);
+                if let Err(e) = self.merge_and_resolve(std::slice::from_ref(rev)).await {
+                    let error_msg = format!(
+                        "Failed to merge archived {} (revision: {}): {}",
+                        result.change_id, rev, e
+                    );
+                    error!("{}", error_msg);
+                    send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
+                    return Err(e);
+                }
+            }
         }
 
         // Execute apply + archive in parallel with concurrency limit
         // Each task: apply -> (if success) -> archive
-        let results = match self
-            .execute_apply_and_archive_parallel(
-                &workspaces,
-                Some(group.id),
-                total_changes,
-                changes_processed,
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let error_msg = format!("Failed to execute applies: {}", e);
-                error!("{}", error_msg);
-                send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
-                return Err(e);
-            }
-        };
+        let mut results = archived_results;
+        if !workspaces.is_empty() {
+            let apply_results = match self
+                .execute_apply_and_archive_parallel(
+                    &workspaces,
+                    Some(group.id),
+                    total_changes,
+                    changes_processed,
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let error_msg = format!("Failed to execute applies: {}", e);
+                    error!("{}", error_msg);
+                    send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
+                    return Err(e);
+                }
+            };
+            results.extend(apply_results);
+        }
 
         // Collect successful and failed results
         let successful: Vec<&WorkspaceResult> = results
@@ -633,7 +693,9 @@ impl ParallelExecutor {
         // Cleanup only successful workspaces (preserve failed ones)
         let failed_workspace_names: std::collections::HashSet<_> =
             failed.iter().map(|r| r.workspace_name.clone()).collect();
-        for workspace in &workspaces {
+        let mut cleanup_workspaces = workspaces.clone();
+        cleanup_workspaces.extend(archived_workspaces);
+        for workspace in &cleanup_workspaces {
             // Skip cleanup for failed workspaces - they are preserved
             if failed_workspace_names.contains(&workspace.name) {
                 continue;

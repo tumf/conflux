@@ -327,7 +327,15 @@ pub async fn execute_apply_in_workspace(
         }
 
         // Check current task progress using helper
-        let progress = check_task_progress(workspace_path, change_id).unwrap_or_default();
+        let progress = match check_task_progress(workspace_path, change_id) {
+            Some(progress) => progress,
+            None => {
+                return Err(OrchestratorError::AgentCommand(format!(
+                    "Tasks file not found for change {} in workspace",
+                    change_id
+                )));
+            }
+        };
 
         // Send progress event only if we have valid progress data
         if progress.total > 0 {
@@ -504,7 +512,15 @@ pub async fn execute_apply_in_workspace(
         // Git worktrees already reflect working copy changes for task progress.
 
         // Check task progress after apply using helper
-        let new_progress = check_task_progress(workspace_path, change_id).unwrap_or_default();
+        let new_progress = match check_task_progress(workspace_path, change_id) {
+            Some(progress) => progress,
+            None => {
+                return Err(OrchestratorError::AgentCommand(format!(
+                    "Tasks file not found for change {} in workspace after apply",
+                    change_id
+                )));
+            }
+        };
 
         // Send progress event after apply only if we have valid progress data
         if new_progress.total > 0 {
