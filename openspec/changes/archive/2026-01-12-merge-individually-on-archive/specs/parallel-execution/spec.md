@@ -49,4 +49,3 @@
 - **WHEN** マージが完了する
 - **THEN** `ParallelEvent::MergeCompleted { change_id, merged_revision }` が発行される
 - **AND** TUI のログパネルに「Merged as {merged_revision}」が表示される
-

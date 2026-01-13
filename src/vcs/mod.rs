@@ -244,6 +244,30 @@ pub trait WorkspaceManager: Send + Sync {
     /// For Git: `git commit --amend -m <message>` (if there's a commit)
     async fn set_commit_message(&self, workspace_path: &Path, message: &str) -> VcsResult<()>;
 
+    /// Create an iteration snapshot with WIP commit message.
+    ///
+    /// For jj: Snapshot working copy and set WIP message with iteration number.
+    /// For Git: Stage all changes and create/amend WIP commit with iteration number.
+    async fn create_iteration_snapshot(
+        &self,
+        workspace_path: &Path,
+        change_id: &str,
+        iteration: u32,
+        completed: u32,
+        total: u32,
+    ) -> VcsResult<()>;
+
+    /// Squash all WIP snapshots into a single Apply commit.
+    ///
+    /// For jj: Use `jj squash` to combine WIP commits.
+    /// For Git: Use `git reset --soft` and `git commit` to squash.
+    async fn squash_wip_commits(
+        &self,
+        workspace_path: &Path,
+        change_id: &str,
+        final_iteration: u32,
+    ) -> VcsResult<()>;
+
     /// Get the current revision in a workspace.
     ///
     /// For jj: `jj log -r @ -T change_id`

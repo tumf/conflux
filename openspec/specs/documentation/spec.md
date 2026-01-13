@@ -80,4 +80,3 @@ The AGENTS.md SHALL accurately document the current project structure and module
 - **WHEN** AGENTS.md lists key dependencies
 - **THEN** all major crates from Cargo.toml are listed
 - **AND** each dependency has its purpose described
-

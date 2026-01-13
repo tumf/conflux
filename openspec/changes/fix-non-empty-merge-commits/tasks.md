@@ -66,3 +66,4 @@
 - [x] 7.1 `cargo fmt` でフォーマットを整える
 - [x] 7.2 `cargo clippy -- -D warnings` でリントチェック
 - [x] 7.3 `cargo test` で全テストが通ることを確認（`cli::tests::test_default_openspec_cmd` が失敗）
+- [ ] 7.4 変更内容をコミットメッセージに記載（"fix: Optimize parallel merge to avoid duplicate commits in jj"）

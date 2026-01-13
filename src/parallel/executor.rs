@@ -15,42 +15,54 @@ use tracing::{debug, error, info, warn};
 
 use super::events::ParallelEvent;
 
-/// Create a progress commit to save current work state.
+/// Create an iteration snapshot with WIP commit message including iteration number.
 ///
-/// This function creates a WIP (work-in-progress) commit after each apply iteration
-/// where progress was made. This ensures that work is not lost if the process is
-/// interrupted or reaches the maximum iteration limit.
+/// This function creates a WIP (work-in-progress) commit after each apply iteration,
+/// regardless of whether progress was made. This ensures that work is not lost if the
+/// process is interrupted or reaches the maximum iteration limit.
 ///
 /// # Arguments
 ///
 /// * `workspace_path` - Path to the workspace directory
 /// * `change_id` - The change identifier
-/// * `progress` - Current task progress (completed/total)
+/// * `iteration` - Current iteration number
+/// * `completed` - Number of completed tasks
+/// * `total` - Total number of tasks
 /// * `vcs_backend` - The VCS backend to use (jj or Git)
 ///
 /// # Commit Message Format
 ///
-/// The commit message follows the format: `WIP: {change_id} ({completed}/{total} tasks)`
-/// For example: `WIP: add-feature (5/10 tasks)`
-pub async fn create_progress_commit(
+/// The commit message follows the format: `WIP: {change_id} ({completed}/{total} tasks, apply#{iteration})`
+/// For example: `WIP: add-feature (5/10 tasks, apply#3)`
+async fn create_iteration_snapshot(
     workspace_path: &Path,
     change_id: &str,
-    progress: &TaskProgress,
+    iteration: u32,
+    completed: u32,
+    total: u32,
     vcs_backend: VcsBackend,
 ) -> Result<()> {
     let commit_message = format!(
-        "WIP: {} ({}/{} tasks)",
-        change_id, progress.completed, progress.total
+        "WIP: {} ({}/{} tasks, apply#{})",
+        change_id, completed, total, iteration
     );
 
     debug!(
-        "Creating progress commit for {}: {}",
-        change_id, commit_message
+        "Creating iteration snapshot #{} for {}: {}",
+        iteration, change_id, commit_message
     );
 
     match vcs_backend {
         VcsBackend::Jj => {
             // jj automatically snapshots working copy changes
+            // First ensure working copy is snapshotted
+            let _ = Command::new("jj")
+                .arg("status")
+                .current_dir(workspace_path)
+                .stdin(StdStdio::null())
+                .output()
+                .await;
+
             let output = Command::new("jj")
                 .args(["describe", "-m", &commit_message])
                 .current_dir(workspace_path)
@@ -58,21 +70,27 @@ pub async fn create_progress_commit(
                 .output()
                 .await
                 .map_err(|e| {
-                    OrchestratorError::JjCommand(format!("Failed to create progress commit: {}", e))
+                    OrchestratorError::JjCommand(format!(
+                        "Failed to create iteration snapshot: {}",
+                        e
+                    ))
                 })?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 warn!(
-                    "Failed to set progress commit message for {}: {}",
-                    change_id, stderr
+                    "Failed to set WIP message for iteration {}: {}",
+                    iteration, stderr
                 );
             } else {
-                debug!("Progress commit created for {} (jj)", change_id);
+                debug!(
+                    "Iteration snapshot #{} created for {} (jj)",
+                    iteration, change_id
+                );
             }
         }
         VcsBackend::Git | VcsBackend::Auto => {
-            // For Git: stage all changes and amend the commit
+            // For Git: stage all changes and create/amend commit
             let add_output = Command::new("git")
                 .args(["add", "-A"])
                 .current_dir(workspace_path)
@@ -85,49 +103,150 @@ pub async fn create_progress_commit(
 
             if !add_output.status.success() {
                 let stderr = String::from_utf8_lossy(&add_output.stderr);
-                warn!("Failed to stage changes for {}: {}", change_id, stderr);
+                warn!(
+                    "Failed to stage changes for iteration {}: {}",
+                    iteration, stderr
+                );
                 return Ok(());
             }
 
-            // Amend the existing commit with the new changes and message
-            let commit_output = Command::new("git")
-                .args(["commit", "--amend", "-m", &commit_message])
+            // Check if we have commits to amend
+            let has_commits = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(workspace_path)
+                .stdin(StdStdio::null())
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false);
+
+            if has_commits {
+                // Amend existing commit
+                let commit_output = Command::new("git")
+                    .args(["commit", "--amend", "--allow-empty", "-m", &commit_message])
+                    .current_dir(workspace_path)
+                    .stdin(StdStdio::null())
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::GitCommand(format!("Failed to amend commit: {}", e))
+                    })?;
+
+                if !commit_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&commit_output.stderr);
+                    warn!(
+                        "Failed to amend WIP commit for iteration {}: {}",
+                        iteration, stderr
+                    );
+                } else {
+                    debug!(
+                        "Iteration snapshot #{} created for {} (git, amended)",
+                        iteration, change_id
+                    );
+                }
+            } else {
+                // Create initial commit
+                let commit_output = Command::new("git")
+                    .args(["commit", "--allow-empty", "-m", &commit_message])
+                    .current_dir(workspace_path)
+                    .stdin(StdStdio::null())
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::GitCommand(format!("Failed to create commit: {}", e))
+                    })?;
+
+                if !commit_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&commit_output.stderr);
+                    warn!(
+                        "Failed to create initial WIP commit for iteration {}: {}",
+                        iteration, stderr
+                    );
+                } else {
+                    debug!(
+                        "Iteration snapshot #{} created for {} (git, initial)",
+                        iteration, change_id
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Squash all WIP iteration snapshots into a single Apply commit.
+///
+/// This function is called after all apply iterations succeed. It combines all WIP
+/// snapshots into a single final commit with an Apply message.
+///
+/// # Arguments
+///
+/// * `workspace_path` - Path to the workspace directory
+/// * `change_id` - The change identifier
+/// * `final_iteration` - The final iteration number
+/// * `vcs_backend` - The VCS backend to use (jj or Git)
+///
+/// # Commit Message Format
+///
+/// The commit message follows the format: `Apply: {change_id} (apply#{final_iteration})`
+/// For example: `Apply: add-feature (apply#5)`
+async fn squash_wip_commits(
+    workspace_path: &Path,
+    change_id: &str,
+    final_iteration: u32,
+    vcs_backend: VcsBackend,
+) -> Result<()> {
+    let apply_message = format!("Apply: {} (apply#{})", change_id, final_iteration);
+
+    debug!("Squashing WIP commits for {} into Apply commit", change_id);
+
+    match vcs_backend {
+        VcsBackend::Jj => {
+            // For jj, we just update the commit message to the final Apply message
+            // jj's automatic snapshotting means the final state is already captured
+            let output = Command::new("jj")
+                .args(["describe", "-m", &apply_message])
                 .current_dir(workspace_path)
                 .stdin(StdStdio::null())
                 .output()
                 .await
                 .map_err(|e| {
-                    OrchestratorError::GitCommand(format!("Failed to amend commit: {}", e))
+                    OrchestratorError::JjCommand(format!("Failed to squash WIP commits: {}", e))
                 })?;
 
-            if !commit_output.status.success() {
-                let stderr = String::from_utf8_lossy(&commit_output.stderr);
-                // If amend fails (e.g., no prior commit), try a regular commit
-                if stderr.contains("No HEAD") || stderr.contains("does not have any commits") {
-                    let initial_output = Command::new("git")
-                        .args(["commit", "-m", &commit_message])
-                        .current_dir(workspace_path)
-                        .stdin(StdStdio::null())
-                        .output()
-                        .await;
-
-                    if let Ok(output) = initial_output {
-                        if !output.status.success() {
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            warn!(
-                                "Failed to create initial commit for {}: {}",
-                                change_id, stderr
-                            );
-                        } else {
-                            debug!("Initial progress commit created for {} (git)", change_id);
-                        }
-                    }
-                } else {
-                    warn!("Failed to amend commit for {}: {}", change_id, stderr);
-                }
-            } else {
-                debug!("Progress commit amended for {} (git)", change_id);
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(OrchestratorError::JjCommand(format!(
+                    "Failed to set Apply message: {}",
+                    stderr
+                )));
             }
+
+            info!("WIP commits squashed into Apply commit for {}", change_id);
+        }
+        VcsBackend::Git | VcsBackend::Auto => {
+            // For Git, we update the commit message to the final Apply message
+            // Since we've been amending the same commit, we just need to update the message
+            let output = Command::new("git")
+                .args(["commit", "--amend", "-m", &apply_message])
+                .current_dir(workspace_path)
+                .stdin(StdStdio::null())
+                .output()
+                .await
+                .map_err(|e| {
+                    OrchestratorError::GitCommand(format!("Failed to squash WIP commits: {}", e))
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(OrchestratorError::GitCommand(format!(
+                    "Failed to set Apply message: {}",
+                    stderr
+                )));
+            }
+
+            info!("WIP commits squashed into Apply commit for {}", change_id);
         }
     }
 
@@ -222,6 +341,7 @@ pub async fn execute_apply_in_workspace(
     const MAX_ITERATIONS: u32 = 50;
     let mut iteration = 0;
     let mut first_apply = true;
+    let mut apply_succeeded = false; // Track if all iterations succeeded
 
     loop {
         iteration += 1;
@@ -495,14 +615,22 @@ pub async fn execute_apply_in_workspace(
             }
         }
 
-        // Create progress commit if progress was made
-        // This ensures work is not lost if the process is interrupted
-        if new_progress.completed > progress.completed {
-            if let Err(e) =
-                create_progress_commit(workspace_path, change_id, &new_progress, vcs_backend).await
-            {
-                warn!("Failed to create progress commit for {}: {}", change_id, e);
-            }
+        // Create iteration snapshot after each apply iteration
+        // This ensures work is not lost even if no progress was made
+        if let Err(e) = create_iteration_snapshot(
+            workspace_path,
+            change_id,
+            iteration,
+            new_progress.completed,
+            new_progress.total,
+            vcs_backend,
+        )
+        .await
+        {
+            warn!(
+                "Failed to create iteration snapshot for {}: {}",
+                change_id, e
+            );
         }
 
         // Check if complete
@@ -561,6 +689,7 @@ pub async fn execute_apply_in_workspace(
                 "Change {} completed after {} iteration(s)",
                 change_id, iteration
             );
+            apply_succeeded = true; // Mark success for squashing
             break;
         }
 
@@ -573,50 +702,21 @@ pub async fn execute_apply_in_workspace(
         }
     }
 
-    // Set a meaningful commit message for the completed change
-    let commit_message = format!("Apply: {}", change_id);
-
-    match vcs_backend {
-        VcsBackend::Jj => {
-            let describe_output = Command::new("jj")
-                .args(["describe", "-m", &commit_message])
-                .current_dir(workspace_path)
-                .stdin(StdStdio::null())
-                .output()
-                .await;
-
-            if let Err(e) = describe_output {
-                warn!("Failed to set commit message for {}: {}", change_id, e);
-            } else if let Ok(output) = describe_output {
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    warn!("Failed to set commit message for {}: {}", change_id, stderr);
-                }
-            }
+    // Squash WIP commits into Apply commit if successful
+    if apply_succeeded {
+        info!(
+            "Squashing WIP snapshots into final Apply commit for {}",
+            change_id
+        );
+        if let Err(e) = squash_wip_commits(workspace_path, change_id, iteration, vcs_backend).await
+        {
+            warn!("Failed to squash WIP commits for {}: {}", change_id, e);
         }
-        VcsBackend::Git | VcsBackend::Auto => {
-            // For Git: stage all changes and commit (or amend if changes exist)
-            let add_output = Command::new("git")
-                .args(["add", "-A"])
-                .current_dir(workspace_path)
-                .stdin(StdStdio::null())
-                .output()
-                .await;
-
-            if add_output.is_ok() {
-                // Try to commit; if nothing to commit, that's fine
-                let commit_output = Command::new("git")
-                    .args(["commit", "-m", &commit_message, "--allow-empty"])
-                    .current_dir(workspace_path)
-                    .stdin(StdStdio::null())
-                    .output()
-                    .await;
-
-                if let Err(e) = commit_output {
-                    warn!("Failed to commit for {}: {}", change_id, e);
-                }
-            }
-        }
+    } else {
+        info!(
+            "Apply loop exited without completion for {}; WIP snapshots preserved",
+            change_id
+        );
     }
 
     // Get the resulting revision
@@ -914,6 +1014,13 @@ pub async fn execute_archive_in_workspace(
             }
         }
         VcsBackend::Jj => {
+            // Refresh stale working copy before snapshotting archive changes.
+            let _ = Command::new("jj")
+                .args(["workspace", "update-stale"])
+                .current_dir(workspace_path)
+                .output()
+                .await;
+
             // Snapshot working copy changes so archive results are part of the revision.
             let status_output = Command::new("jj")
                 .args(["status"])

@@ -344,3 +344,8 @@ let state = OrchestratorState::load()?.unwrap_or_else(OrchestratorState::new);
 self.state.touch();  // Update timestamp
 self.state.save()?;
 ```
+
+## JJ Merge Guidance
+
+- Keep merge commits empty: use `jj new --no-edit` and then `jj edit <merge_rev>` followed by `jj new <merge_rev>`.
+- Avoid `jj workspace update-stale` in merge flows so working-copy changes stay out of the merge commit.

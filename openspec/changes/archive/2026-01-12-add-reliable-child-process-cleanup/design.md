@@ -89,10 +89,10 @@ impl Drop for JobObjectGuard {
 #[cfg(windows)]
 fn assign_to_job(child: &Child) -> io::Result<JobObjectGuard> {
     let job = unsafe { CreateJobObjectW(None, PCWSTR::null())? };
-    
+
     let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    
+
     unsafe {
         SetInformationJobObject(
             job,
@@ -100,17 +100,17 @@ fn assign_to_job(child: &Child) -> io::Result<JobObjectGuard> {
             &info as *const _ as *const c_void,
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         )?;
-        
+
         let process_handle = OpenProcess(
             PROCESS_ALL_ACCESS,
             false,
             child.id().unwrap(),
         )?;
-        
+
         AssignProcessToJobObject(job, process_handle)?;
         CloseHandle(process_handle)?;
     }
-    
+
     Ok(JobObjectGuard { handle: job })
 }
 ```

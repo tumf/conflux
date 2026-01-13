@@ -106,7 +106,7 @@ Read the proposal files in the specified directories to understand dependencies 
   - `[ ]` = 未承認
   - `[@]` = 承認済みだが未選択
   - `[x]` = 承認済み**かつ**選択済み
-  
+
 - **Analyzer入力**: `Change` 構造体には `is_approved` フィールドのみ
   - 呼び出し元（TUI/CLI）が承認＋選択済みの change を `is_approved = true` として渡す
   - つまり、analyzer に渡される時点で既に実行対象のみがフィルタ済み

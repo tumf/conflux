@@ -34,11 +34,14 @@ Loose matching guidance:
 - With one of: `create`, `plan`, `make`, `start`, `help`
 
 Skip proposal for:
-- Bug fixes (restore intended behavior)
+- Bug fixes (restore intended behavior) when you are fixing code without entering the OpenSpec change workflow
 - Typos, formatting, comments
 - Dependency updates (non-breaking)
 - Configuration changes
 - Tests for existing behavior
+
+### Bugfixes Without Spec Changes (When You Still Use Changes)
+If a bugfix goes through `openspec/changes/` and must pass `openspec validate <id> --strict`, you still need at least one delta. Use a minimal `## MODIFIED Requirements` entry with a single requirement and `#### Scenario:` that clarifies the expected behavior. This can introduce a new requirement title under MODIFIED if the existing spec is too thin, as long as the change stays within the same capability.
 
 **Workflow**
 1. Review `openspec/project.md`, `openspec list`, and `openspec list --specs` to understand current context.

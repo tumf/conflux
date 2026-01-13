@@ -36,7 +36,7 @@ Change A: apply → archive → final_revision (rev_a)
 Change B: apply → archive → final_revision (rev_b)  ┐
 Change C: apply → 詰まる                              ├─ 待機
                                                      ┘
-                                                     
+
 ↓ (Change C が完了しないと次に進まない)
 
 merge_and_resolve(&[rev_a, rev_b, rev_c])  # 実行されない
@@ -58,7 +58,7 @@ Change C: apply → 詰まる (他に影響なし)
 // execute_apply_and_archive_parallel 内
 async fn execute_apply_and_archive_parallel(...) -> Result<Vec<ChangeResult>> {
     // ... (既存の並列実行ロジック)
-    
+
     // 各タスクの結果を処理
     while let Some(result) = join_set.join_next().await {
         match result {
@@ -72,7 +72,7 @@ async fn execute_apply_and_archive_parallel(...) -> Result<Vec<ChangeResult>> {
                             revision: final_revision.clone(),
                         },
                     ).await;
-                    
+
                     match self.merge_and_resolve(&[final_revision.clone()]).await {
                         Ok(merged_rev) => {
                             info!("Merged {} (revision: {})", change_result.change_id, merged_rev);
@@ -91,13 +91,13 @@ async fn execute_apply_and_archive_parallel(...) -> Result<Vec<ChangeResult>> {
                         }
                     }
                 }
-                
+
                 results.push(change_result);
             }
             // ... (エラーハンドリング)
         }
     }
-    
+
     Ok(results)
 }
 ```
@@ -108,17 +108,17 @@ async fn execute_apply_and_archive_parallel(...) -> Result<Vec<ChangeResult>> {
 // execute_group 内
 async fn execute_group(...) -> Result<()> {
     // ... (既存のロジック)
-    
+
     // ❌ 削除: グループ単位のマージ
     // let revisions: Vec<String> = successful
     //     .iter()
     //     .filter_map(|r| r.final_revision.clone())
     //     .collect();
-    // 
+    //
     // if !revisions.is_empty() {
     //     self.merge_and_resolve(&revisions).await?;
     // }
-    
+
     // Cleanup は通常通り実行
     // ...
 }
@@ -131,19 +131,19 @@ async fn execute_group(...) -> Result<()> {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ParallelEvent {
     // ... (既存のイベント)
-    
+
     /// マージ開始
     MergeStarted {
         change_id: String,
         revision: String,
     },
-    
+
     /// マージ完了
     MergeCompleted {
         change_id: String,
         merged_revision: String,
     },
-    
+
     /// マージ失敗
     MergeFailed {
         change_id: String,
@@ -158,21 +158,21 @@ pub enum ParallelEvent {
 pub fn parallel_event_to_orchestrator_events(event: &ParallelEvent) -> Vec<OrchestratorEvent> {
     match event {
         // ... (既存のマッピング)
-        
+
         ParallelEvent::MergeStarted { change_id, revision } => vec![
             OrchestratorEvent::Log(
                 LogEntry::info(&format!("Merging revision {}", revision))
                     .with_change_id(change_id)
             ),
         ],
-        
+
         ParallelEvent::MergeCompleted { change_id, merged_revision } => vec![
             OrchestratorEvent::Log(
                 LogEntry::success(&format!("Merged as {}", merged_revision))
                     .with_change_id(change_id)
             ),
         ],
-        
+
         ParallelEvent::MergeFailed { change_id, error } => vec![
             OrchestratorEvent::Log(
                 LogEntry::error(&format!("Merge failed: {}", error))

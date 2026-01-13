@@ -31,36 +31,36 @@ pub enum ExecutionEvent {
     ProcessingStarted(String),  // change_id
     ProcessingCompleted(String),
     ProcessingError { id: String, error: String },
-    
+
     // Apply events
     ApplyStarted { change_id: String },
     ApplyCompleted { change_id: String },
     ApplyFailed { change_id: String, error: String },
     ApplyOutput { change_id: String, output: String },
-    
+
     // Archive events
     ArchiveStarted(String),
     ArchiveCompleted(String),
     ArchiveFailed { change_id: String, error: String },
     ArchiveOutput { change_id: String, output: String },
-    
+
     // Progress events
     ProgressUpdated { change_id: String, completed: u32, total: u32 },
-    
+
     // Workspace events (parallel mode)
     WorkspaceCreated { change_id: String, path: String },
     WorkspaceResumed { change_id: String, path: String },
-    
+
     // Merge events (parallel mode)
     MergeStarted { change_ids: Vec<String> },
     MergeCompleted { change_ids: Vec<String>, revision: String },
     MergeConflict { change_ids: Vec<String>, error: String },
-    
+
     // Hook events
     HookStarted { hook_type: String, change_id: Option<String> },
     HookCompleted { hook_type: String, change_id: Option<String> },
     HookFailed { hook_type: String, change_id: Option<String>, error: String },
-    
+
     // General events
     Log(LogEntry),
     Stopped,
@@ -68,7 +68,7 @@ pub enum ExecutionEvent {
 }
 ```
 
-**理由**: 
+**理由**:
 - すべてのユースケースをカバーする包括的な設計
 - 各バリアントに必要な情報を含める
 - `change_id` を一貫して使用

@@ -350,11 +350,11 @@ impl AppState {
         match self.mode {
             AppMode::Select => {
                 // In select mode:
-                // [ ] (unapproved) → @ → [x] (approved + selected)
+                // [ ] (unapproved) → @ → [x] (approved + selected, NOT queued)
                 // [x] (approved + selected) → @ → [ ] (unapproved + not selected)
                 if !is_approved {
-                    // Unapproved → approved + selected
-                    Some(TuiCommand::ApproveAndQueue(id))
+                    // Unapproved → approved + selected (no auto-queue)
+                    Some(TuiCommand::ApproveOnly(id))
                 } else {
                     // Approved → unapproved (also deselects)
                     Some(TuiCommand::UnapproveAndDequeue(id))
@@ -793,8 +793,8 @@ mod tests {
     }
 
     #[test]
-    fn test_approve_and_queue_in_select_mode_returns_correct_command() {
-        // Test that toggle_approval in Select mode returns ApproveAndQueue for unapproved change
+    fn test_approve_only_in_select_mode_returns_correct_command() {
+        // Test that toggle_approval in Select mode returns ApproveOnly for unapproved change
         let changes = vec![create_test_change("unapproved-change", 0, 1)];
         let mut app = AppState::new(changes);
 
@@ -802,17 +802,17 @@ mod tests {
         assert_eq!(app.mode, AppMode::Select);
         assert!(!app.changes[0].is_approved);
 
-        // Toggle approval should return ApproveAndQueue
+        // Toggle approval should return ApproveOnly
         let cmd = app.toggle_approval();
         assert!(matches!(
             cmd,
-            Some(TuiCommand::ApproveAndQueue(ref id)) if id == "unapproved-change"
+            Some(TuiCommand::ApproveOnly(ref id)) if id == "unapproved-change"
         ));
     }
 
     #[test]
-    fn test_approve_and_queue_state_update_simulation() {
-        // Simulate what runner.rs ApproveAndQueue handler does
+    fn test_approve_only_state_update_simulation_select_mode() {
+        // Simulate what runner.rs ApproveOnly handler does in Select mode
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
@@ -821,24 +821,23 @@ mod tests {
         assert!(!app.changes[0].selected);
         assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
 
-        // Simulate ApproveAndQueue handler logic (from runner.rs:329-358)
+        // Simulate ApproveOnly handler logic for Select mode
         let id = "test-change";
 
         // 1. update_approval_status (this adds a log)
         app.update_approval_status(id, true);
 
-        // 2. Set queue_status and selected
+        // 2. Mark selected (no queue status change)
         if let Some(change) = app.changes.iter_mut().find(|c| c.id == id) {
-            change.queue_status = QueueStatus::Queued;
             change.selected = true;
         }
 
-        // Verify final state: approved + selected + queued
+        // Verify final state: approved + selected + not queued
         assert!(app.changes[0].is_approved);
         assert!(app.changes[0].selected);
-        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
 
-        // This is the state that should render as [x] (Queued)
+        // This is the state that should render as [x] (selected)
         // Checkbox logic: if is_approved && selected → "[x]"
         let checkbox = if !app.changes[0].is_approved {
             "[ ]"
@@ -949,7 +948,7 @@ mod tests {
     #[test]
     fn test_toggle_approval_in_stopped_mode_returns_approve_only() {
         // Test that toggle_approval in Stopped mode returns ApproveOnly for unapproved change
-        // (not ApproveAndQueue, which would incorrectly add to queue while stopped)
+        // (no auto-queue side effects while stopped)
         let changes = vec![create_test_change("unapproved-change", 0, 1)];
         let mut app = AppState::new(changes);
 
@@ -959,7 +958,7 @@ mod tests {
         assert_eq!(app.mode, AppMode::Stopped);
         assert!(!app.changes[0].is_approved);
 
-        // Toggle approval should return ApproveOnly (not ApproveAndQueue)
+        // Toggle approval should return ApproveOnly (no queue side effects)
         let cmd = app.toggle_approval();
         assert!(matches!(
             cmd,

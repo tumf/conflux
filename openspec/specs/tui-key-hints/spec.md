@@ -149,4 +149,3 @@ TUIは停止モード（Stopped Mode）において、Running Mode と同様に�
 - **WHEN** the user presses `@`
 - **THEN** the change SHALL become unapproved showing `[ ]`
 - **AND** the change SHALL be removed from the queue
-

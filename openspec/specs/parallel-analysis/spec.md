@@ -48,4 +48,3 @@ TBD - created by archiving change pass-approved-changes-to-analyzer. Update Purp
 - **WHEN** AIエージェントが依存関係分析を実行する
 - **THEN** レスポンス形式（JSON with `groups` array）は変更されないこと
 - **AND** 既存の `parse_response()` ロジックが引き続き動作すること
-

@@ -447,43 +447,19 @@ async fn run_tui_loop(
                         app.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
                     }
                 }
-                TuiCommand::ApproveAndQueue(id) => {
-                    // Approve and add to queue (used in select/stopped/completed mode)
-                    use crate::approval;
-
-                    match approval::approve_change(&id) {
-                        Ok(_) => {
-                            app.update_approval_status(&id, true);
-                            // Also add to queue
-                            if let Some(change) = app.changes.iter_mut().find(|c| c.id == id) {
-                                change.queue_status = QueueStatus::Queued;
-                                change.selected = true;
-                            }
-                            // Push to dynamic queue for orchestrator to pick up
-                            if dynamic_queue.push(id.clone()).await {
-                                app.add_log(LogEntry::info(format!("Approved and queued: {}", id)));
-                            } else {
-                                app.add_log(LogEntry::info(format!(
-                                    "Approved (already in queue): {}",
-                                    id
-                                )));
-                            }
-                        }
-                        Err(e) => {
-                            app.add_log(LogEntry::error(format!(
-                                "Failed to approve '{}': {}",
-                                id, e
-                            )));
-                        }
-                    }
-                }
                 TuiCommand::ApproveOnly(id) => {
-                    // Approve without adding to queue (used in running mode)
+                    // Approve without adding to queue (select/running/stopped modes)
                     use crate::approval;
 
                     match approval::approve_change(&id) {
                         Ok(_) => {
                             app.update_approval_status(&id, true);
+                            if app.mode == AppMode::Select {
+                                if let Some(change) = app.changes.iter_mut().find(|c| c.id == id) {
+                                    change.selected = true;
+                                    change.queue_status = QueueStatus::NotQueued;
+                                }
+                            }
                             app.add_log(LogEntry::info(format!("Approved (not queued): {}", id)));
                         }
                         Err(e) => {

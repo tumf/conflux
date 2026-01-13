@@ -29,7 +29,7 @@
 fn find_existing_workspace(&self, change_id: &str) -> Option<WorkspaceInfo>;
 ```
 
-**理由**: 
+**理由**:
 - 既存のworkspace命名規則を活用できる
 - change_idから直接検索可能
 
@@ -77,15 +77,15 @@ fn find_existing_workspace(&self, change_id: &str) -> Option<WorkspaceInfo> {
     if candidates.is_empty() {
         return None;
     }
-    
+
     // 最新（last_modified が最も新しい）を選択
     let (newest, others) = select_newest_workspace(candidates);
-    
+
     // 古いworkspaceを削除
     for old_ws in others {
         self.cleanup_workspace(&old_ws.workspace_name);
     }
-    
+
     Some(newest)
 }
 ```

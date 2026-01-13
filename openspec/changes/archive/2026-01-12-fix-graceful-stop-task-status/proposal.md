@@ -89,7 +89,7 @@ for change in &mut app.changes {
 
 Stopped/Stoppingモード時は、Processing状態の変更を異なる方法で表示する。
 
-**却下理由**: 
+**却下理由**:
 - 根本的な状態管理の問題を解決しない
 - 内部状態と表示が乖離する
 

@@ -41,7 +41,7 @@ pub enum AppMode {
 ```rust
 pub struct AppState {
     // 既存フィールド...
-    
+
     /// Web UIのURL（Webサーバーが有効な場合に設定）
     pub web_url: Option<String>,
 }
@@ -74,20 +74,20 @@ Ratatuiの `Clear` + `Block` でオーバーレイを実現:
 fn render_qr_popup(f: &mut Frame, area: Rect, url: &str) {
     // 画面中央にポップアップを配置
     let popup_area = centered_rect(60, 80, area);
-    
+
     // 背景をクリア
     f.render_widget(Clear, popup_area);
-    
+
     // QRコードを含むブロックを描画
     let qr_string = generate_qr_string(url).unwrap_or_default();
     let block = Block::default()
         .title("Web UI QR Code")
         .borders(Borders::ALL);
-    
+
     let paragraph = Paragraph::new(format!("{}\n\n{}", qr_string, url))
         .block(block)
         .alignment(Alignment::Center);
-    
+
     f.render_widget(paragraph, popup_area);
 }
 ```
@@ -169,7 +169,7 @@ web-monitoring = ["axum", "tower", "tower-http", "qrcode", "local-ip-address"]
 
 1. **QRコード生成失敗**: URLが長すぎる場合など
    - フォールバック: URL文字列のみ表示
-   
+
 2. **Webサーバー未起動**: `web_url` が `None`
    - `w` キーを無視またはエラーメッセージ表示
 

@@ -158,7 +158,7 @@ let change_ids: String = changes
 fn test_build_prompt_with_selected_markers() {
     let agent = AgentRunner::new(OrchestratorConfig::default());
     let analyzer = ParallelizationAnalyzer::new(agent);
-    
+
     let changes = vec![
         Change {
             id: "selected-a".to_string(),
@@ -171,9 +171,9 @@ fn test_build_prompt_with_selected_markers() {
             // ...
         },
     ];
-    
+
     let prompt = analyzer.build_parallelization_prompt(&changes);
-    
+
     assert!(prompt.contains("[x] selected-a (openspec/changes/selected-a/proposal.md)"));
     assert!(prompt.contains("[ ] unselected-b (openspec/changes/unselected-b/proposal.md)"));
     assert!(prompt.contains("Analyze ONLY the changes marked with [x]"));

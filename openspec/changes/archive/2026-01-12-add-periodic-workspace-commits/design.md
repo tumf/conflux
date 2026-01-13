@@ -49,7 +49,7 @@ WIP: add-web-monitoring (50/70 tasks)
 
 ### 3. jjとGitの処理の違い
 
-**決定**: 
+**決定**:
 - jj: `jj describe` でコミットメッセージを更新（working copyの変更は自動的にスナップショットされる）
 - Git: `git add -A && git commit --amend` で変更をコミット
 

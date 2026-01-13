@@ -718,4 +718,3 @@ The configuration file SHALL support web monitoring settings to control HTTP ser
 - **WHEN** config file contains only `web.enabled = true`
 - **THEN** HTTP server uses default port 8080
 - **AND** HTTP server uses default bind address 127.0.0.1
-

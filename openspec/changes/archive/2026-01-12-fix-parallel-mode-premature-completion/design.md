@@ -99,14 +99,14 @@ User: F5, ESC
 ```rust
 pub async fn run_orchestrator_parallel(...) -> Result<()> {
     // ... existing setup ...
-    
+
     let mut stopped_or_cancelled = false;
     let mut had_errors = false;
-    
+
     loop {
         // ... existing loop body ...
     }
-    
+
     // ... conditional completion ...
 }
 ```

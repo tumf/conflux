@@ -508,6 +508,100 @@ impl WorkspaceManager for GitWorkspaceManager {
         Ok(())
     }
 
+    async fn create_iteration_snapshot(
+        &self,
+        workspace_path: &Path,
+        change_id: &str,
+        iteration: u32,
+        completed: u32,
+        total: u32,
+    ) -> VcsResult<()> {
+        let wip_message = format!(
+            "WIP: {} ({}/{} tasks, apply#{})",
+            change_id, completed, total, iteration
+        );
+
+        debug!(
+            "Creating iteration snapshot #{} for {}",
+            iteration, change_id
+        );
+
+        // Stage all changes
+        commands::run_git(&["add", "-A"], workspace_path).await?;
+
+        // Create or amend commit with --allow-empty to ensure snapshot is created
+        // even if there are no file changes
+        let has_commits = commands::run_git(&["rev-parse", "HEAD"], workspace_path)
+            .await
+            .is_ok();
+
+        if has_commits {
+            // Amend existing commit
+            let result = commands::run_git(
+                &["commit", "--amend", "--allow-empty", "-m", &wip_message],
+                workspace_path,
+            )
+            .await;
+            if let Err(e) = result {
+                warn!(
+                    "Failed to amend WIP commit for iteration {}: {}",
+                    iteration, e
+                );
+            } else {
+                debug!(
+                    "Iteration snapshot #{} created for {} (amended)",
+                    iteration, change_id
+                );
+            }
+        } else {
+            // Create initial commit
+            let result = commands::run_git(
+                &["commit", "--allow-empty", "-m", &wip_message],
+                workspace_path,
+            )
+            .await;
+            if let Err(e) = result {
+                warn!(
+                    "Failed to create initial WIP commit for iteration {}: {}",
+                    iteration, e
+                );
+            } else {
+                debug!(
+                    "Iteration snapshot #{} created for {} (initial)",
+                    iteration, change_id
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn squash_wip_commits(
+        &self,
+        workspace_path: &Path,
+        change_id: &str,
+        final_iteration: u32,
+    ) -> VcsResult<()> {
+        let apply_message = format!("Apply: {} (apply#{})", change_id, final_iteration);
+
+        debug!("Squashing WIP commits for {} into Apply commit", change_id);
+
+        // For Git, we update the commit message to final Apply message
+        // Since we've been amending the same commit, we just need to update the message
+        let result =
+            commands::run_git(&["commit", "--amend", "-m", &apply_message], workspace_path).await;
+
+        if let Err(e) = result {
+            return Err(VcsError::git_command(format!(
+                "Failed to set Apply message: {}",
+                e
+            )));
+        }
+
+        info!("WIP commits squashed into Apply commit for {}", change_id);
+        Ok(())
+    }
+
     async fn get_revision_in_workspace(&self, workspace_path: &Path) -> VcsResult<String> {
         commands::get_current_commit(workspace_path).await
     }
