@@ -350,11 +350,11 @@ impl AppState {
         match self.mode {
             AppMode::Select => {
                 // In select mode:
-                // [ ] (unapproved) → @ → [x] (approved + selected)
+                // [ ] (unapproved) → @ → [x] (approved + selected, NOT queued)
                 // [x] (approved + selected) → @ → [ ] (unapproved + not selected)
                 if !is_approved {
-                    // Unapproved → approved + selected
-                    Some(TuiCommand::ApproveAndQueue(id))
+                    // Unapproved → approved + selected (no auto-queue)
+                    Some(TuiCommand::ApproveOnly(id))
                 } else {
                     // Approved → unapproved (also deselects)
                     Some(TuiCommand::UnapproveAndDequeue(id))
