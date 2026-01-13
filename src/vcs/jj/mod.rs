@@ -284,8 +284,8 @@ impl JjWorkspaceManager {
     /// Merge multiple workspace revisions into main
     ///
     /// For a single revision: Uses `jj edit` to switch to that revision without creating merge commits.
-    /// For multiple revisions: Uses `jj new --no-edit` to create an empty merge commit, switches to it,
-    /// then creates a new working copy commit with `jj new <merge_rev>` so the merge stays empty.
+    /// For multiple revisions: Uses `jj new --no-edit` to create an empty merge commit,
+    /// then switches to it with `jj edit` so the working copy stays at the merge commit.
     pub async fn merge_jj_workspaces(&self, revisions: &[String]) -> VcsResult<String> {
         if revisions.is_empty() {
             return Err(VcsError::jj_command("No revisions to merge"));
@@ -327,7 +327,7 @@ impl JjWorkspaceManager {
         info!("Using base revision for merge: {}", base_short);
 
         // For multiple revisions, create a merge commit with `jj new --no-edit`
-        // Using --no-edit prevents creating an additional empty working copy commit
+        // Using --no-edit keeps the merge commit as the working copy
         // Always include base revision first to ensure consistent merge base
         let mut args = vec!["new", "--no-edit", &base_rev];
         for rev in revisions {
@@ -384,36 +384,8 @@ impl JjWorkspaceManager {
             )));
         }
 
-        let new_output = Command::new("jj")
-            .args(["new", &merge_rev])
-            .current_dir(&self.repo_root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| {
-                VcsError::jj_command(format!("Failed to create working copy commit: {}", e))
-            })?;
-
-        if !new_output.status.success() {
-            let stderr = String::from_utf8_lossy(&new_output.stderr);
-            return Err(VcsError::jj_command(format!(
-                "Failed to create working copy commit: {}",
-                stderr
-            )));
-        }
-
-        let new_stderr = String::from_utf8_lossy(&new_output.stderr);
-        match self.parse_created_commit_id(&new_stderr).await {
-            Ok(new_rev) => {
-                let short_rev = &new_rev[..8.min(new_rev.len())];
-                info!("Created working copy commit {} after merge", short_rev);
-            }
-            Err(err) => {
-                warn!("Failed to parse working copy commit after merge: {}", err);
-            }
-        }
+        let short_rev = &merge_rev[..8.min(merge_rev.len())];
+        info!("Merge commit {} is now the working copy", short_rev);
 
         Ok(merge_rev)
     }
@@ -986,6 +958,14 @@ mod tests {
                 case
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_parse_created_commit_id_from_output() {
+        let (manager, _temp) = create_test_manager();
+        let output = "Created new commit kmnoprq 1234567890";
+        let result = manager.parse_created_commit_id(output).await.unwrap();
+        assert_eq!(result, "kmnoprq");
     }
 
     #[test]
