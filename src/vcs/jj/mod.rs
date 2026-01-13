@@ -120,6 +120,13 @@ impl JjWorkspaceManager {
         info!("Snapshotting working copy for parallel execution");
 
         // First, check if there are any changes to snapshot
+        let _ = Command::new("jj")
+            .args(["workspace", "update-stale"])
+            .current_dir(&self.repo_root)
+            .stdin(Stdio::null())
+            .output()
+            .await;
+
         let status_output = Command::new("jj")
             .args(["status"])
             .current_dir(&self.repo_root)
@@ -738,6 +745,12 @@ impl WorkspaceManager for JjWorkspaceManager {
     async fn snapshot_working_copy(&self, workspace_path: &Path) -> VcsResult<()> {
         // jj snapshots working copy changes when running status
         let _ = tokio::process::Command::new("jj")
+            .args(["workspace", "update-stale"])
+            .current_dir(workspace_path)
+            .output()
+            .await;
+
+        let _ = tokio::process::Command::new("jj")
             .arg("status")
             .current_dir(workspace_path)
             .output()
@@ -778,6 +791,12 @@ impl WorkspaceManager for JjWorkspaceManager {
             "Creating iteration snapshot #{} for {}",
             iteration, change_id
         );
+
+        let _ = tokio::process::Command::new("jj")
+            .args(["workspace", "update-stale"])
+            .current_dir(workspace_path)
+            .output()
+            .await;
 
         let _ = tokio::process::Command::new("jj")
             .arg("status")
