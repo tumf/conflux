@@ -5,7 +5,7 @@
 use std::time::Instant;
 
 use super::super::events::{LogEntry, TuiCommand};
-use super::super::types::{AppMode, QueueStatus};
+use super::super::types::{AppMode, QueueStatus, StopMode};
 use super::AppState;
 
 impl AppState {
@@ -36,6 +36,15 @@ impl AppState {
         true
     }
 
+    /// Reset stop/cancel state before a new run
+    pub fn reset_for_run(&mut self) {
+        self.stop_mode = StopMode::None;
+        self.current_change = None;
+        self.error_change_id = None;
+        self.orchestration_started_at = Some(Instant::now());
+        self.orchestration_elapsed = None;
+    }
+
     /// Start processing selected changes
     pub fn start_processing(&mut self) -> Option<TuiCommand> {
         if self.mode != AppMode::Select {
@@ -61,15 +70,42 @@ impl AppState {
             }
         }
 
+        self.reset_for_run();
         self.mode = AppMode::Running;
-        self.orchestration_started_at = Some(Instant::now());
-        self.orchestration_elapsed = None;
         self.add_log(LogEntry::info(format!(
             "Starting processing {} change(s)",
             selected.len()
         )));
 
         Some(TuiCommand::StartProcessing(selected))
+    }
+
+    /// Resume processing queued changes from Stopped mode
+    pub fn resume_processing(&mut self) -> Option<TuiCommand> {
+        if self.mode != AppMode::Stopped {
+            return None;
+        }
+
+        let queued: Vec<String> = self
+            .changes
+            .iter()
+            .filter(|c| matches!(c.queue_status, QueueStatus::Queued))
+            .map(|c| c.id.clone())
+            .collect();
+
+        if queued.is_empty() {
+            self.warning_message = Some("No queued changes to resume".to_string());
+            return None;
+        }
+
+        self.reset_for_run();
+        self.mode = AppMode::Running;
+        self.add_log(LogEntry::info(format!(
+            "Resuming processing {} change(s)...",
+            queued.len()
+        )));
+
+        Some(TuiCommand::StartProcessing(queued))
     }
 
     /// Retry error changes - resets error changes to queued and returns their IDs
@@ -105,8 +141,8 @@ impl AppState {
         }
 
         // Reset error state and transition to Running
+        self.reset_for_run();
         self.mode = AppMode::Running;
-        self.error_change_id = None;
 
         Some(TuiCommand::StartProcessing(error_ids))
     }
@@ -148,6 +184,65 @@ mod tests {
         let cmd = app.start_processing();
         assert!(cmd.is_some());
         assert_eq!(app.mode, AppMode::Running);
+    }
+
+    #[test]
+    fn test_start_processing_resets_stop_state() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.stop_mode = StopMode::ForceStopped;
+        app.error_change_id = Some("stale".to_string());
+        app.orchestration_elapsed = Some(std::time::Duration::from_secs(5));
+
+        let cmd = app.start_processing();
+
+        assert!(cmd.is_some());
+        assert_eq!(app.stop_mode, StopMode::None);
+        assert!(app.orchestration_started_at.is_some());
+        assert!(app.orchestration_elapsed.is_none());
+        assert!(app.error_change_id.is_none());
+    }
+
+    #[test]
+    fn test_resume_processing_resets_stop_state() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Stopped;
+        app.stop_mode = StopMode::ForceStopped;
+        app.error_change_id = Some("stale".to_string());
+        app.orchestration_elapsed = Some(std::time::Duration::from_secs(4));
+        app.changes[0].queue_status = QueueStatus::Queued;
+
+        let cmd = app.resume_processing();
+
+        assert!(cmd.is_some());
+        assert_eq!(app.mode, AppMode::Running);
+        assert_eq!(app.stop_mode, StopMode::None);
+        assert!(app.orchestration_started_at.is_some());
+        assert!(app.orchestration_elapsed.is_none());
+        assert!(app.error_change_id.is_none());
+    }
+
+    #[test]
+    fn test_resume_processing_preserves_parallel_mode() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Stopped;
+        app.parallel_mode = true;
+        app.changes[0].queue_status = QueueStatus::Queued;
+
+        let cmd = app.resume_processing();
+
+        assert!(cmd.is_some());
+        assert!(app.parallel_mode);
+        if let Some(TuiCommand::StartProcessing(ids)) = cmd {
+            assert_eq!(ids, vec!["a".to_string()]);
+        } else {
+            panic!("Expected StartProcessing command");
+        }
     }
 
     #[test]
@@ -197,6 +292,26 @@ mod tests {
         assert!(app.changes[0].selected);
         // Completed change should remain completed
         assert_eq!(app.changes[1].queue_status, QueueStatus::Completed);
+    }
+
+    #[test]
+    fn test_retry_error_changes_resets_stop_state() {
+        let changes = vec![create_approved_change("error-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Error;
+        app.stop_mode = StopMode::GracefulPending;
+        app.error_change_id = Some("error-change".to_string());
+        app.orchestration_elapsed = Some(std::time::Duration::from_secs(4));
+        app.changes[0].queue_status = QueueStatus::Error("test error".to_string());
+
+        let cmd = app.retry_error_changes();
+
+        assert!(cmd.is_some());
+        assert_eq!(app.stop_mode, StopMode::None);
+        assert!(app.orchestration_started_at.is_some());
+        assert!(app.orchestration_elapsed.is_none());
+        assert!(app.error_change_id.is_none());
     }
 
     #[test]
