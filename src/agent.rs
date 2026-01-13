@@ -29,8 +29,13 @@ Do NOT remove:
 - Documentation updates - agent can write
 - Any task the agent can execute autonomously
 
+Every remaining unchecked task MUST be immediately actionable in this repo and have objective pass/fail criteria.
+If you find a non-actionable task (abstract, subjective, or human-only), rewrite it into one or more actionable tasks with concrete commands and clear acceptance criteria while preserving intent.
+Only when a task truly requires human decision or external action, mark it as '(future work)', move it to a "Future work" section, and remove the checkbox.
+Do not allow apply to finish successfully with non-actionable unchecked tasks; normalize tasks until all remaining unchecked tasks are actionable or moved to Future work.
+
 Special handling for 'future work' tasks:
-- If a task is marked '(future work)', remove it from tasks.md
+- If a task is already marked '(future work)', move it to a "Future work" section and remove the checkbox
 - This indicates deferred work, not current implementation scope"#;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{ApplyAttempt, ApplyHistory};
@@ -899,5 +904,8 @@ mod tests {
         assert!(APPLY_SYSTEM_PROMPT.contains("Out-of-scope"));
         assert!(APPLY_SYSTEM_PROMPT.contains("human decision"));
         assert!(APPLY_SYSTEM_PROMPT.contains("Do NOT remove"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("actionable"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("concrete commands"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("Future work"));
     }
 }

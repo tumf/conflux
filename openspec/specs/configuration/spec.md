@@ -302,46 +302,52 @@ Claude template SHALL include verbose and streaming JSON output options for prop
 
 ### Requirement: System Prompt for Apply and Archive Commands
 
-The orchestrator SHALL support `{prompt}` placeholder in both `apply_command` and `archive_command` templates, allowing system-provided instructions to be injected into agent commands.
+オーケストレーターは `apply_command` と `archive_command` の両方で `{prompt}` プレースホルダーをサポートし、システム提供の指示をエージェントコマンドへ注入できなければならない（SHALL）。
 
-The orchestrator SHALL provide `apply_prompt` and `archive_prompt` configuration options to define user-customizable prompt values.
+オーケストレーターは `apply_prompt` と `archive_prompt` の設定項目を提供し、ユーザーがカスタムのプロンプト値を定義できなければならない（SHALL）。
 
-The orchestrator SHALL include a hardcoded system prompt for apply commands that is always appended after `apply_prompt`. This system prompt enforces non-negotiable task management rules and cannot be disabled by user configuration.
+オーケストレーターは apply コマンド向けに、`apply_prompt` の直後に必ず付与されるハードコードシステムプロンプトを含めなければならない（SHALL）。このシステムプロンプトはタスク管理の必須ルールを強制し、ユーザー設定で無効化できない。
 
-The `{prompt}` placeholder for apply commands SHALL be expanded as: `apply_prompt` + hardcoded system prompt + history context (if any), concatenated with newlines.
+apply コマンドの `{prompt}` は `apply_prompt` + ハードコードシステムプロンプト + 履歴コンテキスト（存在する場合）を改行で連結したものとして展開されなければならない（SHALL）。
 
-The hardcoded system prompt SHALL contain:
+ハードコードシステムプロンプトには以下の指示が含まれなければならない（SHALL）。
 - "Remove out-of-scope tasks."
 - "Remove tasks that wait for or require user action."
+- 未完了タスクは必ず実行可能であることを求める指示
+- 実行不能タスクを具体コマンド + 合格基準を持つ実行可能タスクへ書き換える指示
+- 人間判断や外部アクションが必須な場合のみ `(future work)` を付けて `Future work` セクションへ移動し、チェックボックスを外す指示
+- apply が成功しても未完了タスクが残る状態を許容せず、タスク正規化を優先する指示
 
 #### Scenario: Apply command prompt structure
 
-- **GIVEN** `apply_command` is configured as `"agent apply {change_id} {prompt}"`
-- **AND** `apply_prompt` is configured as `"Focus on implementation."`
-- **WHEN** applying change `add-feature`
-- **THEN** the `{prompt}` expands to: `"Focus on implementation.\n\nRemove out-of-scope tasks. Remove tasks that wait for or require user action."`
+- **GIVEN** `apply_command` が `"agent apply {change_id} {prompt}"` に設定されている
+- **AND** `apply_prompt` が `"Focus on implementation."` に設定されている
+- **WHEN** change `add-feature` を apply する
+- **THEN** `{prompt}` は `"Focus on implementation.\n\nRemove out-of-scope tasks. Remove tasks that wait for or require user action."` に展開される
+- **AND** 未完了タスクを実行可能に保つための指示が含まれる
+- **AND** `(future work)` をチェックリストから外すための指示が含まれる
 
 #### Scenario: Apply command with empty user prompt
 
-- **GIVEN** `apply_command` is configured as `"agent apply {change_id} {prompt}"`
-- **AND** `apply_prompt` is empty or NOT configured
-- **WHEN** applying change `add-feature`
-- **THEN** the `{prompt}` expands to the hardcoded system prompt only
+- **GIVEN** `apply_command` が `"agent apply {change_id} {prompt}"` に設定されている
+- **AND** `apply_prompt` が空、または未設定である
+- **WHEN** change `add-feature` を apply する
+- **THEN** `{prompt}` はハードコードシステムプロンプトのみを展開する
 
 #### Scenario: Apply command with history context
 
-- **GIVEN** `apply_command` is configured as `"agent apply {change_id} {prompt}"`
-- **AND** `apply_prompt` is configured as `"Focus on implementation."`
-- **AND** there is a previous failed apply attempt for the change
-- **WHEN** applying change `add-feature`
-- **THEN** the `{prompt}` expands to: user prompt + system prompt + history context
+- **GIVEN** `apply_command` が `"agent apply {change_id} {prompt}"` に設定されている
+- **AND** `apply_prompt` が `"Focus on implementation."` に設定されている
+- **AND** 以前の apply 失敗履歴が存在する
+- **WHEN** change `add-feature` を apply する
+- **THEN** `{prompt}` はユーザープロンプト + システムプロンプト + 履歴コンテキストに展開される
 
 #### Scenario: Archive command unchanged
 
-- **GIVEN** `archive_command` is configured as `"agent archive {change_id} {prompt}"`
-- **AND** `archive_prompt` is configured as `"Verify completion."`
-- **WHEN** archiving change `add-feature`
-- **THEN** the `{prompt}` expands to `archive_prompt` only (no hardcoded system prompt for archive)
+- **GIVEN** `archive_command` が `"agent archive {change_id} {prompt}"` に設定されている
+- **AND** `archive_prompt` が `"Verify completion."` に設定されている
+- **WHEN** change `add-feature` を archive する
+- **THEN** `{prompt}` は `archive_prompt` のみに展開される（archive にはハードコードシステムプロンプトを追加しない）
 
 ### Requirement: Approved File Format
 
