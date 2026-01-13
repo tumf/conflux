@@ -227,7 +227,10 @@ pub enum ExecutionEvent {
     /// Error during execution
     Error { message: String },
     /// Changes list refreshed
-    ChangesRefreshed(Vec<crate::openspec::Change>),
+    ChangesRefreshed {
+        changes: Vec<crate::openspec::Change>,
+        committed_change_ids: std::collections::HashSet<String>,
+    },
 }
 
 /// Helper to send events through the channel.

@@ -261,6 +261,14 @@ impl AppState {
             return None;
         }
 
+        if self.parallel_mode && !change.is_parallel_eligible {
+            self.warning_message = Some(format!(
+                "Cannot queue uncommitted change '{}' in parallel mode. Commit it first.",
+                change.id
+            ));
+            return None;
+        }
+
         match self.mode {
             AppMode::Select => {
                 change.selected = !change.selected;
@@ -324,6 +332,24 @@ impl AppState {
                 }
             }
             AppMode::Stopping | AppMode::Error | AppMode::Proposing | AppMode::QrPopup => None,
+        }
+    }
+
+    /// Update parallel eligibility status for changes.
+    pub fn apply_parallel_eligibility(&mut self, committed_change_ids: &HashSet<String>) {
+        for change in &mut self.changes {
+            change.is_parallel_eligible = committed_change_ids.contains(&change.id);
+            if self.parallel_mode
+                && matches!(self.mode, AppMode::Select | AppMode::Stopped)
+                && !change.is_parallel_eligible
+            {
+                if change.selected {
+                    change.selected = false;
+                }
+                if matches!(change.queue_status, QueueStatus::Queued) {
+                    change.queue_status = QueueStatus::NotQueued;
+                }
+            }
         }
     }
 

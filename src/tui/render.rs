@@ -217,18 +217,37 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             // [@] - approved but not selected (ready to select)
             // [x] - selected/reserved (will become Queued when F5 is pressed)
             // [x] (gray) - archived (processing complete, no longer actionable)
-            let (checkbox, checkbox_color) =
-                get_checkbox_display(&change.queue_status, change.is_approved, change.selected);
+            let is_parallel_blocked = app.parallel_mode && !change.is_parallel_eligible;
+            let (checkbox, checkbox_color) = if is_parallel_blocked {
+                ("[ ]", Color::DarkGray)
+            } else {
+                get_checkbox_display(&change.queue_status, change.is_approved, change.selected)
+            };
 
             let cursor = if i == app.cursor_index { "►" } else { " " };
             let new_badge = if change.is_new { " NEW" } else { "" };
+            let uncommitted_badge = if !change.is_parallel_eligible {
+                " UNCOMMITED"
+            } else {
+                ""
+            };
 
             // Use brighter colors for selected row to ensure visibility on DarkGray background
             let is_selected_row = i == app.cursor_index;
-            let dim_color = if is_selected_row {
+            let dim_color = if is_parallel_blocked {
+                Color::DarkGray
+            } else if is_selected_row {
                 Color::Gray // Brighter than DarkGray for visibility on selected row
             } else {
                 Color::DarkGray
+            };
+
+            let name_color = if is_parallel_blocked {
+                Color::DarkGray
+            } else if change.is_approved {
+                Color::White
+            } else {
+                Color::Gray
             };
 
             let line = Line::from(vec![
@@ -238,14 +257,16 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 ),
                 Span::styled(
                     format!("{:<25}", change.id),
-                    Style::default().fg(if change.is_approved {
-                        Color::White
-                    } else {
-                        Color::Gray
-                    }),
+                    Style::default().fg(name_color),
                 ),
                 Span::styled(
                     new_badge,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    uncommitted_badge,
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -336,18 +357,37 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             // [x] - in queue or being processed
             // [x] (gray) - archived (processing complete, no longer actionable)
             // Note: In Running mode, queue_status shows actual state (Queued/Processing/etc.)
-            let (checkbox, checkbox_color) =
-                get_checkbox_display(&change.queue_status, change.is_approved, change.selected);
+            let is_parallel_blocked = app.parallel_mode && !change.is_parallel_eligible;
+            let (checkbox, checkbox_color) = if is_parallel_blocked {
+                ("[ ]", Color::DarkGray)
+            } else {
+                get_checkbox_display(&change.queue_status, change.is_approved, change.selected)
+            };
 
             let cursor = if i == app.cursor_index { "►" } else { " " };
             let new_badge = if change.is_new { " NEW" } else { "" };
+            let uncommitted_badge = if !change.is_parallel_eligible {
+                " UNCOMMITED"
+            } else {
+                ""
+            };
 
             // Use brighter colors for selected row to ensure visibility on DarkGray background
             let is_selected_row = i == app.cursor_index;
-            let dim_color = if is_selected_row {
+            let dim_color = if is_parallel_blocked {
+                Color::DarkGray
+            } else if is_selected_row {
                 Color::Gray // Brighter than DarkGray for visibility on selected row
             } else {
                 Color::DarkGray
+            };
+
+            let name_color = if is_parallel_blocked {
+                Color::DarkGray
+            } else if change.is_approved {
+                Color::White
+            } else {
+                Color::Gray
             };
 
             let status_text = match &change.queue_status {
@@ -378,14 +418,16 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 ),
                 Span::styled(
                     format!("{:<25}", change.id),
-                    Style::default().fg(if change.is_approved {
-                        Color::White
-                    } else {
-                        Color::Gray
-                    }),
+                    Style::default().fg(name_color),
                 ),
                 Span::styled(
                     new_badge,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    uncommitted_badge,
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -898,6 +940,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
+    use std::collections::HashSet;
 
     fn create_test_change(id: &str, is_approved: bool) -> Change {
         Change {
@@ -1011,5 +1054,17 @@ mod tests {
         let content = buffer_to_string(&buffer);
         assert!(content.contains("OpenSpec Orchestrator"));
         assert!(content.contains("Press F5 to start processing"));
+    }
+
+    #[test]
+    fn test_render_shows_uncommitted_badge() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.parallel_available = true;
+        app.parallel_mode = true;
+        app.apply_parallel_eligibility(&HashSet::new());
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(content.contains("UNCOMMITED"));
     }
 }
