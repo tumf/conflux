@@ -897,14 +897,6 @@ impl ParallelExecutor {
 
                         // Individual merge: merge immediately after archive completes
                         info!("Merging {} (revision: {})", workspace_result.change_id, rev);
-                        send_event(
-                            &self.event_tx,
-                            ParallelEvent::MergeStarted {
-                                revisions: vec![rev.clone()],
-                            },
-                        )
-                        .await;
-
                         match self.merge_and_resolve(std::slice::from_ref(rev)).await {
                             Ok(_) => {
                                 info!(
@@ -935,6 +927,31 @@ impl ParallelExecutor {
 
     /// Merge revisions and resolve any conflicts
     async fn merge_and_resolve(&self, revisions: &[String]) -> Result<()> {
+        self.merge_and_resolve_with(revisions, |revisions, details| async move {
+            conflict::resolve_conflicts_with_retry(
+                self.workspace_manager.as_ref(),
+                &self.config,
+                &self.event_tx,
+                &revisions,
+                &details,
+                self.max_conflict_retries,
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn merge_and_resolve_with<'a, F, Fut>(
+        &'a self,
+        revisions: &'a [String],
+        mut resolve_conflicts: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Vec<String>, String) -> Fut,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'a,
+    {
+        let max_attempts = self.max_conflict_retries.max(1);
+
         send_event(
             &self.event_tx,
             ParallelEvent::MergeStarted {
@@ -943,47 +960,81 @@ impl ParallelExecutor {
         )
         .await;
 
-        // Attempt merge
-        let merge_result = self.workspace_manager.merge_workspaces(revisions).await;
+        for attempt in 1..=max_attempts {
+            info!(
+                "Merge attempt {}/{} for revisions: {}",
+                attempt,
+                max_attempts,
+                revisions.join(", ")
+            );
 
-        let result = match merge_result {
-            Ok(merge_revision) => {
-                send_event(
-                    &self.event_tx,
-                    ParallelEvent::MergeCompleted {
-                        revision: merge_revision,
-                    },
-                )
-                .await;
-                Ok(())
+            let merge_result = self.workspace_manager.merge_workspaces(revisions).await;
+
+            match merge_result {
+                Ok(merge_revision) => {
+                    if attempt > 1 {
+                        info!("Merge succeeded after {} attempts", attempt);
+                    }
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::MergeCompleted {
+                            revision: merge_revision,
+                        },
+                    )
+                    .await;
+                    return Ok(());
+                }
+                Err(VcsError::Conflict { details, .. }) => {
+                    let conflict_files =
+                        conflict::detect_conflicts(self.workspace_manager.as_ref()).await?;
+                    warn!(
+                        "Merge conflict detected on attempt {}/{}",
+                        attempt, max_attempts
+                    );
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::MergeConflict {
+                            files: conflict_files,
+                        },
+                    )
+                    .await;
+
+                    if attempt >= max_attempts {
+                        let error_msg = format!(
+                            "Merge conflict unresolved after {} attempts: {}",
+                            max_attempts, details
+                        );
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::ConflictResolutionFailed {
+                                error: error_msg.clone(),
+                            },
+                        )
+                        .await;
+                        return Err(OrchestratorError::from_vcs_error(VcsError::Conflict {
+                            backend: self.workspace_manager.backend_type(),
+                            details: error_msg,
+                        }));
+                    }
+
+                    info!(
+                        "Resolving merge conflicts (attempt {}/{}).",
+                        attempt, max_attempts
+                    );
+                    if let Err(err) = resolve_conflicts(revisions.to_vec(), details.clone()).await {
+                        warn!(
+                            "Conflict resolution failed on attempt {}/{}: {}",
+                            attempt, max_attempts, err
+                        );
+                        return Err(err);
+                    }
+                    info!("Conflict resolution completed, retrying merge");
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(VcsError::Conflict { details, .. }) => {
-                // Detect conflict files
-                let conflict_files =
-                    conflict::detect_conflicts(self.workspace_manager.as_ref()).await?;
-                send_event(
-                    &self.event_tx,
-                    ParallelEvent::MergeConflict {
-                        files: conflict_files.clone(),
-                    },
-                )
-                .await;
+        }
 
-                // Attempt automatic resolution with VCS context
-                conflict::resolve_conflicts_with_retry(
-                    self.workspace_manager.as_ref(),
-                    &self.config,
-                    &self.event_tx,
-                    revisions,
-                    &details,
-                    self.max_conflict_retries,
-                )
-                .await
-            }
-            Err(e) => Err(e.into()),
-        };
-
-        result
+        Ok(())
     }
 
     /// Cleanup all workspaces.
@@ -1002,6 +1053,11 @@ impl ParallelExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vcs::{VcsResult, VcsWarning, WorkspaceInfo};
+    use async_trait::async_trait;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn test_parallel_executor_creation() {
@@ -1010,5 +1066,200 @@ mod tests {
         let executor = ParallelExecutor::new(repo_root, config, None);
 
         assert_eq!(executor.max_conflict_retries, 3);
+    }
+
+    struct TestWorkspaceManager {
+        merge_calls: Arc<AtomicUsize>,
+        conflict_files: Vec<String>,
+        #[allow(dead_code)]
+        repo_root: PathBuf,
+    }
+
+    impl TestWorkspaceManager {
+        fn new(merge_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                merge_calls,
+                conflict_files: vec!["conflict.txt".to_string()],
+                repo_root: PathBuf::from("/tmp/test-repo"),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WorkspaceManager for TestWorkspaceManager {
+        fn backend_type(&self) -> VcsBackend {
+            VcsBackend::Git
+        }
+
+        async fn check_available(&self) -> VcsResult<bool> {
+            Ok(true)
+        }
+
+        async fn prepare_for_parallel(&self) -> VcsResult<Option<VcsWarning>> {
+            Ok(None)
+        }
+
+        async fn get_current_revision(&self) -> VcsResult<String> {
+            Ok("rev".to_string())
+        }
+
+        async fn create_workspace(
+            &mut self,
+            change_id: &str,
+            _base_revision: Option<&str>,
+        ) -> VcsResult<Workspace> {
+            Ok(Workspace {
+                name: change_id.to_string(),
+                path: PathBuf::from("/tmp/test-workspace"),
+                change_id: change_id.to_string(),
+                base_revision: "base".to_string(),
+                status: WorkspaceStatus::Created,
+            })
+        }
+
+        fn update_workspace_status(&mut self, _workspace_name: &str, _status: WorkspaceStatus) {}
+
+        async fn merge_workspaces(&self, _revisions: &[String]) -> VcsResult<String> {
+            let attempt = self.merge_calls.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                Err(VcsError::Conflict {
+                    backend: VcsBackend::Git,
+                    details: "conflict".to_string(),
+                })
+            } else {
+                Ok("merge-rev".to_string())
+            }
+        }
+
+        async fn cleanup_workspace(&mut self, _workspace_name: &str) -> VcsResult<()> {
+            Ok(())
+        }
+
+        async fn cleanup_all(&mut self) -> VcsResult<()> {
+            Ok(())
+        }
+
+        fn max_concurrent(&self) -> usize {
+            1
+        }
+
+        fn workspaces(&self) -> Vec<Workspace> {
+            Vec::new()
+        }
+
+        fn conflict_resolution_prompt(&self) -> &'static str {
+            "test prompt"
+        }
+
+        async fn snapshot_working_copy(&self, _workspace_path: &Path) -> VcsResult<()> {
+            Ok(())
+        }
+
+        async fn set_commit_message(
+            &self,
+            _workspace_path: &Path,
+            _message: &str,
+        ) -> VcsResult<()> {
+            Ok(())
+        }
+
+        async fn create_iteration_snapshot(
+            &self,
+            _workspace_path: &Path,
+            _change_id: &str,
+            _iteration: u32,
+            _completed: u32,
+            _total: u32,
+        ) -> VcsResult<()> {
+            Ok(())
+        }
+
+        async fn squash_wip_commits(
+            &self,
+            _workspace_path: &Path,
+            _change_id: &str,
+            _final_iteration: u32,
+        ) -> VcsResult<()> {
+            Ok(())
+        }
+
+        async fn get_revision_in_workspace(&self, _workspace_path: &Path) -> VcsResult<String> {
+            Ok("rev".to_string())
+        }
+
+        async fn get_status(&self) -> VcsResult<String> {
+            Ok(String::new())
+        }
+
+        async fn get_log_for_revisions(&self, _revisions: &[String]) -> VcsResult<String> {
+            Ok(String::new())
+        }
+
+        async fn detect_conflicts(&self) -> VcsResult<Vec<String>> {
+            Ok(self.conflict_files.clone())
+        }
+
+        fn forget_workspace_sync(&self, _workspace_name: &str) {}
+
+        fn repo_root(&self) -> &Path {
+            &self.repo_root
+        }
+
+        async fn find_existing_workspace(
+            &mut self,
+            _change_id: &str,
+        ) -> VcsResult<Option<WorkspaceInfo>> {
+            Ok(None)
+        }
+
+        async fn reuse_workspace(
+            &mut self,
+            workspace_info: &WorkspaceInfo,
+        ) -> VcsResult<Workspace> {
+            Ok(Workspace {
+                name: workspace_info.workspace_name.clone(),
+                path: workspace_info.path.clone(),
+                change_id: workspace_info.change_id.clone(),
+                base_revision: "base".to_string(),
+                status: WorkspaceStatus::Created,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merge_retries_after_conflict() {
+        let merge_calls = Arc::new(AtomicUsize::new(0));
+        let manager = TestWorkspaceManager::new(merge_calls.clone());
+        let config = OrchestratorConfig::default();
+        let executor = ParallelExecutor {
+            workspace_manager: Box::new(manager),
+            config,
+            apply_command: String::new(),
+            archive_command: String::new(),
+            event_tx: None,
+            max_conflict_retries: 2,
+            repo_root: PathBuf::from("/tmp/test-repo"),
+            no_resume: false,
+            failed_tracker: FailedChangeTracker::new(),
+            hooks: None,
+        };
+
+        let resolve_calls = Arc::new(AtomicUsize::new(0));
+        let revisions = vec!["rev-1".to_string()];
+        let resolve_calls_clone = resolve_calls.clone();
+
+        executor
+            .merge_and_resolve_with(&revisions, move |_, _| {
+                let resolve_calls = resolve_calls_clone.clone();
+                async move {
+                    resolve_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(merge_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(resolve_calls.load(Ordering::SeqCst), 1);
     }
 }

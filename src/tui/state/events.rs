@@ -170,8 +170,12 @@ impl AppState {
             OrchestratorEvent::Log(entry) => {
                 self.add_log(entry);
             }
-            OrchestratorEvent::ChangesRefreshed(changes) => {
+            OrchestratorEvent::ChangesRefreshed {
+                changes,
+                committed_change_ids,
+            } => {
                 self.update_changes(changes);
+                self.apply_parallel_eligibility(&committed_change_ids);
             }
             // Output events - add to log
             OrchestratorEvent::ApplyOutput { change_id, output } => {

@@ -80,6 +80,29 @@ pub async fn get_current_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<String> {
     run_git(&["rev-parse", "HEAD"], cwd).await
 }
 
+/// List change IDs from the HEAD commit tree.
+///
+/// Reads directories under `openspec/changes` in the HEAD tree and filters out
+/// archive and hidden entries.
+pub async fn list_changes_in_head<P: AsRef<Path>>(cwd: P) -> VcsResult<Vec<String>> {
+    let output = run_git(
+        &["ls-tree", "-d", "--name-only", "HEAD:openspec/changes"],
+        cwd,
+    )
+    .await?;
+
+    let mut change_ids: Vec<String> = output
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|name| *name != "archive" && !name.starts_with('.'))
+        .map(String::from)
+        .collect();
+
+    change_ids.sort();
+    Ok(change_ids)
+}
+
 /// Get the current branch name.
 /// Returns None if in detached HEAD state.
 pub async fn get_current_branch<P: AsRef<Path>>(cwd: P) -> VcsResult<Option<String>> {
@@ -345,5 +368,61 @@ mod tests {
         let (has_changes, output) = result.unwrap();
         assert!(has_changes);
         assert!(output.contains("test.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_list_changes_in_head_filters_special_dirs() {
+        let temp_dir = TempDir::new().unwrap();
+
+        debug!(
+            "Executing git command: git init (cwd: {:?})",
+            temp_dir.path()
+        );
+        let init_result = Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        if init_result.is_err() {
+            return;
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        let base_dir = temp_dir.path().join("openspec/changes");
+        std::fs::create_dir_all(base_dir.join("change-b")).unwrap();
+        std::fs::create_dir_all(base_dir.join("change-a")).unwrap();
+        std::fs::create_dir_all(base_dir.join("archive")).unwrap();
+        std::fs::create_dir_all(base_dir.join(".hidden")).expect("create hidden dir");
+        std::fs::write(base_dir.join("change-a").join("proposal.md"), "test").unwrap();
+        std::fs::write(base_dir.join("change-b").join("proposal.md"), "test").unwrap();
+        std::fs::write(base_dir.join("archive").join("proposal.md"), "test").unwrap();
+
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "add changes"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        let changes = list_changes_in_head(temp_dir.path()).await.unwrap();
+        assert_eq!(
+            changes,
+            vec!["change-a".to_string(), "change-b".to_string()]
+        );
     }
 }
