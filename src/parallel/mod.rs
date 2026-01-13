@@ -1,6 +1,6 @@
 //! Parallel execution coordinator for VCS workspace-based parallel change application.
 //!
-//! This module manages the parallel execution of changes using VCS workspaces (jj or Git),
+//! This module manages the parallel execution of changes using Git worktrees,
 //! including workspace creation, apply command execution, merge, and cleanup.
 
 mod cleanup;
@@ -17,8 +17,7 @@ use crate::analyzer::{extract_change_dependencies, ParallelGroup};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::vcs::{
-    GitWorkspaceManager, JjWorkspaceManager, VcsBackend, VcsError, Workspace, WorkspaceManager,
-    WorkspaceStatus,
+    GitWorkspaceManager, VcsBackend, VcsError, Workspace, WorkspaceManager, WorkspaceStatus,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,7 +31,7 @@ use executor::{execute_apply_in_workspace, execute_archive_in_workspace, Paralle
 
 use crate::hooks::HookRunner;
 
-/// Parallel executor for running changes in jj workspaces
+/// Parallel executor for running changes in git worktrees
 pub struct ParallelExecutor {
     /// Workspace manager (VCS-agnostic)
     workspace_manager: Box<dyn WorkspaceManager>,
@@ -106,13 +105,7 @@ impl ParallelExecutor {
         info!("Using VCS backend: {:?}", resolved_backend);
 
         let workspace_manager: Box<dyn WorkspaceManager> = match resolved_backend {
-            VcsBackend::Git => Box::new(GitWorkspaceManager::new(
-                base_dir,
-                repo_root.clone(),
-                max_concurrent,
-                config.clone(),
-            )),
-            VcsBackend::Jj | VcsBackend::Auto => Box::new(JjWorkspaceManager::new(
+            VcsBackend::Git | VcsBackend::Auto => Box::new(GitWorkspaceManager::new(
                 base_dir,
                 repo_root.clone(),
                 max_concurrent,
@@ -150,19 +143,9 @@ impl ParallelExecutor {
     }
 
     /// Resolve VCS backend (convert Auto to concrete backend)
-    fn resolve_backend(backend: VcsBackend, repo_root: &Path) -> VcsBackend {
+    fn resolve_backend(backend: VcsBackend, _repo_root: &Path) -> VcsBackend {
         match backend {
-            VcsBackend::Auto => {
-                // Check for jj first (preferred)
-                if repo_root.join(".jj").exists() {
-                    VcsBackend::Jj
-                } else if repo_root.join(".git").exists() {
-                    VcsBackend::Git
-                } else {
-                    // Default to jj
-                    VcsBackend::Jj
-                }
-            }
+            VcsBackend::Auto => VcsBackend::Git,
             other => other,
         }
     }
@@ -182,13 +165,6 @@ impl ParallelExecutor {
             .map_err(Into::into)
     }
 
-    /// Check if jj is available for parallel execution (deprecated, use check_vcs_available)
-    #[deprecated(note = "Use check_vcs_available instead")]
-    #[allow(dead_code)] // Deprecated but kept for backward compatibility
-    pub async fn check_jj_available(&self) -> Result<bool> {
-        self.check_vcs_available().await
-    }
-
     /// Execute groups in topological order
     pub async fn execute_groups(&mut self, groups: Vec<ParallelGroup>) -> Result<()> {
         if groups.is_empty() {
@@ -206,7 +182,7 @@ impl ParallelExecutor {
         let total_changes: usize = groups.iter().map(|g| g.changes.len()).sum();
         let mut changes_processed: usize = 0;
 
-        // Prepare for parallel execution (snapshot for jj, clean check for git)
+        // Prepare for parallel execution (clean check for git)
         info!("Preparing for parallel execution...");
         if let Err(e) = self.workspace_manager.prepare_for_parallel().await {
             let error_msg = format!("Failed to prepare for parallel execution: {}", e);
@@ -254,7 +230,7 @@ impl ParallelExecutor {
             changes.len()
         );
 
-        // Prepare for parallel execution (snapshot for jj, clean check for git)
+        // Prepare for parallel execution (clean check for git)
         info!("Preparing for parallel execution...");
         if let Err(e) = self.workspace_manager.prepare_for_parallel().await {
             let error_msg = format!("Failed to prepare for parallel execution: {}", e);

@@ -28,7 +28,7 @@ use super::events::ParallelEvent;
 /// * `iteration` - Current iteration number
 /// * `completed` - Number of completed tasks
 /// * `total` - Total number of tasks
-/// * `vcs_backend` - The VCS backend to use (jj or Git)
+/// * `vcs_backend` - The VCS backend to use (Git)
 ///
 /// # Commit Message Format
 ///
@@ -53,44 +53,12 @@ async fn create_iteration_snapshot(
     );
 
     match vcs_backend {
-        VcsBackend::Jj => {
-            // jj automatically snapshots working copy changes
-            // First ensure working copy is snapshotted
-            let _ = Command::new("jj")
-                .arg("status")
-                .current_dir(workspace_path)
-                .stdin(StdStdio::null())
-                .output()
-                .await;
-
-            let output = Command::new("jj")
-                .args(["describe", "-m", &commit_message])
-                .current_dir(workspace_path)
-                .stdin(StdStdio::null())
-                .output()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::JjCommand(format!(
-                        "Failed to create iteration snapshot: {}",
-                        e
-                    ))
-                })?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!(
-                    "Failed to set WIP message for iteration {}: {}",
-                    iteration, stderr
-                );
-            } else {
-                debug!(
-                    "Iteration snapshot #{} created for {} (jj)",
-                    iteration, change_id
-                );
-            }
-        }
         VcsBackend::Git | VcsBackend::Auto => {
             // For Git: stage all changes and create/amend commit
+            debug!(
+                "Executing git command: git add -A (cwd: {:?})",
+                workspace_path
+            );
             let add_output = Command::new("git")
                 .args(["add", "-A"])
                 .current_dir(workspace_path)
@@ -111,6 +79,10 @@ async fn create_iteration_snapshot(
             }
 
             // Check if we have commits to amend
+            debug!(
+                "Executing git command: git rev-parse HEAD (cwd: {:?})",
+                workspace_path
+            );
             let has_commits = Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(workspace_path)
@@ -122,6 +94,10 @@ async fn create_iteration_snapshot(
 
             if has_commits {
                 // Amend existing commit
+                debug!(
+                    "Executing git command: git commit --amend --allow-empty -m {} (cwd: {:?})",
+                    commit_message, workspace_path
+                );
                 let commit_output = Command::new("git")
                     .args(["commit", "--amend", "--allow-empty", "-m", &commit_message])
                     .current_dir(workspace_path)
@@ -146,6 +122,10 @@ async fn create_iteration_snapshot(
                 }
             } else {
                 // Create initial commit
+                debug!(
+                    "Executing git command: git commit --allow-empty -m {} (cwd: {:?})",
+                    commit_message, workspace_path
+                );
                 let commit_output = Command::new("git")
                     .args(["commit", "--allow-empty", "-m", &commit_message])
                     .current_dir(workspace_path)
@@ -185,7 +165,7 @@ async fn create_iteration_snapshot(
 /// * `workspace_path` - Path to the workspace directory
 /// * `change_id` - The change identifier
 /// * `final_iteration` - The final iteration number
-/// * `vcs_backend` - The VCS backend to use (jj or Git)
+/// * `vcs_backend` - The VCS backend to use (Git)
 ///
 /// # Commit Message Format
 ///
@@ -202,32 +182,13 @@ async fn squash_wip_commits(
     debug!("Squashing WIP commits for {} into Apply commit", change_id);
 
     match vcs_backend {
-        VcsBackend::Jj => {
-            // For jj, we just update the commit message to the final Apply message
-            // jj's automatic snapshotting means the final state is already captured
-            let output = Command::new("jj")
-                .args(["describe", "-m", &apply_message])
-                .current_dir(workspace_path)
-                .stdin(StdStdio::null())
-                .output()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::JjCommand(format!("Failed to squash WIP commits: {}", e))
-                })?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(OrchestratorError::JjCommand(format!(
-                    "Failed to set Apply message: {}",
-                    stderr
-                )));
-            }
-
-            info!("WIP commits squashed into Apply commit for {}", change_id);
-        }
         VcsBackend::Git | VcsBackend::Auto => {
             // For Git, we update the commit message to the final Apply message
             // Since we've been amending the same commit, we just need to update the message
+            debug!(
+                "Executing git command: git commit --amend -m {} (cwd: {:?})",
+                apply_message, workspace_path
+            );
             let output = Command::new("git")
                 .args(["commit", "--amend", "-m", &apply_message])
                 .current_dir(workspace_path)
@@ -469,6 +430,10 @@ pub async fn execute_apply_in_workspace(
         // Use null stdin to prevent any interactive behavior
         use tokio::io::{AsyncBufReadExt, BufReader};
 
+        debug!(
+            "Executing shell command: sh -c {} (cwd: {:?})",
+            command, workspace_path
+        );
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(&command)
@@ -536,15 +501,7 @@ pub async fn execute_apply_in_workspace(
             )));
         }
 
-        // Snapshot working copy changes (for jj; no-op for git)
-        // This ensures file modifications are visible for task progress check
-        if vcs_backend == VcsBackend::Jj {
-            let _ = Command::new("jj")
-                .arg("status")
-                .current_dir(workspace_path)
-                .output()
-                .await;
-        }
+        // Git worktrees already reflect working copy changes for task progress.
 
         // Check task progress after apply using helper
         let new_progress = check_task_progress(workspace_path, change_id).unwrap_or_default();
@@ -721,29 +678,11 @@ pub async fn execute_apply_in_workspace(
 
     // Get the resulting revision
     let revision = match vcs_backend {
-        VcsBackend::Jj => {
-            let revision_output = Command::new("jj")
-                .args(["log", "-r", "@", "--no-graph", "-T", "commit_id"])
-                .current_dir(workspace_path)
-                .output()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::JjCommand(format!("Failed to get revision: {}", e))
-                })?;
-
-            if !revision_output.status.success() {
-                let stderr = String::from_utf8_lossy(&revision_output.stderr);
-                return Err(OrchestratorError::JjCommand(format!(
-                    "Failed to get workspace revision: {}",
-                    stderr
-                )));
-            }
-
-            String::from_utf8_lossy(&revision_output.stdout)
-                .trim()
-                .to_string()
-        }
         VcsBackend::Git | VcsBackend::Auto => {
+            debug!(
+                "Executing git command: git rev-parse HEAD (cwd: {:?})",
+                workspace_path
+            );
             let revision_output = Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(workspace_path)
@@ -870,6 +809,10 @@ pub async fn execute_archive_in_workspace(
     // Execute command with streaming output
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    debug!(
+        "Executing shell command: sh -c {} (cwd: {:?})",
+        command, workspace_path
+    );
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&command)
@@ -961,6 +904,10 @@ pub async fn execute_archive_in_workspace(
     match vcs_backend {
         VcsBackend::Git | VcsBackend::Auto => {
             // Check for uncommitted changes
+            debug!(
+                "Executing git command: git status --porcelain (cwd: {:?})",
+                workspace_path
+            );
             let status_output = Command::new("git")
                 .args(["status", "--porcelain"])
                 .current_dir(workspace_path)
@@ -975,6 +922,10 @@ pub async fn execute_archive_in_workspace(
                 debug!("Committing archive changes for {}", change_id);
 
                 // Stage all changes
+                debug!(
+                    "Executing git command: git add -A (cwd: {:?})",
+                    workspace_path
+                );
                 let add_output = Command::new("git")
                     .args(["add", "-A"])
                     .current_dir(workspace_path)
@@ -993,6 +944,10 @@ pub async fn execute_archive_in_workspace(
                 }
 
                 // Commit
+                debug!(
+                    "Executing git command: git commit -m Archive: {} (cwd: {:?})",
+                    change_id, workspace_path
+                );
                 let commit_output = Command::new("git")
                     .args(["commit", "-m", &format!("Archive: {}", change_id)])
                     .current_dir(workspace_path)
@@ -1013,74 +968,15 @@ pub async fn execute_archive_in_workspace(
                 info!("Committed archive changes for {}", change_id);
             }
         }
-        VcsBackend::Jj => {
-            // Refresh stale working copy before snapshotting archive changes.
-            let _ = Command::new("jj")
-                .args(["workspace", "update-stale"])
-                .current_dir(workspace_path)
-                .output()
-                .await;
-
-            // Snapshot working copy changes so archive results are part of the revision.
-            let status_output = Command::new("jj")
-                .args(["status"])
-                .current_dir(workspace_path)
-                .output()
-                .await
-                .map_err(|e| OrchestratorError::JjCommand(format!("Failed to snapshot: {}", e)))?;
-
-            if !status_output.status.success() {
-                let stderr = String::from_utf8_lossy(&status_output.stderr);
-                return Err(OrchestratorError::JjCommand(format!(
-                    "Failed to snapshot working copy: {}",
-                    stderr
-                )));
-            }
-
-            let describe_output = Command::new("jj")
-                .args(["describe", "-m", &format!("Archive: {}", change_id)])
-                .current_dir(workspace_path)
-                .output()
-                .await
-                .map_err(|e| OrchestratorError::JjCommand(format!("Failed to describe: {}", e)))?;
-
-            if !describe_output.status.success() {
-                let stderr = String::from_utf8_lossy(&describe_output.stderr);
-                return Err(OrchestratorError::JjCommand(format!(
-                    "Failed to describe revision: {}",
-                    stderr
-                )));
-            }
-
-            info!("Committed archive changes for {}", change_id);
-        }
     }
 
     // Get the current revision after archive
     let revision = match vcs_backend {
-        VcsBackend::Jj => {
-            let revision_output = Command::new("jj")
-                .args(["log", "-r", "@", "--no-graph", "-T", "commit_id"])
-                .current_dir(workspace_path)
-                .output()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::JjCommand(format!("Failed to get revision: {}", e))
-                })?;
-
-            if !revision_output.status.success() {
-                let stderr = String::from_utf8_lossy(&revision_output.stderr);
-                return Err(OrchestratorError::JjCommand(format!(
-                    "Failed to get revision: {}",
-                    stderr
-                )));
-            }
-
-            String::from_utf8_lossy(&revision_output.stdout)
-                .trim()
-                .to_string()
-        }
         VcsBackend::Git | VcsBackend::Auto => {
+            debug!(
+                "Executing git command: git rev-parse HEAD (cwd: {:?})",
+                workspace_path
+            );
             let revision_output = Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(workspace_path)
@@ -1249,12 +1145,12 @@ mod tests {
         };
 
         // Should NOT create commit when no progress
-        assert!(!(new_progress_same.completed > old_progress.completed));
+        assert!(new_progress_same.completed <= old_progress.completed);
 
         // Should create commit when progress increased
         assert!(new_progress_increased.completed > old_progress.completed);
 
         // Should NOT create commit when progress decreased (edge case)
-        assert!(!(new_progress_decreased.completed > old_progress.completed));
+        assert!(new_progress_decreased.completed <= old_progress.completed);
     }
 }

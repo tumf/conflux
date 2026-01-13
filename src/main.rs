@@ -162,7 +162,34 @@ async fn main() -> Result<()> {
             }
 
             // Parse VCS backend from CLI option
-            let vcs_override = args.vcs.parse().ok();
+            let vcs_override = match args.vcs.parse::<vcs::VcsBackend>() {
+                Ok(backend) => Some(backend),
+                Err(err) => {
+                    eprintln!("Error: {}", err);
+                    std::process::exit(1);
+                }
+            };
+
+            if args.parallel {
+                let backend = vcs_override.unwrap_or(vcs::VcsBackend::Auto);
+                let git_dir_exists = cli::check_git_directory();
+                let git_available = cli::check_git_available();
+
+                if !git_dir_exists {
+                    let message = if matches!(backend, vcs::VcsBackend::Git) {
+                        "git repository not found (.git directory missing)"
+                    } else {
+                        "Error: --parallel requires a git repository (.git directory not found)"
+                    };
+                    eprintln!("{}", message);
+                    std::process::exit(1);
+                }
+
+                if !git_available {
+                    eprintln!("Error: git command not available");
+                    std::process::exit(1);
+                }
+            }
 
             info!("Starting orchestrator");
             let mut orchestrator = Orchestrator::new(

@@ -1,5 +1,7 @@
-use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+use tracing::debug;
 
 /// OpenSpec Orchestrator - Automate OpenSpec workflow
 #[derive(Parser, Debug)]
@@ -62,7 +64,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub max_iterations: Option<u32>,
 
-    /// Enable parallel execution mode using jj workspaces or git worktrees
+    /// Enable parallel execution mode using git worktrees
     #[arg(long)]
     pub parallel: bool,
 
@@ -74,8 +76,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// VCS backend for parallel execution: auto, jj, or git
-    /// Default: auto (detects jj first, then falls back to git)
+    /// VCS backend for parallel execution: auto or git
+    /// Default: auto (detects git repository)
     #[arg(long, default_value = "auto")]
     pub vcs: String,
 
@@ -186,20 +188,6 @@ pub enum ApproveAction {
     },
 }
 
-/// Check if the current directory is a jj repository
-pub fn check_jj_directory() -> bool {
-    std::path::Path::new(".jj").exists()
-}
-
-/// Check if jj CLI is available
-pub fn check_jj_available() -> bool {
-    std::process::Command::new("jj")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 /// Check if git directory exists
 pub fn check_git_directory() -> bool {
     std::path::Path::new(".git").exists()
@@ -207,6 +195,10 @@ pub fn check_git_directory() -> bool {
 
 /// Check if git CLI is available
 pub fn check_git_available() -> bool {
+    debug!(
+        "Executing git command: git --version (cwd: {:?})",
+        std::env::current_dir().ok()
+    );
     std::process::Command::new("git")
         .arg("--version")
         .output()
@@ -214,10 +206,9 @@ pub fn check_git_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Check if parallel execution is available (jj or git)
+/// Check if parallel execution is available (git)
 pub fn check_parallel_available() -> bool {
-    (check_jj_directory() && check_jj_available())
-        || (check_git_directory() && check_git_available())
+    check_git_directory() && check_git_available()
 }
 
 #[cfg(test)]

@@ -166,7 +166,7 @@ pub async fn create_progress_commit<W: WorkspaceManager + ?Sized>(
         change_id, commit_message
     );
 
-    // Snapshot working copy changes first (important for jj)
+    // Snapshot working copy changes first to capture workspace state.
     workspace_manager
         .snapshot_working_copy(workspace_path)
         .await?;
@@ -206,7 +206,7 @@ pub async fn create_final_commit<W: WorkspaceManager + ?Sized>(
         change_id, commit_message
     );
 
-    // Snapshot working copy changes first (important for jj)
+    // Snapshot working copy changes first to capture workspace state.
     workspace_manager
         .snapshot_working_copy(workspace_path)
         .await?;

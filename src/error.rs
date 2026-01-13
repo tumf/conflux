@@ -47,18 +47,6 @@ pub enum OrchestratorError {
 
     // Legacy error variants kept for backward compatibility
     // These delegate to VcsError internally
-    #[error("jj command failed: {0}")]
-    JjCommand(String),
-
-    #[error("jj conflict detected: {0}")]
-    JjConflict(String),
-
-    /// Reserved for future use when jj availability check fails.
-    /// Currently check_jj_repo returns false instead of this error.
-    #[error("jj not available: {0}")]
-    #[allow(dead_code)] // Kept for future use in stricter jj availability checks
-    JjNotAvailable(String),
-
     #[error("Git command failed: {0}")]
     GitCommand(String),
 
@@ -70,17 +58,12 @@ pub enum OrchestratorError {
     GitUncommittedChanges(String),
 
     #[error("No VCS backend available for parallel execution")]
-    #[allow(dead_code)] // Reserved for future use when both jj and git are unavailable
+    #[allow(dead_code)] // Reserved for future use when git is unavailable
     NoVcsBackend,
 }
 
 #[allow(dead_code)] // Legacy API helpers, kept for backward compatibility
 impl OrchestratorError {
-    /// Create a JjCommand error (legacy, prefer VcsError::jj_command)
-    pub fn jj_command(msg: impl Into<String>) -> Self {
-        OrchestratorError::JjCommand(msg.into())
-    }
-
     /// Create a GitCommand error (legacy, prefer VcsError::git_command)
     pub fn git_command(msg: impl Into<String>) -> Self {
         OrchestratorError::GitCommand(msg.into())
@@ -90,19 +73,14 @@ impl OrchestratorError {
     pub fn from_vcs_error(err: VcsError) -> Self {
         match err {
             VcsError::Command { backend, message } => match backend {
-                VcsBackend::Jj => OrchestratorError::JjCommand(message),
                 VcsBackend::Git => OrchestratorError::GitCommand(message),
                 VcsBackend::Auto => OrchestratorError::Vcs(VcsError::Command { backend, message }),
             },
             VcsError::Conflict { backend, details } => match backend {
-                VcsBackend::Jj => OrchestratorError::JjConflict(details),
                 VcsBackend::Git => OrchestratorError::GitConflict(details),
                 VcsBackend::Auto => OrchestratorError::Vcs(VcsError::Conflict { backend, details }),
             },
-            VcsError::NotAvailable { backend, reason } => match backend {
-                VcsBackend::Jj => OrchestratorError::JjNotAvailable(reason),
-                VcsBackend::Git | VcsBackend::Auto => OrchestratorError::NoVcsBackend,
-            },
+            VcsError::NotAvailable { .. } => OrchestratorError::NoVcsBackend,
             VcsError::UncommittedChanges(msg) => OrchestratorError::GitUncommittedChanges(msg),
             VcsError::NoBackend => OrchestratorError::NoVcsBackend,
             VcsError::Io(e) => OrchestratorError::Io(e),

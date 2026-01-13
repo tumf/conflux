@@ -1277,7 +1277,7 @@ async fn test_vcs_backend_auto_detection_git() {
     let temp_dir = tempfile::tempdir().unwrap();
     let temp_path = temp_dir.path();
 
-    // Initialize git repo (not jj)
+    // Initialize git repo
     if !init_git_repo(temp_path).await {
         println!("Skipping test: git not available");
         return;
@@ -1289,14 +1289,8 @@ async fn test_vcs_backend_auto_detection_git() {
         ".git directory should exist"
     );
 
-    // Verify .jj directory does NOT exist
-    assert!(
-        !temp_path.join(".jj").exists(),
-        ".jj directory should NOT exist"
-    );
-
     // This validates the auto-detection logic: Git should be detected
-    // when .git exists and .jj does not
+    // when .git exists
 }
 
 #[tokio::test]
@@ -1332,24 +1326,4 @@ async fn test_git_worktree_staged_changes_error() {
         "Staged file should be detected with 'A' status"
     );
     assert!(!status.is_empty(), "Repo should have staged changes");
-}
-
-// ============================================================================
-// JJ existing tests verification (ensure no regression)
-// ============================================================================
-
-#[test]
-fn test_jj_tests_structure_exists() {
-    // This test verifies that the jj workspace module exists and has tests
-    // The actual jj tests are in src/jj_workspace.rs and are run via cargo test
-    // This is a placeholder to document that jj tests are expected to pass
-
-    // Verify the test structure expectations:
-    // 1. JjWorkspaceManager should implement WorkspaceManager trait
-    // 2. workspace_status_equality test should exist
-    // 3. manager_creation test should exist
-    // 4. workspace_name_sanitization test should exist
-
-    // These are validated by the compilation of jj_workspace.rs
-    // The test itself validates that the module compiles correctly
 }

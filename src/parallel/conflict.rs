@@ -145,7 +145,6 @@ pub async fn resolve_conflicts_with_retry(
 
     // Return VCS-specific error
     match workspace_manager.backend_type() {
-        VcsBackend::Jj => Err(OrchestratorError::JjConflict(error_msg)),
         VcsBackend::Git | VcsBackend::Auto => Err(OrchestratorError::GitConflict(error_msg)),
     }
 }

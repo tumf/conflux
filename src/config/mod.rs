@@ -73,7 +73,7 @@ pub struct OrchestratorConfig {
     #[serde(default)]
     pub max_iterations: Option<u32>,
 
-    /// Enable parallel execution mode (requires jj).
+    /// Enable parallel execution mode (requires git).
     /// Default: false (off by default)
     #[serde(default)]
     pub parallel_mode: Option<bool>,
@@ -101,9 +101,8 @@ pub struct OrchestratorConfig {
     pub use_llm_analysis: Option<bool>,
 
     /// VCS backend to use for parallel execution.
-    /// Options: "auto" (default), "jj", "git"
-    /// - auto: Automatically detect (jj preferred, then Git)
-    /// - jj: Use jj workspaces (requires jj repository)
+    /// Options: "auto" (default) or "git"
+    /// - auto: Automatically detect Git repository
     /// - git: Use git worktrees (requires clean working directory)
     #[serde(default)]
     pub vcs_backend: Option<VcsBackend>,
@@ -202,7 +201,7 @@ impl OrchestratorConfig {
     }
 
     /// Get the VCS backend to use for parallel execution.
-    /// Default: Auto (automatically detect jj or Git)
+    /// Default: Auto (automatically detect Git)
     pub fn get_vcs_backend(&self) -> VcsBackend {
         self.vcs_backend.unwrap_or(VcsBackend::Auto)
     }
@@ -841,15 +840,6 @@ mod tests {
     }
 
     #[test]
-    fn test_vcs_backend_can_be_set_to_jj() {
-        let config = OrchestratorConfig {
-            vcs_backend: Some(VcsBackend::Jj),
-            ..Default::default()
-        };
-        assert_eq!(config.get_vcs_backend(), VcsBackend::Jj);
-    }
-
-    #[test]
     fn test_vcs_backend_can_be_set_to_git() {
         let config = OrchestratorConfig {
             vcs_backend: Some(VcsBackend::Git),
@@ -879,7 +869,7 @@ mod tests {
             "parallel_mode": true,
             "max_concurrent_workspaces": 6,
             "workspace_base_dir": "/custom/path",
-            "vcs_backend": "jj",
+            "vcs_backend": "git",
             "use_llm_analysis": false
         }"#;
         let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
@@ -887,7 +877,7 @@ mod tests {
         assert!(config.get_parallel_mode());
         assert_eq!(config.get_max_concurrent_workspaces(), 6);
         assert_eq!(config.get_workspace_base_dir(), Some("/custom/path"));
-        assert_eq!(config.get_vcs_backend(), VcsBackend::Jj);
+        assert_eq!(config.get_vcs_backend(), VcsBackend::Git);
         assert!(!config.use_llm_analysis());
     }
 

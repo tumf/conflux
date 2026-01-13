@@ -2,14 +2,17 @@
 //!
 //! Contains helper functions used across TUI modules.
 
-use crate::error::{OrchestratorError, Result};
+use std::path::Path;
+use std::process::Command;
+
 use crossterm::{
     execute,
     terminal::{Clear, ClearType},
 };
-use std::path::Path;
-use std::process::Command;
+use tracing::info;
 use unicode_width::UnicodeWidthStr;
+
+use crate::error::{OrchestratorError, Result};
 
 /// Launch editor in the specified change directory
 ///
@@ -24,6 +27,7 @@ pub fn launch_editor_for_change(change_id: &str) -> Result<()> {
         return Err(OrchestratorError::ChangeNotFound(change_id.to_string()));
     }
 
+    info!("Launching editor: {} (cwd: {:?})", editor, change_dir);
     Command::new(&editor)
         .arg(".")
         .current_dir(&change_dir)

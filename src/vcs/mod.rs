@@ -1,18 +1,16 @@
 //! VCS backend abstraction for parallel execution.
 //!
 //! This module provides a trait-based abstraction for VCS operations,
-//! allowing parallel execution to work with both jj and Git.
+//! allowing parallel execution to work with Git worktrees.
 //!
 //! ## Module Structure
 //!
 //! - `mod.rs` - Public API, traits, and VcsError
 //! - `commands.rs` - Common command execution helpers
-//! - `jj/` - Jujutsu-specific implementation
 //! - `git/` - Git-specific implementation
 
 pub mod commands;
 pub mod git;
-pub mod jj;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -53,27 +51,11 @@ pub enum VcsError {
 }
 
 impl VcsError {
-    /// Create a command error for jj backend.
-    pub fn jj_command(message: impl Into<String>) -> Self {
-        VcsError::Command {
-            backend: VcsBackend::Jj,
-            message: message.into(),
-        }
-    }
-
     /// Create a command error for Git backend.
     pub fn git_command(message: impl Into<String>) -> Self {
         VcsError::Command {
             backend: VcsBackend::Git,
             message: message.into(),
-        }
-    }
-
-    /// Create a conflict error for jj backend.
-    pub fn jj_conflict(details: impl Into<String>) -> Self {
-        VcsError::Conflict {
-            backend: VcsBackend::Jj,
-            details: details.into(),
         }
     }
 
@@ -93,11 +75,9 @@ pub type VcsResult<T> = std::result::Result<T, VcsError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum VcsBackend {
-    /// Automatically detect VCS (jj preferred, then Git)
+    /// Automatically detect VCS (Git worktree)
     #[default]
     Auto,
-    /// jj (Jujutsu) VCS
-    Jj,
     /// Git VCS
     Git,
 }
@@ -106,7 +86,6 @@ impl std::fmt::Display for VcsBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VcsBackend::Auto => write!(f, "auto"),
-            VcsBackend::Jj => write!(f, "jj"),
             VcsBackend::Git => write!(f, "git"),
         }
     }
@@ -118,17 +97,16 @@ impl std::str::FromStr for VcsBackend {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "auto" => Ok(VcsBackend::Auto),
-            "jj" => Ok(VcsBackend::Jj),
             "git" => Ok(VcsBackend::Git),
             _ => Err(format!(
-                "Invalid VCS backend: {}. Valid values: auto, jj, git",
+                "Invalid VCS backend: {}. Valid values: auto, git",
                 s
             )),
         }
     }
 }
 
-/// Status of a workspace (shared between jj and Git implementations)
+/// Status of a workspace (shared between VCS implementations)
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)] // Variants used in workspace state tracking
 pub enum WorkspaceStatus {
@@ -181,7 +159,7 @@ pub struct WorkspaceInfo {
 /// Trait for VCS workspace management.
 ///
 /// This trait abstracts VCS-specific operations needed for parallel execution,
-/// allowing both jj and Git backends to be used interchangeably.
+/// allowing Git worktrees to be used interchangeably.
 #[async_trait]
 #[allow(dead_code)] // Some trait methods are reserved for future use
 pub trait WorkspaceManager: Send + Sync {
@@ -193,7 +171,6 @@ pub trait WorkspaceManager: Send + Sync {
 
     /// Prepare for parallel execution.
     ///
-    /// For jj: Creates a snapshot of working copy changes.
     /// For Git: Verifies working directory is clean (returns error if not).
     async fn prepare_for_parallel(&self) -> VcsResult<()>;
 
@@ -234,19 +211,16 @@ pub trait WorkspaceManager: Send + Sync {
 
     /// Snapshot working copy changes.
     ///
-    /// For jj: Runs `jj status` to trigger automatic snapshotting.
     /// For Git: No-op (Git doesn't auto-snapshot).
     async fn snapshot_working_copy(&self, workspace_path: &Path) -> VcsResult<()>;
 
     /// Set the commit message for a workspace.
     ///
-    /// For jj: `jj describe -m <message>`
     /// For Git: `git commit --amend -m <message>` (if there's a commit)
     async fn set_commit_message(&self, workspace_path: &Path, message: &str) -> VcsResult<()>;
 
     /// Create an iteration snapshot with WIP commit message.
     ///
-    /// For jj: Snapshot working copy and set WIP message with iteration number.
     /// For Git: Stage all changes and create/amend WIP commit with iteration number.
     async fn create_iteration_snapshot(
         &self,
@@ -259,7 +233,6 @@ pub trait WorkspaceManager: Send + Sync {
 
     /// Squash all WIP snapshots into a single Apply commit.
     ///
-    /// For jj: Use `jj squash` to combine WIP commits.
     /// For Git: Use `git reset --soft` and `git commit` to squash.
     async fn squash_wip_commits(
         &self,
@@ -270,7 +243,6 @@ pub trait WorkspaceManager: Send + Sync {
 
     /// Get the current revision in a workspace.
     ///
-    /// For jj: `jj log -r @ -T change_id`
     /// For Git: `git rev-parse HEAD`
     async fn get_revision_in_workspace(&self, workspace_path: &Path) -> VcsResult<String>;
 
@@ -315,9 +287,8 @@ pub trait WorkspaceManager: Send + Sync {
 ///
 /// Detection order:
 /// 1. If explicit backend is specified (not Auto), use that
-/// 2. Check for .jj directory → jj backend
-/// 3. Check for .git directory → Git backend
-/// 4. Return error if no VCS found
+/// 2. Check for .git directory → Git backend
+/// 3. Return error if no VCS found
 #[allow(dead_code)] // Reserved for future use in workspace initialization
 pub async fn detect_vcs_backend<P: AsRef<Path>>(
     requested: VcsBackend,
@@ -326,15 +297,6 @@ pub async fn detect_vcs_backend<P: AsRef<Path>>(
     let cwd = cwd.as_ref();
 
     match requested {
-        VcsBackend::Jj => {
-            // Explicit jj requested, verify it's available
-            if jj::commands::check_jj_repo(cwd).await? {
-                info!("Using explicitly requested jj backend");
-                Ok(VcsBackend::Jj)
-            } else {
-                Err(VcsError::NoBackend)
-            }
-        }
         VcsBackend::Git => {
             // Explicit Git requested, verify it's available
             if git::commands::check_git_repo(cwd).await? {
@@ -345,30 +307,21 @@ pub async fn detect_vcs_backend<P: AsRef<Path>>(
             }
         }
         VcsBackend::Auto => {
-            // Auto-detect: jj first, then Git
+            // Auto-detect: Git only
             debug!("Auto-detecting VCS backend...");
 
-            // Check for jj first (preferred)
-            if jj::commands::check_jj_repo(cwd).await? {
-                info!("Auto-detected jj backend");
-                return Ok(VcsBackend::Jj);
-            }
-
-            // Check for Git
             if git::commands::check_git_repo(cwd).await? {
                 info!("Auto-detected Git backend");
-                return Ok(VcsBackend::Git);
+                Ok(VcsBackend::Git)
+            } else {
+                Err(VcsError::NoBackend)
             }
-
-            // No VCS found
-            Err(VcsError::NoBackend)
         }
     }
 }
 
 // Re-export workspace managers for convenience
 pub use git::GitWorkspaceManager;
-pub use jj::JjWorkspaceManager;
 
 #[cfg(test)]
 mod tests {
@@ -377,17 +330,14 @@ mod tests {
     #[test]
     fn test_vcs_backend_from_str() {
         assert_eq!("auto".parse::<VcsBackend>().unwrap(), VcsBackend::Auto);
-        assert_eq!("jj".parse::<VcsBackend>().unwrap(), VcsBackend::Jj);
         assert_eq!("git".parse::<VcsBackend>().unwrap(), VcsBackend::Git);
         assert_eq!("Git".parse::<VcsBackend>().unwrap(), VcsBackend::Git);
-        assert_eq!("JJ".parse::<VcsBackend>().unwrap(), VcsBackend::Jj);
         assert!("invalid".parse::<VcsBackend>().is_err());
     }
 
     #[test]
     fn test_vcs_backend_display() {
         assert_eq!(VcsBackend::Auto.to_string(), "auto");
-        assert_eq!(VcsBackend::Jj.to_string(), "jj");
         assert_eq!(VcsBackend::Git.to_string(), "git");
     }
 
@@ -403,29 +353,11 @@ mod tests {
 
     #[test]
     fn test_vcs_error_constructors() {
-        let err = VcsError::jj_command("test error");
-        assert!(matches!(
-            err,
-            VcsError::Command {
-                backend: VcsBackend::Jj,
-                ..
-            }
-        ));
-
         let err = VcsError::git_command("test error");
         assert!(matches!(
             err,
             VcsError::Command {
                 backend: VcsBackend::Git,
-                ..
-            }
-        ));
-
-        let err = VcsError::jj_conflict("conflict details");
-        assert!(matches!(
-            err,
-            VcsError::Conflict {
-                backend: VcsBackend::Jj,
                 ..
             }
         ));
@@ -451,10 +383,6 @@ mod tests {
     #[test]
     fn test_vcs_backend_serialization() {
         // Test serde serialization for config files
-        let backend = VcsBackend::Jj;
-        let json = serde_json::to_string(&backend).unwrap();
-        assert_eq!(json, "\"jj\"");
-
         let backend = VcsBackend::Git;
         let json = serde_json::to_string(&backend).unwrap();
         assert_eq!(json, "\"git\"");
@@ -466,9 +394,6 @@ mod tests {
 
     #[test]
     fn test_vcs_backend_deserialization() {
-        let jj: VcsBackend = serde_json::from_str("\"jj\"").unwrap();
-        assert_eq!(jj, VcsBackend::Jj);
-
         let git: VcsBackend = serde_json::from_str("\"git\"").unwrap();
         assert_eq!(git, VcsBackend::Git);
 

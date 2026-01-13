@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 use super::events::{LogEntry, OrchestratorEvent, TuiCommand};
 use super::orchestrator::{run_orchestrator, run_orchestrator_parallel};
@@ -378,7 +379,7 @@ async fn run_tui_loop(
                             app.scroll_logs_to_bottom();
                         }
                         (KeyCode::Char('='), _) => {
-                            // Toggle parallel mode (only if jj is available)
+                            // Toggle parallel mode (only if git is available)
                             app.toggle_parallel_mode();
                         }
                         (KeyCode::Char('+'), _) => {
@@ -527,6 +528,7 @@ async fn run_tui_loop(
                         execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
 
                         // Execute the propose command
+                        info!("Running propose command: sh -c {}", command);
                         let status = std::process::Command::new("sh")
                             .arg("-c")
                             .arg(&command)
