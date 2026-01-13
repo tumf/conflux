@@ -1,6 +1,7 @@
 use crate::agent::AgentRunner;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::execution::apply::{check_task_progress, create_progress_commit, is_progress_complete};
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::{
@@ -9,7 +10,8 @@ use crate::orchestration::{
 };
 use crate::parallel_run_service::ParallelRunService;
 use crate::progress::ProgressDisplay;
-use crate::vcs::VcsBackend;
+use crate::vcs::git::commands as git_commands;
+use crate::vcs::{GitWorkspaceManager, VcsBackend, WorkspaceManager};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
@@ -413,11 +415,35 @@ impl Orchestrator {
 
                 match apply_change(&next, &mut self.agent, &self.hooks, &apply_ctx, &output).await {
                     Ok(ApplyResult::Success) => {
+                        let progress_snapshot = match self
+                            .snapshot_serial_iteration(&next.id, new_apply_count)
+                            .await
+                        {
+                            Ok(progress) => progress,
+                            Err(e) => {
+                                warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
+                                crate::task_parser::TaskProgress::default()
+                            }
+                        };
+
+                        if is_progress_complete(&progress_snapshot) {
+                            let _ = self
+                                .squash_serial_wip_commits(&next.id, new_apply_count)
+                                .await;
+                        }
+
                         if let Some(progress) = &mut self.progress {
                             progress.complete_change(&next.id);
                         }
                     }
                     Ok(ApplyResult::Failed { error }) => {
+                        if let Err(e) = self
+                            .snapshot_serial_iteration(&next.id, new_apply_count)
+                            .await
+                        {
+                            warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
+                        }
+
                         error!("Apply failed for {}: {}", next.id, error);
                         if let Some(progress) = &mut self.progress {
                             progress.error(&format!("Apply failed: {}", next.id));
@@ -447,6 +473,89 @@ impl Orchestrator {
             .await?;
 
         info!("Orchestration completed");
+        Ok(())
+    }
+
+    async fn snapshot_serial_iteration(
+        &self,
+        change_id: &str,
+        iteration: u32,
+    ) -> Result<crate::task_parser::TaskProgress> {
+        let repo_root = std::env::current_dir()?;
+        let progress = check_task_progress(&repo_root, change_id).unwrap_or_default();
+
+        if matches!(self.vcs_backend, VcsBackend::Git | VcsBackend::Auto) {
+            let is_git_repo = match git_commands::check_git_repo(&repo_root).await {
+                Ok(is_repo) => is_repo,
+                Err(e) => {
+                    warn!("Failed to check Git repository status: {}", e);
+                    false
+                }
+            };
+
+            if is_git_repo {
+                let workspace_manager = GitWorkspaceManager::new(
+                    repo_root.join(".openspec-worktrees"),
+                    repo_root.clone(),
+                    1,
+                    self.config.clone(),
+                );
+
+                if let Err(e) = create_progress_commit(
+                    &workspace_manager,
+                    &repo_root,
+                    change_id,
+                    &progress,
+                    iteration,
+                )
+                .await
+                {
+                    warn!(
+                        "Failed to create WIP commit for {} (apply#{}): {}",
+                        change_id, iteration, e
+                    );
+                }
+            }
+        }
+
+        Ok(progress)
+    }
+
+    async fn squash_serial_wip_commits(&self, change_id: &str, iteration: u32) -> Result<()> {
+        if !matches!(self.vcs_backend, VcsBackend::Git | VcsBackend::Auto) {
+            return Ok(());
+        }
+
+        let repo_root = std::env::current_dir()?;
+        let is_git_repo = match git_commands::check_git_repo(&repo_root).await {
+            Ok(is_repo) => is_repo,
+            Err(e) => {
+                warn!("Failed to check Git repository status: {}", e);
+                false
+            }
+        };
+
+        if !is_git_repo {
+            return Ok(());
+        }
+
+        let workspace_manager = GitWorkspaceManager::new(
+            repo_root.join(".openspec-worktrees"),
+            repo_root.clone(),
+            1,
+            self.config.clone(),
+        );
+
+        if let Err(e) = workspace_manager
+            .squash_wip_commits(&repo_root, change_id, iteration)
+            .await
+        {
+            warn!(
+                "Failed to squash WIP commits for {} (apply#{}): {}",
+                change_id, iteration, e
+            );
+        }
+
         Ok(())
     }
 
