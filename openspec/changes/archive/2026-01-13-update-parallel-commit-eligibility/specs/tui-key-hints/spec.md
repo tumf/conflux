@@ -1,6 +1,6 @@
 # tui-key-hints Spec Delta
 
-## MODIFIED Requirements
+## ADDED Requirements
 ### Requirement: 未コミット change の操作ヒントを非表示にする
 並列モードで未コミットの change が選択中の場合、Changes パネルのキーヒントは選択・承認に関する操作を表示してはならない（SHALL）。
 

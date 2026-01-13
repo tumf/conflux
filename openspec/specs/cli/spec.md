@@ -465,6 +465,11 @@ The TUI SHALL correctly calculate and truncate text based on Unicode display wid
 - **THEN** emoji characters are counted with their proper display width
 - **AND** truncation does not split emoji sequences
 
+#### Scenario: ANSI control codes are stripped before display
+- **WHEN** a log message contains ANSI control sequences (e.g., "\x1b[96mRead\x1b[0m")
+- **THEN** the log panel displays the message without those control sequences (e.g., "Read")
+- **AND** display width calculation and truncation operate on the stripped text
+
 ### Requirement: Native Task Progress Parsing
 
 The system SHALL provide native change list discovery by directly reading the filesystem instead of relying on external commands.

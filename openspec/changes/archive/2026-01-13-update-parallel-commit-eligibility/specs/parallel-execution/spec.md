@@ -1,6 +1,6 @@
 # parallel-execution Spec Delta
 
-## MODIFIED Requirements
+## ADDED Requirements
 ### Requirement: 並列モードのコミット起点対象判定
 並列モードは、`HEAD` のコミットツリーに存在する change だけを実行対象として扱わなければならない（SHALL）。
 
