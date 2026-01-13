@@ -23,6 +23,17 @@ This document maps specification scenarios to their corresponding test implement
 
 ---
 
+## Testing Specification (`openspec/specs/testing/spec.md`)
+
+### Requirement: 仕様ベーステスト
+
+| Scenario | Test | Status |
+|----------|------|--------|
+| TUI描画のバッファ検査 | `src/tui/render.rs::test_render_select_mode_footer_message` | ✅ NEW |
+| 端末サイズ不足の警告描画 | `src/tui/render.rs::test_render_shows_small_terminal_warning` | ✅ NEW |
+
+---
+
 ## Hooks Specification (`openspec/specs/hooks/spec.md`)
 
 ### Requirement: on_queue_add hook
@@ -512,7 +523,12 @@ This document maps specification scenarios to their corresponding test implement
 - `test_cursor_navigation_with_empty_list` - empty cursor
 - `test_toggle_selection_with_empty_list` - empty toggle
 
+### tui/render.rs (+2 tests)
+- `test_render_shows_small_terminal_warning` - terminal size warning
+- `test_render_select_mode_footer_message` - footer text rendering
+
 ### approval.rs (+18 tests)
+
 - `test_approved_file_is_md5sum_compatible_format` - md5sum format
 - `test_compute_md5_produces_32_char_hex` - hex output
 - `test_compute_md5_same_content_same_hash` - same content hash
@@ -535,9 +551,9 @@ This document maps specification scenarios to their corresponding test implement
 ## Remaining Gaps
 
 ### UI Rendering Tests
-UI rendering code in `tui.rs` is difficult to unit test due to ratatui dependencies.
-Consider:
-- Snapshot testing for UI components
+TUI rendering now has TestBackend buffer checks in `src/tui/render.rs`.
+Consider extending with:
+- Snapshot testing for more complex UI layouts
 - Integration tests with mock terminal
 - Manual testing for visual verification
 
