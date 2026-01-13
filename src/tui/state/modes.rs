@@ -32,6 +32,26 @@ impl AppState {
         } else {
             "disabled"
         };
+
+        if self.parallel_mode {
+            let mut removed = Vec::new();
+            for change in &mut self.changes {
+                if !change.is_parallel_eligible && change.selected {
+                    change.selected = false;
+                    if matches!(change.queue_status, QueueStatus::Queued) {
+                        change.queue_status = QueueStatus::NotQueued;
+                    }
+                    removed.push(change.id.clone());
+                }
+            }
+            if !removed.is_empty() {
+                self.warning_message = Some(format!(
+                    "Removed uncommitted changes from queue in parallel mode: {}",
+                    removed.join(", ")
+                ));
+            }
+        }
+
         self.add_log(LogEntry::info(format!("Parallel mode {}", status)));
         true
     }
@@ -57,6 +77,22 @@ impl AppState {
             .filter(|c| c.selected)
             .map(|c| c.id.clone())
             .collect();
+
+        if self.parallel_mode {
+            let ineligible: Vec<String> = self
+                .changes
+                .iter()
+                .filter(|c| c.selected && !c.is_parallel_eligible)
+                .map(|c| c.id.clone())
+                .collect();
+            if !ineligible.is_empty() {
+                self.warning_message = Some(format!(
+                    "Parallel mode requires committed changes. Uncommitted: {}",
+                    ineligible.join(", ")
+                ));
+                return None;
+            }
+        }
 
         if selected.is_empty() {
             self.warning_message = Some("No changes selected".to_string());

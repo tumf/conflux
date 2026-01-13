@@ -27,6 +27,8 @@ pub struct ChangeState {
     pub last_modified: String,
     /// Whether this change is approved for execution
     pub is_approved: bool,
+    /// Whether this change is eligible for parallel execution
+    pub is_parallel_eligible: bool,
     /// When processing started for this change
     pub started_at: Option<Instant>,
     /// Elapsed time when processing finished (for display after completion)
@@ -45,6 +47,7 @@ impl ChangeState {
             queue_status: QueueStatus::NotQueued,
             last_modified: change.last_modified.clone(),
             is_approved: change.is_approved,
+            is_parallel_eligible: true,
             started_at: None,
             elapsed_time: None,
         }
@@ -89,6 +92,7 @@ mod tests {
             is_new: false,
             last_modified: "now".to_string(),
             is_approved: false,
+            is_parallel_eligible: true,
             started_at: None,
             elapsed_time: None,
         };
@@ -118,6 +122,7 @@ mod tests {
         assert!(!state.is_new);
         assert_eq!(state.queue_status, QueueStatus::NotQueued);
         assert!(state.is_approved);
+        assert!(state.is_parallel_eligible);
     }
 
     #[test]
@@ -131,6 +136,7 @@ mod tests {
             is_new: false,
             last_modified: "now".to_string(),
             is_approved: false,
+            is_parallel_eligible: true,
             started_at: None,
             elapsed_time: None,
         };
@@ -151,6 +157,7 @@ mod tests {
             is_new: false,
             last_modified: "now".to_string(),
             is_approved: false,
+            is_parallel_eligible: true,
             started_at: None,
             elapsed_time: None,
         };

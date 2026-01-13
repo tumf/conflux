@@ -55,6 +55,37 @@ impl ParallelRunService {
         Ok(crate::cli::check_parallel_available())
     }
 
+    async fn filter_committed_changes(
+        &self,
+        changes: Vec<Change>,
+    ) -> Result<(Vec<Change>, Vec<String>)> {
+        let committed_change_ids: HashSet<String> =
+            match crate::vcs::git::commands::list_changes_in_head(&self.repo_root).await {
+                Ok(ids) => ids.into_iter().collect(),
+                Err(err) => {
+                    warn!(
+                        "Failed to load committed change snapshot; assuming all changes are committed: {}",
+                        err
+                    );
+                    return Ok((changes, Vec::new()));
+                }
+            };
+
+        let mut committed = Vec::new();
+        let mut skipped = Vec::new();
+
+        for change in changes {
+            if committed_change_ids.contains(&change.id) {
+                committed.push(change);
+            } else {
+                skipped.push(change.id);
+            }
+        }
+
+        skipped.sort();
+        Ok((committed, skipped))
+    }
+
     /// Run parallel execution with an event callback
     ///
     /// The event_handler receives ParallelEvents as they occur during execution.
@@ -63,6 +94,25 @@ impl ParallelRunService {
     where
         F: Fn(ParallelEvent) + Send + Sync + 'static,
     {
+        let (changes, skipped) = self.filter_committed_changes(changes).await?;
+
+        if !skipped.is_empty() {
+            let message = format!(
+                "Skipping uncommitted changes in parallel mode: {}",
+                skipped.join(", ")
+            );
+            warn!("{}", message);
+            event_handler(ParallelEvent::Warning {
+                title: "Uncommitted changes skipped".to_string(),
+                message,
+            });
+        }
+
+        if changes.is_empty() {
+            info!("No committed changes available for parallel execution");
+            return Ok(());
+        }
+
         info!("Starting parallel execution for {} changes", changes.len());
 
         // Group changes - try LLM analysis first, fall back to declarative dependencies

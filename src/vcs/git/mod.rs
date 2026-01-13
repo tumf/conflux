@@ -233,13 +233,46 @@ impl GitWorkspaceManager {
 
     /// Cleanup a single worktree (remove worktree + delete branch)
     pub async fn cleanup_worktree(&mut self, workspace_name: &str) -> VcsResult<()> {
-        let workspace = self
-            .workspaces
-            .iter()
-            .find(|w| w.name == workspace_name)
-            .cloned();
+        let mut workspace_path = None;
+        let mut change_id = None;
 
-        let Some(workspace) = workspace else {
+        if let Some(workspace) = self.workspaces.iter().find(|w| w.name == workspace_name) {
+            workspace_path = Some(workspace.path.clone());
+            change_id = Some(workspace.change_id.clone());
+        }
+
+        if workspace_path.is_none() {
+            if let Some(info) = self.find_worktree_by_name(workspace_name).await? {
+                workspace_path = Some(info.path);
+                change_id = Some(info.change_id);
+            }
+        }
+
+        if workspace_path.is_none() {
+            if let Some(extracted_change_id) =
+                Self::extract_change_id_from_worktree_name(workspace_name)
+            {
+                let candidates = self
+                    .find_all_worktrees_for_change(&extracted_change_id)
+                    .await?;
+                if let Some(matching) = candidates
+                    .iter()
+                    .find(|candidate| candidate.workspace_name == workspace_name)
+                {
+                    workspace_path = Some(matching.path.clone());
+                    change_id = Some(matching.change_id.clone());
+                } else if let Some(newest) = candidates.first() {
+                    warn!(
+                        "Worktree '{}' not found in tracked list; using newest worktree '{}' for change '{}'",
+                        workspace_name, newest.workspace_name, extracted_change_id
+                    );
+                    workspace_path = Some(newest.path.clone());
+                    change_id = Some(newest.change_id.clone());
+                }
+            }
+        }
+
+        let Some(worktree_path) = workspace_path else {
             warn!("Worktree '{}' not found for cleanup", workspace_name);
             return Ok(());
         };
@@ -247,16 +280,16 @@ impl GitWorkspaceManager {
         info!("Cleaning up worktree '{}'", workspace_name);
 
         // Remove worktree
-        if workspace.path.exists() {
+        if worktree_path.exists() {
             if let Err(e) =
-                commands::worktree_remove(&self.repo_root, workspace.path.to_str().unwrap()).await
+                commands::worktree_remove(&self.repo_root, worktree_path.to_str().unwrap()).await
             {
                 warn!("Failed to remove worktree '{}': {}", workspace_name, e);
                 // Try force removal via filesystem
-                if let Err(e) = std::fs::remove_dir_all(&workspace.path) {
+                if let Err(e) = std::fs::remove_dir_all(&worktree_path) {
                     warn!(
                         "Failed to force remove worktree directory {:?}: {}",
-                        workspace.path, e
+                        worktree_path, e
                     );
                 }
             }
@@ -271,9 +304,16 @@ impl GitWorkspaceManager {
         }
 
         // Update status
-        self.update_git_workspace_status(workspace_name, WorkspaceStatus::Cleaned);
-
-        debug!("Worktree '{}' cleaned up", workspace_name);
+        if let Some(change_id) = change_id {
+            self.update_git_workspace_status(workspace_name, WorkspaceStatus::Cleaned);
+            debug!(
+                "Worktree '{}' cleaned up for change '{}'",
+                workspace_name, change_id
+            );
+        } else {
+            self.update_git_workspace_status(workspace_name, WorkspaceStatus::Cleaned);
+            debug!("Worktree '{}' cleaned up", workspace_name);
+        }
         Ok(())
     }
 
@@ -326,6 +366,70 @@ impl GitWorkspaceManager {
 
         // Fallback: return everything after "ws-" (worktree might not have suffix)
         Some(without_prefix.to_string())
+    }
+
+    /// Find a worktree by branch name (workspace name).
+    async fn find_worktree_by_name(
+        &self,
+        workspace_name: &str,
+    ) -> VcsResult<Option<WorkspaceInfo>> {
+        let output =
+            commands::run_git(&["worktree", "list", "--porcelain"], &self.repo_root).await?;
+        let mut current_worktree_path: Option<PathBuf> = None;
+        let mut current_branch: Option<String> = None;
+
+        for line in output.lines() {
+            if let Some(worktree_path) = line.strip_prefix("worktree ") {
+                current_worktree_path = Some(PathBuf::from(worktree_path));
+            } else if let Some(branch_name) = line.strip_prefix("branch refs/heads/") {
+                current_branch = Some(branch_name.to_string());
+            } else if line.is_empty() {
+                if let (Some(path), Some(branch)) = (&current_worktree_path, &current_branch) {
+                    if branch == workspace_name {
+                        let last_modified = if path.exists() {
+                            path.metadata()
+                                .and_then(|m| m.modified())
+                                .unwrap_or(SystemTime::UNIX_EPOCH)
+                        } else {
+                            SystemTime::UNIX_EPOCH
+                        };
+                        let change_id = Self::extract_change_id_from_worktree_name(branch)
+                            .unwrap_or_else(|| workspace_name.to_string());
+                        return Ok(Some(WorkspaceInfo {
+                            path: path.clone(),
+                            change_id,
+                            workspace_name: branch.clone(),
+                            last_modified,
+                        }));
+                    }
+                }
+
+                current_worktree_path = None;
+                current_branch = None;
+            }
+        }
+
+        if let (Some(path), Some(branch)) = (&current_worktree_path, &current_branch) {
+            if branch == workspace_name {
+                let last_modified = if path.exists() {
+                    path.metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(SystemTime::UNIX_EPOCH)
+                } else {
+                    SystemTime::UNIX_EPOCH
+                };
+                let change_id = Self::extract_change_id_from_worktree_name(branch)
+                    .unwrap_or_else(|| workspace_name.to_string());
+                return Ok(Some(WorkspaceInfo {
+                    path: path.clone(),
+                    change_id,
+                    workspace_name: branch.clone(),
+                    last_modified,
+                }));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Find all existing worktrees for the given change_id.

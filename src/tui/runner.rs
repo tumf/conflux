@@ -14,12 +14,13 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::DefaultTerminal;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::events::{LogEntry, OrchestratorEvent, TuiCommand};
 use super::orchestrator::{run_orchestrator, run_orchestrator_parallel};
@@ -83,7 +84,21 @@ async fn run_tui_loop(
 ) -> Result<()> {
     use crate::openspec;
 
+    let repo_root = std::env::current_dir()?;
+    let committed_change_ids: HashSet<String> =
+        match crate::vcs::git::commands::list_changes_in_head(&repo_root).await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(err) => {
+                warn!("Failed to load committed change snapshot: {}", err);
+                initial_changes
+                    .iter()
+                    .map(|change| change.id.clone())
+                    .collect()
+            }
+        };
+
     let mut app = AppState::new(initial_changes);
+    app.apply_parallel_eligibility(&committed_change_ids);
     app.max_concurrent = config.get_max_concurrent_workspaces();
     app.web_url = web_url;
     let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(100);
@@ -98,6 +113,7 @@ async fn run_tui_loop(
     // Start auto-refresh task
     let refresh_tx = tx.clone();
     let refresh_cancel = cancel_token.clone();
+    let refresh_repo_root = repo_root.clone();
     let refresh_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS));
         loop {
@@ -108,8 +124,20 @@ async fn run_tui_loop(
                 _ = interval.tick() => {
                     match openspec::list_changes_native() {
                         Ok(changes) => {
+                            let committed_change_ids: HashSet<String> =
+                                match crate::vcs::git::commands::list_changes_in_head(&refresh_repo_root).await {
+                                    Ok(ids) => ids.into_iter().collect(),
+                                    Err(err) => {
+                                        warn!("Failed to refresh committed change snapshot: {}", err);
+                                        changes.iter().map(|change| change.id.clone()).collect()
+                                    }
+                                };
+
                             if refresh_tx
-                                .send(OrchestratorEvent::ChangesRefreshed(changes))
+                                .send(OrchestratorEvent::ChangesRefreshed {
+                                    changes,
+                                    committed_change_ids,
+                                })
                                 .await
                                 .is_err()
                             {
