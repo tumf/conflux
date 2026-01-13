@@ -863,6 +863,49 @@ fn render_qr_popup(frame: &mut Frame, app: &AppState, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openspec::Change;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
+
+    fn create_test_change(id: &str, is_approved: bool) -> Change {
+        Change {
+            id: id.to_string(),
+            completed_tasks: 0,
+            total_tasks: 3,
+            last_modified: "now".to_string(),
+            is_approved,
+            dependencies: Vec::new(),
+        }
+    }
+
+    fn create_test_app(changes: Vec<Change>) -> AppState {
+        let mut app = AppState::new(changes);
+        app.logs.clear();
+        app.parallel_available = false;
+        app.parallel_mode = false;
+        app.web_url = None;
+        app
+    }
+
+    fn render_buffer(app: &mut AppState, width: u16, height: u16) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal init");
+        terminal.draw(|frame| render(frame, app)).expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_to_string(buffer: &Buffer) -> String {
+        let mut lines = Vec::new();
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            lines.push(line);
+        }
+        lines.join("\n")
+    }
 
     #[test]
     fn test_get_checkbox_display_archived_always_gray() {
@@ -920,5 +963,22 @@ mod tests {
         let (text, color) = get_checkbox_display(&QueueStatus::Completed, true, true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
+    }
+
+    #[test]
+    fn test_render_shows_small_terminal_warning() {
+        let mut app = create_test_app(Vec::new());
+        let buffer = render_buffer(&mut app, 50, 10);
+        let content = buffer_to_string(&buffer);
+        assert!(content.contains("Terminal too small. Minimum: 60x15"));
+    }
+
+    #[test]
+    fn test_render_select_mode_footer_message() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(content.contains("OpenSpec Orchestrator"));
+        assert!(content.contains("Press F5 to start processing"));
     }
 }

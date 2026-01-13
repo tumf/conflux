@@ -1,5 +1,4 @@
 use crate::agent::AgentRunner;
-use crate::analyzer::ParallelGroup;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::hooks::{HookContext, HookRunner, HookType};
@@ -575,130 +574,47 @@ impl Orchestrator {
         let mut service = ParallelRunService::new(repo_root.clone(), self.config.clone());
         service.set_no_resume(self.no_resume);
 
-        // Check if VCS is available for true parallel execution
-        match service.check_vcs_available().await {
-            Ok(true) => {
-                info!("jj available, executing changes in parallel using workspaces");
-
-                // Run with a simple logging event handler for CLI mode
-                service
-                    .run_parallel(approved, |event| {
-                        // Log events for CLI mode (no TUI)
-                        use crate::parallel::ParallelEvent;
-                        match event {
-                            ParallelEvent::GroupStarted { group_id, changes } => {
-                                info!("Starting group {} with {} changes", group_id, changes.len());
-                            }
-                            ParallelEvent::GroupCompleted { group_id } => {
-                                info!("Group {} completed", group_id);
-                            }
-                            ParallelEvent::ApplyCompleted { change_id, .. } => {
-                                info!("Apply completed for {}", change_id);
-                            }
-                            ParallelEvent::ApplyFailed { change_id, error } => {
-                                error!("Apply failed for {}: {}", change_id, error);
-                            }
-                            ParallelEvent::ChangeArchived(change_id) => {
-                                info!("Archived {}", change_id);
-                            }
-                            ParallelEvent::AllCompleted => {
-                                info!("All parallel execution completed");
-                            }
-                            ParallelEvent::Error { message } => {
-                                error!("Parallel execution error: {}", message);
-                            }
-                            _ => {}
-                        }
-                    })
-                    .await?;
-            }
-            Ok(false) | Err(_) => {
-                warn!("jj not available, falling back to sequential execution");
-                let groups = ParallelRunService::group_by_dependencies(&approved);
-                self.run_sequential(&approved, groups).await?;
-            }
+        // Check if Git is available for true parallel execution
+        if !service.check_vcs_available().await? {
+            return Err(OrchestratorError::GitCommand(
+                "Git repository not available for parallel execution".to_string(),
+            ));
         }
 
-        Ok(())
-    }
+        info!("Git available, executing changes in parallel using worktrees");
 
-    async fn run_sequential(
-        &mut self,
-        approved: &[Change],
-        groups: Vec<ParallelGroup>,
-    ) -> Result<()> {
-        let total_changes = approved.len();
-        let output = LogOutputHandler::new();
-
-        for group in groups {
-            info!("Processing group {} sequentially", group.id);
-            for change_id in group.changes {
-                if let Some(change) = approved.iter().find(|c| c.id == change_id) {
-                    info!("Processing change: {}", change.id);
-                    let apply_count = *self.apply_counts.get(&change.id).unwrap_or(&0);
-                    let remaining_changes = approved
-                        .iter()
-                        .filter(|c| !self.completed_change_ids.contains(&c.id))
-                        .count();
-
-                    if change.is_complete() {
-                        let archive_ctx = ArchiveContext::new(
-                            self.changes_processed,
-                            total_changes,
-                            remaining_changes,
-                            apply_count,
-                        );
-                        match archive_change(
-                            change,
-                            &mut self.agent,
-                            &self.hooks,
-                            &archive_ctx,
-                            &output,
-                        )
-                        .await?
-                        {
-                            ArchiveResult::Success => {
-                                self.changes_processed += 1;
-                                self.completed_change_ids.insert(change.id.clone());
-                            }
-                            ArchiveResult::Failed { error } => {
-                                return Err(OrchestratorError::AgentCommand(error));
-                            }
-                            ArchiveResult::Cancelled => {
-                                return Ok(());
-                            }
-                        }
-                    } else {
-                        let new_apply_count = apply_count + 1;
-                        self.apply_counts.insert(change.id.clone(), new_apply_count);
-
-                        let apply_ctx = ApplyContext::new(
-                            self.changes_processed,
-                            total_changes,
-                            remaining_changes,
-                            new_apply_count,
-                        );
-                        match apply_change(
-                            change,
-                            &mut self.agent,
-                            &self.hooks,
-                            &apply_ctx,
-                            &output,
-                        )
-                        .await?
-                        {
-                            ApplyResult::Success => {}
-                            ApplyResult::Failed { error } => {
-                                return Err(OrchestratorError::AgentCommand(error));
-                            }
-                            ApplyResult::Cancelled => {
-                                return Ok(());
-                            }
-                        }
+        // Run with a simple logging event handler for CLI mode
+        service
+            .run_parallel(approved, |event| {
+                // Log events for CLI mode (no TUI)
+                use crate::parallel::ParallelEvent;
+                match event {
+                    ParallelEvent::GroupStarted { group_id, changes } => {
+                        info!("Starting group {} with {} changes", group_id, changes.len());
                     }
+                    ParallelEvent::GroupCompleted { group_id } => {
+                        info!("Group {} completed", group_id);
+                    }
+                    ParallelEvent::ApplyCompleted { change_id, .. } => {
+                        info!("Apply completed for {}", change_id);
+                    }
+                    ParallelEvent::ApplyFailed { change_id, error } => {
+                        error!("Apply failed for {}: {}", change_id, error);
+                    }
+                    ParallelEvent::ChangeArchived(change_id) => {
+                        info!("Archived {}", change_id);
+                    }
+                    ParallelEvent::AllCompleted => {
+                        info!("All parallel execution completed");
+                    }
+                    ParallelEvent::Error { message } => {
+                        error!("Parallel execution error: {}", message);
+                    }
+                    _ => {}
                 }
-            }
-        }
+            })
+            .await?;
+
         Ok(())
     }
 }

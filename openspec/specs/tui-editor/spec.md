@@ -104,11 +104,11 @@ TUIの選択モードで `e` キーを押すと、カーソル位置のchangeデ
 
 ### Requirement: Parallel Mode Toggle Key
 
-The TUI SHALL support toggling parallel mode using the `=` key, but only when jj is available.
+The TUI SHALL support toggling parallel mode using the `=` key, but only when git is available.
 
 #### Scenario: Toggle parallel mode on with `=` key
 - **GIVEN** TUI is in selection mode
-- **AND** a `.jj` directory exists (jj repository detected)
+- **AND** a `.git` directory exists (git repository detected)
 - **AND** parallel mode is currently OFF
 - **WHEN** user presses `=` key
 - **THEN** parallel mode is enabled
@@ -123,16 +123,16 @@ The TUI SHALL support toggling parallel mode using the `=` key, but only when jj
 - **AND** log displays "Parallel mode: OFF"
 - **AND** visual indicator is removed
 
-#### Scenario: `=` key hidden when jj not available
+#### Scenario: `=` key hidden when git not available
 - **GIVEN** TUI is in selection mode
-- **AND** no `.jj` directory exists
+- **AND** no `.git` directory exists
 - **WHEN** TUI renders the footer help text
 - **THEN** the `=: parallel` option is NOT displayed in help text
 - **AND** pressing `=` key has no effect
 
-#### Scenario: `=` key shown when jj available
+#### Scenario: `=` key shown when git available
 - **GIVEN** TUI is in selection mode
-- **AND** a `.jj` directory exists
+- **AND** a `.git` directory exists
 - **WHEN** TUI renders the footer help text
 - **THEN** the `=: parallel` option IS displayed in help text
 
@@ -176,23 +176,6 @@ The TUI SHALL restrict parallel mode toggling based on current app mode.
 - **WHEN** user presses `=` key
 - **THEN** parallel mode is NOT toggled
 
-### Requirement: jj Detection at TUI Startup
-
-The TUI SHALL detect jj availability at startup and cache the result.
-
-#### Scenario: jj detected at startup
-- **GIVEN** user starts the TUI
-- **AND** a `.jj` directory exists in the current working directory
-- **THEN** jj_available flag is set to true
-- **AND** parallel mode features are enabled
-
-#### Scenario: jj not detected at startup
-- **GIVEN** user starts the TUI
-- **AND** no `.jj` directory exists in the current working directory
-- **THEN** jj_available flag is set to false
-- **AND** parallel mode features are hidden
-- **AND** no error is displayed (silent degradation)
-
 ### Requirement: Proposal編集時のオーケストレーションステータス維持
 TUIでproposal編集を開始・終了しても、オーケストレーションステータスは変更してはならない（MUST）。
 
@@ -206,3 +189,20 @@ TUIでproposal編集を開始・終了しても、オーケストレーション
 - **GIVEN** proposal編集のためにエディタが起動している
 - **WHEN** ユーザーがエディタを終了しTUIが復帰する
 - **THEN** オーケストレーションステータスは編集開始前の値を維持する
+
+### Requirement: Git Detection at TUI Startup
+
+The TUI SHALL detect git availability at startup and cache the result.
+
+#### Scenario: git detected at startup
+- **GIVEN** user starts the TUI
+- **AND** a `.git` directory exists in the current working directory
+- **THEN** git_available flag is set to true
+- **AND** parallel mode features are enabled
+
+#### Scenario: git not detected at startup
+- **GIVEN** user starts the TUI
+- **AND** no `.git` directory exists in the current working directory
+- **THEN** git_available flag is set to false
+- **AND** parallel mode features are hidden
+- **AND** no error is displayed (silent degradation)

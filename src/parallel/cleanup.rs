@@ -93,33 +93,14 @@ impl Drop for WorkspaceCleanupGuard {
             );
 
             match self.vcs_backend {
-                VcsBackend::Jj => {
-                    // Forget the workspace in jj
-                    let result = std::process::Command::new("jj")
-                        .args(["workspace", "forget", workspace_name])
-                        .current_dir(&self.repo_root)
-                        .output();
-
-                    match result {
-                        Ok(output) if !output.status.success() => {
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            debug!(
-                                "Failed to forget jj workspace '{}': {}",
-                                workspace_name, stderr
-                            );
-                        }
-                        Err(e) => {
-                            debug!("Failed to run jj workspace forget: {}", e);
-                        }
-                        _ => {
-                            debug!("Successfully forgot jj workspace '{}'", workspace_name);
-                        }
-                    }
-                }
                 VcsBackend::Git | VcsBackend::Auto => {
                     // For Git, we need the worktree path, but we only have the name
                     // This is a best-effort cleanup; the worktree will be orphaned
                     // but can be cleaned up later with `git worktree prune`
+                    debug!(
+                        "Executing git command: git branch -D {} (cwd: {:?})",
+                        workspace_name, self.repo_root
+                    );
                     let result = std::process::Command::new("git")
                         .args(["branch", "-D", workspace_name])
                         .current_dir(&self.repo_root)
@@ -156,7 +137,7 @@ mod tests {
     #[test]
     fn test_cleanup_guard_creation() {
         let temp_dir = TempDir::new().unwrap();
-        let guard = WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+        let guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
 
         // Guard should start with no workspaces and not committed
         assert!(!guard.committed);
@@ -166,7 +147,7 @@ mod tests {
     #[test]
     fn test_cleanup_guard_tracks_workspaces() {
         let temp_dir = TempDir::new().unwrap();
-        let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+        let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
 
         guard.track("ws-change-a-1234".to_string());
         guard.track("ws-change-b-5678".to_string());
@@ -183,7 +164,7 @@ mod tests {
     #[test]
     fn test_cleanup_guard_commit_prevents_cleanup() {
         let temp_dir = TempDir::new().unwrap();
-        let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+        let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
 
         guard.track("ws-change-a-1234".to_string());
         assert!(!guard.committed);
@@ -213,7 +194,7 @@ mod tests {
     #[test]
     fn test_cleanup_guard_drop_with_empty_workspaces_does_nothing() {
         let temp_dir = TempDir::new().unwrap();
-        let guard = WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+        let guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
 
         // Drop with no tracked workspaces should not panic
         drop(guard);
@@ -222,7 +203,7 @@ mod tests {
     #[test]
     fn test_cleanup_guard_drop_with_committed_guard_does_nothing() {
         let temp_dir = TempDir::new().unwrap();
-        let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+        let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
         guard.track("ws-test-1234".to_string());
 
         // Commit and then drop - should not attempt cleanup
@@ -239,7 +220,7 @@ mod tests {
         // Simulate a scope where guard is created
         {
             let mut guard =
-                WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+                WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
             guard.track("ws-test-1234".to_string());
             // Not committed - will attempt cleanup on drop
         } // guard drops here
@@ -252,7 +233,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         // Simulate successful operation
-        let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+        let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
         guard.track("ws-success-1234".to_string());
 
         // On success, commit to prevent cleanup
@@ -261,16 +242,6 @@ mod tests {
     }
 
     // === Tests for VCS backend cleanup paths ===
-
-    #[test]
-    fn test_cleanup_guard_jj_workspace_forget_command() {
-        // Verify JJ cleanup uses "jj workspace forget" command
-        let temp_dir = TempDir::new().unwrap();
-        let guard = WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
-
-        assert!(matches!(guard.vcs_backend, VcsBackend::Jj));
-        // The Drop impl calls "jj workspace forget <name>"
-    }
 
     #[test]
     fn test_cleanup_guard_git_branch_delete_command() {
@@ -287,7 +258,7 @@ mod tests {
     #[test]
     fn test_cleanup_guard_preserve_workspace() {
         let temp_dir = TempDir::new().unwrap();
-        let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+        let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
 
         guard.track("ws-change-a-1234".to_string());
         guard.track("ws-change-b-5678".to_string());
@@ -306,7 +277,7 @@ mod tests {
         // Test that preserved workspaces are excluded from cleanup
         {
             let mut guard =
-                WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+                WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
             guard.track("ws-success-1234".to_string());
             guard.track("ws-failed-5678".to_string());
 
@@ -326,7 +297,7 @@ mod tests {
         // If all workspaces are preserved, drop should do nothing
         {
             let mut guard =
-                WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+                WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
             guard.track("ws-failed-1".to_string());
             guard.track("ws-failed-2".to_string());
 
@@ -342,7 +313,7 @@ mod tests {
     #[test]
     fn test_cleanup_guard_preserved_workspaces_starts_empty() {
         let temp_dir = TempDir::new().unwrap();
-        let guard = WorkspaceCleanupGuard::new(VcsBackend::Jj, temp_dir.path().to_path_buf());
+        let guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
 
         assert!(guard.preserved_workspaces.is_empty());
     }

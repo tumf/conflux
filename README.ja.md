@@ -14,7 +14,7 @@ OpenSpec変更ワークフローを自動化: list → 依存関係分析 → ap
 - 🔌 **マルチエージェント対応**: Claude Code、OpenCode、Codexに対応
 - 🪝 **ライフサイクルフック**: ワークフロー各段階でのカスタムアクション設定
 - ✅ **承認ワークフロー**: チェックサム検証による変更の承認管理
-- ⚡ **並列実行**: jjワークスペースまたはGit worktreesを使用した複数の独立した変更の同時処理
+- ⚡ **並列実行**: Git worktreesを使用した複数の独立した変更の同時処理
 
 ## アーキテクチャ
 
@@ -411,20 +411,19 @@ openspec-orchestrator
   --openspec-cmd <CMD>  カスタムopenspecコマンド [env: OPENSPEC_CMD]
   --parallel            並列実行モードを有効化
   --max-concurrent <N>  最大同時ワークスペース数（デフォルト: 3）
-  --vcs <BACKEND>       VCSバックエンド: auto, jj, または git（デフォルト: auto）
+  --vcs <BACKEND>       VCSバックエンド: auto または git（デフォルト: auto）
   --dry-run             実行せずに並列化グループをプレビュー
 ```
 
 ### 並列実行
 
-オーケストレーターはjjワークスペースまたはGit worktreesを使用した独立した変更の並列実行をサポートします。
+オーケストレーターはGit worktreesを使用した独立した変更の並列実行をサポートします。
 
 **VCSバックエンドの選択:**
 
 | バックエンド | 説明 | 要件 |
 |---------|-------------|--------------|
-| `auto` | 自動検出（jj優先、次にGit） | jjまたはGitリポジトリ |
-| `jj` | jjワークスペースを使用 | jjリポジトリ（.jjディレクトリ） |
+| `auto` | Gitリポジトリを自動検出 | クリーンな作業ディレクトリを持つGitリポジトリ |
 | `git` | Git worktreesを使用 | クリーンな作業ディレクトリを持つGitリポジトリ |
 
 **使用法:**
@@ -435,9 +434,6 @@ openspec-orchestrator run --parallel
 
 # Git worktreesを強制
 openspec-orchestrator run --parallel --vcs git
-
-# jjワークスペースを強制
-openspec-orchestrator run --parallel --vcs jj
 
 # 実行せずに並列化グループをプレビュー
 openspec-orchestrator run --parallel --dry-run
@@ -452,7 +448,7 @@ openspec-orchestrator run --parallel --max-concurrent 5
 
 ```jsonc
 {
-  // 並列実行用のVCSバックエンド: "auto", "jj", または "git"
+  // 並列実行用のVCSバックエンド: "auto" または "git"
   "vcs_backend": "auto",
 
   // 最大同時ワークスペース数
@@ -466,13 +462,6 @@ Git worktrees使用時:
 - 作業ディレクトリがクリーンである必要があります（未コミットの変更がないこと）
 - 各変更は独自のブランチを持つ独立したworktreeで実行されます
 - 変更は完了後に順次マージされます
-
-**jj要件:**
-
-jjワークスペース使用時:
-- 作業コピーの変更は自動的にスナップショットされます
-- 各変更は独立したワークスペースで実行されます
-- 変更はjjのコンフリクトフリーマージを使用してマージされます
 
 **initサブコマンドのオプション:**
 ```
@@ -526,7 +515,7 @@ jjワークスペース使用時:
 ## 今後の機能強化
 
 - [ ] リカバリと再開のための状態永続化
-- [x] 独立した変更の並列実行（jjワークスペースまたはGit worktrees使用）
+- [x] 独立した変更の並列実行（Git worktrees使用）
 - [ ] Slack/Discord通知
 - [ ] 最大イテレーション制限（無限ループ防止）
 - [ ] 手動優先度オーバーライド

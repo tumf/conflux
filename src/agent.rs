@@ -280,6 +280,7 @@ impl AgentRunner {
         command: &str,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
         let mut child = if cfg!(target_os = "windows") {
+            debug!("Spawning shell command: cmd /C {}", command);
             Command::new("cmd")
                 .arg("/C")
                 .arg(command)
@@ -306,6 +307,7 @@ impl AgentRunner {
             // Use login shell to load .zprofile/.profile for PATH and environment setup
             // Note: -l (login) instead of -i (interactive) to avoid job control issues with TUI
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            debug!("Spawning shell command: {} -l -c {}", shell, command);
             let mut cmd = Command::new(&shell);
             cmd.arg("-l")
                 .arg("-c")
@@ -403,6 +405,7 @@ impl AgentRunner {
     /// Execute a shell command and wait for completion (blocking, no streaming)
     async fn execute_shell_command(&self, command: &str) -> Result<ExitStatus> {
         let output = if cfg!(target_os = "windows") {
+            debug!("Executing shell command: cmd /C {}", command);
             Command::new("cmd")
                 .arg("/C")
                 .arg(command)
@@ -418,6 +421,7 @@ impl AgentRunner {
                 })?
         } else {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            debug!("Executing shell command: {} -l -c {}", shell, command);
             Command::new(&shell)
                 .arg("-l")
                 .arg("-c")
@@ -444,6 +448,7 @@ impl AgentRunner {
         command: &str,
     ) -> Result<std::process::Output> {
         let output = if cfg!(target_os = "windows") {
+            debug!("Executing shell command: cmd /C {}", command);
             Command::new("cmd")
                 .arg("/C")
                 .arg(command)
@@ -457,6 +462,7 @@ impl AgentRunner {
                 })?
         } else {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            debug!("Executing shell command: {} -l -c {}", shell, command);
             Command::new(&shell)
                 .arg("-l")
                 .arg("-c")

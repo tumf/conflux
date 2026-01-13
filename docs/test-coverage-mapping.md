@@ -23,6 +23,17 @@ This document maps specification scenarios to their corresponding test implement
 
 ---
 
+## Testing Specification (`openspec/specs/testing/spec.md`)
+
+### Requirement: 仕様ベーステスト
+
+| Scenario | Test | Status |
+|----------|------|--------|
+| TUI描画のバッファ検査 | `src/tui/render.rs::test_render_select_mode_footer_message` | ✅ NEW |
+| 端末サイズ不足の警告描画 | `src/tui/render.rs::test_render_shows_small_terminal_warning` | ✅ NEW |
+
+---
+
 ## Hooks Specification (`openspec/specs/hooks/spec.md`)
 
 ### Requirement: on_queue_add hook
@@ -122,7 +133,6 @@ This document maps specification scenarios to their corresponding test implement
 | Scenario | Test | Status |
 |----------|------|--------|
 | デフォルトは Auto | `src/vcs/mod.rs::test_vcs_backend_default_is_auto` | ✅ NEW |
-| jj バックエンドの設定 | `src/config/mod.rs::test_vcs_backend_can_be_set_to_jj` | ✅ NEW |
 | git バックエンドの設定 | `src/config/mod.rs::test_vcs_backend_can_be_set_to_git` | ✅ NEW |
 | VcsBackend のシリアライズ | `src/vcs/mod.rs::test_vcs_backend_serialization` | ✅ NEW |
 | VcsBackend のデシリアライズ | `src/vcs/mod.rs::test_vcs_backend_deserialization` | ✅ NEW |
@@ -219,7 +229,6 @@ This document maps specification scenarios to their corresponding test implement
 
 | Scenario | Test | Status |
 |----------|------|--------|
-| jj workspace forget コマンド | `src/parallel/cleanup.rs::test_cleanup_guard_jj_workspace_forget_command` | ✅ NEW |
 | git branch -D コマンド | `src/parallel/cleanup.rs::test_cleanup_guard_git_branch_delete_command` | ✅ NEW |
 
 ---
@@ -458,7 +467,6 @@ This document maps specification scenarios to their corresponding test implement
 - `test_workspace_base_dir_can_be_configured` - workspace_base_dir config
 - `test_workspace_base_dir_empty_string_treated_as_none` - empty string handling
 - `test_vcs_backend_defaults_to_auto` - vcs_backend default
-- `test_vcs_backend_can_be_set_to_jj` - jj backend
 - `test_vcs_backend_can_be_set_to_git` - git backend
 - `test_use_llm_analysis_defaults_to_true` - use_llm_analysis default
 - `test_use_llm_analysis_can_be_disabled` - use_llm_analysis disable
@@ -477,7 +485,6 @@ This document maps specification scenarios to their corresponding test implement
 - `test_cleanup_guard_drop_with_committed_guard_does_nothing` - committed drop
 - `test_cleanup_guard_raii_pattern` - RAII pattern
 - `test_cleanup_guard_commit_on_success` - success commit
-- `test_cleanup_guard_jj_workspace_forget_command` - jj cleanup
 - `test_cleanup_guard_git_branch_delete_command` - git cleanup
 
 ### vcs/mod.rs (+12 tests)
@@ -516,7 +523,12 @@ This document maps specification scenarios to their corresponding test implement
 - `test_cursor_navigation_with_empty_list` - empty cursor
 - `test_toggle_selection_with_empty_list` - empty toggle
 
+### tui/render.rs (+2 tests)
+- `test_render_shows_small_terminal_warning` - terminal size warning
+- `test_render_select_mode_footer_message` - footer text rendering
+
 ### approval.rs (+18 tests)
+
 - `test_approved_file_is_md5sum_compatible_format` - md5sum format
 - `test_compute_md5_produces_32_char_hex` - hex output
 - `test_compute_md5_same_content_same_hash` - same content hash
@@ -539,9 +551,9 @@ This document maps specification scenarios to their corresponding test implement
 ## Remaining Gaps
 
 ### UI Rendering Tests
-UI rendering code in `tui.rs` is difficult to unit test due to ratatui dependencies.
-Consider:
-- Snapshot testing for UI components
+TUI rendering now has TestBackend buffer checks in `src/tui/render.rs`.
+Consider extending with:
+- Snapshot testing for more complex UI layouts
 - Integration tests with mock terminal
 - Manual testing for visual verification
 

@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 ///
 /// This service encapsulates the shared logic between CLI and TUI
 /// parallel execution modes, including:
-/// - jj availability checking
+/// - Git availability checking
 /// - Dependency-based grouping
 /// - ParallelExecutor coordination
 pub struct ParallelRunService {
@@ -50,16 +50,8 @@ impl ParallelRunService {
         self.no_resume = no_resume;
     }
 
-    /// Check if jj is available for parallel execution
-    #[deprecated(note = "Use check_vcs_available instead")]
-    #[allow(dead_code)] // Deprecated but kept for backward compatibility
-    pub async fn check_jj_available(&self) -> Result<bool> {
-        self.check_vcs_available().await
-    }
-
-    /// Check if VCS (jj or git) is available for parallel execution
+    /// Check if git is available for parallel execution
     pub async fn check_vcs_available(&self) -> Result<bool> {
-        // Check if either jj or git is available
         Ok(crate::cli::check_parallel_available())
     }
 
@@ -240,6 +232,7 @@ impl ParallelRunService {
     /// - Group 1: Changes with no dependencies
     /// - Group 2: Changes that depend only on Group 1 changes
     /// - And so on...
+    #[allow(dead_code)]
     pub fn group_by_dependencies(changes: &[Change]) -> Vec<ParallelGroup> {
         if changes.is_empty() {
             return Vec::new();
