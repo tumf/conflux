@@ -608,6 +608,22 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_failed_marks_change_error_without_error_mode() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].selected = true;
+        app.start_processing();
+
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyFailed {
+            change_id: "a".to_string(),
+            error: "apply failed".to_string(),
+        });
+
+        assert!(matches!(app.changes[0].queue_status, QueueStatus::Error(_)));
+        assert_eq!(app.mode, AppMode::Running);
+    }
+
+    #[test]
     fn test_update_changes_marks_new_changes_correctly() {
         let initial_changes = vec![create_test_change("existing", 1, 2)];
         let mut app = AppState::new(initial_changes);
