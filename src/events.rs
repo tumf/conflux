@@ -216,6 +216,8 @@ pub enum ExecutionEvent {
     },
 
     // General events
+    /// Warning message (non-fatal)
+    Warning { title: String, message: String },
     /// Log message
     Log(LogEntry),
     /// Processing stopped (graceful stop completed)

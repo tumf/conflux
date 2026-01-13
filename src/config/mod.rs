@@ -103,7 +103,7 @@ pub struct OrchestratorConfig {
     /// VCS backend to use for parallel execution.
     /// Options: "auto" (default) or "git"
     /// - auto: Automatically detect Git repository
-    /// - git: Use git worktrees (requires clean working directory)
+    /// - git: Use git worktrees (warns if working directory has changes)
     #[serde(default)]
     pub vcs_backend: Option<VcsBackend>,
 

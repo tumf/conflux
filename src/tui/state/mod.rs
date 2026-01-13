@@ -23,6 +23,12 @@ pub use change::ChangeState;
 /// Auto-refresh interval in seconds
 pub const AUTO_REFRESH_INTERVAL_SECS: u64 = 5;
 
+/// Warning popup content
+pub struct WarningPopup {
+    pub title: String,
+    pub message: String,
+}
+
 /// Main application state for the TUI
 pub struct AppState {
     /// Current mode
@@ -49,6 +55,8 @@ pub struct AppState {
     pub should_quit: bool,
     /// Warning message to display
     pub warning_message: Option<String>,
+    /// Warning popup content
+    pub warning_popup: Option<WarningPopup>,
     /// Current spinner animation frame
     pub spinner_frame: usize,
     /// Log scroll offset (0 = show most recent at bottom)
@@ -121,6 +129,7 @@ impl AppState {
             known_change_ids: known_ids,
             should_quit: false,
             warning_message: None,
+            warning_popup: None,
             spinner_frame: 0,
             log_scroll_offset: 0,
             log_auto_scroll: true,
@@ -404,6 +413,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::events::OrchestratorEvent;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -1212,6 +1222,26 @@ mod tests {
         assert!(cmd.is_none());
         assert!(app.warning_message.is_some());
         assert!(app.warning_message.as_ref().unwrap().contains("unapproved"));
+    }
+
+    #[test]
+    fn test_warning_popup_set_on_warning_event() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.handle_orchestrator_event(OrchestratorEvent::Warning {
+            title: "Uncommitted Changes Detected".to_string(),
+            message: "Warning: Uncommitted changes detected.".to_string(),
+        });
+
+        assert!(app.warning_popup.is_some());
+        let popup = app.warning_popup.as_ref().unwrap();
+        assert_eq!(popup.title, "Uncommitted Changes Detected");
+        assert!(popup.message.contains("Warning: Uncommitted"));
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("Warning: Uncommitted")));
     }
 
     #[test]

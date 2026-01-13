@@ -7,7 +7,8 @@ pub mod commands;
 
 use crate::config::OrchestratorConfig;
 use crate::vcs::{
-    VcsBackend, VcsError, VcsResult, Workspace, WorkspaceInfo, WorkspaceManager, WorkspaceStatus,
+    VcsBackend, VcsError, VcsResult, VcsWarning, Workspace, WorkspaceInfo, WorkspaceManager,
+    WorkspaceStatus,
 };
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -86,26 +87,29 @@ impl GitWorkspaceManager {
 
     /// Check if working directory is clean (no uncommitted changes or untracked files).
     ///
-    /// Returns an error with detailed message if there are uncommitted changes.
-    pub async fn check_clean_working_directory(&self) -> VcsResult<()> {
+    /// Returns a warning message if there are uncommitted changes, or None if clean.
+    pub async fn check_clean_working_directory(&self) -> VcsResult<Option<VcsWarning>> {
         let (has_changes, status) = commands::has_uncommitted_changes(&self.repo_root).await?;
 
         if has_changes {
-            let mut error_msg =
-                String::from("Cannot start parallel execution with uncommitted changes.\n\n");
-            error_msg.push_str("The following files have uncommitted changes:\n");
-            error_msg.push_str(&status);
-            error_msg.push_str(
-                "\n\nPlease commit or stash your changes before running parallel execution.\n",
+            let warning_msg = format!(
+                "Warning: Uncommitted changes detected.\n\
+                 Parallel mode will continue, but uncommitted changes remain in your working directory.\n\
+                 Consider committing or stashing if you need isolated workspaces.\n\n\
+                 The following files have uncommitted changes:\n{}",
+                if status.trim().is_empty() {
+                    " (none listed)".to_string()
+                } else {
+                    format!("\n{}", status)
+                }
             );
-            error_msg.push_str("Commands to resolve:\n");
-            error_msg.push_str("  git add -A && git commit -m 'WIP'  # Commit changes\n");
-            error_msg.push_str("  git stash                          # Or stash changes\n");
-
-            return Err(VcsError::UncommittedChanges(error_msg));
+            Ok(Some(VcsWarning {
+                title: "Uncommitted Changes Detected".to_string(),
+                message: warning_msg,
+            }))
+        } else {
+            Ok(None)
         }
-
-        Ok(())
     }
 
     /// Get the current commit hash
@@ -419,8 +423,8 @@ impl WorkspaceManager for GitWorkspaceManager {
         self.check_git_available().await
     }
 
-    async fn prepare_for_parallel(&self) -> VcsResult<()> {
-        // Git requires a clean working directory
+    async fn prepare_for_parallel(&self) -> VcsResult<Option<VcsWarning>> {
+        // Git requires a clean working directory - now only warns if not clean
         self.check_clean_working_directory().await
     }
 
@@ -781,6 +785,7 @@ impl WorkspaceManager for GitWorkspaceManager {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use tokio::process::Command;
 
     fn create_test_manager() -> (GitWorkspaceManager, TempDir) {
         let temp_dir = TempDir::new().unwrap();
@@ -797,6 +802,37 @@ mod tests {
         let (manager, _temp) = create_test_manager();
         assert_eq!(manager.max_concurrent, 3);
         assert!(manager.workspaces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_check_clean_working_directory_warns_when_dirty() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_dir = temp_dir.path().join("worktrees");
+        let repo_root = temp_dir.path().to_path_buf();
+
+        let init_result = Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        if init_result.is_err() {
+            return;
+        }
+
+        std::fs::write(temp_dir.path().join("dirty.txt"), "content").unwrap();
+
+        let manager =
+            GitWorkspaceManager::new(base_dir, repo_root, 3, OrchestratorConfig::default());
+        let warning = manager.check_clean_working_directory().await.unwrap();
+        assert!(warning.is_some());
+
+        let warning = warning.unwrap();
+        assert!(warning
+            .message
+            .contains("Warning: Uncommitted changes detected."));
+        assert!(warning.message.contains("Parallel mode will continue"));
+        assert_eq!(warning.title, "Uncommitted Changes Detected");
     }
 
     #[test]

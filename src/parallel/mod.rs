@@ -184,11 +184,25 @@ impl ParallelExecutor {
 
         // Prepare for parallel execution (clean check for git)
         info!("Preparing for parallel execution...");
-        if let Err(e) = self.workspace_manager.prepare_for_parallel().await {
-            let error_msg = format!("Failed to prepare for parallel execution: {}", e);
-            error!("{}", error_msg);
-            send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
-            return Err(e.into());
+        match self.workspace_manager.prepare_for_parallel().await {
+            Ok(Some(warning)) => {
+                warn!("{}", warning.message);
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Warning {
+                        title: warning.title,
+                        message: warning.message,
+                    },
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let error_msg = format!("Failed to prepare for parallel execution: {}", e);
+                error!("{}", error_msg);
+                send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
+                return Err(e.into());
+            }
         }
         info!("Preparation complete");
 
@@ -232,11 +246,25 @@ impl ParallelExecutor {
 
         // Prepare for parallel execution (clean check for git)
         info!("Preparing for parallel execution...");
-        if let Err(e) = self.workspace_manager.prepare_for_parallel().await {
-            let error_msg = format!("Failed to prepare for parallel execution: {}", e);
-            error!("{}", error_msg);
-            send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
-            return Err(e.into());
+        match self.workspace_manager.prepare_for_parallel().await {
+            Ok(Some(warning)) => {
+                warn!("{}", warning.message);
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Warning {
+                        title: warning.title,
+                        message: warning.message,
+                    },
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let error_msg = format!("Failed to prepare for parallel execution: {}", e);
+                error!("{}", error_msg);
+                send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
+                return Err(e.into());
+            }
         }
         info!("Preparation complete");
 

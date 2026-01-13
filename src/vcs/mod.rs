@@ -41,6 +41,7 @@ pub enum VcsError {
     NotAvailable { backend: VcsBackend, reason: String },
 
     #[error("Uncommitted changes detected: {0}")]
+    #[allow(dead_code)]
     UncommittedChanges(String),
 
     #[error("No VCS backend available for parallel execution")]
@@ -70,6 +71,13 @@ impl VcsError {
 
 /// Result type for VCS operations.
 pub type VcsResult<T> = std::result::Result<T, VcsError>;
+
+/// Warning information emitted by VCS checks.
+#[derive(Debug, Clone)]
+pub struct VcsWarning {
+    pub title: String,
+    pub message: String,
+}
 
 /// VCS backend type for parallel execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -171,8 +179,8 @@ pub trait WorkspaceManager: Send + Sync {
 
     /// Prepare for parallel execution.
     ///
-    /// For Git: Verifies working directory is clean (returns error if not).
-    async fn prepare_for_parallel(&self) -> VcsResult<()>;
+    /// For Git: Verifies working directory is clean and returns a warning if not.
+    async fn prepare_for_parallel(&self) -> VcsResult<Option<VcsWarning>>;
 
     /// Get the current revision/commit
     async fn get_current_revision(&self) -> VcsResult<String>;

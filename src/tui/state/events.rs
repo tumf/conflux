@@ -160,6 +160,13 @@ impl AppState {
                 }
                 self.add_log(LogEntry::warn("Processing stopped"));
             }
+            OrchestratorEvent::Warning { title, message } => {
+                self.warning_popup = Some(super::WarningPopup {
+                    title: title.clone(),
+                    message: message.clone(),
+                });
+                self.add_log(LogEntry::warn(message));
+            }
             OrchestratorEvent::Log(entry) => {
                 self.add_log(entry);
             }

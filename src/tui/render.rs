@@ -83,6 +83,11 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
     if app.mode == AppMode::QrPopup {
         render_qr_popup(frame, app, area);
     }
+
+    // Render warning popup on top if present
+    if app.warning_popup.is_some() {
+        render_warning_popup(frame, app, area);
+    }
 }
 
 /// Render selection mode
@@ -751,6 +756,32 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
             .border_style(Style::default().fg(Color::Blue)),
     );
     frame.render_widget(footer, area);
+}
+
+/// Render the warning popup modal
+fn render_warning_popup(frame: &mut Frame, app: &AppState, area: Rect) {
+    let Some(popup) = &app.warning_popup else {
+        return;
+    };
+
+    let modal_width = (area.width * 70 / 100).clamp(40, 90);
+    let modal_height = (area.height * 40 / 100).clamp(8, 14);
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .title(format!(" {} ", popup.title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner_area = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let body = Paragraph::new(popup.message.clone()).style(Style::default().fg(Color::Yellow));
+    frame.render_widget(body, inner_area);
 }
 
 /// Render the proposal input modal

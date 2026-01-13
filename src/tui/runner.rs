@@ -403,6 +403,7 @@ async fn run_tui_loop(
                     }
                     // Clear warning message on any key press
                     app.warning_message = None;
+                    app.warning_popup = None;
                 }
                 Event::Mouse(mouse) => {
                     match mouse.kind {

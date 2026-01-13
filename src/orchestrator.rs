@@ -610,6 +610,9 @@ impl Orchestrator {
                     ParallelEvent::Error { message } => {
                         error!("Parallel execution error: {}", message);
                     }
+                    ParallelEvent::Warning { message, .. } => {
+                        eprintln!("{}", message);
+                    }
                     _ => {}
                 }
             })
