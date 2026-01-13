@@ -217,7 +217,15 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             // [@] - approved but not selected (ready to select)
             // [x] - selected/reserved (will become Queued when F5 is pressed)
             // [x] (gray) - archived (processing complete, no longer actionable)
-            let is_parallel_blocked = app.parallel_mode && !change.is_parallel_eligible;
+            let is_archived = matches!(change.queue_status, QueueStatus::Archived);
+            let show_uncommitted_badge = app.parallel_mode
+                && !change.is_parallel_eligible
+                && !is_archived
+                && matches!(
+                    change.queue_status,
+                    QueueStatus::NotQueued | QueueStatus::Queued
+                );
+            let is_parallel_blocked = show_uncommitted_badge;
             let (checkbox, checkbox_color) = if is_parallel_blocked {
                 ("[ ]", Color::DarkGray)
             } else {
@@ -226,7 +234,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
 
             let cursor = if i == app.cursor_index { "►" } else { " " };
             let new_badge = if change.is_new { " NEW" } else { "" };
-            let uncommitted_badge = if !change.is_parallel_eligible {
+            let uncommitted_badge = if show_uncommitted_badge {
                 " UNCOMMITED"
             } else {
                 ""
@@ -357,7 +365,15 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             // [x] - in queue or being processed
             // [x] (gray) - archived (processing complete, no longer actionable)
             // Note: In Running mode, queue_status shows actual state (Queued/Processing/etc.)
-            let is_parallel_blocked = app.parallel_mode && !change.is_parallel_eligible;
+            let is_archived = matches!(change.queue_status, QueueStatus::Archived);
+            let show_uncommitted_badge = app.parallel_mode
+                && !change.is_parallel_eligible
+                && !is_archived
+                && matches!(
+                    change.queue_status,
+                    QueueStatus::NotQueued | QueueStatus::Queued
+                );
+            let is_parallel_blocked = show_uncommitted_badge;
             let (checkbox, checkbox_color) = if is_parallel_blocked {
                 ("[ ]", Color::DarkGray)
             } else {
@@ -366,7 +382,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
             let cursor = if i == app.cursor_index { "►" } else { " " };
             let new_badge = if change.is_new { " NEW" } else { "" };
-            let uncommitted_badge = if !change.is_parallel_eligible {
+            let uncommitted_badge = if show_uncommitted_badge {
                 " UNCOMMITED"
             } else {
                 ""
@@ -1044,6 +1060,33 @@ mod tests {
         let buffer = render_buffer(&mut app, 50, 10);
         let content = buffer_to_string(&buffer);
         assert!(content.contains("Terminal too small. Minimum: 60x15"));
+    }
+
+    #[test]
+    fn test_render_parallel_archived_row_does_not_show_uncommited_badge() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.parallel_mode = true;
+        app.changes[0].queue_status = QueueStatus::Archived;
+        app.changes[0].is_parallel_eligible = false;
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        assert!(!content.contains("UNCOMMITED"));
+        assert!(content.contains("[x]"));
+    }
+
+    #[test]
+    fn test_render_parallel_uncommitted_queueable_row_shows_uncommited_badge() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.parallel_mode = true;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].is_parallel_eligible = false;
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        assert!(content.contains("UNCOMMITED"));
     }
 
     #[test]
