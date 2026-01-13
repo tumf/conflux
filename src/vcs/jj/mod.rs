@@ -761,6 +761,79 @@ impl WorkspaceManager for JjWorkspaceManager {
         Ok(())
     }
 
+    async fn create_iteration_snapshot(
+        &self,
+        workspace_path: &Path,
+        change_id: &str,
+        iteration: u32,
+        completed: u32,
+        total: u32,
+    ) -> VcsResult<()> {
+        let wip_message = format!(
+            "WIP: {} ({}/{} tasks, apply#{})",
+            change_id, completed, total, iteration
+        );
+
+        debug!(
+            "Creating iteration snapshot #{} for {}",
+            iteration, change_id
+        );
+
+        let _ = tokio::process::Command::new("jj")
+            .arg("status")
+            .current_dir(workspace_path)
+            .output()
+            .await;
+
+        let output = tokio::process::Command::new("jj")
+            .args(["describe", "-m", &wip_message])
+            .current_dir(workspace_path)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| VcsError::jj_command(format!("Failed to describe: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(
+                "Failed to create WIP snapshot for iteration {}: {}",
+                iteration, stderr
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn squash_wip_commits(
+        &self,
+        workspace_path: &Path,
+        change_id: &str,
+        final_iteration: u32,
+    ) -> VcsResult<()> {
+        let apply_message = format!("Apply: {} (apply#{})", change_id, final_iteration);
+
+        debug!("Finalizing WIP snapshots for {}", change_id);
+
+        let output = tokio::process::Command::new("jj")
+            .args(["describe", "-m", &apply_message])
+            .current_dir(workspace_path)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| VcsError::jj_command(format!("Failed to describe: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(VcsError::jj_command(format!(
+                "Failed to set Apply message: {}",
+                stderr
+            )));
+        }
+
+        info!("WIP snapshots finalized for {}", change_id);
+        Ok(())
+    }
+
     async fn get_revision_in_workspace(&self, workspace_path: &Path) -> VcsResult<String> {
         let output = tokio::process::Command::new("jj")
             .args(["log", "-r", "@", "--no-graph", "-T", "change_id"])
