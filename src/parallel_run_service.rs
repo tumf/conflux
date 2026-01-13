@@ -158,6 +158,27 @@ impl ParallelRunService {
         changes: Vec<Change>,
         event_tx: mpsc::Sender<ParallelEvent>,
     ) -> Result<()> {
+        let (changes, skipped) = self.filter_committed_changes(changes).await?;
+
+        if !skipped.is_empty() {
+            let message = format!(
+                "Skipping uncommitted changes in parallel mode: {}",
+                skipped.join(", ")
+            );
+            warn!("{}", message);
+            let _ = event_tx
+                .send(ParallelEvent::Warning {
+                    title: "Uncommitted changes skipped".to_string(),
+                    message,
+                })
+                .await;
+        }
+
+        if changes.is_empty() {
+            info!("No committed changes available for parallel execution");
+            return Ok(());
+        }
+
         info!(
             "Starting parallel execution with re-analysis for {} changes",
             changes.len()
@@ -363,6 +384,8 @@ impl ParallelRunService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+    use tokio::process::Command;
 
     fn create_test_change(id: &str, dependencies: Vec<&str>) -> Change {
         Change {
@@ -373,6 +396,35 @@ mod tests {
             is_approved: true,
             dependencies: dependencies.into_iter().map(String::from).collect(),
         }
+    }
+
+    async fn init_git_repo(temp_dir: &TempDir) -> bool {
+        let init_result = Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        let init_ok = init_result
+            .as_ref()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !init_ok {
+            return false;
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        true
     }
 
     #[test]
@@ -446,5 +498,47 @@ mod tests {
         // Both should be in group 1 since "external" is filtered out
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].changes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_filter_committed_changes_skips_uncommitted() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        if !init_git_repo(&temp_dir).await {
+            return;
+        }
+
+        let base_dir = temp_dir.path().join("openspec/changes");
+        std::fs::create_dir_all(base_dir.join("change-a")).unwrap();
+        std::fs::write(base_dir.join("change-a/proposal.md"), "test").unwrap();
+
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "add change-a"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        std::fs::create_dir_all(base_dir.join("change-b")).unwrap();
+        std::fs::write(base_dir.join("change-b/proposal.md"), "test").unwrap();
+
+        let service =
+            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let changes = vec![
+            create_test_change("change-a", vec![]),
+            create_test_change("change-b", vec![]),
+        ];
+
+        let (committed, skipped) = service
+            .filter_committed_changes(changes)
+            .await
+            .expect("filter changes");
+
+        let committed_ids: Vec<String> = committed.into_iter().map(|change| change.id).collect();
+        assert_eq!(committed_ids, vec!["change-a".to_string()]);
+        assert_eq!(skipped, vec!["change-b".to_string()]);
     }
 }

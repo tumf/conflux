@@ -956,6 +956,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
+    use std::collections::HashSet;
 
     fn create_test_change(id: &str, is_approved: bool) -> Change {
         Change {
@@ -1096,5 +1097,17 @@ mod tests {
         let content = buffer_to_string(&buffer);
         assert!(content.contains("OpenSpec Orchestrator"));
         assert!(content.contains("Press F5 to start processing"));
+    }
+
+    #[test]
+    fn test_render_shows_uncommitted_badge() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.parallel_available = true;
+        app.parallel_mode = true;
+        app.apply_parallel_eligibility(&HashSet::new());
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(content.contains("UNCOMMITED"));
     }
 }
