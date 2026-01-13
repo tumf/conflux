@@ -123,6 +123,13 @@ mod tests {
     }
 
     #[test]
+    fn test_truncate_to_display_width_with_emoji() {
+        let s = "日本😀語";
+        let result = truncate_to_display_width(s, 6);
+        assert_eq!(result, "日...");
+    }
+
+    #[test]
     fn test_get_version_string() {
         let version = get_version_string();
         assert!(version.starts_with("v"));

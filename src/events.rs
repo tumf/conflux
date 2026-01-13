@@ -6,8 +6,11 @@
 //! The ExecutionEvent enum represents all possible events that can occur during
 //! change processing, whether in serial or parallel mode.
 
+use std::sync::OnceLock;
+
 use chrono::Local;
 use ratatui::style::Color;
+use regex::Regex;
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -24,12 +27,33 @@ pub struct LogEntry {
     pub change_id: Option<String>,
 }
 
+fn ansi_csi_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("Invalid ANSI CSI regex"))
+}
+
+fn ansi_fragment_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\[[0-9;]{1,}m").expect("Invalid ANSI fragment regex"))
+}
+
+fn sanitize_log_message(message: &str) -> String {
+    let without_ansi = ansi_csi_regex().replace_all(message, "");
+    let without_fragments = ansi_fragment_regex().replace_all(&without_ansi, "");
+    without_fragments
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect()
+}
+
 impl LogEntry {
     /// Create a new info log entry
     pub fn info(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let message = sanitize_log_message(&message);
         Self {
             timestamp: Local::now().format("%H:%M:%S").to_string(),
-            message: message.into(),
+            message,
             color: Color::White,
             change_id: None,
         }
@@ -37,9 +61,11 @@ impl LogEntry {
 
     /// Create a new success log entry
     pub fn success(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let message = sanitize_log_message(&message);
         Self {
             timestamp: Local::now().format("%H:%M:%S").to_string(),
-            message: message.into(),
+            message,
             color: Color::Green,
             change_id: None,
         }
@@ -47,9 +73,11 @@ impl LogEntry {
 
     /// Create a new warning log entry
     pub fn warn(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let message = sanitize_log_message(&message);
         Self {
             timestamp: Local::now().format("%H:%M:%S").to_string(),
-            message: message.into(),
+            message,
             color: Color::Yellow,
             change_id: None,
         }
@@ -57,9 +85,11 @@ impl LogEntry {
 
     /// Create a new error log entry
     pub fn error(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let message = sanitize_log_message(&message);
         Self {
             timestamp: Local::now().format("%H:%M:%S").to_string(),
-            message: message.into(),
+            message,
             color: Color::Red,
             change_id: None,
         }
@@ -264,6 +294,18 @@ mod tests {
         assert_eq!(entry.message, "test message");
         assert!(matches!(entry.color, Color::White));
         assert!(entry.change_id.is_none());
+    }
+
+    #[test]
+    fn test_log_entry_strips_ansi_sequences() {
+        let entry = LogEntry::info("\x1b[96mRead\x1b[0m");
+        assert_eq!(entry.message, "Read");
+    }
+
+    #[test]
+    fn test_log_entry_strips_sgr_fragments() {
+        let entry = LogEntry::info("[96m[1m| [0m[90m Read");
+        assert_eq!(entry.message, "|  Read");
     }
 
     #[test]

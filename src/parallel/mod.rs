@@ -613,6 +613,37 @@ impl ParallelExecutor {
                     send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
                     return Err(e);
                 }
+
+                if let Some(workspace) = archived_workspaces
+                    .iter()
+                    .find(|workspace| workspace.change_id == result.change_id)
+                {
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::CleanupStarted {
+                            workspace: workspace.name.clone(),
+                        },
+                    )
+                    .await;
+                    if let Err(err) = self
+                        .workspace_manager
+                        .cleanup_workspace(&workspace.name)
+                        .await
+                    {
+                        warn!(
+                            "Failed to cleanup worktree '{}' after merge: {}",
+                            workspace.name, err
+                        );
+                    } else {
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::CleanupCompleted {
+                                workspace: workspace.name.clone(),
+                            },
+                        )
+                        .await;
+                    }
+                }
             }
         }
 
@@ -693,11 +724,23 @@ impl ParallelExecutor {
         // Cleanup only successful workspaces (preserve failed ones)
         let failed_workspace_names: std::collections::HashSet<_> =
             failed.iter().map(|r| r.workspace_name.clone()).collect();
+        let workspace_statuses: std::collections::HashMap<_, _> = self
+            .workspace_manager
+            .workspaces()
+            .into_iter()
+            .map(|workspace| (workspace.name, workspace.status))
+            .collect();
         let mut cleanup_workspaces = workspaces.clone();
         cleanup_workspaces.extend(archived_workspaces);
         for workspace in &cleanup_workspaces {
             // Skip cleanup for failed workspaces - they are preserved
             if failed_workspace_names.contains(&workspace.name) {
+                continue;
+            }
+            if matches!(
+                workspace_statuses.get(&workspace.name),
+                Some(WorkspaceStatus::Cleaned)
+            ) {
                 continue;
             }
             send_event(
@@ -707,10 +750,17 @@ impl ParallelExecutor {
                 },
             )
             .await;
-            self.workspace_manager
+            if let Err(err) = self
+                .workspace_manager
                 .cleanup_workspace(&workspace.name)
                 .await
-                .map_err(OrchestratorError::from)?;
+            {
+                warn!(
+                    "Failed to cleanup worktree '{}' after merge: {}",
+                    workspace.name, err
+                );
+                continue;
+            }
             send_event(
                 &self.event_tx,
                 ParallelEvent::CleanupCompleted {
@@ -903,6 +953,31 @@ impl ParallelExecutor {
                                     "Successfully merged {} (revision: {})",
                                     workspace_result.change_id, rev
                                 );
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::CleanupStarted {
+                                        workspace: workspace_result.workspace_name.clone(),
+                                    },
+                                )
+                                .await;
+                                if let Err(err) = self
+                                    .workspace_manager
+                                    .cleanup_workspace(&workspace_result.workspace_name)
+                                    .await
+                                {
+                                    warn!(
+                                        "Failed to cleanup worktree '{}' after merge: {}",
+                                        workspace_result.workspace_name, err
+                                    );
+                                } else {
+                                    send_event(
+                                        &self.event_tx,
+                                        ParallelEvent::CleanupCompleted {
+                                            workspace: workspace_result.workspace_name.clone(),
+                                        },
+                                    )
+                                    .await;
+                                }
                             }
                             Err(e) => {
                                 error!(
