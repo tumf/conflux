@@ -173,9 +173,11 @@ impl AppState {
             OrchestratorEvent::ChangesRefreshed {
                 changes,
                 committed_change_ids,
+                worktree_change_ids,
             } => {
                 self.update_changes(changes);
                 self.apply_parallel_eligibility(&committed_change_ids);
+                self.apply_worktree_status(&worktree_change_ids);
             }
             // Output events - add to log
             OrchestratorEvent::ApplyOutput { change_id, output } => {

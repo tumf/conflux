@@ -1264,6 +1264,45 @@ The CLI SHALL detect whether the current directory is a git-managed repository b
 - **THEN** the command exits with a non-zero exit code
 - **AND** an error message is displayed: "Error: --parallel requires a git repository (.git directory not found)"
 
+### Requirement: TUIのChange一覧にworktree存在を表示する
+TUIのChange一覧は、各changeに紐づくworktreeの有無を識別できるインジケータを表示しなければならない（SHALL）。
+
+#### Scenario: worktreeが存在するchangeの表示
+- **GIVEN** 対象changeにworktreeが存在する
+- **WHEN** TUIのChange一覧を表示する
+- **THEN** そのchangeの行にworktreeインジケータが表示される
+
+#### Scenario: worktreeが存在しないchangeの表示
+- **GIVEN** 対象changeにworktreeが存在しない
+- **WHEN** TUIのChange一覧を表示する
+- **THEN** そのchangeの行にworktreeインジケータは表示されない
+
+### Requirement: 選択中changeのworktree削除操作を提供する
+TUIは選択中changeに紐づくworktreeを削除する操作を提供し、削除前に確認を行わなければならない（SHALL）。
+
+#### Scenario: Dキーで削除確認を出す
+- **GIVEN** 選択中changeにworktreeが存在する
+- **WHEN** SelectモードでDキーを押す
+- **THEN** 削除確認ダイアログが表示される
+
+#### Scenario: 確認後にworktreeを削除する
+- **GIVEN** 削除確認ダイアログで同意する
+- **WHEN** 削除処理が実行される
+- **THEN** 対象worktreeが削除され、Change一覧からインジケータが消える
+
+#### Scenario: worktreeが存在しない場合の削除操作
+- **GIVEN** 選択中changeにworktreeが存在しない
+- **WHEN** SelectモードでDキーを押す
+- **THEN** 削除は行われず、存在しない旨の通知が表示される
+
+### Requirement: 実行中changeのworktree削除を禁止する
+TUIはProcessing/Running中のchangeに対してworktree削除を許可してはならない（MUST NOT）。
+
+#### Scenario: Processing中に削除を試みる
+- **GIVEN** 選択中changeがProcessing/Running中である
+- **WHEN** SelectモードでDキーを押す
+- **THEN** 削除は行われず、禁止メッセージが表示される
+
 ### Requirement: Serial Apply Iteration WIP Commits
 逐次（非parallel）applyループでは、各イテレーション終了後に作業内容をWIPコミットとして保存しなければならない（MUST）。apply成功・失敗や進捗増加の有無に関わらず、最新状態をスナップショットとして残さなければならない（MUST）。
 
@@ -1278,18 +1317,3 @@ WIPコミットメッセージは `WIP: {change_id} ({completed}/{total} tasks, 
 - Given: 逐次applyループが実行中である
 - When: applyコマンドが失敗してイテレーションが終了する
 - Then: 失敗時点の作業内容がWIPスナップショットとして保存される
-
-#### Scenario: Snapshot created even when no progress made
-- Given: applyコマンドが正常に完了したがタスク進捗が増加しなかった
-- When: イテレーションが終了する
-- Then: 最新の作業内容を反映したWIPスナップショットが作成される
-
-#### Scenario: WIP message includes iteration index
-- Given: WIPスナップショットを作成する
-- When: コミットメッセージを設定する
-- Then: メッセージに `apply#{iteration}` が含まれる
-
-#### Scenario: Git backend uses allow-empty commit
-- Given: Gitリポジトリで逐次applyループが実行中である
-- When: WIPスナップショットを作成する
-- Then: `git add -A` と `git commit --allow-empty` 相当の操作で新規コミットが作成される

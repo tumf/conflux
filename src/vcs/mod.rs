@@ -14,6 +14,7 @@ pub mod git;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use thiserror::Error;
@@ -211,6 +212,9 @@ pub trait WorkspaceManager: Send + Sync {
 
     /// Get the list of active workspaces
     fn workspaces(&self) -> Vec<Workspace>;
+
+    /// List change IDs that currently have worktrees.
+    async fn list_worktree_change_ids(&self) -> VcsResult<HashSet<String>>;
 
     /// Get the conflict resolution prompt prefix for this VCS.
     ///

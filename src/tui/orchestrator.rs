@@ -7,6 +7,7 @@ use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::openspec::Change;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -115,7 +116,8 @@ pub async fn archive_single_change(
         .await;
 
     use crate::execution::archive::{
-        build_archive_error_message, verify_archive_completion, ARCHIVE_COMMAND_MAX_RETRIES,
+        build_archive_error_message, ensure_archive_commit, verify_archive_completion,
+        ARCHIVE_COMMAND_MAX_RETRIES,
     };
 
     let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
@@ -193,6 +195,54 @@ pub async fn archive_single_change(
 
         let verification = verify_archive_completion(change_id, None);
         if verification.is_success() {
+            let log_tx = tx.clone();
+            let commit_result = ensure_archive_commit(
+                change_id,
+                Path::new("."),
+                &*agent,
+                crate::vcs::VcsBackend::Auto,
+                move |line| {
+                    let log_tx = log_tx.clone();
+                    async move {
+                        match line {
+                            OutputLine::Stdout(text) => {
+                                let _ = log_tx
+                                    .send(OrchestratorEvent::Log(LogEntry::info(text)))
+                                    .await;
+                            }
+                            OutputLine::Stderr(text) => {
+                                let _ = log_tx
+                                    .send(OrchestratorEvent::Log(LogEntry::warn(text)))
+                                    .await;
+                            }
+                        }
+                    }
+                },
+            )
+            .await;
+
+            if let Err(e) = commit_result {
+                let error_msg = format!("Archive commit failed for {}: {}", change_id, e);
+                let error_context = HookContext::new(
+                    context.changes_processed,
+                    context.total_changes,
+                    context.remaining_changes,
+                    false,
+                )
+                .with_change(change_id, change.completed_tasks, change.total_tasks)
+                .with_apply_count(context.apply_count)
+                .with_error(&error_msg);
+                let _ = hooks.run_hook(HookType::OnError, &error_context).await;
+
+                let _ = tx
+                    .send(OrchestratorEvent::ProcessingError {
+                        id: change_id.to_string(),
+                        error: error_msg,
+                    })
+                    .await;
+                return Ok(ArchiveResult::Failed);
+            }
+
             // Clear apply history for the archived change
             agent.clear_apply_history(change_id);
 
