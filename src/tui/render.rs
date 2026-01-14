@@ -334,6 +334,9 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             "@: approve"
         });
         keys.push("e: edit");
+        if matches!(item.queue_status, QueueStatus::MergeWait) {
+            keys.push("M: resolve");
+        }
         if item.has_worktree {
             keys.push("D: delete WT");
         }
@@ -521,6 +524,9 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             "@: approve"
         });
         keys.push("e: edit");
+        if matches!(item.queue_status, QueueStatus::MergeWait) {
+            keys.push("M: resolve");
+        }
     }
     // Show QR code hint if web server is enabled
     if app.web_url.is_some() {

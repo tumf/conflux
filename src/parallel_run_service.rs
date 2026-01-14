@@ -126,7 +126,8 @@ impl ParallelRunService {
         // Spawn event forwarding task
         let forward_handle = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
-                let is_completed = matches!(event, ParallelEvent::AllCompleted);
+                let is_completed =
+                    matches!(event, ParallelEvent::AllCompleted | ParallelEvent::Stopped);
                 event_handler(event);
                 if is_completed {
                     break;

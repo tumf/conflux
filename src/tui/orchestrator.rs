@@ -1008,6 +1008,8 @@ pub async fn run_orchestrator_parallel(
         // Spawn event forwarding task
         let forward_tx = tx.clone();
         let forward_cancel = cancel_token.clone();
+        let merge_deferred_stop = Arc::new(AtomicBool::new(false));
+        let forward_merge_stop = merge_deferred_stop.clone();
         let forward_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -1018,6 +1020,11 @@ pub async fn run_orchestrator_parallel(
                         match event {
                             Some(ParallelEvent::AllCompleted) => {
                                 // AllCompleted signals batch completion
+                                break;
+                            }
+                            Some(ParallelEvent::Stopped) => {
+                                forward_merge_stop.store(true, Ordering::SeqCst);
+                                let _ = forward_tx.send(ParallelEvent::Stopped).await;
                                 break;
                             }
                             Some(parallel_event) => {
@@ -1057,6 +1064,9 @@ pub async fn run_orchestrator_parallel(
 
         // Wait for forward task to complete
         let _ = forward_handle.await;
+        if merge_deferred_stop.load(Ordering::SeqCst) {
+            stopped_or_cancelled = true;
+        }
 
         // Mark batch changes as processed
         for change in &batch_changes {
@@ -1065,12 +1075,21 @@ pub async fn run_orchestrator_parallel(
 
         match result {
             Ok(_) => {
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::success(format!(
-                        "Batch completed ({} changes processed)",
-                        batch_changes.len()
-                    ))))
-                    .await;
+                if merge_deferred_stop.load(Ordering::SeqCst) {
+                    let _ = tx
+                        .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                            "Batch stopped with deferred merges ({} changes processed)",
+                            batch_changes.len()
+                        ))))
+                        .await;
+                } else {
+                    let _ = tx
+                        .send(OrchestratorEvent::Log(LogEntry::success(format!(
+                            "Batch completed ({} changes processed)",
+                            batch_changes.len()
+                        ))))
+                        .await;
+                }
             }
             Err(e) => {
                 had_errors = true;

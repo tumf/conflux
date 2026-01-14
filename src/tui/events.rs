@@ -29,4 +29,6 @@ pub enum TuiCommand {
     SubmitProposal(String),
     /// Delete worktrees associated with a change
     DeleteWorktree(String),
+    /// Resolve a deferred merge for a change
+    ResolveMerge(String),
 }

@@ -45,7 +45,10 @@ impl AppState {
                     // In Stopped mode, task completion does not trigger auto-queue.
                     // After Completed, the tasks.md file may be moved/archived.
                     match change.queue_status {
-                        QueueStatus::Completed | QueueStatus::Archiving | QueueStatus::Archived => {
+                        QueueStatus::Completed
+                        | QueueStatus::Archiving
+                        | QueueStatus::Archived
+                        | QueueStatus::MergeWait => {
                             // Don't update progress after completion - file may be moved
                         }
                         _ => {
@@ -103,6 +106,15 @@ impl AppState {
                     }
                 }
                 self.add_log(LogEntry::info(format!("Archived: {}", id)));
+            }
+            OrchestratorEvent::MergeDeferred { change_id, reason } => {
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+                    change.queue_status = QueueStatus::MergeWait;
+                }
+                self.add_log(LogEntry::warn(format!(
+                    "Merge deferred for {}: {}",
+                    change_id, reason
+                )));
             }
             OrchestratorEvent::ProcessingError { id, error } => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
@@ -233,6 +245,7 @@ impl AppState {
                         QueueStatus::Completed
                         | QueueStatus::Archiving
                         | QueueStatus::Archived
+                        | QueueStatus::MergeWait
                         | QueueStatus::Processing => {
                             // Don't update progress after completion or during processing
                             // - After completion: file may be moved
@@ -271,6 +284,7 @@ impl AppState {
                     QueueStatus::Completed
                         | QueueStatus::Archiving
                         | QueueStatus::Archived
+                        | QueueStatus::MergeWait
                         | QueueStatus::Error(_)
                 )
         });
@@ -387,6 +401,23 @@ mod tests {
         assert_eq!(app.changes[0].queue_status, QueueStatus::Archived);
         assert!(app.changes[0].elapsed_time.is_some());
         assert!(app.changes[0].elapsed_time.unwrap().as_nanos() > 0);
+    }
+
+    #[test]
+    fn test_merge_deferred_sets_merge_wait_status() {
+        let changes = vec![create_approved_change("change-a", 0, 5)];
+        let mut app = AppState::new(changes);
+
+        app.handle_orchestrator_event(OrchestratorEvent::MergeDeferred {
+            change_id: "change-a".to_string(),
+            reason: "Base working tree dirty".to_string(),
+        });
+
+        assert_eq!(app.changes[0].queue_status, QueueStatus::MergeWait);
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("Merge deferred")));
     }
 
     // === Tests for fix-stopped-task-complete-queued ===

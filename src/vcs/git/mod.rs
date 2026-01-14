@@ -319,6 +319,7 @@ impl GitWorkspaceManager {
     }
 
     /// Cleanup all worktrees
+    #[allow(dead_code)]
     pub async fn cleanup_all_worktrees(&mut self) -> VcsResult<()> {
         let workspace_names: Vec<String> = self.workspaces.iter().map(|w| w.name.clone()).collect();
 
