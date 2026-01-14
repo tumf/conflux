@@ -16,10 +16,10 @@ use crossterm::{
 };
 use ratatui::DefaultTerminal;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -39,6 +39,18 @@ fn restore_terminal() {
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     let _ = clear_screen();
     ratatui::restore();
+}
+
+fn should_trigger_worktree_command(config: &OrchestratorConfig, is_git_repo: bool) -> bool {
+    config.get_worktree_command().is_some() && is_git_repo
+}
+
+fn build_worktree_path(base_dir: &Path) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis();
+    base_dir.join(format!("proposal-{}", timestamp))
 }
 
 /// Run the TUI application
@@ -244,44 +256,6 @@ async fn run_tui_loop(
                         continue;
                     }
 
-                    // Handle Proposing mode separately (textarea input)
-                    if app.mode == AppMode::Proposing {
-                        match (key.code, key.modifiers) {
-                            (KeyCode::Esc, _) => {
-                                app.cancel_proposing();
-                            }
-                            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                                // Try to submit proposal
-                                if let Some(proposal) = app.submit_proposal() {
-                                    // Submission successful, send command
-                                    let _ = cmd_tx.send(TuiCommand::SubmitProposal(proposal)).await;
-                                } else {
-                                    // Submission failed (empty input), stay in Proposing mode
-                                    // No action needed - submit_proposal() already keeps mode and input
-                                }
-                            }
-                            (KeyCode::Char(_), _)
-                            | (KeyCode::Backspace, _)
-                            | (KeyCode::Delete, _)
-                            | (KeyCode::Enter, _)
-                            | (KeyCode::Left, _)
-                            | (KeyCode::Right, _)
-                            | (KeyCode::Up, _)
-                            | (KeyCode::Down, _)
-                            | (KeyCode::Home, _)
-                            | (KeyCode::End, _) => {
-                                if let Some(ref mut textarea) = app.propose_textarea {
-                                    // Convert crossterm KeyEvent to tui-textarea Input
-                                    use tui_textarea::Input;
-                                    let input: Input = key.into();
-                                    textarea.input(input);
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
                     match (key.code, key.modifiers) {
                         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             app.should_quit = true;
@@ -464,14 +438,108 @@ async fn run_tui_loop(
                             app.toggle_parallel_mode();
                         }
                         (KeyCode::Char('+'), _) => {
-                            // Enter propose mode if propose_command is configured
-                            if config.get_propose_command().is_some() {
-                                app.start_proposing();
-                            } else {
-                                app.warning_message = Some(
-                                    "propose_command not configured in .openspec-orchestrator.jsonc"
-                                        .to_string(),
-                                );
+                            let Some(template) = config.get_worktree_command().map(str::to_string)
+                            else {
+                                continue;
+                            };
+
+                            let is_git_repo =
+                                match crate::vcs::git::commands::check_git_repo(&repo_root).await {
+                                    Ok(is_repo) => is_repo,
+                                    Err(err) => {
+                                        app.add_log(LogEntry::error(format!(
+                                            "Failed to check git repo: {}",
+                                            err
+                                        )));
+                                        continue;
+                                    }
+                                };
+
+                            if !should_trigger_worktree_command(&config, is_git_repo) {
+                                continue;
+                            }
+
+                            if let Err(err) = std::fs::create_dir_all(&worktree_base_dir) {
+                                app.add_log(LogEntry::error(format!(
+                                    "Failed to prepare worktree base dir: {}",
+                                    err
+                                )));
+                                continue;
+                            }
+
+                            let worktree_path = build_worktree_path(&worktree_base_dir);
+                            let Some(worktree_path_str) = worktree_path.to_str() else {
+                                app.add_log(LogEntry::error(
+                                    "Failed to resolve worktree path".to_string(),
+                                ));
+                                continue;
+                            };
+                            let Some(repo_root_str) = repo_root.to_str() else {
+                                app.add_log(LogEntry::error(
+                                    "Failed to resolve repo root path".to_string(),
+                                ));
+                                continue;
+                            };
+
+                            if let Err(err) = crate::vcs::git::commands::worktree_add_detached(
+                                &repo_root,
+                                worktree_path_str,
+                                "HEAD",
+                            )
+                            .await
+                            {
+                                app.add_log(LogEntry::error(format!(
+                                    "Failed to create worktree: {}",
+                                    err
+                                )));
+                                continue;
+                            }
+
+                            let command = OrchestratorConfig::expand_worktree_command(
+                                &template,
+                                worktree_path_str,
+                                repo_root_str,
+                            );
+                            app.add_log(LogEntry::info(format!(
+                                "Running worktree command in {}",
+                                worktree_path_str
+                            )));
+
+                            disable_raw_mode()?;
+                            execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+
+                            info!(
+                                module = module_path!(),
+                                "Running worktree command: sh -c {}", command
+                            );
+                            let status = std::process::Command::new("sh")
+                                .arg("-c")
+                                .arg(&command)
+                                .current_dir(&worktree_path)
+                                .status();
+
+                            enable_raw_mode()?;
+                            execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+                            terminal.clear()?;
+
+                            match status {
+                                Ok(exit_status) if exit_status.success() => {
+                                    app.add_log(LogEntry::success(
+                                        "Worktree command completed successfully",
+                                    ));
+                                }
+                                Ok(exit_status) => {
+                                    app.add_log(LogEntry::error(format!(
+                                        "Worktree command failed with exit code: {:?}",
+                                        exit_status.code()
+                                    )));
+                                }
+                                Err(err) => {
+                                    app.add_log(LogEntry::error(format!(
+                                        "Failed to execute worktree command: {}",
+                                        err
+                                    )));
+                                }
                             }
                         }
                         (KeyCode::Char('w'), _) => {
@@ -722,67 +790,6 @@ async fn run_tui_loop(
                         }
                     }
                 }
-                TuiCommand::SubmitProposal(proposal) => {
-                    // Execute propose_command with the proposal text
-                    if let Some(template) = config.get_propose_command() {
-                        let command = OrchestratorConfig::expand_proposal(template, &proposal);
-                        app.add_log(LogEntry::info(format!("Submitting proposal: {}", proposal)));
-
-                        // Suspend TUI and execute command
-                        disable_raw_mode()?;
-                        execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
-
-                        // Execute the propose command
-                        info!(
-                            module = module_path!(),
-                            "Running propose command: sh -c {}", command
-                        );
-                        let status = std::process::Command::new("sh")
-                            .arg("-c")
-                            .arg(&command)
-                            .status();
-
-                        // Restore TUI
-                        enable_raw_mode()?;
-                        execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-                        terminal.clear()?;
-
-                        match status {
-                            Ok(exit_status) if exit_status.success() => {
-                                app.add_log(LogEntry::success("Proposal submitted successfully"));
-                                // Success: mode was already changed by submit_proposal()
-                            }
-                            Ok(exit_status) => {
-                                app.add_log(LogEntry::error(format!(
-                                    "Proposal command failed with exit code: {:?}",
-                                    exit_status.code()
-                                )));
-                                // Failure: return to Proposing mode to allow retry
-                                app.mode = AppMode::Proposing;
-                                // Recreate textarea with previous input
-                                app.propose_textarea = Some(AppState::create_propose_textarea());
-                                if let Some(ref mut textarea) = app.propose_textarea {
-                                    textarea.insert_str(&proposal);
-                                }
-                            }
-                            Err(e) => {
-                                app.add_log(LogEntry::error(format!(
-                                    "Failed to execute proposal command: {}",
-                                    e
-                                )));
-                                // Failure: return to Proposing mode to allow retry
-                                app.mode = AppMode::Proposing;
-                                // Recreate textarea with previous input
-                                app.propose_textarea = Some(AppState::create_propose_textarea());
-                                if let Some(ref mut textarea) = app.propose_textarea {
-                                    textarea.insert_str(&proposal);
-                                }
-                            }
-                        }
-                    } else {
-                        app.add_log(LogEntry::error("propose_command not configured"));
-                    }
-                }
                 _ => {}
             }
         }
@@ -810,4 +817,34 @@ async fn run_tui_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OrchestratorConfig;
+
+    #[test]
+    fn test_should_trigger_worktree_command_missing_config() {
+        let config = OrchestratorConfig::default();
+        assert!(!should_trigger_worktree_command(&config, true));
+    }
+
+    #[test]
+    fn test_should_trigger_worktree_command_not_git_repo() {
+        let config = OrchestratorConfig {
+            worktree_command: Some("cmd {workspace_dir}".to_string()),
+            ..Default::default()
+        };
+        assert!(!should_trigger_worktree_command(&config, false));
+    }
+
+    #[test]
+    fn test_should_trigger_worktree_command_enabled() {
+        let config = OrchestratorConfig {
+            worktree_command: Some("cmd {repo_root}".to_string()),
+            ..Default::default()
+        };
+        assert!(should_trigger_worktree_command(&config, true));
+    }
 }

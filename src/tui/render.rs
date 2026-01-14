@@ -74,11 +74,6 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
         render_running_mode(frame, app, area);
     }
 
-    // Render proposal modal on top if in Proposing mode
-    if app.mode == AppMode::Proposing {
-        render_propose_modal(frame, app, area);
-    }
-
     // Render QR popup on top if in QrPopup mode
     if app.mode == AppMode::QrPopup {
         render_qr_popup(frame, app, area);
@@ -145,7 +140,6 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Stopping => "Stopping...",
         AppMode::Stopped => "Stopped",
         AppMode::Error => "Error",
-        AppMode::Proposing => "Proposing",
         AppMode::ConfirmWorktreeDelete => "Confirm Delete",
         AppMode::QrPopup => "QR Code",
     };
@@ -156,7 +150,6 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Stopping => Color::Yellow,
         AppMode::Stopped => Color::DarkGray,
         AppMode::Error => Color::Red,
-        AppMode::Proposing => Color::Magenta,
         AppMode::ConfirmWorktreeDelete => Color::Yellow,
         AppMode::QrPopup => Color::Green,
     };
@@ -571,7 +564,6 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Select if all_completed => ("Done".to_string(), Color::Green),
         AppMode::Select => ("Ready".to_string(), Color::DarkGray),
         AppMode::Stopped => ("Stopped".to_string(), Color::DarkGray),
-        AppMode::Proposing => ("Proposing".to_string(), Color::Magenta),
         AppMode::ConfirmWorktreeDelete => ("Confirm delete".to_string(), Color::Yellow),
         AppMode::QrPopup => ("QR Code".to_string(), Color::Green),
         AppMode::Running | AppMode::Stopping => {
@@ -623,10 +615,6 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         ),
         AppMode::Select => ("", Color::White),
         AppMode::Error => ("Press F5 to retry, or 'q' to quit.", Color::Yellow),
-        AppMode::Proposing => (
-            "Enter: newline, Ctrl+S: submit, Esc: cancel",
-            Color::Magenta,
-        ),
         AppMode::ConfirmWorktreeDelete => ("Y: delete worktree, N/Esc: cancel", Color::Yellow),
         AppMode::QrPopup => ("Esc: close QR code", Color::Green),
     };
@@ -834,7 +822,7 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
     } else if app.changes.is_empty() {
         // No changes available
         spans.push(Span::styled(
-            "Add new proposals to get started",
+            "Add new changes to get started",
             Style::default().fg(Color::DarkGray),
         ));
     } else if selected == 0 {
@@ -920,42 +908,6 @@ fn render_warning_popup(frame: &mut Frame, app: &AppState, area: Rect) {
 
     let body = Paragraph::new(popup.message.clone()).style(Style::default().fg(Color::Yellow));
     frame.render_widget(body, inner_area);
-}
-
-/// Render the proposal input modal
-fn render_propose_modal(frame: &mut Frame, app: &mut AppState, area: Rect) {
-    // Calculate modal dimensions (centered, 60% width, 50% height)
-    let modal_width = (area.width * 60 / 100).clamp(40, 80);
-    let modal_height = (area.height * 50 / 100).clamp(8, 20);
-    let modal_x = (area.width - modal_width) / 2;
-    let modal_y = (area.height - modal_height) / 2;
-
-    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
-
-    // Clear the modal area background
-    frame.render_widget(Clear, modal_area);
-
-    // Render textarea if available
-    if let Some(ref textarea) = app.propose_textarea {
-        // Build the border block first
-        let block = Block::default()
-            .title(" New Proposal (Enter: newline, Ctrl+S: submit, Esc: cancel) ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta));
-
-        // Calculate inner area for text content
-        let inner_area = block.inner(modal_area);
-        frame.render_widget(block, modal_area);
-
-        // Render text content line by line
-        let lines: Vec<Line> = textarea
-            .lines()
-            .iter()
-            .map(|s| Line::from(s.as_str()))
-            .collect();
-        let text = Paragraph::new(lines);
-        frame.render_widget(text, inner_area);
-    }
 }
 
 /// Render the QR code popup

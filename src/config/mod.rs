@@ -177,6 +177,11 @@ pub struct OrchestratorConfig {
     /// Example: "opencode run '{proposal}'"
     #[serde(default)]
     pub propose_command: Option<String>,
+
+    /// Command template for creating a proposal worktree from TUI.
+    /// Supports `{workspace_dir}` and `{repo_root}` placeholders.
+    #[serde(default)]
+    pub worktree_command: Option<String>,
 }
 
 impl OrchestratorConfig {
@@ -283,13 +288,26 @@ impl OrchestratorConfig {
 
     /// Get the propose command template, if configured.
     /// Returns None if not set (propose feature is disabled).
+    #[allow(dead_code)]
     pub fn get_propose_command(&self) -> Option<&str> {
         self.propose_command.as_deref()
     }
 
+    /// Get the worktree command template, if configured.
+    /// Returns None if not set (worktree flow is disabled).
+    pub fn get_worktree_command(&self) -> Option<&str> {
+        self.worktree_command.as_deref()
+    }
+
     /// Expand `{proposal}` placeholder in a command template.
+    #[allow(dead_code)]
     pub fn expand_proposal(template: &str, proposal: &str) -> String {
         expand::expand_proposal(template, proposal)
+    }
+
+    /// Expand `{workspace_dir}` and `{repo_root}` placeholders in a command template.
+    pub fn expand_worktree_command(template: &str, workspace_dir: &str, repo_root: &str) -> String {
+        expand::expand_worktree_command(template, workspace_dir, repo_root)
     }
 
     /// Expand `{conflict_files}` placeholder in a command template
@@ -801,6 +819,44 @@ mod tests {
             config.propose_command,
             Some("opencode run '/openspec:proposal {proposal}'".to_string())
         );
+    }
+
+    #[test]
+    fn test_get_worktree_command_default() {
+        let config = OrchestratorConfig::default();
+        assert!(config.get_worktree_command().is_none());
+    }
+
+    #[test]
+    fn test_get_worktree_command_configured() {
+        let config = OrchestratorConfig {
+            worktree_command: Some("cmd --repo {repo_root}".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.get_worktree_command(),
+            Some("cmd --repo {repo_root}")
+        );
+    }
+
+    #[test]
+    fn test_parse_jsonc_with_worktree_command() {
+        let jsonc = r#"{
+            "worktree_command": "cmd --cwd {workspace_dir}"
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        assert_eq!(
+            config.worktree_command,
+            Some("cmd --cwd {workspace_dir}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_expand_worktree_command() {
+        let template = "cmd {workspace_dir} {repo_root}";
+        let result =
+            OrchestratorConfig::expand_worktree_command(template, "/tmp/worktree", "/repo/root");
+        assert_eq!(result, "cmd /tmp/worktree /repo/root");
     }
 
     #[test]

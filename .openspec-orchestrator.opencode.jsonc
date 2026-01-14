@@ -14,8 +14,9 @@
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "opencode run --model openai/gpt-5.2-codex '{prompt}'",
 
-  //  Worktree comamnd
-  "worktree_command": "tmux new-window -n osor 'opencode --model openai/gpt-5.2-codex'",
+  // Worktree command for TUI (+ key)
+  // Supports {workspace_dir} and {repo_root} placeholders
+  "worktree_command": "tmux new-window -n osor 'opencode --model openai/gpt-5.2-codex --worktree {workspace_dir}'",
 
   // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
   // Note: A hardcoded system prompt is always appended after this value
@@ -26,10 +27,6 @@
 
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
-
-  // Command to propose new changes from TUI (+ key)
-  // Supports {proposal} placeholder for the proposal text
-  // "propose_command": "opencode run '/openspec:proposal {proposal}'",
 
   // Lifecycle hooks (optional)
   // Available hooks:

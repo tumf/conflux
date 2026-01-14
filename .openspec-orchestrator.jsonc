@@ -2,7 +2,7 @@
   // OpenSpec Orchestrator Configuration
   // Template: Claude Code
   // Agent command configuration
-  "propose_command": "claude --model opus --dangerously-skip-permissions --verbose -p '/openspec:proposal {proposal}'",
+  "worktree_command": "claude --model opus --dangerously-skip-permissions --verbose -p '/openspec:proposal --worktree {workspace_dir}'",
   "analyze_command": "claude --model opus --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
   "apply_command": "claude --model sonnet --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id} {prompt}'",
   "archive_command": "claude --model sonnet --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id} {prompt}'",

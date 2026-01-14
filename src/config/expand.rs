@@ -5,7 +5,10 @@ use std::borrow::Cow;
 const PLACEHOLDER_CHANGE_ID: &str = "{change_id}";
 const PLACEHOLDER_PROMPT: &str = "{prompt}";
 const PLACEHOLDER_CONFLICT_FILES: &str = "{conflict_files}";
+#[allow(dead_code)]
 const PLACEHOLDER_PROPOSAL: &str = "{proposal}";
+const PLACEHOLDER_WORKSPACE_DIR: &str = "{workspace_dir}";
+const PLACEHOLDER_REPO_ROOT: &str = "{repo_root}";
 
 /// Expand `{change_id}` placeholder in a command template.
 ///
@@ -52,8 +55,15 @@ pub fn expand_conflict_files(template: &str, conflict_files: &str) -> String {
 /// let result = expand_proposal(template, "Add user authentication feature");
 /// assert_eq!(result, "opencode run 'Add user authentication feature'");
 /// ```
+#[allow(dead_code)]
 pub fn expand_proposal(template: &str, proposal: &str) -> String {
     expand_placeholder(template, PLACEHOLDER_PROPOSAL, proposal)
+}
+
+/// Expand `{workspace_dir}` and `{repo_root}` placeholders in a command template.
+pub fn expand_worktree_command(template: &str, workspace_dir: &str, repo_root: &str) -> String {
+    let command = expand_placeholder(template, PLACEHOLDER_WORKSPACE_DIR, workspace_dir);
+    expand_placeholder(&command, PLACEHOLDER_REPO_ROOT, repo_root)
 }
 
 pub(crate) fn expand_placeholder(template: &str, placeholder: &str, value: &str) -> String {
@@ -258,6 +268,20 @@ mod tests {
             result,
             "claude 'Feature request:\n- Add login\n- Add logout'"
         );
+    }
+
+    #[test]
+    fn test_expand_worktree_command() {
+        let template = "run --cwd {workspace_dir} --repo {repo_root}";
+        let result = expand_worktree_command(template, "/tmp/worktree", "/repo/root");
+        assert_eq!(result, "run --cwd /tmp/worktree --repo /repo/root");
+    }
+
+    #[test]
+    fn test_expand_worktree_command_escaped() {
+        let template = "cmd {workspace_dir} {repo_root}";
+        let result = expand_worktree_command(template, "/tmp/work tree", "/repo/root path");
+        assert_eq!(result, "cmd '/tmp/work tree' '/repo/root path'");
     }
 
     #[test]
