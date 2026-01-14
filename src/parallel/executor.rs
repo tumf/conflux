@@ -78,76 +78,33 @@ async fn create_iteration_snapshot(
                 return Ok(());
             }
 
-            // Check if we have commits to amend
             debug!(
                 module = module_path!(),
-                "Executing git command: git rev-parse HEAD (cwd: {:?})", workspace_path
+                "Executing git command: git commit --allow-empty -m {} (cwd: {:?})",
+                commit_message,
+                workspace_path
             );
-            let has_commits = Command::new("git")
-                .args(["rev-parse", "HEAD"])
+            let commit_output = Command::new("git")
+                .args(["commit", "--allow-empty", "-m", &commit_message])
                 .current_dir(workspace_path)
                 .stdin(StdStdio::null())
                 .output()
                 .await
-                .map(|output| output.status.success())
-                .unwrap_or(false);
+                .map_err(|e| {
+                    OrchestratorError::GitCommand(format!("Failed to create commit: {}", e))
+                })?;
 
-            if has_commits {
-                // Amend existing commit
-                debug!(
-                    "Executing git command: git commit --amend --allow-empty -m {} (cwd: {:?})",
-                    commit_message, workspace_path
+            if !commit_output.status.success() {
+                let stderr = String::from_utf8_lossy(&commit_output.stderr);
+                warn!(
+                    "Failed to create WIP commit for iteration {}: {}",
+                    iteration, stderr
                 );
-                let commit_output = Command::new("git")
-                    .args(["commit", "--amend", "--allow-empty", "-m", &commit_message])
-                    .current_dir(workspace_path)
-                    .stdin(StdStdio::null())
-                    .output()
-                    .await
-                    .map_err(|e| {
-                        OrchestratorError::GitCommand(format!("Failed to amend commit: {}", e))
-                    })?;
-
-                if !commit_output.status.success() {
-                    let stderr = String::from_utf8_lossy(&commit_output.stderr);
-                    warn!(
-                        "Failed to amend WIP commit for iteration {}: {}",
-                        iteration, stderr
-                    );
-                } else {
-                    debug!(
-                        "Iteration snapshot #{} created for {} (git, amended)",
-                        iteration, change_id
-                    );
-                }
             } else {
-                // Create initial commit
                 debug!(
-                    "Executing git command: git commit --allow-empty -m {} (cwd: {:?})",
-                    commit_message, workspace_path
+                    "Iteration snapshot #{} created for {} (git)",
+                    iteration, change_id
                 );
-                let commit_output = Command::new("git")
-                    .args(["commit", "--allow-empty", "-m", &commit_message])
-                    .current_dir(workspace_path)
-                    .stdin(StdStdio::null())
-                    .output()
-                    .await
-                    .map_err(|e| {
-                        OrchestratorError::GitCommand(format!("Failed to create commit: {}", e))
-                    })?;
-
-                if !commit_output.status.success() {
-                    let stderr = String::from_utf8_lossy(&commit_output.stderr);
-                    warn!(
-                        "Failed to create initial WIP commit for iteration {}: {}",
-                        iteration, stderr
-                    );
-                } else {
-                    debug!(
-                        "Iteration snapshot #{} created for {} (git, initial)",
-                        iteration, change_id
-                    );
-                }
             }
         }
     }
@@ -183,26 +140,103 @@ async fn squash_wip_commits(
 
     match vcs_backend {
         VcsBackend::Git | VcsBackend::Auto => {
-            // For Git, we update the commit message to the final Apply message
-            // Since we've been amending the same commit, we just need to update the message
+            let wip_pattern = format!("^WIP: {} ", change_id);
             debug!(
                 module = module_path!(),
-                "Executing git command: git commit --amend -m {} (cwd: {:?})",
-                apply_message,
+                "Executing git command: git rev-list --reverse --grep {} HEAD (cwd: {:?})",
+                wip_pattern,
                 workspace_path
             );
-            let output = Command::new("git")
-                .args(["commit", "--amend", "-m", &apply_message])
+            let wip_commits = Command::new("git")
+                .args(["rev-list", "--reverse", "--grep", &wip_pattern, "HEAD"])
                 .current_dir(workspace_path)
                 .stdin(StdStdio::null())
                 .output()
                 .await
                 .map_err(|e| {
-                    OrchestratorError::GitCommand(format!("Failed to squash WIP commits: {}", e))
+                    OrchestratorError::GitCommand(format!("Failed to list WIP commits: {}", e))
                 })?;
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+            if !wip_commits.status.success() {
+                let stderr = String::from_utf8_lossy(&wip_commits.stderr);
+                return Err(OrchestratorError::GitCommand(format!(
+                    "Failed to list WIP commits: {}",
+                    stderr
+                )));
+            }
+
+            let wip_output = String::from_utf8_lossy(&wip_commits.stdout);
+            let first_wip = wip_output
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .ok_or_else(|| {
+                    OrchestratorError::GitCommand(format!("No WIP commits found for {}", change_id))
+                })?;
+
+            let parent_rev = format!("{}^", first_wip);
+            debug!(
+                "Executing git command: git rev-parse {} (cwd: {:?})",
+                parent_rev, workspace_path
+            );
+            let parent_output = Command::new("git")
+                .args(["rev-parse", &parent_rev])
+                .current_dir(workspace_path)
+                .stdin(StdStdio::null())
+                .output()
+                .await
+                .map_err(|e| {
+                    OrchestratorError::GitCommand(format!("Failed to resolve parent: {}", e))
+                })?;
+
+            if !parent_output.status.success() {
+                let stderr = String::from_utf8_lossy(&parent_output.stderr);
+                return Err(OrchestratorError::GitCommand(format!(
+                    "Failed to resolve parent revision: {}",
+                    stderr
+                )));
+            }
+
+            let parent_revision = String::from_utf8_lossy(&parent_output.stdout)
+                .trim()
+                .to_string();
+
+            debug!(
+                "Executing git command: git reset --soft {} (cwd: {:?})",
+                parent_revision, workspace_path
+            );
+            let reset_output = Command::new("git")
+                .args(["reset", "--soft", &parent_revision])
+                .current_dir(workspace_path)
+                .stdin(StdStdio::null())
+                .output()
+                .await
+                .map_err(|e| OrchestratorError::GitCommand(format!("Failed to reset: {}", e)))?;
+
+            if !reset_output.status.success() {
+                let stderr = String::from_utf8_lossy(&reset_output.stderr);
+                return Err(OrchestratorError::GitCommand(format!(
+                    "Failed to reset WIP commits: {}",
+                    stderr
+                )));
+            }
+
+            debug!(
+                "Executing git command: git commit --allow-empty -m {} (cwd: {:?})",
+                apply_message, workspace_path
+            );
+            let commit_output = Command::new("git")
+                .args(["commit", "--allow-empty", "-m", &apply_message])
+                .current_dir(workspace_path)
+                .stdin(StdStdio::null())
+                .output()
+                .await
+                .map_err(|e| {
+                    OrchestratorError::GitCommand(format!("Failed to create Apply commit: {}", e))
+                })?;
+
+            if !commit_output.status.success() {
+                let stderr = String::from_utf8_lossy(&commit_output.stderr);
                 return Err(OrchestratorError::GitCommand(format!(
                     "Failed to set Apply message: {}",
                     stderr
@@ -505,6 +539,25 @@ pub async fn execute_apply_in_workspace(
             .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to wait: {}", e)))?;
 
         if !status.success() {
+            let failure_progress =
+                check_task_progress(workspace_path, change_id).unwrap_or_else(|| progress.clone());
+
+            if let Err(e) = create_iteration_snapshot(
+                workspace_path,
+                change_id,
+                iteration,
+                failure_progress.completed,
+                failure_progress.total,
+                vcs_backend,
+            )
+            .await
+            {
+                warn!(
+                    "Failed to create iteration snapshot for {} after failure: {}",
+                    change_id, e
+                );
+            }
+
             return Err(OrchestratorError::AgentCommand(format!(
                 "Apply command failed with exit code: {:?}",
                 status.code()
@@ -1077,6 +1130,7 @@ Requirements:\n\
 mod tests {
     use super::ensure_archive_commit;
     use crate::config::OrchestratorConfig;
+    use crate::execution::apply::format_wip_commit_message;
     use crate::execution::archive::is_archive_commit_complete;
     use crate::task_parser::TaskProgress;
     use crate::vcs::VcsBackend;
@@ -1093,11 +1147,8 @@ mod tests {
             total: 10,
         };
 
-        let expected = "WIP: add-feature (5/10 tasks)";
-        let actual = format!(
-            "WIP: {} ({}/{} tasks)",
-            change_id, progress.completed, progress.total
-        );
+        let expected = "WIP: add-feature (5/10 tasks, apply#2)";
+        let actual = format_wip_commit_message(change_id, &progress, 2);
 
         assert_eq!(actual, expected);
     }
@@ -1110,11 +1161,8 @@ mod tests {
             total: 7,
         };
 
-        let expected = "WIP: fix-bug (7/7 tasks)";
-        let actual = format!(
-            "WIP: {} ({}/{} tasks)",
-            change_id, progress.completed, progress.total
-        );
+        let expected = "WIP: fix-bug (7/7 tasks, apply#4)";
+        let actual = format_wip_commit_message(change_id, &progress, 4);
 
         assert_eq!(actual, expected);
     }
@@ -1127,11 +1175,8 @@ mod tests {
             total: 5,
         };
 
-        let expected = "WIP: new-change (0/5 tasks)";
-        let actual = format!(
-            "WIP: {} ({}/{} tasks)",
-            change_id, progress.completed, progress.total
-        );
+        let expected = "WIP: new-change (0/5 tasks, apply#1)";
+        let actual = format_wip_commit_message(change_id, &progress, 1);
 
         assert_eq!(actual, expected);
     }
@@ -1145,11 +1190,8 @@ mod tests {
             total: 70,
         };
 
-        let expected = "WIP: add-web-monitoring-feature (50/70 tasks)";
-        let actual = format!(
-            "WIP: {} ({}/{} tasks)",
-            change_id, progress.completed, progress.total
-        );
+        let expected = "WIP: add-web-monitoring-feature (50/70 tasks, apply#9)";
+        let actual = format_wip_commit_message(change_id, &progress, 9);
 
         assert_eq!(actual, expected);
     }

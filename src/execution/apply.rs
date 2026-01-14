@@ -148,18 +148,27 @@ pub fn check_task_progress(workspace_path: &Path, change_id: &str) -> Option<Tas
 ///
 /// # Commit Message Format
 ///
-/// The commit message follows the format: `WIP: {change_id} ({completed}/{total} tasks)`
-/// For example: `WIP: add-feature (5/10 tasks)`
+/// The commit message follows the format: `WIP: {change_id} ({completed}/{total} tasks, apply#{iteration})`
+/// For example: `WIP: add-feature (5/10 tasks, apply#3)`
+pub fn format_wip_commit_message(
+    change_id: &str,
+    progress: &TaskProgress,
+    iteration: u32,
+) -> String {
+    format!(
+        "WIP: {} ({}/{} tasks, apply#{})",
+        change_id, progress.completed, progress.total, iteration
+    )
+}
+
 pub async fn create_progress_commit<W: WorkspaceManager + ?Sized>(
     workspace_manager: &W,
     workspace_path: &Path,
     change_id: &str,
     progress: &TaskProgress,
+    iteration: u32,
 ) -> VcsResult<()> {
-    let commit_message = format!(
-        "WIP: {} ({}/{} tasks)",
-        change_id, progress.completed, progress.total
-    );
+    let commit_message = format_wip_commit_message(change_id, progress, iteration);
 
     debug!(
         "Creating progress commit for {}: {}",
@@ -171,9 +180,14 @@ pub async fn create_progress_commit<W: WorkspaceManager + ?Sized>(
         .snapshot_working_copy(workspace_path)
         .await?;
 
-    // Set the commit message
     workspace_manager
-        .set_commit_message(workspace_path, &commit_message)
+        .create_iteration_snapshot(
+            workspace_path,
+            change_id,
+            iteration,
+            progress.completed,
+            progress.total,
+        )
         .await?;
 
     debug!(
@@ -478,11 +492,9 @@ mod tests {
             total: 10,
         };
 
-        let expected = "WIP: add-feature (5/10 tasks)";
-        let actual = format!(
-            "WIP: {} ({}/{} tasks)",
-            change_id, progress.completed, progress.total
-        );
+        let iteration = 3;
+        let expected = "WIP: add-feature (5/10 tasks, apply#3)";
+        let actual = format_wip_commit_message(change_id, &progress, iteration);
 
         assert_eq!(actual, expected);
     }
@@ -495,11 +507,9 @@ mod tests {
             total: 7,
         };
 
-        let expected = "WIP: fix-bug (7/7 tasks)";
-        let actual = format!(
-            "WIP: {} ({}/{} tasks)",
-            change_id, progress.completed, progress.total
-        );
+        let iteration = 5;
+        let expected = "WIP: fix-bug (7/7 tasks, apply#5)";
+        let actual = format_wip_commit_message(change_id, &progress, iteration);
 
         assert_eq!(actual, expected);
     }
@@ -512,11 +522,9 @@ mod tests {
             total: 5,
         };
 
-        let expected = "WIP: new-change (0/5 tasks)";
-        let actual = format!(
-            "WIP: {} ({}/{} tasks)",
-            change_id, progress.completed, progress.total
-        );
+        let iteration = 1;
+        let expected = "WIP: new-change (0/5 tasks, apply#1)";
+        let actual = format_wip_commit_message(change_id, &progress, iteration);
 
         assert_eq!(actual, expected);
     }
@@ -529,11 +537,9 @@ mod tests {
             total: 70,
         };
 
-        let expected = "WIP: add-web-monitoring-feature (50/70 tasks)";
-        let actual = format!(
-            "WIP: {} ({}/{} tasks)",
-            change_id, progress.completed, progress.total
-        );
+        let iteration = 8;
+        let expected = "WIP: add-web-monitoring-feature (50/70 tasks, apply#8)";
+        let actual = format_wip_commit_message(change_id, &progress, iteration);
 
         assert_eq!(actual, expected);
     }

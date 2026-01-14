@@ -229,7 +229,7 @@ pub trait WorkspaceManager: Send + Sync {
 
     /// Create an iteration snapshot with WIP commit message.
     ///
-    /// For Git: Stage all changes and create/amend WIP commit with iteration number.
+    /// For Git: Stage all changes and create a new WIP commit with iteration number.
     async fn create_iteration_snapshot(
         &self,
         workspace_path: &Path,

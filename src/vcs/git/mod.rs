@@ -637,48 +637,24 @@ impl WorkspaceManager for GitWorkspaceManager {
         // Stage all changes
         commands::run_git(&["add", "-A"], workspace_path).await?;
 
-        // Create or amend commit with --allow-empty to ensure snapshot is created
+        // Create a new WIP commit with --allow-empty to ensure snapshot is created
         // even if there are no file changes
-        let has_commits = commands::run_git(&["rev-parse", "HEAD"], workspace_path)
-            .await
-            .is_ok();
+        let result = commands::run_git(
+            &["commit", "--allow-empty", "-m", &wip_message],
+            workspace_path,
+        )
+        .await;
 
-        if has_commits {
-            // Amend existing commit
-            let result = commands::run_git(
-                &["commit", "--amend", "--allow-empty", "-m", &wip_message],
-                workspace_path,
-            )
-            .await;
-            if let Err(e) = result {
-                warn!(
-                    "Failed to amend WIP commit for iteration {}: {}",
-                    iteration, e
-                );
-            } else {
-                debug!(
-                    "Iteration snapshot #{} created for {} (amended)",
-                    iteration, change_id
-                );
-            }
+        if let Err(e) = result {
+            warn!(
+                "Failed to create WIP commit for iteration {}: {}",
+                iteration, e
+            );
         } else {
-            // Create initial commit
-            let result = commands::run_git(
-                &["commit", "--allow-empty", "-m", &wip_message],
-                workspace_path,
-            )
-            .await;
-            if let Err(e) = result {
-                warn!(
-                    "Failed to create initial WIP commit for iteration {}: {}",
-                    iteration, e
-                );
-            } else {
-                debug!(
-                    "Iteration snapshot #{} created for {} (initial)",
-                    iteration, change_id
-                );
-            }
+            debug!(
+                "Iteration snapshot #{} created for {}",
+                iteration, change_id
+            );
         }
 
         Ok(())
@@ -694,17 +670,31 @@ impl WorkspaceManager for GitWorkspaceManager {
 
         debug!("Squashing WIP commits for {} into Apply commit", change_id);
 
-        // For Git, we update the commit message to final Apply message
-        // Since we've been amending the same commit, we just need to update the message
-        let result =
-            commands::run_git(&["commit", "--amend", "-m", &apply_message], workspace_path).await;
+        let wip_pattern = format!("^WIP: {} ", change_id);
+        let wip_commits = commands::run_git(
+            &["rev-list", "--reverse", "--grep", &wip_pattern, "HEAD"],
+            workspace_path,
+        )
+        .await?;
 
-        if let Err(e) = result {
-            return Err(VcsError::git_command(format!(
-                "Failed to set Apply message: {}",
-                e
-            )));
-        }
+        let first_wip = wip_commits
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .ok_or_else(|| {
+                VcsError::git_command(format!("No WIP commits found for {}", change_id))
+            })?;
+
+        let parent_revision =
+            commands::run_git(&["rev-parse", &format!("{}^", first_wip)], workspace_path).await?;
+        let parent_revision = parent_revision.trim();
+
+        commands::run_git(&["reset", "--soft", parent_revision], workspace_path).await?;
+        commands::run_git(
+            &["commit", "--allow-empty", "-m", &apply_message],
+            workspace_path,
+        )
+        .await?;
 
         info!("WIP commits squashed into Apply commit for {}", change_id);
         Ok(())
