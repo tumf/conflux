@@ -29,7 +29,10 @@ use tracing::{error, info, warn};
 
 use cleanup::WorkspaceCleanupGuard;
 use events::send_event;
-use executor::{execute_apply_in_workspace, execute_archive_in_workspace, ParallelHookContext};
+use executor::{
+    ensure_archive_commit, execute_apply_in_workspace, execute_archive_in_workspace,
+    ParallelHookContext,
+};
 
 use crate::hooks::HookRunner;
 
@@ -573,6 +576,27 @@ impl ParallelExecutor {
                     ParallelEvent::ArchiveStarted(change_id.clone()),
                 )
                 .await;
+
+                if let Err(err) = ensure_archive_commit(
+                    change_id,
+                    &workspace.path,
+                    &self.config,
+                    self.event_tx.clone(),
+                    self.workspace_manager.backend_type(),
+                )
+                .await
+                {
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::ArchiveFailed {
+                            change_id: change_id.clone(),
+                            error: err.to_string(),
+                        },
+                    )
+                    .await;
+                    return Err(err);
+                }
+
                 send_event(
                     &self.event_tx,
                     ParallelEvent::ChangeArchived(change_id.clone()),
@@ -603,12 +627,18 @@ impl ParallelExecutor {
         }
 
         for result in &archived_results {
-            if let Some(ref rev) = result.final_revision {
-                info!("Merging archived {} (revision: {})", result.change_id, rev);
-                if let Err(e) = self.merge_and_resolve(std::slice::from_ref(rev)).await {
+            if result.final_revision.is_some() {
+                let revisions = vec![result.workspace_name.clone()];
+                let change_ids = vec![result.change_id.clone()];
+
+                info!(
+                    "Merging archived {} (workspace: {})",
+                    result.change_id, result.workspace_name
+                );
+                if let Err(e) = self.merge_and_resolve(&revisions, &change_ids).await {
                     let error_msg = format!(
-                        "Failed to merge archived {} (revision: {}): {}",
-                        result.change_id, rev, e
+                        "Failed to merge archived {} (workspace: {}): {}",
+                        result.change_id, result.workspace_name, e
                     );
                     error!("{}", error_msg);
                     send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
@@ -947,12 +977,18 @@ impl ParallelExecutor {
                         );
 
                         // Individual merge: merge immediately after archive completes
-                        info!("Merging {} (revision: {})", workspace_result.change_id, rev);
-                        match self.merge_and_resolve(std::slice::from_ref(rev)).await {
+                        let revisions = vec![workspace_result.workspace_name.clone()];
+                        let change_ids = vec![workspace_result.change_id.clone()];
+
+                        info!(
+                            "Merging {} (workspace: {})",
+                            workspace_result.change_id, workspace_result.workspace_name
+                        );
+                        match self.merge_and_resolve(&revisions, &change_ids).await {
                             Ok(_) => {
                                 info!(
-                                    "Successfully merged {} (revision: {})",
-                                    workspace_result.change_id, rev
+                                    "Successfully merged {} (workspace: {})",
+                                    workspace_result.change_id, workspace_result.workspace_name
                                 );
                                 send_event(
                                     &self.event_tx,
@@ -982,8 +1018,8 @@ impl ParallelExecutor {
                             }
                             Err(e) => {
                                 error!(
-                                    "Failed to merge {} (revision: {}): {}",
-                                    workspace_result.change_id, rev, e
+                                    "Failed to merge {} (workspace: {}): {}",
+                                    workspace_result.change_id, workspace_result.workspace_name, e
                                 );
                                 // Merge failure is critical - return error immediately
                                 return Err(e);
@@ -1002,8 +1038,8 @@ impl ParallelExecutor {
     }
 
     /// Merge revisions and resolve any conflicts
-    async fn merge_and_resolve(&self, revisions: &[String]) -> Result<()> {
-        self.merge_and_resolve_with(revisions, |revisions, details| async move {
+    async fn merge_and_resolve(&self, revisions: &[String], change_ids: &[String]) -> Result<()> {
+        self.merge_and_resolve_with(revisions, change_ids, |revisions, details| async move {
             conflict::resolve_conflicts_with_retry(
                 self.workspace_manager.as_ref(),
                 &self.config,
@@ -1020,6 +1056,7 @@ impl ParallelExecutor {
     async fn merge_and_resolve_with<'a, F, Fut>(
         &'a self,
         revisions: &'a [String],
+        change_ids: &'a [String],
         mut resolve_conflicts: F,
     ) -> Result<()>
     where
@@ -1046,27 +1083,27 @@ impl ParallelExecutor {
                 .original_branch()
                 .unwrap_or_else(|| "main".to_string());
 
-            let change_ids = revisions
-                .iter()
-                .map(|rev| {
-                    GitWorkspaceManager::extract_change_id_from_worktree_name(rev)
-                        .unwrap_or_else(|| rev.to_string())
-                })
-                .collect::<Vec<_>>();
+            if change_ids.len() != revisions.len() {
+                return Err(OrchestratorError::GitCommand(format!(
+                    "Expected {} change_ids for {} revisions",
+                    revisions.len(),
+                    change_ids.len()
+                )));
+            }
 
             conflict::resolve_merges_with_retry(conflict::ResolveMergesWithRetryArgs {
                 workspace_manager: self.workspace_manager.as_ref(),
                 config: &self.config,
                 event_tx: &self.event_tx,
                 revisions,
-                change_ids: &change_ids,
+                change_ids,
                 target_branch: target_branch.as_str(),
                 base_revision: base_revision.as_str(),
                 max_retries: max_attempts,
             })
             .await?;
 
-            self.verify_merge_commits(&base_revision, &target_branch, &change_ids)
+            self.verify_merge_commits(&base_revision, &target_branch, change_ids)
                 .await?;
 
             let merge_revision = self.workspace_manager.get_current_revision().await?;
@@ -1554,9 +1591,14 @@ mod tests {
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
+        let change_ids = vec!["change-a".to_string(), "change-b".to_string()];
 
         executor
-            .merge_and_resolve_with(&revisions, |_revs, _details| async move { Ok(()) })
+            .merge_and_resolve_with(
+                &revisions,
+                &change_ids,
+                |_revs, _details| async move { Ok(()) },
+            )
             .await
             .unwrap();
     }
@@ -1673,9 +1715,14 @@ mod tests {
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
+        let change_ids = vec!["change-a".to_string(), "change-b".to_string()];
 
         executor
-            .merge_and_resolve_with(&revisions, |_revs, _details| async move { Ok(()) })
+            .merge_and_resolve_with(
+                &revisions,
+                &change_ids,
+                |_revs, _details| async move { Ok(()) },
+            )
             .await
             .unwrap();
 
@@ -1809,9 +1856,14 @@ mod tests {
         };
 
         let revisions = vec![workspace_a.name];
+        let change_ids = vec!["change-a".to_string()];
 
         executor
-            .merge_and_resolve_with(&revisions, |_revs, _details| async move { Ok(()) })
+            .merge_and_resolve_with(
+                &revisions,
+                &change_ids,
+                |_revs, _details| async move { Ok(()) },
+            )
             .await
             .unwrap();
 

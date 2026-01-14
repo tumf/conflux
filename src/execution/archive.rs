@@ -21,6 +21,7 @@
 use crate::error::{OrchestratorError, Result};
 use crate::task_parser;
 use std::path::Path;
+use tokio::process::Command;
 use tracing::debug;
 
 /// Result of archive path verification.
@@ -87,6 +88,63 @@ pub fn is_change_archived(change_id: &str, base_path: Option<&Path>) -> bool {
     );
 
     archive_exists && !change_exists
+}
+
+/// Check if the archive commit is complete for a change.
+///
+/// The archive commit is considered complete when the working tree is clean
+/// and the latest commit subject matches `Archive: <change_id>`.
+pub async fn is_archive_commit_complete(change_id: &str, base_path: Option<&Path>) -> Result<bool> {
+    let repo_root = base_path.unwrap_or_else(|| Path::new("."));
+
+    let status_output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .map_err(|e| OrchestratorError::GitCommand(format!("Failed to check git status: {}", e)))?;
+
+    if !status_output.status.success() {
+        let stderr = String::from_utf8_lossy(&status_output.stderr);
+        return Err(OrchestratorError::GitCommand(format!(
+            "Failed to check git status: {}",
+            stderr
+        )));
+    }
+
+    let is_clean = String::from_utf8_lossy(&status_output.stdout)
+        .trim()
+        .is_empty();
+
+    let log_output = Command::new("git")
+        .args(["log", "-1", "--format=%s"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .map_err(|e| OrchestratorError::GitCommand(format!("Failed to read git log: {}", e)))?;
+
+    if !log_output.status.success() {
+        let stderr = String::from_utf8_lossy(&log_output.stderr);
+        return Err(OrchestratorError::GitCommand(format!(
+            "Failed to read git log: {}",
+            stderr
+        )));
+    }
+
+    let subject = String::from_utf8_lossy(&log_output.stdout)
+        .trim()
+        .to_string();
+    let expected_subject = format!("Archive: {}", change_id);
+
+    debug!(
+        change_id = %change_id,
+        is_clean = is_clean,
+        subject = %subject,
+        expected_subject = %expected_subject,
+        "is_archive_commit_complete: checking commit state"
+    );
+
+    Ok(is_clean && subject == expected_subject)
 }
 
 /// Verify that a change was actually archived.
@@ -286,6 +344,7 @@ pub fn build_archive_error_message(change_id: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
     use tempfile::TempDir;
 
     // ===========================
@@ -447,6 +506,90 @@ mod tests {
 
         let change_id = "missing-archive";
         assert!(!is_change_archived(change_id, Some(base)));
+    }
+
+    // ===========================
+    // is_archive_commit_complete tests
+    // ===========================
+
+    #[tokio::test]
+    async fn test_is_archive_commit_complete_when_clean() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        fs::write(repo_root.join("README.md"), "base").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Archive: change-a"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        let result = is_archive_commit_complete("change-a", Some(repo_root))
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn test_is_archive_commit_complete_false_when_dirty() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        fs::write(repo_root.join("README.md"), "base").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Archive: change-a"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        fs::write(repo_root.join("README.md"), "dirty").unwrap();
+
+        let result = is_archive_commit_complete("change-a", Some(repo_root))
+            .await
+            .unwrap();
+        assert!(!result);
     }
 
     // ===========================

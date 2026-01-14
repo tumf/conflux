@@ -381,35 +381,14 @@ ba74d36d6cdc1effcae37cfed4f97e19  openspec/changes/my-change/tasks.md
 
 ### Requirement: Approval Validation Logic
 
-The system SHALL validate approval by comparing current files against the approved manifest.
+The system SHALL validate approval by checking for the presence of the `approved` file.
 
-#### Scenario: Validation excludes tasks.md
+#### Scenario: Approved file exists
 
-- **WHEN** validating approval status
-- **THEN** `tasks.md` hash changes do NOT affect approval status
-- **AND** `tasks.md` missing from current directory does NOT affect approval status
-- **AND** only non-tasks.md files are compared for validation
-
-#### Scenario: File list mismatch invalidates approval
-
-- **WHEN** validating approval status
-- **AND** a new `.md` file (not `tasks.md`) is added to the change directory
-- **THEN** the change is considered unapproved
-- **AND** re-approval is required
-
-#### Scenario: File content change invalidates approval
-
-- **WHEN** validating approval status
-- **AND** any `.md` file (except `tasks.md`) has different content than at approval time
-- **THEN** the change is considered unapproved
-- **AND** re-approval is required
-
-#### Scenario: File removed invalidates approval
-
-- **WHEN** validating approval status
-- **AND** a `.md` file (not `tasks.md`) listed in the manifest no longer exists
-- **THEN** the change is considered unapproved
-- **AND** re-approval is required
+- **WHEN** checking approval status
+- **AND** the `approved` file exists
+- **THEN** the change is considered approved
+- **AND** `is_approved` field is `true`
 
 #### Scenario: Missing approved file means unapproved
 

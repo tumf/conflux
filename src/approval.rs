@@ -95,16 +95,12 @@ pub fn compute_md5(path: &Path) -> Result<String> {
 
 /// Parse an approved file to get the file-to-hash mapping
 ///
-/// The approved file format is compatible with `md5sum` output:
-/// ```text
-/// 47dadc8fb73c2d2ec6b19c0de0d71094  openspec/changes/{change_id}/proposal.md
-/// ```
-///
 /// # Arguments
 /// * `path` - Path to the approved file
 ///
 /// # Returns
 /// A map from file path to expected MD5 hash
+#[allow(dead_code)]
 pub fn parse_approved_file(path: &Path) -> Result<BTreeMap<PathBuf, String>> {
     let file = fs::File::open(path).map_err(|e| {
         OrchestratorError::ConfigLoad(format!(
@@ -141,8 +137,6 @@ pub fn parse_approved_file(path: &Path) -> Result<BTreeMap<PathBuf, String>> {
 ///
 /// A change is approved if:
 /// 1. The `approved` file exists
-/// 2. All files in the manifest exist and have matching hashes
-/// 3. No new files have been added (except tasks.md)
 ///
 /// # Arguments
 /// * `change_id` - The ID of the change to check
@@ -158,88 +152,6 @@ pub fn check_approval(change_id: &str) -> Result<bool> {
     if !approved_path.exists() {
         debug!("Change '{}' is not approved: no approved file", change_id);
         return Ok(false);
-    }
-
-    // 2. Parse approved manifest
-    let manifest = match parse_approved_file(&approved_path) {
-        Ok(m) => m,
-        Err(e) => {
-            debug!(
-                "Change '{}' approval invalid: failed to parse manifest: {}",
-                change_id, e
-            );
-            return Ok(false);
-        }
-    };
-
-    // 3. Get current file list (excluding tasks.md)
-    let current_files = match discover_md_files(change_id) {
-        Ok(f) => f,
-        Err(e) => {
-            debug!(
-                "Change '{}' approval check failed: cannot discover files: {}",
-                change_id, e
-            );
-            return Err(e);
-        }
-    };
-
-    // 4. Compare file lists (excluding tasks.md from manifest)
-    let manifest_files: std::collections::HashSet<PathBuf> = manifest
-        .keys()
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n != "tasks.md")
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect();
-
-    let current_set: std::collections::HashSet<PathBuf> = current_files.into_iter().collect();
-
-    if manifest_files != current_set {
-        debug!(
-            "Change '{}' approval invalid: file list mismatch. Manifest: {:?}, Current: {:?}",
-            change_id, manifest_files, current_set
-        );
-        return Ok(false);
-    }
-
-    // 5. Verify hashes for all files in manifest (except tasks.md)
-    for (path, expected_hash) in &manifest {
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n == "tasks.md")
-            .unwrap_or(false)
-        {
-            continue;
-        }
-
-        let actual_hash = match compute_md5(path) {
-            Ok(h) => h,
-            Err(e) => {
-                debug!(
-                    "Change '{}' approval invalid: cannot compute hash for {}: {}",
-                    change_id,
-                    path.display(),
-                    e
-                );
-                return Ok(false);
-            }
-        };
-
-        if &actual_hash != expected_hash {
-            debug!(
-                "Change '{}' approval invalid: hash mismatch for {}. Expected: {}, Actual: {}",
-                change_id,
-                path.display(),
-                expected_hash,
-                actual_hash
-            );
-            return Ok(false);
-        }
     }
 
     debug!("Change '{}' is approved and valid", change_id);
@@ -329,6 +241,7 @@ pub fn unapprove_change(change_id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     #[allow(dead_code)]
@@ -347,6 +260,14 @@ mod tests {
         fs::write(specs_dir.join("spec.md"), "# Spec\nSpec content").unwrap();
 
         changes_dir
+    }
+
+    static CURRENT_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_current_dir() -> std::sync::MutexGuard<'static, ()> {
+        CURRENT_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
     }
 
     #[test]
@@ -505,6 +426,8 @@ mod tests {
         fs::create_dir_all(&changes_dir).unwrap();
         fs::write(changes_dir.join("proposal.md"), "# Proposal").unwrap();
 
+        let _lock = lock_current_dir();
+
         // Change to the temp dir so relative paths work
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp_dir.path()).unwrap();
@@ -525,6 +448,8 @@ mod tests {
         let changes_dir = temp_dir.path().join("openspec/changes/my-change");
         fs::create_dir_all(&changes_dir).unwrap();
         fs::write(changes_dir.join("proposal.md"), "# Proposal\nContent").unwrap();
+
+        let _lock = lock_current_dir();
 
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp_dir.path()).unwrap();
@@ -549,6 +474,8 @@ mod tests {
         )
         .unwrap();
 
+        let _lock = lock_current_dir();
+
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp_dir.path()).unwrap();
 
@@ -568,6 +495,8 @@ mod tests {
         fs::write(changes_dir.join("proposal.md"), "# Proposal\nContent").unwrap();
         // No approved file exists
 
+        let _lock = lock_current_dir();
+
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp_dir.path()).unwrap();
 
@@ -582,6 +511,7 @@ mod tests {
     #[test]
     fn test_approve_nonexistent_change_fails() {
         let temp_dir = TempDir::new().unwrap();
+        let _lock = lock_current_dir();
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp_dir.path()).unwrap();
 
@@ -599,6 +529,8 @@ mod tests {
         fs::create_dir_all(&changes_dir).unwrap();
         fs::write(changes_dir.join("proposal.md"), "content").unwrap();
         fs::write(changes_dir.join("design.md"), "design").unwrap();
+
+        let _lock = lock_current_dir();
 
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp_dir.path()).unwrap();
@@ -629,6 +561,8 @@ mod tests {
         fs::write(changes_dir.join("proposal.md"), "# Proposal").unwrap();
         fs::write(changes_dir.join("tasks.md"), "# Tasks").unwrap();
 
+        let _lock = lock_current_dir();
+
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp_dir.path()).unwrap();
 
@@ -646,28 +580,22 @@ mod tests {
     }
 
     #[test]
-    fn test_check_approval_ignores_tasks_md_changes() {
+    fn test_check_approval_only_checks_approved_file() {
         let temp_dir = TempDir::new().unwrap();
         let changes_dir = temp_dir.path().join("openspec/changes/my-change");
         fs::create_dir_all(&changes_dir).unwrap();
-
-        // Create proposal.md with known content
         fs::write(changes_dir.join("proposal.md"), "# Proposal").unwrap();
+        fs::write(changes_dir.join("approved"), "ignored contents").unwrap();
+
+        let _lock = lock_current_dir();
 
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp_dir.path()).unwrap();
-
-        // Approve the change
-        approve_change("my-change").unwrap();
-
-        // Now modify tasks.md (should not affect approval status)
-        fs::write(changes_dir.join("tasks.md"), "# Tasks\n- [x] Modified").unwrap();
 
         let is_approved = check_approval("my-change").unwrap();
 
         std::env::set_current_dir(original_dir).unwrap();
 
-        // Should still be approved since tasks.md is excluded
         assert!(is_approved);
     }
 }
