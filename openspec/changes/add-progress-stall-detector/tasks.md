@@ -1,20 +1,37 @@
-# タスク一覧: 進捗停滞検出
+# タスク一覧: 進捗停滞検出（空WIPコミット連続）
 
-## 実装タスク
+## 1. 仕様・設定
 
-- [ ] `Progress History`構造体を追加して、各changeのタスク進捗を追跡
-- [ ] `detect_stall()`メソッドを追加して、3回連続で進捗なしを検出
-- [ ] configに`stall_detection.enabled`と`stall_detection.threshold`を追加
-- [ ] orchestrator.rsのループ内で進捗履歴を更新
-- [ ] 停滞検出時にwarningログを出力し、次のchangeへスキップ
+- [ ] `stall_detection.enabled`（default: true）を追加
+- [ ] `stall_detection.threshold`（default: 3）を追加
+- [ ] stall 判定の対象を `apply` / `archive` に限定し、`resolve` は out of scope とする
 
-## テストタスク
+## 2. WIP と stall 検出（共通）
 
-- [ ] 進捗が停滞した場合のユニットテストを追加
-- [ ] 正常に進捗する場合は検出されないことをテスト
-- [ ] config設定値の読み込みテスト
+- [ ] WIP コミット直後に「空コミット（親との差分なし）」を判定するヘルパを追加
+- [ ] change ごと・phase ごとに「空コミット連続回数」を保持し、非空コミットでリセットする
+- [ ] 連続回数が `threshold` に達したら stall と判定する
 
-## ドキュメント
+## 3. apply ループ（serial / parallel）
 
-- [ ] AGENTS.mdに進捗停滞検出の説明を追加
-- [ ] configサンプルにstall_detection設定を追加
+- [ ] apply 反復の WIP 作成は既存仕様を維持しつつ、空コミット連続判定に接続
+- [ ] stall 発生時は change を停止（failed 扱い）として扱う
+- [ ] 停止 change に依存する change はこの run ではスキップし、依存しない queued change は継続する
+
+## 4. archive ループ（serial / parallel）
+
+- [ ] archive retry 反復ごとに `WIP(archive)`（`--allow-empty`）を作成する
+- [ ] `WIP(archive)` の空コミット連続判定で stall したら、その change の archive を中断し停止扱いにする
+- [ ] archive 成功時に `WIP(archive)` を phase 別に squash し、最終 `Archive:` コミットを残す
+
+## 5. 依存スキップ
+
+- [ ] parallel: stall を failure として扱い、既存の依存スキップ機構に乗せる
+- [ ] serial: 停止済み change を依存に含む queued change を、この run の選択対象から除外する
+
+## 6. テスト
+
+- [ ] 空コミットが `threshold` 回連続した場合に stall すること
+- [ ] 非空コミットが挟まると連続カウントがリセットされること
+- [ ] `enabled=false` の場合は stall しないこと
+- [ ] 停止 change の依存先がスキップされ、独立 change が継続されること
