@@ -992,41 +992,14 @@ The apply history context MUST be formatted as XML-like tags containing the agen
 - **AND** the orchestrator captures this summary message for history
 
 ### Requirement: TUI Stop Processing with Escape Key
+TUIはEsc二度押しによる強制停止時、現在のエージェントプロセスとその子プロセスを確実に終了しなければならない（SHALL）。
 
-The TUI SHALL allow users to stop ongoing processing using the Escape key.
-
-#### Scenario: Graceful stop completes naturally
-
-- **WHEN** TUI is in Stopping mode
-- **AND** the current agent process completes successfully
-- **THEN** the TUI transitions to Stopped mode
-- **AND** the completed change transitions to appropriate status (completed/archived)
-- **AND** log displays "Stopped - processing halted"
-
-#### Scenario: Graceful stop with incomplete processing (NEW)
-
-- **WHEN** TUI is in Stopping mode
-- **AND** the orchestrator stops without completing the current change
-- **OR** the current change is still in Processing/Archiving state when stop completes
-- **THEN** the TUI transitions to Stopped mode
-- **AND** any changes in Processing or Archiving status SHALL transition to Queued status
-- **AND** elapsed time for interrupted changes SHALL be recorded
-- **AND** log displays "Processing stopped"
-- **AND** interrupted changes can be resumed with F5 key
-
-#### Scenario: Second Esc press forces immediate stop
-
-- **WHEN** TUI is in Stopping mode
-- **AND** user presses Escape key again
-- **THEN** the current agent process is terminated immediately (SIGTERM)
-- **AND** the TUI transitions to Stopped mode
-- **AND** log displays "Force stopped - process terminated"
-- **AND** the interrupted change status becomes "queued" (not error)
-- **AND** elapsed time for interrupted changes SHALL be recorded
-
-**Note**: Graceful stopとForce stopは、中断された変更の状態遷移において同じ動作をします（両方ともQueuedに戻す）。
-
----
+#### Scenario: 強制停止で子プロセスが残らない
+- **WHEN** TUIがStoppingモードでユーザーがEscを再度押す
+- **THEN** 現在のエージェントプロセスとその子プロセスが終了する
+- **AND** 終了待機がタイムアウトした場合でも、追加の終了処理が行われる
+- **AND** ログに「Force stopped - process terminated」が表示される
+- **AND** 変更の状態はQueuedに戻る
 
 ### Requirement: TUI Stopped Mode
 
