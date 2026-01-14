@@ -24,6 +24,9 @@ use std::path::Path;
 use tokio::process::Command;
 use tracing::debug;
 
+/// Maximum number of archive retries after a verification failure.
+pub const ARCHIVE_COMMAND_MAX_RETRIES: u32 = 2;
+
 /// Result of archive path verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArchiveVerificationResult {

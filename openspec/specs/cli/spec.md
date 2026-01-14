@@ -632,6 +632,13 @@ The TUI SHALL track archived changes reliably and report accurate final status.
 - **AND** the error is logged with details
 - **AND** the change is not removed from tracking until explicitly handled
 
+#### Scenario: Archive command succeeded but change not archived
+- **WHEN** an archive command exits successfully (exit code 0)
+- **AND** archive verification indicates the change is not archived
+- **THEN** the orchestrator re-runs the archive command up to N times before marking the change as errored
+- **AND** each retry attempt is logged
+- **AND** no arbitrary delay-based polling is used
+
 ### Requirement: TUI Uses Native Change Discovery
 
 The TUI mode MUST use native directory scanning instead of external `openspec list` command for all change list operations.

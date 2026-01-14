@@ -346,8 +346,15 @@ impl Orchestrator {
                 );
                 let output = LogOutputHandler::new();
 
-                match archive_change(&next, &mut self.agent, &self.hooks, &archive_ctx, &output)
-                    .await
+                match archive_change(
+                    &next,
+                    &mut self.agent,
+                    &self.hooks,
+                    &archive_ctx,
+                    &output,
+                    None,
+                )
+                .await
                 {
                     Ok(ArchiveResult::Success) => {
                         // Update changes_processed count
