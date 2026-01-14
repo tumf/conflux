@@ -16,6 +16,7 @@ pub use types::{FailedChangeTracker, WorkspaceResult};
 use crate::analyzer::{extract_change_dependencies, ParallelGroup};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::events::LogEntry;
 use crate::execution::archive::is_change_archived;
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{
@@ -26,6 +27,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use cleanup::WorkspaceCleanupGuard;
@@ -59,6 +61,8 @@ pub struct ParallelExecutor {
     failed_tracker: FailedChangeTracker,
     /// Hook runner for executing hooks (optional)
     hooks: Option<Arc<HookRunner>>,
+    /// Cancellation token for force stop cleanup
+    cancel_token: Option<CancellationToken>,
 }
 
 impl ParallelExecutor {
@@ -130,6 +134,7 @@ impl ParallelExecutor {
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
+            cancel_token: None,
         }
     }
 
@@ -146,6 +151,17 @@ impl ParallelExecutor {
     /// are reused to resume interrupted work.
     pub fn set_no_resume(&mut self, no_resume: bool) {
         self.no_resume = no_resume;
+    }
+
+    /// Set the cancellation token for force stop cleanup.
+    pub fn set_cancel_token(&mut self, cancel_token: CancellationToken) {
+        self.cancel_token = Some(cancel_token);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
     }
 
     /// Resolve VCS backend (convert Auto to concrete backend)
@@ -213,6 +229,14 @@ impl ParallelExecutor {
         info!("Preparation complete");
 
         for group in groups {
+            if self.is_cancelled() {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::warn("Parallel execution cancelled")),
+                )
+                .await;
+                return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+            }
             let group_size = group.changes.len();
             self.execute_group(&group, total_changes, changes_processed)
                 .await?;
@@ -279,6 +303,14 @@ impl ParallelExecutor {
         let mut changes_processed: usize = 0;
 
         while !changes.is_empty() {
+            if self.is_cancelled() {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::warn("Parallel execution cancelled")),
+                )
+                .await;
+                return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+            }
             // Filter out changes that depend on failed changes
             let executable_changes: Vec<_> = changes
                 .iter()
@@ -379,6 +411,14 @@ impl ParallelExecutor {
         total_changes: usize,
         changes_processed: usize,
     ) -> Result<()> {
+        if self.is_cancelled() {
+            send_event(
+                &self.event_tx,
+                ParallelEvent::Log(LogEntry::warn("Parallel execution cancelled")),
+            )
+            .await;
+            return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+        }
         // First, check which changes should be skipped due to failed dependencies
         let mut changes_to_execute: Vec<String> = Vec::new();
         let mut skipped_changes: Vec<(String, String)> = Vec::new();
@@ -841,6 +881,7 @@ impl ParallelExecutor {
             let event_tx = self.event_tx.clone();
             let vcs_backend = self.workspace_manager.backend_type();
             let hooks = self.hooks.clone();
+            let cancel_token = self.cancel_token.clone();
 
             // Build parallel hook context
             let parallel_ctx = ParallelHookContext {
@@ -869,6 +910,7 @@ impl ParallelExecutor {
                     vcs_backend,
                     hooks.as_ref().map(|h| h.as_ref()),
                     Some(&parallel_ctx),
+                    cancel_token.as_ref(),
                 )
                 .await;
 
@@ -900,6 +942,7 @@ impl ParallelExecutor {
                             vcs_backend,
                             hooks.as_ref().map(|h| h.as_ref()),
                             Some(&parallel_ctx),
+                            cancel_token.as_ref(),
                         )
                         .await;
 
@@ -1543,6 +1586,7 @@ mod tests {
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
+            cancel_token: None,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1662,6 +1706,7 @@ mod tests {
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
+            cancel_token: None,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1768,6 +1813,7 @@ mod tests {
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
+            cancel_token: None,
         };
 
         let revisions = vec![workspace_a.name];
@@ -1890,6 +1936,7 @@ mod tests {
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
+            cancel_token: None,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2024,6 +2071,7 @@ mod tests {
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
+            cancel_token: None,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2165,6 +2213,7 @@ mod tests {
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
+            cancel_token: None,
         };
 
         let revisions = vec![workspace_a.name];

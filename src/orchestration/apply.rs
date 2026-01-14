@@ -12,6 +12,8 @@ use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::Change;
+use crate::process_manager::TerminationOutcome;
+use std::time::Duration;
 use tracing::info;
 
 use super::output::OutputHandler;
@@ -192,9 +194,20 @@ where
     // Stream output
     loop {
         if cancel_check() {
-            let _ = child.terminate();
-            let _ = child.kill().await;
-            output.on_warn("Process killed due to cancellation");
+            let termination = child.terminate_with_timeout(Duration::from_secs(5)).await;
+            let message = match termination {
+                Ok(TerminationOutcome::Exited(_)) => {
+                    "Process terminated due to cancellation".to_string()
+                }
+                Ok(TerminationOutcome::ForceKilled(_)) => {
+                    "Process force killed after cancellation timeout".to_string()
+                }
+                Ok(TerminationOutcome::TimedOut) => {
+                    "Process still running after force kill timeout".to_string()
+                }
+                Err(e) => format!("Failed to terminate process after cancellation: {}", e),
+            };
+            output.on_warn(&message);
             return Ok(ApplyResult::Cancelled);
         }
 
