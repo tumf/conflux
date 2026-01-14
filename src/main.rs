@@ -15,6 +15,8 @@ mod parallel;
 mod parallel_run_service;
 mod process_manager;
 mod progress;
+#[cfg(test)]
+mod spec_test_annotations;
 mod stall;
 mod task_parser;
 mod templates;
