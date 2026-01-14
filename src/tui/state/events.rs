@@ -277,8 +277,9 @@ impl AppState {
         // Remove changes that no longer exist (have been archived externally)
         let current_ids: HashSet<String> = fetched_changes.iter().map(|c| c.id.clone()).collect();
         self.changes.retain(|c| {
-            // Keep if still exists, or if it's in a terminal state (completed/archiving/archived/error)
+            // Keep if still exists, apply started in this session, or in a terminal state.
             current_ids.contains(&c.id)
+                || c.started_at.is_some()
                 || matches!(
                     c.queue_status,
                     QueueStatus::Completed
@@ -880,6 +881,23 @@ mod tests {
             QueueStatus::Completed
         ));
         assert!(matches!(app.changes[2].queue_status, QueueStatus::Error(_)));
+    }
+    /// Test that started changes are retained when removed from fetched_changes.
+    #[test]
+    fn test_started_changes_retained_when_not_fetched() {
+        let changes = vec![create_approved_change("started", 1, 3)];
+        let mut app = AppState::new(changes);
+
+        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[0].started_at = Some(Instant::now());
+
+        // Simulate refresh with no changes present in filesystem
+        let fetched: Vec<Change> = vec![];
+        app.update_changes(fetched);
+
+        assert_eq!(app.changes.len(), 1, "Started change should be retained");
+        assert_eq!(app.changes[0].id, "started");
+        assert!(app.changes[0].started_at.is_some());
     }
 
     /// Test that non-terminal state changes are removed when not in fetched_changes.
