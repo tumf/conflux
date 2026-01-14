@@ -342,6 +342,24 @@ impl AppState {
         }
     }
 
+    /// Trigger merge resolution for the selected change when applicable.
+    pub fn resolve_merge(&mut self) -> Option<TuiCommand> {
+        if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
+            return None;
+        }
+
+        if !matches!(self.mode, AppMode::Select | AppMode::Stopped) {
+            return None;
+        }
+
+        let change = &self.changes[self.cursor_index];
+        if matches!(change.queue_status, QueueStatus::MergeWait) {
+            Some(TuiCommand::ResolveMerge(change.id.clone()))
+        } else {
+            None
+        }
+    }
+
     /// Update parallel eligibility status for changes.
     pub fn apply_parallel_eligibility(&mut self, committed_change_ids: &HashSet<String>) {
         for change in &mut self.changes {

@@ -27,28 +27,17 @@ The TUI module SHALL be organized as a directory-based module tree under `src/tu
 
 ### Requirement: Public API Stability
 
-The TUI module SHALL maintain backward-compatible public exports.
+TUI モジュールは公開エクスポートを維持しなければならない（SHALL）。
 
-#### Scenario: run_tui function exported
+ただし、本プロジェクト内の機能追加に伴い、`OrchestratorEvent` および `TuiCommand` への **バリアント追加**は許容される（MAY）。
 
+既存バリアントの意味・フィールド・名称の互換性は維持されなければならない（MUST）。
+
+#### Scenario: 既存バリアントを壊さずに追加できる
 - **GIVEN** external code imports from the tui module
-- **WHEN** `use crate::tui::run_tui` is called
-- **THEN** the function is accessible
-- **AND** the function signature is unchanged
-
-#### Scenario: DynamicQueue type exported
-
-- **GIVEN** external code imports from the tui module
-- **WHEN** `use crate::tui::DynamicQueue` is called
-- **THEN** the type is accessible
-- **AND** all public methods are unchanged
-
-#### Scenario: Event types exported
-
-- **GIVEN** external code imports from the tui module
-- **WHEN** `use crate::tui::{OrchestratorEvent, TuiCommand}` is called
-- **THEN** the types are accessible
-- **AND** all variants are unchanged
+- **WHEN** new variants are added to `OrchestratorEvent` or `TuiCommand`
+- **THEN** existing variants remain available and unchanged
+- **AND** the module continues to compile and run within this repository
 
 ### Requirement: No Behavioral Changes
 

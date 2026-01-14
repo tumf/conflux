@@ -23,9 +23,9 @@ use crate::vcs::git::commands as git_commands;
 use crate::vcs::{
     GitWorkspaceManager, VcsBackend, VcsError, Workspace, WorkspaceManager, WorkspaceStatus,
 };
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -36,6 +36,8 @@ use events::send_event;
 use executor::{execute_apply_in_workspace, execute_archive_in_workspace, ParallelHookContext};
 
 use crate::hooks::HookRunner;
+
+const DEFAULT_MAX_CONFLICT_RETRIES: u32 = 3;
 
 /// Parallel executor for running changes in git worktrees
 pub struct ParallelExecutor {
@@ -59,10 +61,50 @@ pub struct ParallelExecutor {
     no_resume: bool,
     /// Tracker for failed changes to enable skipping dependent changes
     failed_tracker: FailedChangeTracker,
+    /// Change-level dependencies (change_id -> dependency ids)
+    change_dependencies: HashMap<String, Vec<String>>,
+    /// Changes waiting for merge resolution
+    merge_deferred_changes: HashSet<String>,
     /// Hook runner for executing hooks (optional)
     hooks: Option<Arc<HookRunner>>,
     /// Cancellation token for force stop cleanup
     cancel_token: Option<CancellationToken>,
+}
+
+pub async fn base_dirty_reason(repo_root: &Path) -> Result<Option<String>> {
+    let is_git_repo = git_commands::check_git_repo(repo_root)
+        .await
+        .map_err(OrchestratorError::from_vcs_error)?;
+    if !is_git_repo {
+        return Ok(None);
+    }
+
+    let merge_in_progress = git_commands::is_merge_in_progress(repo_root)
+        .await
+        .map_err(OrchestratorError::from_vcs_error)?;
+    if merge_in_progress {
+        return Ok(Some("Merge in progress (MERGE_HEAD exists)".to_string()));
+    }
+
+    let (has_changes, status) = git_commands::has_uncommitted_changes(repo_root)
+        .await
+        .map_err(OrchestratorError::from_vcs_error)?;
+    if has_changes {
+        let trimmed = status.trim();
+        let reason = if trimmed.is_empty() {
+            "Working tree has uncommitted changes".to_string()
+        } else {
+            format!("Working tree has uncommitted changes:\n{}", trimmed)
+        };
+        return Ok(Some(reason));
+    }
+
+    Ok(None)
+}
+
+enum MergeAttempt {
+    Merged,
+    Deferred(String),
 }
 
 impl ParallelExecutor {
@@ -129,11 +171,13 @@ impl ParallelExecutor {
             apply_command,
             archive_command,
             event_tx,
-            max_conflict_retries: 3,
+            max_conflict_retries: DEFAULT_MAX_CONFLICT_RETRIES,
             merge_lock: Arc::new(Mutex::new(())),
             repo_root,
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
+            change_dependencies: HashMap::new(),
+            merge_deferred_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
         }
@@ -163,6 +207,31 @@ impl ParallelExecutor {
         self.cancel_token
             .as_ref()
             .is_some_and(|token| token.is_cancelled())
+    }
+
+    fn has_merge_deferred(&self) -> bool {
+        !self.merge_deferred_changes.is_empty()
+    }
+
+    fn should_skip_due_to_merge_wait(&self, change_id: &str) -> Option<String> {
+        if let Some(deps) = self.change_dependencies.get(change_id) {
+            for dep in deps {
+                if self.merge_deferred_changes.contains(dep) {
+                    return Some(dep.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn skip_reason_for_change(&self, change_id: &str) -> Option<String> {
+        if let Some(failed_dep) = self.failed_tracker.should_skip(change_id) {
+            return Some(format!("Dependency '{}' failed", failed_dep));
+        }
+        if let Some(deferred_dep) = self.should_skip_due_to_merge_wait(change_id) {
+            return Some(format!("Dependency '{}' awaiting merge", deferred_dep));
+        }
+        None
     }
 
     /// Resolve VCS backend (convert Auto to concrete backend)
@@ -199,7 +268,8 @@ impl ParallelExecutor {
 
         // Extract change-level dependencies from groups and set them in the tracker
         let change_deps = extract_change_dependencies(&groups);
-        self.failed_tracker.set_dependencies(change_deps);
+        self.failed_tracker.set_dependencies(change_deps.clone());
+        self.change_dependencies = change_deps;
 
         // Calculate total changes count
         let total_changes: usize = groups.iter().map(|g| g.changes.len()).sum();
@@ -244,7 +314,11 @@ impl ParallelExecutor {
             changes_processed += group_size;
         }
 
-        send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+        if self.has_merge_deferred() {
+            send_event(&self.event_tx, ParallelEvent::Stopped).await;
+        } else {
+            send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+        }
         Ok(())
     }
 
@@ -316,11 +390,8 @@ impl ParallelExecutor {
             let executable_changes: Vec<_> = changes
                 .iter()
                 .filter(|c| {
-                    if let Some(failed_dep) = self.failed_tracker.should_skip(&c.id) {
-                        warn!(
-                            "Excluding '{}' from analysis: dependency '{}' failed",
-                            c.id, failed_dep
-                        );
+                    if let Some(reason) = self.skip_reason_for_change(&c.id) {
+                        warn!("Excluding '{}' from analysis: {}", c.id, reason);
                         // Emit skip event
                         // Note: We can't async here, so we'll emit after filtering
                         false
@@ -333,12 +404,12 @@ impl ParallelExecutor {
 
             // Emit skip events for filtered changes
             for change in &changes {
-                if let Some(failed_dep) = self.failed_tracker.should_skip(&change.id) {
+                if let Some(reason) = self.skip_reason_for_change(&change.id) {
                     send_event(
                         &self.event_tx,
                         ParallelEvent::ChangeSkipped {
                             change_id: change.id.clone(),
-                            reason: format!("Dependency '{}' failed", failed_dep),
+                            reason,
                         },
                     )
                     .await;
@@ -349,7 +420,7 @@ impl ParallelExecutor {
             changes = executable_changes;
 
             if changes.is_empty() {
-                info!("All remaining changes depend on failed changes, stopping");
+                info!("All remaining changes are blocked by dependencies, stopping");
                 break;
             }
 
@@ -375,7 +446,8 @@ impl ParallelExecutor {
 
             // Extract change-level dependencies for this iteration
             let change_deps = extract_change_dependencies(&groups);
-            self.failed_tracker.set_dependencies(change_deps);
+            self.failed_tracker.set_dependencies(change_deps.clone());
+            self.change_dependencies = change_deps;
 
             // Execute only the first group (no dependencies)
             let first_group = ParallelGroup {
@@ -401,7 +473,11 @@ impl ParallelExecutor {
             group_counter += 1;
         }
 
-        send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+        if self.has_merge_deferred() {
+            send_event(&self.event_tx, ParallelEvent::Stopped).await;
+        } else {
+            send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+        }
         Ok(())
     }
 
@@ -425,24 +501,21 @@ impl ParallelExecutor {
         let mut skipped_changes: Vec<(String, String)> = Vec::new();
 
         for change_id in &group.changes {
-            if let Some(failed_dep) = self.failed_tracker.should_skip(change_id) {
-                warn!(
-                    "Skipping '{}' because dependency '{}' failed",
-                    change_id, failed_dep
-                );
-                skipped_changes.push((change_id.clone(), failed_dep));
+            if let Some(reason) = self.skip_reason_for_change(change_id) {
+                warn!("Skipping '{}' because {}", change_id, reason);
+                skipped_changes.push((change_id.clone(), reason));
             } else {
                 changes_to_execute.push(change_id.clone());
             }
         }
 
         // Emit events for skipped changes
-        for (change_id, failed_dep) in &skipped_changes {
+        for (change_id, reason) in &skipped_changes {
             send_event(
                 &self.event_tx,
                 ParallelEvent::ChangeSkipped {
                     change_id: change_id.clone(),
-                    reason: format!("Dependency '{}' failed", failed_dep),
+                    reason: reason.clone(),
                 },
             )
             .await;
@@ -451,7 +524,7 @@ impl ParallelExecutor {
         // If all changes are skipped, we're done with this group
         if changes_to_execute.is_empty() {
             info!(
-                "All changes in group {} were skipped due to failed dependencies",
+                "All changes in group {} were skipped due to blocked dependencies",
                 group.id
             );
             send_event(
@@ -696,9 +769,22 @@ impl ParallelExecutor {
                     "Merging archived {} (workspace: {})",
                     result.change_id, result.workspace_name
                 );
-                {
-                    let _merge_guard = self.merge_lock.lock().await;
-                    if let Err(e) = self.merge_and_resolve(&revisions, &change_ids).await {
+                let merge_result = self.attempt_merge(&revisions, &change_ids).await;
+                match merge_result {
+                    Ok(MergeAttempt::Merged) => {}
+                    Ok(MergeAttempt::Deferred(reason)) => {
+                        self.merge_deferred_changes.insert(result.change_id.clone());
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::MergeDeferred {
+                                change_id: result.change_id.clone(),
+                                reason,
+                            },
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(e) => {
                         let error_msg = format!(
                             "Failed to merge archived {} (workspace: {}): {}",
                             result.change_id, result.workspace_name, e
@@ -831,6 +917,9 @@ impl ParallelExecutor {
         for workspace in &cleanup_workspaces {
             // Skip cleanup for failed workspaces - they are preserved
             if failed_workspace_names.contains(&workspace.name) {
+                continue;
+            }
+            if self.merge_deferred_changes.contains(&workspace.change_id) {
                 continue;
             }
             if matches!(
@@ -1052,12 +1141,9 @@ impl ParallelExecutor {
                             "Merging {} (workspace: {})",
                             workspace_result.change_id, workspace_result.workspace_name
                         );
-                        let merge_result = {
-                            let _merge_guard = self.merge_lock.lock().await;
-                            self.merge_and_resolve(&revisions, &change_ids).await
-                        };
+                        let merge_result = self.attempt_merge(&revisions, &change_ids).await;
                         match merge_result {
-                            Ok(_) => {
+                            Ok(MergeAttempt::Merged) => {
                                 info!(
                                     "Successfully merged {} (workspace: {})",
                                     workspace_result.change_id, workspace_result.workspace_name
@@ -1088,6 +1174,18 @@ impl ParallelExecutor {
                                     .await;
                                 }
                             }
+                            Ok(MergeAttempt::Deferred(reason)) => {
+                                self.merge_deferred_changes
+                                    .insert(workspace_result.change_id.clone());
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::MergeDeferred {
+                                        change_id: workspace_result.change_id.clone(),
+                                        reason,
+                                    },
+                                )
+                                .await;
+                            }
                             Err(e) => {
                                 error!(
                                     "Failed to merge {} (workspace: {}): {}",
@@ -1107,6 +1205,68 @@ impl ParallelExecutor {
         }
 
         Ok(results)
+    }
+
+    async fn attempt_merge(
+        &self,
+        revisions: &[String],
+        change_ids: &[String],
+    ) -> Result<MergeAttempt> {
+        let _merge_guard = self.merge_lock.lock().await;
+        if let Some(reason) = base_dirty_reason(&self.repo_root).await? {
+            return Ok(MergeAttempt::Deferred(reason));
+        }
+        self.merge_and_resolve(revisions, change_ids).await?;
+        Ok(MergeAttempt::Merged)
+    }
+
+    pub async fn resolve_merge_for_change(&mut self, change_id: &str) -> Result<()> {
+        let workspace_info = self
+            .workspace_manager
+            .find_existing_workspace(change_id)
+            .await
+            .map_err(OrchestratorError::from_vcs_error)?
+            .ok_or_else(|| OrchestratorError::ChangeNotFound(change_id.to_string()))?;
+        let workspace = self
+            .workspace_manager
+            .reuse_workspace(&workspace_info)
+            .await
+            .map_err(OrchestratorError::from_vcs_error)?;
+
+        let revisions = vec![workspace.name.clone()];
+        let change_ids = vec![change_id.to_string()];
+
+        match self.attempt_merge(&revisions, &change_ids).await? {
+            MergeAttempt::Merged => {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::CleanupStarted {
+                        workspace: workspace.name.clone(),
+                    },
+                )
+                .await;
+                if let Err(err) = self
+                    .workspace_manager
+                    .cleanup_workspace(&workspace.name)
+                    .await
+                {
+                    warn!(
+                        "Failed to cleanup worktree '{}' after merge: {}",
+                        workspace.name, err
+                    );
+                } else {
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::CleanupCompleted {
+                            workspace: workspace.name.clone(),
+                        },
+                    )
+                    .await;
+                }
+                Ok(())
+            }
+            MergeAttempt::Deferred(reason) => Err(OrchestratorError::GitCommand(reason)),
+        }
     }
 
     /// Merge revisions and resolve any conflicts
@@ -1269,77 +1429,50 @@ impl ParallelExecutor {
     async fn verify_merge_commits(
         &self,
         base_revision: &str,
-        target_branch: &str,
+        _target_branch: &str,
         change_ids: &[String],
     ) -> Result<()> {
-        if change_ids.is_empty() {
-            return Ok(());
-        }
-
-        let repo_root = self.workspace_manager.repo_root();
-
-        let branch_output = Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .current_dir(repo_root)
-            .output()
-            .await
-            .map_err(|e| OrchestratorError::GitCommand(format!("Failed to get branch: {}", e)))?;
-
-        if !branch_output.status.success() {
-            let stderr = String::from_utf8_lossy(&branch_output.stderr);
-            return Err(OrchestratorError::GitCommand(format!(
-                "Failed to get branch: {}",
-                stderr
-            )));
-        }
-
-        let current_branch = String::from_utf8_lossy(&branch_output.stdout)
-            .trim()
-            .to_string();
-        if current_branch != target_branch {
-            return Err(OrchestratorError::GitCommand(format!(
-                "Expected merge on branch '{}' but found '{}'",
-                target_branch, current_branch
-            )));
-        }
-
-        let missing_commits =
-            git_commands::missing_merge_commits_since(repo_root, base_revision, change_ids)
-                .await
-                .map_err(OrchestratorError::from)?;
-
-        if !missing_commits.is_empty() {
-            return Err(OrchestratorError::GitCommand(format!(
-                "Missing merge commit message containing change_id(s): {}",
-                missing_commits.join(", ")
-            )));
+        if matches!(
+            self.workspace_manager.backend_type(),
+            VcsBackend::Git | VcsBackend::Auto
+        ) {
+            let repo_root = self.workspace_manager.repo_root();
+            let missing =
+                git_commands::missing_merge_commits_since(repo_root, base_revision, change_ids)
+                    .await
+                    .map_err(OrchestratorError::from_vcs_error)?;
+            if !missing.is_empty() {
+                return Err(OrchestratorError::GitCommand(format!(
+                    "Missing merge commit message containing change_id(s): {}",
+                    missing.join(", ")
+                )));
+            }
         }
 
         Ok(())
     }
+}
 
-    /// Cleanup all workspaces.
-    ///
-    /// Note: Currently cleanup is handled automatically in execute_group.
-    /// This method is provided for manual cleanup in error recovery scenarios.
-    #[allow(dead_code)] // Public API for manual cleanup in error recovery
-    pub async fn cleanup(&mut self) -> Result<()> {
-        self.workspace_manager
-            .cleanup_all()
-            .await
-            .map_err(OrchestratorError::from)
-    }
+pub async fn resolve_deferred_merge(
+    repo_root: PathBuf,
+    config: OrchestratorConfig,
+    change_id: &str,
+) -> Result<()> {
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+    executor.resolve_merge_for_change(change_id).await
 }
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::vcs::{VcsResult, VcsWarning, WorkspaceInfo};
     use async_trait::async_trait;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use tokio::process::Command;
 
     #[test]
     fn test_parallel_executor_creation() {
@@ -1518,6 +1651,179 @@ mod tests {
         }
     }
 
+    async fn init_git_repo(repo_root: &Path) {
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(repo_root.join("README.md"), "base").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Base"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+    }
+
+    async fn commit_workspace_change(
+        workspace: &Workspace,
+        filename: &str,
+        contents: &str,
+        message: &str,
+    ) {
+        std::fs::write(workspace.path.join(filename), contents).unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&workspace.path)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", message])
+            .current_dir(&workspace.path)
+            .output()
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn test_skip_reason_for_merge_deferred_dependency() {
+        let merge_calls = Arc::new(AtomicUsize::new(0));
+        let manager = TestWorkspaceManager::new(merge_calls);
+        let mut change_dependencies = HashMap::new();
+        change_dependencies.insert("change-b".to_string(), vec!["change-a".to_string()]);
+        let mut merge_deferred_changes = HashSet::new();
+        merge_deferred_changes.insert("change-a".to_string());
+        let executor = ParallelExecutor {
+            workspace_manager: Box::new(manager),
+            config: OrchestratorConfig::default(),
+            apply_command: String::new(),
+            archive_command: String::new(),
+            event_tx: None,
+            max_conflict_retries: 1,
+            merge_lock: Arc::new(Mutex::new(())),
+            repo_root: PathBuf::from("/tmp/test-repo"),
+            no_resume: false,
+            failed_tracker: FailedChangeTracker::new(),
+            change_dependencies,
+            merge_deferred_changes,
+            hooks: None,
+            cancel_token: None,
+        };
+
+        assert_eq!(
+            executor.skip_reason_for_change("change-b"),
+            Some("Dependency 'change-a' awaiting merge".to_string())
+        );
+        assert!(executor.skip_reason_for_change("change-c").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_merge_aborts_when_base_dirty() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        let base_dir = repo_root.join("worktrees");
+
+        init_git_repo(repo_root).await;
+
+        let config = OrchestratorConfig {
+            resolve_command: Some("sh merge-resolver.sh".to_string()),
+            ..Default::default()
+        };
+        let mut manager =
+            GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
+
+        let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
+        commit_workspace_change(&workspace_a, "change-a.txt", "A", "Apply: change-a").await;
+
+        std::fs::write(repo_root.join("dirty.txt"), "dirty").unwrap();
+
+        let result = resolve_deferred_merge(repo_root.to_path_buf(), config, "change-a").await;
+        assert!(result.is_err());
+
+        let merge_log = Command::new("git")
+            .args(["log", "--merges", "--format=%s"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        let merge_messages = String::from_utf8_lossy(&merge_log.stdout);
+        assert!(!merge_messages.contains("Merge change: change-a"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_merge_executes_selected_change_only() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        let worktree_dir = tempfile::TempDir::new().unwrap();
+        let base_dir = worktree_dir.path().join("worktrees");
+        let resolver_dir = tempfile::TempDir::new().unwrap();
+        let resolver_script = resolver_dir.path().join("merge-resolver.sh");
+
+        init_git_repo(repo_root).await;
+
+        let config = OrchestratorConfig {
+            resolve_command: Some(format!("sh {}", resolver_script.display())),
+            ..Default::default()
+        };
+        let mut manager =
+            GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
+
+        let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
+        let workspace_b = manager.create_workspace("change-b", None).await.unwrap();
+        commit_workspace_change(&workspace_a, "change-a.txt", "A", "Apply: change-a").await;
+        commit_workspace_change(&workspace_b, "change-b.txt", "B", "Apply: change-b").await;
+
+        let script_contents = format!(
+            "#!/bin/sh\nset -e\nROOT=\"$(pwd)\"\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff -m 'Pre-sync base into change-a' main\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
+            git merge --no-ff -m 'Merge change: change-a' {}\n",
+            workspace_a.path.to_string_lossy(),
+            workspace_a.name,
+            workspace_a.name
+        );
+        std::fs::write(&resolver_script, script_contents).unwrap();
+
+        resolve_deferred_merge(repo_root.to_path_buf(), config, "change-a")
+            .await
+            .unwrap();
+
+        let merge_log = Command::new("git")
+            .args(["log", "--merges", "--format=%s"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        let merge_messages = String::from_utf8_lossy(&merge_log.stdout);
+        assert!(merge_messages.contains("Merge change: change-a"));
+        assert!(!merge_messages.contains("Merge change: change-b"));
+    }
+
     #[tokio::test]
     async fn test_merge_uses_resolve_command_with_change_ids() {
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -1634,6 +1940,8 @@ mod tests {
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
+            change_dependencies: HashMap::new(),
+            merge_deferred_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
         };
@@ -1770,6 +2078,8 @@ mod tests {
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
+            change_dependencies: HashMap::new(),
+            merge_deferred_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
         };
@@ -1878,6 +2188,8 @@ mod tests {
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
+            change_dependencies: HashMap::new(),
+            merge_deferred_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
         };
@@ -2015,6 +2327,8 @@ mod tests {
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
+            change_dependencies: HashMap::new(),
+            merge_deferred_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
         };
@@ -2166,6 +2480,8 @@ mod tests {
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
+            change_dependencies: HashMap::new(),
+            merge_deferred_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
         };
@@ -2323,6 +2639,8 @@ mod tests {
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
+            change_dependencies: HashMap::new(),
+            merge_deferred_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
         };

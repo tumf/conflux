@@ -52,6 +52,8 @@ pub enum QueueStatus {
     Archiving,
     /// Archived after completion
     Archived,
+    /// Waiting for merge resolution
+    MergeWait,
     /// Error occurred during processing
     Error(String),
 }
@@ -66,6 +68,7 @@ impl QueueStatus {
             QueueStatus::Completed => "completed",
             QueueStatus::Archiving => "archiving",
             QueueStatus::Archived => "archived",
+            QueueStatus::MergeWait => "merge wait",
             QueueStatus::Error(_) => "error",
         }
     }
@@ -79,6 +82,7 @@ impl QueueStatus {
             QueueStatus::Completed => Color::Green,
             QueueStatus::Archiving => Color::Magenta,
             QueueStatus::Archived => Color::Blue,
+            QueueStatus::MergeWait => Color::LightMagenta,
             QueueStatus::Error(_) => Color::Red,
         }
     }
@@ -96,6 +100,7 @@ mod tests {
         assert_eq!(QueueStatus::Completed.display(), "completed");
         assert_eq!(QueueStatus::Archiving.display(), "archiving");
         assert_eq!(QueueStatus::Archived.display(), "archived");
+        assert_eq!(QueueStatus::MergeWait.display(), "merge wait");
         assert_eq!(QueueStatus::Error("err".to_string()).display(), "error");
     }
 
@@ -107,6 +112,7 @@ mod tests {
         assert_eq!(QueueStatus::Completed.color(), Color::Green);
         assert_eq!(QueueStatus::Archiving.color(), Color::Magenta);
         assert_eq!(QueueStatus::Archived.color(), Color::Blue);
+        assert_eq!(QueueStatus::MergeWait.color(), Color::LightMagenta);
         assert_eq!(QueueStatus::Error("err".to_string()).color(), Color::Red);
     }
 }

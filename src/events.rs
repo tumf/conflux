@@ -190,6 +190,9 @@ pub enum ExecutionEvent {
         #[allow(dead_code)]
         revision: String,
     },
+    /// Merge deferred due to dirty base
+    #[allow(dead_code)]
+    MergeDeferred { change_id: String, reason: String },
     /// Merge resulted in conflicts
     #[allow(dead_code)]
     MergeConflict { files: Vec<String> },
