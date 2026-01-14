@@ -434,7 +434,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 QueueStatus::Processing => {
                     format!("{} [{:>3.0}%]", spinner_char, change.progress_percent())
                 }
-                QueueStatus::Archiving => {
+                QueueStatus::Archiving | QueueStatus::Resolving => {
                     format!("{} [{}]", spinner_char, change.queue_status.display())
                 }
                 QueueStatus::Completed | QueueStatus::Archived | QueueStatus::Error(_) => {
@@ -985,6 +985,7 @@ fn render_qr_popup(frame: &mut Frame, app: &AppState, area: Rect) {
 mod tests {
     use super::*;
     use crate::openspec::Change;
+    use crate::tui::events::LogEntry;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
@@ -1103,6 +1104,17 @@ mod tests {
         let buffer = render_buffer(&mut app, 80, 20);
         let content = buffer_to_string(&buffer);
         assert!(content.contains("WT"));
+    }
+
+    #[test]
+    fn test_render_resolving_status_shows_label() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.add_log(LogEntry::info("log"));
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(content.contains("resolving"));
     }
 
     #[test]
