@@ -9,9 +9,11 @@
 #![allow(dead_code)]
 
 use crate::agent::AgentRunner;
+use crate::config::StallDetectionConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::Change;
+use crate::vcs::git::commands as git_commands;
 use std::path::Path;
 use tracing::info;
 
@@ -22,6 +24,8 @@ use super::output::OutputHandler;
 pub enum ArchiveResult {
     /// Archive completed successfully.
     Success,
+    /// Archive stalled due to repeated empty WIP commits.
+    Stalled { error: String },
     /// Archive command failed.
     Failed { error: String },
     /// Archive was cancelled (e.g., by user or timeout).
@@ -81,6 +85,7 @@ impl ArchiveContext {
 /// * `context` - Context information for hooks
 /// * `output` - Output handler for logging
 /// * `base_path` - Optional base path for archive verification
+/// * `stall_config` - Stall detection configuration for empty WIP commits
 ///
 /// # Returns
 /// Same as `archive_change_streaming`
@@ -91,6 +96,7 @@ pub async fn archive_change<O>(
     context: &ArchiveContext,
     output: &O,
     base_path: Option<&Path>,
+    stall_config: &StallDetectionConfig,
 ) -> Result<ArchiveResult>
 where
     O: OutputHandler,
@@ -128,6 +134,15 @@ where
 
     let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
     let mut attempt: u32 = 0;
+    let repo_root = base_path.unwrap_or_else(|| Path::new("."));
+    let is_git_repo = match git_commands::check_git_repo(repo_root).await {
+        Ok(is_repo) => is_repo,
+        Err(e) => {
+            output.on_warn(&format!("Failed to check Git repository status: {}", e));
+            false
+        }
+    };
+    let mut empty_commit_streak = 0u32;
 
     loop {
         attempt += 1;
@@ -146,6 +161,44 @@ where
             return Ok(ArchiveResult::Failed { error: error_msg });
         }
 
+        if is_git_repo {
+            if let Err(e) =
+                git_commands::create_archive_wip_commit(repo_root, &change.id, attempt).await
+            {
+                output.on_warn(&format!(
+                    "Failed to create WIP(archive) commit for {} (attempt {}): {}",
+                    change.id, attempt, e
+                ));
+            } else if stall_config.enabled {
+                match git_commands::is_head_empty_commit(repo_root).await {
+                    Ok(is_empty) => {
+                        if is_empty {
+                            empty_commit_streak = empty_commit_streak.saturating_add(1);
+                        } else {
+                            empty_commit_streak = 0;
+                        }
+                        if empty_commit_streak >= stall_config.threshold {
+                            let message = format!(
+                                "Stall detected for {} after {} empty WIP commits (archive)",
+                                change.id, empty_commit_streak
+                            );
+                            output.on_warn(&format!(
+                                "{} (threshold {})",
+                                message, stall_config.threshold
+                            ));
+                            return Ok(ArchiveResult::Stalled { error: message });
+                        }
+                    }
+                    Err(e) => {
+                        output.on_warn(&format!(
+                            "Failed to check WIP(archive) commit for {} (attempt {}): {}",
+                            change.id, attempt, e
+                        ));
+                    }
+                }
+            }
+        }
+
         // Verify archive was successful
         if verify_archive_completion(&change.id, base_path).is_success() {
             break;
@@ -162,6 +215,15 @@ where
         let error_msg = build_archive_error_message(&change.id);
         output.on_error(&error_msg);
         return Ok(ArchiveResult::Failed { error: error_msg });
+    }
+
+    if is_git_repo {
+        if let Err(e) = git_commands::squash_archive_wip_commits(repo_root, &change.id).await {
+            output.on_warn(&format!(
+                "Failed to squash WIP(archive) commits for {}: {}",
+                change.id, e
+            ));
+        }
     }
 
     // Clear apply history for the archived change
@@ -201,9 +263,11 @@ where
 /// * `output` - Output handler for streaming command output
 /// * `cancel_check` - Function to check if operation should be cancelled
 /// * `base_path` - Optional base path for archive verification
+/// * `stall_config` - Stall detection configuration for empty WIP commits
 ///
 /// # Returns
 /// Same as `archive_change`
+#[allow(clippy::too_many_arguments)]
 pub async fn archive_change_streaming<O, F>(
     change: &Change,
     agent: &mut AgentRunner,
@@ -212,6 +276,7 @@ pub async fn archive_change_streaming<O, F>(
     output: &O,
     cancel_check: F,
     base_path: Option<&Path>,
+    stall_config: &StallDetectionConfig,
 ) -> Result<ArchiveResult>
 where
     O: OutputHandler,
@@ -251,6 +316,15 @@ where
 
     let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
     let mut attempt: u32 = 0;
+    let repo_root = base_path.unwrap_or_else(|| Path::new("."));
+    let is_git_repo = match git_commands::check_git_repo(repo_root).await {
+        Ok(is_repo) => is_repo,
+        Err(e) => {
+            output.on_warn(&format!("Failed to check Git repository status: {}", e));
+            false
+        }
+    };
+    let mut empty_commit_streak = 0u32;
 
     loop {
         attempt += 1;
@@ -294,6 +368,44 @@ where
             return Ok(ArchiveResult::Failed { error: error_msg });
         }
 
+        if is_git_repo {
+            if let Err(e) =
+                git_commands::create_archive_wip_commit(repo_root, &change.id, attempt).await
+            {
+                output.on_warn(&format!(
+                    "Failed to create WIP(archive) commit for {} (attempt {}): {}",
+                    change.id, attempt, e
+                ));
+            } else if stall_config.enabled {
+                match git_commands::is_head_empty_commit(repo_root).await {
+                    Ok(is_empty) => {
+                        if is_empty {
+                            empty_commit_streak = empty_commit_streak.saturating_add(1);
+                        } else {
+                            empty_commit_streak = 0;
+                        }
+                        if empty_commit_streak >= stall_config.threshold {
+                            let message = format!(
+                                "Stall detected for {} after {} empty WIP commits (archive)",
+                                change.id, empty_commit_streak
+                            );
+                            output.on_warn(&format!(
+                                "{} (threshold {})",
+                                message, stall_config.threshold
+                            ));
+                            return Ok(ArchiveResult::Stalled { error: message });
+                        }
+                    }
+                    Err(e) => {
+                        output.on_warn(&format!(
+                            "Failed to check WIP(archive) commit for {} (attempt {}): {}",
+                            change.id, attempt, e
+                        ));
+                    }
+                }
+            }
+        }
+
         // Verify archive was successful
         if verify_archive_completion(&change.id, base_path).is_success() {
             break;
@@ -310,6 +422,15 @@ where
         let error_msg = build_archive_error_message(&change.id);
         output.on_error(&error_msg);
         return Ok(ArchiveResult::Failed { error: error_msg });
+    }
+
+    if is_git_repo {
+        if let Err(e) = git_commands::squash_archive_wip_commits(repo_root, &change.id).await {
+            output.on_warn(&format!(
+                "Failed to squash WIP(archive) commits for {}: {}",
+                change.id, e
+            ));
+        }
     }
 
     // Clear apply history
@@ -349,8 +470,12 @@ mod tests {
     #[test]
     fn test_archive_result_is_success() {
         assert!(ArchiveResult::Success.is_success());
+        assert!(!ArchiveResult::Stalled {
+            error: "stalled".to_string()
+        }
+        .is_success());
         assert!(!ArchiveResult::Failed {
-            error: "test".to_string()
+            error: "oops".to_string()
         }
         .is_success());
         assert!(!ArchiveResult::Cancelled.is_success());
@@ -437,6 +562,7 @@ mv "$base_dir/openspec/changes/$1" "$base_dir/openspec/changes/archive/$1"
             dependencies: Vec::new(),
         };
 
+        let stall_config = OrchestratorConfig::default().get_stall_detection();
         let result = archive_change(
             &change,
             &mut agent,
@@ -444,9 +570,11 @@ mv "$base_dir/openspec/changes/$1" "$base_dir/openspec/changes/archive/$1"
             &context,
             &output,
             Some(temp_dir.path()),
+            &stall_config,
         )
         .await
         .unwrap();
+
         assert_eq!(result, ArchiveResult::Success);
 
         let attempts = fs::read_to_string(&attempts_path).unwrap();
