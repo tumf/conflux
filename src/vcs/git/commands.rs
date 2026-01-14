@@ -81,6 +81,60 @@ pub async fn get_current_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<String> {
     run_git(&["rev-parse", "HEAD"], cwd).await
 }
 
+/// Check whether the current HEAD commit has no file changes.
+pub async fn is_head_empty_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
+    let output = run_git(
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "--root",
+            "HEAD",
+        ],
+        cwd,
+    )
+    .await?;
+    Ok(output.trim().is_empty())
+}
+
+/// Create a WIP archive commit for a retry attempt.
+pub async fn create_archive_wip_commit<P: AsRef<Path>>(
+    cwd: P,
+    change_id: &str,
+    attempt: u32,
+) -> VcsResult<()> {
+    let message = format!("WIP(archive): {} (attempt#{})", change_id, attempt);
+    run_git(&["add", "-A"], &cwd).await?;
+    run_git(&["commit", "--allow-empty", "-m", &message], cwd).await?;
+    Ok(())
+}
+
+/// Squash all archive WIP commits into a final Archive commit.
+pub async fn squash_archive_wip_commits<P: AsRef<Path>>(cwd: P, change_id: &str) -> VcsResult<()> {
+    let wip_pattern = format!("^WIP\\(archive\\): {} ", change_id);
+    let wip_commits = run_git(
+        &["rev-list", "--reverse", "--grep", &wip_pattern, "HEAD"],
+        &cwd,
+    )
+    .await?;
+    let first_wip = wip_commits
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| {
+            VcsError::git_command(format!("No archive WIP commits found for {}", change_id))
+        })?;
+
+    let parent_revision = run_git(&["rev-parse", &format!("{}^", first_wip)], &cwd).await?;
+    let parent_revision = parent_revision.trim();
+
+    run_git(&["reset", "--soft", parent_revision], &cwd).await?;
+    let archive_message = format!("Archive: {}", change_id);
+    run_git(&["commit", "--allow-empty", "-m", &archive_message], cwd).await?;
+    Ok(())
+}
+
 /// List change IDs from the HEAD commit tree.
 ///
 /// Reads directories under `openspec/changes` in the HEAD tree and filters out

@@ -5,7 +5,9 @@ use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
+use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser::TaskProgress;
+use crate::vcs::git::commands as git_commands;
 use crate::vcs::VcsBackend;
 use std::path::Path;
 use std::process::Stdio as StdStdio;
@@ -42,7 +44,7 @@ async fn create_iteration_snapshot(
     completed: u32,
     total: u32,
     vcs_backend: VcsBackend,
-) -> Result<()> {
+) -> Result<Option<bool>> {
     let commit_message = format!(
         "WIP: {} ({}/{} tasks, apply#{})",
         change_id, completed, total, iteration
@@ -52,6 +54,8 @@ async fn create_iteration_snapshot(
         "Creating iteration snapshot #{} for {}: {}",
         iteration, change_id, commit_message
     );
+
+    let mut commit_created = false;
 
     match vcs_backend {
         VcsBackend::Git | VcsBackend::Auto => {
@@ -76,7 +80,7 @@ async fn create_iteration_snapshot(
                     "Failed to stage changes for iteration {}: {}",
                     iteration, stderr
                 );
-                return Ok(());
+                return Ok(None);
             }
 
             // Check if we have commits to amend
@@ -116,6 +120,7 @@ async fn create_iteration_snapshot(
                         iteration, stderr
                     );
                 } else {
+                    commit_created = true;
                     debug!(
                         "Iteration snapshot #{} created for {} (git, amended)",
                         iteration, change_id
@@ -144,6 +149,7 @@ async fn create_iteration_snapshot(
                         iteration, stderr
                     );
                 } else {
+                    commit_created = true;
                     debug!(
                         "Iteration snapshot #{} created for {} (git, initial)",
                         iteration, change_id
@@ -153,7 +159,20 @@ async fn create_iteration_snapshot(
         }
     }
 
-    Ok(())
+    if commit_created {
+        match git_commands::is_head_empty_commit(workspace_path).await {
+            Ok(is_empty) => Ok(Some(is_empty)),
+            Err(e) => {
+                warn!(
+                    "Failed to check WIP commit contents for {} (apply#{}): {}",
+                    change_id, iteration, e
+                );
+                Ok(None)
+            }
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 /// Squash all WIP iteration snapshots into a single Apply commit.
@@ -307,6 +326,7 @@ pub async fn execute_apply_in_workspace(
     let mut iteration = 0;
     let mut first_apply = true;
     let mut apply_succeeded = false; // Track if all iterations succeeded
+    let mut stall_detector = StallDetector::new(config.get_stall_detection());
 
     loop {
         iteration += 1;
@@ -597,7 +617,7 @@ pub async fn execute_apply_in_workspace(
 
         // Create iteration snapshot after each apply iteration
         // This ensures work is not lost even if no progress was made
-        if let Err(e) = create_iteration_snapshot(
+        let empty_commit = match create_iteration_snapshot(
             workspace_path,
             change_id,
             iteration,
@@ -607,10 +627,29 @@ pub async fn execute_apply_in_workspace(
         )
         .await
         {
-            warn!(
-                "Failed to create iteration snapshot for {}: {}",
-                change_id, e
-            );
+            Ok(result) => result,
+            Err(e) => {
+                warn!(
+                    "Failed to create iteration snapshot for {}: {}",
+                    change_id, e
+                );
+                None
+            }
+        };
+
+        if let Some(is_empty) = empty_commit {
+            if !common_apply::is_progress_complete(&new_progress)
+                && stall_detector.register_commit(change_id, StallPhase::Apply, is_empty)
+            {
+                let count = stall_detector.current_count(change_id, StallPhase::Apply);
+                let threshold = stall_detector.config().threshold;
+                let message = format!(
+                    "Stall detected for {} after {} empty WIP commits (apply)",
+                    change_id, count
+                );
+                warn!("{} (threshold {})", message, threshold);
+                return Err(OrchestratorError::AgentCommand(message));
+            }
         }
 
         // Check if complete
@@ -782,6 +821,8 @@ pub async fn execute_archive_in_workspace(
         }
     };
 
+    let stall_detector = StallDetector::new(config.get_stall_detection());
+
     // Run pre_archive hook
     if let Some(hook_runner) = hooks {
         let hook_ctx = build_parallel_hook_context(
@@ -842,6 +883,21 @@ pub async fn execute_archive_in_workspace(
 
     let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
     let mut attempt: u32 = 0;
+    let is_git_repo = if matches!(vcs_backend, VcsBackend::Git | VcsBackend::Auto) {
+        match git_commands::check_git_repo(workspace_path).await {
+            Ok(is_repo) => is_repo,
+            Err(e) => {
+                warn!(
+                    "Failed to check Git repository status for {}: {}",
+                    change_id, e
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let mut empty_commit_streak = 0u32;
 
     loop {
         attempt += 1;
@@ -920,6 +976,45 @@ pub async fn execute_archive_in_workspace(
             )));
         }
 
+        if is_git_repo {
+            if let Err(e) =
+                git_commands::create_archive_wip_commit(workspace_path, change_id, attempt).await
+            {
+                warn!(
+                    "Failed to create WIP(archive) commit for {} (attempt {}): {}",
+                    change_id, attempt, e
+                );
+            } else if stall_detector.config().enabled {
+                match git_commands::is_head_empty_commit(workspace_path).await {
+                    Ok(is_empty) => {
+                        if is_empty {
+                            empty_commit_streak = empty_commit_streak.saturating_add(1);
+                        } else {
+                            empty_commit_streak = 0;
+                        }
+                        if empty_commit_streak >= stall_detector.config().threshold {
+                            let message = format!(
+                                "Stall detected for {} after {} empty WIP commits (archive)",
+                                change_id, empty_commit_streak
+                            );
+                            warn!(
+                                "{} (threshold {})",
+                                message,
+                                stall_detector.config().threshold
+                            );
+                            return Err(OrchestratorError::AgentCommand(message));
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to check WIP(archive) commit for {} (attempt {}): {}",
+                            change_id, attempt, e
+                        );
+                    }
+                }
+            }
+        }
+
         let verification = verify_archive_completion(change_id, Some(workspace_path));
         if verification.is_success() {
             break;
@@ -955,6 +1050,15 @@ pub async fn execute_archive_in_workspace(
         "Archive verification passed for {}: change moved to archive",
         change_id
     );
+
+    if is_git_repo {
+        if let Err(e) = git_commands::squash_archive_wip_commits(workspace_path, change_id).await {
+            warn!(
+                "Failed to squash WIP(archive) commits for {}: {}",
+                change_id, e
+            );
+        }
+    }
 
     let resolve_agent = AgentRunner::new(config.clone());
     let change_id_owned = change_id.to_string();

@@ -15,6 +15,7 @@ mod parallel;
 mod parallel_run_service;
 mod process_manager;
 mod progress;
+mod stall;
 mod task_parser;
 mod templates;
 mod tui;

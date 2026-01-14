@@ -10,15 +10,21 @@ use crate::orchestration::{
 };
 use crate::parallel_run_service::ParallelRunService;
 use crate::progress::ProgressDisplay;
+use crate::stall::{StallDetector, StallPhase};
 use crate::tui::log_deduplicator;
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{GitWorkspaceManager, VcsBackend, WorkspaceManager};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 #[cfg(feature = "web-monitoring")]
 use crate::web::WebState;
+
+struct SerialSnapshot {
+    progress: crate::task_parser::TaskProgress,
+    empty_commit: Option<bool>,
+}
 #[cfg(feature = "web-monitoring")]
 use std::sync::Arc;
 
@@ -40,6 +46,12 @@ pub struct Orchestrator {
     completed_change_ids: HashSet<String>,
     /// Apply counts per change (how many times each change has been applied)
     apply_counts: HashMap<String, u32>,
+    /// Stall detector for empty WIP commit tracking
+    stall_detector: StallDetector,
+    /// Changes marked as stalled (failed due to no progress)
+    stalled_change_ids: HashSet<String>,
+    /// Changes skipped due to stalled dependencies
+    skipped_change_ids: HashSet<String>,
     /// Number of changes processed (archived)
     changes_processed: usize,
     /// Maximum iterations limit (0 = no limit)
@@ -83,6 +95,7 @@ impl Orchestrator {
         let agent = AgentRunner::new(config.clone());
         // VCS backend: CLI override takes precedence, then config, then auto
         let vcs_backend = vcs_override.unwrap_or_else(|| config.get_vcs_backend());
+        let stall_detector = StallDetector::new(config.get_stall_detection());
 
         Ok(Self {
             agent,
@@ -94,6 +107,9 @@ impl Orchestrator {
             current_change_id: None,
             completed_change_ids: HashSet::new(),
             apply_counts: HashMap::new(),
+            stall_detector,
+            stalled_change_ids: HashSet::new(),
+            skipped_change_ids: HashSet::new(),
             changes_processed: 0,
             max_iterations,
             iteration: 0,
@@ -135,6 +151,7 @@ impl Orchestrator {
         let hooks = HookRunner::new(config.get_hooks());
         let max_iterations = config.get_max_iterations();
         let agent = AgentRunner::new(config.clone());
+        let stall_detector = StallDetector::new(config.get_stall_detection());
 
         Ok(Self {
             agent,
@@ -146,6 +163,9 @@ impl Orchestrator {
             current_change_id: None,
             completed_change_ids: HashSet::new(),
             apply_counts: HashMap::new(),
+            stall_detector,
+            stalled_change_ids: HashSet::new(),
+            skipped_change_ids: HashSet::new(),
             changes_processed: 0,
             max_iterations,
             iteration: 0,
@@ -298,8 +318,6 @@ impl Orchestrator {
             // Log any new changes that appeared after run started
             self.log_new_changes(&changes);
 
-            let remaining_changes = snapshot_changes.len();
-
             if snapshot_changes.is_empty() {
                 info!("All changes from initial snapshot processed");
                 if let Some(progress) = &mut self.progress {
@@ -309,8 +327,20 @@ impl Orchestrator {
                 break;
             }
 
+            let eligible_changes = self.filter_stalled_changes(&snapshot_changes);
+            let remaining_changes = eligible_changes.len();
+
+            if eligible_changes.is_empty() {
+                info!("All remaining changes are blocked by stalled dependencies");
+                if let Some(progress) = &mut self.progress {
+                    progress.complete_all();
+                }
+                finish_status = "stalled_dependencies";
+                break;
+            }
+
             // Select next change to process
-            let next = self.select_next_change(&snapshot_changes).await?;
+            let next = self.select_next_change(&eligible_changes).await?;
             info!("Selected change: {}", next.id);
 
             if let Some(progress) = &mut self.progress {
@@ -351,6 +381,8 @@ impl Orchestrator {
                 );
                 let output = LogOutputHandler::new();
 
+                let stall_config = self.config.get_stall_detection();
+
                 match archive_change(
                     &next,
                     &mut self.agent,
@@ -358,6 +390,7 @@ impl Orchestrator {
                     &archive_ctx,
                     &output,
                     None,
+                    &stall_config,
                 )
                 .await
                 {
@@ -383,10 +416,16 @@ impl Orchestrator {
                         self.completed_change_ids.insert(next.id.clone());
                         self.current_change_id = None;
                         self.apply_counts.remove(&next.id);
+                        self.stall_detector.clear_change(&next.id);
 
                         if let Some(progress) = &mut self.progress {
                             progress.archive_change(&next.id);
                         }
+                    }
+                    Ok(ArchiveResult::Stalled { error }) => {
+                        warn!("Archive stalled for {}: {}", next.id, error);
+                        self.mark_change_stalled(&next.id, &error);
+                        continue;
                     }
                     Ok(ArchiveResult::Failed { error }) => {
                         error!("Archive failed for {}: {}", next.id, error);
@@ -425,16 +464,43 @@ impl Orchestrator {
 
                 match apply_change(&next, &mut self.agent, &self.hooks, &apply_ctx, &output).await {
                     Ok(ApplyResult::Success) => {
-                        let progress_snapshot = match self
+                        let snapshot = match self
                             .snapshot_serial_iteration(&next.id, new_apply_count)
                             .await
                         {
-                            Ok(progress) => progress,
+                            Ok(snapshot) => snapshot,
                             Err(e) => {
                                 warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
-                                crate::task_parser::TaskProgress::default()
+                                SerialSnapshot {
+                                    progress: crate::task_parser::TaskProgress::default(),
+                                    empty_commit: None,
+                                }
                             }
                         };
+
+                        let progress_snapshot = snapshot.progress;
+
+                        if let Some(is_empty) = snapshot.empty_commit {
+                            if !is_progress_complete(&progress_snapshot)
+                                && self.stall_detector.register_commit(
+                                    &next.id,
+                                    StallPhase::Apply,
+                                    is_empty,
+                                )
+                            {
+                                let count = self
+                                    .stall_detector
+                                    .current_count(&next.id, StallPhase::Apply);
+                                let threshold = self.stall_detector.config().threshold;
+                                let message = format!(
+                                    "Stall detected for {} after {} empty WIP commits (apply)",
+                                    next.id, count
+                                );
+                                warn!("{} (threshold {})", message, threshold);
+                                self.mark_change_stalled(&next.id, &message);
+                                continue;
+                            }
+                        }
 
                         if is_progress_complete(&progress_snapshot) {
                             let _ = self
@@ -490,9 +556,10 @@ impl Orchestrator {
         &self,
         change_id: &str,
         iteration: u32,
-    ) -> Result<crate::task_parser::TaskProgress> {
+    ) -> Result<SerialSnapshot> {
         let repo_root = std::env::current_dir()?;
         let progress = check_task_progress(&repo_root, change_id).unwrap_or_default();
+        let mut empty_commit = None;
 
         if matches!(self.vcs_backend, VcsBackend::Git | VcsBackend::Auto) {
             let is_git_repo = match git_commands::check_git_repo(&repo_root).await {
@@ -524,11 +591,24 @@ impl Orchestrator {
                         "Failed to create WIP commit for {} (apply#{}): {}",
                         change_id, iteration, e
                     );
+                } else {
+                    match git_commands::is_head_empty_commit(&repo_root).await {
+                        Ok(is_empty) => empty_commit = Some(is_empty),
+                        Err(e) => {
+                            warn!(
+                                "Failed to check WIP commit contents for {} (apply#{}): {}",
+                                change_id, iteration, e
+                            );
+                        }
+                    }
                 }
             }
         }
 
-        Ok(progress)
+        Ok(SerialSnapshot {
+            progress,
+            empty_commit,
+        })
     }
 
     async fn squash_serial_wip_commits(&self, change_id: &str, iteration: u32) -> Result<()> {
@@ -598,12 +678,52 @@ impl Orchestrator {
         if let Some(snapshot) = &self.initial_change_ids {
             for change in changes {
                 if !snapshot.contains(&change.id) {
-                    debug!(
-                        "Ignoring new change '{}' added after run started (will be processed on next run)",
+                    warn!(
+                        "New change '{}' detected after run started - will be ignored",
                         change.id
                     );
                 }
             }
+        }
+    }
+
+    /// Filter out stalled changes and those blocked by stalled dependencies.
+    fn filter_stalled_changes(&mut self, changes: &[Change]) -> Vec<Change> {
+        let mut eligible = Vec::new();
+
+        for change in changes {
+            if self.stalled_change_ids.contains(&change.id) {
+                continue;
+            }
+
+            if let Some(failed_dep) = change
+                .dependencies
+                .iter()
+                .find(|dep| self.stalled_change_ids.contains(*dep))
+            {
+                if self.skipped_change_ids.insert(change.id.clone()) {
+                    warn!(
+                        "Skipping '{}' because dependency '{}' stalled",
+                        change.id, failed_dep
+                    );
+                }
+                continue;
+            }
+
+            eligible.push(change.clone());
+        }
+
+        eligible
+    }
+
+    fn mark_change_stalled(&mut self, change_id: &str, reason: &str) {
+        self.stalled_change_ids.insert(change_id.to_string());
+        self.apply_counts.remove(change_id);
+        self.current_change_id = None;
+        self.stall_detector.clear_change(change_id);
+
+        if let Some(progress) = &mut self.progress {
+            progress.error(reason);
         }
     }
 
@@ -859,6 +979,46 @@ mod tests {
         let filtered = orchestrator.filter_to_snapshot(&current_changes);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].completed_tasks, 4); // Progress should be updated
+    }
+
+    #[test]
+    fn test_filter_stalled_changes_skips_dependencies() {
+        let config = OrchestratorConfig::default();
+        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
+        orchestrator
+            .stalled_change_ids
+            .insert("change-a".to_string());
+
+        let changes = vec![
+            Change {
+                id: "change-a".to_string(),
+                completed_tasks: 0,
+                total_tasks: 3,
+                last_modified: "now".to_string(),
+                is_approved: true,
+                dependencies: Vec::new(),
+            },
+            Change {
+                id: "change-b".to_string(),
+                completed_tasks: 0,
+                total_tasks: 3,
+                last_modified: "now".to_string(),
+                is_approved: true,
+                dependencies: vec!["change-a".to_string()],
+            },
+            Change {
+                id: "change-c".to_string(),
+                completed_tasks: 0,
+                total_tasks: 3,
+                last_modified: "now".to_string(),
+                is_approved: true,
+                dependencies: Vec::new(),
+            },
+        ];
+
+        let eligible = orchestrator.filter_stalled_changes(&changes);
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].id, "change-c");
     }
 
     // Note: build_analysis_prompt tests moved to src/orchestration/selection.rs
