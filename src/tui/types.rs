@@ -31,6 +31,8 @@ pub enum AppMode {
     Error,
     /// Proposing mode - user is entering a new proposal
     Proposing,
+    /// Confirmation dialog for worktree deletion
+    ConfirmWorktreeDelete,
     /// QR popup mode - showing Web UI QR code
     QrPopup,
 }

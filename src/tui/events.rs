@@ -27,4 +27,6 @@ pub enum TuiCommand {
     Stop,
     /// Submit a new proposal (execute propose_command with the given text)
     SubmitProposal(String),
+    /// Delete worktrees associated with a change
+    DeleteWorktree(String),
 }

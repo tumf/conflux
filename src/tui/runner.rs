@@ -5,6 +5,7 @@
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::openspec::Change;
+use crate::vcs::{GitWorkspaceManager, WorkspaceManager};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -15,6 +16,7 @@ use crossterm::{
 };
 use ratatui::DefaultTerminal;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -96,9 +98,28 @@ async fn run_tui_loop(
                     .collect()
             }
         };
+    let worktree_base_dir = config
+        .get_workspace_base_dir()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("openspec-tui-worktrees"));
+    let worktree_manager = GitWorkspaceManager::new(
+        worktree_base_dir.clone(),
+        repo_root.clone(),
+        config.get_max_concurrent_workspaces(),
+        config.clone(),
+    );
+    let worktree_change_ids: HashSet<String> =
+        match worktree_manager.list_worktree_change_ids().await {
+            Ok(ids) => ids,
+            Err(err) => {
+                warn!("Failed to load worktree snapshot: {}", err);
+                HashSet::new()
+            }
+        };
 
     let mut app = AppState::new(initial_changes);
     app.apply_parallel_eligibility(&committed_change_ids);
+    app.apply_worktree_status(&worktree_change_ids);
     app.max_concurrent = config.get_max_concurrent_workspaces();
     app.web_url = web_url;
     let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(100);
@@ -114,7 +135,15 @@ async fn run_tui_loop(
     let refresh_tx = tx.clone();
     let refresh_cancel = cancel_token.clone();
     let refresh_repo_root = repo_root.clone();
+    let refresh_worktree_base_dir = worktree_base_dir.clone();
+    let refresh_config = config.clone();
     let refresh_handle = tokio::spawn(async move {
+        let worktree_manager = GitWorkspaceManager::new(
+            refresh_worktree_base_dir,
+            refresh_repo_root.clone(),
+            refresh_config.get_max_concurrent_workspaces(),
+            refresh_config,
+        );
         let mut interval = tokio::time::interval(Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS));
         loop {
             tokio::select! {
@@ -132,11 +161,20 @@ async fn run_tui_loop(
                                         changes.iter().map(|change| change.id.clone()).collect()
                                     }
                                 };
+                            let worktree_change_ids: HashSet<String> =
+                                match worktree_manager.list_worktree_change_ids().await {
+                                    Ok(ids) => ids,
+                                    Err(err) => {
+                                        warn!("Failed to refresh worktree snapshot: {}", err);
+                                        HashSet::new()
+                                    }
+                                };
 
                             if refresh_tx
                                 .send(OrchestratorEvent::ChangesRefreshed {
                                     changes,
                                     committed_change_ids,
+                                    worktree_change_ids,
                                 })
                                 .await
                                 .is_err()
@@ -176,9 +214,30 @@ async fn run_tui_loop(
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    let had_warning_message = app.warning_message.is_some();
+                    let had_warning_popup = app.warning_popup.is_some();
+
                     // Handle QrPopup mode - any key closes the popup
                     if app.mode == AppMode::QrPopup {
                         app.hide_qr_popup();
+                        continue;
+                    }
+
+                    // Handle worktree delete confirmation
+                    if app.mode == AppMode::ConfirmWorktreeDelete {
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
+                                if let Some(cmd) = app.confirm_worktree_delete() {
+                                    let _ = cmd_tx.send(cmd).await;
+                                }
+                            }
+                            (KeyCode::Char('n'), _)
+                            | (KeyCode::Char('N'), _)
+                            | (KeyCode::Esc, _) => {
+                                app.cancel_worktree_delete();
+                            }
+                            _ => {}
+                        }
                         continue;
                     }
 
@@ -268,6 +327,11 @@ async fn run_tui_loop(
                                     EnableMouseCapture
                                 )?;
                                 terminal.clear()?;
+                            }
+                        }
+                        (KeyCode::Char('d'), _) | (KeyCode::Char('D'), _) => {
+                            if app.mode == AppMode::Select {
+                                app.request_worktree_delete();
                             }
                         }
                         (KeyCode::Esc, _) => {
@@ -410,9 +474,11 @@ async fn run_tui_loop(
                         }
                         _ => {}
                     }
-                    // Clear warning message on any key press
-                    app.warning_message = None;
-                    app.warning_popup = None;
+                    // Clear previous warning message on any key press
+                    if had_warning_message || had_warning_popup {
+                        app.warning_message = None;
+                        app.warning_popup = None;
+                    }
                 }
                 Event::Mouse(mouse) => {
                     match mouse.kind {
@@ -522,6 +588,42 @@ async fn run_tui_loop(
                         Err(e) => {
                             app.add_log(LogEntry::error(format!(
                                 "Failed to unapprove '{}': {}",
+                                id, e
+                            )));
+                        }
+                    }
+                }
+                TuiCommand::DeleteWorktree(id) => {
+                    match crate::vcs::git::remove_worktrees_for_change(&repo_root, &id).await {
+                        Ok(removed) => {
+                            if removed == 0 {
+                                app.warning_popup = Some(super::state::WarningPopup {
+                                    title: "Worktree not found".to_string(),
+                                    message: format!("No worktree found for change '{}'.", id),
+                                });
+                                app.add_log(LogEntry::warn(format!(
+                                    "No worktree to delete for '{}'",
+                                    id
+                                )));
+                            } else {
+                                if let Some(change) =
+                                    app.changes.iter_mut().find(|change| change.id == id)
+                                {
+                                    change.has_worktree = false;
+                                }
+                                app.add_log(LogEntry::success(format!(
+                                    "Deleted {} worktree(s) for '{}'",
+                                    removed, id
+                                )));
+                            }
+                        }
+                        Err(e) => {
+                            app.warning_popup = Some(super::state::WarningPopup {
+                                title: "Worktree delete failed".to_string(),
+                                message: format!("Failed to delete worktrees for '{}': {}", id, e),
+                            });
+                            app.add_log(LogEntry::error(format!(
+                                "Worktree delete failed for '{}': {}",
                                 id, e
                             )));
                         }

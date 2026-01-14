@@ -260,6 +260,7 @@ pub enum ExecutionEvent {
     ChangesRefreshed {
         changes: Vec<crate::openspec::Change>,
         committed_change_ids: std::collections::HashSet<String>,
+        worktree_change_ids: std::collections::HashSet<String>,
     },
 }
 
