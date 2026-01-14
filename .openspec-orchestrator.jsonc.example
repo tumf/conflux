@@ -21,5 +21,13 @@
   // Analyze command template
   // Executed for dependency analysis using LLM
   // Placeholder: {prompt} - replaced with the analysis prompt at runtime
-  "analyze_command": "opencode run --format json {prompt}"
+  "analyze_command": "opencode run --format json {prompt}",
+
+  // Logging configuration for TUI debug output
+  "logging": {
+    // Suppress repetitive debug logs when state has not changed
+    "suppress_repetitive_debug": true,
+    // Emit summary logs every N seconds (0 disables summaries)
+    "summary_interval_secs": 60
+  }
 }

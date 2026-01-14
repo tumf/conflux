@@ -69,11 +69,12 @@ async fn main() -> Result<()> {
             let openspec_cmd = cli.openspec_cmd;
             let opencode_path = cli.opencode_path;
 
-            // Get initial changes using native implementation
-            let changes = openspec::list_changes_native()?;
-
             // Load config (uses default paths)
             let config = OrchestratorConfig::load(None)?;
+            tui::log_deduplicator::configure_logging(config.get_logging());
+
+            // Get initial changes using native implementation
+            let changes = openspec::list_changes_native()?;
 
             // Run TUI (no web server in default mode)
             tui::run_tui(changes, openspec_cmd, opencode_path, config, None).await?;
@@ -86,11 +87,12 @@ async fn main() -> Result<()> {
                 init_file_logging(log_path)?;
             }
 
-            // Get initial changes using native implementation
-            let changes = openspec::list_changes_native()?;
-
             // Load config
             let config = OrchestratorConfig::load(args.config.as_deref())?;
+            tui::log_deduplicator::configure_logging(config.get_logging());
+
+            // Get initial changes using native implementation
+            let changes = openspec::list_changes_native()?;
 
             // Start web monitoring server if enabled and build URL
             #[cfg(feature = "web-monitoring")]

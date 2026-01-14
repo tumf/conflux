@@ -121,7 +121,8 @@ pub fn check_task_progress(workspace_path: &Path, change_id: &str) -> Option<Tas
     debug!("Checking tasks at: {:?}", tasks_path);
 
     if tasks_path.exists() {
-        let progress = crate::task_parser::parse_file(&tasks_path).unwrap_or_default();
+        let progress =
+            crate::task_parser::parse_file(&tasks_path, Some(change_id)).unwrap_or_default();
         debug!(
             "Tasks file found for {}: {}/{} complete",
             change_id, progress.completed, progress.total

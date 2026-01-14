@@ -10,6 +10,7 @@ use crate::orchestration::{
 };
 use crate::parallel_run_service::ParallelRunService;
 use crate::progress::ProgressDisplay;
+use crate::tui::log_deduplicator;
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{GitWorkspaceManager, VcsBackend, WorkspaceManager};
 use std::collections::{HashMap, HashSet};
@@ -75,6 +76,7 @@ impl Orchestrator {
         no_resume: bool,
     ) -> Result<Self> {
         let config = OrchestratorConfig::load(config_path.as_deref())?;
+        log_deduplicator::configure_logging(config.get_logging());
         let hooks = HookRunner::new(config.get_hooks());
         // CLI override takes precedence over config file value
         let max_iterations = max_iterations_override.unwrap_or_else(|| config.get_max_iterations());
@@ -129,6 +131,7 @@ impl Orchestrator {
         target_changes: Option<Vec<String>>,
         config: OrchestratorConfig,
     ) -> Result<Self> {
+        log_deduplicator::configure_logging(config.get_logging());
         let hooks = HookRunner::new(config.get_hooks());
         let max_iterations = config.get_max_iterations();
         let agent = AgentRunner::new(config.clone());

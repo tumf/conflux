@@ -29,6 +29,12 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
 
+  // Logging configuration for TUI debug output
+  // "logging": {
+  //   "suppress_repetitive_debug": true,
+  //   "summary_interval_secs": 60
+  // },
+
   // Command to propose new changes from TUI (+ key)
   // Supports {proposal} placeholder for the proposal text
   // "propose_command": "claude --dangerously-skip-permissions --verbose -p '/openspec:proposal {proposal}'",
@@ -73,6 +79,12 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
 
+  // Logging configuration for TUI debug output
+  // "logging": {
+  //   "suppress_repetitive_debug": true,
+  //   "summary_interval_secs": 60
+  // },
+
   // Command to propose new changes from TUI (+ key)
   // Supports {proposal} placeholder for the proposal text
   // "propose_command": "opencode run '/openspec:proposal {proposal}'",
@@ -116,6 +128,12 @@ pub const CODEX_TEMPLATE: &str = r#"{
 
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
+
+  // Logging configuration for TUI debug output
+  // "logging": {
+  //   "suppress_repetitive_debug": true,
+  //   "summary_interval_secs": 60
+  // },
 
   // Command to propose new changes from TUI (+ key)
   // Supports {proposal} placeholder for the proposal text

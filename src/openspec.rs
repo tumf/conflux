@@ -1,6 +1,7 @@
 use crate::approval;
 use crate::error::{OrchestratorError, Result};
 use crate::task_parser;
+use crate::tui::log_deduplicator;
 use std::fs;
 use std::path::Path;
 use tracing::{debug, info};
@@ -196,13 +197,24 @@ pub fn list_changes_native() -> Result<Vec<Change>> {
     // Sort by id for consistent ordering
     changes.sort_by(|a, b| a.id.cmp(&b.id));
 
-    debug!("Found {} changes via native parsing", changes.len());
+    if log_deduplicator::should_log_change_count(changes.len()) {
+        debug!("Found {} changes via native parsing", changes.len());
+    }
     Ok(changes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LoggingConfig;
+    use crate::tui::log_deduplicator;
+    use std::env;
+    use std::fs;
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::TempDir;
+
+    static LOG_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn test_change_progress() {
@@ -307,5 +319,43 @@ mod tests {
         for change in &changes {
             assert!(!change.id.is_empty(), "change ID should not be empty");
         }
+    }
+
+    #[test]
+    fn test_list_changes_native_suppresses_repetitive_logs() {
+        let log_lock = LOG_TEST_MUTEX.get_or_init(|| Mutex::new(()));
+        let _guard = log_lock.lock().expect("log mutex poisoned");
+
+        let temp_dir = TempDir::new().unwrap();
+        let change_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("sample-change");
+        fs::create_dir_all(&change_dir).unwrap();
+        let mut tasks_file = fs::File::create(change_dir.join("tasks.md")).unwrap();
+        writeln!(tasks_file, "- [ ] Task 1").unwrap();
+
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(temp_dir.path()).unwrap();
+
+        log_deduplicator::configure_logging(LoggingConfig {
+            suppress_repetitive_debug: true,
+            summary_interval_secs: 0,
+        });
+
+        let _ = list_changes_native();
+        let _ = list_changes_native();
+
+        let should_log_progress = log_deduplicator::should_log_task_progress("sample-change", 0, 1);
+        let should_log_approval =
+            log_deduplicator::should_log_approval_status("sample-change", false);
+        let should_log_count = log_deduplicator::should_log_change_count(1);
+
+        env::set_current_dir(original_dir).unwrap();
+
+        assert!(!should_log_progress);
+        assert!(!should_log_approval);
+        assert!(!should_log_count);
     }
 }

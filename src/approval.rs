@@ -6,6 +6,7 @@
 //! been modified since approval.
 
 use crate::error::{OrchestratorError, Result};
+use crate::tui::log_deduplicator;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -150,11 +151,97 @@ pub fn check_approval(change_id: &str) -> Result<bool> {
 
     // 1. Check if approved file exists
     if !approved_path.exists() {
-        debug!("Change '{}' is not approved: no approved file", change_id);
+        if log_deduplicator::should_log_approval_status(change_id, false) {
+            debug!("Change '{}' is not approved: no approved file", change_id);
+        }
         return Ok(false);
     }
 
-    debug!("Change '{}' is approved and valid", change_id);
+    // 2. Parse approved manifest
+    let manifest = match parse_approved_file(&approved_path) {
+        Ok(m) => m,
+        Err(e) => {
+            debug!(
+                "Change '{}' approval invalid: failed to parse manifest: {}",
+                change_id, e
+            );
+            return Ok(false);
+        }
+    };
+
+    // 3. Get current file list (excluding tasks.md)
+    let current_files = match discover_md_files(change_id) {
+        Ok(f) => f,
+        Err(e) => {
+            debug!(
+                "Change '{}' approval check failed: cannot discover files: {}",
+                change_id, e
+            );
+            return Err(e);
+        }
+    };
+
+    // 4. Compare file lists (excluding tasks.md from manifest)
+    let manifest_files: std::collections::HashSet<PathBuf> = manifest
+        .keys()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n != "tasks.md")
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+
+    let current_set: std::collections::HashSet<PathBuf> = current_files.into_iter().collect();
+
+    if manifest_files != current_set {
+        debug!(
+            "Change '{}' approval invalid: file list mismatch. Manifest: {:?}, Current: {:?}",
+            change_id, manifest_files, current_set
+        );
+        return Ok(false);
+    }
+
+    // 5. Verify hashes for all files in manifest (except tasks.md)
+    for (path, expected_hash) in &manifest {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n == "tasks.md")
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let actual_hash = match compute_md5(path) {
+            Ok(h) => h,
+            Err(e) => {
+                debug!(
+                    "Change '{}' approval invalid: cannot compute hash for {}: {}",
+                    change_id,
+                    path.display(),
+                    e
+                );
+                return Ok(false);
+            }
+        };
+
+        if &actual_hash != expected_hash {
+            debug!(
+                "Change '{}' approval invalid: hash mismatch for {}. Expected: {}, Actual: {}",
+                change_id,
+                path.display(),
+                expected_hash,
+                actual_hash
+            );
+            return Ok(false);
+        }
+    }
+
+    if log_deduplicator::should_log_approval_status(change_id, true) {
+        debug!("Change '{}' is approved and valid", change_id);
+    }
     Ok(true)
 }
 
