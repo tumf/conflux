@@ -3,17 +3,50 @@
 use crate::agent::build_apply_prompt;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::events::LogEntry;
 use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
+use crate::process_manager::{configure_process_group, ManagedChild, TerminationOutcome};
 use crate::task_parser::TaskProgress;
 use crate::vcs::VcsBackend;
 use std::path::Path;
 use std::process::Stdio as StdStdio;
+use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::events::ParallelEvent;
+
+fn format_termination_message(
+    result: std::result::Result<TerminationOutcome, std::io::Error>,
+) -> String {
+    match result {
+        Ok(TerminationOutcome::Exited(_)) => "Process terminated due to cancellation".to_string(),
+        Ok(TerminationOutcome::ForceKilled(_)) => {
+            "Process force killed after cancellation timeout".to_string()
+        }
+        Ok(TerminationOutcome::TimedOut) => {
+            "Process still running after force kill timeout".to_string()
+        }
+        Err(e) => format!("Failed to terminate process after cancellation: {}", e),
+    }
+}
+
+async fn send_cancellation_log(
+    event_tx: &Option<mpsc::Sender<ParallelEvent>>,
+    change_id: &str,
+    message: String,
+) {
+    if let Some(ref tx) = event_tx {
+        let _ = tx
+            .send(ParallelEvent::Log(
+                LogEntry::warn(message).with_change_id(change_id.to_string()),
+            ))
+            .await;
+    }
+}
 
 /// Create an iteration snapshot with WIP commit message including iteration number.
 ///
@@ -298,6 +331,7 @@ pub async fn execute_apply_in_workspace(
     vcs_backend: VcsBackend,
     hooks: Option<&HookRunner>,
     parallel_ctx: Option<&ParallelHookContext>,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<String> {
     const MAX_ITERATIONS: u32 = 50;
     let mut iteration = 0;
@@ -306,6 +340,15 @@ pub async fn execute_apply_in_workspace(
 
     loop {
         iteration += 1;
+        if cancel_token.is_some_and(|token| token.is_cancelled()) {
+            send_cancellation_log(
+                &event_tx,
+                change_id,
+                "Apply cancelled before execution".to_string(),
+            )
+            .await;
+            return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+        }
         if iteration > MAX_ITERATIONS {
             // Run on_error hook if configured
             if let Some(hook_runner) = hooks {
@@ -442,21 +485,26 @@ pub async fn execute_apply_in_workspace(
             "Executing shell command: sh -c {} (cwd: {:?})",
             command, workspace_path
         );
-        let mut child = Command::new("sh")
-            .arg("-c")
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
             .arg(&command)
             .current_dir(workspace_path)
             .stdin(StdStdio::null())
             .stdout(StdStdio::piped())
-            .stderr(StdStdio::piped())
+            .stderr(StdStdio::piped());
+        configure_process_group(&mut cmd);
+        let child = cmd
             .spawn()
             .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to spawn: {}", e)))?;
+        let mut child = ManagedChild::new(child).map_err(|e| {
+            OrchestratorError::AgentCommand(format!("Failed to create managed child: {}", e))
+        })?;
 
         // Stream stdout and stderr in real-time
-        let stdout = child.stdout.take().ok_or_else(|| {
+        let stdout = child.child.stdout.take().ok_or_else(|| {
             OrchestratorError::AgentCommand("Failed to capture stdout".to_string())
         })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
+        let stderr = child.child.stderr.take().ok_or_else(|| {
             OrchestratorError::AgentCommand("Failed to capture stderr".to_string())
         })?;
 
@@ -492,15 +540,31 @@ pub async fn execute_apply_in_workspace(
             }
         });
 
+        let status = if let Some(token) = cancel_token {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    let message = format_termination_message(
+                        child.terminate_with_timeout(Duration::from_secs(5)).await,
+                    );
+                    send_cancellation_log(&event_tx, change_id, message).await;
+                    stdout_handle.abort();
+                    stderr_handle.abort();
+                    return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+                }
+                status = child.wait() => {
+                    status.map_err(|e| OrchestratorError::AgentCommand(format!("Failed to wait: {}", e)))?
+                }
+            }
+        } else {
+            child
+                .wait()
+                .await
+                .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to wait: {}", e)))?
+        };
+
         // Wait for streams to complete
         let _ = stdout_handle.await;
         let _ = stderr_handle.await;
-
-        // Wait for process to finish
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to wait: {}", e)))?;
 
         if !status.success() {
             return Err(OrchestratorError::AgentCommand(format!(
@@ -736,6 +800,7 @@ pub async fn execute_archive_in_workspace(
     vcs_backend: VcsBackend,
     hooks: Option<&HookRunner>,
     parallel_ctx: Option<&ParallelHookContext>,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<String> {
     // Verify task completion before archiving using common function
     use crate::execution::archive::get_task_progress;
@@ -816,6 +881,16 @@ pub async fn execute_archive_in_workspace(
         }
     }
 
+    if cancel_token.is_some_and(|token| token.is_cancelled()) {
+        send_cancellation_log(
+            &event_tx,
+            change_id,
+            "Archive cancelled before execution".to_string(),
+        )
+        .await;
+        return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+    }
+
     // Expand change_id and prompt in archive command
     let command = OrchestratorConfig::expand_change_id(archive_cmd_template, change_id);
     let command = OrchestratorConfig::expand_prompt(&command, config.get_archive_prompt());
@@ -829,21 +904,24 @@ pub async fn execute_archive_in_workspace(
         "Executing shell command: sh -c {} (cwd: {:?})",
         command, workspace_path
     );
-    let mut child = Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(&command)
         .current_dir(workspace_path)
         .stdin(StdStdio::null())
         .stdout(StdStdio::piped())
-        .stderr(StdStdio::piped())
-        .spawn()
-        .map_err(|e| {
-            OrchestratorError::AgentCommand(format!("Failed to spawn archive command: {}", e))
-        })?;
+        .stderr(StdStdio::piped());
+    configure_process_group(&mut cmd);
+    let child = cmd.spawn().map_err(|e| {
+        OrchestratorError::AgentCommand(format!("Failed to spawn archive command: {}", e))
+    })?;
+    let mut child = ManagedChild::new(child).map_err(|e| {
+        OrchestratorError::AgentCommand(format!("Failed to create managed child: {}", e))
+    })?;
 
     // Stream stdout
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let stdout = child.child.stdout.take();
+    let stderr = child.child.stderr.take();
     let change_id_clone = change_id.to_string();
     let event_tx_clone = event_tx.clone();
 
@@ -883,15 +961,30 @@ pub async fn execute_archive_in_workspace(
         }
     });
 
+    let status = if let Some(token) = cancel_token {
+        tokio::select! {
+            _ = token.cancelled() => {
+                let message = format_termination_message(
+                    child.terminate_with_timeout(Duration::from_secs(5)).await,
+                );
+                send_cancellation_log(&event_tx, change_id, message).await;
+                stdout_handle.abort();
+                stderr_handle.abort();
+                return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+            }
+            status = child.wait() => {
+                status.map_err(|e| OrchestratorError::AgentCommand(format!("Archive command failed: {}", e)))?
+            }
+        }
+    } else {
+        child.wait().await.map_err(|e| {
+            OrchestratorError::AgentCommand(format!("Archive command failed: {}", e))
+        })?
+    };
+
     // Wait for streams to complete
     let _ = stdout_handle.await;
     let _ = stderr_handle.await;
-
-    // Wait for process to complete
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| OrchestratorError::AgentCommand(format!("Archive command failed: {}", e)))?;
 
     if !status.success() {
         return Err(OrchestratorError::AgentCommand(format!(

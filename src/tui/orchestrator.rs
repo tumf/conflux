@@ -6,9 +6,11 @@ use crate::agent::AgentRunner;
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::openspec::Change;
+use crate::process_manager::TerminationOutcome;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -99,12 +101,21 @@ pub async fn archive_single_change(
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                let _ = child.terminate();
-                let _ = child.kill().await;
+                let termination = child.terminate_with_timeout(Duration::from_secs(5)).await;
+                let message = match termination {
+                    Ok(TerminationOutcome::Exited(_)) => {
+                        "Process terminated due to cancellation".to_string()
+                    }
+                    Ok(TerminationOutcome::ForceKilled(_)) => {
+                        "Process force killed after cancellation timeout".to_string()
+                    }
+                    Ok(TerminationOutcome::TimedOut) => {
+                        "Process still running after force kill timeout".to_string()
+                    }
+                    Err(e) => format!("Failed to terminate process after cancellation: {}", e),
+                };
                 let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::warn(
-                        "Process killed due to cancellation".to_string(),
-                    )))
+                    .send(OrchestratorEvent::Log(LogEntry::warn(message)))
                     .await;
                 return Ok(ArchiveResult::Cancelled);
             }
@@ -570,12 +581,21 @@ pub async fn run_orchestrator(
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
-                    let _ = child.terminate();
-                    let _ = child.kill().await;
+                    let termination = child.terminate_with_timeout(Duration::from_secs(5)).await;
+                    let message = match termination {
+                        Ok(TerminationOutcome::Exited(_)) => {
+                            "Process terminated due to cancellation".to_string()
+                        }
+                        Ok(TerminationOutcome::ForceKilled(_)) => {
+                            "Process force killed after cancellation timeout".to_string()
+                        }
+                        Ok(TerminationOutcome::TimedOut) => {
+                            "Process still running after force kill timeout".to_string()
+                        }
+                        Err(e) => format!("Failed to terminate process after cancellation: {}", e),
+                    };
                     let _ = tx
-                        .send(OrchestratorEvent::Log(LogEntry::warn(
-                            "Process killed due to cancellation".to_string(),
-                        )))
+                        .send(OrchestratorEvent::Log(LogEntry::warn(message)))
                         .await;
                     // Exit the main loop
                     pending_changes.clear();
@@ -907,22 +927,21 @@ pub async fn run_orchestrator_parallel(
         let batch_service = ParallelRunService::new(repo_root.clone(), config.clone());
 
         // Execute batch using ParallelRunService with channel
-        let result = tokio::select! {
-            _ = cancel_token.cancelled() => {
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::warn(
-                        "Parallel execution cancelled".to_string(),
-                    )))
-                    .await;
-                Err(crate::error::OrchestratorError::AgentCommand("Cancelled".to_string()))
-            }
-            result = batch_service.run_parallel_with_channel(batch_changes.clone(), parallel_tx) => {
-                result
-            }
-        };
+        let result = batch_service
+            .run_parallel_with_channel(
+                batch_changes.clone(),
+                parallel_tx,
+                Some(cancel_token.clone()),
+            )
+            .await;
 
         // Wait for forward task to complete
         let _ = forward_handle.await;
+
+        if cancel_token.is_cancelled() {
+            stopped_or_cancelled = true;
+            break;
+        }
 
         // Mark batch changes as processed
         for change in &batch_changes {
