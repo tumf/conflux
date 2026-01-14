@@ -654,73 +654,85 @@ async fn run_tui_loop(
                     }
                 }
                 TuiCommand::ResolveMerge(id) => {
-                    match crate::parallel::base_dirty_reason(&repo_root).await {
-                        Ok(Some(reason)) => {
-                            app.warning_popup = Some(super::state::WarningPopup {
-                                title: "Base is dirty".to_string(),
-                                message: format!("Cannot resolve merge for '{}': {}", id, reason),
-                            });
-                            app.add_log(LogEntry::warn(format!(
-                                "Merge resolve skipped for '{}': {}",
-                                id, reason
-                            )));
+                    let resolve_tx = tx.clone();
+                    let resolve_repo_root = repo_root.clone();
+                    let resolve_config = config.clone();
+                    let resolve_worktree_base_dir = worktree_base_dir.clone();
+                    tokio::spawn(async move {
+                        let _ = resolve_tx
+                            .send(OrchestratorEvent::ResolveStarted {
+                                change_id: id.clone(),
+                            })
+                            .await;
+
+                        match crate::parallel::base_dirty_reason(&resolve_repo_root).await {
+                            Ok(Some(reason)) => {
+                                let _ = resolve_tx
+                                    .send(OrchestratorEvent::ResolveFailed {
+                                        change_id: id.clone(),
+                                        error: format!("Base is dirty: {}", reason),
+                                    })
+                                    .await;
+                                return;
+                            }
+                            Err(e) => {
+                                let _ = resolve_tx
+                                    .send(OrchestratorEvent::ResolveFailed {
+                                        change_id: id.clone(),
+                                        error: format!("Failed to check base status: {}", e),
+                                    })
+                                    .await;
+                                return;
+                            }
+                            Ok(None) => {}
                         }
-                        Ok(None) => {
-                            match crate::parallel::resolve_deferred_merge(
-                                repo_root.clone(),
-                                config.clone(),
-                                &id,
-                            )
-                            .await
-                            {
-                                Ok(_) => {
-                                    if let Some(change) =
-                                        app.changes.iter_mut().find(|change| change.id == id)
-                                    {
-                                        change.queue_status = QueueStatus::Archived;
+
+                        match crate::parallel::resolve_deferred_merge(
+                            resolve_repo_root.clone(),
+                            resolve_config.clone(),
+                            &id,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                let refresh_manager = GitWorkspaceManager::new(
+                                    resolve_worktree_base_dir.clone(),
+                                    resolve_repo_root.clone(),
+                                    resolve_config.get_max_concurrent_workspaces(),
+                                    resolve_config.clone(),
+                                );
+                                let worktree_change_ids = match refresh_manager
+                                    .list_worktree_change_ids()
+                                    .await
+                                {
+                                    Ok(ids) => Some(ids),
+                                    Err(err) => {
+                                        let _ = resolve_tx
+                                            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                                                "Failed to refresh worktree snapshot: {}",
+                                                err
+                                            ))))
+                                            .await;
+                                        None
                                     }
-                                    let refresh_manager = GitWorkspaceManager::new(
-                                        worktree_base_dir.clone(),
-                                        repo_root.clone(),
-                                        config.get_max_concurrent_workspaces(),
-                                        config.clone(),
-                                    );
-                                    if let Ok(ids) =
-                                        refresh_manager.list_worktree_change_ids().await
-                                    {
-                                        app.apply_worktree_status(&ids);
-                                    }
-                                    app.add_log(LogEntry::success(format!(
-                                        "Merge resolved for '{}'",
-                                        id
-                                    )));
-                                }
-                                Err(e) => {
-                                    app.warning_popup = Some(super::state::WarningPopup {
-                                        title: "Merge resolve failed".to_string(),
-                                        message: format!(
-                                            "Failed to resolve merge for '{}': {}",
-                                            id, e
-                                        ),
-                                    });
-                                    app.add_log(LogEntry::error(format!(
-                                        "Merge resolve failed for '{}': {}",
-                                        id, e
-                                    )));
-                                }
+                                };
+                                let _ = resolve_tx
+                                    .send(OrchestratorEvent::ResolveCompleted {
+                                        change_id: id.clone(),
+                                        worktree_change_ids,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = resolve_tx
+                                    .send(OrchestratorEvent::ResolveFailed {
+                                        change_id: id.clone(),
+                                        error: e.to_string(),
+                                    })
+                                    .await;
                             }
                         }
-                        Err(e) => {
-                            app.warning_popup = Some(super::state::WarningPopup {
-                                title: "Merge resolve failed".to_string(),
-                                message: format!("Failed to check base status: {}", e),
-                            });
-                            app.add_log(LogEntry::error(format!(
-                                "Failed to resolve merge for '{}': {}",
-                                id, e
-                            )));
-                        }
-                    }
+                    });
                 }
                 TuiCommand::SubmitProposal(proposal) => {
                     // Execute propose_command with the proposal text
