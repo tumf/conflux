@@ -1231,32 +1231,6 @@ impl ParallelExecutor {
             )));
         }
 
-        let parents_output = Command::new("git")
-            .args(["rev-list", "--parents", "-n", "1", "HEAD"])
-            .current_dir(repo_root)
-            .output()
-            .await
-            .map_err(|e| {
-                OrchestratorError::GitCommand(format!("Failed to read merge commit: {}", e))
-            })?;
-
-        if !parents_output.status.success() {
-            let stderr = String::from_utf8_lossy(&parents_output.stderr);
-            return Err(OrchestratorError::GitCommand(format!(
-                "Failed to read merge commit: {}",
-                stderr
-            )));
-        }
-
-        let parent_tokens = String::from_utf8_lossy(&parents_output.stdout)
-            .split_whitespace()
-            .count();
-        if parent_tokens < 3 {
-            return Err(OrchestratorError::GitCommand(
-                "Expected a merge commit on HEAD after resolve".to_string(),
-            ));
-        }
-
         let merge_log_output = Command::new("git")
             .args([
                 "log",
@@ -1280,6 +1254,13 @@ impl ParallelExecutor {
         }
 
         let merge_messages = String::from_utf8_lossy(&merge_log_output.stdout);
+        if merge_messages.trim().is_empty() {
+            return Err(OrchestratorError::GitCommand(format!(
+                "No merge commits found after resolve (expected merge commits for change_ids: {})",
+                change_ids.join(", ")
+            )));
+        }
+
         for change_id in change_ids {
             if !merge_messages.contains(change_id) {
                 return Err(OrchestratorError::GitCommand(format!(
@@ -1592,6 +1573,231 @@ mod tests {
 
         let revisions = vec![workspace_a.name, workspace_b.name];
         let change_ids = vec!["change-a".to_string(), "change-b".to_string()];
+
+        executor
+            .merge_and_resolve_with(
+                &revisions,
+                &change_ids,
+                |_revs, _details| async move { Ok(()) },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_merge_allows_non_merge_head_after_merges() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        let base_dir = repo_root.join("worktrees");
+
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(repo_root.join("README.md"), "base").unwrap();
+
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["commit", "-m", "Base"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        let config = OrchestratorConfig {
+            resolve_command: Some("sh merge-resolver.sh".to_string()),
+            ..Default::default()
+        };
+        let mut manager =
+            GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
+
+        let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
+        let workspace_b = manager.create_workspace("change-b", None).await.unwrap();
+
+        std::fs::write(workspace_a.path.join("change-a.txt"), "A").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&workspace_a.path)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Apply: change-a"])
+            .current_dir(&workspace_a.path)
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(workspace_b.path.join("change-b.txt"), "B").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&workspace_b.path)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Apply: change-b"])
+            .current_dir(&workspace_b.path)
+            .output()
+            .await
+            .unwrap();
+
+        let resolver_script = repo_root.join("merge-resolver.sh");
+        let script_contents = format!(
+            "#!/bin/sh\nset -e\ngit checkout main\n\
+            git merge --no-ff -m 'Merge change: change-a' {}\n\
+            git merge --no-ff -m 'Merge change: change-b' {}\n\
+            echo 'post-merge' >> README.md\n\
+            git add -A\n\
+            git commit -m 'Post-merge commit'\n",
+            workspace_a.name, workspace_b.name
+        );
+        std::fs::write(&resolver_script, script_contents).unwrap();
+
+        let executor = ParallelExecutor {
+            workspace_manager: Box::new(manager),
+            config,
+            apply_command: String::new(),
+            archive_command: String::new(),
+            event_tx: None,
+            max_conflict_retries: 2,
+            repo_root: repo_root.to_path_buf(),
+            no_resume: false,
+            failed_tracker: FailedChangeTracker::new(),
+            hooks: None,
+        };
+
+        let revisions = vec![workspace_a.name, workspace_b.name];
+        let change_ids = vec!["change-a".to_string(), "change-b".to_string()];
+
+        executor
+            .merge_and_resolve_with(
+                &revisions,
+                &change_ids,
+                |_revs, _details| async move { Ok(()) },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_merge_retries_when_merge_left_in_progress() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        let base_dir = repo_root.join("worktrees");
+
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(repo_root.join("README.md"), "base").unwrap();
+
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["commit", "-m", "Base"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        let config = OrchestratorConfig {
+            resolve_command: Some("sh merge-resolver.sh".to_string()),
+            ..Default::default()
+        };
+        let mut manager =
+            GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 1, config.clone());
+
+        let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
+
+        std::fs::write(workspace_a.path.join("change-a.txt"), "A").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&workspace_a.path)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Apply: change-a"])
+            .current_dir(&workspace_a.path)
+            .output()
+            .await
+            .unwrap();
+
+        let resolver_script = repo_root.join("merge-resolver.sh");
+        let script_contents = format!(
+            "#!/bin/sh\nset -e\n\
+            if [ -f .git/merge-in-progress-marker ]; then\n\
+              git commit -m 'Merge change: change-a'\n\
+              exit 0\n\
+            fi\n\
+            git checkout main\n\
+            git merge --no-ff --no-commit {}\n\
+            touch .git/merge-in-progress-marker\n",
+            workspace_a.name
+        );
+        std::fs::write(&resolver_script, script_contents).unwrap();
+
+        let executor = ParallelExecutor {
+            workspace_manager: Box::new(manager),
+            config,
+            apply_command: String::new(),
+            archive_command: String::new(),
+            event_tx: None,
+            max_conflict_retries: 2,
+            repo_root: repo_root.to_path_buf(),
+            no_resume: false,
+            failed_tracker: FailedChangeTracker::new(),
+            hooks: None,
+        };
+
+        let revisions = vec![workspace_a.name];
+        let change_ids = vec!["change-a".to_string()];
 
         executor
             .merge_and_resolve_with(

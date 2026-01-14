@@ -749,8 +749,10 @@ impl WorkspaceManager for GitWorkspaceManager {
 
             // Try to remove the worktree
             debug!(
+                module = module_path!(),
                 "Executing git command: git worktree remove {} --force (cwd: {:?})",
-                path, self.repo_root
+                path,
+                self.repo_root
             );
             let result = std::process::Command::new("git")
                 .args(["worktree", "remove", path, "--force"])
@@ -780,8 +782,10 @@ impl WorkspaceManager for GitWorkspaceManager {
 
             // Try to delete the branch
             debug!(
+                module = module_path!(),
                 "Executing git command: git branch -D {} (cwd: {:?})",
-                workspace_name, self.repo_root
+                workspace_name,
+                self.repo_root
             );
             let _ = std::process::Command::new("git")
                 .args(["branch", "-D", workspace_name])
@@ -894,6 +898,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use tokio::process::Command;
+    use tracing::debug;
 
     fn create_test_manager() -> (GitWorkspaceManager, TempDir) {
         let temp_dir = TempDir::new().unwrap();
@@ -918,6 +923,11 @@ mod tests {
         let base_dir = temp_dir.path().join("worktrees");
         let repo_root = temp_dir.path().to_path_buf();
 
+        debug!(
+            module = module_path!(),
+            "Executing git command: git init (cwd: {:?})",
+            temp_dir.path()
+        );
         let init_result = Command::new("git")
             .args(["init"])
             .current_dir(temp_dir.path())

@@ -3,6 +3,7 @@
 use crate::agent::AgentRunner;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::vcs::git::commands as git_commands;
 use crate::vcs::{VcsBackend, WorkspaceManager};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -261,6 +262,33 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         if status.success() {
             let remaining_conflicts = detect_conflicts(workspace_manager).await?;
             if remaining_conflicts.is_empty() {
+                if matches!(
+                    workspace_manager.backend_type(),
+                    VcsBackend::Git | VcsBackend::Auto
+                ) {
+                    let merge_in_progress =
+                        git_commands::is_merge_in_progress(workspace_manager.repo_root())
+                            .await
+                            .map_err(OrchestratorError::from)?;
+
+                    if merge_in_progress {
+                        warn!(
+                            "Merge still in progress after resolve attempt {}/{}",
+                            attempt, max_retries
+                        );
+                        send_event(
+                            event_tx,
+                            ParallelEvent::ResolveOutput {
+                                output:
+                                    "Merge still in progress (MERGE_HEAD exists); retrying resolve"
+                                        .to_string(),
+                            },
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+
                 send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
                 return Ok(());
             }

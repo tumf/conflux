@@ -48,6 +48,7 @@ pub async fn check_git_repo<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
 
     // Check if directory is a git repo
     debug!(
+        module = module_path!(),
         "Executing git command: git rev-parse --git-dir (cwd: {:?})",
         cwd.as_ref()
     );
@@ -183,6 +184,7 @@ pub async fn checkout<P: AsRef<Path>>(cwd: P, branch_or_commit: &str) -> VcsResu
 /// Returns Ok(()) on success, or GitConflict error if there are conflicts.
 pub async fn merge<P: AsRef<Path>>(cwd: P, branch_name: &str) -> VcsResult<()> {
     debug!(
+        module = module_path!(),
         "Executing git command: git merge {} --no-edit (cwd: {:?})",
         branch_name,
         cwd.as_ref()
@@ -221,6 +223,21 @@ pub async fn merge_abort<P: AsRef<Path>>(cwd: P) -> VcsResult<()> {
     Ok(())
 }
 
+/// Check whether a merge is currently in progress.
+///
+/// Returns `Ok(true)` when `MERGE_HEAD` exists.
+pub async fn is_merge_in_progress<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
+    let output = Command::new("git")
+        .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+        .current_dir(cwd.as_ref())
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| VcsError::git_command(format!("Failed to check merge state: {}", e)))?;
+
+    Ok(output.status.success())
+}
+
 /// Stage all changes and commit with the given message.
 #[allow(dead_code)]
 pub async fn add_and_commit<P: AsRef<Path>>(cwd: P, message: &str) -> VcsResult<()> {
@@ -256,6 +273,7 @@ mod tests {
 
         // Initialize git repo
         debug!(
+            module = module_path!(),
             "Executing git command: git init (cwd: {:?})",
             temp_dir.path()
         );
@@ -281,6 +299,7 @@ mod tests {
 
         // Initialize git repo
         debug!(
+            module = module_path!(),
             "Executing git command: git init (cwd: {:?})",
             temp_dir.path()
         );
@@ -296,6 +315,7 @@ mod tests {
 
         // Configure git user for commit
         debug!(
+            module = module_path!(),
             "Executing git command: git config user.email test@example.com (cwd: {:?})",
             temp_dir.path()
         );
@@ -305,6 +325,7 @@ mod tests {
             .output()
             .await;
         debug!(
+            module = module_path!(),
             "Executing git command: git config user.name Test User (cwd: {:?})",
             temp_dir.path()
         );
@@ -317,6 +338,7 @@ mod tests {
         // Create and commit a file
         std::fs::write(temp_dir.path().join("test.txt"), "content").unwrap();
         debug!(
+            module = module_path!(),
             "Executing git command: git add . (cwd: {:?})",
             temp_dir.path()
         );
@@ -326,6 +348,7 @@ mod tests {
             .output()
             .await;
         debug!(
+            module = module_path!(),
             "Executing git command: git commit -m initial (cwd: {:?})",
             temp_dir.path()
         );
@@ -347,6 +370,7 @@ mod tests {
 
         // Initialize git repo
         debug!(
+            module = module_path!(),
             "Executing git command: git init (cwd: {:?})",
             temp_dir.path()
         );
@@ -375,6 +399,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         debug!(
+            module = module_path!(),
             "Executing git command: git init (cwd: {:?})",
             temp_dir.path()
         );
@@ -388,11 +413,21 @@ mod tests {
             return;
         }
 
+        debug!(
+            module = module_path!(),
+            "Executing git command: git config user.email test@example.com (cwd: {:?})",
+            temp_dir.path()
+        );
         let _ = Command::new("git")
             .args(["config", "user.email", "test@example.com"])
             .current_dir(temp_dir.path())
             .output()
             .await;
+        debug!(
+            module = module_path!(),
+            "Executing git command: git config user.name Test User (cwd: {:?})",
+            temp_dir.path()
+        );
         let _ = Command::new("git")
             .args(["config", "user.name", "Test User"])
             .current_dir(temp_dir.path())
@@ -408,11 +443,21 @@ mod tests {
         std::fs::write(base_dir.join("change-b").join("proposal.md"), "test").unwrap();
         std::fs::write(base_dir.join("archive").join("proposal.md"), "test").unwrap();
 
+        debug!(
+            module = module_path!(),
+            "Executing git command: git add . (cwd: {:?})",
+            temp_dir.path()
+        );
         let _ = Command::new("git")
             .args(["add", "."])
             .current_dir(temp_dir.path())
             .output()
             .await;
+        debug!(
+            module = module_path!(),
+            "Executing git command: git commit -m add changes (cwd: {:?})",
+            temp_dir.path()
+        );
         let _ = Command::new("git")
             .args(["commit", "-m", "add changes"])
             .current_dir(temp_dir.path())
