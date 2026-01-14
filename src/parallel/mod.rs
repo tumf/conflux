@@ -25,7 +25,7 @@ use crate::vcs::{
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -53,6 +53,8 @@ pub struct ParallelExecutor {
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
     /// Maximum retries for conflict resolution
     max_conflict_retries: u32,
+    /// Serialize merges into the target branch.
+    merge_lock: Arc<Mutex<()>>,
     /// Repository root path for archive operations
     repo_root: PathBuf,
     /// Disable automatic workspace resume (always create new workspaces)
@@ -130,6 +132,7 @@ impl ParallelExecutor {
             archive_command,
             event_tx,
             max_conflict_retries: 3,
+            merge_lock: Arc::new(Mutex::new(())),
             repo_root,
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
@@ -676,14 +679,18 @@ impl ParallelExecutor {
                     "Merging archived {} (workspace: {})",
                     result.change_id, result.workspace_name
                 );
-                if let Err(e) = self.merge_and_resolve(&revisions, &change_ids).await {
-                    let error_msg = format!(
-                        "Failed to merge archived {} (workspace: {}): {}",
-                        result.change_id, result.workspace_name, e
-                    );
-                    error!("{}", error_msg);
-                    send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
-                    return Err(e);
+                {
+                    let _merge_guard = self.merge_lock.lock().await;
+                    if let Err(e) = self.merge_and_resolve(&revisions, &change_ids).await {
+                        let error_msg = format!(
+                            "Failed to merge archived {} (workspace: {}): {}",
+                            result.change_id, result.workspace_name, e
+                        );
+                        error!("{}", error_msg);
+                        send_event(&self.event_tx, ParallelEvent::Error { message: error_msg })
+                            .await;
+                        return Err(e);
+                    }
                 }
 
                 if let Some(workspace) = archived_workspaces
@@ -1028,7 +1035,11 @@ impl ParallelExecutor {
                             "Merging {} (workspace: {})",
                             workspace_result.change_id, workspace_result.workspace_name
                         );
-                        match self.merge_and_resolve(&revisions, &change_ids).await {
+                        let merge_result = {
+                            let _merge_guard = self.merge_lock.lock().await;
+                            self.merge_and_resolve(&revisions, &change_ids).await
+                        };
+                        match merge_result {
                             Ok(_) => {
                                 info!(
                                     "Successfully merged {} (workspace: {})",
@@ -1568,10 +1579,25 @@ mod tests {
 
         let resolver_script = repo_root.join("merge-resolver.sh");
         let script_contents = format!(
-            "#!/bin/sh\nset -e\ngit checkout main\n\
+            "#!/bin/sh\nset -e\nROOT=\"$(pwd)\"\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff -m 'Pre-sync base into change-a' main\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
             git merge --no-ff -m 'Merge change: change-a' {}\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff -m 'Pre-sync base into change-b' main\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
             git merge --no-ff -m 'Merge change: change-b' {}\n",
-            workspace_a.name, workspace_b.name
+            workspace_a.path.to_string_lossy(),
+            workspace_a.name,
+            workspace_a.name,
+            workspace_b.path.to_string_lossy(),
+            workspace_b.name,
+            workspace_b.name
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
 
@@ -1582,6 +1608,7 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
+            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
@@ -1685,13 +1712,28 @@ mod tests {
 
         let resolver_script = repo_root.join("merge-resolver.sh");
         let script_contents = format!(
-            "#!/bin/sh\nset -e\ngit checkout main\n\
+            "#!/bin/sh\nset -e\nROOT=\"$(pwd)\"\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff -m 'Pre-sync base into change-a' main\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
             git merge --no-ff -m 'Merge change: change-a' {}\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff -m 'Pre-sync base into change-b' main\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
             git merge --no-ff -m 'Merge change: change-b' {}\n\
             echo 'post-merge' >> README.md\n\
             git add -A\n\
             git commit -m 'Post-merge commit'\n",
-            workspace_a.name, workspace_b.name
+            workspace_a.path.to_string_lossy(),
+            workspace_a.name,
+            workspace_a.name,
+            workspace_b.path.to_string_lossy(),
+            workspace_b.name,
+            workspace_b.name
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
 
@@ -1702,6 +1744,7 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
+            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
@@ -1809,6 +1852,7 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
+            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
@@ -1912,16 +1956,29 @@ mod tests {
 
         let resolver_script = repo_root.join("merge-resolver.sh");
         let script_contents = format!(
-            "#!/bin/sh\nset -e\n\
+            "#!/bin/sh\nset -e\nROOT=\"$(pwd)\"\n\
             if [ -f .git/merge-missing-marker ]; then\n\
+              cd \"{}\"\n\
+              git checkout {}\n\
+              git merge --no-ff -m 'Pre-sync base into change-b' main\n\
+              cd \"$ROOT\"\n\
               git checkout main\n\
               git merge --no-ff -m 'Merge change: change-b' {}\n\
               exit 0\n\
             fi\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff -m 'Pre-sync base into change-a' main\n\
+            cd \"$ROOT\"\n\
             git checkout main\n\
             git merge --no-ff -m 'Merge change: change-a' {}\n\
             touch .git/merge-missing-marker\n",
-            workspace_b.name, workspace_a.name
+            workspace_b.path.to_string_lossy(),
+            workspace_b.name,
+            workspace_b.name,
+            workspace_a.path.to_string_lossy(),
+            workspace_a.name,
+            workspace_a.name
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
 
@@ -1932,6 +1989,7 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
+            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
@@ -2045,18 +2103,33 @@ mod tests {
 
         let resolver_script = repo_root.join("merge-resolver.sh");
         let script_contents = format!(
-            "#!/bin/sh\nset -e\ngit checkout main\n\
+            "#!/bin/sh\nset -e\nROOT=\"$(pwd)\"\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff -m 'Pre-sync base into change-a' main\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
             git merge --no-ff -m 'Merge change: change-a' {}\n\
-            if ! git merge --no-ff -m 'Merge change: change-b' {}; then\n\
-              if [ -f .git/MERGE_HEAD ]; then\n\
-                git checkout --theirs conflict.txt\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            if ! git merge --no-ff -m 'Pre-sync base into change-b' main; then\n\
+              if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then\n\
+                git checkout --ours conflict.txt\n\
                 git add -A\n\
-                git commit -m 'Merge change: change-b'\n\
+                git commit -m 'Pre-sync base into change-b'\n\
               else\n\
                 exit 1\n\
               fi\n\
-            fi\n",
-            workspace_a.name, workspace_b.name
+            fi\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
+            git merge --no-ff -m 'Merge change: change-b' {}\n",
+            workspace_a.path.to_string_lossy(),
+            workspace_a.name,
+            workspace_a.name,
+            workspace_b.path.to_string_lossy(),
+            workspace_b.name,
+            workspace_b.name
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
 
@@ -2067,6 +2140,7 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
+            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
@@ -2174,10 +2248,13 @@ mod tests {
         let hooks_dir = repo_root.join(".git/hooks");
         let hook_path = hooks_dir.join("pre-commit");
         let hook_contents = "#!/bin/sh\n\
-        if [ ! -f .git/hooks/pre-commit-ran ]; then\n\
+        set -e\n\
+        COMMON_DIR=$(git rev-parse --git-common-dir)\n\
+        MARKER=\"$COMMON_DIR/hooks/pre-commit-ran\"\n\
+        if [ ! -f \"$MARKER\" ]; then\n\
           echo 'hooked' >> hooked.txt\n\
           git add hooked.txt\n\
-          touch .git/hooks/pre-commit-ran\n\
+          touch \"$MARKER\"\n\
           exit 1\n\
         fi\n\
         exit 0\n";
@@ -2192,12 +2269,23 @@ mod tests {
 
         let resolver_script = repo_root.join("merge-resolver.sh");
         let script_contents = format!(
-            "#!/bin/sh\nset -e\ngit checkout main\n\
+            "#!/bin/sh\nset -e\nROOT=\"$(pwd)\"\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff --no-commit main\n\
+            if ! git commit -m 'Pre-sync base into change-a'; then\n\
+              git add -A\n\
+              git commit -m 'Pre-sync base into change-a'\n\
+            fi\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
             git merge --no-ff --no-commit {}\n\
             if ! git commit -m 'Merge change: change-a'; then\n\
               git add -A\n\
               git commit -m 'Merge change: change-a'\n\
             fi\n",
+            workspace_a.path.to_string_lossy(),
+            workspace_a.name,
             workspace_a.name
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
@@ -2209,6 +2297,7 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
+            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),

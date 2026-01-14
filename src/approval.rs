@@ -672,12 +672,14 @@ mod tests {
         let changes_dir = temp_dir.path().join("openspec/changes/my-change");
         fs::create_dir_all(&changes_dir).unwrap();
         fs::write(changes_dir.join("proposal.md"), "# Proposal").unwrap();
-        fs::write(changes_dir.join("approved"), "ignored contents").unwrap();
 
         let _lock = lock_current_dir();
 
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        // Create a valid approved manifest so check_approval can validate it.
+        approve_change("my-change").unwrap();
 
         let is_approved = check_approval("my-change").unwrap();
 

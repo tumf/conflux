@@ -5,8 +5,9 @@ use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{VcsBackend, WorkspaceManager};
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -239,6 +240,31 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         .collect::<Vec<_>>()
         .join("\n");
 
+    let workspaces = workspace_manager.workspaces();
+
+    let workspace_paths: HashMap<String, PathBuf> = workspaces
+        .iter()
+        .map(|workspace| (workspace.name.clone(), workspace.path.clone()))
+        .collect();
+
+    let workspace_base_revisions: HashMap<String, String> = workspaces
+        .into_iter()
+        .map(|workspace| (workspace.name, workspace.base_revision))
+        .collect();
+
+    let worktree_locations = revisions
+        .iter()
+        .zip(change_ids.iter())
+        .map(|(rev, change_id)| {
+            let path = workspace_paths
+                .get(rev)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "(unknown)".to_string());
+            format!("- {} => {} (change_id: {})", rev, path, change_id)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
     for attempt in 1..=max_retries {
         info!(
             "Merge resolution attempt {}/{} for branches: {}",
@@ -252,23 +278,35 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
              You must complete sequential Git merges into the target branch.\n\n\
              Target branch: {}\n\
              Base revision before merges: {}\n\
-             Merge plan (branch => change_id):\n{}
-\n\
-             Instructions:\n\
-             1) Ensure you are on the target branch.\n\
-             2) For each branch in order, run a merge that always creates a merge commit, even if fast-forward is possible.\n\
-             3) The merge commit message MUST include the change_id (use: \"Merge change: <change_id>\").\n\
-             4) If a conflict occurs, resolve it, run git add, and complete the merge commit.\n\
-             5) If a pre-commit hook modifies files and stops the commit, re-stage and re-run git commit with the same message.\n\
-             6) Do not use destructive commands like reset --hard.\n\n\
+             Merge plan (branch => change_id):\n{}\n\n\
+             Worktree directories (branch => path):\n{}\n\n\
+             Requirements:\n\
+             - Before merging each branch into the target branch, you MUST pre-sync base into that worktree branch (base -> worktree) from inside the worktree directory.\n\
+             - If a pre-sync merge commit is created, its subject MUST be exactly: \"Pre-sync base into <change_id>\".\n\
+             - The final merge into the target branch MUST create a merge commit with subject exactly: \"Merge change: <change_id>\".\n\n\
+             Instructions (repeat for each branch in order):\n\
+             1) Pre-sync in the worktree directory:\n\
+                - cd <worktree_path>\n\
+                - git checkout <branch>\n\
+                - git merge --no-ff -m \"Pre-sync base into <change_id>\" <target_branch>\n\
+                - If a conflict occurs, resolve it, git add, then git commit -m \"Pre-sync base into <change_id>\" to complete the merge.\n\
+                - If the merge commit message is wrong, fix it with: git commit --amend -m \"Pre-sync base into <change_id>\".\n\
+             2) Final merge into the target branch (in the repo root):\n\
+                - cd <repo_root>\n\
+                - git checkout <target_branch>\n\
+                - git merge --no-ff -m \"Merge change: <change_id>\" <branch>\n\
+                - If a conflict occurs, resolve it, git add, then git commit -m \"Merge change: <change_id>\" to complete the merge.\n\
+             3) If a pre-commit hook modifies files and stops the commit, re-stage and re-run git commit with the same message.\n\
+             4) Do not use destructive commands like reset --hard.\n\n\
              Current VCS status:\n{}\n\n\
              VCS log for branches:\n{}\n\n\
-             Conflicting files (if any): {}\n\n\
+             Conflicting files (repo root, if any): {}\n\n\
              Complete the merges so that the target branch has merge commits for every change_id.",
             vcs_prompt_prefix,
             target_branch,
             base_revision,
             merge_plan,
+            worktree_locations,
             vcs_status,
             vcs_log,
             conflict_files_str
@@ -326,6 +364,75 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                     continue;
                 }
 
+                // Ensure there is no unfinished pre-sync merge left in any worktree.
+                let mut retry_reason: Option<String> = None;
+                for revision in revisions {
+                    if let Some(worktree_path) = workspace_paths.get(revision) {
+                        let worktree_merge_in_progress =
+                            git_commands::is_merge_in_progress(worktree_path)
+                                .await
+                                .map_err(OrchestratorError::from)?;
+                        if worktree_merge_in_progress {
+                            retry_reason = Some(format!(
+                                "Worktree merge still in progress for '{}' (MERGE_HEAD exists); retrying resolve",
+                                revision
+                            ));
+                            break;
+                        }
+
+                        let worktree_conflicts = git_commands::get_conflict_files(worktree_path)
+                            .await
+                            .map_err(OrchestratorError::from)?;
+                        if !worktree_conflicts.is_empty() {
+                            retry_reason = Some(format!(
+                                "Worktree conflicts still present for '{}' ({}); retrying resolve",
+                                revision,
+                                worktree_conflicts.join(", ")
+                            ));
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(reason) = retry_reason {
+                    warn!("{}", reason);
+                    send_event(event_tx, ParallelEvent::ResolveOutput { output: reason }).await;
+                    continue;
+                }
+
+                // Validate pre-sync merge commit subject convention inside each worktree.
+                // (If no pre-sync merge commit was created, this check is a no-op.)
+                let mut presync_retry_reason: Option<String> = None;
+                for (revision, change_id) in revisions.iter().zip(change_ids.iter()) {
+                    let Some(worktree_path) = workspace_paths.get(revision) else {
+                        continue;
+                    };
+
+                    let mismatches = git_commands::presync_merge_subject_mismatches_since(
+                        worktree_path,
+                        base_revision,
+                        change_id,
+                    )
+                    .await
+                    .map_err(OrchestratorError::from)?;
+
+                    if !mismatches.is_empty() {
+                        presync_retry_reason = Some(format!(
+                            "Invalid pre-sync merge commit subject in worktree '{}' (expected: 'Pre-sync base into {}', got: {}); retrying resolve",
+                            revision,
+                            change_id,
+                            mismatches.join("; ")
+                        ));
+                        break;
+                    }
+                }
+
+                if let Some(reason) = presync_retry_reason {
+                    warn!("{}", reason);
+                    send_event(event_tx, ParallelEvent::ResolveOutput { output: reason }).await;
+                    continue;
+                }
+
                 let missing_commits =
                     git_commands::missing_merge_commits_since(repo_root, base_revision, change_ids)
                         .await
@@ -346,6 +453,78 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         },
                     )
                     .await;
+                    continue;
+                }
+
+                // Enforce that each worktree branch was pre-synced with the target branch state
+                // that existed immediately before its final merge commit.
+                let mut presync_missing_reason: Option<String> = None;
+                for (revision, change_id) in revisions.iter().zip(change_ids.iter()) {
+                    let expected_subject = format!("Merge change: {}", change_id);
+                    let merge_commit = git_commands::merge_commit_hash_by_subject_since(
+                        repo_root,
+                        base_revision,
+                        expected_subject.as_str(),
+                    )
+                    .await
+                    .map_err(OrchestratorError::from)?;
+
+                    let Some(merge_commit) = merge_commit else {
+                        continue;
+                    };
+
+                    let pre_merge_base =
+                        git_commands::first_parent_of(repo_root, merge_commit.trim())
+                            .await
+                            .map_err(OrchestratorError::from)?;
+                    let pre_merge_base = pre_merge_base.trim();
+
+                    let includes_presync_base =
+                        git_commands::is_ancestor(repo_root, pre_merge_base, revision)
+                            .await
+                            .map_err(OrchestratorError::from)?;
+
+                    if !includes_presync_base {
+                        let short = &pre_merge_base[..8.min(pre_merge_base.len())];
+                        presync_missing_reason = Some(format!(
+                            "Worktree branch '{}' does not include pre-merge base '{}' for change_id '{}' (pre-sync may have been skipped); retrying resolve",
+                            revision, short, change_id
+                        ));
+                        break;
+                    }
+
+                    let (Some(worktree_path), Some(worktree_base_revision)) = (
+                        workspace_paths.get(revision),
+                        workspace_base_revisions.get(revision),
+                    ) else {
+                        continue;
+                    };
+
+                    // If the worktree was created from an older base revision, require that a
+                    // pre-sync merge commit exists with the standard subject.
+                    if worktree_base_revision.trim() != pre_merge_base {
+                        let expected_presync_subject = format!("Pre-sync base into {}", change_id);
+                        let presync_commit = git_commands::merge_commit_hash_by_subject_since(
+                            worktree_path,
+                            worktree_base_revision.trim(),
+                            expected_presync_subject.as_str(),
+                        )
+                        .await
+                        .map_err(OrchestratorError::from)?;
+
+                        if presync_commit.is_none() {
+                            presync_missing_reason = Some(format!(
+                                "Missing pre-sync merge commit in worktree '{}' (expected subject: 'Pre-sync base into {}'); retrying resolve",
+                                revision, change_id
+                            ));
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(reason) = presync_missing_reason {
+                    warn!("{}", reason);
+                    send_event(event_tx, ParallelEvent::ResolveOutput { output: reason }).await;
                     continue;
                 }
 

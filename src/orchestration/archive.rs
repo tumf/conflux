@@ -340,7 +340,6 @@ where
 mod tests {
     use super::*;
     use crate::config::OrchestratorConfig;
-    use crate::execution::archive::ARCHIVE_COMMAND_MAX_RETRIES;
     use crate::hooks::HookRunner;
     use crate::openspec::Change;
     use crate::orchestration::output::NullOutputHandler;
@@ -448,12 +447,17 @@ mv "$base_dir/openspec/changes/$1" "$base_dir/openspec/changes/archive/$1"
         )
         .await
         .unwrap();
-        assert!(matches!(result, ArchiveResult::Failed { .. }));
+        assert_eq!(result, ArchiveResult::Success);
 
         let attempts = fs::read_to_string(&attempts_path).unwrap();
-        let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES + 1;
         let attempt_count: u32 = attempts.trim().parse().unwrap();
-        assert_eq!(attempt_count, max_attempts);
-        assert!(change_dir.exists());
+        assert_eq!(attempt_count, 2);
+
+        let archived_dir = temp_dir
+            .path()
+            .join("openspec/changes/archive")
+            .join(change_id);
+        assert!(!change_dir.exists());
+        assert!(archived_dir.exists());
     }
 }
