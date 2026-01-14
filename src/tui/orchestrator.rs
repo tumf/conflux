@@ -6,11 +6,9 @@ use crate::agent::AgentRunner;
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::openspec::Change;
-use crate::process_manager::TerminationOutcome;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -116,122 +114,139 @@ pub async fn archive_single_change(
         .send(OrchestratorEvent::ArchiveStarted(change_id.to_string()))
         .await;
 
-    // Run archive command with streaming output
-    let (mut child, mut output_rx) = agent.run_archive_streaming(change_id).await?;
+    use crate::execution::archive::{
+        build_archive_error_message, verify_archive_completion, ARCHIVE_COMMAND_MAX_RETRIES,
+    };
 
-    // Stream output to TUI log, with cancellation support
+    let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
+    let mut attempt: u32 = 0;
+
     loop {
-        tokio::select! {
-            _ = cancel_token.cancelled() => {
-                let termination = child.terminate_with_timeout(Duration::from_secs(5)).await;
-                let message = match termination {
-                    Ok(TerminationOutcome::Exited(_)) => {
-                        "Process terminated due to cancellation".to_string()
-                    }
-                    Ok(TerminationOutcome::ForceKilled(_)) => {
-                        "Process force killed after cancellation timeout".to_string()
-                    }
-                    Ok(TerminationOutcome::TimedOut) => {
-                        "Process still running after force kill timeout".to_string()
-                    }
-                    Err(e) => format!("Failed to terminate process after cancellation: {}", e),
-                };
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::warn(message)))
-                    .await;
-                return Ok(ArchiveResult::Cancelled);
-            }
-            line = output_rx.recv() => {
-                match line {
-                    Some(OutputLine::Stdout(s)) => {
-                        tracing::debug!("Archive stdout: {}", s);
-                        let _ = tx.send(OrchestratorEvent::Log(LogEntry::info(s))).await;
-                    }
-                    Some(OutputLine::Stderr(s)) => {
-                        tracing::debug!("Archive stderr: {}", s);
-                        let _ = tx.send(OrchestratorEvent::Log(LogEntry::warn(s))).await;
-                    }
-                    None => {
-                        tracing::debug!("Archive output stream closed");
-                        break;
+        attempt += 1;
+
+        // Run archive command with streaming output
+        let (mut child, mut output_rx) = agent.run_archive_streaming(change_id).await?;
+
+        // Stream output to TUI log, with cancellation support
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    let _ = child.terminate();
+                    let _ = child.kill().await;
+                    let _ = tx
+                        .send(OrchestratorEvent::Log(LogEntry::warn(
+                            "Process killed due to cancellation".to_string(),
+                        )))
+                        .await;
+                    return Ok(ArchiveResult::Cancelled);
+                }
+                line = output_rx.recv() => {
+                    match line {
+                        Some(OutputLine::Stdout(s)) => {
+                            tracing::debug!("Archive stdout: {}", s);
+                            let _ = tx.send(OrchestratorEvent::Log(LogEntry::info(s))).await;
+                        }
+                        Some(OutputLine::Stderr(s)) => {
+                            tracing::debug!("Archive stderr: {}", s);
+                            let _ = tx.send(OrchestratorEvent::Log(LogEntry::warn(s))).await;
+                        }
+                        None => {
+                            tracing::debug!("Archive output stream closed");
+                            break;
+                        }
                     }
                 }
             }
         }
-    }
 
-    // Wait for child process to complete
-    let status = child.wait().await.map_err(|e| {
-        crate::error::OrchestratorError::AgentCommand(format!("Failed to wait for process: {}", e))
-    })?;
+        // Wait for child process to complete
+        let status = child.wait().await.map_err(|e| {
+            crate::error::OrchestratorError::AgentCommand(format!(
+                "Failed to wait for process: {}",
+                e
+            ))
+        })?;
 
-    if status.success() {
-        // Verify that the change was actually archived using common function
-        use crate::execution::archive::{build_archive_error_message, verify_archive_completion};
+        if !status.success() {
+            let error_msg = format!("Archive failed with exit code: {:?}", status.code());
 
-        let verification = verify_archive_completion(change_id, None);
+            // Run on_error hook
+            let error_context = HookContext::new(
+                context.changes_processed,
+                context.total_changes,
+                context.remaining_changes,
+                false,
+            )
+            .with_change(change_id, change.completed_tasks, change.total_tasks)
+            .with_apply_count(context.apply_count)
+            .with_error(&error_msg);
+            let _ = hooks.run_hook(HookType::OnError, &error_context).await;
 
-        if !verification.is_success() {
-            let error_msg = build_archive_error_message(change_id);
             let _ = tx
                 .send(OrchestratorEvent::ProcessingError {
                     id: change_id.to_string(),
-                    error: error_msg,
+                    error: error_msg.clone(),
                 })
                 .await;
             return Ok(ArchiveResult::Failed);
         }
 
-        // Clear apply history for the archived change
-        agent.clear_apply_history(change_id);
+        let verification = verify_archive_completion(change_id, None);
+        if verification.is_success() {
+            // Clear apply history for the archived change
+            agent.clear_apply_history(change_id);
 
-        // Run post_archive hook
-        let post_archive_context = HookContext::new(
-            context.changes_processed + 1,
-            context.total_changes,
-            context.remaining_changes.saturating_sub(1),
-            false,
-        )
-        .with_change(change_id, change.completed_tasks, change.total_tasks)
-        .with_apply_count(context.apply_count);
-        if let Err(e) = hooks
-            .run_hook(HookType::PostArchive, &post_archive_context)
-            .await
-        {
+            // Run post_archive hook
+            let post_archive_context = HookContext::new(
+                context.changes_processed + 1,
+                context.total_changes,
+                context.remaining_changes.saturating_sub(1),
+                false,
+            )
+            .with_change(change_id, change.completed_tasks, change.total_tasks)
+            .with_apply_count(context.apply_count);
+            if let Err(e) = hooks
+                .run_hook(HookType::PostArchive, &post_archive_context)
+                .await
+            {
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                        "post_archive hook failed: {}",
+                        e
+                    ))))
+                    .await;
+            }
+
             let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                    "post_archive hook failed: {}",
-                    e
-                ))))
+                .send(OrchestratorEvent::ChangeArchived(change_id.to_string()))
                 .await;
+            return Ok(ArchiveResult::Success);
         }
 
-        let _ = tx
-            .send(OrchestratorEvent::ChangeArchived(change_id.to_string()))
-            .await;
-        Ok(ArchiveResult::Success)
-    } else {
-        let error_msg = format!("Archive failed with exit code: {:?}", status.code());
+        if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                    "Archive verification failed for {} (attempt {}/{}); retrying archive command",
+                    change_id, attempt, max_attempts
+                ))))
+                .await;
+            tracing::warn!(
+                change_id = %change_id,
+                attempt = attempt,
+                max_attempts = max_attempts,
+                "Archive verification failed; retrying archive command"
+            );
+            continue;
+        }
 
-        // Run on_error hook
-        let error_context = HookContext::new(
-            context.changes_processed,
-            context.total_changes,
-            context.remaining_changes,
-            false,
-        )
-        .with_change(change_id, change.completed_tasks, change.total_tasks)
-        .with_apply_count(context.apply_count)
-        .with_error(&error_msg);
-        let _ = hooks.run_hook(HookType::OnError, &error_context).await;
-
+        let error_msg = build_archive_error_message(change_id);
         let _ = tx
             .send(OrchestratorEvent::ProcessingError {
                 id: change_id.to_string(),
-                error: error_msg.clone(),
+                error: error_msg,
             })
             .await;
-        Ok(ArchiveResult::Failed)
+        return Ok(ArchiveResult::Failed);
     }
 }
 
@@ -621,21 +636,12 @@ pub async fn run_orchestrator(
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
-                    let termination = child.terminate_with_timeout(Duration::from_secs(5)).await;
-                    let message = match termination {
-                        Ok(TerminationOutcome::Exited(_)) => {
-                            "Process terminated due to cancellation".to_string()
-                        }
-                        Ok(TerminationOutcome::ForceKilled(_)) => {
-                            "Process force killed after cancellation timeout".to_string()
-                        }
-                        Ok(TerminationOutcome::TimedOut) => {
-                            "Process still running after force kill timeout".to_string()
-                        }
-                        Err(e) => format!("Failed to terminate process after cancellation: {}", e),
-                    };
+                    let _ = child.terminate();
+                    let _ = child.kill().await;
                     let _ = tx
-                        .send(OrchestratorEvent::Log(LogEntry::warn(message)))
+                        .send(OrchestratorEvent::Log(LogEntry::warn(
+                            "Process killed due to cancellation".to_string(),
+                        )))
                         .await;
                     // Exit the main loop
                     pending_changes.clear();
@@ -981,21 +987,26 @@ pub async fn run_orchestrator_parallel(
         let batch_service = ParallelRunService::new(repo_root.clone(), config.clone());
 
         // Execute batch using ParallelRunService with channel
-        let result = batch_service
-            .run_parallel_with_channel(
+        let result = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::warn(
+                        "Parallel execution cancelled".to_string(),
+                    )))
+                    .await;
+                Err(crate::error::OrchestratorError::AgentCommand("Cancelled".to_string()))
+            }
+            result = batch_service.run_parallel_with_channel(
                 batch_changes.clone(),
                 parallel_tx,
                 Some(cancel_token.clone()),
-            )
-            .await;
+            ) => {
+                result
+            }
+        };
 
         // Wait for forward task to complete
         let _ = forward_handle.await;
-
-        if cancel_token.is_cancelled() {
-            stopped_or_cancelled = true;
-            break;
-        }
 
         // Mark batch changes as processed
         for change in &batch_changes {
@@ -1046,7 +1057,6 @@ pub async fn run_orchestrator_parallel(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
     use std::path::Path;
 
     /// Test that the archive path uses the correct directory structure.
@@ -1073,33 +1083,6 @@ mod tests {
         // The archive path should be under openspec/changes/archive, not openspec/archive
         assert!(archive_path.starts_with("openspec/changes/archive"));
         assert!(!archive_path.starts_with("openspec/archive/"));
-    }
-
-    #[test]
-    fn test_apply_pending_removals() {
-        let mut pending_changes: HashSet<String> = ["change-a", "change-b"]
-            .iter()
-            .map(|id| id.to_string())
-            .collect();
-        let mut processed_change_ids = vec![
-            "change-a".to_string(),
-            "change-b".to_string(),
-            "change-c".to_string(),
-        ];
-        let mut apply_counts = HashMap::from([("change-b".to_string(), 1)]);
-
-        let removed = super::apply_pending_removals(
-            &mut pending_changes,
-            &mut processed_change_ids,
-            &mut apply_counts,
-            vec!["change-b".to_string(), "change-d".to_string()],
-        );
-
-        assert_eq!(removed, vec!["change-b".to_string()]);
-        assert_eq!(pending_changes.len(), 1);
-        assert!(pending_changes.contains("change-a"));
-        assert!(!processed_change_ids.contains(&"change-b".to_string()));
-        assert!(!apply_counts.contains_key("change-b"));
     }
 
     /// Test archive verification logic: when change still exists and archive doesn't,

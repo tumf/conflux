@@ -3,50 +3,18 @@
 use crate::agent::{build_apply_prompt, AgentRunner, OutputLine};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
-use crate::events::LogEntry;
 use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
-use crate::process_manager::{configure_process_group, ManagedChild, TerminationOutcome};
 use crate::task_parser::TaskProgress;
 use crate::vcs::VcsBackend;
 use std::path::Path;
 use std::process::Stdio as StdStdio;
-use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::events::ParallelEvent;
-
-fn format_termination_message(
-    result: std::result::Result<TerminationOutcome, std::io::Error>,
-) -> String {
-    match result {
-        Ok(TerminationOutcome::Exited(_)) => "Process terminated due to cancellation".to_string(),
-        Ok(TerminationOutcome::ForceKilled(_)) => {
-            "Process force killed after cancellation timeout".to_string()
-        }
-        Ok(TerminationOutcome::TimedOut) => {
-            "Process still running after force kill timeout".to_string()
-        }
-        Err(e) => format!("Failed to terminate process after cancellation: {}", e),
-    }
-}
-
-async fn send_cancellation_log(
-    event_tx: &Option<mpsc::Sender<ParallelEvent>>,
-    change_id: &str,
-    message: String,
-) {
-    if let Some(ref tx) = event_tx {
-        let _ = tx
-            .send(ParallelEvent::Log(
-                LogEntry::warn(message).with_change_id(change_id.to_string()),
-            ))
-            .await;
-    }
-}
 
 /// Create an iteration snapshot with WIP commit message including iteration number.
 ///
@@ -111,33 +79,76 @@ async fn create_iteration_snapshot(
                 return Ok(());
             }
 
+            // Check if we have commits to amend
             debug!(
                 module = module_path!(),
-                "Executing git command: git commit --allow-empty -m {} (cwd: {:?})",
-                commit_message,
-                workspace_path
+                "Executing git command: git rev-parse HEAD (cwd: {:?})", workspace_path
             );
-            let commit_output = Command::new("git")
-                .args(["commit", "--allow-empty", "-m", &commit_message])
+            let has_commits = Command::new("git")
+                .args(["rev-parse", "HEAD"])
                 .current_dir(workspace_path)
                 .stdin(StdStdio::null())
                 .output()
                 .await
-                .map_err(|e| {
-                    OrchestratorError::GitCommand(format!("Failed to create commit: {}", e))
-                })?;
+                .map(|output| output.status.success())
+                .unwrap_or(false);
 
-            if !commit_output.status.success() {
-                let stderr = String::from_utf8_lossy(&commit_output.stderr);
-                warn!(
-                    "Failed to create WIP commit for iteration {}: {}",
-                    iteration, stderr
-                );
-            } else {
+            if has_commits {
+                // Amend existing commit
                 debug!(
-                    "Iteration snapshot #{} created for {} (git)",
-                    iteration, change_id
+                    "Executing git command: git commit --amend --allow-empty -m {} (cwd: {:?})",
+                    commit_message, workspace_path
                 );
+                let commit_output = Command::new("git")
+                    .args(["commit", "--amend", "--allow-empty", "-m", &commit_message])
+                    .current_dir(workspace_path)
+                    .stdin(StdStdio::null())
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::GitCommand(format!("Failed to amend commit: {}", e))
+                    })?;
+
+                if !commit_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&commit_output.stderr);
+                    warn!(
+                        "Failed to amend WIP commit for iteration {}: {}",
+                        iteration, stderr
+                    );
+                } else {
+                    debug!(
+                        "Iteration snapshot #{} created for {} (git, amended)",
+                        iteration, change_id
+                    );
+                }
+            } else {
+                // Create initial commit
+                debug!(
+                    "Executing git command: git commit --allow-empty -m {} (cwd: {:?})",
+                    commit_message, workspace_path
+                );
+                let commit_output = Command::new("git")
+                    .args(["commit", "--allow-empty", "-m", &commit_message])
+                    .current_dir(workspace_path)
+                    .stdin(StdStdio::null())
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        OrchestratorError::GitCommand(format!("Failed to create commit: {}", e))
+                    })?;
+
+                if !commit_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&commit_output.stderr);
+                    warn!(
+                        "Failed to create initial WIP commit for iteration {}: {}",
+                        iteration, stderr
+                    );
+                } else {
+                    debug!(
+                        "Iteration snapshot #{} created for {} (git, initial)",
+                        iteration, change_id
+                    );
+                }
             }
         }
     }
@@ -173,103 +184,26 @@ async fn squash_wip_commits(
 
     match vcs_backend {
         VcsBackend::Git | VcsBackend::Auto => {
-            let wip_pattern = format!("^WIP: {} ", change_id);
+            // For Git, we update the commit message to the final Apply message
+            // Since we've been amending the same commit, we just need to update the message
             debug!(
                 module = module_path!(),
-                "Executing git command: git rev-list --reverse --grep {} HEAD (cwd: {:?})",
-                wip_pattern,
+                "Executing git command: git commit --amend -m {} (cwd: {:?})",
+                apply_message,
                 workspace_path
             );
-            let wip_commits = Command::new("git")
-                .args(["rev-list", "--reverse", "--grep", &wip_pattern, "HEAD"])
+            let output = Command::new("git")
+                .args(["commit", "--amend", "-m", &apply_message])
                 .current_dir(workspace_path)
                 .stdin(StdStdio::null())
                 .output()
                 .await
                 .map_err(|e| {
-                    OrchestratorError::GitCommand(format!("Failed to list WIP commits: {}", e))
+                    OrchestratorError::GitCommand(format!("Failed to squash WIP commits: {}", e))
                 })?;
 
-            if !wip_commits.status.success() {
-                let stderr = String::from_utf8_lossy(&wip_commits.stderr);
-                return Err(OrchestratorError::GitCommand(format!(
-                    "Failed to list WIP commits: {}",
-                    stderr
-                )));
-            }
-
-            let wip_output = String::from_utf8_lossy(&wip_commits.stdout);
-            let first_wip = wip_output
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .ok_or_else(|| {
-                    OrchestratorError::GitCommand(format!("No WIP commits found for {}", change_id))
-                })?;
-
-            let parent_rev = format!("{}^", first_wip);
-            debug!(
-                "Executing git command: git rev-parse {} (cwd: {:?})",
-                parent_rev, workspace_path
-            );
-            let parent_output = Command::new("git")
-                .args(["rev-parse", &parent_rev])
-                .current_dir(workspace_path)
-                .stdin(StdStdio::null())
-                .output()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::GitCommand(format!("Failed to resolve parent: {}", e))
-                })?;
-
-            if !parent_output.status.success() {
-                let stderr = String::from_utf8_lossy(&parent_output.stderr);
-                return Err(OrchestratorError::GitCommand(format!(
-                    "Failed to resolve parent revision: {}",
-                    stderr
-                )));
-            }
-
-            let parent_revision = String::from_utf8_lossy(&parent_output.stdout)
-                .trim()
-                .to_string();
-
-            debug!(
-                "Executing git command: git reset --soft {} (cwd: {:?})",
-                parent_revision, workspace_path
-            );
-            let reset_output = Command::new("git")
-                .args(["reset", "--soft", &parent_revision])
-                .current_dir(workspace_path)
-                .stdin(StdStdio::null())
-                .output()
-                .await
-                .map_err(|e| OrchestratorError::GitCommand(format!("Failed to reset: {}", e)))?;
-
-            if !reset_output.status.success() {
-                let stderr = String::from_utf8_lossy(&reset_output.stderr);
-                return Err(OrchestratorError::GitCommand(format!(
-                    "Failed to reset WIP commits: {}",
-                    stderr
-                )));
-            }
-
-            debug!(
-                "Executing git command: git commit --allow-empty -m {} (cwd: {:?})",
-                apply_message, workspace_path
-            );
-            let commit_output = Command::new("git")
-                .args(["commit", "--allow-empty", "-m", &apply_message])
-                .current_dir(workspace_path)
-                .stdin(StdStdio::null())
-                .output()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::GitCommand(format!("Failed to create Apply commit: {}", e))
-                })?;
-
-            if !commit_output.status.success() {
-                let stderr = String::from_utf8_lossy(&commit_output.stderr);
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(OrchestratorError::GitCommand(format!(
                     "Failed to set Apply message: {}",
                     stderr
@@ -377,12 +311,6 @@ pub async fn execute_apply_in_workspace(
     loop {
         iteration += 1;
         if cancel_token.is_some_and(|token| token.is_cancelled()) {
-            send_cancellation_log(
-                &event_tx,
-                change_id,
-                "Apply cancelled before execution".to_string(),
-            )
-            .await;
             return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
         }
         if iteration > MAX_ITERATIONS {
@@ -521,26 +449,21 @@ pub async fn execute_apply_in_workspace(
             module = module_path!(),
             "Executing shell command: sh -c {} (cwd: {:?})", command, workspace_path
         );
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
+        let mut child = Command::new("sh")
+            .arg("-c")
             .arg(&command)
             .current_dir(workspace_path)
             .stdin(StdStdio::null())
             .stdout(StdStdio::piped())
-            .stderr(StdStdio::piped());
-        configure_process_group(&mut cmd);
-        let child = cmd
+            .stderr(StdStdio::piped())
             .spawn()
             .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to spawn: {}", e)))?;
-        let mut child = ManagedChild::new(child).map_err(|e| {
-            OrchestratorError::AgentCommand(format!("Failed to create managed child: {}", e))
-        })?;
 
         // Stream stdout and stderr in real-time
-        let stdout = child.child.stdout.take().ok_or_else(|| {
+        let stdout = child.stdout.take().ok_or_else(|| {
             OrchestratorError::AgentCommand("Failed to capture stdout".to_string())
         })?;
-        let stderr = child.child.stderr.take().ok_or_else(|| {
+        let stderr = child.stderr.take().ok_or_else(|| {
             OrchestratorError::AgentCommand("Failed to capture stderr".to_string())
         })?;
 
@@ -576,52 +499,17 @@ pub async fn execute_apply_in_workspace(
             }
         });
 
-        let status = if let Some(token) = cancel_token {
-            tokio::select! {
-                _ = token.cancelled() => {
-                    let message = format_termination_message(
-                        child.terminate_with_timeout(Duration::from_secs(5)).await,
-                    );
-                    send_cancellation_log(&event_tx, change_id, message).await;
-                    stdout_handle.abort();
-                    stderr_handle.abort();
-                    return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
-                }
-                status = child.wait() => {
-                    status.map_err(|e| OrchestratorError::AgentCommand(format!("Failed to wait: {}", e)))?
-                }
-            }
-        } else {
-            child
-                .wait()
-                .await
-                .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to wait: {}", e)))?
-        };
-
         // Wait for streams to complete
         let _ = stdout_handle.await;
         let _ = stderr_handle.await;
 
-        if !status.success() {
-            let failure_progress =
-                check_task_progress(workspace_path, change_id).unwrap_or_else(|| progress.clone());
-
-            if let Err(e) = create_iteration_snapshot(
-                workspace_path,
-                change_id,
-                iteration,
-                failure_progress.completed,
-                failure_progress.total,
-                vcs_backend,
-            )
+        // Wait for process to finish
+        let status = child
+            .wait()
             .await
-            {
-                warn!(
-                    "Failed to create iteration snapshot for {} after failure: {}",
-                    change_id, e
-                );
-            }
+            .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to wait: {}", e)))?;
 
+        if !status.success() {
             return Err(OrchestratorError::AgentCommand(format!(
                 "Apply command failed with exit code: {:?}",
                 status.code()
@@ -857,6 +745,10 @@ pub async fn execute_archive_in_workspace(
     parallel_ctx: Option<&ParallelHookContext>,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<String> {
+    if cancel_token.is_some_and(|token| token.is_cancelled()) {
+        return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+    }
+
     // Verify task completion before archiving using common function
     use crate::execution::archive::get_task_progress;
 
@@ -936,123 +828,123 @@ pub async fn execute_archive_in_workspace(
         }
     }
 
-    if cancel_token.is_some_and(|token| token.is_cancelled()) {
-        send_cancellation_log(
-            &event_tx,
-            change_id,
-            "Archive cancelled before execution".to_string(),
-        )
-        .await;
-        return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
-    }
-
     // Expand change_id and prompt in archive command
     let command = OrchestratorConfig::expand_change_id(archive_cmd_template, change_id);
     let command = OrchestratorConfig::expand_prompt(&command, config.get_archive_prompt());
 
     debug!("Archive command in workspace: {}", command);
 
-    // Execute command with streaming output
+    use crate::execution::archive::{
+        build_archive_error_message, verify_archive_completion, ARCHIVE_COMMAND_MAX_RETRIES,
+    };
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    debug!(
-        "Executing shell command: sh -c {} (cwd: {:?})",
-        command, workspace_path
-    );
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(&command)
-        .current_dir(workspace_path)
-        .stdin(StdStdio::null())
-        .stdout(StdStdio::piped())
-        .stderr(StdStdio::piped());
-    configure_process_group(&mut cmd);
-    let child = cmd.spawn().map_err(|e| {
-        OrchestratorError::AgentCommand(format!("Failed to spawn archive command: {}", e))
-    })?;
-    let mut child = ManagedChild::new(child).map_err(|e| {
-        OrchestratorError::AgentCommand(format!("Failed to create managed child: {}", e))
-    })?;
+    let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
+    let mut attempt: u32 = 0;
 
-    // Stream stdout
-    let stdout = child.child.stdout.take();
-    let stderr = child.child.stderr.take();
-    let change_id_clone = change_id.to_string();
-    let event_tx_clone = event_tx.clone();
+    loop {
+        attempt += 1;
 
-    let stdout_handle = tokio::spawn(async move {
-        if let Some(stdout) = stdout {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(ref tx) = event_tx_clone {
-                    let _ = tx
-                        .send(ParallelEvent::ArchiveOutput {
-                            change_id: change_id_clone.clone(),
-                            output: line,
-                        })
-                        .await;
+        debug!(
+            "Executing shell command: sh -c {} (cwd: {:?})",
+            command, workspace_path
+        );
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(workspace_path)
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped())
+            .spawn()
+            .map_err(|e| {
+                OrchestratorError::AgentCommand(format!("Failed to spawn archive command: {}", e))
+            })?;
+
+        // Stream stdout
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let change_id_clone = change_id.to_string();
+        let event_tx_clone = event_tx.clone();
+
+        let stdout_handle = tokio::spawn(async move {
+            if let Some(stdout) = stdout {
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(ref tx) = event_tx_clone {
+                        let _ = tx
+                            .send(ParallelEvent::ArchiveOutput {
+                                change_id: change_id_clone.clone(),
+                                output: line,
+                            })
+                            .await;
+                    }
                 }
             }
-        }
-    });
+        });
 
-    let change_id_clone2 = change_id.to_string();
-    let event_tx_clone2 = event_tx.clone();
-    let stderr_handle = tokio::spawn(async move {
-        if let Some(stderr) = stderr {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(ref tx) = event_tx_clone2 {
-                    let _ = tx
-                        .send(ParallelEvent::ArchiveOutput {
-                            change_id: change_id_clone2.clone(),
-                            output: line,
-                        })
-                        .await;
+        let change_id_clone2 = change_id.to_string();
+        let event_tx_clone2 = event_tx.clone();
+        let stderr_handle = tokio::spawn(async move {
+            if let Some(stderr) = stderr {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(ref tx) = event_tx_clone2 {
+                        let _ = tx
+                            .send(ParallelEvent::ArchiveOutput {
+                                change_id: change_id_clone2.clone(),
+                                output: line,
+                            })
+                            .await;
+                    }
                 }
             }
-        }
-    });
+        });
 
-    let status = if let Some(token) = cancel_token {
-        tokio::select! {
-            _ = token.cancelled() => {
-                let message = format_termination_message(
-                    child.terminate_with_timeout(Duration::from_secs(5)).await,
-                );
-                send_cancellation_log(&event_tx, change_id, message).await;
-                stdout_handle.abort();
-                stderr_handle.abort();
-                return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
-            }
-            status = child.wait() => {
-                status.map_err(|e| OrchestratorError::AgentCommand(format!("Archive command failed: {}", e)))?
-            }
-        }
-    } else {
-        child.wait().await.map_err(|e| {
+        // Wait for streams to complete
+        let _ = stdout_handle.await;
+        let _ = stderr_handle.await;
+
+        // Wait for process to complete
+        let status = child.wait().await.map_err(|e| {
             OrchestratorError::AgentCommand(format!("Archive command failed: {}", e))
-        })?
-    };
+        })?;
 
-    // Wait for streams to complete
-    let _ = stdout_handle.await;
-    let _ = stderr_handle.await;
+        if !status.success() {
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Archive command failed with exit code: {:?}",
+                status.code()
+            )));
+        }
 
-    if !status.success() {
-        return Err(OrchestratorError::AgentCommand(format!(
-            "Archive command failed with exit code: {:?}",
-            status.code()
-        )));
-    }
+        let verification = verify_archive_completion(change_id, Some(workspace_path));
+        if verification.is_success() {
+            break;
+        }
 
-    // Verify that the change was actually archived using common function
-    use crate::execution::archive::{build_archive_error_message, verify_archive_completion};
+        if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::Log(
+                        crate::events::LogEntry::warn(format!(
+                            "Archive verification failed for {} (attempt {}/{}); retrying archive command",
+                            change_id, attempt, max_attempts
+                        ))
+                        .with_change_id(change_id),
+                    ))
+                    .await;
+            }
+            warn!(
+                change_id = %change_id,
+                attempt = attempt,
+                max_attempts = max_attempts,
+                "Archive verification failed; retrying archive command"
+            );
+            continue;
+        }
 
-    let verification = verify_archive_completion(change_id, Some(workspace_path));
-    if !verification.is_success() {
         return Err(OrchestratorError::AgentCommand(
             build_archive_error_message(change_id),
         ));
@@ -1223,7 +1115,6 @@ Requirements:\n\
 mod tests {
     use super::ensure_archive_commit;
     use crate::config::OrchestratorConfig;
-    use crate::execution::apply::format_wip_commit_message;
     use crate::execution::archive::is_archive_commit_complete;
     use crate::task_parser::TaskProgress;
     use crate::vcs::VcsBackend;
@@ -1240,8 +1131,11 @@ mod tests {
             total: 10,
         };
 
-        let expected = "WIP: add-feature (5/10 tasks, apply#2)";
-        let actual = format_wip_commit_message(change_id, &progress, 2);
+        let expected = "WIP: add-feature (5/10 tasks)";
+        let actual = format!(
+            "WIP: {} ({}/{} tasks)",
+            change_id, progress.completed, progress.total
+        );
 
         assert_eq!(actual, expected);
     }
@@ -1254,8 +1148,11 @@ mod tests {
             total: 7,
         };
 
-        let expected = "WIP: fix-bug (7/7 tasks, apply#4)";
-        let actual = format_wip_commit_message(change_id, &progress, 4);
+        let expected = "WIP: fix-bug (7/7 tasks)";
+        let actual = format!(
+            "WIP: {} ({}/{} tasks)",
+            change_id, progress.completed, progress.total
+        );
 
         assert_eq!(actual, expected);
     }
@@ -1268,8 +1165,11 @@ mod tests {
             total: 5,
         };
 
-        let expected = "WIP: new-change (0/5 tasks, apply#1)";
-        let actual = format_wip_commit_message(change_id, &progress, 1);
+        let expected = "WIP: new-change (0/5 tasks)";
+        let actual = format!(
+            "WIP: {} ({}/{} tasks)",
+            change_id, progress.completed, progress.total
+        );
 
         assert_eq!(actual, expected);
     }
@@ -1283,8 +1183,11 @@ mod tests {
             total: 70,
         };
 
-        let expected = "WIP: add-web-monitoring-feature (50/70 tasks, apply#9)";
-        let actual = format_wip_commit_message(change_id, &progress, 9);
+        let expected = "WIP: add-web-monitoring-feature (50/70 tasks)";
+        let actual = format!(
+            "WIP: {} ({}/{} tasks)",
+            change_id, progress.completed, progress.total
+        );
 
         assert_eq!(actual, expected);
     }
