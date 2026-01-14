@@ -835,7 +835,8 @@ pub async fn execute_archive_in_workspace(
     debug!("Archive command in workspace: {}", command);
 
     use crate::execution::archive::{
-        build_archive_error_message, verify_archive_completion, ARCHIVE_COMMAND_MAX_RETRIES,
+        build_archive_error_message, ensure_archive_commit, verify_archive_completion,
+        ARCHIVE_COMMAND_MAX_RETRIES,
     };
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -955,12 +956,31 @@ pub async fn execute_archive_in_workspace(
         change_id
     );
 
+    let resolve_agent = AgentRunner::new(config.clone());
+    let change_id_owned = change_id.to_string();
+    let event_tx_clone = event_tx.clone();
     ensure_archive_commit(
         change_id,
         workspace_path,
-        config,
-        event_tx.clone(),
+        &resolve_agent,
         vcs_backend,
+        move |line| {
+            let event_tx = event_tx_clone.clone();
+            let change_id = change_id_owned.clone();
+            async move {
+                let text = match line {
+                    OutputLine::Stdout(text) | OutputLine::Stderr(text) => text,
+                };
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::ArchiveOutput {
+                            change_id,
+                            output: text,
+                        })
+                        .await;
+                }
+            }
+        },
     )
     .await?;
 
@@ -1043,84 +1063,9 @@ pub async fn execute_archive_in_workspace(
     Ok(revision)
 }
 
-pub(super) async fn ensure_archive_commit(
-    change_id: &str,
-    workspace_path: &Path,
-    config: &OrchestratorConfig,
-    event_tx: Option<mpsc::Sender<ParallelEvent>>,
-    vcs_backend: VcsBackend,
-) -> Result<()> {
-    match vcs_backend {
-        VcsBackend::Git | VcsBackend::Auto => {
-            use crate::execution::archive::is_archive_commit_complete;
-
-            if is_archive_commit_complete(change_id, Some(workspace_path)).await? {
-                return Ok(());
-            }
-
-            let prompt = format!(
-                "You are finalizing the archive commit for change '{change_id}'.\n\n\
-Requirements:\n\
-1) Ensure `git status --porcelain` is empty when done.\n\
-2) If there are changes, run `git add -A` and commit with message \"Archive: {change_id}\".\n\
-3) If a pre-commit hook modifies files or stops the commit, re-run `git add -A` and commit with the same message.\n\
-4) If the latest commit already has subject \"Archive: {change_id}\" and the working tree is clean, do nothing.\n\
-5) Do not use destructive commands like `git reset --hard`.",
-                change_id = change_id
-            );
-
-            let agent = AgentRunner::new(config.clone());
-            let (mut child, mut rx) = agent
-                .run_resolve_streaming_in_dir(&prompt, workspace_path)
-                .await?;
-
-            while let Some(line) = rx.recv().await {
-                let text = match line {
-                    OutputLine::Stdout(text) | OutputLine::Stderr(text) => text,
-                };
-                if let Some(ref tx) = event_tx {
-                    let _ = tx
-                        .send(ParallelEvent::ArchiveOutput {
-                            change_id: change_id.to_string(),
-                            output: text,
-                        })
-                        .await;
-                }
-            }
-
-            let status = child.wait().await.map_err(|e| {
-                OrchestratorError::AgentCommand(format!("Archive resolve command failed: {}", e))
-            })?;
-
-            if !status.success() {
-                return Err(OrchestratorError::AgentCommand(format!(
-                    "Archive resolve command failed with exit code: {:?}",
-                    status.code()
-                )));
-            }
-
-            if !is_archive_commit_complete(change_id, Some(workspace_path)).await? {
-                return Err(OrchestratorError::AgentCommand(format!(
-                    "Archive commit verification failed for {}",
-                    change_id
-                )));
-            }
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::ensure_archive_commit;
-    use crate::config::OrchestratorConfig;
-    use crate::execution::archive::is_archive_commit_complete;
     use crate::task_parser::TaskProgress;
-    use crate::vcs::VcsBackend;
-    use std::fs;
-    use std::process::Command;
-    use tempfile::TempDir;
 
     #[test]
     fn test_progress_commit_message_format() {
@@ -1221,87 +1166,5 @@ mod tests {
 
         // Should NOT create commit when progress decreased (edge case)
         assert!(new_progress_decreased.completed <= old_progress.completed);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_archive_commit_retries_after_pre_commit() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp_dir = TempDir::new().unwrap();
-        let repo_root = temp_dir.path();
-
-        Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-
-        fs::write(repo_root.join("README.md"), "base").unwrap();
-        Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "Base"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-
-        let archive_dir = repo_root.join("openspec/changes/archive/change-a");
-        fs::create_dir_all(&archive_dir).unwrap();
-        fs::write(archive_dir.join("archive.txt"), "archived").unwrap();
-
-        let hooks_dir = repo_root.join(".git/hooks");
-        let hook_path = hooks_dir.join("pre-commit");
-        let hook_contents = "#!/bin/sh\n\
-if [ ! -f .git/hooks/pre-commit-ran ]; then\n\
-  echo 'hooked' >> openspec/changes/archive/change-a/archive.txt\n\
-  git add openspec/changes/archive/change-a/archive.txt\n\
-  touch .git/hooks/pre-commit-ran\n\
-  exit 1\n\
-fi\n\
-exit 0\n";
-        fs::write(&hook_path, hook_contents).unwrap();
-        let mut perms = fs::metadata(&hook_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&hook_path, perms).unwrap();
-
-        let resolver_script = repo_root.join("archive-resolver.sh");
-        let script_contents = "#!/bin/sh\nset -e\n\
-git add -A\n\
-if ! git commit -m 'Archive: change-a'; then\n\
-  git add -A\n\
-  git commit -m 'Archive: change-a'\n\
-fi\n";
-        fs::write(&resolver_script, script_contents).unwrap();
-        let mut perms = fs::metadata(&resolver_script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&resolver_script, perms).unwrap();
-
-        let config = OrchestratorConfig {
-            resolve_command: Some("sh archive-resolver.sh".to_string()),
-            ..Default::default()
-        };
-
-        ensure_archive_commit("change-a", repo_root, &config, None, VcsBackend::Git)
-            .await
-            .unwrap();
-
-        let result = is_archive_commit_complete("change-a", Some(repo_root))
-            .await
-            .unwrap();
-        assert!(result);
     }
 }

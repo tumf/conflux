@@ -13,11 +13,12 @@ mod types;
 pub use crate::events::ExecutionEvent as ParallelEvent;
 pub use types::{FailedChangeTracker, WorkspaceResult};
 
+use crate::agent::{AgentRunner, OutputLine};
 use crate::analyzer::{extract_change_dependencies, ParallelGroup};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
-use crate::execution::archive::is_change_archived;
+use crate::execution::archive::{ensure_archive_commit, is_change_archived};
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{
     GitWorkspaceManager, VcsBackend, VcsError, Workspace, WorkspaceManager, WorkspaceStatus,
@@ -32,10 +33,7 @@ use tracing::{error, info, warn};
 
 use cleanup::WorkspaceCleanupGuard;
 use events::send_event;
-use executor::{
-    ensure_archive_commit, execute_apply_in_workspace, execute_archive_in_workspace,
-    ParallelHookContext,
-};
+use executor::{execute_apply_in_workspace, execute_archive_in_workspace, ParallelHookContext};
 
 use crate::hooks::HookRunner;
 
@@ -621,12 +619,31 @@ impl ParallelExecutor {
                 )
                 .await;
 
+                let resolve_agent = AgentRunner::new(self.config.clone());
+                let change_id_owned = change_id.clone();
+                let event_tx = self.event_tx.clone();
                 if let Err(err) = ensure_archive_commit(
                     change_id,
                     &workspace.path,
-                    &self.config,
-                    self.event_tx.clone(),
+                    &resolve_agent,
                     self.workspace_manager.backend_type(),
+                    move |line| {
+                        let event_tx = event_tx.clone();
+                        let change_id = change_id_owned.clone();
+                        async move {
+                            let text = match line {
+                                OutputLine::Stdout(text) | OutputLine::Stderr(text) => text,
+                            };
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::ArchiveOutput {
+                                        change_id,
+                                        output: text,
+                                    })
+                                    .await;
+                            }
+                        }
+                    },
                 )
                 .await
                 {

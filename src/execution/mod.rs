@@ -29,8 +29,8 @@ pub use apply::{
 // to avoid circular dependency issues and to make the import intent clearer.
 #[allow(unused_imports)]
 pub use archive::{
-    build_archive_error_message, get_task_progress, verify_archive_completion,
-    verify_task_completion, ArchiveVerificationResult,
+    build_archive_error_message, ensure_archive_commit, get_task_progress,
+    verify_archive_completion, verify_task_completion, ArchiveVerificationResult,
 };
 
 // Re-export type items for convenience.
