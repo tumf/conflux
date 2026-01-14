@@ -44,3 +44,9 @@ pub const DEFAULT_SUPPRESS_REPETITIVE_DEBUG: bool = true;
 
 /// Default interval (seconds) for summary log output
 pub const DEFAULT_LOG_SUMMARY_INTERVAL_SECS: u64 = 60;
+
+/// Default enablement for stall detection
+pub const DEFAULT_STALL_DETECTION_ENABLED: bool = true;
+
+/// Default threshold for consecutive empty WIP commits before stalling
+pub const DEFAULT_STALL_DETECTION_THRESHOLD: u32 = 3;

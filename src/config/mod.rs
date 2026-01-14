@@ -32,6 +32,14 @@ fn default_log_summary_interval_secs() -> u64 {
     DEFAULT_LOG_SUMMARY_INTERVAL_SECS
 }
 
+fn default_stall_detection_enabled() -> bool {
+    DEFAULT_STALL_DETECTION_ENABLED
+}
+
+fn default_stall_detection_threshold() -> u32 {
+    DEFAULT_STALL_DETECTION_THRESHOLD
+}
+
 /// Logging configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoggingConfig {
@@ -49,6 +57,26 @@ impl Default for LoggingConfig {
         Self {
             suppress_repetitive_debug: DEFAULT_SUPPRESS_REPETITIVE_DEBUG,
             summary_interval_secs: DEFAULT_LOG_SUMMARY_INTERVAL_SECS,
+        }
+    }
+}
+
+/// Stall detection configuration for empty WIP commits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StallDetectionConfig {
+    /// Enable stall detection based on consecutive empty WIP commits.
+    #[serde(default = "default_stall_detection_enabled")]
+    pub enabled: bool,
+    /// Consecutive empty commit threshold before stalling.
+    #[serde(default = "default_stall_detection_threshold")]
+    pub threshold: u32,
+}
+
+impl Default for StallDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_STALL_DETECTION_ENABLED,
+            threshold: DEFAULT_STALL_DETECTION_THRESHOLD,
         }
     }
 }
@@ -89,6 +117,10 @@ pub struct OrchestratorConfig {
     /// Logging configuration for TUI debug output.
     #[serde(default)]
     pub logging: Option<LoggingConfig>,
+
+    /// Stall detection configuration (empty WIP commit detection).
+    #[serde(default)]
+    pub stall_detection: Option<StallDetectionConfig>,
 
     /// Delay between completion check retries in milliseconds.
     /// Default: 500ms
@@ -195,6 +227,11 @@ impl OrchestratorConfig {
     /// Get logging configuration, returning defaults if not set.
     pub fn get_logging(&self) -> LoggingConfig {
         self.logging.clone().unwrap_or_default()
+    }
+
+    /// Get stall detection configuration, returning defaults if not set.
+    pub fn get_stall_detection(&self) -> StallDetectionConfig {
+        self.stall_detection.clone().unwrap_or_default()
     }
 
     /// Get the maximum iterations limit.
@@ -362,6 +399,29 @@ mod tests {
         let logging = config.get_logging();
         assert!(!logging.suppress_repetitive_debug);
         assert_eq!(logging.summary_interval_secs, 15);
+    }
+
+    #[test]
+    fn test_stall_detection_defaults() {
+        let config = OrchestratorConfig::default();
+        assert_eq!(
+            config.get_stall_detection(),
+            StallDetectionConfig::default()
+        );
+    }
+
+    #[test]
+    fn test_parse_stall_detection_config() {
+        let jsonc = r#"{
+            "stall_detection": {
+                "enabled": false,
+                "threshold": 5
+            }
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        let stall = config.get_stall_detection();
+        assert!(!stall.enabled);
+        assert_eq!(stall.threshold, 5);
     }
 
     #[test]
