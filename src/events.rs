@@ -193,6 +193,15 @@ pub enum ExecutionEvent {
     /// Merge deferred due to dirty base
     #[allow(dead_code)]
     MergeDeferred { change_id: String, reason: String },
+    /// Merge resolution started for a change
+    ResolveStarted { change_id: String },
+    /// Merge resolution completed for a change
+    ResolveCompleted {
+        change_id: String,
+        worktree_change_ids: Option<std::collections::HashSet<String>>,
+    },
+    /// Merge resolution failed for a change
+    ResolveFailed { change_id: String, error: String },
     /// Merge resulted in conflicts
     #[allow(dead_code)]
     MergeConflict { files: Vec<String> },
