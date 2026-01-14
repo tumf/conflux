@@ -195,65 +195,18 @@ When auto-refresh detects new changes, they SHALL be displayed appropriately.
 
 ### Requirement: Dynamic Execution Queue
 
-In running mode, unselected changes can be added to the queue, and queued changes can be removed. Added changes SHALL be processed by the orchestrator. If a queued change is removed before processing begins, the orchestrator SHALL exclude it from pending execution.
+Running 中に queued change を外した場合、当該 change がまだ Processing を開始していないなら、オーケストレータはその change を実行対象から除外しなければならない（MUST）。Processing/Archiving の change は引き続き操作できない。
 
-#### Scenario: Queue addition during execution
+#### Scenario: Running 中に queued change を外す
+- **WHEN** TUI が Running モードである
+- **AND** ユーザーが queued change を Space キーで NotQueued に切り替える
+- **AND** その change が Processing を開始していない
+- **THEN** その change は実行対象から除外される
+- **AND** 以降の実行でその change は処理されない
 
-- **WHEN** TUI is in running mode
-- **AND** user moves cursor to an unselected change (NotQueued) and presses Space key
-- **THEN** the change is added to the execution queue
-- **AND** display updates from "not queued" to "queued"
-- **AND** the change ID is pushed to the shared queue
-
-#### Scenario: Remove queued change
-
-- **WHEN** TUI is in running mode
-- **AND** user moves cursor to a queued change (Queued) and presses Space key
-- **THEN** the change is removed from the queue
-- **AND** display updates from "queued" to "not queued"
-- **AND** the selection is cleared
-- **AND** the orchestrator removes the change from pending execution if it has not started processing
-- **AND** the change is not processed later in the run
-
-#### Scenario: Processing order after queue addition
-
-- **WHEN** a change is dynamically added to the queue
-- **THEN** it is processed after the currently processing change completes
-- **AND** the order of existing queued changes is unchanged
-
-#### Scenario: Processing change cannot be modified
-
-- **WHEN** a change is Processing
-- **THEN** its selection state cannot be changed
-- **AND** pressing Space key has no effect
-
-#### Scenario: Archiving change cannot be modified
-
-- **WHEN** a change is being archived
-- **THEN** its selection state cannot be changed
-- **AND** pressing Space key has no effect
-
-#### Scenario: Dynamic queue addition in Waiting state
-
-- **WHEN** TUI is in running mode showing "Waiting..."
-- **AND** no change is currently processing
-- **AND** user moves cursor to an unselected change (NotQueued) and presses Space key
-- **THEN** the change is added to the execution queue
-- **AND** the orchestrator detects and starts processing the change
-- **AND** log displays "Processing dynamically added: <change-id>"
-
-#### Scenario: Dynamically added change processing completion
-
-- **WHEN** processing of a dynamically added change completes
-- **THEN** the change status updates to "completed" or "archived"
-- **AND** remaining dynamic queue items continue processing
-- **AND** "AllCompleted" event is sent when both initial and dynamic queues are empty
-
-#### Scenario: Prevent duplicate addition
-
-- **WHEN** attempting to add a change that already exists in the queue
-- **THEN** the addition is ignored
-- **AND** a warning log is displayed
+#### Scenario: Processing 中の change は操作できない
+- **WHEN** change が Processing または Archiving である
+- **THEN** Space キーを押しても selected/queue 状態は変更されない
 
 ### Requirement: Error State Display
 
