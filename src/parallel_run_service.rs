@@ -13,6 +13,7 @@ use crate::parallel::{ParallelEvent, ParallelExecutor};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 /// Service for parallel execution of changes.
@@ -157,6 +158,7 @@ impl ParallelRunService {
         &self,
         changes: Vec<Change>,
         event_tx: mpsc::Sender<ParallelEvent>,
+        cancel_token: Option<CancellationToken>,
     ) -> Result<()> {
         let (changes, skipped) = self.filter_committed_changes(changes).await?;
 
@@ -191,6 +193,9 @@ impl ParallelRunService {
             Some(event_tx.clone()),
         );
         executor.set_no_resume(self.no_resume);
+        if let Some(token) = cancel_token {
+            executor.set_cancel_token(token);
+        }
 
         // Clone config for the analyzer closure
         let config = self.config.clone();

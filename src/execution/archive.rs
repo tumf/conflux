@@ -24,6 +24,9 @@ use std::path::Path;
 use tokio::process::Command;
 use tracing::debug;
 
+/// Maximum number of archive retries after a verification failure.
+pub const ARCHIVE_COMMAND_MAX_RETRIES: u32 = 2;
+
 /// Result of archive path verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArchiveVerificationResult {
@@ -276,7 +279,7 @@ pub fn verify_task_completion(change_id: &str, base_path: Option<&Path>) -> Resu
         )));
     }
 
-    let progress = task_parser::parse_file(&tasks_path)?;
+    let progress = task_parser::parse_file(&tasks_path, Some(change_id))?;
 
     debug!(
         change_id = %change_id,
@@ -323,7 +326,7 @@ pub fn get_task_progress(
         return Ok(None);
     }
 
-    let progress = task_parser::parse_file(&tasks_path)?;
+    let progress = task_parser::parse_file(&tasks_path, Some(change_id))?;
     Ok(Some(progress))
 }
 

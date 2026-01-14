@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::Stdio as StdStdio;
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::events::ParallelEvent;
@@ -300,6 +301,7 @@ pub async fn execute_apply_in_workspace(
     vcs_backend: VcsBackend,
     hooks: Option<&HookRunner>,
     parallel_ctx: Option<&ParallelHookContext>,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<String> {
     const MAX_ITERATIONS: u32 = 50;
     let mut iteration = 0;
@@ -308,6 +310,9 @@ pub async fn execute_apply_in_workspace(
 
     loop {
         iteration += 1;
+        if cancel_token.is_some_and(|token| token.is_cancelled()) {
+            return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+        }
         if iteration > MAX_ITERATIONS {
             // Run on_error hook if configured
             if let Some(hook_runner) = hooks {
@@ -738,7 +743,12 @@ pub async fn execute_archive_in_workspace(
     vcs_backend: VcsBackend,
     hooks: Option<&HookRunner>,
     parallel_ctx: Option<&ParallelHookContext>,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<String> {
+    if cancel_token.is_some_and(|token| token.is_cancelled()) {
+        return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+    }
+
     // Verify task completion before archiving using common function
     use crate::execution::archive::get_task_progress;
 
@@ -824,89 +834,117 @@ pub async fn execute_archive_in_workspace(
 
     debug!("Archive command in workspace: {}", command);
 
-    // Execute command with streaming output
+    use crate::execution::archive::{
+        build_archive_error_message, verify_archive_completion, ARCHIVE_COMMAND_MAX_RETRIES,
+    };
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    debug!(
-        "Executing shell command: sh -c {} (cwd: {:?})",
-        command, workspace_path
-    );
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(&command)
-        .current_dir(workspace_path)
-        .stdin(StdStdio::null())
-        .stdout(StdStdio::piped())
-        .stderr(StdStdio::piped())
-        .spawn()
-        .map_err(|e| {
-            OrchestratorError::AgentCommand(format!("Failed to spawn archive command: {}", e))
+    let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
+    let mut attempt: u32 = 0;
+
+    loop {
+        attempt += 1;
+
+        debug!(
+            "Executing shell command: sh -c {} (cwd: {:?})",
+            command, workspace_path
+        );
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(workspace_path)
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped())
+            .spawn()
+            .map_err(|e| {
+                OrchestratorError::AgentCommand(format!("Failed to spawn archive command: {}", e))
+            })?;
+
+        // Stream stdout
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let change_id_clone = change_id.to_string();
+        let event_tx_clone = event_tx.clone();
+
+        let stdout_handle = tokio::spawn(async move {
+            if let Some(stdout) = stdout {
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(ref tx) = event_tx_clone {
+                        let _ = tx
+                            .send(ParallelEvent::ArchiveOutput {
+                                change_id: change_id_clone.clone(),
+                                output: line,
+                            })
+                            .await;
+                    }
+                }
+            }
+        });
+
+        let change_id_clone2 = change_id.to_string();
+        let event_tx_clone2 = event_tx.clone();
+        let stderr_handle = tokio::spawn(async move {
+            if let Some(stderr) = stderr {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(ref tx) = event_tx_clone2 {
+                        let _ = tx
+                            .send(ParallelEvent::ArchiveOutput {
+                                change_id: change_id_clone2.clone(),
+                                output: line,
+                            })
+                            .await;
+                    }
+                }
+            }
+        });
+
+        // Wait for streams to complete
+        let _ = stdout_handle.await;
+        let _ = stderr_handle.await;
+
+        // Wait for process to complete
+        let status = child.wait().await.map_err(|e| {
+            OrchestratorError::AgentCommand(format!("Archive command failed: {}", e))
         })?;
 
-    // Stream stdout
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let change_id_clone = change_id.to_string();
-    let event_tx_clone = event_tx.clone();
-
-    let stdout_handle = tokio::spawn(async move {
-        if let Some(stdout) = stdout {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(ref tx) = event_tx_clone {
-                    let _ = tx
-                        .send(ParallelEvent::ArchiveOutput {
-                            change_id: change_id_clone.clone(),
-                            output: line,
-                        })
-                        .await;
-                }
-            }
+        if !status.success() {
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Archive command failed with exit code: {:?}",
+                status.code()
+            )));
         }
-    });
 
-    let change_id_clone2 = change_id.to_string();
-    let event_tx_clone2 = event_tx.clone();
-    let stderr_handle = tokio::spawn(async move {
-        if let Some(stderr) = stderr {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(ref tx) = event_tx_clone2 {
-                    let _ = tx
-                        .send(ParallelEvent::ArchiveOutput {
-                            change_id: change_id_clone2.clone(),
-                            output: line,
-                        })
-                        .await;
-                }
-            }
+        let verification = verify_archive_completion(change_id, Some(workspace_path));
+        if verification.is_success() {
+            break;
         }
-    });
 
-    // Wait for streams to complete
-    let _ = stdout_handle.await;
-    let _ = stderr_handle.await;
+        if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::Log(
+                        crate::events::LogEntry::warn(format!(
+                            "Archive verification failed for {} (attempt {}/{}); retrying archive command",
+                            change_id, attempt, max_attempts
+                        ))
+                        .with_change_id(change_id),
+                    ))
+                    .await;
+            }
+            warn!(
+                change_id = %change_id,
+                attempt = attempt,
+                max_attempts = max_attempts,
+                "Archive verification failed; retrying archive command"
+            );
+            continue;
+        }
 
-    // Wait for process to complete
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| OrchestratorError::AgentCommand(format!("Archive command failed: {}", e)))?;
-
-    if !status.success() {
-        return Err(OrchestratorError::AgentCommand(format!(
-            "Archive command failed with exit code: {:?}",
-            status.code()
-        )));
-    }
-
-    // Verify that the change was actually archived using common function
-    use crate::execution::archive::{build_archive_error_message, verify_archive_completion};
-
-    let verification = verify_archive_completion(change_id, Some(workspace_path));
-    if !verification.is_success() {
         return Err(OrchestratorError::AgentCommand(
             build_archive_error_message(change_id),
         ));

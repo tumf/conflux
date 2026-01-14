@@ -240,7 +240,7 @@ pub async fn is_merge_in_progress<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
 
 /// Return any change_ids missing merge commits since base_revision.
 ///
-/// A merge commit is recognized by the subject containing `Merge change: <change_id>`.
+/// A merge commit is recognized by the subject exactly matching `Merge change: <change_id>`.
 pub async fn missing_merge_commits_since<P: AsRef<Path>>(
     cwd: P,
     base_revision: &str,
@@ -265,12 +265,101 @@ pub async fn missing_merge_commits_since<P: AsRef<Path>>(
     let mut missing = Vec::new();
     for change_id in change_ids {
         let expected = format!("Merge change: {}", change_id);
-        if !merge_messages.iter().any(|line| line.contains(&expected)) {
+        if !merge_messages.iter().any(|line| line.trim() == expected) {
             missing.push(change_id.clone());
         }
     }
 
     Ok(missing)
+}
+
+/// Find the most recent merge commit hash whose subject matches exactly.
+///
+/// Returns `Ok(None)` when no such merge commit exists in the given range.
+pub async fn merge_commit_hash_by_subject_since<P: AsRef<Path>>(
+    cwd: P,
+    base_revision: &str,
+    expected_subject: &str,
+) -> VcsResult<Option<String>> {
+    let output = run_git(
+        &[
+            "log",
+            "--merges",
+            "--format=%H\t%s",
+            &format!("{}..HEAD", base_revision),
+        ],
+        cwd,
+    )
+    .await?;
+
+    for line in output.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let mut parts = line.splitn(2, '\t');
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let subject = parts.next().unwrap_or("");
+        if subject == expected_subject {
+            return Ok(Some(hash.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Return the first parent of a commit (e.g. the target branch state before a merge commit).
+pub async fn first_parent_of<P: AsRef<Path>>(cwd: P, commit: &str) -> VcsResult<String> {
+    run_git(&["rev-parse", &format!("{}^1", commit)], cwd).await
+}
+
+/// Check whether `ancestor` is an ancestor of `descendant`.
+///
+/// Returns `Ok(false)` when not an ancestor.
+pub async fn is_ancestor<P: AsRef<Path>>(
+    cwd: P,
+    ancestor: &str,
+    descendant: &str,
+) -> VcsResult<bool> {
+    let output = Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(cwd.as_ref())
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| VcsError::git_command(format!("Failed to execute git merge-base: {}", e)))?;
+
+    Ok(output.status.success())
+}
+
+/// Return merge commit subjects that start with "Pre-sync base into" but do not match the
+/// expected subject for this change.
+///
+/// This is used to validate pre-sync merge commit message conventions inside worktrees.
+pub async fn presync_merge_subject_mismatches_since<P: AsRef<Path>>(
+    cwd: P,
+    base_revision: &str,
+    change_id: &str,
+) -> VcsResult<Vec<String>> {
+    let expected = format!("Pre-sync base into {}", change_id);
+
+    let output = run_git(
+        &[
+            "log",
+            "--merges",
+            "--format=%s",
+            &format!("{}..HEAD", base_revision),
+        ],
+        cwd,
+    )
+    .await?;
+
+    let mut mismatches = Vec::new();
+    for subject in output.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        if subject.starts_with("Pre-sync base into") && subject != expected {
+            mismatches.push(subject.to_string());
+        }
+    }
+
+    Ok(mismatches)
 }
 
 /// Stage all changes and commit with the given message.
@@ -292,6 +381,99 @@ pub async fn has_changes_to_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_presync_merge_subject_mismatches_since() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let init = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init.is_err() {
+            // Skip if git not available
+            return;
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        std::fs::write(temp_dir.path().join("README.md"), "base\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Base"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        let base_revision = run_git(&["rev-parse", "HEAD"], temp_dir.path())
+            .await
+            .unwrap();
+
+        // Create worktree-like branch
+        let _ = Command::new("git")
+            .args(["checkout", "-b", "ws-change-a"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Advance main
+        let _ = Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        std::fs::write(temp_dir.path().join("main.txt"), "main\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Main advance"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Pre-sync merge on ws-change-a, but with wrong message
+        let _ = Command::new("git")
+            .args(["checkout", "ws-change-a"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["merge", "--no-ff", "-m", "Pre-sync base into WRONG", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        let mismatches = presync_merge_subject_mismatches_since(
+            temp_dir.path(),
+            base_revision.trim(),
+            "change-a",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            mismatches.iter().any(|s| s == "Pre-sync base into WRONG"),
+            "Expected mismatch to include wrong pre-sync subject"
+        );
+    }
 
     #[tokio::test]
     async fn test_check_git_repo_non_repo() {

@@ -7,6 +7,8 @@ class WebMonitor {
         this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 10;
         this.reconnectDelay = 1000;
+        this.pollIntervalId = null;
+        this.pollIntervalMs = 5000;
         this.isMobile = window.matchMedia('(max-width: 767px)').matches;
         this.previousConnectionStatus = null;
 
@@ -45,6 +47,7 @@ class WebMonitor {
         this.setupMediaQueryListener();
         this.setupTouchHandlers();
         this.setupPullToRefresh();
+        this.fetchState();
         this.connect();
     }
 
@@ -136,7 +139,7 @@ class WebMonitor {
 
         // Request fresh data from server
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.send(JSON.stringify({ type: 'refresh' }));
+            this.fetchState();
             this.showToast('Refreshing data...', 'info');
         } else {
             this.showToast('Not connected. Reconnecting...', 'warning');
@@ -283,6 +286,38 @@ class WebMonitor {
         }
     }
 
+    async fetchState() {
+        try {
+            const response = await fetch('/api/state', { cache: 'no-store' });
+            if (!response.ok) {
+                throw new Error(`Failed to fetch state: ${response.status}`);
+            }
+
+            const state = await response.json();
+            this.renderFullState(state);
+        } catch (error) {
+            console.error('Failed to fetch state:', error);
+            this.showToast('Failed to refresh state', 'error');
+        }
+    }
+
+    startPolling() {
+        if (this.pollIntervalId) return;
+
+        this.pollIntervalId = setInterval(() => {
+            this.fetchState();
+        }, this.pollIntervalMs);
+
+        this.fetchState();
+    }
+
+    stopPolling() {
+        if (!this.pollIntervalId) return;
+
+        clearInterval(this.pollIntervalId);
+        this.pollIntervalId = null;
+    }
+
     connect() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}/ws`;
@@ -359,10 +394,12 @@ class WebMonitor {
             case 'connected':
                 el.classList.add('connected');
                 this.elements.statusText.textContent = 'Connected';
+                this.stopPolling();
                 break;
             case 'disconnected':
                 el.classList.add('disconnected');
                 this.elements.statusText.textContent = 'Disconnected';
+                this.startPolling();
                 break;
             default:
                 this.elements.statusText.textContent = 'Connecting...';

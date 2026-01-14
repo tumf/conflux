@@ -1,9 +1,10 @@
 //! REST API handlers for web monitoring.
 
-use super::state::{ChangeStatus, OrchestratorState, WebState};
+use super::state::{ChangeStatus, WebState};
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, StatusCode},
+    response::IntoResponse,
     Json,
 };
 use serde::Serialize;
@@ -25,8 +26,9 @@ pub async fn health() -> Json<HealthResponse> {
 }
 
 /// Get full orchestrator state
-pub async fn get_state(State(state): State<Arc<WebState>>) -> Json<OrchestratorState> {
-    Json(state.get_state().await)
+pub async fn get_state(State(state): State<Arc<WebState>>) -> impl IntoResponse {
+    let snapshot = state.get_state().await;
+    ([(header::CACHE_CONTROL, "no-store")], Json(snapshot))
 }
 
 /// List all changes
@@ -130,6 +132,7 @@ pub async fn unapprove_change(
 mod tests {
     use super::*;
     use crate::openspec::Change;
+    use crate::web::state::OrchestratorState;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -153,8 +156,17 @@ mod tests {
         let changes = vec![create_test_change("test", 2, 5)];
         let web_state = Arc::new(WebState::new(&changes));
 
-        let response = get_state(State(web_state)).await;
-        assert_eq!(response.total_changes, 1);
+        let response = get_state(State(web_state)).await.into_response();
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let state: OrchestratorState = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state.total_changes, 1);
     }
 
     #[tokio::test]

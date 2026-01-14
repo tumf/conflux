@@ -13,7 +13,7 @@ use crate::error::{OrchestratorError, Result};
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::Change;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::info;
 
 use super::output::OutputHandler;
 
@@ -79,20 +79,22 @@ impl ArchiveContext {
 /// * `agent` - The agent runner for executing commands
 /// * `hooks` - The hook runner for executing hooks
 /// * `context` - Context information for hooks
-/// * `output` - Output handler for streaming command output
+/// * `output` - Output handler for logging
+/// * `base_path` - Optional base path for archive verification
 ///
 /// # Returns
-/// * `Ok(ArchiveResult::Success)` - Archive completed successfully
-/// * `Ok(ArchiveResult::Failed { error })` - Archive command failed
-/// * `Ok(ArchiveResult::Cancelled)` - Archive was cancelled
-/// * `Err(e)` - An error occurred (e.g., hook failure with continue_on_failure=false)
-pub async fn archive_change<O: OutputHandler>(
+/// Same as `archive_change_streaming`
+pub async fn archive_change<O>(
     change: &Change,
     agent: &mut AgentRunner,
     hooks: &HookRunner,
     context: &ArchiveContext,
     output: &O,
-) -> Result<ArchiveResult> {
+    base_path: Option<&Path>,
+) -> Result<ArchiveResult>
+where
+    O: OutputHandler,
+{
     info!("Archiving change: {}", change.id);
 
     // Build hook context
@@ -120,27 +122,44 @@ pub async fn archive_change<O: OutputHandler>(
 
     output.on_info(&format!("Archiving: {}", change.id));
 
-    // Execute archive command
-    let status = agent.run_archive(&change.id).await?;
+    use crate::execution::archive::{
+        build_archive_error_message, verify_archive_completion, ARCHIVE_COMMAND_MAX_RETRIES,
+    };
 
-    if !status.success() {
-        let error_msg = format!("Archive command failed with exit code: {:?}", status.code());
+    let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
+    let mut attempt: u32 = 0;
 
-        // Run on_error hook
-        let error_ctx = hook_ctx.clone().with_error(&error_msg);
-        let _ = hooks.run_hook(HookType::OnError, &error_ctx).await;
+    loop {
+        attempt += 1;
 
-        output.on_error(&error_msg);
-        return Ok(ArchiveResult::Failed { error: error_msg });
-    }
+        // Execute archive command
+        let status = agent.run_archive(&change.id).await?;
 
-    // Verify archive was successful
-    if !verify_archive(&change.id) {
-        let error_msg = format!(
-            "Archive command succeeded but change '{}' was not actually archived. \
-             The change directory still exists in openspec/changes/.",
-            change.id
-        );
+        if !status.success() {
+            let error_msg = format!("Archive command failed with exit code: {:?}", status.code());
+
+            // Run on_error hook
+            let error_ctx = hook_ctx.clone().with_error(&error_msg);
+            let _ = hooks.run_hook(HookType::OnError, &error_ctx).await;
+
+            output.on_error(&error_msg);
+            return Ok(ArchiveResult::Failed { error: error_msg });
+        }
+
+        // Verify archive was successful
+        if verify_archive_completion(&change.id, base_path).is_success() {
+            break;
+        }
+
+        if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
+            output.on_warn(&format!(
+                "Archive verification failed for {} (attempt {}/{}); retrying archive command",
+                change.id, attempt, max_attempts
+            ));
+            continue;
+        }
+
+        let error_msg = build_archive_error_message(&change.id);
         output.on_error(&error_msg);
         return Ok(ArchiveResult::Failed { error: error_msg });
     }
@@ -181,6 +200,7 @@ pub async fn archive_change<O: OutputHandler>(
 /// * `context` - Context information for hooks
 /// * `output` - Output handler for streaming command output
 /// * `cancel_check` - Function to check if operation should be cancelled
+/// * `base_path` - Optional base path for archive verification
 ///
 /// # Returns
 /// Same as `archive_change`
@@ -191,6 +211,7 @@ pub async fn archive_change_streaming<O, F>(
     context: &ArchiveContext,
     output: &O,
     cancel_check: F,
+    base_path: Option<&Path>,
 ) -> Result<ArchiveResult>
 where
     O: OutputHandler,
@@ -224,51 +245,69 @@ where
 
     output.on_info(&format!("Archiving: {}", change.id));
 
-    // Execute archive command with streaming
-    let (mut child, mut output_rx) = agent.run_archive_streaming(&change.id).await?;
+    use crate::execution::archive::{
+        build_archive_error_message, verify_archive_completion, ARCHIVE_COMMAND_MAX_RETRIES,
+    };
 
-    // Stream output
+    let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
+    let mut attempt: u32 = 0;
+
     loop {
-        if cancel_check() {
-            let _ = child.terminate();
-            let _ = child.kill().await;
-            output.on_warn("Process killed due to cancellation");
-            return Ok(ArchiveResult::Cancelled);
-        }
+        attempt += 1;
 
-        match output_rx.try_recv() {
-            Ok(OutputLine::Stdout(s)) => output.on_stdout(&s),
-            Ok(OutputLine::Stderr(s)) => output.on_stderr(&s),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                // No data available, check if process is done
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        // Execute archive command with streaming
+        let (mut child, mut output_rx) = agent.run_archive_streaming(&change.id).await?;
+
+        // Stream output
+        loop {
+            if cancel_check() {
+                let _ = child.terminate();
+                let _ = child.kill().await;
+                output.on_warn("Process killed due to cancellation");
+                return Ok(ArchiveResult::Cancelled);
             }
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+
+            match output_rx.try_recv() {
+                Ok(OutputLine::Stdout(s)) => output.on_stdout(&s),
+                Ok(OutputLine::Stderr(s)) => output.on_stderr(&s),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    // No data available, check if process is done
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
         }
-    }
 
-    // Wait for child process to complete
-    let status = child.wait().await.map_err(|e| {
-        OrchestratorError::AgentCommand(format!("Failed to wait for process: {}", e))
-    })?;
+        // Wait for child process to complete
+        let status = child.wait().await.map_err(|e| {
+            OrchestratorError::AgentCommand(format!("Failed to wait for process: {}", e))
+        })?;
 
-    if !status.success() {
-        let error_msg = format!("Archive command failed with exit code: {:?}", status.code());
+        if !status.success() {
+            let error_msg = format!("Archive command failed with exit code: {:?}", status.code());
 
-        // Run on_error hook
-        let error_ctx = hook_ctx.clone().with_error(&error_msg);
-        let _ = hooks.run_hook(HookType::OnError, &error_ctx).await;
+            // Run on_error hook
+            let error_ctx = hook_ctx.clone().with_error(&error_msg);
+            let _ = hooks.run_hook(HookType::OnError, &error_ctx).await;
 
-        output.on_error(&error_msg);
-        return Ok(ArchiveResult::Failed { error: error_msg });
-    }
+            output.on_error(&error_msg);
+            return Ok(ArchiveResult::Failed { error: error_msg });
+        }
 
-    // Verify archive was successful
-    if !verify_archive(&change.id) {
-        let error_msg = format!(
-            "Archive command succeeded but change '{}' was not actually archived.",
-            change.id
-        );
+        // Verify archive was successful
+        if verify_archive_completion(&change.id, base_path).is_success() {
+            break;
+        }
+
+        if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
+            output.on_warn(&format!(
+                "Archive verification failed for {} (attempt {}/{}); retrying archive command",
+                change.id, attempt, max_attempts
+            ));
+            continue;
+        }
+
+        let error_msg = build_archive_error_message(&change.id);
         output.on_error(&error_msg);
         return Ok(ArchiveResult::Failed { error: error_msg });
     }
@@ -297,36 +336,15 @@ where
     Ok(ArchiveResult::Success)
 }
 
-/// Verify that a change was actually archived.
-///
-/// Checks that:
-/// - The change directory no longer exists in `openspec/changes/`
-/// - OR the archive directory exists in `openspec/changes/archive/`
-fn verify_archive(change_id: &str) -> bool {
-    let change_path = Path::new("openspec/changes").join(change_id);
-    let archive_path = Path::new("openspec/changes/archive").join(change_id);
-
-    let change_exists = change_path.exists();
-    let archive_exists = archive_path.exists();
-
-    debug!(
-        change_id = %change_id,
-        change_path = %change_path.display(),
-        archive_path = %archive_path.display(),
-        change_exists = change_exists,
-        archive_exists = archive_exists,
-        "verify_archive: checking paths"
-    );
-
-    // Archive is successful if:
-    // - Change directory doesn't exist (was moved/deleted)
-    // - OR archive directory exists (was archived)
-    !change_exists || archive_exists
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OrchestratorConfig;
+    use crate::hooks::HookRunner;
+    use crate::openspec::Change;
+    use crate::orchestration::output::NullOutputHandler;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_archive_result_is_success() {
@@ -365,5 +383,81 @@ mod tests {
 
         // Archive path should be under openspec/changes/archive, not openspec/archive
         assert!(archive_path.starts_with("openspec/changes/archive"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_archive_change_retries_until_verified() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let change_id = "retry-change";
+        let change_dir = temp_dir.path().join("openspec/changes").join(change_id);
+        let archive_dir = temp_dir.path().join("openspec/changes/archive");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let attempts_path = temp_dir.path().join("archive_attempts.txt");
+        let script_path = temp_dir.path().join("archive.sh");
+        let script = format!(
+            r#"#!/bin/sh
+attempts_file="{attempts}"
+base_dir="{base_dir}"
+count=0
+if [ -f "$attempts_file" ]; then
+  count=$(cat "$attempts_file")
+fi
+count=$((count+1))
+echo "$count" > "$attempts_file"
+if [ "$count" -lt 2 ]; then
+  exit 0
+fi
+mkdir -p "$base_dir/openspec/changes/archive"
+mv "$base_dir/openspec/changes/$1" "$base_dir/openspec/changes/archive/$1"
+"#,
+            attempts = attempts_path.display(),
+            base_dir = temp_dir.path().display()
+        );
+        fs::write(&script_path, script).unwrap();
+
+        let config = OrchestratorConfig {
+            archive_command: Some(format!("sh \"{}\" {{change_id}}", script_path.display())),
+            ..Default::default()
+        };
+
+        let mut agent = AgentRunner::new(config);
+        let hooks = HookRunner::empty();
+        let output = NullOutputHandler::new();
+        let context = ArchiveContext::new(0, 1, 1, 0);
+        let change = Change {
+            id: change_id.to_string(),
+            completed_tasks: 1,
+            total_tasks: 1,
+            last_modified: "".to_string(),
+            is_approved: true,
+            dependencies: Vec::new(),
+        };
+
+        let result = archive_change(
+            &change,
+            &mut agent,
+            &hooks,
+            &context,
+            &output,
+            Some(temp_dir.path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, ArchiveResult::Success);
+
+        let attempts = fs::read_to_string(&attempts_path).unwrap();
+        let attempt_count: u32 = attempts.trim().parse().unwrap();
+        assert_eq!(attempt_count, 2);
+
+        let archived_dir = temp_dir
+            .path()
+            .join("openspec/changes/archive")
+            .join(change_id);
+        assert!(!change_dir.exists());
+        assert!(archived_dir.exists());
     }
 }

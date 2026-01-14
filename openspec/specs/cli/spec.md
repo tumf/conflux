@@ -195,63 +195,18 @@ When auto-refresh detects new changes, they SHALL be displayed appropriately.
 
 ### Requirement: Dynamic Execution Queue
 
-In running mode, unselected changes can be added to the queue, and queued changes can be removed. Added changes SHALL be processed by the orchestrator.
+Running 中に queued change を外した場合、当該 change がまだ Processing を開始していないなら、オーケストレータはその change を実行対象から除外しなければならない（MUST）。Processing/Archiving の change は引き続き操作できない。
 
-#### Scenario: Queue addition during execution
+#### Scenario: Running 中に queued change を外す
+- **WHEN** TUI が Running モードである
+- **AND** ユーザーが queued change を Space キーで NotQueued に切り替える
+- **AND** その change が Processing を開始していない
+- **THEN** その change は実行対象から除外される
+- **AND** 以降の実行でその change は処理されない
 
-- **WHEN** TUI is in running mode
-- **AND** user moves cursor to an unselected change (NotQueued) and presses Space key
-- **THEN** the change is added to the execution queue
-- **AND** display updates from "not queued" to "queued"
-- **AND** the change ID is pushed to the shared queue
-
-#### Scenario: Remove queued change
-
-- **WHEN** TUI is in running mode
-- **AND** user moves cursor to a queued change (Queued) and presses Space key
-- **THEN** the change is removed from the queue
-- **AND** display updates from "queued" to "not queued"
-- **AND** the selection is cleared
-
-#### Scenario: Processing order after queue addition
-
-- **WHEN** a change is dynamically added to the queue
-- **THEN** it is processed after the currently processing change completes
-- **AND** the order of existing queued changes is unchanged
-
-#### Scenario: Processing change cannot be modified
-
-- **WHEN** a change is Processing
-- **THEN** its selection state cannot be changed
-- **AND** pressing Space key has no effect
-
-#### Scenario: Archiving change cannot be modified
-
-- **WHEN** a change is being archived
-- **THEN** its selection state cannot be changed
-- **AND** pressing Space key has no effect
-
-#### Scenario: Dynamic queue addition in Waiting state
-
-- **WHEN** TUI is in running mode showing "Waiting..."
-- **AND** no change is currently processing
-- **AND** user moves cursor to an unselected change (NotQueued) and presses Space key
-- **THEN** the change is added to the execution queue
-- **AND** the orchestrator detects and starts processing the change
-- **AND** log displays "Processing dynamically added: <change-id>"
-
-#### Scenario: Dynamically added change processing completion
-
-- **WHEN** processing of a dynamically added change completes
-- **THEN** the change status updates to "completed" or "archived"
-- **AND** remaining dynamic queue items continue processing
-- **AND** "AllCompleted" event is sent when both initial and dynamic queues are empty
-
-#### Scenario: Prevent duplicate addition
-
-- **WHEN** attempting to add a change that already exists in the queue
-- **THEN** the addition is ignored
-- **AND** a warning log is displayed
+#### Scenario: Processing 中の change は操作できない
+- **WHEN** change が Processing または Archiving である
+- **THEN** Space キーを押しても selected/queue 状態は変更されない
 
 ### Requirement: Error State Display
 
@@ -632,6 +587,13 @@ The TUI SHALL track archived changes reliably and report accurate final status.
 - **AND** the error is logged with details
 - **AND** the change is not removed from tracking until explicitly handled
 
+#### Scenario: Archive command succeeded but change not archived
+- **WHEN** an archive command exits successfully (exit code 0)
+- **AND** archive verification indicates the change is not archived
+- **THEN** the orchestrator re-runs the archive command up to N times before marking the change as errored
+- **AND** each retry attempt is logged
+- **AND** no arbitrary delay-based polling is used
+
 ### Requirement: TUI Uses Native Change Discovery
 
 The TUI mode MUST use native directory scanning instead of external `openspec list` command for all change list operations.
@@ -997,41 +959,14 @@ The apply history context MUST be formatted as XML-like tags containing the agen
 - **AND** the orchestrator captures this summary message for history
 
 ### Requirement: TUI Stop Processing with Escape Key
+TUIはEsc二度押しによる強制停止時、現在のエージェントプロセスとその子プロセスを確実に終了しなければならない（SHALL）。
 
-The TUI SHALL allow users to stop ongoing processing using the Escape key.
-
-#### Scenario: Graceful stop completes naturally
-
-- **WHEN** TUI is in Stopping mode
-- **AND** the current agent process completes successfully
-- **THEN** the TUI transitions to Stopped mode
-- **AND** the completed change transitions to appropriate status (completed/archived)
-- **AND** log displays "Stopped - processing halted"
-
-#### Scenario: Graceful stop with incomplete processing (NEW)
-
-- **WHEN** TUI is in Stopping mode
-- **AND** the orchestrator stops without completing the current change
-- **OR** the current change is still in Processing/Archiving state when stop completes
-- **THEN** the TUI transitions to Stopped mode
-- **AND** any changes in Processing or Archiving status SHALL transition to Queued status
-- **AND** elapsed time for interrupted changes SHALL be recorded
-- **AND** log displays "Processing stopped"
-- **AND** interrupted changes can be resumed with F5 key
-
-#### Scenario: Second Esc press forces immediate stop
-
-- **WHEN** TUI is in Stopping mode
-- **AND** user presses Escape key again
-- **THEN** the current agent process is terminated immediately (SIGTERM)
-- **AND** the TUI transitions to Stopped mode
-- **AND** log displays "Force stopped - process terminated"
-- **AND** the interrupted change status becomes "queued" (not error)
-- **AND** elapsed time for interrupted changes SHALL be recorded
-
-**Note**: Graceful stopとForce stopは、中断された変更の状態遷移において同じ動作をします（両方ともQueuedに戻す）。
-
----
+#### Scenario: 強制停止で子プロセスが残らない
+- **WHEN** TUIがStoppingモードでユーザーがEscを再度押す
+- **THEN** 現在のエージェントプロセスとその子プロセスが終了する
+- **AND** 終了待機がタイムアウトした場合でも、追加の終了処理が行われる
+- **AND** ログに「Force stopped - process terminated」が表示される
+- **AND** 変更の状態はQueuedに戻る
 
 ### Requirement: TUI Stopped Mode
 
@@ -1367,3 +1302,18 @@ TUIはProcessing/Running中のchangeに対してworktree削除を許可しては
 - **GIVEN** 選択中changeがProcessing/Running中である
 - **WHEN** SelectモードでDキーを押す
 - **THEN** 削除は行われず、禁止メッセージが表示される
+
+### Requirement: Serial Apply Iteration WIP Commits
+逐次（非parallel）applyループでは、各イテレーション終了後に作業内容をWIPコミットとして保存しなければならない（MUST）。apply成功・失敗や進捗増加の有無に関わらず、最新状態をスナップショットとして残さなければならない（MUST）。
+
+WIPコミットメッセージは `WIP: {change_id} ({completed}/{total} tasks, apply#{iteration})` の形式としなければならない（MUST）。Gitリポジトリで実行中の場合、`git add -A` と `git commit --allow-empty` 相当の操作で新規WIPコミットを作成しなければならない（MUST）。既存WIPコミットの `--amend` を使用してはならない（MUST NOT）。
+
+#### Scenario: WIP created after successful apply iteration
+- Given: 逐次applyループが実行中である
+- When: applyコマンドが正常に完了しイテレーションが終了する
+- Then: WIPスナップショットが新規コミットとして作成される
+
+#### Scenario: WIP created after failed apply iteration
+- Given: 逐次applyループが実行中である
+- When: applyコマンドが失敗してイテレーションが終了する
+- Then: 失敗時点の作業内容がWIPスナップショットとして保存される

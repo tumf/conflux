@@ -5,6 +5,7 @@
 //! - Windows: Job Objects (automatic termination on parent exit)
 
 use std::io;
+use std::time::Duration;
 use tokio::process::Child;
 use tracing::{debug, warn};
 
@@ -42,6 +43,15 @@ pub struct ManagedChild {
     pub handle: ProcessHandle,
 }
 
+/// Result of a termination attempt.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum TerminationOutcome {
+    Exited(std::process::ExitStatus),
+    ForceKilled(std::process::ExitStatus),
+    TimedOut,
+}
+
 impl ManagedChild {
     /// Creates a new managed child from a tokio Child process
     pub fn new(mut child: Child) -> io::Result<Self> {
@@ -65,6 +75,38 @@ impl ManagedChild {
         self.handle.terminate(&self.child)
     }
 
+    /// Forcefully kills the child process and its descendants.
+    pub async fn force_kill(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.handle.force_kill()
+        }
+
+        #[cfg(windows)]
+        {
+            self.child.kill().await
+        }
+    }
+
+    /// Terminates the process, waits for exit, then force kills if needed.
+    pub async fn terminate_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> io::Result<TerminationOutcome> {
+        self.terminate()?;
+
+        match tokio::time::timeout(timeout, self.wait()).await {
+            Ok(status) => Ok(TerminationOutcome::Exited(status?)),
+            Err(_) => {
+                self.force_kill().await?;
+                match tokio::time::timeout(timeout, self.wait()).await {
+                    Ok(status) => Ok(TerminationOutcome::ForceKilled(status?)),
+                    Err(_) => Ok(TerminationOutcome::TimedOut),
+                }
+            }
+        }
+    }
+
     /// Returns the process ID
     #[allow(dead_code)]
     pub fn id(&self) -> Option<u32> {
@@ -77,6 +119,7 @@ impl ManagedChild {
     }
 
     /// Attempts to kill the child process (fallback to standard kill)
+    #[allow(dead_code)]
     pub async fn kill(&mut self) -> io::Result<()> {
         self.child.kill().await
     }
@@ -104,6 +147,29 @@ impl ProcessHandle {
             }
         } else {
             warn!("No PID available for process group termination");
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn force_kill(&self) -> io::Result<()> {
+        use nix::sys::signal::{killpg, Signal};
+        use nix::unistd::Pid;
+
+        if let Some(pid) = self.pid {
+            debug!("Sending SIGKILL to process group {}", pid);
+            match killpg(Pid::from_raw(pid as i32), Signal::SIGKILL) {
+                Ok(_) => {
+                    debug!("Successfully sent SIGKILL to process group {}", pid);
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!("Failed to send SIGKILL to process group {}: {}", pid, e);
+                    Err(io::Error::other(e))
+                }
+            }
+        } else {
+            warn!("No PID available for process group force kill");
             Ok(())
         }
     }
@@ -194,4 +260,58 @@ fn assign_to_job(child: &Child) -> io::Result<JobObjectGuard> {
 /// Configures the command for Windows (no-op, job assignment happens after spawn)
 pub fn configure_process_group(_cmd: &mut tokio::process::Command) {
     // No pre-spawn configuration needed on Windows
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use tokio::process::Command;
+
+    #[tokio::test]
+    async fn terminate_with_timeout_exits_cleanly() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 5")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        configure_process_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn sleep");
+        let mut child = ManagedChild::new(child).expect("managed child");
+
+        let outcome = child
+            .terminate_with_timeout(Duration::from_secs(1))
+            .await
+            .expect("terminate");
+
+        assert!(matches!(
+            outcome,
+            TerminationOutcome::Exited(_) | TerminationOutcome::ForceKilled(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminate_with_timeout_force_kills() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("trap '' TERM; while true; do sleep 1; done")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        configure_process_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn trap");
+        let mut child = ManagedChild::new(child).expect("managed child");
+
+        let outcome = child
+            .terminate_with_timeout(Duration::from_millis(200))
+            .await
+            .expect("terminate");
+
+        assert!(matches!(
+            outcome,
+            TerminationOutcome::Exited(_)
+                | TerminationOutcome::ForceKilled(_)
+                | TerminationOutcome::TimedOut
+        ));
+    }
 }

@@ -16,6 +16,7 @@ pub use types::{FailedChangeTracker, WorkspaceResult};
 use crate::analyzer::{extract_change_dependencies, ParallelGroup};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::events::LogEntry;
 use crate::execution::archive::is_change_archived;
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{
@@ -24,8 +25,9 @@ use crate::vcs::{
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use cleanup::WorkspaceCleanupGuard;
@@ -51,6 +53,8 @@ pub struct ParallelExecutor {
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
     /// Maximum retries for conflict resolution
     max_conflict_retries: u32,
+    /// Serialize merges into the target branch.
+    merge_lock: Arc<Mutex<()>>,
     /// Repository root path for archive operations
     repo_root: PathBuf,
     /// Disable automatic workspace resume (always create new workspaces)
@@ -59,6 +63,8 @@ pub struct ParallelExecutor {
     failed_tracker: FailedChangeTracker,
     /// Hook runner for executing hooks (optional)
     hooks: Option<Arc<HookRunner>>,
+    /// Cancellation token for force stop cleanup
+    cancel_token: Option<CancellationToken>,
 }
 
 impl ParallelExecutor {
@@ -126,10 +132,12 @@ impl ParallelExecutor {
             archive_command,
             event_tx,
             max_conflict_retries: 3,
+            merge_lock: Arc::new(Mutex::new(())),
             repo_root,
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
+            cancel_token: None,
         }
     }
 
@@ -146,6 +154,17 @@ impl ParallelExecutor {
     /// are reused to resume interrupted work.
     pub fn set_no_resume(&mut self, no_resume: bool) {
         self.no_resume = no_resume;
+    }
+
+    /// Set the cancellation token for force stop cleanup.
+    pub fn set_cancel_token(&mut self, cancel_token: CancellationToken) {
+        self.cancel_token = Some(cancel_token);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
     }
 
     /// Resolve VCS backend (convert Auto to concrete backend)
@@ -213,6 +232,14 @@ impl ParallelExecutor {
         info!("Preparation complete");
 
         for group in groups {
+            if self.is_cancelled() {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::warn("Parallel execution cancelled")),
+                )
+                .await;
+                return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+            }
             let group_size = group.changes.len();
             self.execute_group(&group, total_changes, changes_processed)
                 .await?;
@@ -279,6 +306,14 @@ impl ParallelExecutor {
         let mut changes_processed: usize = 0;
 
         while !changes.is_empty() {
+            if self.is_cancelled() {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::warn("Parallel execution cancelled")),
+                )
+                .await;
+                return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+            }
             // Filter out changes that depend on failed changes
             let executable_changes: Vec<_> = changes
                 .iter()
@@ -379,6 +414,14 @@ impl ParallelExecutor {
         total_changes: usize,
         changes_processed: usize,
     ) -> Result<()> {
+        if self.is_cancelled() {
+            send_event(
+                &self.event_tx,
+                ParallelEvent::Log(LogEntry::warn("Parallel execution cancelled")),
+            )
+            .await;
+            return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+        }
         // First, check which changes should be skipped due to failed dependencies
         let mut changes_to_execute: Vec<String> = Vec::new();
         let mut skipped_changes: Vec<(String, String)> = Vec::new();
@@ -636,14 +679,18 @@ impl ParallelExecutor {
                     "Merging archived {} (workspace: {})",
                     result.change_id, result.workspace_name
                 );
-                if let Err(e) = self.merge_and_resolve(&revisions, &change_ids).await {
-                    let error_msg = format!(
-                        "Failed to merge archived {} (workspace: {}): {}",
-                        result.change_id, result.workspace_name, e
-                    );
-                    error!("{}", error_msg);
-                    send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
-                    return Err(e);
+                {
+                    let _merge_guard = self.merge_lock.lock().await;
+                    if let Err(e) = self.merge_and_resolve(&revisions, &change_ids).await {
+                        let error_msg = format!(
+                            "Failed to merge archived {} (workspace: {}): {}",
+                            result.change_id, result.workspace_name, e
+                        );
+                        error!("{}", error_msg);
+                        send_event(&self.event_tx, ParallelEvent::Error { message: error_msg })
+                            .await;
+                        return Err(e);
+                    }
                 }
 
                 if let Some(workspace) = archived_workspaces
@@ -841,6 +888,7 @@ impl ParallelExecutor {
             let event_tx = self.event_tx.clone();
             let vcs_backend = self.workspace_manager.backend_type();
             let hooks = self.hooks.clone();
+            let cancel_token = self.cancel_token.clone();
 
             // Build parallel hook context
             let parallel_ctx = ParallelHookContext {
@@ -869,6 +917,7 @@ impl ParallelExecutor {
                     vcs_backend,
                     hooks.as_ref().map(|h| h.as_ref()),
                     Some(&parallel_ctx),
+                    cancel_token.as_ref(),
                 )
                 .await;
 
@@ -900,6 +949,7 @@ impl ParallelExecutor {
                             vcs_backend,
                             hooks.as_ref().map(|h| h.as_ref()),
                             Some(&parallel_ctx),
+                            cancel_token.as_ref(),
                         )
                         .await;
 
@@ -985,7 +1035,11 @@ impl ParallelExecutor {
                             "Merging {} (workspace: {})",
                             workspace_result.change_id, workspace_result.workspace_name
                         );
-                        match self.merge_and_resolve(&revisions, &change_ids).await {
+                        let merge_result = {
+                            let _merge_guard = self.merge_lock.lock().await;
+                            self.merge_and_resolve(&revisions, &change_ids).await
+                        };
+                        match merge_result {
                             Ok(_) => {
                                 info!(
                                     "Successfully merged {} (workspace: {})",
@@ -1530,10 +1584,25 @@ mod tests {
 
         let resolver_script = repo_root.join("merge-resolver.sh");
         let script_contents = format!(
-            "#!/bin/sh\nset -e\ngit checkout main\n\
+            "#!/bin/sh\nset -e\nROOT=\"$(pwd)\"\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff -m 'Pre-sync base into change-a' main\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
             git merge --no-ff -m 'Merge change: change-a' {}\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff -m 'Pre-sync base into change-b' main\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
             git merge --no-ff -m 'Merge change: change-b' {}\n",
-            workspace_a.name, workspace_b.name
+            workspace_a.path.to_string_lossy(),
+            workspace_a.name,
+            workspace_a.name,
+            workspace_b.path.to_string_lossy(),
+            workspace_b.name,
+            workspace_b.name
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
 
@@ -1544,10 +1613,12 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
+            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
+            cancel_token: None,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1646,13 +1717,28 @@ mod tests {
 
         let resolver_script = repo_root.join("merge-resolver.sh");
         let script_contents = format!(
-            "#!/bin/sh\nset -e\ngit checkout main\n\
+            "#!/bin/sh\nset -e\nROOT=\"$(pwd)\"\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff -m 'Pre-sync base into change-a' main\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
             git merge --no-ff -m 'Merge change: change-a' {}\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff -m 'Pre-sync base into change-b' main\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
             git merge --no-ff -m 'Merge change: change-b' {}\n\
             echo 'post-merge' >> README.md\n\
             git add -A\n\
             git commit -m 'Post-merge commit'\n",
-            workspace_a.name, workspace_b.name
+            workspace_a.path.to_string_lossy(),
+            workspace_a.name,
+            workspace_a.name,
+            workspace_b.path.to_string_lossy(),
+            workspace_b.name,
+            workspace_b.name
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
 
@@ -1663,10 +1749,12 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
+            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
+            cancel_token: None,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1769,10 +1857,12 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
+            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
+            cancel_token: None,
         };
 
         let revisions = vec![workspace_a.name];
@@ -1871,16 +1961,29 @@ mod tests {
 
         let resolver_script = repo_root.join("merge-resolver.sh");
         let script_contents = format!(
-            "#!/bin/sh\nset -e\n\
+            "#!/bin/sh\nset -e\nROOT=\"$(pwd)\"\n\
             if [ -f .git/merge-missing-marker ]; then\n\
+              cd \"{}\"\n\
+              git checkout {}\n\
+              git merge --no-ff -m 'Pre-sync base into change-b' main\n\
+              cd \"$ROOT\"\n\
               git checkout main\n\
               git merge --no-ff -m 'Merge change: change-b' {}\n\
               exit 0\n\
             fi\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff -m 'Pre-sync base into change-a' main\n\
+            cd \"$ROOT\"\n\
             git checkout main\n\
             git merge --no-ff -m 'Merge change: change-a' {}\n\
             touch .git/merge-missing-marker\n",
-            workspace_b.name, workspace_a.name
+            workspace_b.path.to_string_lossy(),
+            workspace_b.name,
+            workspace_b.name,
+            workspace_a.path.to_string_lossy(),
+            workspace_a.name,
+            workspace_a.name
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
 
@@ -1891,10 +1994,12 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
+            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
+            cancel_token: None,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2003,18 +2108,33 @@ mod tests {
 
         let resolver_script = repo_root.join("merge-resolver.sh");
         let script_contents = format!(
-            "#!/bin/sh\nset -e\ngit checkout main\n\
+            "#!/bin/sh\nset -e\nROOT=\"$(pwd)\"\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff -m 'Pre-sync base into change-a' main\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
             git merge --no-ff -m 'Merge change: change-a' {}\n\
-            if ! git merge --no-ff -m 'Merge change: change-b' {}; then\n\
-              if [ -f .git/MERGE_HEAD ]; then\n\
-                git checkout --theirs conflict.txt\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            if ! git merge --no-ff -m 'Pre-sync base into change-b' main; then\n\
+              if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then\n\
+                git checkout --ours conflict.txt\n\
                 git add -A\n\
-                git commit -m 'Merge change: change-b'\n\
+                git commit -m 'Pre-sync base into change-b'\n\
               else\n\
                 exit 1\n\
               fi\n\
-            fi\n",
-            workspace_a.name, workspace_b.name
+            fi\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
+            git merge --no-ff -m 'Merge change: change-b' {}\n",
+            workspace_a.path.to_string_lossy(),
+            workspace_a.name,
+            workspace_a.name,
+            workspace_b.path.to_string_lossy(),
+            workspace_b.name,
+            workspace_b.name
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
 
@@ -2025,10 +2145,12 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
+            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
+            cancel_token: None,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2131,10 +2253,13 @@ mod tests {
         let hooks_dir = repo_root.join(".git/hooks");
         let hook_path = hooks_dir.join("pre-commit");
         let hook_contents = "#!/bin/sh\n\
-        if [ ! -f .git/hooks/pre-commit-ran ]; then\n\
+        set -e\n\
+        COMMON_DIR=$(git rev-parse --git-common-dir)\n\
+        MARKER=\"$COMMON_DIR/hooks/pre-commit-ran\"\n\
+        if [ ! -f \"$MARKER\" ]; then\n\
           echo 'hooked' >> hooked.txt\n\
           git add hooked.txt\n\
-          touch .git/hooks/pre-commit-ran\n\
+          touch \"$MARKER\"\n\
           exit 1\n\
         fi\n\
         exit 0\n";
@@ -2149,12 +2274,23 @@ mod tests {
 
         let resolver_script = repo_root.join("merge-resolver.sh");
         let script_contents = format!(
-            "#!/bin/sh\nset -e\ngit checkout main\n\
+            "#!/bin/sh\nset -e\nROOT=\"$(pwd)\"\n\
+            cd \"{}\"\n\
+            git checkout {}\n\
+            git merge --no-ff --no-commit main\n\
+            if ! git commit -m 'Pre-sync base into change-a'; then\n\
+              git add -A\n\
+              git commit -m 'Pre-sync base into change-a'\n\
+            fi\n\
+            cd \"$ROOT\"\n\
+            git checkout main\n\
             git merge --no-ff --no-commit {}\n\
             if ! git commit -m 'Merge change: change-a'; then\n\
               git add -A\n\
               git commit -m 'Merge change: change-a'\n\
             fi\n",
+            workspace_a.path.to_string_lossy(),
+            workspace_a.name,
             workspace_a.name
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
@@ -2166,10 +2302,12 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
+            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
             hooks: None,
+            cancel_token: None,
         };
 
         let revisions = vec![workspace_a.name];

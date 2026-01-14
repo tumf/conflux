@@ -7,6 +7,7 @@
 //! - Auto-refresh of change list
 
 mod events;
+pub mod log_deduplicator;
 mod orchestrator;
 mod qr;
 mod queue;

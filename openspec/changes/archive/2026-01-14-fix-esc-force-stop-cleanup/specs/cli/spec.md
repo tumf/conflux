@@ -1,5 +1,5 @@
 ## MODIFIED Requirements
-### Requirement: Esc二度押しの強制停止で子プロセスを終了
+### Requirement: TUI Stop Processing with Escape Key
 TUIはEsc二度押しによる強制停止時、現在のエージェントプロセスとその子プロセスを確実に終了しなければならない（SHALL）。
 
 #### Scenario: 強制停止で子プロセスが残らない

@@ -152,7 +152,7 @@ impl WebState {
             let update = StateUpdate {
                 msg_type: "state_update".to_string(),
                 timestamp: chrono::Utc::now().to_rfc3339(),
-                changes: has_changes,
+                changes: new_state.changes.clone(),
             };
 
             // Ignore send errors (no subscribers)
@@ -475,11 +475,11 @@ mod tests {
         let updated = vec![create_test_change("change-a", 2, 5)];
         web_state.update(&updated).await;
 
-        // Broadcast should include archived change
+        // Broadcast should include the latest full list
         let update = rx.try_recv().unwrap();
         assert_eq!(update.changes.len(), 1);
-        assert_eq!(update.changes[0].id, "change-b");
-        assert_eq!(update.changes[0].status, "archived");
+        assert_eq!(update.changes[0].id, "change-a");
+        assert_eq!(update.changes[0].status, "in_progress");
     }
 
     #[tokio::test]
@@ -496,9 +496,10 @@ mod tests {
         ];
         web_state.update(&updated).await;
 
-        // Broadcast should include only new change
+        // Broadcast should include the latest full list
         let update = rx.try_recv().unwrap();
-        assert_eq!(update.changes.len(), 1);
-        assert_eq!(update.changes[0].id, "change-b");
+        assert_eq!(update.changes.len(), 2);
+        assert!(update.changes.iter().any(|change| change.id == "change-a"));
+        assert!(update.changes.iter().any(|change| change.id == "change-b"));
     }
 }
