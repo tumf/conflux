@@ -5,6 +5,8 @@ use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{VcsBackend, WorkspaceManager};
+use std::fs;
+use std::path::Path;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -35,6 +37,35 @@ pub async fn get_vcs_log_for_revisions(
         .get_log_for_revisions(revisions)
         .await
         .map_err(OrchestratorError::from)
+}
+
+fn cleanup_approved_only_changes(repo_root: &Path, change_ids: &[String]) -> Result<Vec<String>> {
+    let changes_root = repo_root.join("openspec").join("changes");
+    let mut removed = Vec::new();
+
+    for change_id in change_ids {
+        let change_dir = changes_root.join(change_id);
+        if !change_dir.exists() || !change_dir.is_dir() {
+            continue;
+        }
+
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&change_dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            entries.push((name, entry.path()));
+        }
+
+        if entries.len() == 1 {
+            let (name, path) = &entries[0];
+            if name == "approved" && path.is_file() {
+                fs::remove_dir_all(&change_dir)?;
+                removed.push(change_id.clone());
+            }
+        }
+    }
+
+    Ok(removed)
 }
 
 /// Attempt to resolve conflicts with retries using the configured resolve command.
@@ -116,14 +147,22 @@ pub async fn resolve_conflicts_with_retry(
         let status = child.wait().await.map_err(|e| {
             OrchestratorError::AgentCommand(format!("Resolve command failed: {}", e))
         })?;
+        let status_success = status.success();
 
-        if status.success() {
-            // Verify resolution
-            let remaining_conflicts = detect_conflicts(workspace_manager).await?;
-            if remaining_conflicts.is_empty() {
-                send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
-                return Ok(());
+        // Verify resolution regardless of exit code
+        let remaining_conflicts = detect_conflicts(workspace_manager).await?;
+        if remaining_conflicts.is_empty() {
+            if !status_success {
+                warn!(
+                    "Resolve command exited non-zero but conflicts cleared (attempt {}/{})",
+                    attempt, max_retries
+                );
             }
+            send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
+            return Ok(());
+        }
+
+        if status_success {
             warn!(
                 "Conflicts still present after resolution attempt: {:?}",
                 remaining_conflicts
@@ -258,40 +297,84 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         let status = child.wait().await.map_err(|e| {
             OrchestratorError::AgentCommand(format!("Resolve command failed: {}", e))
         })?;
+        let status_success = status.success();
 
-        if status.success() {
-            let remaining_conflicts = detect_conflicts(workspace_manager).await?;
-            if remaining_conflicts.is_empty() {
-                if matches!(
-                    workspace_manager.backend_type(),
-                    VcsBackend::Git | VcsBackend::Auto
-                ) {
-                    let merge_in_progress =
-                        git_commands::is_merge_in_progress(workspace_manager.repo_root())
-                            .await
-                            .map_err(OrchestratorError::from)?;
+        let remaining_conflicts = detect_conflicts(workspace_manager).await?;
+        if remaining_conflicts.is_empty() {
+            if matches!(
+                workspace_manager.backend_type(),
+                VcsBackend::Git | VcsBackend::Auto
+            ) {
+                let repo_root = workspace_manager.repo_root();
+                let merge_in_progress = git_commands::is_merge_in_progress(repo_root)
+                    .await
+                    .map_err(OrchestratorError::from)?;
 
-                    if merge_in_progress {
-                        warn!(
-                            "Merge still in progress after resolve attempt {}/{}",
-                            attempt, max_retries
-                        );
-                        send_event(
-                            event_tx,
-                            ParallelEvent::ResolveOutput {
-                                output:
-                                    "Merge still in progress (MERGE_HEAD exists); retrying resolve"
-                                        .to_string(),
-                            },
-                        )
-                        .await;
-                        continue;
-                    }
+                if merge_in_progress {
+                    warn!(
+                        "Merge still in progress after resolve attempt {}/{}",
+                        attempt, max_retries
+                    );
+                    send_event(
+                        event_tx,
+                        ParallelEvent::ResolveOutput {
+                            output: "Merge still in progress (MERGE_HEAD exists); retrying resolve"
+                                .to_string(),
+                        },
+                    )
+                    .await;
+                    continue;
                 }
 
-                send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
-                return Ok(());
+                let missing_commits =
+                    git_commands::missing_merge_commits_since(repo_root, base_revision, change_ids)
+                        .await
+                        .map_err(OrchestratorError::from)?;
+
+                if !missing_commits.is_empty() {
+                    warn!(
+                        "Missing merge commits after resolve attempt {}/{}: {:?}",
+                        attempt, max_retries, missing_commits
+                    );
+                    send_event(
+                        event_tx,
+                        ParallelEvent::ResolveOutput {
+                            output: format!(
+                                "Missing merge commits for change_ids ({}); retrying resolve",
+                                missing_commits.join(", ")
+                            ),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+
+                let removed_changes = cleanup_approved_only_changes(repo_root, change_ids)?;
+                if !removed_changes.is_empty() {
+                    send_event(
+                        event_tx,
+                        ParallelEvent::ResolveOutput {
+                            output: format!(
+                                "Removed approved-only change directories: {}",
+                                removed_changes.join(", ")
+                            ),
+                        },
+                    )
+                    .await;
+                }
             }
+
+            if !status_success {
+                warn!(
+                    "Resolve command exited non-zero but goals met (attempt {}/{})",
+                    attempt, max_retries
+                );
+            }
+            send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
+            return Ok(());
+        }
+
+        if status_success {
             warn!(
                 "Conflicts still present after merge resolution attempt: {:?}",
                 remaining_conflicts

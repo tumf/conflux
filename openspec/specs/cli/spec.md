@@ -195,7 +195,7 @@ When auto-refresh detects new changes, they SHALL be displayed appropriately.
 
 ### Requirement: Dynamic Execution Queue
 
-In running mode, unselected changes can be added to the queue, and queued changes can be removed. Added changes SHALL be processed by the orchestrator.
+In running mode, unselected changes can be added to the queue, and queued changes can be removed. Added changes SHALL be processed by the orchestrator. If a queued change is removed before processing begins, the orchestrator SHALL exclude it from pending execution.
 
 #### Scenario: Queue addition during execution
 
@@ -212,6 +212,8 @@ In running mode, unselected changes can be added to the queue, and queued change
 - **THEN** the change is removed from the queue
 - **AND** display updates from "queued" to "not queued"
 - **AND** the selection is cleared
+- **AND** the orchestrator removes the change from pending execution if it has not started processing
+- **AND** the change is not processed later in the run
 
 #### Scenario: Processing order after queue addition
 

@@ -449,14 +449,24 @@ async fn run_tui_loop(
                 }
                 TuiCommand::RemoveFromQueue(id) => {
                     // Remove from dynamic queue so orchestrator won't process it
-                    if dynamic_queue.remove(&id).await {
-                        app.add_log(LogEntry::info(format!(
-                            "Removed from queue: {} (also removed from dynamic queue)",
-                            id
-                        )));
-                    } else {
-                        app.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
+                    let removed_from_dynamic = dynamic_queue.remove(&id).await;
+                    let removed_from_pending = dynamic_queue.mark_removed(id.clone()).await;
+                    let mut details = Vec::new();
+                    if removed_from_dynamic {
+                        details.push("also removed from dynamic queue");
                     }
+                    if removed_from_pending {
+                        details.push("removed from pending");
+                    }
+                    let suffix = if details.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", details.join(", "))
+                    };
+                    app.add_log(LogEntry::info(format!(
+                        "Removed from queue: {}{}",
+                        id, suffix
+                    )));
                 }
                 TuiCommand::ApproveOnly(id) => {
                     // Approve without adding to queue (select/running/stopped modes)
@@ -505,17 +515,23 @@ async fn run_tui_loop(
                             }
                             // Remove from dynamic queue so orchestrator won't process it
                             let removed_from_dynamic = dynamic_queue.remove(&id).await;
-                            let msg = if was_queued {
-                                if removed_from_dynamic {
-                                    format!(
-                                        "Unapproved and removed from queue: {} (also removed from dynamic queue)",
-                                        id
-                                    )
-                                } else {
-                                    format!("Unapproved and removed from queue: {}", id)
-                                }
+                            let removed_from_pending = dynamic_queue.mark_removed(id.clone()).await;
+                            let mut details = Vec::new();
+                            if removed_from_dynamic {
+                                details.push("also removed from dynamic queue");
+                            }
+                            if removed_from_pending {
+                                details.push("removed from pending");
+                            }
+                            let suffix = if details.is_empty() {
+                                String::new()
                             } else {
-                                format!("Unapproved: {}", id)
+                                format!(" ({})", details.join(", "))
+                            };
+                            let msg = if was_queued {
+                                format!("Unapproved and removed from queue: {}{}", id, suffix)
+                            } else {
+                                format!("Unapproved: {}{}", id, suffix)
                             };
                             app.add_log(LogEntry::info(msg));
                         }

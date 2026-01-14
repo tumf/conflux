@@ -238,6 +238,41 @@ pub async fn is_merge_in_progress<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
     Ok(output.status.success())
 }
 
+/// Return any change_ids missing merge commits since base_revision.
+///
+/// A merge commit is recognized by the subject containing `Merge change: <change_id>`.
+pub async fn missing_merge_commits_since<P: AsRef<Path>>(
+    cwd: P,
+    base_revision: &str,
+    change_ids: &[String],
+) -> VcsResult<Vec<String>> {
+    if change_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let output = run_git(
+        &[
+            "log",
+            "--merges",
+            "--format=%s",
+            &format!("{}..HEAD", base_revision),
+        ],
+        cwd,
+    )
+    .await?;
+
+    let merge_messages: Vec<&str> = output.lines().collect();
+    let mut missing = Vec::new();
+    for change_id in change_ids {
+        let expected = format!("Merge change: {}", change_id);
+        if !merge_messages.iter().any(|line| line.contains(&expected)) {
+            missing.push(change_id.clone());
+        }
+    }
+
+    Ok(missing)
+}
+
 /// Stage all changes and commit with the given message.
 #[allow(dead_code)]
 pub async fn add_and_commit<P: AsRef<Path>>(cwd: P, message: &str) -> VcsResult<()> {

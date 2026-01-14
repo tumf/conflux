@@ -3,7 +3,7 @@
 //! This module provides a thread-safe queue for dynamically adding changes
 //! during orchestrator execution.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct DynamicQueue {
     inner: Arc<Mutex<VecDeque<String>>>,
+    removed: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DynamicQueue {
@@ -22,12 +23,17 @@ impl DynamicQueue {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(VecDeque::new())),
+            removed: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
     /// Push a change ID to the queue
     /// Returns false if the ID is already in the queue
     pub async fn push(&self, id: String) -> bool {
+        {
+            let mut removed = self.removed.lock().await;
+            removed.remove(&id);
+        }
         let mut queue = self.inner.lock().await;
         if queue.contains(&id) {
             return false;
@@ -52,6 +58,19 @@ impl DynamicQueue {
         } else {
             false
         }
+    }
+
+    /// Mark a change ID as removed from the pending set
+    /// Returns true if the ID was newly marked for removal
+    pub async fn mark_removed(&self, id: String) -> bool {
+        let mut removed = self.removed.lock().await;
+        removed.insert(id)
+    }
+
+    /// Drain all removed IDs for pending removal processing
+    pub async fn drain_removed(&self) -> Vec<String> {
+        let mut removed = self.removed.lock().await;
+        removed.drain().collect()
     }
 
     /// Check if the queue is empty
@@ -192,5 +211,30 @@ mod tests {
         // Should be able to push the same item again
         assert!(queue.push("a".to_string()).await);
         assert_eq!(queue.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_mark_removed_and_drain() {
+        let queue = DynamicQueue::new();
+
+        assert!(queue.mark_removed("a".to_string()).await);
+        assert!(!queue.mark_removed("a".to_string()).await);
+        assert!(queue.mark_removed("b".to_string()).await);
+
+        let mut removed = queue.drain_removed().await;
+        removed.sort();
+        assert_eq!(removed, vec!["a".to_string(), "b".to_string()]);
+        assert!(queue.drain_removed().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_push_clears_removed_marker() {
+        let queue = DynamicQueue::new();
+
+        assert!(queue.mark_removed("a".to_string()).await);
+        assert!(queue.push("a".to_string()).await);
+
+        let removed = queue.drain_removed().await;
+        assert!(removed.is_empty());
     }
 }

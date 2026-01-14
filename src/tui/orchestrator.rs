@@ -31,6 +31,28 @@ pub enum ArchiveResult {
     Cancelled,
 }
 
+fn apply_pending_removals(
+    pending_changes: &mut HashSet<String>,
+    processed_change_ids: &mut Vec<String>,
+    apply_counts: &mut HashMap<String, u32>,
+    removed_ids: Vec<String>,
+) -> Vec<String> {
+    if removed_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut removed_pending = Vec::new();
+    for id in removed_ids {
+        if pending_changes.remove(&id) {
+            processed_change_ids.retain(|existing| existing != &id);
+            apply_counts.remove(&id);
+            removed_pending.push(id);
+        }
+    }
+
+    removed_pending
+}
+
 /// Archive a single completed change
 /// Returns Ok(ArchiveResult) indicating success, failure, or cancellation
 pub async fn archive_single_change(
@@ -418,6 +440,24 @@ pub async fn run_orchestrator(
                 pending_changes.insert(dynamic_id.clone());
                 processed_change_ids.push(dynamic_id);
                 total_changes += 1;
+            }
+        }
+
+        let removed_pending = apply_pending_removals(
+            &mut pending_changes,
+            &mut processed_change_ids,
+            &mut apply_counts,
+            dynamic_queue.drain_removed().await,
+        );
+        if !removed_pending.is_empty() {
+            total_changes = total_changes.saturating_sub(removed_pending.len());
+            for id in removed_pending {
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                        "Removed from pending queue: {}",
+                        id
+                    ))))
+                    .await;
             }
         }
 
@@ -829,6 +869,20 @@ pub async fn run_orchestrator_parallel(
             }
         }
 
+        let removed_ids = dynamic_queue.drain_removed().await;
+        if !removed_ids.is_empty() {
+            for id in removed_ids {
+                if pending_ids.remove(&id) {
+                    let _ = tx
+                        .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                            "Removed from pending queue: {}",
+                            id
+                        ))))
+                        .await;
+                }
+            }
+        }
+
         // Get changes to process in this batch (pending - processed)
         let batch_ids: Vec<String> = pending_ids.difference(&processed_ids).cloned().collect();
 
@@ -973,6 +1027,7 @@ pub async fn run_orchestrator_parallel(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
     use std::path::Path;
 
     /// Test that the archive path uses the correct directory structure.
@@ -999,6 +1054,33 @@ mod tests {
         // The archive path should be under openspec/changes/archive, not openspec/archive
         assert!(archive_path.starts_with("openspec/changes/archive"));
         assert!(!archive_path.starts_with("openspec/archive/"));
+    }
+
+    #[test]
+    fn test_apply_pending_removals() {
+        let mut pending_changes: HashSet<String> = ["change-a", "change-b"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        let mut processed_change_ids = vec![
+            "change-a".to_string(),
+            "change-b".to_string(),
+            "change-c".to_string(),
+        ];
+        let mut apply_counts = HashMap::from([("change-b".to_string(), 1)]);
+
+        let removed = super::apply_pending_removals(
+            &mut pending_changes,
+            &mut processed_change_ids,
+            &mut apply_counts,
+            vec!["change-b".to_string(), "change-d".to_string()],
+        );
+
+        assert_eq!(removed, vec!["change-b".to_string()]);
+        assert_eq!(pending_changes.len(), 1);
+        assert!(pending_changes.contains("change-a"));
+        assert!(!processed_change_ids.contains(&"change-b".to_string()));
+        assert!(!apply_counts.contains_key("change-b"));
     }
 
     /// Test archive verification logic: when change still exists and archive doesn't,
