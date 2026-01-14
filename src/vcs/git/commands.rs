@@ -213,6 +213,24 @@ pub async fn worktree_add<P: AsRef<Path>>(
     Ok(())
 }
 
+/// Create a new detached worktree at the specified path.
+pub async fn worktree_add_detached<P: AsRef<Path>>(
+    cwd: P,
+    worktree_path: &str,
+    base_commit: &str,
+) -> VcsResult<()> {
+    debug!(
+        "Creating detached worktree at {} from {}",
+        worktree_path, base_commit
+    );
+    run_git(
+        &["worktree", "add", "--detach", worktree_path, base_commit],
+        cwd,
+    )
+    .await?;
+    Ok(())
+}
+
 /// Remove a worktree.
 pub async fn worktree_remove<P: AsRef<Path>>(cwd: P, worktree_path: &str) -> VcsResult<()> {
     debug!("Removing worktree at {}", worktree_path);

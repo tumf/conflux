@@ -35,9 +35,9 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   //   "summary_interval_secs": 60
   // },
 
-  // Command to propose new changes from TUI (+ key)
-  // Supports {proposal} placeholder for the proposal text
-  // "propose_command": "claude --dangerously-skip-permissions --verbose -p '/openspec:proposal {proposal}'",
+  // Command to create a worktree for proposals from TUI (+ key)
+  // Supports {workspace_dir} and {repo_root} placeholders
+  // "worktree_command": "claude --dangerously-skip-permissions --verbose -p '/openspec:proposal --worktree {workspace_dir}'",
 
   // Lifecycle hooks (optional)
   // Available hooks:
@@ -85,9 +85,9 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   //   "summary_interval_secs": 60
   // },
 
-  // Command to propose new changes from TUI (+ key)
-  // Supports {proposal} placeholder for the proposal text
-  // "propose_command": "opencode run '/openspec:proposal {proposal}'",
+  // Command to create a worktree for proposals from TUI (+ key)
+  // Supports {workspace_dir} and {repo_root} placeholders
+  // "worktree_command": "opencode run '/openspec:proposal --worktree {workspace_dir}'",
 
   // Lifecycle hooks (optional)
   // Available hooks:
@@ -135,9 +135,9 @@ pub const CODEX_TEMPLATE: &str = r#"{
   //   "summary_interval_secs": 60
   // },
 
-  // Command to propose new changes from TUI (+ key)
-  // Supports {proposal} placeholder for the proposal text
-  // "propose_command": "codex '/openspec:proposal {proposal}'",
+  // Command to create a worktree for proposals from TUI (+ key)
+  // Supports {workspace_dir} and {repo_root} placeholders
+  // "worktree_command": "codex '/openspec:proposal --worktree {workspace_dir}'",
 
   // Lifecycle hooks (optional)
   // Available hooks:

@@ -255,9 +255,9 @@ This allows you to use different AI tools (Claude Code, OpenCode, Codex, etc.) w
   // System prompt for archive command (injected into {prompt} placeholder)
   "archive_prompt": "",
 
-  // Command to propose new changes from TUI (+ key)
-  // Supports {proposal} placeholder for the proposal text
-  "propose_command": "claude --dangerously-skip-permissions --verbose -p '/openspec:proposal {proposal}'",
+  // Command to create a proposal worktree from TUI (+ key)
+  // Supports {workspace_dir} and {repo_root} placeholders
+  "worktree_command": "claude --dangerously-skip-permissions --verbose -p '/openspec:proposal --worktree {workspace_dir}'",
 
   // Lifecycle hooks (optional)
   "hooks": {
@@ -287,7 +287,8 @@ This allows you to use different AI tools (Claude Code, OpenCode, Codex, etc.) w
 |-------------|-------------|---------|
 | `{change_id}` | The change ID being processed | apply_command, archive_command |
 | `{prompt}` | System prompt for agent commands | apply_command, archive_command, analyze_command |
-| `{proposal}` | Proposal text from TUI input | propose_command |
+| `{workspace_dir}` | New worktree path for proposals | worktree_command |
+| `{repo_root}` | Repository root path | worktree_command |
 
 **System Prompts:**
 

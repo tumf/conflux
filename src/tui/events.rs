@@ -25,8 +25,6 @@ pub enum TuiCommand {
     /// Stop processing (graceful shutdown)
     #[allow(dead_code)]
     Stop,
-    /// Submit a new proposal (execute propose_command with the given text)
-    SubmitProposal(String),
     /// Delete worktrees associated with a change
     DeleteWorktree(String),
     /// Resolve a deferred merge for a change
