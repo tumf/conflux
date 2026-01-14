@@ -221,6 +221,7 @@ mod tests {
     // Note: These tests need to run sequentially due to environment variable manipulation
     // Run with: cargo test --test-threads=1
 
+    // OPENSPEC: openspec/specs/configuration/spec.md#environment-variable-configuration-for-openspec-command/どちらも未設定時はデフォルト値を使用
     #[test]
     fn test_default_openspec_cmd() {
         // Save original env value
@@ -283,6 +284,7 @@ mod tests {
         }
     }
 
+    // OPENSPEC: openspec/specs/configuration/spec.md#environment-variable-configuration-for-openspec-command/環境変数のみ設定
     #[test]
     fn test_env_var_openspec_cmd() {
         // Save original env value
@@ -307,6 +309,7 @@ mod tests {
         assert_eq!(cli.openspec_cmd, "/usr/local/bin/openspec");
     }
 
+    // OPENSPEC: openspec/specs/configuration/spec.md#environment-variable-configuration-for-openspec-command/cli-引数が環境変数より優先
     #[test]
     fn test_cli_arg_overrides_env_var() {
         // Save original env value

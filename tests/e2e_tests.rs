@@ -477,6 +477,7 @@ fn test_opencode_run_command_format() {
 // Archive Priority Tests (fix-tui-archive-skip)
 // ============================================================================
 
+// OPENSPEC: openspec/specs/cli/spec.md#tui-archive-priority-processing/archive-before-next-apply
 #[test]
 fn test_archive_priority_complete_changes_first() {
     // Test scenario: Change A at 100%, Change B at 50%
@@ -541,6 +542,7 @@ esac
     assert!(output.status.success());
 }
 
+// OPENSPEC: openspec/specs/cli/spec.md#tui-archive-priority-processing/multiple-complete-changes
 #[test]
 fn test_archive_priority_multiple_complete_changes() {
     // Test scenario: Multiple changes at 100% completion
@@ -581,6 +583,7 @@ exit 0
     assert!(stdout.contains("1/10")); // incomplete
 }
 
+// OPENSPEC: openspec/specs/cli/spec.md#remove-retry-based-completion-check/completion-detected-on-next-iteration
 #[test]
 fn test_mid_apply_completion_detection() {
     // Test scenario: Change becomes 100% during another apply
