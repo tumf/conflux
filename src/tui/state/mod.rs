@@ -403,7 +403,10 @@ impl AppState {
         let change = &self.changes[self.cursor_index];
 
         // Block approval toggle for processing changes
-        if matches!(change.queue_status, QueueStatus::Processing) {
+        if matches!(
+            change.queue_status,
+            QueueStatus::Processing | QueueStatus::Resolving
+        ) {
             self.warning_message = Some("Cannot change approval for processing change".to_string());
             return None;
         }
@@ -475,7 +478,7 @@ impl AppState {
         let change = &self.changes[self.cursor_index];
         if matches!(
             change.queue_status,
-            QueueStatus::Processing | QueueStatus::Archiving
+            QueueStatus::Processing | QueueStatus::Archiving | QueueStatus::Resolving
         ) {
             self.warning_popup = Some(WarningPopup {
                 title: "Worktree delete blocked".to_string(),

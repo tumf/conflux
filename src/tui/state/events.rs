@@ -48,7 +48,8 @@ impl AppState {
                         QueueStatus::Completed
                         | QueueStatus::Archiving
                         | QueueStatus::Archived
-                        | QueueStatus::MergeWait => {
+                        | QueueStatus::MergeWait
+                        | QueueStatus::Resolving => {
                             // Don't update progress after completion - file may be moved
                         }
                         _ => {
@@ -115,6 +116,51 @@ impl AppState {
                     "Merge deferred for {}: {}",
                     change_id, reason
                 )));
+            }
+            OrchestratorEvent::ResolveStarted { change_id } => {
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+                    if change.started_at.is_none() {
+                        change.started_at = Some(Instant::now());
+                    }
+                    change.queue_status = QueueStatus::Resolving;
+                    change.elapsed_time = None;
+                }
+                self.add_log(LogEntry::info(format!(
+                    "Resolving merge for '{}'",
+                    change_id
+                )));
+            }
+            OrchestratorEvent::ResolveCompleted {
+                change_id,
+                worktree_change_ids,
+            } => {
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+                    change.queue_status = QueueStatus::Archived;
+                    if let Some(started) = change.started_at {
+                        change.elapsed_time = Some(started.elapsed());
+                    }
+                }
+                if let Some(ids) = worktree_change_ids {
+                    self.apply_worktree_status(&ids);
+                }
+                self.add_log(LogEntry::success(format!(
+                    "Merge resolved for '{}'",
+                    change_id
+                )));
+            }
+            OrchestratorEvent::ResolveFailed { change_id, error } => {
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+                    change.queue_status = QueueStatus::MergeWait;
+                    if let Some(started) = change.started_at {
+                        change.elapsed_time = Some(started.elapsed());
+                    }
+                }
+                let message = format!("Failed to resolve merge for '{}': {}", change_id, error);
+                self.warning_popup = Some(super::WarningPopup {
+                    title: "Merge resolve failed".to_string(),
+                    message: message.clone(),
+                });
+                self.add_log(LogEntry::error(message));
             }
             OrchestratorEvent::ProcessingError { id, error } => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
@@ -246,6 +292,7 @@ impl AppState {
                         | QueueStatus::Archiving
                         | QueueStatus::Archived
                         | QueueStatus::MergeWait
+                        | QueueStatus::Resolving
                         | QueueStatus::Processing => {
                             // Don't update progress after completion or during processing
                             // - After completion: file may be moved
@@ -286,6 +333,7 @@ impl AppState {
                         | QueueStatus::Archiving
                         | QueueStatus::Archived
                         | QueueStatus::MergeWait
+                        | QueueStatus::Resolving
                         | QueueStatus::Error(_)
                 )
         });
@@ -302,6 +350,7 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::tui::events::TuiCommand;
+    use std::collections::HashSet;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -419,6 +468,63 @@ mod tests {
             .logs
             .iter()
             .any(|log| log.message.contains("Merge deferred")));
+    }
+
+    #[test]
+    fn test_resolve_started_sets_resolving_status() {
+        let changes = vec![create_approved_change("change-a", 0, 5)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+
+        app.handle_orchestrator_event(OrchestratorEvent::ResolveStarted {
+            change_id: "change-a".to_string(),
+        });
+
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Resolving);
+        assert!(app.changes[0].started_at.is_some());
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("Resolving merge")));
+    }
+
+    #[test]
+    fn test_resolve_completed_sets_archived_and_updates_worktrees() {
+        let changes = vec![create_approved_change("change-a", 0, 5)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].started_at = Some(Instant::now());
+
+        let mut ids = HashSet::new();
+        ids.insert("change-a".to_string());
+
+        app.handle_orchestrator_event(OrchestratorEvent::ResolveCompleted {
+            change_id: "change-a".to_string(),
+            worktree_change_ids: Some(ids),
+        });
+
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archived);
+        assert!(app.changes[0].elapsed_time.is_some());
+        assert!(app.changes[0].has_worktree);
+    }
+
+    #[test]
+    fn test_resolve_failed_restores_merge_wait_and_warns() {
+        let changes = vec![create_approved_change("change-a", 0, 5)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::Resolving;
+
+        app.handle_orchestrator_event(OrchestratorEvent::ResolveFailed {
+            change_id: "change-a".to_string(),
+            error: "boom".to_string(),
+        });
+
+        assert_eq!(app.changes[0].queue_status, QueueStatus::MergeWait);
+        assert!(app.warning_popup.is_some());
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("Failed to resolve merge")));
     }
 
     // === Tests for fix-stopped-task-complete-queued ===
