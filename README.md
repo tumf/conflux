@@ -261,6 +261,20 @@ This allows you to use different AI tools (Claude Code, OpenCode, Codex, etc.) w
 }
 ```
 
+**Logging configuration:**
+
+```jsonc
+{
+  "logging": {
+    "suppress_repetitive_debug": true,
+    "summary_interval_secs": 60
+  }
+}
+```
+
+- `suppress_repetitive_debug`: suppress repeated debug logs when state is unchanged (default: true)
+- `summary_interval_secs`: emit summary logs every N seconds, set to 0 to disable (default: 60)
+
 **Placeholders:**
 
 | Placeholder | Description | Used in |

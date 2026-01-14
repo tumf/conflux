@@ -38,3 +38,9 @@ pub const DEFAULT_MAX_CONCURRENT_WORKSPACES: usize = 3;
 /// Default workspace base directory (uses system temp)
 #[allow(dead_code)]
 pub const DEFAULT_WORKSPACE_BASE_DIR: &str = "";
+
+/// Default suppression for repetitive debug logs
+pub const DEFAULT_SUPPRESS_REPETITIVE_DEBUG: bool = true;
+
+/// Default interval (seconds) for summary log output
+pub const DEFAULT_LOG_SUMMARY_INTERVAL_SECS: u64 = 60;

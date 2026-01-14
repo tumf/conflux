@@ -24,6 +24,35 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
+fn default_suppress_repetitive_debug() -> bool {
+    DEFAULT_SUPPRESS_REPETITIVE_DEBUG
+}
+
+fn default_log_summary_interval_secs() -> u64 {
+    DEFAULT_LOG_SUMMARY_INTERVAL_SECS
+}
+
+/// Logging configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoggingConfig {
+    /// Suppress repetitive debug logs when state has not changed.
+    #[serde(default = "default_suppress_repetitive_debug")]
+    pub suppress_repetitive_debug: bool,
+
+    /// Interval in seconds for emitting status summaries (0 disables summaries).
+    #[serde(default = "default_log_summary_interval_secs")]
+    pub summary_interval_secs: u64,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            suppress_repetitive_debug: DEFAULT_SUPPRESS_REPETITIVE_DEBUG,
+            summary_interval_secs: DEFAULT_LOG_SUMMARY_INTERVAL_SECS,
+        }
+    }
+}
+
 /// Orchestrator configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OrchestratorConfig {
@@ -56,6 +85,10 @@ pub struct OrchestratorConfig {
     /// All hooks are optional.
     #[serde(default)]
     pub hooks: Option<HooksConfig>,
+
+    /// Logging configuration for TUI debug output.
+    #[serde(default)]
+    pub logging: Option<LoggingConfig>,
 
     /// Delay between completion check retries in milliseconds.
     /// Default: 500ms
@@ -157,6 +190,11 @@ impl OrchestratorConfig {
     /// Get the hooks configuration, returning default (empty) if not set
     pub fn get_hooks(&self) -> HooksConfig {
         self.hooks.clone().unwrap_or_default()
+    }
+
+    /// Get logging configuration, returning defaults if not set.
+    pub fn get_logging(&self) -> LoggingConfig {
+        self.logging.clone().unwrap_or_default()
     }
 
     /// Get the maximum iterations limit.
@@ -304,6 +342,26 @@ mod tests {
         assert!(config.apply_command.is_none());
         assert!(config.archive_command.is_none());
         assert!(config.analyze_command.is_none());
+    }
+
+    #[test]
+    fn test_default_logging_config() {
+        let config = OrchestratorConfig::default();
+        assert_eq!(config.get_logging(), LoggingConfig::default());
+    }
+
+    #[test]
+    fn test_parse_logging_config() {
+        let jsonc = r#"{
+            "logging": {
+                "suppress_repetitive_debug": false,
+                "summary_interval_secs": 15
+            }
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        let logging = config.get_logging();
+        assert!(!logging.suppress_repetitive_debug);
+        assert_eq!(logging.summary_interval_secs, 15);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! supporting both bullet lists (`- [ ]`) and numbered lists (`1. [ ]`).
 
 use crate::error::{OrchestratorError, Result};
+use crate::tui::log_deduplicator;
 use regex::Regex;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -59,7 +60,8 @@ fn task_regex() -> &'static Regex {
 ///
 /// Parses each line looking for task checkboxes at the start of lines.
 /// Returns the count of completed and total tasks.
-pub fn parse_content(content: &str) -> TaskProgress {
+/// When change_id is provided, emits deduplicated debug logs.
+pub fn parse_content(content: &str, change_id: Option<&str>) -> TaskProgress {
     let regex = task_regex();
     let mut progress = TaskProgress::new();
 
@@ -76,10 +78,15 @@ pub fn parse_content(content: &str) -> TaskProgress {
         }
     }
 
-    debug!(
-        "Parsed task progress: {}/{} tasks completed",
-        progress.completed, progress.total
-    );
+    if let Some(change_id) = change_id {
+        if log_deduplicator::should_log_task_progress(change_id, progress.completed, progress.total)
+        {
+            debug!(
+                "Parsed task progress: {}/{} tasks completed",
+                progress.completed, progress.total
+            );
+        }
+    }
 
     progress
 }
@@ -87,12 +94,13 @@ pub fn parse_content(content: &str) -> TaskProgress {
 /// Parse task progress from a file.
 ///
 /// Reads the file content and parses it for task checkboxes.
-pub fn parse_file(path: &Path) -> Result<TaskProgress> {
+/// When change_id is provided, emits deduplicated debug logs.
+pub fn parse_file(path: &Path, change_id: Option<&str>) -> Result<TaskProgress> {
     let content = std::fs::read_to_string(path).map_err(|e| {
         OrchestratorError::ConfigLoad(format!("Failed to read tasks file {:?}: {}", path, e))
     })?;
 
-    Ok(parse_content(&content))
+    Ok(parse_content(&content, change_id))
 }
 
 /// Parse task progress for a change by its ID.
@@ -110,7 +118,7 @@ pub fn parse_change(change_id: &str) -> Result<TaskProgress> {
         )));
     }
 
-    parse_file(&tasks_path)
+    parse_file(&tasks_path, Some(change_id))
 }
 
 #[cfg(test)]
@@ -124,7 +132,7 @@ mod tests {
     #[test]
     fn test_bullet_unchecked() {
         let content = "- [ ] Task 1\n- [ ] Task 2";
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         assert_eq!(progress.total, 2);
         assert_eq!(progress.completed, 0);
     }
@@ -132,7 +140,7 @@ mod tests {
     #[test]
     fn test_bullet_checked_lowercase() {
         let content = "- [x] Task 1\n- [x] Task 2";
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         assert_eq!(progress.total, 2);
         assert_eq!(progress.completed, 2);
     }
@@ -140,7 +148,7 @@ mod tests {
     #[test]
     fn test_bullet_checked_uppercase() {
         let content = "- [X] Task 1\n- [X] Task 2";
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         assert_eq!(progress.total, 2);
         assert_eq!(progress.completed, 2);
     }
@@ -148,7 +156,7 @@ mod tests {
     #[test]
     fn test_asterisk_bullets() {
         let content = "* [ ] Task 1\n* [x] Task 2";
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         assert_eq!(progress.total, 2);
         assert_eq!(progress.completed, 1);
     }
@@ -156,7 +164,7 @@ mod tests {
     #[test]
     fn test_bullet_mixed_status() {
         let content = "- [x] Completed\n- [ ] Pending\n- [X] Also done";
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         assert_eq!(progress.total, 3);
         assert_eq!(progress.completed, 2);
     }
@@ -168,7 +176,7 @@ mod tests {
     #[test]
     fn test_numbered_unchecked() {
         let content = "1. [ ] Task 1\n2. [ ] Task 2";
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         assert_eq!(progress.total, 2);
         assert_eq!(progress.completed, 0);
     }
@@ -176,7 +184,7 @@ mod tests {
     #[test]
     fn test_numbered_checked() {
         let content = "1. [x] Task 1\n2. [x] Task 2";
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         assert_eq!(progress.total, 2);
         assert_eq!(progress.completed, 2);
     }
@@ -184,7 +192,7 @@ mod tests {
     #[test]
     fn test_numbered_multi_digit() {
         let content = "1. [x] Task 1\n10. [ ] Task 10\n100. [X] Task 100";
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         assert_eq!(progress.total, 3);
         assert_eq!(progress.completed, 2);
     }
@@ -192,7 +200,7 @@ mod tests {
     #[test]
     fn test_numbered_mixed_status() {
         let content = "1. [x] Done\n2. [ ] Not done\n3. [X] Also done";
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         assert_eq!(progress.total, 3);
         assert_eq!(progress.completed, 2);
     }
@@ -205,7 +213,7 @@ mod tests {
     fn test_mixed_bullets_and_numbers() {
         let content =
             "- [x] Bullet done\n1. [ ] Number pending\n* [X] Asterisk done\n2. [x] Number done";
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         assert_eq!(progress.total, 4);
         assert_eq!(progress.completed, 3);
     }
@@ -222,7 +230,7 @@ mod tests {
 1. [x] Test 1
 2. [ ] Test 2
 "#;
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         assert_eq!(progress.total, 4);
         assert_eq!(progress.completed, 2);
     }
@@ -233,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_empty_content() {
-        let progress = parse_content("");
+        let progress = parse_content("", None);
         assert_eq!(progress.total, 0);
         assert_eq!(progress.completed, 0);
     }
@@ -241,7 +249,7 @@ mod tests {
     #[test]
     fn test_no_tasks() {
         let content = "# Just a header\nSome text without tasks.\n\n- Regular list item";
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         assert_eq!(progress.total, 0);
         assert_eq!(progress.completed, 0);
     }
@@ -250,7 +258,7 @@ mod tests {
     fn test_indented_not_counted() {
         let content =
             "- [x] Parent task\n  - [ ] Sub-task (should not count)\n  - [x] Another sub-task";
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         // Only the parent task at the start of line should count
         assert_eq!(progress.total, 1);
         assert_eq!(progress.completed, 1);
@@ -259,7 +267,7 @@ mod tests {
     #[test]
     fn test_inline_checkbox_not_counted() {
         let content = "Some text with [ ] inline checkbox\nAnother line [x] here";
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         assert_eq!(progress.total, 0);
         assert_eq!(progress.completed, 0);
     }
@@ -267,7 +275,7 @@ mod tests {
     #[test]
     fn test_header_checkbox_not_counted() {
         let content = "## [x] Header with checkbox\n### [ ] Another header";
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         assert_eq!(progress.total, 0);
         assert_eq!(progress.completed, 0);
     }
@@ -294,7 +302,7 @@ mod tests {
 - [ ] Run `cargo test` to verify all tests pass
 - [ ] Run `cargo clippy` to check for warnings
 "#;
-        let progress = parse_content(content);
+        let progress = parse_content(content, None);
         // 4 bullets + 3 numbered + 2 bullets = 9 total
         // 2 checked bullets + 1 checked numbered = 3 completed
         assert_eq!(progress.total, 9);
@@ -332,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_parse_file_not_found() {
-        let result = parse_file(Path::new("/nonexistent/path/tasks.md"));
+        let result = parse_file(Path::new("/nonexistent/path/tasks.md"), None);
         assert!(result.is_err());
     }
 

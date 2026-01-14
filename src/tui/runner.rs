@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::events::{LogEntry, OrchestratorEvent, TuiCommand};
+use super::log_deduplicator;
 use super::orchestrator::{run_orchestrator, run_orchestrator_parallel};
 use super::queue::DynamicQueue;
 use super::render::{render, SPINNER_CHARS};
@@ -153,6 +154,8 @@ async fn run_tui_loop(
                                 .await;
                         }
                     }
+
+                    log_deduplicator::maybe_log_summary();
                 }
             }
         }

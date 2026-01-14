@@ -6,6 +6,7 @@
 //! been modified since approval.
 
 use crate::error::{OrchestratorError, Result};
+use crate::tui::log_deduplicator;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -156,7 +157,9 @@ pub fn check_approval(change_id: &str) -> Result<bool> {
 
     // 1. Check if approved file exists
     if !approved_path.exists() {
-        debug!("Change '{}' is not approved: no approved file", change_id);
+        if log_deduplicator::should_log_approval_status(change_id, false) {
+            debug!("Change '{}' is not approved: no approved file", change_id);
+        }
         return Ok(false);
     }
 
@@ -242,7 +245,9 @@ pub fn check_approval(change_id: &str) -> Result<bool> {
         }
     }
 
-    debug!("Change '{}' is approved and valid", change_id);
+    if log_deduplicator::should_log_approval_status(change_id, true) {
+        debug!("Change '{}' is approved and valid", change_id);
+    }
     Ok(true)
 }
 
