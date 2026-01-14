@@ -57,6 +57,8 @@ pub struct AppState {
     pub warning_message: Option<String>,
     /// Warning popup content
     pub warning_popup: Option<WarningPopup>,
+    /// Pending worktree delete confirmation (change ID)
+    pub pending_worktree_delete: Option<String>,
     /// Current spinner animation frame
     pub spinner_frame: usize,
     /// Log scroll offset (0 = show most recent at bottom)
@@ -130,6 +132,7 @@ impl AppState {
             should_quit: false,
             warning_message: None,
             warning_popup: None,
+            pending_worktree_delete: None,
             spinner_frame: 0,
             log_scroll_offset: 0,
             log_auto_scroll: true,
@@ -331,7 +334,11 @@ impl AppState {
                     _ => None,
                 }
             }
-            AppMode::Stopping | AppMode::Error | AppMode::Proposing | AppMode::QrPopup => None,
+            AppMode::Stopping
+            | AppMode::Error
+            | AppMode::Proposing
+            | AppMode::ConfirmWorktreeDelete
+            | AppMode::QrPopup => None,
         }
     }
 
@@ -350,6 +357,14 @@ impl AppState {
                     change.queue_status = QueueStatus::NotQueued;
                 }
             }
+        }
+    }
+
+    /// Update worktree presence flags for changes.
+    pub fn apply_worktree_status(&mut self, worktree_change_ids: &HashSet<String>) {
+        for change in &mut self.changes {
+            let sanitized = change.id.replace(['/', '\\', ' '], "-");
+            change.has_worktree = worktree_change_ids.contains(&sanitized);
         }
     }
 
@@ -404,7 +419,11 @@ impl AppState {
                     Some(TuiCommand::UnapproveAndDequeue(id))
                 }
             }
-            AppMode::Stopping | AppMode::Error | AppMode::Proposing | AppMode::QrPopup => None,
+            AppMode::Stopping
+            | AppMode::Error
+            | AppMode::Proposing
+            | AppMode::ConfirmWorktreeDelete
+            | AppMode::QrPopup => None,
         }
     }
 
@@ -429,6 +448,44 @@ impl AppState {
         }
     }
 
+    /// Request worktree deletion for the selected change.
+    pub fn request_worktree_delete(&mut self) {
+        if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
+            return;
+        }
+
+        let change = &self.changes[self.cursor_index];
+        if matches!(
+            change.queue_status,
+            QueueStatus::Processing | QueueStatus::Archiving
+        ) {
+            self.warning_popup = Some(WarningPopup {
+                title: "Worktree delete blocked".to_string(),
+                message: format!(
+                    "Change '{}' is currently running. Stop processing before deleting its worktree.",
+                    change.id
+                ),
+            });
+            return;
+        }
+
+        self.pending_worktree_delete = Some(change.id.clone());
+        self.mode = AppMode::ConfirmWorktreeDelete;
+    }
+
+    /// Confirm the pending worktree delete request.
+    pub fn confirm_worktree_delete(&mut self) -> Option<TuiCommand> {
+        let change_id = self.pending_worktree_delete.take()?;
+        self.mode = AppMode::Select;
+        Some(TuiCommand::DeleteWorktree(change_id))
+    }
+
+    /// Cancel worktree delete confirmation.
+    pub fn cancel_worktree_delete(&mut self) {
+        self.pending_worktree_delete = None;
+        self.mode = AppMode::Select;
+    }
+
     /// Check if auto-refresh is due
     #[allow(dead_code)]
     pub fn should_refresh(&self) -> bool {
@@ -440,6 +497,7 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::tui::events::OrchestratorEvent;
+    use std::collections::HashSet;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -1268,6 +1326,42 @@ mod tests {
             .logs
             .iter()
             .any(|log| log.message.contains("Warning: Uncommitted")));
+    }
+
+    #[test]
+    fn test_apply_worktree_status_sets_flag() {
+        let changes = vec![create_test_change("change/a", 0, 1)];
+        let mut app = AppState::new(changes);
+        let mut worktree_ids = HashSet::new();
+        worktree_ids.insert("change-a".to_string());
+
+        app.apply_worktree_status(&worktree_ids);
+
+        assert!(app.changes[0].has_worktree);
+    }
+
+    #[test]
+    fn test_request_worktree_delete_sets_confirmation() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.request_worktree_delete();
+
+        assert_eq!(app.mode, AppMode::ConfirmWorktreeDelete);
+        assert_eq!(app.pending_worktree_delete.as_deref(), Some("change-a"));
+    }
+
+    #[test]
+    fn test_request_worktree_delete_blocks_processing_change() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::Processing;
+
+        app.request_worktree_delete();
+
+        assert!(app.warning_popup.is_some());
+        assert!(app.pending_worktree_delete.is_none());
+        assert_eq!(app.mode, AppMode::Select);
     }
 
     #[test]

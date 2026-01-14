@@ -1319,6 +1319,7 @@ mod tests {
     use super::*;
     use crate::vcs::{VcsResult, VcsWarning, WorkspaceInfo};
     use async_trait::async_trait;
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1411,6 +1412,10 @@ mod tests {
 
         fn workspaces(&self) -> Vec<Workspace> {
             Vec::new()
+        }
+
+        async fn list_worktree_change_ids(&self) -> VcsResult<HashSet<String>> {
+            Ok(HashSet::new())
         }
 
         fn conflict_resolution_prompt(&self) -> &'static str {

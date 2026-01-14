@@ -84,6 +84,11 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
         render_qr_popup(frame, app, area);
     }
 
+    // Render worktree delete confirmation modal on top if needed
+    if app.mode == AppMode::ConfirmWorktreeDelete {
+        render_worktree_delete_confirm(frame, app, area);
+    }
+
     // Render warning popup on top if present
     if app.warning_popup.is_some() {
         render_warning_popup(frame, app, area);
@@ -141,6 +146,7 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Stopped => "Stopped",
         AppMode::Error => "Error",
         AppMode::Proposing => "Proposing",
+        AppMode::ConfirmWorktreeDelete => "Confirm Delete",
         AppMode::QrPopup => "QR Code",
     };
 
@@ -151,6 +157,7 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Stopped => Color::DarkGray,
         AppMode::Error => Color::Red,
         AppMode::Proposing => Color::Magenta,
+        AppMode::ConfirmWorktreeDelete => Color::Yellow,
         AppMode::QrPopup => Color::Green,
     };
 
@@ -233,6 +240,12 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             };
 
             let cursor = if i == app.cursor_index { "►" } else { " " };
+            let worktree_badge = if change.has_worktree { " WT" } else { "" };
+            let worktree_color = if is_parallel_blocked {
+                Color::DarkGray
+            } else {
+                Color::Green
+            };
             let new_badge = if change.is_new { " NEW" } else { "" };
             let uncommitted_badge = if show_uncommitted_badge {
                 " UNCOMMITED"
@@ -266,6 +279,12 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 Span::styled(
                     format!("{:<25}", change.id),
                     Style::default().fg(name_color),
+                ),
+                Span::styled(
+                    worktree_badge,
+                    Style::default()
+                        .fg(worktree_color)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     new_badge,
@@ -315,6 +334,9 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             "@: approve"
         });
         keys.push("e: edit");
+        if item.has_worktree {
+            keys.push("D: delete WT");
+        }
     }
     if has_queue {
         keys.push("F5: run");
@@ -381,6 +403,12 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             };
 
             let cursor = if i == app.cursor_index { "►" } else { " " };
+            let worktree_badge = if change.has_worktree { " WT" } else { "" };
+            let worktree_color = if is_parallel_blocked {
+                Color::DarkGray
+            } else {
+                Color::Green
+            };
             let new_badge = if change.is_new { " NEW" } else { "" };
             let uncommitted_badge = if show_uncommitted_badge {
                 " UNCOMMITED"
@@ -435,6 +463,12 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 Span::styled(
                     format!("{:<25}", change.id),
                     Style::default().fg(name_color),
+                ),
+                Span::styled(
+                    worktree_badge,
+                    Style::default()
+                        .fg(worktree_color)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     new_badge,
@@ -532,6 +566,7 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Select => ("Ready".to_string(), Color::DarkGray),
         AppMode::Stopped => ("Stopped".to_string(), Color::DarkGray),
         AppMode::Proposing => ("Proposing".to_string(), Color::Magenta),
+        AppMode::ConfirmWorktreeDelete => ("Confirm delete".to_string(), Color::Yellow),
         AppMode::QrPopup => ("QR Code".to_string(), Color::Green),
         AppMode::Running | AppMode::Stopping => {
             // Count changes that are currently processing or archiving
@@ -586,6 +621,7 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
             "Enter: newline, Ctrl+S: submit, Esc: cancel",
             Color::Magenta,
         ),
+        AppMode::ConfirmWorktreeDelete => ("Y: delete worktree, N/Esc: cancel", Color::Yellow),
         AppMode::QrPopup => ("Esc: close QR code", Color::Green),
     };
 
@@ -662,6 +698,7 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         AppMode::Running => " Status (Esc: stop, q: quit) ".to_string(),
         AppMode::Stopping => " Status (Esc: force stop, q: quit) ".to_string(),
         AppMode::Stopped => " Status (F5: resume, q: quit) ".to_string(),
+        AppMode::ConfirmWorktreeDelete => " Status (Y/N: confirm, q: quit) ".to_string(),
         _ => " Status (q: quit) ".to_string(),
     };
 
@@ -814,6 +851,43 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
             .border_style(Style::default().fg(Color::Blue)),
     );
     frame.render_widget(footer, area);
+}
+
+/// Render the worktree delete confirmation modal
+fn render_worktree_delete_confirm(frame: &mut Frame, app: &AppState, area: Rect) {
+    let Some(change_id) = app.pending_worktree_delete.as_ref() else {
+        return;
+    };
+
+    let modal_width = (area.width * 60 / 100).clamp(40, 90);
+    let modal_height = (area.height * 30 / 100).clamp(7, 12);
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .title(" Delete worktree ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner_area = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("Delete worktree for '{}'?", change_id),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "Press Y to delete, N or Esc to cancel.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let body = Paragraph::new(lines);
+    frame.render_widget(body, inner_area);
 }
 
 /// Render the warning popup modal
@@ -1061,6 +1135,28 @@ mod tests {
         let buffer = render_buffer(&mut app, 50, 10);
         let content = buffer_to_string(&buffer);
         assert!(content.contains("Terminal too small. Minimum: 60x15"));
+    }
+
+    #[test]
+    fn test_render_shows_worktree_badge() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.changes[0].has_worktree = true;
+
+        let buffer = render_buffer(&mut app, 80, 20);
+        let content = buffer_to_string(&buffer);
+        assert!(content.contains("WT"));
+    }
+
+    #[test]
+    fn test_render_shows_worktree_delete_confirm_modal() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.pending_worktree_delete = Some("change-a".to_string());
+        app.mode = AppMode::ConfirmWorktreeDelete;
+
+        let buffer = render_buffer(&mut app, 80, 20);
+        let content = buffer_to_string(&buffer);
+        assert!(content.contains("Delete worktree"));
+        assert!(content.contains("change-a"));
     }
 
     #[test]
