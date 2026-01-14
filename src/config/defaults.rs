@@ -32,14 +32,6 @@ pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
 /// Default maximum iterations for the orchestration loop
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
 
-#[allow(dead_code)]
-/// Default delay (ms) between archive completion checks
-pub const DEFAULT_COMPLETION_CHECK_DELAY_MS: u64 = 500;
-
-#[allow(dead_code)]
-/// Default maximum retries for archive completion checks
-pub const DEFAULT_COMPLETION_CHECK_MAX_RETRIES: u32 = 3;
-
 /// Default maximum concurrent workspaces for parallel execution
 pub const DEFAULT_MAX_CONCURRENT_WORKSPACES: usize = 3;
 

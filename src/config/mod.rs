@@ -166,20 +166,6 @@ impl OrchestratorConfig {
         self.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS)
     }
 
-    #[allow(dead_code)]
-    /// Get the archive completion check delay in milliseconds.
-    pub fn get_completion_check_delay_ms(&self) -> u64 {
-        self.completion_check_delay_ms
-            .unwrap_or(DEFAULT_COMPLETION_CHECK_DELAY_MS)
-    }
-
-    #[allow(dead_code)]
-    /// Get the archive completion check max retries.
-    pub fn get_completion_check_max_retries(&self) -> u32 {
-        self.completion_check_max_retries
-            .unwrap_or(DEFAULT_COMPLETION_CHECK_MAX_RETRIES)
-    }
-
     /// Get whether parallel mode is enabled.
     /// Default: false (off by default)
     #[allow(dead_code)]
@@ -304,9 +290,8 @@ pub fn get_global_config_path() -> Option<PathBuf> {
 // Re-export commonly used items for convenience
 pub use defaults::{
     DEFAULT_ANALYZE_COMMAND, DEFAULT_APPLY_COMMAND, DEFAULT_APPLY_PROMPT, DEFAULT_ARCHIVE_COMMAND,
-    DEFAULT_ARCHIVE_PROMPT, DEFAULT_COMPLETION_CHECK_DELAY_MS,
-    DEFAULT_COMPLETION_CHECK_MAX_RETRIES, DEFAULT_MAX_CONCURRENT_WORKSPACES,
-    DEFAULT_MAX_ITERATIONS, GLOBAL_CONFIG_DIR, GLOBAL_CONFIG_FILE, PROJECT_CONFIG_FILE,
+    DEFAULT_ARCHIVE_PROMPT, DEFAULT_MAX_CONCURRENT_WORKSPACES, DEFAULT_MAX_ITERATIONS,
+    GLOBAL_CONFIG_DIR, GLOBAL_CONFIG_FILE, PROJECT_CONFIG_FILE,
 };
 
 #[cfg(test)]
