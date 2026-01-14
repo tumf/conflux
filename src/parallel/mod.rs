@@ -1560,4 +1560,262 @@ mod tests {
             .await
             .unwrap();
     }
+
+    #[tokio::test]
+    async fn test_merge_resolves_conflict_with_resolve_command() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        let base_dir = repo_root.join("worktrees");
+
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(repo_root.join("conflict.txt"), "base").unwrap();
+
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["commit", "-m", "Base"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        let config = OrchestratorConfig {
+            resolve_command: Some("sh merge-resolver.sh".to_string()),
+            ..Default::default()
+        };
+        let mut manager =
+            GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
+
+        let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
+        let workspace_b = manager.create_workspace("change-b", None).await.unwrap();
+
+        std::fs::write(workspace_a.path.join("conflict.txt"), "A").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&workspace_a.path)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Apply: change-a"])
+            .current_dir(&workspace_a.path)
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(workspace_b.path.join("conflict.txt"), "B").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&workspace_b.path)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Apply: change-b"])
+            .current_dir(&workspace_b.path)
+            .output()
+            .await
+            .unwrap();
+
+        let resolver_script = repo_root.join("merge-resolver.sh");
+        let script_contents = format!(
+            "#!/bin/sh\nset -e\ngit checkout main\n\
+            git merge --no-ff -m 'Merge change: change-a' {}\n\
+            if ! git merge --no-ff -m 'Merge change: change-b' {}; then\n\
+              if [ -f .git/MERGE_HEAD ]; then\n\
+                git checkout --theirs conflict.txt\n\
+                git add -A\n\
+                git commit -m 'Merge change: change-b'\n\
+              else\n\
+                exit 1\n\
+              fi\n\
+            fi\n",
+            workspace_a.name, workspace_b.name
+        );
+        std::fs::write(&resolver_script, script_contents).unwrap();
+
+        let executor = ParallelExecutor {
+            workspace_manager: Box::new(manager),
+            config,
+            apply_command: String::new(),
+            archive_command: String::new(),
+            event_tx: None,
+            max_conflict_retries: 2,
+            repo_root: repo_root.to_path_buf(),
+            no_resume: false,
+            failed_tracker: FailedChangeTracker::new(),
+            hooks: None,
+        };
+
+        let revisions = vec![workspace_a.name, workspace_b.name];
+
+        executor
+            .merge_and_resolve_with(&revisions, |_revs, _details| async move { Ok(()) })
+            .await
+            .unwrap();
+
+        let merged_contents = std::fs::read_to_string(repo_root.join("conflict.txt")).unwrap();
+        assert!(merged_contents.contains('B'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_merge_retries_after_pre_commit_changes() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        let base_dir = repo_root.join("worktrees");
+
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(repo_root.join("hooked.txt"), "base").unwrap();
+
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        Command::new("git")
+            .args(["commit", "-m", "Base"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        let config = OrchestratorConfig {
+            resolve_command: Some("sh merge-resolver.sh".to_string()),
+            ..Default::default()
+        };
+        let mut manager =
+            GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 1, config.clone());
+
+        let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
+
+        std::fs::write(repo_root.join("main.txt"), "main").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Main update"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(workspace_a.path.join("change-a.txt"), "A").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&workspace_a.path)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Apply: change-a"])
+            .current_dir(&workspace_a.path)
+            .output()
+            .await
+            .unwrap();
+
+        let hooks_dir = repo_root.join(".git/hooks");
+        let hook_path = hooks_dir.join("pre-commit");
+        let hook_contents = "#!/bin/sh\n\
+        if [ ! -f .git/hooks/pre-commit-ran ]; then\n\
+          echo 'hooked' >> hooked.txt\n\
+          git add hooked.txt\n\
+          touch .git/hooks/pre-commit-ran\n\
+          exit 1\n\
+        fi\n\
+        exit 0\n";
+        std::fs::write(&hook_path, hook_contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&hook_path, perms).unwrap();
+        }
+
+        let resolver_script = repo_root.join("merge-resolver.sh");
+        let script_contents = format!(
+            "#!/bin/sh\nset -e\ngit checkout main\n\
+            git merge --no-ff --no-commit {}\n\
+            if ! git commit -m 'Merge change: change-a'; then\n\
+              git add -A\n\
+              git commit -m 'Merge change: change-a'\n\
+            fi\n",
+            workspace_a.name
+        );
+        std::fs::write(&resolver_script, script_contents).unwrap();
+
+        let executor = ParallelExecutor {
+            workspace_manager: Box::new(manager),
+            config,
+            apply_command: String::new(),
+            archive_command: String::new(),
+            event_tx: None,
+            max_conflict_retries: 2,
+            repo_root: repo_root.to_path_buf(),
+            no_resume: false,
+            failed_tracker: FailedChangeTracker::new(),
+            hooks: None,
+        };
+
+        let revisions = vec![workspace_a.name];
+
+        executor
+            .merge_and_resolve_with(&revisions, |_revs, _details| async move { Ok(()) })
+            .await
+            .unwrap();
+
+        let hook_contents = std::fs::read_to_string(repo_root.join("hooked.txt")).unwrap();
+        assert!(hook_contents.contains("hooked"));
+    }
 }

@@ -580,7 +580,7 @@ impl WorkspaceManager for GitWorkspaceManager {
     }
 
     fn conflict_resolution_prompt(&self) -> &'static str {
-        "This project uses Git for version control.\n\n\
+        "This project uses Git for version control, not jj.\n\n\
          A merge conflict occurred. The conflicting files contain Git conflict markers:\n\
          <<<<<<< HEAD\n\
          [your changes]\n\

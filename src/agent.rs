@@ -230,18 +230,6 @@ impl AgentRunner {
         self.execute_shell_command_streaming(&command).await
     }
 
-    /// Execute resolve command with streaming output
-    /// Returns a child process handle and a receiver for output lines
-    pub async fn run_resolve_streaming(
-        &self,
-        prompt: &str,
-    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
-        let template = self.config.get_resolve_command();
-        let command = OrchestratorConfig::expand_prompt(template, prompt);
-        info!("Running resolve command (streaming): {}", command);
-        self.execute_shell_command_streaming(&command).await
-    }
-
     /// Execute resolve command with streaming output in a specific directory.
     /// Returns a child process handle and a receiver for output lines.
     pub async fn run_resolve_streaming_in_dir(

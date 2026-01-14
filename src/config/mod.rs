@@ -88,8 +88,8 @@ pub struct OrchestratorConfig {
     #[serde(default)]
     pub workspace_base_dir: Option<String>,
 
-    /// Command template for conflict resolution.
-    /// Supports `{conflict_info}` placeholder.
+    /// Command template for merge/conflict resolution.
+    /// Supports `{prompt}` placeholder.
     /// If not set, uses automatic AI-based resolution.
     #[serde(default)]
     pub resolve_command: Option<String>,

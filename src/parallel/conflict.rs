@@ -91,7 +91,9 @@ pub async fn resolve_conflicts_with_retry(
 
         // Use AgentRunner for streaming resolve command execution
         let agent = AgentRunner::new(config.clone());
-        let (mut child, mut rx) = agent.run_resolve_streaming(&resolve_prompt).await?;
+        let (mut child, mut rx) = agent
+            .run_resolve_streaming_in_dir(&resolve_prompt, workspace_manager.repo_root())
+            .await?;
 
         // Stream output to events
         while let Some(line) = rx.recv().await {

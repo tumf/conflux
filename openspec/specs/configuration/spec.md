@@ -34,11 +34,12 @@ Defines the configuration file format, agent command templates, and settings for
 
 オーケストレーターは JSONC 形式の設定ファイルを通じてエージェントコマンドを設定できなければならない (MUST)。
 
-設定可能なコマンドは以下の4種類とする:
+設定可能なコマンドは以下の5種類とする:
 1. `apply_command` - 変更の適用コマンド
 2. `archive_command` - 変更のアーカイブコマンド
 3. `analyze_command` - 依存関係分析コマンド
-4. `hooks` - 段階フックコマンド
+4. `resolve_command` - Git マージの完了（merge/add/commit）や競合解消に使用するコマンド
+5. `hooks` - 段階フックコマンド
 
 #### Scenario: プロジェクト設定ファイルで hooks を設定
 
@@ -93,7 +94,7 @@ Defines the configuration file format, agent command templates, and settings for
 
 サポートするプレースホルダー:
 - `{change_id}` - 変更ID（apply_command, archive_command で使用）
-- `{prompt}` - システム提供の指示（apply_command, archive_command, analyze_command で使用）
+- `{prompt}` - システム提供の指示（apply_command, archive_command, analyze_command, resolve_command で使用）
 
 #### Scenario: {change_id} プレースホルダーの正常な展開
 
