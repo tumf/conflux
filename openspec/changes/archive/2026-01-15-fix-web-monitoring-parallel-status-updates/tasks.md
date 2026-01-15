@@ -12,4 +12,4 @@
 - [x] 3.1 `npx @fission-ai/openspec@latest validate fix-web-monitoring-parallel-status-updates --strict`
 
 ## Future work
-- (future work) `--web --parallel` で起動し、Web 画面のステータスが更新されることを確認
+- 3.2 `--web --parallel` で起動し、Web 画面のステータスが更新されることを確認
