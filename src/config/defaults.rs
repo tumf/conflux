@@ -50,3 +50,30 @@ pub const DEFAULT_STALL_DETECTION_ENABLED: bool = true;
 
 /// Default threshold for consecutive empty WIP commits before stalling
 pub const DEFAULT_STALL_DETECTION_THRESHOLD: u32 = 3;
+
+/// Default delay between command executions (milliseconds)
+pub const DEFAULT_STAGGER_DELAY_MS: u64 = 2000;
+
+/// Default maximum number of retries for commands
+pub const DEFAULT_MAX_RETRIES: u32 = 2;
+
+/// Default delay between retries (milliseconds)
+pub const DEFAULT_RETRY_DELAY_MS: u64 = 5000;
+
+/// Default threshold for retry based on execution duration (seconds)
+pub const DEFAULT_RETRY_IF_DURATION_UNDER_SECS: u64 = 5;
+
+/// Default error patterns that trigger automatic retry
+pub fn default_retry_patterns() -> Vec<String> {
+    vec![
+        // Module resolution errors
+        r"Cannot find module".to_string(),
+        r"ResolveMessage:".to_string(),
+        // npm/bun registry errors
+        r"ENOTFOUND registry\.npmjs\.org".to_string(),
+        r"ETIMEDOUT.*registry".to_string(),
+        // File lock errors
+        r"EBADF.*lock".to_string(),
+        r"Lock acquisition failed".to_string(),
+    ]
+}

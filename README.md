@@ -557,6 +557,79 @@ $ openspec-orchestrator run --parallel
 # Action: Skip all operations, cleanup workspace
 ```
 
+### Command Execution Queue
+
+The orchestrator includes a command execution queue that prevents resource conflicts and handles transient errors when running multiple AI agent commands in parallel.
+
+**Features:**
+
+1. **Staggered Start**: Commands are started with a configurable delay to prevent simultaneous resource access
+2. **Automatic Retry**: Commands that fail due to transient errors (module resolution, network issues, etc.) are automatically retried
+
+**Configuration:**
+
+```jsonc
+{
+  // Delay between command executions (milliseconds)
+  // Default: 2000 (2 seconds)
+  "command_queue_stagger_delay_ms": 2000,
+
+  // Maximum number of retries for failed commands
+  // Default: 2
+  "command_queue_max_retries": 2,
+
+  // Delay between retries (milliseconds)
+  // Default: 5000 (5 seconds)
+  "command_queue_retry_delay_ms": 5000,
+
+  // Retry if execution duration is under this threshold (seconds)
+  // Short-running failures often indicate environment/startup issues
+  // Default: 5
+  "command_queue_retry_if_duration_under_secs": 5,
+
+  // Error patterns that trigger automatic retry (regex)
+  // Default: module resolution, registry, and lock errors
+  "command_queue_retry_patterns": [
+    "Cannot find module",
+    "ResolveMessage:",
+    "ENOTFOUND registry\\.npmjs\\.org",
+    "ETIMEDOUT.*registry",
+    "EBADF.*lock",
+    "Lock acquisition failed"
+  ]
+}
+```
+
+**How It Works:**
+
+- **Staggered Start**: Each command waits for a minimum delay since the last command started, preventing simultaneous access to shared resources (e.g., `~/.cache/opencode/node_modules`)
+- **Retry Logic**: Commands are retried if they:
+  - Match a configured error pattern (e.g., "Cannot find module"), OR
+  - Exit quickly (< 5 seconds by default), indicating a startup/environment issue
+- **No Retry**: Commands that run for a long time (> 5 seconds) and don't match error patterns are not retried, as they likely failed due to logical errors
+
+**Example - Preventing Module Resolution Conflicts:**
+
+```bash
+# Without queue: Multiple commands start simultaneously
+# → Conflict: All try to update node_modules at once
+# → Result: "Cannot find module" errors
+
+# With queue (default): Commands start 2 seconds apart
+# → First command updates node_modules
+# → Subsequent commands use stable environment
+# → Result: No conflicts
+```
+
+**Example - Handling Transient Network Errors:**
+
+```bash
+# Error: ETIMEDOUT registry.npmjs.org
+# → Matches retry pattern
+# → Automatically retried after 5 seconds
+# → Usually succeeds on retry
+```
+
 ### Web Monitoring (Optional Feature)
 
 The orchestrator supports an optional HTTP server for remote monitoring of orchestration progress via web browser.

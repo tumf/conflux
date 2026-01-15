@@ -2,6 +2,7 @@ mod agent;
 mod analyzer;
 mod approval;
 mod cli;
+mod command_queue;
 mod config;
 mod error;
 mod events;

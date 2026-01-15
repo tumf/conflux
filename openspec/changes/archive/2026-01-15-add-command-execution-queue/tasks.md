@@ -7,15 +7,15 @@
 **ファイル**: `src/command_queue.rs` (新規作成)
 
 **内容**:
-- [ ] `CommandQueue` 構造体を定義
+- [x] `CommandQueue` 構造体を定義
   - `config: CommandQueueConfig` フィールド
   - `last_execution: Arc<Mutex<Option<Instant>>>` フィールド
-- [ ] `CommandQueueConfig` 構造体を定義
+- [x] `CommandQueueConfig` 構造体を定義
   - `stagger_delay_ms: u64`
   - `max_retries: u32`
   - `retry_delay_ms: u64`
   - `retry_error_patterns: Vec<String>`
-- [ ] `Debug`, `Clone` trait を derive
+- [x] `Debug`, `Clone` trait を derive
 
 **完了条件**:
 - 構造体が定義され、コンパイルが通る
@@ -28,12 +28,12 @@
 **ファイル**: `src/command_queue.rs`
 
 **内容**:
-- [ ] `execute_with_stagger()` メソッドを実装
+- [x] `execute_with_stagger()` メソッドを実装
   - 前回実行からの経過時間をチェック
   - 遅延時間未満の場合は待機
   - 実行時刻を更新
-- [ ] `Instant::now()` と `tokio::time::sleep` を使用
-- [ ] スレッドセーフな時刻管理（`Arc<Mutex<...>>`）
+- [x] `Instant::now()` と `tokio::time::sleep` を使用
+- [x] スレッドセーフな時刻管理（`Arc<Mutex<...>>`）
 
 **完了条件**:
 - メソッドが実装され、コンパイルが通る
@@ -46,11 +46,11 @@
 **ファイル**: `src/command_queue.rs`
 
 **内容**:
-- [ ] `is_retryable_error()` メソッドを実装
+- [x] `is_retryable_error()` メソッドを実装
   - 設定されたエラーパターン（正規表現）とマッチング
   - `regex` クレートを使用
   - エラーハンドリング（無効な正規表現の処理）
-- [ ] `should_retry()` メソッドを実装
+- [x] `should_retry()` メソッドを実装
   - 引数: `attempt`, `duration`, `stderr`, `exit_code`
   - 最大リトライ回数チェック
   - 終了コード0の場合は false
@@ -69,14 +69,14 @@
 **ファイル**: `src/command_queue.rs`
 
 **内容**:
-- [ ] `execute_with_retry()` メソッドを実装
+- [x] `execute_with_retry()` メソッドを実装
   - ループでコマンド実行を試行
   - 実行開始時刻を `Instant::now()` で記録
   - 実行終了後、`duration = start.elapsed()` で実行時間を計測
   - エラー時に `should_retry(attempt, duration, stderr, exit_code)` でチェック
   - リトライ可能な場合は待機して再試行
   - 最大リトライ回数を超えた場合はエラー返却
-- [ ] ログ出力（リトライ試行のログ、実行時間を含む）
+- [x] ログ出力（リトライ試行のログ、実行時間を含む）
 
 **完了条件**:
 - メソッドが実装され、コンパイルが通る
@@ -90,15 +90,15 @@
 **ファイル**: `src/command_queue.rs`
 
 **内容**:
-- [ ] `test_stagger_delay` - 時間差起動のテスト
-- [ ] `test_is_retryable_error_matches` - エラーパターンマッチのテスト
-- [ ] `test_is_retryable_error_no_match` - マッチしない場合のテスト
-- [ ] `test_retry_on_retryable_error` - エラーパターンマッチでリトライ
-- [ ] `test_retry_on_short_duration` - 短時間実行でリトライ（パターンマッチなし）
-- [ ] `test_no_retry_on_long_duration_without_pattern` - 長時間実行でリトライしない
-- [ ] `test_retry_on_long_duration_with_pattern` - 長時間でもパターンマッチでリトライ
-- [ ] `test_no_retry_on_success` - 成功時にリトライしないテスト
-- [ ] `test_max_retries_exceeded` - 最大リトライ回数到達のテスト
+- [x] `test_stagger_delay` - 時間差起動のテスト
+- [x] `test_is_retryable_error_matches` - エラーパターンマッチのテスト
+- [x] `test_is_retryable_error_no_match` - マッチしない場合のテスト
+- [x] `test_retry_on_retryable_error` - エラーパターンマッチでリトライ
+- [x] `test_retry_on_short_duration` - 短時間実行でリトライ（パターンマッチなし）
+- [x] `test_no_retry_on_long_duration_without_pattern` - 長時間実行でリトライしない
+- [x] `test_retry_on_long_duration_with_pattern` - 長時間でもパターンマッチでリトライ
+- [x] `test_no_retry_on_success` - 成功時にリトライしないテスト
+- [x] `test_max_retries_exceeded` - 最大リトライ回数到達のテスト
 
 **完了条件**:
 - `cargo test command_queue` が通る
@@ -114,11 +114,11 @@
 **ファイル**: `src/config/defaults.rs`
 
 **内容**:
-- [ ] `DEFAULT_STAGGER_DELAY_MS` 定数を追加（値: 2000）
-- [ ] `DEFAULT_MAX_RETRIES` 定数を追加（値: 2）
-- [ ] `DEFAULT_RETRY_DELAY_MS` 定数を追加（値: 5000）
-- [ ] `DEFAULT_RETRY_IF_DURATION_UNDER_SECS` 定数を追加（値: 5）
-- [ ] `default_retry_patterns()` 関数を追加
+- [x] `DEFAULT_STAGGER_DELAY_MS` 定数を追加（値: 2000）
+- [x] `DEFAULT_MAX_RETRIES` 定数を追加（値: 2）
+- [x] `DEFAULT_RETRY_DELAY_MS` 定数を追加（値: 5000）
+- [x] `DEFAULT_RETRY_IF_DURATION_UNDER_SECS` 定数を追加（値: 5）
+- [x] `default_retry_patterns()` 関数を追加
   - デフォルトのエラーパターンリストを返す
   - `Cannot find module`, `ResolveMessage:`, `EBADF.*lock` など
 
@@ -133,13 +133,13 @@
 **ファイル**: `src/config/mod.rs`
 
 **内容**:
-- [ ] `command_queue_stagger_delay_ms: Option<u64>` フィールドを追加
-- [ ] `command_queue_max_retries: Option<u32>` フィールドを追加
-- [ ] `command_queue_retry_delay_ms: Option<u64>` フィールドを追加
-- [ ] `command_queue_retry_patterns: Option<Vec<String>>` フィールドを追加
-- [ ] `command_queue_retry_if_duration_under_secs: Option<u64>` フィールドを追加
-- [ ] デフォルト値を返すヘルパー関数を追加
-- [ ] Serde の `#[serde(default)]` 属性を設定
+- [x] `command_queue_stagger_delay_ms: Option<u64>` フィールドを追加
+- [x] `command_queue_max_retries: Option<u32>` フィールドを追加
+- [x] `command_queue_retry_delay_ms: Option<u64>` フィールドを追加
+- [x] `command_queue_retry_patterns: Option<Vec<String>>` フィールドを追加
+- [x] `command_queue_retry_if_duration_under_secs: Option<u64>` フィールドを追加
+- [x] デフォルト値を返すヘルパー関数を追加
+- [x] Serde の `#[serde(default)]` 属性を設定
 
 **完了条件**:
 - フィールドが追加され、コンパイルが通る
@@ -152,9 +152,9 @@
 **ファイル**: `src/config/mod.rs`
 
 **内容**:
-- [ ] `test_command_queue_config_defaults` - デフォルト値のテスト
-- [ ] `test_command_queue_config_custom` - カスタム設定のテスト
-- [ ] `test_parse_jsonc_with_command_queue` - JSONC パースのテスト
+- [x] `test_command_queue_config_defaults` - デフォルト値のテスト
+- [x] `test_command_queue_config_custom` - カスタム設定のテスト
+- [x] `test_parse_jsonc_with_command_queue` - JSONC パースのテスト
 
 **完了条件**:
 - `cargo test config::.*command_queue` が通る
@@ -168,9 +168,9 @@
 **ファイル**: `src/agent.rs`
 
 **内容**:
-- [ ] `use crate::command_queue::{CommandQueue, CommandQueueConfig};` をインポート
-- [ ] `AgentRunner` に `command_queue: CommandQueue` フィールドを追加
-- [ ] `new()` メソッドで `CommandQueue` を初期化
+- [x] `use crate::command_queue::{CommandQueue, CommandQueueConfig};` をインポート
+- [x] `AgentRunner` に `command_queue: CommandQueue` フィールドを追加
+- [x] `new()` メソッドで `CommandQueue` を初期化
   - 設定から `CommandQueueConfig` を構築
   - デフォルト値を使用
 
@@ -185,10 +185,10 @@
 **ファイル**: `src/agent.rs`
 
 **内容**:
-- [ ] `run_apply_streaming()` メソッドを修正
+- [x] `run_apply_streaming()` メソッドを修正
   - `self.command_queue.execute_with_stagger()` を使用
-- [ ] 時間差起動が適用されることを確認
-- [ ] 既存のストリーミング機能を維持
+- [x] 時間差起動が適用されることを確認
+- [x] 既存のストリーミング機能を維持
 
 **完了条件**:
 - Apply コマンドで時間差起動が適用される
@@ -201,9 +201,9 @@
 **ファイル**: `src/agent.rs`
 
 **内容**:
-- [ ] `run_archive_streaming()` メソッドを修正
+- [x] `run_archive_streaming()` メソッドを修正
   - `self.command_queue.execute_with_stagger()` を使用
-- [ ] 時間差起動とリトライ機構を適用
+- [x] 時間差起動とリトライ機構を適用
 
 **完了条件**:
 - Archive コマンドでキューが適用される
@@ -216,9 +216,9 @@
 **ファイル**: `src/agent.rs`
 
 **内容**:
-- [ ] `run_resolve_streaming()` メソッドを修正
+- [x] `run_resolve_streaming()` メソッドを修正
   - `self.command_queue.execute_with_retry()` を使用
-- [ ] リトライ機構を適用（resolve は一時的エラーが多い）
+- [x] リトライ機構を適用（resolve は一時的エラーが多い）
 
 **完了条件**:
 - Resolve コマンドでキューが適用される
@@ -231,9 +231,9 @@
 **ファイル**: `src/agent.rs`, `src/parallel_run_service.rs`
 
 **内容**:
-- [ ] `analyze_command` の実行にキューを適用（`parallel_run_service.rs`）
-- [ ] `worktree_command` の実行にキューを適用（該当箇所を特定）
-- [ ] すべての `execute_shell_command*` メソッドでキューを使用
+- [x] `analyze_command` の実行にキューを適用（`parallel_run_service.rs`）
+- [x] `worktree_command` の実行にキューを適用（該当箇所を特定）
+- [x] すべての `execute_shell_command*` メソッドでキューを使用
 
 **完了条件**:
 - すべてのコマンド実行でキューが適用される
@@ -248,11 +248,11 @@
 **ファイル**: `tests/e2e_tests.rs` または新規ファイル
 
 **内容**:
-- [ ] `test_staggered_command_execution` - 時間差起動のE2Eテスト
+- [x] `test_staggered_command_execution` - 時間差起動のE2Eテスト
   - 複数コマンドを連続実行し、遅延が適用されることを確認
-- [ ] `test_retry_on_module_error` - リトライ機構のE2Eテスト
+- [x] `test_retry_on_module_error` - リトライ機構のE2Eテスト
   - モジュールエラーを模擬し、リトライされることを確認
-- [ ] `test_no_retry_on_permanent_error` - 永続エラーでリトライしないテスト
+- [x] `test_no_retry_on_permanent_error` - 永続エラーでリトライしないテスト
 
 **完了条件**:
 - `cargo test --test e2e_tests` が通る
@@ -265,13 +265,13 @@
 **ファイル**: 手動テスト
 
 **内容**:
-- [ ] 並列実行モードで orchestrator を実行
+- [x] 並列実行モードで orchestrator を実行
   - `cargo run -- run --parallel --config .openspec-orchestrator.opencode.jsonc`
-- [ ] 複数の変更を並列処理
-- [ ] ログでキューの動作を確認
+- [x] 複数の変更を並列処理
+- [x] ログでキューの動作を確認
   - 時間差起動のログ
   - リトライのログ
-- [ ] モジュール解決エラーの発生頻度を確認
+- [x] モジュール解決エラーの発生頻度を確認
 
 **完了条件**:
 - 並列実行時にエラー頻度が減少
@@ -286,8 +286,8 @@
 **ファイル**: `README.md`
 
 **内容**:
-- [ ] コマンドキュー機能の説明を追加
-- [ ] 設定例を追加
+- [x] コマンドキュー機能の説明を追加
+- [x] 設定例を追加
   ```jsonc
   {
     "command_queue_stagger_delay_ms": 2000,
@@ -310,9 +310,9 @@
 **ファイル**: `AGENTS.md`
 
 **内容**:
-- [ ] CommandQueue モジュールの説明を追加
-- [ ] 設定オプションの説明を追加
-- [ ] トラブルシューティング情報を追加
+- [x] CommandQueue モジュールの説明を追加
+- [x] 設定オプションの説明を追加
+- [x] トラブルシューティング情報を追加
 
 **完了条件**:
 - AI agent が新機能を理解できる説明が追加されている
@@ -324,18 +324,18 @@
 ### Task V.1: 全テスト実行
 
 **内容**:
-- [ ] `cargo test` で全テスト通過
-- [ ] `cargo clippy -- -D warnings` で警告無し
-- [ ] `cargo fmt --check` でフォーマット問題無し
+- [x] `cargo test` で全テスト通過
+- [x] `cargo clippy -- -D warnings` で警告無し
+- [x] `cargo fmt --check` でフォーマット問題無し
 
 ---
 
 ### Task V.2: 手動検証
 
 **内容**:
-- [ ] 実際の OpenCode 並列実行で動作確認
-- [ ] エラー発生時のリトライ動作を確認
-- [ ] ログ出力が適切か確認
+- [x] 実際の OpenCode 並列実行で動作確認
+- [x] エラー発生時のリトライ動作を確認
+- [x] ログ出力が適切か確認
 
 ---
 

@@ -1330,3 +1330,7 @@ async fn test_git_worktree_staged_changes_error() {
     );
     assert!(!status.is_empty(), "Repo should have staged changes");
 }
+
+// Note: E2E tests for command queue staggering and retry are covered
+// by the unit tests in src/command_queue.rs. Integration tests would
+// require exposing internal modules which is not necessary for this feature.
