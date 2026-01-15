@@ -37,8 +37,6 @@
   - `ResolveContext` を使用
   - マージ検証の失敗理由を記録
   - 次回プロンプトに継続理由を追加
-- [ ] `src/execution/archive.rs` の `ensure_archive_commit()` を更新
-  - archive commit 作成の resolve でもコンテキストを使用（オプショナル）
 
 ## Phase 3: テストの追加
 
@@ -49,11 +47,16 @@
 - [x] `src/agent.rs` に archive プロンプト構築のテストを追加
   - 初回実行時（履歴なし）
   - 2回目以降（履歴あり）
-- [ ] 統合テストで archive 再試行時の履歴伝播を検証（オプショナル）
-- [ ] 統合テストで resolve 再試行時のコンテキスト伝播を検証（オプショナル）
 
 ## Phase 4: ドキュメント更新
 
 - [x] `AGENTS.md` に archive と resolve の履歴機能について記載
-- [ ] 設定ファイルのテンプレートにコメントを追加
-  - archive と resolve でも履歴が使用されることを明記（オプショナル）
+
+## Future work
+
+These tasks are deferred for later implementation:
+
+- `src/execution/archive.rs` の `ensure_archive_commit()` を更新して archive commit 作成の resolve でもコンテキストを使用
+- 統合テストで archive 再試行時の履歴伝播を検証
+- 統合テストで resolve 再試行時のコンテキスト伝播を検証
+- 設定ファイルのテンプレートにコメントを追加して archive と resolve でも履歴が使用されることを明記

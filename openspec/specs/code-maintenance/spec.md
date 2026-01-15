@@ -247,26 +247,15 @@ parallel/executor.rs 内の VCS 操作は、直接コマンドを実行する代
 
 ### Requirement: Common Archive Verification
 
-システムは、アーカイブ操作の成功を検証するための共通関数を提供しなければならない（SHALL）。この関数は serial mode と parallel mode の両方で使用される。
+archive 検証の失敗理由は、次回の archive 試行のプロンプトに含められるように構造化されなければならない（SHALL）。
 
-#### Scenario: アーカイブ成功の検証
+#### Scenario: 検証失敗理由の構造化
 
-- **GIVEN** change_id = "my-change" のアーカイブ操作が完了した
-- **WHEN** `verify_archive_completion()` を呼び出す
-- **THEN** change が `openspec/changes/` から削除されていることを確認する
-- **AND** change が `openspec/changes/archive/` に存在することを確認する
-
-#### Scenario: 日付プレフィックス付きアーカイブの検証
-
-- **GIVEN** change_id = "my-change" がアーカイブされた
-- **WHEN** アーカイブディレクトリ名が "2026-01-12-my-change" 形式である
-- **THEN** `verify_archive_completion()` は成功を返す
-
-#### Scenario: アーカイブ失敗の検出
-
-- **GIVEN** archive コマンドが実行されたが、ファイルが移動されていない
-- **WHEN** `verify_archive_completion()` を呼び出す
-- **THEN** エラーが返され、change ディレクトリがまだ存在することを示す
+- **GIVEN** archive 検証が失敗した
+- **WHEN** 検証結果が返される
+- **THEN** 失敗理由には具体的な情報が含まれる
+- **AND** 理由は履歴コンテキストに含められる形式である
+- **AND** 例: "Change still exists at openspec/changes/{change_id}"
 
 ### Requirement: Common Task Completion Verification
 
@@ -285,24 +274,28 @@ parallel/executor.rs 内の VCS 操作は、直接コマンドを実行する代
 - **THEN** false が返され、進捗情報 (7/10) が含まれる
 
 ### Requirement: Common Archive Command Execution
-システムは、archive コマンドを実行するための共通関数を提供しなければならない（SHALL）。この関数は workspace_path を受け取り、指定された場所でコマンドを実行する。さらに、archive が成功した後に Git backend で未コミット変更が残っている場合、`git add -A` と `git commit -m "Archive: {change_id}"` 相当の操作で変更をコミットしなければならない（SHALL）。
 
-#### Scenario: メインワークスペースでの実行
-- **GIVEN** workspace_path = None
-- **WHEN** `execute_archive_command()` を呼び出す
-- **THEN** カレントディレクトリで archive コマンドが実行される
+`archive_change()` および `archive_change_streaming()` は、archive コマンドの実行結果を記録し、再試行時には前回の履歴をプロンプトに含めなければならない（MUST）。
 
-#### Scenario: 別ワークスペースでの実行
-- **GIVEN** workspace_path = Some("/path/to/workspace")
-- **WHEN** `execute_archive_command()` を呼び出す
-- **THEN** 指定されたワークスペースで archive コマンドが実行される
+#### Scenario: Archive 実行後の履歴記録
 
-#### Scenario: シリアルモードのアーカイブ後コミット
-- **GIVEN** VCS backend が Git である
-- **AND** serial モードで archive コマンドが成功した
-- **AND** `git status --porcelain` が非空である
-- **WHEN** archive の後処理が完了する
-- **THEN** `git add -A` と `git commit -m "Archive: {change_id}"` 相当でコミットが作成される
+- **GIVEN** システムが change の archive を実行する
+- **WHEN** archive コマンドが完了する（成功または失敗）
+- **THEN** システムは試行結果を記録する
+- **AND** 記録には試行回数、成功/失敗ステータス、所要時間、検証結果が含まれる
+
+#### Scenario: Archive 再試行時の履歴伝播
+
+- **GIVEN** 1回目の archive が検証失敗した
+- **WHEN** システムが同じ change の archive を再試行する
+- **THEN** `AgentRunner::run_archive_streaming()` に渡されるプロンプトに前回の履歴が含まれる
+- **AND** 履歴には検証失敗の理由（"Change still exists at..."）が含まれる
+
+#### Scenario: Archive 成功時の履歴クリア
+
+- **GIVEN** change の archive が成功した
+- **WHEN** change が完全に処理される
+- **THEN** その change の archive 履歴はクリアされる
 
 ### Requirement: Serial/Parallel 実行フローの共有化
 システムは serial/parallel モードで共通となる apply・archive・進捗更新の処理を共有関数に集約しなければならない（SHALL）。
@@ -316,3 +309,4 @@ parallel/executor.rs 内の VCS 操作は、直接コマンドを実行する代
 - **WHEN** モード固有の出力やイベント送信を実装する
 - **THEN** 共有関数は純粋な実行フローのみを扱う
 - **AND** 出力/イベントの責務は呼び出し側に分離される
+
