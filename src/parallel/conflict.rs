@@ -3,11 +3,13 @@
 use crate::agent::AgentRunner;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::history::{ResolveAttempt, ResolveContext};
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{VcsBackend, WorkspaceManager};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -95,14 +97,18 @@ pub async fn resolve_conflicts_with_retry(
     // Get the VCS-specific conflict resolution prompt prefix
     let vcs_prompt_prefix = workspace_manager.conflict_resolution_prompt();
 
+    // Create resolve context for tracking attempts
+    let mut resolve_context = ResolveContext::new(max_retries);
+
     for attempt in 1..=max_retries {
+        let start = Instant::now();
         info!(
             "Conflict resolution attempt {}/{} for files: {}",
             attempt, max_retries, conflict_files_str
         );
 
         // Build the resolve prompt with VCS-specific context
-        let resolve_prompt = format!(
+        let mut resolve_prompt = format!(
             "{}\n\n\
              A merge conflict occurred while trying to merge the following revisions:\n\
              {}\n\n\
@@ -121,6 +127,12 @@ pub async fn resolve_conflicts_with_retry(
             vcs_log,
             conflict_files_str
         );
+
+        // Add context from previous attempts if any
+        let continuation_context = resolve_context.format_continuation_context();
+        if !continuation_context.is_empty() {
+            resolve_prompt = format!("{}\n\n{}", resolve_prompt, continuation_context);
+        }
 
         // Use AgentRunner for streaming resolve command execution
         let agent = AgentRunner::new(config.clone());
@@ -152,6 +164,8 @@ pub async fn resolve_conflicts_with_retry(
 
         // Verify resolution regardless of exit code
         let remaining_conflicts = detect_conflicts(workspace_manager).await?;
+        let duration = start.elapsed();
+
         if remaining_conflicts.is_empty() {
             if !status_success {
                 warn!(
@@ -159,22 +173,48 @@ pub async fn resolve_conflicts_with_retry(
                     attempt, max_retries
                 );
             }
+            // Record successful resolution
+            resolve_context.record(ResolveAttempt {
+                attempt,
+                command_success: status_success,
+                verification_success: true,
+                duration,
+                continuation_reason: None,
+                exit_code: status.code(),
+            });
             send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
             return Ok(());
         }
 
-        if status_success {
-            warn!(
-                "Conflicts still present after resolution attempt: {:?}",
-                remaining_conflicts
+        // Record failed attempt with continuation reason
+        let continuation_reason = if status_success {
+            let reason = format!(
+                "Conflicts still present after resolution attempt: {}",
+                remaining_conflicts.join(", ")
             );
+            warn!("{}", reason);
+            Some(reason)
         } else {
+            let reason = format!(
+                "Resolution command failed with exit code: {:?}",
+                status.code()
+            );
             warn!(
                 "Resolution attempt {} failed with exit code: {:?}",
                 attempt,
                 status.code()
             );
-        }
+            Some(reason)
+        };
+
+        resolve_context.record(ResolveAttempt {
+            attempt,
+            command_success: status_success,
+            verification_success: false,
+            duration,
+            continuation_reason,
+            exit_code: status.code(),
+        });
     }
 
     let error_msg = format!("Failed to resolve conflicts after {} attempts", max_retries);
@@ -218,6 +258,17 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
     } = args;
 
     send_event(event_tx, ParallelEvent::ConflictResolutionStarted).await;
+
+    // Send ResolveStarted for each change_id to update TUI status
+    for change_id in change_ids {
+        send_event(
+            event_tx,
+            ParallelEvent::ResolveStarted {
+                change_id: change_id.to_string(),
+            },
+        )
+        .await;
+    }
 
     let conflict_files = detect_conflicts(workspace_manager).await?;
     let conflict_files_str = if conflict_files.is_empty() {
@@ -265,7 +316,11 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         .collect::<Vec<_>>()
         .join("\n");
 
+    // Create resolve context for tracking attempts
+    let mut resolve_context = ResolveContext::new(max_retries);
+
     for attempt in 1..=max_retries {
+        let start = Instant::now();
         info!(
             "Merge resolution attempt {}/{} for branches: {}",
             attempt,
@@ -273,7 +328,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             revisions.join(", ")
         );
 
-        let resolve_prompt = format!(
+        let mut resolve_prompt = format!(
             "{}\n\n\
              You must complete sequential Git merges into the target branch.\n\n\
              Target branch: {}\n\
@@ -308,9 +363,15 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             merge_plan,
             worktree_locations,
             vcs_status,
-            vcs_log,
+             vcs_log,
             conflict_files_str
         );
+
+        // Add context from previous attempts if any
+        let continuation_context = resolve_context.format_continuation_context();
+        if !continuation_context.is_empty() {
+            resolve_prompt = format!("{}\n\n{}", resolve_prompt, continuation_context);
+        }
 
         let agent = AgentRunner::new(config.clone());
         let (mut child, mut rx) = agent
@@ -336,6 +397,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             OrchestratorError::AgentCommand(format!("Resolve command failed: {}", e))
         })?;
         let status_success = status.success();
+        let duration = start.elapsed();
 
         let remaining_conflicts = detect_conflicts(workspace_manager).await?;
         if remaining_conflicts.is_empty() {
@@ -349,6 +411,8 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                     .map_err(OrchestratorError::from)?;
 
                 if merge_in_progress {
+                    let reason =
+                        "Merge still in progress (MERGE_HEAD exists); retrying resolve".to_string();
                     warn!(
                         "Merge still in progress after resolve attempt {}/{}",
                         attempt, max_retries
@@ -356,11 +420,18 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                     send_event(
                         event_tx,
                         ParallelEvent::ResolveOutput {
-                            output: "Merge still in progress (MERGE_HEAD exists); retrying resolve"
-                                .to_string(),
+                            output: reason.clone(),
                         },
                     )
                     .await;
+                    resolve_context.record(ResolveAttempt {
+                        attempt,
+                        command_success: status_success,
+                        verification_success: false,
+                        duration,
+                        continuation_reason: Some(reason),
+                        exit_code: status.code(),
+                    });
                     continue;
                 }
 
@@ -396,7 +467,21 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
 
                 if let Some(reason) = retry_reason {
                     warn!("{}", reason);
-                    send_event(event_tx, ParallelEvent::ResolveOutput { output: reason }).await;
+                    send_event(
+                        event_tx,
+                        ParallelEvent::ResolveOutput {
+                            output: reason.clone(),
+                        },
+                    )
+                    .await;
+                    resolve_context.record(ResolveAttempt {
+                        attempt,
+                        command_success: status_success,
+                        verification_success: false,
+                        duration,
+                        continuation_reason: Some(reason),
+                        exit_code: status.code(),
+                    });
                     continue;
                 }
 
@@ -429,7 +514,21 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
 
                 if let Some(reason) = presync_retry_reason {
                     warn!("{}", reason);
-                    send_event(event_tx, ParallelEvent::ResolveOutput { output: reason }).await;
+                    send_event(
+                        event_tx,
+                        ParallelEvent::ResolveOutput {
+                            output: reason.clone(),
+                        },
+                    )
+                    .await;
+                    resolve_context.record(ResolveAttempt {
+                        attempt,
+                        command_success: status_success,
+                        verification_success: false,
+                        duration,
+                        continuation_reason: Some(reason),
+                        exit_code: status.code(),
+                    });
                     continue;
                 }
 
@@ -439,6 +538,10 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         .map_err(OrchestratorError::from)?;
 
                 if !missing_commits.is_empty() {
+                    let reason = format!(
+                        "Missing merge commits for change_ids ({}); retrying resolve",
+                        missing_commits.join(", ")
+                    );
                     warn!(
                         "Missing merge commits after resolve attempt {}/{}: {:?}",
                         attempt, max_retries, missing_commits
@@ -446,13 +549,18 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                     send_event(
                         event_tx,
                         ParallelEvent::ResolveOutput {
-                            output: format!(
-                                "Missing merge commits for change_ids ({}); retrying resolve",
-                                missing_commits.join(", ")
-                            ),
+                            output: reason.clone(),
                         },
                     )
                     .await;
+                    resolve_context.record(ResolveAttempt {
+                        attempt,
+                        command_success: status_success,
+                        verification_success: false,
+                        duration,
+                        continuation_reason: Some(reason),
+                        exit_code: status.code(),
+                    });
                     continue;
                 }
 
@@ -524,7 +632,21 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
 
                 if let Some(reason) = presync_missing_reason {
                     warn!("{}", reason);
-                    send_event(event_tx, ParallelEvent::ResolveOutput { output: reason }).await;
+                    send_event(
+                        event_tx,
+                        ParallelEvent::ResolveOutput {
+                            output: reason.clone(),
+                        },
+                    )
+                    .await;
+                    resolve_context.record(ResolveAttempt {
+                        attempt,
+                        command_success: status_success,
+                        verification_success: false,
+                        duration,
+                        continuation_reason: Some(reason),
+                        exit_code: status.code(),
+                    });
                     continue;
                 }
 
@@ -549,22 +671,61 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                     attempt, max_retries
                 );
             }
+            // Record successful resolution
+            resolve_context.record(ResolveAttempt {
+                attempt,
+                command_success: status_success,
+                verification_success: true,
+                duration,
+                continuation_reason: None,
+                exit_code: status.code(),
+            });
             send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
+
+            // Send ResolveCompleted for each change_id to update TUI status
+            for change_id in change_ids {
+                send_event(
+                    event_tx,
+                    ParallelEvent::ResolveCompleted {
+                        change_id: change_id.to_string(),
+                        worktree_change_ids: None,
+                    },
+                )
+                .await;
+            }
+
             return Ok(());
         }
 
-        if status_success {
-            warn!(
-                "Conflicts still present after merge resolution attempt: {:?}",
-                remaining_conflicts
+        // Record failed attempt with continuation reason
+        let continuation_reason = if status_success {
+            let reason = format!(
+                "Conflicts still present after merge resolution attempt: {}",
+                remaining_conflicts.join(", ")
             );
+            warn!("{}", reason);
+            Some(reason)
         } else {
+            let reason = format!(
+                "Merge resolution command failed with exit code: {:?}",
+                status.code()
+            );
             warn!(
                 "Merge resolution attempt {} failed with exit code: {:?}",
                 attempt,
                 status.code()
             );
-        }
+            Some(reason)
+        };
+
+        resolve_context.record(ResolveAttempt {
+            attempt,
+            command_success: status_success,
+            verification_success: false,
+            duration,
+            continuation_reason,
+            exit_code: status.code(),
+        });
     }
 
     let error_msg = format!("Failed to resolve merges after {} attempts", max_retries);
@@ -575,6 +736,18 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         },
     )
     .await;
+
+    // Send ResolveFailed for each change_id to update TUI status
+    for change_id in change_ids {
+        send_event(
+            event_tx,
+            ParallelEvent::ResolveFailed {
+                change_id: change_id.to_string(),
+                error: error_msg.clone(),
+            },
+        )
+        .await;
+    }
 
     match workspace_manager.backend_type() {
         VcsBackend::Git | VcsBackend::Auto => Err(OrchestratorError::GitConflict(error_msg)),

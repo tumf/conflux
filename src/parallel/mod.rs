@@ -1236,6 +1236,15 @@ impl ParallelExecutor {
         let revisions = vec![workspace.name.clone()];
         let change_ids = vec![change_id.to_string()];
 
+        // Send ResolveStarted to update TUI status
+        send_event(
+            &self.event_tx,
+            ParallelEvent::ResolveStarted {
+                change_id: change_id.to_string(),
+            },
+        )
+        .await;
+
         match self.attempt_merge(&revisions, &change_ids).await? {
             MergeAttempt::Merged => {
                 send_event(
@@ -1263,9 +1272,31 @@ impl ParallelExecutor {
                     )
                     .await;
                 }
+
+                // Send ResolveCompleted to update TUI status
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::ResolveCompleted {
+                        change_id: change_id.to_string(),
+                        worktree_change_ids: None,
+                    },
+                )
+                .await;
+
                 Ok(())
             }
-            MergeAttempt::Deferred(reason) => Err(OrchestratorError::GitCommand(reason)),
+            MergeAttempt::Deferred(reason) => {
+                // Send ResolveFailed to update TUI status
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::ResolveFailed {
+                        change_id: change_id.to_string(),
+                        error: reason.clone(),
+                    },
+                )
+                .await;
+                Err(OrchestratorError::GitCommand(reason))
+            }
         }
     }
 
@@ -1342,6 +1373,7 @@ impl ParallelExecutor {
             send_event(
                 &self.event_tx,
                 ParallelEvent::MergeCompleted {
+                    change_id: change_ids[0].clone(),
                     revision: merge_revision,
                 },
             )
@@ -1367,10 +1399,26 @@ impl ParallelExecutor {
                     send_event(
                         &self.event_tx,
                         ParallelEvent::MergeCompleted {
+                            change_id: change_ids[0].clone(),
                             revision: merge_revision,
                         },
                     )
                     .await;
+
+                    // Send ResolveCompleted for each change_id if there were conflicts resolved
+                    if attempt > 1 {
+                        for change_id in change_ids {
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::ResolveCompleted {
+                                    change_id: change_id.to_string(),
+                                    worktree_change_ids: None,
+                                },
+                            )
+                            .await;
+                        }
+                    }
+
                     return Ok(());
                 }
                 Err(VcsError::Conflict { details, .. }) => {
@@ -1400,6 +1448,19 @@ impl ParallelExecutor {
                             },
                         )
                         .await;
+
+                        // Send ResolveFailed for each change_id to update TUI status
+                        for change_id in change_ids {
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::ResolveFailed {
+                                    change_id: change_id.to_string(),
+                                    error: error_msg.clone(),
+                                },
+                            )
+                            .await;
+                        }
+
                         return Err(OrchestratorError::from_vcs_error(VcsError::Conflict {
                             backend: self.workspace_manager.backend_type(),
                             details: error_msg,
@@ -1410,14 +1471,41 @@ impl ParallelExecutor {
                         "Resolving merge conflicts (attempt {}/{}).",
                         attempt, max_attempts
                     );
+
+                    // Send ResolveStarted for each change_id to update TUI status
+                    for change_id in change_ids {
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::ResolveStarted {
+                                change_id: change_id.to_string(),
+                            },
+                        )
+                        .await;
+                    }
+
                     if let Err(err) = resolve_conflicts(revisions.to_vec(), details.clone()).await {
                         warn!(
                             "Conflict resolution failed on attempt {}/{}: {}",
                             attempt, max_attempts, err
                         );
+
+                        // Send ResolveFailed for each change_id to update TUI status
+                        for change_id in change_ids {
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::ResolveFailed {
+                                    change_id: change_id.to_string(),
+                                    error: err.to_string(),
+                                },
+                            )
+                            .await;
+                        }
+
                         return Err(err);
                     }
                     info!("Conflict resolution completed, retrying merge");
+
+                    // Note: ResolveCompleted will be sent when the merge succeeds
                 }
                 Err(e) => return Err(e.into()),
             }

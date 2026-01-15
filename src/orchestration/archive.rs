@@ -11,6 +11,7 @@
 use crate::agent::AgentRunner;
 use crate::config::StallDetectionConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::execution::archive::ArchiveVerificationResult;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::Change;
 use crate::vcs::git::commands as git_commands;
@@ -330,7 +331,7 @@ where
         attempt += 1;
 
         // Execute archive command with streaming
-        let (mut child, mut output_rx) = agent.run_archive_streaming(&change.id).await?;
+        let (mut child, mut output_rx, start) = agent.run_archive_streaming(&change.id).await?;
 
         // Stream output
         loop {
@@ -359,6 +360,9 @@ where
 
         if !status.success() {
             let error_msg = format!("Archive command failed with exit code: {:?}", status.code());
+
+            // Record the failed attempt
+            agent.record_archive_attempt(&change.id, &status, start, Some(error_msg.clone()));
 
             // Run on_error hook
             let error_ctx = hook_ctx.clone().with_error(&error_msg);
@@ -407,14 +411,31 @@ where
         }
 
         // Verify archive was successful
-        if verify_archive_completion(&change.id, base_path).is_success() {
+        let verification_status = verify_archive_completion(&change.id, base_path);
+        if verification_status.is_success() {
+            // Record successful archive attempt
+            agent.record_archive_attempt(&change.id, &status, start, None);
             break;
         }
 
+        // Verification failed - record with reason
+        let verification_reason = match verification_status {
+            ArchiveVerificationResult::NotArchived { ref change_id } => {
+                format!("Change still exists at openspec/changes/{}", change_id)
+            }
+            _ => "Archive verification failed".to_string(),
+        };
+        agent.record_archive_attempt(
+            &change.id,
+            &status,
+            start,
+            Some(verification_reason.clone()),
+        );
+
         if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
             output.on_warn(&format!(
-                "Archive verification failed for {} (attempt {}/{}); retrying archive command",
-                change.id, attempt, max_attempts
+                "Archive verification failed for {} (attempt {}/{}): {}; retrying archive command",
+                change.id, attempt, max_attempts, verification_reason
             ));
             continue;
         }
@@ -433,8 +454,9 @@ where
         }
     }
 
-    // Clear apply history
+    // Clear apply and archive history
     agent.clear_apply_history(&change.id);
+    agent.clear_archive_history(&change.id);
 
     // Run post_archive hook
     let post_ctx = HookContext::new(
