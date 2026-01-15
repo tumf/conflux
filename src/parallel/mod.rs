@@ -70,6 +70,8 @@ pub struct ParallelExecutor {
     hooks: Option<Arc<HookRunner>>,
     /// Cancellation token for force stop cleanup
     cancel_token: Option<CancellationToken>,
+    /// Last queue change timestamp for debouncing re-analysis
+    last_queue_change_at: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 pub async fn base_dirty_reason(repo_root: &Path) -> Result<Option<String>> {
@@ -120,12 +122,13 @@ impl ParallelExecutor {
         Self::with_backend(repo_root, config, event_tx, vcs_backend)
     }
 
-    /// Create a new parallel executor with a specific VCS backend
-    pub fn with_backend(
+    /// Create a new parallel executor with a specific VCS backend and optional shared queue change timestamp
+    pub fn with_backend_and_queue_state(
         repo_root: PathBuf,
         config: OrchestratorConfig,
         event_tx: Option<mpsc::Sender<ParallelEvent>>,
         vcs_backend: VcsBackend,
+        shared_queue_change: Option<Arc<Mutex<Option<std::time::Instant>>>>,
     ) -> Self {
         // Create a unique temp directory for this execution
         let base_dir = if let Some(configured_dir) = config.get_workspace_base_dir() {
@@ -166,6 +169,9 @@ impl ParallelExecutor {
             )),
         };
 
+        let last_queue_change_at =
+            shared_queue_change.unwrap_or_else(|| Arc::new(Mutex::new(None)));
+
         Self {
             workspace_manager,
             config,
@@ -181,7 +187,18 @@ impl ParallelExecutor {
             merge_deferred_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
+            last_queue_change_at,
         }
+    }
+
+    /// Create a new parallel executor with a specific VCS backend
+    pub fn with_backend(
+        repo_root: PathBuf,
+        config: OrchestratorConfig,
+        event_tx: Option<mpsc::Sender<ParallelEvent>>,
+        vcs_backend: VcsBackend,
+    ) -> Self {
+        Self::with_backend_and_queue_state(repo_root, config, event_tx, vcs_backend, None)
     }
 
     /// Set the hook runner for executing hooks during parallel execution.
@@ -202,6 +219,54 @@ impl ParallelExecutor {
     /// Set the cancellation token for force stop cleanup.
     pub fn set_cancel_token(&mut self, cancel_token: CancellationToken) {
         self.cancel_token = Some(cancel_token);
+    }
+
+    /// Mark that the queue has changed (addition or removal).
+    /// This updates the timestamp used for debouncing re-analysis.
+    pub async fn mark_queue_changed(&self) {
+        let mut last_change = self.last_queue_change_at.lock().await;
+        *last_change = Some(std::time::Instant::now());
+        info!("Queue change marked for debouncing");
+    }
+
+    /// Check if re-analysis should proceed based on debounce logic.
+    ///
+    /// Returns `true` if:
+    /// - A slot is available (a change just completed), AND
+    /// - Either no recent queue changes OR 10 seconds have passed since the last queue change
+    ///
+    /// This prevents immediate re-analysis when the queue changes, giving time for
+    /// multiple changes to be queued before triggering expensive re-analysis.
+    pub async fn should_reanalyze(&self, slot_available: bool) -> bool {
+        if !slot_available {
+            return false;
+        }
+
+        let last_change = self.last_queue_change_at.lock().await;
+        match *last_change {
+            None => {
+                // No recent queue changes, proceed with re-analysis
+                true
+            }
+            Some(timestamp) => {
+                let elapsed = timestamp.elapsed();
+                let debounce_duration = std::time::Duration::from_secs(10);
+
+                if elapsed >= debounce_duration {
+                    info!(
+                        "Debounce period elapsed ({:.1}s >= 10s), proceeding with re-analysis",
+                        elapsed.as_secs_f64()
+                    );
+                    true
+                } else {
+                    info!(
+                        "Debounce period active ({:.1}s < 10s), deferring re-analysis",
+                        elapsed.as_secs_f64()
+                    );
+                    false
+                }
+            }
+        }
     }
 
     fn is_cancelled(&self) -> bool {
@@ -423,6 +488,17 @@ impl ParallelExecutor {
             if changes.is_empty() {
                 info!("All remaining changes are blocked by dependencies, stopping");
                 break;
+            }
+
+            // Check debounce: a slot is available (after previous group completed)
+            // Wait for debounce period if queue recently changed
+            let slot_available = group_counter > 1; // First iteration has no previous completion
+            if !self.should_reanalyze(slot_available).await {
+                // Debounce period still active, wait before re-analyzing
+                let wait_duration = std::time::Duration::from_secs(1);
+                info!("Debounce active, waiting {:?} before retry", wait_duration);
+                tokio::time::sleep(wait_duration).await;
+                continue; // Retry the loop after waiting
             }
 
             // Analyze remaining changes to get the next group
@@ -1886,6 +1962,7 @@ mod tests {
             merge_deferred_changes,
             hooks: None,
             cancel_token: None,
+            last_queue_change_at: Arc::new(Mutex::new(None)),
         };
 
         assert_eq!(
@@ -2100,6 +2177,7 @@ mod tests {
             merge_deferred_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
+            last_queue_change_at: Arc::new(Mutex::new(None)),
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2238,6 +2316,7 @@ mod tests {
             merge_deferred_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
+            last_queue_change_at: Arc::new(Mutex::new(None)),
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2348,6 +2427,7 @@ mod tests {
             merge_deferred_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
+            last_queue_change_at: Arc::new(Mutex::new(None)),
         };
 
         let revisions = vec![workspace_a.name];
@@ -2487,6 +2567,7 @@ mod tests {
             merge_deferred_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
+            last_queue_change_at: Arc::new(Mutex::new(None)),
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2640,6 +2721,7 @@ mod tests {
             merge_deferred_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
+            last_queue_change_at: Arc::new(Mutex::new(None)),
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2799,6 +2881,7 @@ mod tests {
             merge_deferred_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
+            last_queue_change_at: Arc::new(Mutex::new(None)),
         };
 
         let revisions = vec![workspace_a.name];

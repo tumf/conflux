@@ -48,6 +48,7 @@ impl AppState {
                         QueueStatus::Completed
                         | QueueStatus::Archiving
                         | QueueStatus::Archived
+                        | QueueStatus::Merged
                         | QueueStatus::MergeWait
                         | QueueStatus::Resolving => {
                             // Don't update progress after completion - file may be moved
@@ -153,7 +154,7 @@ impl AppState {
                 revision: _,
             } => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-                    change.queue_status = QueueStatus::Archived;
+                    change.queue_status = QueueStatus::Merged;
                     if let Some(started) = change.started_at {
                         change.elapsed_time = Some(started.elapsed());
                     }
@@ -308,6 +309,7 @@ impl AppState {
                         QueueStatus::Completed
                         | QueueStatus::Archiving
                         | QueueStatus::Archived
+                        | QueueStatus::Merged
                         | QueueStatus::MergeWait
                         | QueueStatus::Resolving
                         | QueueStatus::Processing => {
@@ -350,6 +352,7 @@ impl AppState {
                     QueueStatus::Completed
                         | QueueStatus::Archiving
                         | QueueStatus::Archived
+                        | QueueStatus::Merged
                         | QueueStatus::MergeWait
                         | QueueStatus::Resolving
                         | QueueStatus::Error(_)
@@ -546,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_completed_sets_archived_status() {
+    fn test_merge_completed_sets_merged_status() {
         let changes = vec![create_approved_change("change-a", 0, 5)];
         let mut app = AppState::new(changes);
         app.changes[0].queue_status = QueueStatus::Processing;
@@ -557,7 +560,7 @@ mod tests {
             revision: "abc123".to_string(),
         });
 
-        assert_eq!(app.changes[0].queue_status, QueueStatus::Archived);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Merged);
         assert!(app.changes[0].elapsed_time.is_some());
         assert!(app
             .logs
@@ -995,19 +998,21 @@ mod tests {
         assert!(app.changes[0].is_approved);
     }
 
-    /// Test that Completed and Error states are also retained (terminal states).
+    /// Test that Completed, Archived, Merged, and Error states are retained (terminal states).
     #[test]
     fn test_terminal_states_retained_after_removal() {
         let changes = vec![
             create_approved_change("archived", 5, 5),
+            create_approved_change("merged", 4, 4),
             create_approved_change("completed", 3, 3),
             create_approved_change("error", 1, 2),
         ];
         let mut app = AppState::new(changes);
 
         app.changes[0].queue_status = QueueStatus::Archived;
-        app.changes[1].queue_status = QueueStatus::Completed;
-        app.changes[2].queue_status = QueueStatus::Error("Test error".to_string());
+        app.changes[1].queue_status = QueueStatus::Merged;
+        app.changes[2].queue_status = QueueStatus::Completed;
+        app.changes[3].queue_status = QueueStatus::Error("Test error".to_string());
 
         // Simulate refresh with all changes removed from filesystem
         let fetched: Vec<Change> = vec![];
@@ -1016,15 +1021,16 @@ mod tests {
         // All terminal state changes should be retained
         assert_eq!(
             app.changes.len(),
-            3,
+            4,
             "All terminal state changes should be retained"
         );
         assert!(matches!(app.changes[0].queue_status, QueueStatus::Archived));
+        assert!(matches!(app.changes[1].queue_status, QueueStatus::Merged));
         assert!(matches!(
-            app.changes[1].queue_status,
+            app.changes[2].queue_status,
             QueueStatus::Completed
         ));
-        assert!(matches!(app.changes[2].queue_status, QueueStatus::Error(_)));
+        assert!(matches!(app.changes[3].queue_status, QueueStatus::Error(_)));
     }
     /// Test that started changes are retained when removed from fetched_changes.
     #[test]

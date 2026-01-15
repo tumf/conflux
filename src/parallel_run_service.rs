@@ -56,6 +56,43 @@ impl ParallelRunService {
         Ok(crate::cli::check_parallel_available())
     }
 
+    /// Create a configured ParallelExecutor instance with optional shared queue change state.
+    ///
+    /// This allows external callers to share queue change timestamps across multiple executors,
+    /// enabling debounce logic to work across batch boundaries.
+    pub fn create_executor_with_queue_state(
+        &self,
+        event_tx: Option<mpsc::Sender<ParallelEvent>>,
+        cancel_token: Option<CancellationToken>,
+        shared_queue_change: Option<std::sync::Arc<tokio::sync::Mutex<Option<std::time::Instant>>>>,
+    ) -> ParallelExecutor {
+        let vcs_backend = self.config.get_vcs_backend();
+        let mut executor = ParallelExecutor::with_backend_and_queue_state(
+            self.repo_root.clone(),
+            self.config.clone(),
+            event_tx,
+            vcs_backend,
+            shared_queue_change,
+        );
+        executor.set_no_resume(self.no_resume);
+        if let Some(token) = cancel_token {
+            executor.set_cancel_token(token);
+        }
+        executor
+    }
+
+    /// Create a configured ParallelExecutor instance.
+    ///
+    /// This allows external callers to access executor methods like `mark_queue_changed()`
+    /// while the executor is managed externally.
+    pub fn create_executor(
+        &self,
+        event_tx: Option<mpsc::Sender<ParallelEvent>>,
+        cancel_token: Option<CancellationToken>,
+    ) -> ParallelExecutor {
+        self.create_executor_with_queue_state(event_tx, cancel_token, None)
+    }
+
     async fn filter_committed_changes(
         &self,
         changes: Vec<Change>,
@@ -148,6 +185,32 @@ impl ParallelRunService {
         result
     }
 
+    /// Run parallel execution with an mpsc sender for events and optional shared queue change state.
+    ///
+    /// This variant is useful when integrating with existing channel-based
+    /// event systems (e.g., TUI).
+    ///
+    /// Uses dynamic re-analysis: after each group completes, the remaining changes
+    /// are re-analyzed to determine the next group.
+    ///
+    /// The `shared_queue_change` parameter allows tracking queue changes across multiple
+    /// batch executions for proper debouncing behavior.
+    pub async fn run_parallel_with_channel_and_queue_state(
+        &self,
+        changes: Vec<Change>,
+        event_tx: mpsc::Sender<ParallelEvent>,
+        cancel_token: Option<CancellationToken>,
+        shared_queue_change: Option<std::sync::Arc<tokio::sync::Mutex<Option<std::time::Instant>>>>,
+    ) -> Result<()> {
+        let executor = self.create_executor_with_queue_state(
+            Some(event_tx.clone()),
+            cancel_token,
+            shared_queue_change,
+        );
+        self.run_parallel_with_executor(executor, changes, event_tx)
+            .await
+    }
+
     /// Run parallel execution with an mpsc sender for events
     ///
     /// This variant is useful when integrating with existing channel-based
@@ -160,6 +223,21 @@ impl ParallelRunService {
         changes: Vec<Change>,
         event_tx: mpsc::Sender<ParallelEvent>,
         cancel_token: Option<CancellationToken>,
+    ) -> Result<()> {
+        self.run_parallel_with_channel_and_queue_state(changes, event_tx, cancel_token, None)
+            .await
+    }
+
+    /// Run parallel execution with a pre-configured executor.
+    ///
+    /// This variant allows the caller to manage the executor instance,
+    /// which is useful for calling executor methods like `mark_queue_changed()`
+    /// during execution.
+    pub async fn run_parallel_with_executor(
+        &self,
+        mut executor: ParallelExecutor,
+        changes: Vec<Change>,
+        event_tx: mpsc::Sender<ParallelEvent>,
     ) -> Result<()> {
         let (changes, skipped) = self.filter_committed_changes(changes).await?;
 
@@ -186,17 +264,6 @@ impl ParallelRunService {
             "Starting parallel execution with re-analysis for {} changes",
             changes.len()
         );
-
-        // Create executor with the provided channel
-        let mut executor = ParallelExecutor::new(
-            self.repo_root.clone(),
-            self.config.clone(),
-            Some(event_tx.clone()),
-        );
-        executor.set_no_resume(self.no_resume);
-        if let Some(token) = cancel_token {
-            executor.set_cancel_token(token);
-        }
 
         // Clone config for the analyzer closure
         let config = self.config.clone();
