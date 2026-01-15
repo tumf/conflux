@@ -1,8 +1,8 @@
 # configuration Specification (Delta)
 
-## MODIFIED Requirements
+## ADDED Requirements
 
-### Requirement: コマンドキューの設定
+### Requirement: Command Queue Configuration
 
 オーケストレーターは JSONC 設定ファイルを通じてコマンド実行キューの動作を設定できなければならない (MUST)。
 
