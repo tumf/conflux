@@ -214,6 +214,9 @@ pub async fn worktree_add<P: AsRef<Path>>(
 }
 
 /// Create a new detached worktree at the specified path.
+///
+/// DEPRECATED: Use worktree_add with a branch name instead to avoid detached HEAD state.
+#[allow(dead_code)]
 pub async fn worktree_add_detached<P: AsRef<Path>>(
     cwd: P,
     worktree_path: &str,
@@ -243,6 +246,52 @@ pub async fn branch_delete<P: AsRef<Path>>(cwd: P, branch_name: &str) -> VcsResu
     debug!("Deleting branch {}", branch_name);
     run_git(&["branch", "-D", branch_name], cwd).await?;
     Ok(())
+}
+
+/// Check if a branch exists.
+pub async fn branch_exists<P: AsRef<Path>>(cwd: P, branch_name: &str) -> VcsResult<bool> {
+    let output = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            &format!("refs/heads/{}", branch_name),
+        ])
+        .current_dir(cwd.as_ref())
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| VcsError::git_command(format!("Failed to check branch existence: {}", e)))?;
+
+    Ok(output.status.success())
+}
+
+/// Generate a unique branch name with the given prefix and random suffix.
+/// Retries with new random values if the branch already exists.
+pub async fn generate_unique_branch_name<P: AsRef<Path>>(
+    cwd: P,
+    prefix: &str,
+    max_attempts: u32,
+) -> VcsResult<String> {
+    use rand::Rng;
+
+    for _ in 0..max_attempts {
+        // Generate 6-character random hex string
+        let random_suffix: String = (0..6)
+            .map(|_| format!("{:x}", rand::thread_rng().gen_range(0..16)))
+            .collect();
+        let branch_name = format!("{}-{}", prefix, random_suffix);
+
+        if !branch_exists(&cwd, &branch_name).await? {
+            return Ok(branch_name);
+        }
+
+        debug!("Branch '{}' already exists, retrying...", branch_name);
+    }
+
+    Err(VcsError::git_command(format!(
+        "Failed to generate unique branch name after {} attempts",
+        max_attempts
+    )))
 }
 
 /// Checkout a branch.
