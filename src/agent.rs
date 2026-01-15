@@ -4,6 +4,8 @@
 //! based on configuration templates. It replaces the OpenCode-specific runner
 //! with a configurable approach.
 
+use crate::command_queue::{CommandQueue, CommandQueueConfig};
+use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 
 /// Hardcoded system prompt for apply commands.
@@ -67,6 +69,8 @@ pub enum OutputLine {
 /// Manages agent process execution based on configuration
 pub struct AgentRunner {
     config: OrchestratorConfig,
+    /// Command execution queue with staggered start and retry mechanism
+    command_queue: CommandQueue,
     /// History of apply attempts per change for context injection
     apply_history: ApplyHistory,
     /// History of archive attempts per change for context injection
@@ -76,8 +80,29 @@ pub struct AgentRunner {
 impl AgentRunner {
     /// Create a new AgentRunner with the given configuration
     pub fn new(config: OrchestratorConfig) -> Self {
+        // Build command queue configuration from orchestrator config
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: config
+                .command_queue_stagger_delay_ms
+                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+            max_retries: config
+                .command_queue_max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_delay_ms: config
+                .command_queue_retry_delay_ms
+                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+            retry_error_patterns: config
+                .command_queue_retry_patterns
+                .clone()
+                .unwrap_or_else(default_retry_patterns),
+            retry_if_duration_under_secs: config
+                .command_queue_retry_if_duration_under_secs
+                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+        };
+
         Self {
             config,
+            command_queue: CommandQueue::new(queue_config),
             apply_history: ApplyHistory::new(),
             archive_history: ArchiveHistory::new(),
         }
@@ -368,92 +393,12 @@ impl AgentRunner {
         &self,
         command: &str,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
-        let mut child = if cfg!(target_os = "windows") {
-            debug!(
-                module = module_path!(),
-                "Spawning shell command: cmd /C {}", command
-            );
-            Command::new("cmd")
-                .arg("/C")
-                .arg(command)
-                .env_clear()
-                .envs(std::env::vars())
-                // Disable terminal-related environment variables
-                .env("NO_COLOR", "1")
-                .env("CLICOLOR", "0")
-                .env("CLICOLOR_FORCE", "0")
-                .env("CI", "true")
-                // Disable pagers
-                .env("PAGER", "type")
-                .env("GIT_PAGER", "type")
-                .env("LESS", "")
-                .env("MORE", "")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| {
-                    OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
-                })?
-        } else {
-            // Use login shell to load .zprofile/.profile for PATH and environment setup
-            // Note: -l (login) instead of -i (interactive) to avoid job control issues with TUI
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            debug!(
-                module = module_path!(),
-                "Spawning shell command: {} -l -c {}", shell, command
-            );
-            let mut cmd = Command::new(&shell);
-            cmd.arg("-l")
-                .arg("-c")
-                .arg(command)
-                .env_clear()
-                .envs(std::env::vars())
-                // Disable terminal-related environment variables
-                .env("TERM", "dumb")
-                .env("NO_COLOR", "1")
-                .env("CLICOLOR", "0")
-                .env("CLICOLOR_FORCE", "0")
-                // Disable interactive features
-                .env("CI", "true")
-                .env("CONTINUOUS_INTEGRATION", "true")
-                .env("NON_INTERACTIVE", "1")
-                // Disable pagers completely
-                .env("PAGER", "cat")
-                .env("GIT_PAGER", "cat")
-                .env("LESS", "-FX") // -F: quit if one screen, -X: no init
-                .env("MORE", "-E") // -E: quit at EOF
-                // Prevent any pager from being used
-                .env("MANPAGER", "cat")
-                .env("SYSTEMD_PAGER", "cat")
-                // Disable git interactive features
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-
-            #[cfg(unix)]
-            {
-                // Detach from controlling terminal and create new process group
-                unsafe {
-                    #[allow(unused_imports)]
-                    use std::os::unix::process::CommandExt;
-                    cmd.pre_exec(|| {
-                        use nix::unistd::{setpgid, Pid};
-
-                        // Create a new process group (replacing setsid for better cleanup)
-                        setpgid(Pid::from_raw(0), Pid::from_raw(0))
-                            .map_err(std::io::Error::other)?;
-
-                        Ok(())
-                    });
-                }
-            }
-
-            cmd.spawn().map_err(|e| {
-                OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
-            })?
-        };
+        // Apply stagger delay before spawning command
+        let command_str = command.to_string();
+        let mut child = self
+            .command_queue
+            .execute_with_stagger(|| self.build_command(&command_str))
+            .await?;
 
         let (tx, rx) = mpsc::channel::<OutputLine>(100);
 
@@ -497,15 +442,149 @@ impl AgentRunner {
         Ok((managed_child, rx))
     }
 
+    /// Build a command for execution (extracted for use with command queue)
+    fn build_command(&self, command: &str) -> Command {
+        if cfg!(target_os = "windows") {
+            debug!(
+                module = module_path!(),
+                "Building shell command: cmd /C {}", command
+            );
+            let mut cmd = Command::new("cmd");
+            cmd.arg("/C")
+                .arg(command)
+                .env_clear()
+                .envs(std::env::vars())
+                // Disable terminal-related environment variables
+                .env("NO_COLOR", "1")
+                .env("CLICOLOR", "0")
+                .env("CLICOLOR_FORCE", "0")
+                .env("CI", "true")
+                // Disable pagers
+                .env("PAGER", "type")
+                .env("GIT_PAGER", "type")
+                .env("LESS", "")
+                .env("MORE", "")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd
+        } else {
+            // Use login shell to load .zprofile/.profile for PATH and environment setup
+            // Note: -l (login) instead of -i (interactive) to avoid job control issues with TUI
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            debug!(
+                module = module_path!(),
+                "Building shell command: {} -l -c {}", shell, command
+            );
+            let mut cmd = Command::new(&shell);
+            cmd.arg("-l")
+                .arg("-c")
+                .arg(command)
+                .env_clear()
+                .envs(std::env::vars())
+                // Disable terminal-related environment variables
+                .env("TERM", "dumb")
+                .env("NO_COLOR", "1")
+                .env("CLICOLOR", "0")
+                .env("CLICOLOR_FORCE", "0")
+                // Disable interactive features
+                .env("CI", "true")
+                .env("CONTINUOUS_INTEGRATION", "true")
+                .env("NON_INTERACTIVE", "1")
+                // Disable pagers completely
+                .env("PAGER", "cat")
+                .env("GIT_PAGER", "cat")
+                .env("LESS", "-FX") // -F: quit if one screen, -X: no init
+                .env("MORE", "-E") // -E: quit at EOF
+                // Prevent any pager from being used
+                .env("MANPAGER", "cat")
+                .env("SYSTEMD_PAGER", "cat")
+                // Disable git interactive features
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            #[cfg(unix)]
+            {
+                // Detach from controlling terminal and create new process group
+                unsafe {
+                    #[allow(unused_imports)]
+                    use std::os::unix::process::CommandExt;
+                    cmd.pre_exec(|| {
+                        use nix::unistd::{setpgid, Pid};
+
+                        // Create a new process group (replacing setsid for better cleanup)
+                        setpgid(Pid::from_raw(0), Pid::from_raw(0))
+                            .map_err(std::io::Error::other)?;
+
+                        Ok(())
+                    });
+                }
+            }
+
+            cmd
+        }
+    }
+
     async fn execute_shell_command_streaming_in_dir(
         &self,
         command: &str,
         cwd: &Path,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
-        let mut child = if cfg!(target_os = "windows") {
-            debug!("Spawning shell command: cmd /C {}", command);
-            Command::new("cmd")
-                .arg("/C")
+        // Apply stagger delay before spawning command
+        let command_str = command.to_string();
+        let cwd_path = cwd.to_path_buf();
+        let mut child = self
+            .command_queue
+            .execute_with_stagger(|| self.build_command_in_dir(&command_str, &cwd_path))
+            .await?;
+
+        let (tx, rx) = mpsc::channel::<OutputLine>(100);
+
+        // Take ownership of stdout and stderr
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        if let Some(stdout) = stdout {
+            let tx_stdout = tx.clone();
+            tokio::spawn(async move {
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if tx_stdout.send(OutputLine::Stdout(line)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        if let Some(stderr) = stderr {
+            let tx_stderr = tx;
+            tokio::spawn(async move {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if tx_stderr.send(OutputLine::Stderr(line)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        let managed_child = ManagedChild::new(child).map_err(|e| {
+            OrchestratorError::AgentCommand(format!("Failed to create managed child: {}", e))
+        })?;
+
+        Ok((managed_child, rx))
+    }
+
+    /// Build a command for execution in a specific directory
+    fn build_command_in_dir(&self, command: &str, cwd: &Path) -> Command {
+        if cfg!(target_os = "windows") {
+            debug!("Building shell command: cmd /C {}", command);
+            let mut cmd = Command::new("cmd");
+            cmd.arg("/C")
                 .arg(command)
                 .current_dir(cwd)
                 .env_clear()
@@ -522,16 +601,13 @@ impl AgentRunner {
                 .env("MORE", "")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| {
-                    OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
-                })?
+                .stderr(Stdio::piped());
+            cmd
         } else {
             // Use login shell to load .zprofile/.profile for PATH and environment setup
             // Note: -l (login) instead of -i (interactive) to avoid job control issues with TUI
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            debug!("Spawning shell command: {} -l -c {}", shell, command);
+            debug!("Building shell command: {} -l -c {}", shell, command);
             let mut cmd = Command::new(&shell);
             cmd.arg("-l")
                 .arg("-c")
@@ -580,48 +656,8 @@ impl AgentRunner {
                 }
             }
 
-            cmd.spawn().map_err(|e| {
-                OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
-            })?
-        };
-
-        let (tx, rx) = mpsc::channel::<OutputLine>(100);
-
-        // Take ownership of stdout and stderr
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-
-        if let Some(stdout) = stdout {
-            let tx_stdout = tx.clone();
-            tokio::spawn(async move {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx_stdout.send(OutputLine::Stdout(line)).await.is_err() {
-                        break;
-                    }
-                }
-            });
+            cmd
         }
-
-        if let Some(stderr) = stderr {
-            let tx_stderr = tx;
-            tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx_stderr.send(OutputLine::Stderr(line)).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-
-        let managed_child = ManagedChild::new(child).map_err(|e| {
-            OrchestratorError::AgentCommand(format!("Failed to create managed child: {}", e))
-        })?;
-
-        Ok((managed_child, rx))
     }
 
     /// Execute a shell command and wait for completion (blocking, no streaming)

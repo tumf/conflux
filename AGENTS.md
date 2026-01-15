@@ -104,6 +104,7 @@ src/
   agent.rs              # AI agent command execution
   analyzer.rs           # Change dependency analyzer for parallel execution
   approval.rs           # Change approval management
+  command_queue.rs      # Command execution queue with stagger and retry
   history.rs            # Apply, archive, and resolve context history management
   hooks.rs              # Lifecycle hook execution
   parallel_run_service.rs # Parallel execution service
@@ -321,6 +322,120 @@ The `run` mode includes signal handlers for graceful shutdown:
 **Issue**: Timeout waiting for process cleanup
 - **TUI Mode**: Default timeout is 5 seconds
 - **Solution**: If processes take longer, check for hung child processes or increase timeout in `src/tui/runner.rs`
+
+## Command Execution Queue
+
+The orchestrator uses a command execution queue to prevent resource conflicts and handle transient errors when running multiple AI agent commands.
+
+### Overview
+
+**Module**: `src/command_queue.rs`
+
+The command queue provides two key features:
+1. **Staggered Start**: Introduces a configurable delay between command executions to prevent simultaneous resource access
+2. **Automatic Retry**: Retries commands that fail due to transient errors (module resolution, network issues, etc.)
+
+### Architecture
+
+```
+AgentRunner
+    ↓
+CommandQueue (stagger + retry)
+    ↓
+tokio::process::Command (spawn)
+```
+
+### Staggered Start
+
+Commands are started with a minimum delay to prevent resource conflicts:
+
+```rust
+async fn execute_with_stagger(&self, command_fn: F) -> Result<Child> {
+    // Wait for minimum delay since last command
+    let mut last = self.last_execution.lock().await;
+    if let Some(last_time) = *last {
+        let elapsed = last_time.elapsed();
+        if elapsed < self.config.stagger_delay_ms {
+            tokio::time::sleep(self.config.stagger_delay_ms - elapsed).await;
+        }
+    }
+    *last = Some(Instant::now());
+    
+    // Spawn command
+    command_fn().spawn()
+}
+```
+
+**Usage**: Applied to all streaming commands (apply, archive, resolve)
+
+### Automatic Retry
+
+Commands are retried if they fail due to transient errors:
+
+**Retry Decision Logic** (OR condition):
+1. **Error Pattern Match**: stderr matches configured regex patterns (e.g., "Cannot find module")
+2. **Short Execution**: Command exits in < 5 seconds (default), indicating startup/environment issues
+
+**No Retry** for:
+- Successful commands (exit code 0)
+- Long-running failures (> 5 seconds) without pattern match (likely logical errors)
+- Max retry count exceeded
+
+**Implementation**:
+
+```rust
+fn should_retry(&self, attempt: u32, duration: Duration, stderr: &str, exit_code: i32) -> bool {
+    if attempt >= self.config.max_retries || exit_code == 0 {
+        return false;
+    }
+    
+    // Retry if: error pattern match OR short execution
+    let matches_pattern = self.is_retryable_error(stderr);
+    let is_short = duration < Duration::from_secs(self.config.retry_if_duration_under_secs);
+    
+    matches_pattern || is_short
+}
+```
+
+### Configuration
+
+| Config Key | Default | Description |
+|------------|---------|-------------|
+| `command_queue_stagger_delay_ms` | 2000 | Delay between command starts (ms) |
+| `command_queue_max_retries` | 2 | Maximum retry attempts |
+| `command_queue_retry_delay_ms` | 5000 | Delay between retries (ms) |
+| `command_queue_retry_if_duration_under_secs` | 5 | Retry threshold for short runs (seconds) |
+| `command_queue_retry_patterns` | See below | Regex patterns for retryable errors |
+
+**Default Retry Patterns**:
+- `Cannot find module` - Module resolution failures
+- `ResolveMessage:` - Module resolve errors
+- `ENOTFOUND registry\.npmjs\.org` - NPM registry unavailable
+- `ETIMEDOUT.*registry` - Registry timeout
+- `EBADF.*lock` - File lock errors
+- `Lock acquisition failed` - Lock contention
+
+### Integration Points
+
+**AgentRunner** (`src/agent.rs`):
+- `execute_shell_command_streaming()` - Uses `execute_with_stagger()` for apply/archive
+- `execute_shell_command_streaming_in_dir()` - Uses `execute_with_stagger()` for resolve
+- `build_command()` - Extracts command building logic for queue integration
+- `build_command_in_dir()` - Command builder for directory-scoped commands
+
+### Troubleshooting
+
+**Issue**: Commands still conflict despite staggered start
+- **Cause**: Stagger delay too short for initialization
+- **Solution**: Increase `command_queue_stagger_delay_ms` (e.g., 3000-5000ms)
+
+**Issue**: Commands retry too aggressively
+- **Cause**: Retry threshold too high or patterns too broad
+- **Solution**: Reduce `command_queue_retry_if_duration_under_secs` or narrow retry patterns
+
+**Issue**: Transient errors not retried
+- **Cause**: Error pattern not in retry list
+- **Solution**: Add custom pattern to `command_queue_retry_patterns`
 
 ## Configuration Files
 

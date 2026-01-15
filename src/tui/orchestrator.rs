@@ -875,6 +875,7 @@ pub async fn run_orchestrator(
 ///
 /// Supports dynamic queue: after each batch completes, checks for newly queued changes
 /// and processes them in subsequent batches.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_orchestrator_parallel(
     change_ids: Vec<String>,
     _openspec_cmd: String,

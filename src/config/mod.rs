@@ -182,6 +182,31 @@ pub struct OrchestratorConfig {
     /// Supports `{workspace_dir}` and `{repo_root}` placeholders.
     #[serde(default)]
     pub worktree_command: Option<String>,
+
+    /// Delay between command executions (milliseconds).
+    /// Default: 2000ms (2 seconds)
+    #[serde(default)]
+    pub command_queue_stagger_delay_ms: Option<u64>,
+
+    /// Maximum number of retries for commands.
+    /// Default: 2
+    #[serde(default)]
+    pub command_queue_max_retries: Option<u32>,
+
+    /// Delay between retries (milliseconds).
+    /// Default: 5000ms (5 seconds)
+    #[serde(default)]
+    pub command_queue_retry_delay_ms: Option<u64>,
+
+    /// Error patterns that trigger automatic retry (regex).
+    /// Default: module resolution, registry, and lock errors
+    #[serde(default)]
+    pub command_queue_retry_patterns: Option<Vec<String>>,
+
+    /// Retry if execution duration is under this threshold (seconds).
+    /// Default: 5 seconds
+    #[serde(default)]
+    pub command_queue_retry_if_duration_under_secs: Option<u64>,
 }
 
 impl OrchestratorConfig {
@@ -1130,5 +1155,58 @@ mod tests {
             shlex::try_quote(conflict_files).unwrap()
         );
         assert_eq!(result, expected);
+    }
+
+    // === Tests for command queue config ===
+
+    #[test]
+    fn test_command_queue_config_defaults() {
+        let config = OrchestratorConfig::default();
+        // Default values should be None (will use defaults from defaults.rs)
+        assert!(config.command_queue_stagger_delay_ms.is_none());
+        assert!(config.command_queue_max_retries.is_none());
+        assert!(config.command_queue_retry_delay_ms.is_none());
+        assert!(config.command_queue_retry_patterns.is_none());
+        assert!(config.command_queue_retry_if_duration_under_secs.is_none());
+    }
+
+    #[test]
+    fn test_command_queue_config_custom() {
+        let jsonc = r#"{
+            "command_queue_stagger_delay_ms": 3000,
+            "command_queue_max_retries": 3,
+            "command_queue_retry_delay_ms": 10000,
+            "command_queue_retry_patterns": [
+                "Custom error pattern",
+                "Another pattern"
+            ],
+            "command_queue_retry_if_duration_under_secs": 10
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+
+        assert_eq!(config.command_queue_stagger_delay_ms, Some(3000));
+        assert_eq!(config.command_queue_max_retries, Some(3));
+        assert_eq!(config.command_queue_retry_delay_ms, Some(10000));
+        assert_eq!(
+            config.command_queue_retry_patterns,
+            Some(vec![
+                "Custom error pattern".to_string(),
+                "Another pattern".to_string()
+            ])
+        );
+        assert_eq!(config.command_queue_retry_if_duration_under_secs, Some(10));
+    }
+
+    #[test]
+    fn test_parse_jsonc_with_command_queue() {
+        let jsonc = r#"{
+            // Command queue configuration
+            "command_queue_stagger_delay_ms": 1500,
+            "command_queue_max_retries": 5
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+
+        assert_eq!(config.command_queue_stagger_delay_ms, Some(1500));
+        assert_eq!(config.command_queue_max_retries, Some(5));
     }
 }
