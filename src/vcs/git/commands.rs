@@ -604,6 +604,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_generate_unique_branch_name_oso_session() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let init = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init.is_err() {
+            return; // Skip if git not available
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create initial commit
+        std::fs::write(temp_dir.path().join("README.md"), "test").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Generate unique branch name with oso-session prefix
+        let branch_name = generate_unique_branch_name(temp_dir.path(), "oso-session", 10)
+            .await
+            .unwrap();
+
+        // Verify format: oso-session-<6 hex chars>
+        assert!(branch_name.starts_with("oso-session-"));
+        let suffix = &branch_name["oso-session-".len()..];
+        assert_eq!(suffix.len(), 6);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Verify branch doesn't exist yet
+        let exists = branch_exists(temp_dir.path(), &branch_name).await.unwrap();
+        assert!(!exists);
+
+        // Create the branch and verify collision avoidance
+        let _ = Command::new("git")
+            .args(["branch", &branch_name])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Generate another branch - should be different
+        let branch_name2 = generate_unique_branch_name(temp_dir.path(), "oso-session", 10)
+            .await
+            .unwrap();
+        assert_ne!(branch_name, branch_name2);
+    }
+
+    #[tokio::test]
+    async fn test_worktree_add_with_oso_session_branch() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let init = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init.is_err() {
+            return; // Skip if git not available
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create initial commit
+        std::fs::write(temp_dir.path().join("README.md"), "test").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Generate unique branch name
+        let branch_name = generate_unique_branch_name(temp_dir.path(), "oso-session", 10)
+            .await
+            .unwrap();
+
+        // Create worktree with the oso-session branch
+        let worktree_path = temp_dir.path().join("worktrees").join(&branch_name);
+        std::fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
+
+        let result = worktree_add(
+            temp_dir.path(),
+            worktree_path.to_str().unwrap(),
+            &branch_name,
+            "HEAD",
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // Verify worktree exists
+        assert!(worktree_path.exists());
+
+        // Verify branch exists and is not detached
+        let branch_check = Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{}", branch_name),
+            ])
+            .current_dir(temp_dir.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(branch_check.status.success());
+
+        // Verify worktree is on the correct branch (not detached)
+        let branch_output = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&worktree_path)
+            .output()
+            .await
+            .unwrap();
+        let current_branch = String::from_utf8_lossy(&branch_output.stdout);
+        assert_eq!(current_branch.trim(), branch_name);
+        assert_ne!(current_branch.trim(), "HEAD"); // Not detached
+
+        // Cleanup
+        let _ = worktree_remove(temp_dir.path(), worktree_path.to_str().unwrap()).await;
+    }
+
+    #[tokio::test]
     async fn test_check_git_repo_non_repo() {
         let temp_dir = TempDir::new().unwrap();
         // Non-git directory should return false (not error)
