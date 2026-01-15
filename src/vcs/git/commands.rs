@@ -119,7 +119,7 @@ pub async fn squash_archive_wip_commits<P: AsRef<Path>>(cwd: P, change_id: &str)
             "--reverse",
             "--grep",
             &wip_pattern,
-            "--fixed-string",
+            "--fixed-strings",
             "HEAD",
         ],
         &cwd,
