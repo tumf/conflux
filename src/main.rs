@@ -80,7 +80,16 @@ async fn main() -> Result<()> {
             let changes = openspec::list_changes_native()?;
 
             // Run TUI (no web server in default mode)
-            tui::run_tui(changes, openspec_cmd, opencode_path, config, None).await?;
+            tui::run_tui(
+                changes,
+                openspec_cmd,
+                opencode_path,
+                config,
+                None,
+                #[cfg(feature = "web-monitoring")]
+                None,
+            )
+            .await?;
         }
 
         // Explicit TUI subcommand
@@ -99,18 +108,18 @@ async fn main() -> Result<()> {
 
             // Start web monitoring server if enabled and build URL
             #[cfg(feature = "web-monitoring")]
-            let web_url = if args.web {
+            let (web_url, web_state_opt) = if args.web {
                 let web_state = std::sync::Arc::new(web::WebState::new(&changes));
                 let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone());
-                match web::spawn_server_with_url(web_config, web_state).await {
-                    Ok((_web_handle, url)) => Some(url),
+                match web::spawn_server_with_url(web_config, web_state.clone()).await {
+                    Ok((_web_handle, url)) => (Some(url), Some(web_state)),
                     Err(e) => {
                         tracing::warn!("Failed to start web monitoring server: {}", e);
-                        None
+                        (None, None)
                     }
                 }
             } else {
-                None
+                (None, None)
             };
 
             #[cfg(not(feature = "web-monitoring"))]
@@ -130,6 +139,8 @@ async fn main() -> Result<()> {
                 args.opencode_path,
                 config,
                 web_url,
+                #[cfg(feature = "web-monitoring")]
+                web_state_opt,
             )
             .await?;
         }
