@@ -1,8 +1,5 @@
-# tui-propose-input Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change add-propose-command. Update Purpose after archive.
-## Requirements
 ### Requirement: `+` による提案作成フローの起動
 
 TUIはSelectモードで `+` キーを押したとき、以下の条件をすべて満たす場合に限り、提案作成フローを開始しなければならない（SHALL）。
@@ -41,14 +38,3 @@ TUIはSelectモードで `+` キーを押したとき、以下の条件をすべ
 - **AND** `worktree_command` が設定されていない
 - **WHEN** ユーザーが `+` キーを押す
 - **THEN** 何も起こらない
-
-### Requirement: Runningモードでは提案作成不可
-
-TUIはRunningモードで `+` キーを押した場合、何も起こしてはならない（SHALL NOT）。
-
-#### Scenario: Runningモードでは無操作
-
-- **GIVEN** TUIがRunningモードである
-- **WHEN** ユーザーが `+` キーを押す
-- **THEN** 何も起こらない
-
