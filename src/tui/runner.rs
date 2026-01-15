@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::events::{LogEntry, OrchestratorEvent, TuiCommand};
 use super::log_deduplicator;
@@ -179,7 +179,7 @@ async fn run_tui_loop(
                 }
                 _ = interval.tick() => {
                     match openspec::list_changes_native() {
-                        Ok(changes) => {
+                        Ok(mut changes) => {
                             let committed_change_ids: HashSet<String> =
                                 match crate::vcs::git::commands::list_changes_in_head(&refresh_repo_root).await {
                                     Ok(ids) => ids.into_iter().collect(),
@@ -196,6 +196,37 @@ async fn run_tui_loop(
                                         HashSet::new()
                                     }
                                 };
+
+                            // Enrich progress from worktrees (uncommitted tasks.md)
+                            for change in &mut changes {
+                                match crate::vcs::git::get_worktree_path_for_change(
+                                    &refresh_repo_root,
+                                    &change.id
+                                ).await {
+                                    Ok(Some(wt_path)) => {
+                                        match crate::task_parser::parse_change_with_worktree_fallback(
+                                            &change.id,
+                                            Some(&wt_path)
+                                        ) {
+                                            Ok(progress) => {
+                                                change.completed_tasks = progress.completed;
+                                                change.total_tasks = progress.total;
+                                            }
+                                            Err(e) => {
+                                                debug!("Failed to read worktree progress for {}: {}", change.id, e);
+                                                // Keep existing progress (from base tree)
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        // No worktree exists, use progress from base tree
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to get worktree path for {}: {}", change.id, e);
+                                        // Keep existing progress
+                                    }
+                                }
+                            }
 
                             if refresh_tx
                                 .send(OrchestratorEvent::ChangesRefreshed {

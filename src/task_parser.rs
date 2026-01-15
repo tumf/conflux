@@ -121,6 +121,35 @@ pub fn parse_change(change_id: &str) -> Result<TaskProgress> {
     parse_file(&tasks_path, Some(change_id))
 }
 
+/// Parse task progress with worktree priority and base tree fallback.
+///
+/// Resolution order:
+/// 1. Try worktree_path/openspec/changes/{change_id}/tasks.md (uncommitted)
+/// 2. Fallback to openspec/changes/{change_id}/tasks.md (base tree)
+///
+/// This function is designed for TUI auto-refresh to read the latest progress
+/// from worktrees where AI agents update tasks.md before committing.
+pub fn parse_change_with_worktree_fallback(
+    change_id: &str,
+    worktree_path: Option<&Path>,
+) -> Result<TaskProgress> {
+    // Try worktree first (uncommitted changes)
+    if let Some(wt_path) = worktree_path {
+        let wt_tasks = wt_path
+            .join("openspec/changes")
+            .join(change_id)
+            .join("tasks.md");
+
+        if wt_tasks.exists() {
+            debug!("Reading tasks from worktree: {:?}", wt_tasks);
+            return parse_file(&wt_tasks, Some(change_id));
+        }
+    }
+
+    // Fallback to base tree
+    parse_change(change_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +377,59 @@ mod tests {
     fn test_parse_change_not_found() {
         let result = parse_change("nonexistent-change-id");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_change_with_worktree_fallback_from_worktree() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let worktree_path = temp_dir.path();
+
+        // Create worktree structure
+        let change_dir = worktree_path.join("openspec/changes/test-change");
+        std::fs::create_dir_all(&change_dir).unwrap();
+
+        // Write tasks.md in worktree
+        let tasks_content = "- [x] Task 1\n- [x] Task 2\n- [ ] Task 3";
+        std::fs::write(change_dir.join("tasks.md"), tasks_content).unwrap();
+
+        // Parse with worktree
+        let result = parse_change_with_worktree_fallback("test-change", Some(worktree_path));
+        assert!(result.is_ok());
+        let progress = result.unwrap();
+        assert_eq!(progress.completed, 2);
+        assert_eq!(progress.total, 3);
+    }
+
+    #[test]
+    fn test_parse_change_with_worktree_fallback_to_base() {
+        use std::env;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path();
+
+        // Change to temp directory
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(base_path).unwrap();
+
+        // Create base tree structure
+        let change_dir = base_path.join("openspec/changes/test-change");
+        std::fs::create_dir_all(&change_dir).unwrap();
+
+        // Write tasks.md in base tree
+        let tasks_content = "- [x] Task 1\n- [ ] Task 2";
+        std::fs::write(change_dir.join("tasks.md"), tasks_content).unwrap();
+
+        // Parse with non-existent worktree (should fallback to base)
+        let result = parse_change_with_worktree_fallback("test-change", None);
+        assert!(result.is_ok());
+        let progress = result.unwrap();
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.total, 2);
+
+        // Restore directory
+        env::set_current_dir(original_dir).unwrap();
     }
 }

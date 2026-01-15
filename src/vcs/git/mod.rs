@@ -366,6 +366,40 @@ impl GitWorkspaceManager {
     }
 }
 
+/// Get the worktree path for a specific change_id.
+///
+/// Parses `git worktree list --porcelain` to find the worktree path
+/// associated with the given change_id.
+///
+/// Returns `None` if no worktree exists for the change_id.
+pub async fn get_worktree_path_for_change(
+    repo_root: &Path,
+    change_id: &str,
+) -> VcsResult<Option<PathBuf>> {
+    let output = commands::run_git(&["worktree", "list", "--porcelain"], repo_root).await?;
+    let sanitized = change_id.replace(['/', '\\', ' '], "-");
+
+    let mut current_path: Option<PathBuf> = None;
+
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_path = Some(PathBuf::from(path));
+        } else if let Some(branch_name) = line.strip_prefix("branch refs/heads/") {
+            if let Some(extracted_change_id) =
+                GitWorkspaceManager::extract_change_id_from_worktree_name(branch_name)
+            {
+                if extracted_change_id == sanitized {
+                    return Ok(current_path);
+                }
+            }
+        } else if line.is_empty() {
+            current_path = None;
+        }
+    }
+
+    Ok(None)
+}
+
 /// List change IDs that currently have worktrees.
 ///
 /// Returns sanitized change IDs extracted from Git worktree branches.
@@ -1364,5 +1398,62 @@ mod tests {
             .current_dir(temp_dir.path())
             .output()
             .await;
+    }
+
+    #[tokio::test]
+    async fn test_get_worktree_path_for_change() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+
+        // Initialize git repo
+        Command::new("git")
+            .args(["init"])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .unwrap();
+
+        // Create initial commit
+        std::fs::write(repo_path.join("test.txt"), "test").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .unwrap();
+
+        // Create worktree with branch matching change_id
+        let worktree_path = temp_dir.path().join("my-change-worktree");
+        Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "-b",
+                "my-change",
+                "HEAD",
+            ])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .unwrap();
+
+        // Test: Find worktree by change_id
+        let result = get_worktree_path_for_change(repo_path, "my-change").await;
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert!(path.is_some());
+        assert!(path.unwrap().ends_with("my-change-worktree"));
+
+        // Test: No worktree for non-existent change
+        let result = get_worktree_path_for_change(repo_path, "nonexistent").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }
