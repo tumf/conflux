@@ -175,16 +175,19 @@ async fn main() -> Result<()> {
                 }
             };
 
-            if args.parallel {
+            let config = OrchestratorConfig::load(args.config.as_deref())?;
+            let git_dir_exists = cli::check_git_directory();
+            let use_parallel = config.resolve_parallel_mode(args.parallel, git_dir_exists);
+
+            if use_parallel {
                 let backend = vcs_override.unwrap_or(vcs::VcsBackend::Auto);
-                let git_dir_exists = cli::check_git_directory();
                 let git_available = cli::check_git_available();
 
                 if !git_dir_exists {
                     let message = if matches!(backend, vcs::VcsBackend::Git) {
                         "git repository not found (.git directory missing)"
                     } else {
-                        "Error: --parallel requires a git repository (.git directory not found)"
+                        "Error: parallel mode requires a git repository (.git directory not found)"
                     };
                     eprintln!("{}", message);
                     std::process::exit(1);
@@ -201,7 +204,7 @@ async fn main() -> Result<()> {
                 args.change,
                 args.config,
                 args.max_iterations,
-                args.parallel,
+                use_parallel,
                 args.max_concurrent,
                 args.dry_run,
                 vcs_override,

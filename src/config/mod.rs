@@ -246,11 +246,24 @@ impl OrchestratorConfig {
         self.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS)
     }
 
-    /// Get whether parallel mode is enabled.
-    /// Default: false (off by default)
+    /// Get whether parallel mode is explicitly enabled in config.
+    /// Default: false (unset)
     #[allow(dead_code)]
     pub fn get_parallel_mode(&self) -> bool {
         self.parallel_mode.unwrap_or(false)
+    }
+
+    /// Resolve parallel mode based on CLI override and git detection.
+    /// Priority: CLI --parallel > config.parallel_mode > git detection default.
+    pub fn resolve_parallel_mode(&self, cli_parallel: bool, git_repo_detected: bool) -> bool {
+        if cli_parallel {
+            return true;
+        }
+
+        match self.parallel_mode {
+            Some(value) => value,
+            None => git_repo_detected,
+        }
     }
 
     /// Get the maximum concurrent workspaces limit.
@@ -961,6 +974,37 @@ mod tests {
             ..Default::default()
         };
         assert!(config.get_parallel_mode());
+    }
+
+    #[test]
+    fn test_resolve_parallel_mode_prefers_cli_override() {
+        let config = OrchestratorConfig {
+            parallel_mode: Some(false),
+            ..Default::default()
+        };
+        assert!(config.resolve_parallel_mode(true, false));
+    }
+
+    #[test]
+    fn test_resolve_parallel_mode_defaults_to_git_detection() {
+        let config = OrchestratorConfig::default();
+        assert!(!config.resolve_parallel_mode(false, false));
+        assert!(config.resolve_parallel_mode(false, true));
+    }
+
+    #[test]
+    fn test_resolve_parallel_mode_uses_config_value() {
+        let enabled = OrchestratorConfig {
+            parallel_mode: Some(true),
+            ..Default::default()
+        };
+        let disabled = OrchestratorConfig {
+            parallel_mode: Some(false),
+            ..Default::default()
+        };
+
+        assert!(enabled.resolve_parallel_mode(false, false));
+        assert!(!disabled.resolve_parallel_mode(false, true));
     }
 
     #[test]

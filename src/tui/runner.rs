@@ -131,6 +131,16 @@ async fn run_tui_loop(
         };
 
     let mut app = AppState::new(initial_changes);
+    let git_dir_exists = crate::cli::check_git_directory();
+    let parallel_available = crate::cli::check_parallel_available();
+    let mut parallel_mode = config.resolve_parallel_mode(false, git_dir_exists);
+    if parallel_mode && !parallel_available {
+        parallel_mode = false;
+        app.warning_message =
+            Some("Parallel mode disabled because git is not available".to_string());
+    }
+    app.parallel_available = parallel_available;
+    app.parallel_mode = parallel_mode;
     app.apply_parallel_eligibility(&committed_change_ids);
     app.apply_worktree_status(&worktree_change_ids);
     app.max_concurrent = config.get_max_concurrent_workspaces();
