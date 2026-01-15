@@ -20,6 +20,8 @@ use tracing::{error, info, warn};
 
 #[cfg(feature = "web-monitoring")]
 use crate::web::WebState;
+#[cfg(feature = "web-monitoring")]
+use tokio::sync::mpsc;
 
 struct SerialSnapshot {
     progress: crate::task_parser::TaskProgress,
@@ -822,11 +824,38 @@ impl Orchestrator {
 
         info!("Git available, executing changes in parallel using worktrees");
 
+        #[cfg(feature = "web-monitoring")]
+        let (web_event_tx, web_event_handle) = if let Some(web_state) = self.web_state.clone() {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let handle = tokio::spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    web_state.apply_execution_event(&event).await;
+                    if matches!(
+                        event,
+                        crate::events::ExecutionEvent::AllCompleted
+                            | crate::events::ExecutionEvent::Stopped
+                    ) {
+                        break;
+                    }
+                }
+            });
+            (Some(tx), Some(handle))
+        } else {
+            (None, None)
+        };
+
+        #[cfg(feature = "web-monitoring")]
+        let web_event_sender = web_event_tx.clone();
+
         // Run with a simple logging event handler for CLI mode
-        service
-            .run_parallel(approved, |event| {
+        let result = service
+            .run_parallel(approved, move |event| {
                 // Log events for CLI mode (no TUI)
                 use crate::parallel::ParallelEvent;
+                #[cfg(feature = "web-monitoring")]
+                if let Some(tx) = &web_event_sender {
+                    let _ = tx.send(event.clone());
+                }
                 match event {
                     ParallelEvent::GroupStarted { group_id, changes } => {
                         info!("Starting group {} with {} changes", group_id, changes.len());
@@ -855,7 +884,15 @@ impl Orchestrator {
                     _ => {}
                 }
             })
-            .await?;
+            .await;
+
+        #[cfg(feature = "web-monitoring")]
+        if let Some(handle) = web_event_handle {
+            drop(web_event_tx);
+            let _ = handle.await;
+        }
+
+        result?;
 
         Ok(())
     }

@@ -117,7 +117,7 @@ pub async fn archive_single_change(
 
     use crate::execution::archive::{
         build_archive_error_message, ensure_archive_commit, verify_archive_completion,
-        ARCHIVE_COMMAND_MAX_RETRIES,
+        ArchiveVerificationResult, ARCHIVE_COMMAND_MAX_RETRIES,
     };
 
     let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
@@ -127,7 +127,7 @@ pub async fn archive_single_change(
         attempt += 1;
 
         // Run archive command with streaming output
-        let (mut child, mut output_rx) = agent.run_archive_streaming(change_id).await?;
+        let (mut child, mut output_rx, start) = agent.run_archive_streaming(change_id).await?;
 
         // Stream output to TUI log, with cancellation support
         loop {
@@ -172,6 +172,9 @@ pub async fn archive_single_change(
         if !status.success() {
             let error_msg = format!("Archive failed with exit code: {:?}", status.code());
 
+            // Record the failed attempt
+            agent.record_archive_attempt(change_id, &status, start, Some(error_msg.clone()));
+
             // Run on_error hook
             let error_context = HookContext::new(
                 context.changes_processed,
@@ -195,6 +198,8 @@ pub async fn archive_single_change(
 
         let verification = verify_archive_completion(change_id, None);
         if verification.is_success() {
+            // Record successful archive attempt
+            agent.record_archive_attempt(change_id, &status, start, None);
             let log_tx = tx.clone();
             let commit_result = ensure_archive_commit(
                 change_id,
@@ -243,8 +248,9 @@ pub async fn archive_single_change(
                 return Ok(ArchiveResult::Failed);
             }
 
-            // Clear apply history for the archived change
+            // Clear apply and archive history for the archived change
             agent.clear_apply_history(change_id);
+            agent.clear_archive_history(change_id);
 
             // Run post_archive hook
             let post_archive_context = HookContext::new(
@@ -273,17 +279,27 @@ pub async fn archive_single_change(
             return Ok(ArchiveResult::Success);
         }
 
+        // Verification failed - record with reason
+        let verification_reason = match verification {
+            ArchiveVerificationResult::NotArchived { ref change_id } => {
+                format!("Change still exists at openspec/changes/{}", change_id)
+            }
+            _ => "Archive verification failed".to_string(),
+        };
+        agent.record_archive_attempt(change_id, &status, start, Some(verification_reason.clone()));
+
         if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
             let _ = tx
                 .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                    "Archive verification failed for {} (attempt {}/{}); retrying archive command",
-                    change_id, attempt, max_attempts
+                    "Archive verification failed for {} (attempt {}/{}): {}; retrying archive command",
+                    change_id, attempt, max_attempts, verification_reason
                 ))))
                 .await;
             tracing::warn!(
                 change_id = %change_id,
                 attempt = attempt,
                 max_attempts = max_attempts,
+                reason = %verification_reason,
                 "Archive verification failed; retrying archive command"
             );
             continue;
