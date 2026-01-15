@@ -40,6 +40,15 @@ fn default_stall_detection_threshold() -> u32 {
     DEFAULT_STALL_DETECTION_THRESHOLD
 }
 
+
+fn default_error_circuit_breaker_enabled() -> bool {
+    DEFAULT_ERROR_CIRCUIT_BREAKER_ENABLED
+}
+
+fn default_error_circuit_breaker_threshold() -> usize {
+    DEFAULT_ERROR_CIRCUIT_BREAKER_THRESHOLD
+}
+
 /// Logging configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoggingConfig {
@@ -70,6 +79,27 @@ pub struct StallDetectionConfig {
     /// Consecutive empty commit threshold before stalling.
     #[serde(default = "default_stall_detection_threshold")]
     pub threshold: u32,
+}
+
+
+/// Error circuit breaker configuration for detecting repeated failures.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ErrorCircuitBreakerConfig {
+    /// Enable circuit breaker for same error detection.
+    #[serde(default = "default_error_circuit_breaker_enabled")]
+    pub enabled: bool,
+    /// Consecutive same error threshold before opening circuit.
+    #[serde(default = "default_error_circuit_breaker_threshold")]
+    pub threshold: usize,
+}
+
+impl Default for ErrorCircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_error_circuit_breaker_enabled(),
+            threshold: default_error_circuit_breaker_threshold(),
+        }
+    }
 }
 
 impl Default for StallDetectionConfig {
@@ -121,6 +151,10 @@ pub struct OrchestratorConfig {
     /// Stall detection configuration (empty WIP commit detection).
     #[serde(default)]
     pub stall_detection: Option<StallDetectionConfig>,
+
+    /// Error circuit breaker configuration (same error detection).
+    #[serde(default)]
+    pub error_circuit_breaker: Option<ErrorCircuitBreakerConfig>,
 
     /// Delay between completion check retries in milliseconds.
     /// Default: 500ms
@@ -262,6 +296,11 @@ impl OrchestratorConfig {
     /// Get stall detection configuration, returning defaults if not set.
     pub fn get_stall_detection(&self) -> StallDetectionConfig {
         self.stall_detection.clone().unwrap_or_default()
+    }
+
+    /// Get error circuit breaker configuration, returning defaults if not set.
+    pub fn get_error_circuit_breaker(&self) -> ErrorCircuitBreakerConfig {
+        self.error_circuit_breaker.clone().unwrap_or_default()
     }
 
     /// Get the maximum iterations limit.

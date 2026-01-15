@@ -1,6 +1,7 @@
 use crate::agent::AgentRunner;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::error_history::{CircuitBreakerConfig, ErrorHistory};
 use crate::execution::apply::{check_task_progress, create_progress_commit, is_progress_complete};
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
@@ -54,6 +55,8 @@ pub struct Orchestrator {
     stalled_change_ids: HashSet<String>,
     /// Changes skipped due to stalled dependencies
     skipped_change_ids: HashSet<String>,
+    /// Error history per change (for circuit breaker pattern)
+    error_histories: HashMap<String, ErrorHistory>,
     /// Number of changes processed (archived)
     changes_processed: usize,
     /// Maximum iterations limit (0 = no limit)
@@ -112,6 +115,7 @@ impl Orchestrator {
             stall_detector,
             stalled_change_ids: HashSet::new(),
             skipped_change_ids: HashSet::new(),
+            error_histories: HashMap::new(),
             changes_processed: 0,
             max_iterations,
             iteration: 0,
@@ -168,6 +172,7 @@ impl Orchestrator {
             stall_detector,
             stalled_change_ids: HashSet::new(),
             skipped_change_ids: HashSet::new(),
+            error_histories: HashMap::new(),
             changes_processed: 0,
             max_iterations,
             iteration: 0,
@@ -522,6 +527,17 @@ impl Orchestrator {
                             warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
                         }
 
+                        // Record error and check circuit breaker
+                        if self.record_error_and_check_circuit_breaker(&next.id, &error) {
+                            let message = format!(
+                                "Circuit breaker opened for '{}' due to repeated errors",
+                                next.id
+                            );
+                            warn!("{}", message);
+                            self.mark_change_stalled(&next.id, &message);
+                            continue;
+                        }
+
                         error!("Apply failed for {}: {}", next.id, error);
                         if let Some(progress) = &mut self.progress {
                             progress.error(&format!("Apply failed: {}", next.id));
@@ -721,11 +737,42 @@ impl Orchestrator {
     fn mark_change_stalled(&mut self, change_id: &str, reason: &str) {
         self.stalled_change_ids.insert(change_id.to_string());
         self.apply_counts.remove(change_id);
+        self.error_histories.remove(change_id);
         self.current_change_id = None;
         self.stall_detector.clear_change(change_id);
 
         if let Some(progress) = &mut self.progress {
             progress.error(reason);
+        }
+    }
+
+    /// Record an error and check if circuit breaker should trip
+    /// Returns true if the change should be skipped due to repeated errors
+    fn record_error_and_check_circuit_breaker(&mut self, change_id: &str, error: &str) -> bool {
+        let cb_config = self.config.get_error_circuit_breaker();
+        let circuit_breaker_config = CircuitBreakerConfig {
+            enabled: cb_config.enabled,
+            threshold: cb_config.threshold,
+        };
+
+        let history = self
+            .error_histories
+            .entry(change_id.to_string())
+            .or_insert_with(|| ErrorHistory::new(circuit_breaker_config.clone()));
+
+        history.record_error(error);
+
+        if history.detect_same_error() {
+            error!(
+                "Circuit breaker triggered for '{}': same error occurred {} times consecutively",
+                change_id, circuit_breaker_config.threshold
+            );
+            if let Some(last_err) = history.last_error() {
+                error!("Last error pattern: {}", last_err);
+            }
+            true
+        } else {
+            false
         }
     }
 

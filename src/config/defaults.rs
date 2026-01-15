@@ -77,3 +77,10 @@ pub fn default_retry_patterns() -> Vec<String> {
         r"Lock acquisition failed".to_string(),
     ]
 }
+
+
+/// Default enablement for error circuit breaker
+pub const DEFAULT_ERROR_CIRCUIT_BREAKER_ENABLED: bool = true;
+
+/// Default threshold for consecutive same errors before opening circuit
+pub const DEFAULT_ERROR_CIRCUIT_BREAKER_THRESHOLD: usize = 5;
