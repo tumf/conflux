@@ -72,6 +72,7 @@ fn archive_entry_exists(change_id: &str, archive_dir: &Path) -> bool {
 ///
 /// This stricter check requires that the change directory is gone and
 /// that an archive entry exists for the change.
+#[allow(dead_code)]
 pub fn is_change_archived(change_id: &str, base_path: Option<&Path>) -> bool {
     let (change_path, archive_dir) = match base_path {
         Some(base) => (

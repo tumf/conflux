@@ -18,7 +18,8 @@ use crate::analyzer::{extract_change_dependencies, ParallelGroup};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
-use crate::execution::archive::{ensure_archive_commit, is_change_archived};
+use crate::execution::archive::ensure_archive_commit;
+use crate::execution::state::{detect_workspace_state, WorkspaceState};
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{
     GitWorkspaceManager, VcsBackend, VcsError, Workspace, WorkspaceManager, WorkspaceStatus,
@@ -680,7 +681,74 @@ impl ParallelExecutor {
                 }
             };
 
-            if resumed && is_change_archived(change_id, Some(&workspace.path)) {
+            // Detect workspace state for idempotent resume
+            let workspace_state = if resumed {
+                match detect_workspace_state(change_id, &workspace.path).await {
+                    Ok(state) => state,
+                    Err(e) => {
+                        warn!(
+                            "Failed to detect workspace state for '{}': {}, assuming Created",
+                            change_id, e
+                        );
+                        WorkspaceState::Created
+                    }
+                }
+            } else {
+                WorkspaceState::Created
+            };
+
+            // Handle different workspace states
+            match workspace_state {
+                WorkspaceState::Merged => {
+                    // Already merged to main - skip all operations and cleanup
+                    info!(
+                        "Change '{}' already merged to main in workspace '{}', skipping all operations",
+                        change_id, workspace.name
+                    );
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::CleanupStarted {
+                            workspace: workspace.name.clone(),
+                        },
+                    )
+                    .await;
+                    if let Err(err) = self
+                        .workspace_manager
+                        .cleanup_workspace(&workspace.name)
+                        .await
+                    {
+                        warn!(
+                            "Failed to cleanup merged workspace '{}': {}",
+                            workspace.name, err
+                        );
+                    } else {
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::CleanupCompleted {
+                                workspace: workspace.name.clone(),
+                            },
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+                WorkspaceState::Archived => {
+                    // Archive complete, skip apply/archive, only merge
+                    info!(
+                        "Change '{}' already archived in workspace '{}', skipping apply/archive, will merge",
+                        change_id, workspace.name
+                    );
+                }
+                WorkspaceState::Applied
+                | WorkspaceState::Applying { .. }
+                | WorkspaceState::Created => {
+                    // These states require apply (or resume apply)
+                    // They will be handled normally by the apply execution
+                }
+            }
+
+            // For Archived state, ensure archive commit and add to archived_results for merge
+            if matches!(workspace_state, WorkspaceState::Archived) {
                 info!(
                     "Change '{}' already archived in workspace '{}', skipping apply/archive",
                     change_id, workspace.name

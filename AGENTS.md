@@ -110,6 +110,14 @@ src/
   task_parser.rs        # Native task.md parser
   templates.rs          # Configuration templates
 
+  # Execution (shared logic between serial and parallel modes)
+  execution/
+    mod.rs              # Execution module root
+    apply.rs            # Common apply operation logic
+    archive.rs          # Common archive operation logic
+    state.rs            # Workspace state detection for idempotent resume
+    types.rs            # Common type definitions
+
   # Configuration
   config/
     mod.rs              # Configuration module root
@@ -416,6 +424,67 @@ let state = OrchestratorState::load()?.unwrap_or_else(OrchestratorState::new);
 self.state.touch();  // Update timestamp
 self.state.save()?;
 ```
+
+## Workspace State Detection (Parallel Mode)
+
+### Overview
+
+The parallel execution mode uses workspace state detection to enable idempotent resume operations. When resuming a workspace, the orchestrator detects the current state and determines the appropriate action.
+
+### Workspace States
+
+| State | Detection Criteria | Action Taken |
+|-------|-------------------|--------------|
+| **Created** | No commits, fresh workspace | Start apply from beginning |
+| **Applying** | WIP commits exist: `WIP(apply): <change_id> (iteration N/M)` | Resume apply from next iteration |
+| **Applied** | Apply commit exists: `Apply: <change_id>` | Skip apply, run archive only |
+| **Archived** | Archive commit exists: `Archive: <change_id>` (not in main) | Skip apply/archive, run merge only |
+| **Merged** | Archive commit found in main branch | Skip all operations, cleanup workspace |
+
+### State Detection Module
+
+**Location**: `src/execution/state.rs`
+
+**Key Functions**:
+
+- `detect_workspace_state(change_id, repo_root)` - Main entry point, returns `WorkspaceState`
+- `is_merged_to_main(change_id, repo_root)` - Check if archive commit is in main branch
+- `has_apply_commit(change_id, repo_root)` - Check for apply completion
+- `get_latest_wip_snapshot(change_id, repo_root)` - Get highest WIP iteration number
+- `is_archive_commit_complete(change_id, repo_root)` - Verify archive commit and clean working tree
+
+### Integration
+
+**Location**: `src/parallel/mod.rs` - `execute_group()` function
+
+When resuming a workspace:
+
+```rust
+let workspace_state = detect_workspace_state(change_id, &workspace.path).await?;
+
+match workspace_state {
+    WorkspaceState::Merged => {
+        // Skip all operations, cleanup workspace
+        cleanup_workspace(&workspace.name).await?;
+    }
+    WorkspaceState::Archived => {
+        // Skip apply/archive, ensure archive commit, then merge
+        ensure_archive_commit(change_id, &workspace.path, ...).await?;
+        // ... merge to main
+    }
+    WorkspaceState::Applied | WorkspaceState::Applying { .. } | WorkspaceState::Created => {
+        // Continue with apply (or resume from iteration)
+        execute_apply_and_archive_parallel(&workspaces, ...).await?;
+    }
+}
+```
+
+### Benefits
+
+1. **Idempotency**: Running the orchestrator multiple times produces the same result
+2. **Manual Intervention Support**: Detects manually archived or merged changes
+3. **Resume Correctness**: Interrupted operations resume from the correct step
+4. **No Duplicate Work**: Skips completed operations automatically
 
 ## JJ Merge Guidance
 

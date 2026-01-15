@@ -12,6 +12,7 @@
 
 pub mod apply;
 pub mod archive;
+pub mod state;
 pub mod types;
 
 // Re-export apply items for convenience.
@@ -32,6 +33,10 @@ pub use archive::{
     build_archive_error_message, ensure_archive_commit, get_task_progress,
     verify_archive_completion, verify_task_completion, ArchiveVerificationResult,
 };
+
+// Re-export state items for convenience.
+#[allow(unused_imports)]
+pub use state::{detect_workspace_state, WorkspaceState};
 
 // Re-export type items for convenience.
 // Note: These are foundation types that are used by apply, archive, and external modules.
