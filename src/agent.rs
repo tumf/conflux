@@ -36,7 +36,16 @@ Do not allow apply to finish successfully with non-actionable unchecked tasks; n
 
 Special handling for 'future work' tasks:
 - If a task is already marked '(future work)', move it to a "Future work" section and remove the checkbox
-- This indicates deferred work, not current implementation scope"#;
+- This indicates deferred work, not current implementation scope
+
+Tasks format requirements:
+- All tasks MUST have checkboxes: `- [ ]` or `- [x]`
+- Invalid formats that need fixing:
+  * `## N. Task` → Convert to `- [ ] N. Task`
+  * `- Task` → Convert to `- [ ] Task`
+  * `1. Task` → Convert to `1. [ ] Task`
+- If you encounter 0/0 tasks detected, check and fix tasks.md format first
+- Fix any malformed tasks before proceeding with implementation"#;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{ApplyAttempt, ApplyHistory, ArchiveAttempt, ArchiveHistory};
 use crate::process_manager::ManagedChild;
