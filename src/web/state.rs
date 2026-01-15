@@ -2,6 +2,7 @@
 //!
 //! Provides thread-safe state access and broadcasting for WebSocket clients.
 
+use crate::events::ExecutionEvent;
 use crate::openspec::Change;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
@@ -105,6 +106,44 @@ impl OrchestratorState {
     }
 }
 
+fn progress_percent(completed: u32, total: u32) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        (completed as f32 / total as f32) * 100.0
+    }
+}
+
+fn status_from_progress(completed: u32, total: u32) -> &'static str {
+    if total > 0 && completed >= total {
+        "complete"
+    } else if completed > 0 {
+        "in_progress"
+    } else {
+        "pending"
+    }
+}
+
+fn refresh_summary(state: &mut OrchestratorState) {
+    state.total_changes = state.changes.len();
+    state.completed_changes = state
+        .changes
+        .iter()
+        .filter(|change| change.status == "complete")
+        .count();
+    state.in_progress_changes = state
+        .changes
+        .iter()
+        .filter(|change| change.status == "in_progress")
+        .count();
+    state.pending_changes = state
+        .changes
+        .iter()
+        .filter(|change| change.status == "pending")
+        .count();
+    state.last_updated = chrono::Utc::now().to_rfc3339();
+}
+
 /// Shared web state with broadcast channel for updates
 pub struct WebState {
     /// Current orchestrator state (thread-safe)
@@ -138,7 +177,9 @@ impl WebState {
         // Check if state has actually changed
         let has_changes = {
             let old_state = self.state.read().await;
-            self.compute_diff(&old_state.changes, &new_state.changes)
+            !self
+                .compute_diff(&old_state.changes, &new_state.changes)
+                .is_empty()
         };
 
         // Update internal state
@@ -148,16 +189,75 @@ impl WebState {
         }
 
         // Only broadcast if there were changes
-        if !has_changes.is_empty() {
-            let update = StateUpdate {
-                msg_type: "state_update".to_string(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                changes: new_state.changes.clone(),
-            };
-
-            // Ignore send errors (no subscribers)
-            let _ = self.tx.send(update);
+        if has_changes {
+            self.broadcast_snapshot(new_state.changes);
         }
+    }
+
+    /// Apply an execution event to the web state and broadcast updates.
+    pub async fn apply_execution_event(&self, event: &ExecutionEvent) {
+        let mut changes_snapshot = None;
+
+        {
+            let mut state = self.state.write().await;
+            let mut updated = false;
+
+            match event {
+                ExecutionEvent::ProcessingStarted(change_id) => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.status = "in_progress".to_string();
+                        change.progress_percent =
+                            progress_percent(change.completed_tasks, change.total_tasks);
+                        updated = true;
+                    }
+                }
+                ExecutionEvent::ProcessingCompleted(change_id)
+                | ExecutionEvent::ChangeArchived(change_id) => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        if change.completed_tasks < change.total_tasks {
+                            change.completed_tasks = change.total_tasks;
+                        }
+                        change.status = "complete".to_string();
+                        change.progress_percent =
+                            progress_percent(change.completed_tasks, change.total_tasks);
+                        updated = true;
+                    }
+                }
+                ExecutionEvent::ProgressUpdated {
+                    change_id,
+                    completed,
+                    total,
+                } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.completed_tasks = *completed;
+                        change.total_tasks = *total;
+                        change.progress_percent = progress_percent(*completed, *total);
+                        change.status = status_from_progress(*completed, *total).to_string();
+                        updated = true;
+                    }
+                }
+                _ => {}
+            }
+
+            if updated {
+                refresh_summary(&mut state);
+                changes_snapshot = Some(state.changes.clone());
+            }
+        }
+
+        if let Some(changes) = changes_snapshot {
+            self.broadcast_snapshot(changes);
+        }
+    }
+
+    fn broadcast_snapshot(&self, changes: Vec<ChangeStatus>) {
+        let update = StateUpdate {
+            msg_type: "state_update".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            changes,
+        };
+
+        let _ = self.tx.send(update);
     }
 
     /// Compute the diff between old and new change lists.
@@ -240,25 +340,19 @@ impl WebState {
         approval::approve_change(id)?;
 
         // Update the approval status in state and get the updated change
-        let updated_change = {
+        let (updated_change, changes_snapshot) = {
             let mut state = self.state.write().await;
-            if let Some(change) = state.changes.iter_mut().find(|c| c.id == id) {
-                change.is_approved = true;
-                change.clone()
+            if let Some(index) = state.changes.iter().position(|c| c.id == id) {
+                state.changes[index].is_approved = true;
+                refresh_summary(&mut state);
+                (state.changes[index].clone(), state.changes.clone())
             } else {
                 return Err(format!("Change '{}' not found after approval", id).into());
             }
         };
 
         // Broadcast the update
-        let update = StateUpdate {
-            msg_type: "state_update".to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            changes: vec![updated_change.clone()],
-        };
-
-        // Ignore send errors (no subscribers)
-        let _ = self.tx.send(update);
+        self.broadcast_snapshot(changes_snapshot);
 
         Ok(updated_change)
     }
@@ -290,25 +384,19 @@ impl WebState {
         approval::unapprove_change(id)?;
 
         // Update the approval status in state and get the updated change
-        let updated_change = {
+        let (updated_change, changes_snapshot) = {
             let mut state = self.state.write().await;
-            if let Some(change) = state.changes.iter_mut().find(|c| c.id == id) {
-                change.is_approved = false;
-                change.clone()
+            if let Some(index) = state.changes.iter().position(|c| c.id == id) {
+                state.changes[index].is_approved = false;
+                refresh_summary(&mut state);
+                (state.changes[index].clone(), state.changes.clone())
             } else {
                 return Err(format!("Change '{}' not found after unapproval", id).into());
             }
         };
 
         // Broadcast the update
-        let update = StateUpdate {
-            msg_type: "state_update".to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            changes: vec![updated_change.clone()],
-        };
-
-        // Ignore send errors (no subscribers)
-        let _ = self.tx.send(update);
+        self.broadcast_snapshot(changes_snapshot);
 
         Ok(updated_change)
     }
@@ -414,6 +502,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_apply_execution_event_processing_started_sets_in_progress() {
+        let changes = vec![create_test_change("change-a", 0, 3)];
+        let web_state = WebState::new(&changes);
+
+        web_state
+            .apply_execution_event(&ExecutionEvent::ProcessingStarted("change-a".to_string()))
+            .await;
+
+        let state = web_state.get_state().await;
+        assert_eq!(state.changes[0].status, "in_progress");
+    }
+
+    #[tokio::test]
+    async fn test_apply_execution_event_progress_updated_updates_counts() {
+        let changes = vec![create_test_change("change-a", 0, 3)];
+        let web_state = WebState::new(&changes);
+
+        web_state
+            .apply_execution_event(&ExecutionEvent::ProgressUpdated {
+                change_id: "change-a".to_string(),
+                completed: 2,
+                total: 4,
+            })
+            .await;
+
+        let state = web_state.get_state().await;
+        let change = &state.changes[0];
+        assert_eq!(change.completed_tasks, 2);
+        assert_eq!(change.total_tasks, 4);
+        assert!((change.progress_percent - 50.0).abs() < 0.01);
+        assert_eq!(change.status, "in_progress");
+    }
+
+    #[tokio::test]
     async fn test_web_state_get_change() {
         let changes = vec![
             create_test_change("change-a", 1, 3),
@@ -445,20 +567,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_compute_diff_progress_update() {
-        let initial = vec![create_test_change("change-a", 2, 5)];
+        let initial = vec![
+            create_test_change("change-a", 2, 5),
+            create_test_change("change-b", 1, 5),
+        ];
         let web_state = WebState::new(&initial);
 
         let mut rx = web_state.subscribe();
 
         // Update with progress change
-        let updated = vec![create_test_change("change-a", 3, 5)];
+        let updated = vec![
+            create_test_change("change-a", 3, 5),
+            create_test_change("change-b", 1, 5),
+        ];
         web_state.update(&updated).await;
 
-        // Broadcast should be sent with only changed item
+        // Broadcast should include full snapshot
         let update = rx.try_recv().unwrap();
-        assert_eq!(update.changes.len(), 1);
-        assert_eq!(update.changes[0].id, "change-a");
-        assert_eq!(update.changes[0].completed_tasks, 3);
+        assert_eq!(update.changes.len(), 2);
+        assert!(update.changes.iter().any(|change| change.id == "change-a"));
+        assert!(update.changes.iter().any(|change| change.id == "change-b"));
+        let updated_change = update
+            .changes
+            .iter()
+            .find(|change| change.id == "change-a")
+            .unwrap();
+        assert_eq!(updated_change.completed_tasks, 3);
     }
 
     #[tokio::test]
