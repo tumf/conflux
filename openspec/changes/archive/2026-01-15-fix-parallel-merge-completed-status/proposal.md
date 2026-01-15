@@ -22,7 +22,7 @@
 3. **change_id の欠落**: このイベントには `change_id` が含まれていないため、TUIはどの変更がマージ完了したか特定できない
 4. **TUIハンドラの欠落**: `src/tui/state/events.rs` に `MergeCompleted` イベントのハンドラがない
 
-## 解決策
+## What Changes
 
 `MergeCompleted` イベントに `change_id` フィールドを追加し、TUIでこのイベントを処理して変更ステータスを `Archived` に更新する。
 
