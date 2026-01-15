@@ -78,7 +78,6 @@ pub fn default_retry_patterns() -> Vec<String> {
     ]
 }
 
-
 /// Default enablement for error circuit breaker
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_ENABLED: bool = true;
 

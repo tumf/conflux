@@ -904,6 +904,9 @@ pub async fn run_orchestrator_parallel(
     // Create ParallelRunService
     let service = ParallelRunService::new(repo_root.clone(), config.clone());
 
+    // Create shared queue change timestamp for debouncing across batches
+    let shared_queue_change = Arc::new(tokio::sync::Mutex::new(None::<std::time::Instant>));
+
     // Check Git availability
     if !service.check_vcs_available().await? {
         let _ = tx
@@ -975,6 +978,7 @@ pub async fn run_orchestrator_parallel(
         }
 
         // Check dynamic queue for newly added changes
+        let mut queue_changed = false;
         while let Some(dynamic_id) = dynamic_queue.pop().await {
             if !processed_ids.contains(&dynamic_id) && !pending_ids.contains(&dynamic_id) {
                 let _ = tx
@@ -984,6 +988,7 @@ pub async fn run_orchestrator_parallel(
                     ))))
                     .await;
                 pending_ids.insert(dynamic_id);
+                queue_changed = true;
             }
         }
 
@@ -997,8 +1002,15 @@ pub async fn run_orchestrator_parallel(
                             id
                         ))))
                         .await;
+                    queue_changed = true;
                 }
             }
+        }
+
+        // Mark queue change timestamp for debouncing
+        if queue_changed {
+            let mut last_change = shared_queue_change.lock().await;
+            *last_change = Some(std::time::Instant::now());
         }
 
         // Get changes to process in this batch (pending - processed)
@@ -1100,7 +1112,7 @@ pub async fn run_orchestrator_parallel(
         // Create a new service for this batch (to get fresh repo state)
         let batch_service = ParallelRunService::new(repo_root.clone(), config.clone());
 
-        // Execute batch using ParallelRunService with channel
+        // Execute batch using ParallelRunService with channel and shared queue state
         let result = tokio::select! {
             _ = cancel_token.cancelled() => {
                 let _ = tx
@@ -1110,10 +1122,11 @@ pub async fn run_orchestrator_parallel(
                     .await;
                 Err(crate::error::OrchestratorError::AgentCommand("Cancelled".to_string()))
             }
-            result = batch_service.run_parallel_with_channel(
+            result = batch_service.run_parallel_with_channel_and_queue_state(
                 batch_changes.clone(),
                 parallel_tx,
                 Some(cancel_token.clone()),
+                Some(shared_queue_change.clone()),
             ) => {
                 result
             }

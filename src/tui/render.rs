@@ -217,7 +217,10 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             // [@] - approved but not selected (ready to select)
             // [x] - selected/reserved (will become Queued when F5 is pressed)
             // [x] (gray) - archived (processing complete, no longer actionable)
-            let is_archived = matches!(change.queue_status, QueueStatus::Archived | QueueStatus::Merged);
+            let is_archived = matches!(
+                change.queue_status,
+                QueueStatus::Archived | QueueStatus::Merged
+            );
             let show_uncommitted_badge = app.parallel_mode
                 && !change.is_parallel_eligible
                 && !is_archived
@@ -383,7 +386,10 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             // [x] - in queue or being processed
             // [x] (gray) - archived (processing complete, no longer actionable)
             // Note: In Running mode, queue_status shows actual state (Queued/Processing/etc.)
-            let is_archived = matches!(change.queue_status, QueueStatus::Archived | QueueStatus::Merged);
+            let is_archived = matches!(
+                change.queue_status,
+                QueueStatus::Archived | QueueStatus::Merged
+            );
             let show_uncommitted_badge = app.parallel_mode
                 && !change.is_parallel_eligible
                 && !is_archived
@@ -437,7 +443,10 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 QueueStatus::Archiving | QueueStatus::Resolving => {
                     format!("{} [{}]", spinner_char, change.queue_status.display())
                 }
-                QueueStatus::Completed | QueueStatus::Archived | QueueStatus::Merged | QueueStatus::Error(_) => {
+                QueueStatus::Completed
+                | QueueStatus::Archived
+                | QueueStatus::Merged
+                | QueueStatus::Error(_) => {
                     format!("[{}]", change.queue_status.display())
                 }
                 status => format!("[{}]", status.display()),

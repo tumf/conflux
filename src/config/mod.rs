@@ -40,7 +40,6 @@ fn default_stall_detection_threshold() -> u32 {
     DEFAULT_STALL_DETECTION_THRESHOLD
 }
 
-
 fn default_error_circuit_breaker_enabled() -> bool {
     DEFAULT_ERROR_CIRCUIT_BREAKER_ENABLED
 }
@@ -80,7 +79,6 @@ pub struct StallDetectionConfig {
     #[serde(default = "default_stall_detection_threshold")]
     pub threshold: u32,
 }
-
 
 /// Error circuit breaker configuration for detecting repeated failures.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -102,23 +102,20 @@ fn normalize_error_message(msg: &str) -> String {
     let msg = path_regex.replace_all(msg, "<PATH>");
 
     // Remove line/column numbers (match each :digit pattern individually)
-    let line_regex = Regex::new(r":\d+")
-        .expect("Invalid line regex");
+    let line_regex = Regex::new(r":\d+").expect("Invalid line regex");
     let msg = line_regex.replace_all(&msg, ":<NUM>");
 
     // Remove timestamps
-    let timestamp_regex = Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}")
-        .expect("Invalid timestamp regex");
+    let timestamp_regex =
+        Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}").expect("Invalid timestamp regex");
     let msg = timestamp_regex.replace_all(&msg, "<TIMESTAMP>");
 
     // Remove generic numbers
-    let number_regex = Regex::new(r"\b\d+\b")
-        .expect("Invalid number regex");
+    let number_regex = Regex::new(r"\b\d+\b").expect("Invalid number regex");
     let msg = number_regex.replace_all(&msg, "<NUM>");
 
     // Normalize whitespace
-    let whitespace_regex = Regex::new(r"\s+")
-        .expect("Invalid whitespace regex");
+    let whitespace_regex = Regex::new(r"\s+").expect("Invalid whitespace regex");
     let normalized = whitespace_regex.replace_all(&msg, " ");
 
     normalized.trim().to_string()
