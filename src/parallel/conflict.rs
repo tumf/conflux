@@ -259,6 +259,17 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
 
     send_event(event_tx, ParallelEvent::ConflictResolutionStarted).await;
 
+    // Send ResolveStarted for each change_id to update TUI status
+    for change_id in change_ids {
+        send_event(
+            event_tx,
+            ParallelEvent::ResolveStarted {
+                change_id: change_id.to_string(),
+            },
+        )
+        .await;
+    }
+
     let conflict_files = detect_conflicts(workspace_manager).await?;
     let conflict_files_str = if conflict_files.is_empty() {
         "(none)".to_string()
@@ -670,6 +681,19 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                 exit_code: status.code(),
             });
             send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
+
+            // Send ResolveCompleted for each change_id to update TUI status
+            for change_id in change_ids {
+                send_event(
+                    event_tx,
+                    ParallelEvent::ResolveCompleted {
+                        change_id: change_id.to_string(),
+                        worktree_change_ids: None,
+                    },
+                )
+                .await;
+            }
+
             return Ok(());
         }
 
@@ -712,6 +736,18 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         },
     )
     .await;
+
+    // Send ResolveFailed for each change_id to update TUI status
+    for change_id in change_ids {
+        send_event(
+            event_tx,
+            ParallelEvent::ResolveFailed {
+                change_id: change_id.to_string(),
+                error: error_msg.clone(),
+            },
+        )
+        .await;
+    }
 
     match workspace_manager.backend_type() {
         VcsBackend::Git | VcsBackend::Auto => Err(OrchestratorError::GitConflict(error_msg)),
