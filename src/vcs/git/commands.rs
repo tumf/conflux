@@ -112,9 +112,16 @@ pub async fn create_archive_wip_commit<P: AsRef<Path>>(
 
 /// Squash all archive WIP commits into a final Archive commit.
 pub async fn squash_archive_wip_commits<P: AsRef<Path>>(cwd: P, change_id: &str) -> VcsResult<()> {
-    let wip_pattern = format!("^WIP\\(archive\\): {} ", change_id);
+    let wip_pattern = format!("WIP(archive): {}", change_id);
     let wip_commits = run_git(
-        &["rev-list", "--reverse", "--grep", &wip_pattern, "HEAD"],
+        &[
+            "rev-list",
+            "--reverse",
+            "--grep",
+            &wip_pattern,
+            "--fixed-string",
+            "HEAD",
+        ],
         &cwd,
     )
     .await?;
