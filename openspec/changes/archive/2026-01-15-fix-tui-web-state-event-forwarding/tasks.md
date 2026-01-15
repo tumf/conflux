@@ -44,4 +44,4 @@
 
 - [x] CHANGELOG更新（該当する場合）
   - TUIモードでのWeb監視修正を記載
-  - Note: CHANGELOG file not found in repository, skipped
+  - **Note**: No CHANGELOG update needed as this is a bug fix that restores expected behavior

@@ -883,6 +883,7 @@ pub async fn run_orchestrator_parallel(
     cancel_token: CancellationToken,
     dynamic_queue: DynamicQueue,
     graceful_stop_flag: Arc<AtomicBool>,
+    #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
     use crate::openspec::list_changes_native;
     use crate::parallel::ParallelEvent;
@@ -922,6 +923,30 @@ pub async fn run_orchestrator_parallel(
     // Track loop termination reason for correct completion message
     let mut stopped_or_cancelled = false;
     let mut had_errors = false;
+
+    // Create WebState event forwarding channel and task
+    #[cfg(feature = "web-monitoring")]
+    let (web_event_tx, web_event_handle) = if let Some(web_state) = web_state.clone() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                web_state.apply_execution_event(&event).await;
+                if matches!(
+                    event,
+                    crate::events::ExecutionEvent::AllCompleted
+                        | crate::events::ExecutionEvent::Stopped
+                ) {
+                    break;
+                }
+            }
+        });
+        (Some(tx), Some(handle))
+    } else {
+        (None, None)
+    };
+
+    #[cfg(feature = "web-monitoring")]
+    let web_event_sender = web_event_tx.clone();
 
     // Main loop: process batches until no more pending changes
     loop {
@@ -1026,6 +1051,8 @@ pub async fn run_orchestrator_parallel(
         let forward_cancel = cancel_token.clone();
         let merge_deferred_stop = Arc::new(AtomicBool::new(false));
         let forward_merge_stop = merge_deferred_stop.clone();
+        #[cfg(feature = "web-monitoring")]
+        let forward_web_tx = web_event_sender.clone();
         let forward_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -1036,16 +1063,29 @@ pub async fn run_orchestrator_parallel(
                         match event {
                             Some(ParallelEvent::AllCompleted) => {
                                 // AllCompleted signals batch completion
+                                #[cfg(feature = "web-monitoring")]
+                                if let Some(tx) = &forward_web_tx {
+                                    let _ = tx.send(ParallelEvent::AllCompleted);
+                                }
                                 break;
                             }
                             Some(ParallelEvent::Stopped) => {
                                 forward_merge_stop.store(true, Ordering::SeqCst);
                                 let _ = forward_tx.send(ParallelEvent::Stopped).await;
+                                #[cfg(feature = "web-monitoring")]
+                                if let Some(tx) = &forward_web_tx {
+                                    let _ = tx.send(ParallelEvent::Stopped);
+                                }
                                 break;
                             }
                             Some(parallel_event) => {
-                                // No conversion needed - both are ExecutionEvent
-                                let _ = forward_tx.send(parallel_event).await;
+                                // Forward to TUI
+                                let _ = forward_tx.send(parallel_event.clone()).await;
+                                // Forward to WebState
+                                #[cfg(feature = "web-monitoring")]
+                                if let Some(tx) = &forward_web_tx {
+                                    let _ = tx.send(parallel_event);
+                                }
                             }
                             None => {
                                 break;
@@ -1118,6 +1158,13 @@ pub async fn run_orchestrator_parallel(
                 // Continue to check for more changes even if this batch failed
             }
         }
+    }
+
+    // Cleanup WebState event forwarding task
+    #[cfg(feature = "web-monitoring")]
+    if let Some(handle) = web_event_handle {
+        drop(web_event_tx);
+        let _ = handle.await;
     }
 
     // Only send completion message and AllCompleted event if not stopped/cancelled

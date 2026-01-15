@@ -60,6 +60,7 @@ pub async fn run_tui(
     _opencode_path: String, // Deprecated - use config instead
     config: OrchestratorConfig,
     web_url: Option<String>,
+    #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
     // Set up panic hook to restore terminal on panic
     let original_hook = std::panic::take_hook();
@@ -80,6 +81,8 @@ pub async fn run_tui(
         openspec_cmd,
         config,
         web_url,
+        #[cfg(feature = "web-monitoring")]
+        web_state,
     )
     .await;
 
@@ -96,6 +99,7 @@ async fn run_tui_loop(
     openspec_cmd: String,
     config: OrchestratorConfig,
     web_url: Option<String>,
+    #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
     use crate::openspec;
 
@@ -387,6 +391,8 @@ async fn run_tui_loop(
                                     let orch_graceful_stop = graceful_stop_flag.clone();
                                     orchestrator_cancel = Some(orch_cancel.clone());
                                     let use_parallel = app.parallel_mode;
+                                    #[cfg(feature = "web-monitoring")]
+                                    let orch_web_state = web_state.clone();
 
                                     orchestrator_handle = Some(tokio::spawn(async move {
                                         let result = if use_parallel {
@@ -398,6 +404,8 @@ async fn run_tui_loop(
                                                 orch_cancel,
                                                 orch_dynamic_queue,
                                                 orch_graceful_stop,
+                                                #[cfg(feature = "web-monitoring")]
+                                                orch_web_state,
                                             )
                                             .await
                                         } else {
