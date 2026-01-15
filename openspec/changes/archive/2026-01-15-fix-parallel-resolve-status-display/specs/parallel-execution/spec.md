@@ -1,6 +1,6 @@
 # parallel-execution Specification Delta
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: 衝突解決時のResolveStartedイベント送信
 
