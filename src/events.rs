@@ -187,6 +187,7 @@ pub enum ExecutionEvent {
     MergeStarted { revisions: Vec<String> },
     /// Merge completed
     MergeCompleted {
+        change_id: String,
         #[allow(dead_code)]
         revision: String,
     },

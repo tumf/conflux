@@ -148,6 +148,21 @@ impl AppState {
                     change_id
                 )));
             }
+            OrchestratorEvent::MergeCompleted {
+                change_id,
+                revision: _,
+            } => {
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+                    change.queue_status = QueueStatus::Archived;
+                    if let Some(started) = change.started_at {
+                        change.elapsed_time = Some(started.elapsed());
+                    }
+                }
+                self.add_log(LogEntry::success(format!(
+                    "Merge completed for '{}'",
+                    change_id
+                )));
+            }
             OrchestratorEvent::ResolveFailed { change_id, error } => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                     change.queue_status = QueueStatus::MergeWait;
@@ -525,6 +540,26 @@ mod tests {
             .logs
             .iter()
             .any(|log| log.message.contains("Failed to resolve merge")));
+    }
+
+    #[test]
+    fn test_merge_completed_sets_archived_status() {
+        let changes = vec![create_approved_change("change-a", 0, 5)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[0].started_at = Some(Instant::now());
+
+        app.handle_orchestrator_event(OrchestratorEvent::MergeCompleted {
+            change_id: "change-a".to_string(),
+            revision: "abc123".to_string(),
+        });
+
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archived);
+        assert!(app.changes[0].elapsed_time.is_some());
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("Merge completed")));
     }
 
     // === Tests for fix-stopped-task-complete-queued ===

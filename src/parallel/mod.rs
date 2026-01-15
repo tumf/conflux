@@ -1373,6 +1373,7 @@ impl ParallelExecutor {
             send_event(
                 &self.event_tx,
                 ParallelEvent::MergeCompleted {
+                    change_id: change_ids[0].clone(),
                     revision: merge_revision,
                 },
             )
@@ -1398,6 +1399,7 @@ impl ParallelExecutor {
                     send_event(
                         &self.event_tx,
                         ParallelEvent::MergeCompleted {
+                            change_id: change_ids[0].clone(),
                             revision: merge_revision,
                         },
                     )
