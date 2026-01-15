@@ -5,6 +5,7 @@ mod cli;
 mod command_queue;
 mod config;
 mod error;
+mod error_history;
 mod events;
 mod execution;
 mod history;
