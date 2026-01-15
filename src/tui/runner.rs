@@ -491,9 +491,30 @@ async fn run_tui_loop(
                                 continue;
                             };
 
-                            if let Err(err) = crate::vcs::git::commands::worktree_add_detached(
+                            // Generate unique branch name with format: oso-session-<rand>
+                            let branch_name =
+                                match crate::vcs::git::commands::generate_unique_branch_name(
+                                    &repo_root,
+                                    "oso-session",
+                                    10,
+                                )
+                                .await
+                                {
+                                    Ok(name) => name,
+                                    Err(err) => {
+                                        app.add_log(LogEntry::error(format!(
+                                            "Failed to generate unique branch name: {}",
+                                            err
+                                        )));
+                                        continue;
+                                    }
+                                };
+
+                            // Create worktree with branch instead of detached HEAD
+                            if let Err(err) = crate::vcs::git::commands::worktree_add(
                                 &repo_root,
                                 worktree_path_str,
+                                &branch_name,
                                 "HEAD",
                             )
                             .await
@@ -504,6 +525,11 @@ async fn run_tui_loop(
                                 )));
                                 continue;
                             }
+
+                            app.add_log(LogEntry::info(format!(
+                                "Created worktree with branch '{}'",
+                                branch_name
+                            )));
 
                             let command = OrchestratorConfig::expand_worktree_command(
                                 &template,

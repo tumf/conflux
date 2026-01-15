@@ -22,7 +22,7 @@ use std::future::Future;
 use std::path::Path;
 
 use tokio::process::Command;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::agent::{AgentRunner, OutputLine};
 use crate::error::{OrchestratorError, Result};
@@ -189,6 +189,33 @@ where
 
             if is_archive_commit_complete(change_id, Some(repo_root)).await? {
                 return Ok(());
+            }
+
+            let (has_changes, _) = git_commands::has_uncommitted_changes(repo_root)
+                .await
+                .map_err(OrchestratorError::from_vcs_error)?;
+            if !has_changes {
+                let subject = git_commands::run_git(&["log", "-1", "--format=%s"], repo_root)
+                    .await
+                    .map_err(OrchestratorError::from_vcs_error)?;
+                let subject = subject.trim();
+                let wip_prefix = format!("WIP(archive): {}", change_id);
+                if subject.starts_with(&wip_prefix) {
+                    match git_commands::squash_archive_wip_commits(repo_root, change_id).await {
+                        Ok(()) => {
+                            if is_archive_commit_complete(change_id, Some(repo_root)).await? {
+                                return Ok(());
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                change_id = %change_id,
+                                error = %err,
+                                "Failed to squash WIP(archive) commits before resolving archive"
+                            );
+                        }
+                    }
+                }
             }
 
             let prompt = format!(
