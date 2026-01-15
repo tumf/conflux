@@ -5,12 +5,24 @@ Defines TUI editor integration for opening change files in external editors.
 ## Requirements
 ### Requirement: エディタ起動キーバインド
 
-TUIの選択モードで `e` キーを押すと、カーソル位置のchangeディレクトリでエディタが起動しなければならない（SHALL）。
+TUIの選択モードで `e` キーを押すと、カーソル位置のchangeの`proposal.md`ファイルを優先的に開き、ファイルが存在しない場合はchangeディレクトリにフォールバックしてエディタが起動しなければならない（SHALL）。
 
-#### Scenario: 選択モードでエディタ起動
+#### Scenario: 選択モードでproposal.mdを直接開く
 
 - **GIVEN** TUIが選択モードである
 - **AND** 変更リストにカーソルが位置している
+- **AND** `openspec/changes/{change_id}/proposal.md`ファイルが存在する
+- **WHEN** ユーザーが `e` キーを押す
+- **THEN** TUIが一時停止する
+- **AND** `$EDITOR` 環境変数で指定されたエディタが起動する
+- **AND** エディタに `openspec/changes/{change_id}/proposal.md` のパスが引数として渡される
+
+#### Scenario: proposal.mdが存在しない場合のディレクトリフォールバック
+
+- **GIVEN** TUIが選択モードである
+- **AND** 変更リストにカーソルが位置している
+- **AND** `openspec/changes/{change_id}/proposal.md`ファイルが存在しない
+- **AND** `openspec/changes/{change_id}/`ディレクトリが存在する
 - **WHEN** ユーザーが `e` キーを押す
 - **THEN** TUIが一時停止する
 - **AND** `$EDITOR` 環境変数で指定されたエディタが起動する
@@ -78,6 +90,7 @@ TUIの選択モードで `e` キーを押すと、カーソル位置のchangeデ
 
 - **GIVEN** TUIが選択モードである
 - **AND** カーソル位置のchangeディレクトリが存在しない
+- **AND** `proposal.md`ファイルも存在しない
 - **WHEN** ユーザーが `e` キーを押す
 - **THEN** エラーログが表示される
 - **AND** TUIは正常に動作を継続する

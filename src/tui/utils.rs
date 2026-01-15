@@ -14,28 +14,43 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::error::{OrchestratorError, Result};
 
-/// Launch editor in the specified change directory
+/// Launch editor for the specified change
 ///
-/// Opens the user's configured editor ($EDITOR) in the change directory.
+/// Opens the user's configured editor ($EDITOR) with the change's proposal.md file.
+/// If proposal.md does not exist, falls back to opening the change directory.
 /// Falls back to "vi" if $EDITOR is not set.
 pub fn launch_editor_for_change(change_id: &str) -> Result<()> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
 
+    let proposal_path = Path::new("openspec/changes")
+        .join(change_id)
+        .join("proposal.md");
     let change_dir = Path::new("openspec/changes").join(change_id);
 
-    if !change_dir.exists() {
+    // Try to open proposal.md directly if it exists
+    if proposal_path.exists() {
+        info!(
+            module = module_path!(),
+            "Launching editor: {} (file: {:?})", editor, proposal_path
+        );
+        Command::new(&editor)
+            .arg(&proposal_path)
+            .status()
+            .map_err(|e| OrchestratorError::EditorLaunchFailed(e.to_string()))?;
+    } else if change_dir.exists() {
+        // Fallback: open directory if proposal.md doesn't exist
+        info!(
+            module = module_path!(),
+            "Launching editor: {} (cwd: {:?})", editor, change_dir
+        );
+        Command::new(&editor)
+            .arg(".")
+            .current_dir(&change_dir)
+            .status()
+            .map_err(|e| OrchestratorError::EditorLaunchFailed(e.to_string()))?;
+    } else {
         return Err(OrchestratorError::ChangeNotFound(change_id.to_string()));
     }
-
-    info!(
-        module = module_path!(),
-        "Launching editor: {} (cwd: {:?})", editor, change_dir
-    );
-    Command::new(&editor)
-        .arg(".")
-        .current_dir(&change_dir)
-        .status()
-        .map_err(|e| OrchestratorError::EditorLaunchFailed(e.to_string()))?;
 
     Ok(())
 }
