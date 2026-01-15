@@ -520,6 +520,43 @@ openspec-orchestrator run --parallel
 openspec-orchestrator run --parallel --no-resume
 ```
 
+**Workspace State Detection (Idempotent Resume):**
+
+The orchestrator detects the current state of each workspace to ensure idempotent execution. When resuming, workspaces are classified into one of five states:
+
+| State | Description | Action Taken |
+|-------|-------------|--------------|
+| **Created** | New workspace, no commits yet | Start apply from beginning |
+| **Applying** | WIP commits exist, apply in progress | Resume apply from next iteration |
+| **Applied** | Apply complete (`Apply: <change_id>` commit exists) | Skip apply, run archive only |
+| **Archived** | Archive complete (`Archive: <change_id>` commit exists) | Skip apply/archive, run merge only |
+| **Merged** | Already merged to main branch | Skip all operations, cleanup workspace |
+
+This state detection ensures that:
+- Running the orchestrator multiple times on the same workspace is safe and produces the same result (idempotency)
+- Manually archived or merged changes are detected and handled correctly
+- Interrupted operations resume from the correct step
+- No duplicate work is performed
+
+**State Detection Examples:**
+
+```bash
+# Interrupted during apply - resumes from where it left off
+$ openspec-orchestrator run --parallel
+# Workspace state: Applying (iteration 3/5)
+# Action: Resume apply from iteration 4
+
+# Manually archived a change - skips apply/archive
+$ openspec-orchestrator run --parallel
+# Workspace state: Archived
+# Action: Skip apply/archive, merge to main only
+
+# Already merged to main - cleanup only
+$ openspec-orchestrator run --parallel
+# Workspace state: Merged
+# Action: Skip all operations, cleanup workspace
+```
+
 ### Web Monitoring (Optional Feature)
 
 The orchestrator supports an optional HTTP server for remote monitoring of orchestration progress via web browser.
