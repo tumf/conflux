@@ -14,5 +14,5 @@
 - [x] 3.1 `npx @fission-ai/openspec@latest validate add-worktree-branch-creation --strict`
 
 ## Future work
-- TUI の `+` を押して worktree が作られ、ブランチが確認できることを確認 (future work - 人間による手動検証)
-- `--parallel` 実行で worktree が作られ、ブランチが確認できることを確認 (future work - 人間による手動検証)
+- 3.2 TUI の `+` を押して worktree が作られ、ブランチが確認できることを確認 - Manual testing required
+- 3.3 `--parallel` 実行で worktree が作られ、ブランチが確認できることを確認 - Manual testing required

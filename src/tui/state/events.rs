@@ -2,6 +2,7 @@
 //!
 //! Contains orchestrator event handling and change refresh logic.
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::openspec::Change;
@@ -291,9 +292,15 @@ impl AppState {
                 let was_archived = existing.queue_status == QueueStatus::Archived;
 
                 if was_archived {
-                    // Keep Archived status - don't revert to NotQueued/Completed
-                    // The change was archived by parallel execution and should remain that way
-                    // Update: Do not update tasks - archived changes should show their final state
+                    // If change still exists after archiving, it means archive failed
+                    // Revert to appropriate status based on completion
+                    existing.queue_status = if fetched.is_complete() {
+                        QueueStatus::Completed
+                    } else {
+                        QueueStatus::NotQueued
+                    };
+                    existing.completed_tasks = fetched.completed_tasks;
+                    existing.total_tasks = fetched.total_tasks;
                 } else if fetched.total_tasks > 0 {
                     // Only update progress if we have valid data (total > 0)
                     // and the change is NOT being processed (parallel mode uses workspace)
@@ -328,6 +335,26 @@ impl AppState {
 
         // Track all known IDs (new + existing)
         self.known_change_ids.extend(new_ids);
+
+        self.new_change_count = self.changes.iter().filter(|c| c.is_new).count();
+        self.last_refresh = Instant::now();
+
+        // Remove changes that no longer exist (have been archived externally)
+        let current_ids: HashSet<String> = fetched_changes.iter().map(|c| c.id.clone()).collect();
+        self.changes.retain(|c| {
+            // Keep if still exists, apply started in this session, or in a terminal state.
+            current_ids.contains(&c.id)
+                || c.started_at.is_some()
+                || matches!(
+                    c.queue_status,
+                    QueueStatus::Completed
+                        | QueueStatus::Archiving
+                        | QueueStatus::Archived
+                        | QueueStatus::MergeWait
+                        | QueueStatus::Resolving
+                        | QueueStatus::Error(_)
+                )
+        });
 
         // Ensure cursor is valid
         if self.cursor_index >= self.changes.len() && !self.changes.is_empty() {
