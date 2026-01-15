@@ -104,7 +104,7 @@ src/
   agent.rs              # AI agent command execution
   analyzer.rs           # Change dependency analyzer for parallel execution
   approval.rs           # Change approval management
-  history.rs            # Apply context history management
+  history.rs            # Apply, archive, and resolve context history management
   hooks.rs              # Lifecycle hook execution
   parallel_run_service.rs # Parallel execution service
   task_parser.rs        # Native task.md parser
@@ -318,6 +318,78 @@ The `run` mode includes signal handlers for graceful shutdown:
 
 - Project config: `.openspec-orchestrator.jsonc` (JSONC format with comments)
 - Global config: `~/.openspec-orchestrator.jsonc`
+
+## Retry Context History
+
+The orchestrator tracks retry history for apply, archive, and resolve operations to help AI agents learn from previous attempts.
+
+### Apply History
+
+- **Module**: `src/history.rs` - `ApplyHistory`
+- **Purpose**: Tracks apply command attempts per change
+- **Recording**: After each apply attempt (success or failure)
+- **Context Format**: XML-like tags with attempt number, status, duration, error, and exit code
+- **Clearing**: When change is successfully archived
+- **Example**:
+  ```xml
+  <last_apply attempt="1">
+  status: failed
+  duration: 45s
+  error: Type error in auth.rs:42
+  exit_code: 1
+  </last_apply>
+  ```
+
+### Archive History
+
+- **Module**: `src/history.rs` - `ArchiveHistory`
+- **Purpose**: Tracks archive command attempts per change
+- **Recording**: After each archive attempt and verification
+- **Context Format**: XML-like tags with attempt number, status, duration, verification result, error, and exit code
+- **Clearing**: When change is successfully archived
+- **Example**:
+  ```xml
+  <last_archive attempt="1">
+  status: failed
+  duration: 5s
+  verification_result: Change still exists at openspec/changes/my-change
+  error: Archive command succeeded but verification failed
+  exit_code: 0
+  </last_archive>
+  ```
+
+### Resolve Context
+
+- **Module**: `src/history.rs` - `ResolveContext`
+- **Purpose**: Tracks resolve attempts within a single retry session (not persisted across changes)
+- **Recording**: After each resolve attempt and verification
+- **Context Format**: XML-like tags with attempt count, previous attempt details, and continuation reason
+- **Clearing**: Automatically when resolve session completes (function scope)
+- **Used By**:
+  - `src/parallel/conflict.rs` - `resolve_conflicts_with_retry()`
+  - `src/parallel/conflict.rs` - `resolve_merges_with_retry()`
+- **Example**:
+  ```xml
+  <resolve_context>
+  This is attempt 2 of 3 for conflict resolution.
+
+  Previous attempt (1):
+  - Command exit: success (code: 0)
+  - Verification: failed
+  - Reason: Conflicts still present after resolution attempt: src/main.rs, src/lib.rs
+  - Duration: 45s
+
+  Continue resolving the conflicts. The previous attempt did not fully resolve all conflicts.
+  </resolve_context>
+  ```
+
+### Implementation Notes
+
+- All history is kept in memory (not persisted to disk)
+- History is passed to AI agents via prompt injection
+- Archive and apply history are per-change and cleared on successful archive
+- Resolve context is per-session and exists only during the retry loop
+- Recording failures are logged as warnings but don't stop execution
 
 ## Common Patterns
 

@@ -38,7 +38,7 @@ Special handling for 'future work' tasks:
 - If a task is already marked '(future work)', move it to a "Future work" section and remove the checkbox
 - This indicates deferred work, not current implementation scope"#;
 use crate::error::{OrchestratorError, Result};
-use crate::history::{ApplyAttempt, ApplyHistory};
+use crate::history::{ApplyAttempt, ApplyHistory, ArchiveAttempt, ArchiveHistory};
 use crate::process_manager::ManagedChild;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -60,6 +60,8 @@ pub struct AgentRunner {
     config: OrchestratorConfig,
     /// History of apply attempts per change for context injection
     apply_history: ApplyHistory,
+    /// History of archive attempts per change for context injection
+    archive_history: ArchiveHistory,
 }
 
 impl AgentRunner {
@@ -68,6 +70,7 @@ impl AgentRunner {
         Self {
             config,
             apply_history: ApplyHistory::new(),
+            archive_history: ArchiveHistory::new(),
         }
     }
 
@@ -120,21 +123,34 @@ impl AgentRunner {
         self.apply_history.record(change_id, attempt);
     }
 
-    /// Run archive command for the given change ID with output streaming
-    /// Returns a child process handle and a receiver for output lines
+    /// Run archive command for the given change ID with output streaming.
+    /// Returns a child process handle, a receiver for output lines, and a start time.
+    /// The caller is responsible for recording the attempt after the child completes
+    /// by calling `record_archive_attempt()`.
+    ///
+    /// The prompt is constructed as: user_prompt + history_context
+    /// - user_prompt: from config.archive_prompt (user-customizable)
+    /// - history_context: previous archive attempts (if any)
     pub async fn run_archive_streaming(
         &self,
         change_id: &str,
-    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
+        let start = Instant::now();
         let template = self.config.get_archive_command();
-        let prompt = self.config.get_archive_prompt();
+        let user_prompt = self.config.get_archive_prompt();
+        let history_context = self.archive_history.format_context(change_id);
+
+        // Build full prompt: user_prompt + history_context
+        let full_prompt = build_archive_prompt(user_prompt, &history_context);
+
         let command = OrchestratorConfig::expand_change_id(template, change_id);
-        let command = OrchestratorConfig::expand_prompt(&command, prompt);
+        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
         info!(
             module = module_path!(),
             "Running archive command: {}", command
         );
-        self.execute_shell_command_streaming(&command).await
+        let (child, rx) = self.execute_shell_command_streaming(&command).await?;
+        Ok((child, rx, start))
     }
 
     /// Run apply command for the given change ID (blocking, no streaming)
@@ -181,9 +197,44 @@ impl AgentRunner {
         Ok(status)
     }
 
+    /// Record an archive attempt after streaming execution completes.
+    /// Call this after `run_archive_streaming()` child process finishes.
+    pub fn record_archive_attempt(
+        &mut self,
+        change_id: &str,
+        status: &ExitStatus,
+        start: Instant,
+        verification_result: Option<String>,
+    ) {
+        let duration = start.elapsed();
+        let attempt = ArchiveAttempt {
+            attempt: self.archive_history.count(change_id) + 1,
+            success: status.success(),
+            duration,
+            error: if status.success() && verification_result.is_none() {
+                None
+            } else if verification_result.is_some() {
+                Some(format!(
+                    "Archive command succeeded but verification failed: {}",
+                    verification_result.as_ref().unwrap()
+                ))
+            } else {
+                Some(format!("Exit code: {:?}", status.code()))
+            },
+            verification_result,
+            exit_code: status.code(),
+        };
+        self.archive_history.record(change_id, attempt);
+    }
+
     /// Clear apply history for a change (call after archiving)
     pub fn clear_apply_history(&mut self, change_id: &str) {
         self.apply_history.clear(change_id);
+    }
+
+    /// Clear archive history for a change (call after successful archiving)
+    pub fn clear_archive_history(&mut self, change_id: &str) {
+        self.archive_history.clear(change_id);
     }
 
     /// Run archive command for the given change ID (blocking, no streaming)
@@ -686,6 +737,22 @@ pub fn build_apply_prompt(user_prompt: &str, history_context: &str) -> String {
     parts.join("\n\n")
 }
 
+/// Build archive prompt from user prompt and history context
+/// Format: user_prompt + history_context
+pub fn build_archive_prompt(user_prompt: &str, history_context: &str) -> String {
+    let mut parts = Vec::new();
+
+    if !user_prompt.is_empty() {
+        parts.push(user_prompt.to_string());
+    }
+
+    if !history_context.is_empty() {
+        parts.push(history_context.to_string());
+    }
+
+    parts.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -931,5 +998,47 @@ mod tests {
         assert!(APPLY_SYSTEM_PROMPT.contains("actionable"));
         assert!(APPLY_SYSTEM_PROMPT.contains("concrete commands"));
         assert!(APPLY_SYSTEM_PROMPT.contains("Future work"));
+    }
+
+    #[test]
+    fn test_build_archive_prompt_with_all_parts() {
+        let user_prompt = "Please archive this change";
+        let history_context = "<last_archive attempt=\"1\">\nstatus: failed\n</last_archive>";
+        let result = build_archive_prompt(user_prompt, history_context);
+
+        assert!(result.contains("Please archive this change"));
+        assert!(result.contains("<last_archive attempt=\"1\">"));
+        assert!(result.contains("status: failed"));
+    }
+
+    #[test]
+    fn test_build_archive_prompt_with_empty_user_prompt() {
+        let user_prompt = "";
+        let history_context = "<last_archive attempt=\"1\">\nstatus: failed\n</last_archive>";
+        let result = build_archive_prompt(user_prompt, history_context);
+
+        // Should only contain history
+        assert!(result.contains("<last_archive attempt=\"1\">"));
+        assert!(!result.contains("\n\n\n")); // No triple newlines
+    }
+
+    #[test]
+    fn test_build_archive_prompt_with_empty_history() {
+        let user_prompt = "Please archive this change";
+        let history_context = "";
+        let result = build_archive_prompt(user_prompt, history_context);
+
+        // Should only contain user prompt
+        assert_eq!(result, "Please archive this change");
+    }
+
+    #[test]
+    fn test_build_archive_prompt_both_empty() {
+        let user_prompt = "";
+        let history_context = "";
+        let result = build_archive_prompt(user_prompt, history_context);
+
+        // Should be empty
+        assert!(result.is_empty());
     }
 }
