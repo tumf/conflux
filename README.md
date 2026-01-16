@@ -21,7 +21,7 @@ Automates the OpenSpec change workflow: list → dependency analysis → apply �
 
 ```
 ┌─────────────────────────────────────────────┐
-│     openspec-orchestrator (Rust CLI)        │
+│     cflx (Rust CLI)        │
 ├─────────────────────────────────────────────┤
 │  CLI → Orchestrator → State Manager         │
 │    ↓        ↓              ↓                │
@@ -37,7 +37,7 @@ Automates the OpenSpec change workflow: list → dependency analysis → apply �
 The primary way to use the orchestrator is through the interactive TUI dashboard:
 
 ```bash
-openspec-orchestrator
+cflx
 ```
 
 The TUI provides:
@@ -176,16 +176,16 @@ Generate a configuration file for your preferred AI agent:
 
 ```bash
 # Default: Claude Code template
-openspec-orchestrator init
+cflx init
 
 # OpenCode template
-openspec-orchestrator init --template opencode
+cflx init --template opencode
 
 # Codex template
-openspec-orchestrator init --template codex
+cflx init --template codex
 
 # Overwrite existing config
-openspec-orchestrator init --force
+cflx init --force
 ```
 
 Available templates: `claude` (default), `opencode`, `codex`
@@ -195,23 +195,23 @@ Available templates: `claude` (default), `opencode`, `codex`
 Process all pending changes in headless mode:
 
 ```bash
-openspec-orchestrator run
+cflx run
 ```
 
 Process specific changes (single or multiple):
 
 ```bash
 # Single change
-openspec-orchestrator run --change add-feature-x
+cflx run --change add-feature-x
 
 # Multiple changes (comma-separated)
-openspec-orchestrator run --change add-feature-x,fix-bug-y,refactor-z
+cflx run --change add-feature-x,fix-bug-y,refactor-z
 ```
 
 Custom configuration file:
 
 ```bash
-openspec-orchestrator run --config /path/to/config.jsonc
+cflx run --config /path/to/config.jsonc
 ```
 
 ### Manage Change Approval
@@ -220,13 +220,13 @@ Approve or unapprove changes to control which changes can be processed:
 
 ```bash
 # Approve a change (creates checksums for validation)
-openspec-orchestrator approve set add-feature-x
+cflx approve set add-feature-x
 
 # Check approval status
-openspec-orchestrator approve status add-feature-x
+cflx approve status add-feature-x
 
 # Unapprove a change
-openspec-orchestrator approve unset add-feature-x
+cflx approve unset add-feature-x
 ```
 
 Approved changes have an `approved` file containing MD5 checksums of all specification files (excluding `tasks.md`). This ensures the change hasn't been modified since approval.
@@ -285,8 +285,8 @@ The orchestrator supports configurable agent commands via JSONC configuration fi
 This allows you to use different AI tools (Claude Code, OpenCode, Codex, etc.) without code changes.
 
 **Configuration file locations** (in order of priority):
-1. `.openspec-orchestrator.jsonc` (project root)
-2. `~/.config/openspec-orchestrator/config.jsonc` (global)
+1. `.cflx.jsonc` (project root)
+2. `~/.config/cflx/config.jsonc` (global)
 3. Custom path via `--config` option
 
 **Example configuration (Claude Code):**
@@ -354,16 +354,16 @@ This allows you to use different AI tools (Claude Code, OpenCode, Codex, etc.) w
 
 ```bash
 # Generate configuration with init command
-openspec-orchestrator init
+cflx init
 
 # Or copy the example configuration
-cp .openspec-orchestrator.jsonc.example .openspec-orchestrator.jsonc
+cp .cflx.jsonc.example .cflx.jsonc
 
 # Edit to customize settings
-vim .openspec-orchestrator.jsonc
+vim .cflx.jsonc
 
 # Run with the configuration
-openspec-orchestrator
+cflx
 ```
 
 ### Hooks Configuration
@@ -469,17 +469,17 @@ Example:
 ```bash
 # Use a custom openspec installation
 export OPENSPEC_CMD="/usr/local/bin/openspec"
-openspec-orchestrator
+cflx
 
 # Use a specific version via npx
 export OPENSPEC_CMD="npx @fission-ai/openspec@1.2.3"
-openspec-orchestrator
+cflx
 ```
 
 ### Command-line Options
 
 ```
-Usage: openspec-orchestrator [OPTIONS] [COMMAND]
+Usage: cflx [OPTIONS] [COMMAND]
 
 Commands:
   run      Run the OpenSpec change orchestration loop (non-interactive, headless mode)
@@ -514,10 +514,10 @@ The TUI (default mode) also supports web monitoring options:
 
 ```bash
 # TUI with web monitoring
-openspec-orchestrator --web
+cflx --web
 
 # Custom port and bind address
-openspec-orchestrator --web --web-port 9000 --web-bind 0.0.0.0
+cflx --web --web-port 9000 --web-bind 0.0.0.0
 ```
 
 ### Parallel Execution
@@ -535,16 +535,16 @@ The orchestrator supports parallel execution of independent changes using Git wo
 
 ```bash
 # Auto-detect VCS backend (default)
-openspec-orchestrator run --parallel
+cflx run --parallel
 
 # Force Git worktrees
-openspec-orchestrator run --parallel --vcs git
+cflx run --parallel --vcs git
 
 # Preview parallelization groups without executing
-openspec-orchestrator run --parallel --dry-run
+cflx run --parallel --dry-run
 
 # Limit concurrent workspaces
-openspec-orchestrator run --parallel --max-concurrent 5
+cflx run --parallel --max-concurrent 5
 ```
 
 **Configuration:**
@@ -578,10 +578,10 @@ By default, the orchestrator automatically detects and reuses existing workspace
 
 ```bash
 # Resume from existing workspaces (default behavior)
-openspec-orchestrator run --parallel
+cflx run --parallel
 
 # Always create new workspaces (discard any existing work)
-openspec-orchestrator run --parallel --no-resume
+cflx run --parallel --no-resume
 ```
 
 **Workspace State Detection (Idempotent Resume):**
@@ -606,17 +606,17 @@ This state detection ensures that:
 
 ```bash
 # Interrupted during apply - resumes from where it left off
-$ openspec-orchestrator run --parallel
+$ cflx run --parallel
 # Workspace state: Applying (iteration 3/5)
 # Action: Resume apply from iteration 4
 
 # Manually archived a change - skips apply/archive
-$ openspec-orchestrator run --parallel
+$ cflx run --parallel
 # Workspace state: Archived
 # Action: Skip apply/archive, merge to main only
 
 # Already merged to main - cleanup only
-$ openspec-orchestrator run --parallel
+$ cflx run --parallel
 # Workspace state: Merged
 # Action: Skip all operations, cleanup workspace
 ```
@@ -702,13 +702,13 @@ The orchestrator supports an optional HTTP server for remote monitoring of orche
 
 ```bash
 # Enable web monitoring with TUI (OS auto-assigns an available port)
-openspec-orchestrator --web
+cflx --web
 
 # Custom port and bind address
-openspec-orchestrator --web --web-port 9000 --web-bind 0.0.0.0
+cflx --web --web-port 9000 --web-bind 0.0.0.0
 
 # With headless run mode
-openspec-orchestrator run --web
+cflx run --web
 ```
 
 When using the default port (0), the OS automatically assigns an available port.
@@ -844,7 +844,7 @@ Priority: CLI argument > Environment variable > Default value
 
 - Verify your AI agent is installed (e.g., `which claude`)
 - Test manually: `claude -p "echo test"`
-- Check your configuration file: `.openspec-orchestrator.jsonc`
+- Check your configuration file: `.cflx.jsonc`
 
 ### "All changes failed"
 

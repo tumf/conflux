@@ -314,6 +314,7 @@ fn build_parallel_hook_context(
 pub async fn execute_apply_in_workspace(
     change_id: &str,
     workspace_path: &Path,
+    repo_root: &Path,
     apply_cmd_template: &str,
     config: &OrchestratorConfig,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
@@ -459,20 +460,22 @@ pub async fn execute_apply_in_workspace(
         let command = OrchestratorConfig::expand_change_id(apply_cmd_template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
         debug!("Workspace path: {:?}", workspace_path);
+        debug!("Repository root: {:?}", repo_root);
         debug!("Apply command: {}", command);
 
-        // Execute command in workspace directory with streaming output
+        // Execute command in repository root (not workspace directory)
+        // This allows the AI agent to access the full repository structure
         // Use null stdin to prevent any interactive behavior
         use tokio::io::{AsyncBufReadExt, BufReader};
 
         debug!(
             module = module_path!(),
-            "Executing shell command: sh -c {} (cwd: {:?})", command, workspace_path
+            "Executing shell command: sh -c {} (cwd: {:?})", command, repo_root
         );
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(&command)
-            .current_dir(workspace_path)
+            .current_dir(repo_root)
             .stdin(StdStdio::null())
             .stdout(StdStdio::piped())
             .stderr(StdStdio::piped())
@@ -776,6 +779,7 @@ pub async fn execute_apply_in_workspace(
 pub async fn execute_archive_in_workspace(
     change_id: &str,
     workspace_path: &Path,
+    repo_root: &Path,
     archive_cmd_template: &str,
     config: &OrchestratorConfig,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
@@ -904,12 +908,12 @@ pub async fn execute_archive_in_workspace(
 
         debug!(
             "Executing shell command: sh -c {} (cwd: {:?})",
-            command, workspace_path
+            command, repo_root
         );
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(&command)
-            .current_dir(workspace_path)
+            .current_dir(repo_root)
             .stdin(StdStdio::null())
             .stdout(StdStdio::piped())
             .stderr(StdStdio::piped())

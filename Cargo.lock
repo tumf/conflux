@@ -346,6 +346,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "conflux"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "clap",
+ "crossterm 0.28.1",
+ "dirs",
+ "indicatif",
+ "libc",
+ "local-ip-address",
+ "md5",
+ "nix 0.27.1",
+ "qrcode",
+ "rand 0.8.5",
+ "ratatui",
+ "regex",
+ "serde",
+ "serde_json",
+ "shlex",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-normalization",
+ "unicode-width",
+ "windows",
+]
+
+[[package]]
 name = "console"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1336,42 +1372,6 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
-
-[[package]]
-name = "openspec-orchestrator"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "chrono",
- "clap",
- "crossterm 0.28.1",
- "dirs",
- "indicatif",
- "libc",
- "local-ip-address",
- "md5",
- "nix 0.27.1",
- "qrcode",
- "rand 0.8.5",
- "ratatui",
- "regex",
- "serde",
- "serde_json",
- "shlex",
- "tempfile",
- "thiserror 2.0.17",
- "tokio",
- "tokio-util",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "unicode-normalization",
- "unicode-width",
- "windows",
-]
 
 [[package]]
 name = "option-ext"

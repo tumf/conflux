@@ -21,7 +21,7 @@ cargo build
 cargo build --release
 ```
 
-The binary will be available at `target/release/openspec-orchestrator`.
+The binary will be available at `target/release/cflx`.
 
 ## Testing
 
@@ -121,7 +121,7 @@ src/
 ```
 User starts orchestrator
         ↓
-    Load config (.openspec-orchestrator.jsonc)
+    Load config (.cflx.jsonc)
         ↓
     Run on_start hook
         ↓

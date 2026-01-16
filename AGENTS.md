@@ -17,13 +17,13 @@ Keep this managed block so 'openspec update' can refresh the instructions.
 
 <!-- OPENSPEC:END -->
 
-# AGENTS.md - OpenSpec Orchestrator
+# AGENTS.md - Conflux
 
 This document provides essential information for AI coding agents working on this Rust codebase.
 
 ## Project Overview
 
-OpenSpec Orchestrator automates the OpenSpec change workflow (list -> dependency analysis -> apply -> archive). It orchestrates `openspec` and `opencode` CLI tools to process changes autonomously.
+Conflux automates the OpenSpec change workflow (list -> dependency analysis -> apply -> archive). It orchestrates `openspec` and AI coding agent tools to process changes autonomously.
 
 ## Build Commands
 
@@ -529,8 +529,8 @@ fn should_retry(&self, attempt: u32, duration: Duration, stderr: &str, exit_code
 
 ## Configuration Files
 
-- Project config: `.openspec-orchestrator.jsonc` (JSONC format with comments)
-- Global config: `~/.openspec-orchestrator.jsonc`
+- Project config: `.cflx.jsonc` (JSONC format with comments)
+- Global config: `~/.cflx.jsonc`
 
 ## Retry Context History
 

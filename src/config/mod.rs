@@ -1,9 +1,9 @@
-//! Configuration module for OpenSpec Orchestrator.
+//! Configuration module for Conflux.
 //!
 //! Supports JSONC format (JSON with Comments) for configuration files.
 //! Configuration is loaded with the following priority:
-//! 1. Project config: `.openspec-orchestrator.jsonc`
-//! 2. Global config: `~/.config/openspec-orchestrator/config.jsonc`
+//! 1. Project config: `.cflx.jsonc`
+//! 2. Global config: `~/.config/cflx/config.jsonc`
 //! 3. Default values (OpenCode-based commands)
 //!
 //! # Module Structure
@@ -417,8 +417,8 @@ impl OrchestratorConfig {
 
     /// Load configuration with priority:
     /// 1. Custom config path (if provided)
-    /// 2. Project config (`.openspec-orchestrator.jsonc`)
-    /// 3. Global config (`~/.config/openspec-orchestrator/config.jsonc`)
+    /// 2. Project config (`.cflx.jsonc`)
+    /// 3. Global config (`~/.config/cflx/config.jsonc`)
     /// 4. Default configuration
     pub fn load(custom_path: Option<&Path>) -> Result<Self> {
         // 1. Custom config path
@@ -450,7 +450,7 @@ impl OrchestratorConfig {
 
 /// Get the path to the global configuration file
 ///
-/// Returns `~/.config/openspec-orchestrator/config.jsonc` on Unix-like systems.
+/// Returns `~/.config/cflx/config.jsonc` on Unix-like systems.
 pub fn get_global_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|config_dir| config_dir.join(GLOBAL_CONFIG_DIR).join(GLOBAL_CONFIG_FILE))
 }

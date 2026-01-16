@@ -259,7 +259,7 @@ async fn main() -> Result<()> {
 
         // Init subcommand: generate configuration file
         Some(Commands::Init(args)) => {
-            let config_path = Path::new(".openspec-orchestrator.jsonc");
+            let config_path = Path::new(".cflx.jsonc");
 
             if config_path.exists() && !args.force {
                 eprintln!(
