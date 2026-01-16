@@ -62,6 +62,10 @@ error: cannot delete branch 'rename-to-conflux' used by worktree at '/path/to/wo
 2. `cleanup.rs`の`WorkspaceCleanupGuard`構造体を変更し、ワークスペース名だけでなくパスも保持
 3. `cleanup.rs`の`Drop`実装で、ブランチ削除前にワークツリー削除を実行
 
+## What Changes
+
+- `workspace-cleanup`: `WorkspaceCleanupGuard`のデータ構造とクリーンアップ順序を修正
+
 ## 関連仕様
 
 - `workspace-cleanup`: ワークスペースクリーンアップの基本動作
