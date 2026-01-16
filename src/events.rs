@@ -275,6 +275,16 @@ pub enum ExecutionEvent {
         committed_change_ids: std::collections::HashSet<String>,
         worktree_change_ids: std::collections::HashSet<String>,
     },
+    /// Worktrees list refreshed (for worktree view)
+    WorktreesRefreshed {
+        worktrees: Vec<crate::tui::types::WorktreeInfo>,
+    },
+    /// Branch merge started (TUI worktree view)
+    BranchMergeStarted { branch_name: String },
+    /// Branch merge completed successfully (TUI worktree view)
+    BranchMergeCompleted { branch_name: String },
+    /// Branch merge failed (TUI worktree view)
+    BranchMergeFailed { branch_name: String, error: String },
 }
 
 /// Helper to send events through the channel.

@@ -10,7 +10,7 @@ use crate::openspec::Change;
 use super::super::events::{LogEntry, OrchestratorEvent};
 use super::super::types::{AppMode, QueueStatus, StopMode};
 use super::change::ChangeState;
-use super::AppState;
+use super::{AppState, WarningPopup};
 
 impl AppState {
     /// Handle an event from the orchestrator
@@ -244,6 +244,15 @@ impl AppState {
             OrchestratorEvent::Log(entry) => {
                 self.add_log(entry);
             }
+            OrchestratorEvent::WorktreesRefreshed { worktrees } => {
+                self.worktrees = worktrees;
+
+                // Adjust cursor if it's out of bounds
+                if self.worktree_cursor_index >= self.worktrees.len() && !self.worktrees.is_empty()
+                {
+                    self.worktree_cursor_index = self.worktrees.len() - 1;
+                }
+            }
             OrchestratorEvent::ChangesRefreshed {
                 changes,
                 committed_change_ids,
@@ -265,6 +274,29 @@ impl AppState {
             }
             OrchestratorEvent::ResolveOutput { output } => {
                 self.add_log(LogEntry::info(format!("[Resolve] {}", output)));
+            }
+            // Branch merge events (TUI worktree view)
+            OrchestratorEvent::BranchMergeStarted { branch_name } => {
+                self.add_log(LogEntry::info(format!(
+                    "Merging branch '{}'...",
+                    branch_name
+                )));
+            }
+            OrchestratorEvent::BranchMergeCompleted { branch_name } => {
+                self.add_log(LogEntry::success(format!(
+                    "Merged branch '{}' successfully",
+                    branch_name
+                )));
+            }
+            OrchestratorEvent::BranchMergeFailed { branch_name, error } => {
+                self.warning_popup = Some(WarningPopup {
+                    title: "Merge failed".to_string(),
+                    message: format!("Failed to merge '{}': {}", branch_name, error),
+                });
+                self.add_log(LogEntry::error(format!(
+                    "Merge failed for '{}': {}",
+                    branch_name, error
+                )));
             }
             // Ignore other parallel-specific events that don't affect TUI state
             _ => {

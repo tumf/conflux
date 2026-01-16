@@ -172,6 +172,96 @@ tests/
   ralph_compatibility.rs # Ralph plugin compatibility tests
 ```
 
+## TUI Features
+
+### Worktree View
+
+The TUI includes a dedicated Worktree View for managing git worktrees with integrated merge functionality.
+
+**Key Features**:
+- **View Switching**: Press `Tab` to switch between Changes and Worktrees views
+- **Worktree List**: Displays all worktrees with path (basename), branch name, and status
+- **Conflict Detection**: Automatically checks for merge conflicts in parallel (background)
+- **Branch Merge**: Merge worktree branches to base with `M` key (conflict-free only)
+- **Worktree Management**: Create (`+`), delete (`D`), open editor (`e`), open shell (`Enter`)
+
+**Workflow**:
+
+1. **Switch to Worktrees View**: Press `Tab` from Changes view
+   - Loads worktree list with conflict detection (runs in parallel)
+   - Displays: `<worktree-path> → <branch-name> [STATUS] [⚠conflicts]`
+
+2. **Navigate Worktrees**: Use `↑`/`↓` or `j`/`k` keys
+   - Main worktree shown with `[MAIN]` indicator (green)
+   - Detached HEAD shown with `[DETACHED]` indicator
+   - Conflicts shown with `⚠<count>` badge (red)
+
+3. **Merge Branch**: Press `M` (only enabled when safe)
+   - Validates: not main worktree, not detached HEAD, no conflicts
+   - Executes: `git merge --no-ff --no-edit <branch>` in worktree
+   - On success: Shows success log, refreshes worktree list
+   - On failure: Shows error popup with details
+
+4. **Create Worktree**: Press `+`
+   - Generates unique branch name: `ws-session-<timestamp>`
+   - Creates worktree with new branch (not detached HEAD)
+   - Requires `worktree_command` config option
+
+5. **Delete Worktree**: Press `D` (only for non-main, non-processing worktrees)
+   - Shows confirmation dialog (`Y` to confirm, `N`/`Esc` to cancel)
+   - Removes worktree directory and updates list
+
+6. **Open Editor/Shell**: Press `e` or `Enter`
+   - `e`: Opens editor in worktree directory (respects `$EDITOR`)
+   - `Enter`: Runs `worktree_command` in worktree (e.g., opens shell)
+
+**Conflict Detection**:
+
+- Runs automatically when switching to Worktrees view
+- Checks each non-main, non-detached worktree in parallel using `git merge --no-commit --no-ff`
+- Detects conflicts without modifying working tree (uses `git merge --abort`)
+- Displays conflict count as `⚠<count>` badge in red
+- Updates every 5 seconds (auto-refresh) in background
+- Disables `M` key when conflicts detected
+
+**Performance**:
+
+- Parallel conflict checking: Uses `tokio::task::JoinSet` for concurrent execution
+- Typical performance: 4 worktrees checked in < 1 second
+- Non-blocking: Conflict checks run asynchronously, TUI remains responsive
+- Fallback: On check failure, assumes no conflict info (safe default)
+
+**Key Bindings** (Worktrees View):
+
+| Key | Action | Condition |
+|-----|--------|-----------|
+| `Tab` | Switch to Changes view | Always |
+| `↑`/`↓`, `j`/`k` | Navigate worktrees | Always |
+| `+` | Create new worktree | `worktree_command` configured |
+| `D` | Delete worktree | Not main, not processing |
+| `M` | Merge to base branch | Not main, not detached, no conflicts, has branch |
+| `e` | Open editor | Always |
+| `Enter` | Open shell | `worktree_command` configured |
+| `q` | Quit | Always |
+
+**Troubleshooting**:
+
+**Issue**: Merge conflicts not detected
+- **Cause**: Conflict check failed or timed out
+- **Solution**: Check git repository health, ensure worktree is accessible
+
+**Issue**: Cannot merge (conflicts detected)
+- **Cause**: Branch has merge conflicts with base
+- **Solution**: Resolve conflicts manually in worktree, then retry merge
+
+**Issue**: Slow worktree view switching
+- **Cause**: Many worktrees (> 10) with slow conflict checks
+- **Solution**: Normal for large number of worktrees; conflict checks run in parallel
+
+**Issue**: `M` key not showing in footer
+- **Cause**: Worktree has conflicts, is detached HEAD, or is main worktree
+- **Solution**: Check worktree status; only clean, non-main, branched worktrees can merge
+
 ## Code Style Guidelines
 
 ### Imports

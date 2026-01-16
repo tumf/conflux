@@ -248,6 +248,205 @@ pub async fn worktree_remove<P: AsRef<Path>>(cwd: P, worktree_path: &str) -> Vcs
     Ok(())
 }
 
+/// List all worktrees with detailed information.
+///
+/// Parses the porcelain format output from `git worktree list --porcelain`.
+/// Returns a Vec of tuples: (path, head, branch, is_detached, is_main)
+pub async fn list_worktrees<P: AsRef<Path>>(
+    cwd: P,
+) -> VcsResult<Vec<(String, String, String, bool, bool)>> {
+    let output = run_git(&["worktree", "list", "--porcelain"], &cwd).await?;
+
+    let mut worktrees = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut current_head: Option<String> = None;
+    let mut current_branch: Option<String> = None;
+    let mut is_detached = false;
+    let mut is_first = true; // First worktree is always the main one
+
+    for line in output.lines() {
+        let line = line.trim();
+
+        if line.is_empty() {
+            // Empty line signals end of current worktree entry
+            if let (Some(path), Some(head)) = (current_path.take(), current_head.take()) {
+                let branch = current_branch.take().unwrap_or_default();
+                worktrees.push((path, head, branch, is_detached, is_first));
+                is_first = false;
+                is_detached = false;
+            }
+        } else if let Some(stripped) = line.strip_prefix("worktree ") {
+            current_path = Some(stripped.to_string());
+        } else if let Some(stripped) = line.strip_prefix("HEAD ") {
+            current_head = Some(stripped.to_string());
+        } else if let Some(stripped) = line.strip_prefix("branch ") {
+            current_branch = Some(stripped.trim_start_matches("refs/heads/").to_string());
+        } else if line == "detached" {
+            is_detached = true;
+        }
+    }
+
+    // Handle the last entry if there's no trailing newline
+    if let (Some(path), Some(head)) = (current_path, current_head) {
+        let branch = current_branch.unwrap_or_default();
+        worktrees.push((path, head, branch, is_detached, is_first));
+    }
+
+    Ok(worktrees)
+}
+
+/// Check if the working directory is clean (no uncommitted changes).
+///
+/// Returns true if working directory is clean, false otherwise.
+pub async fn is_working_directory_clean<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
+    let output = run_git(&["status", "--porcelain"], cwd).await?;
+    Ok(output.trim().is_empty())
+}
+
+#[allow(dead_code)]
+/// Check for merge conflicts by attempting a test merge.
+///
+/// Performs a `git merge --no-commit --no-ff <branch>` to detect potential conflicts.
+/// Aborts the merge immediately after checking, leaving the working directory clean.
+/// Returns Ok(Some(conflict_files)) if conflicts are detected, Ok(None) if no conflicts.
+pub async fn check_merge_conflicts<P: AsRef<Path>>(
+    cwd: P,
+    branch_name: &str,
+) -> VcsResult<Option<Vec<String>>> {
+    let cwd = cwd.as_ref();
+
+    // Attempt test merge without commit
+    let output = Command::new("git")
+        .args(["merge", "--no-commit", "--no-ff", branch_name])
+        .current_dir(cwd)
+        .output()
+        .await
+        .map_err(|e| VcsError::git_command(e.to_string()))?;
+
+    // Check if merge succeeded
+    if output.status.success() {
+        // Merge would succeed - abort and return no conflicts
+        let _ = run_git(&["merge", "--abort"], cwd).await;
+        return Ok(None);
+    }
+
+    // Parse stderr to detect conflicts
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if stderr.contains("CONFLICT") {
+        // Extract conflict files
+        let conflict_files = parse_conflict_files(&stderr);
+
+        // Abort the merge
+        let _ = run_git(&["merge", "--abort"], cwd).await;
+
+        Ok(Some(conflict_files))
+    } else {
+        // Other error (not a conflict)
+        // Attempt to abort anyway
+        let _ = run_git(&["merge", "--abort"], cwd).await;
+
+        Err(VcsError::git_command(format!(
+            "Merge test failed (not a conflict): {}",
+            stderr
+        )))
+    }
+}
+
+/// Parse conflict files from git merge output.
+///
+/// Extracts file paths from lines like "CONFLICT (content): Merge conflict in src/main.rs"
+fn parse_conflict_files(stderr: &str) -> Vec<String> {
+    let mut files = Vec::new();
+
+    for line in stderr.lines() {
+        if line.contains("CONFLICT") {
+            // Extract filename from patterns like:
+            // "CONFLICT (content): Merge conflict in <file>"
+            // "CONFLICT (modify/delete): <file> deleted in ..."
+            // "CONFLICT (rename/rename): Rename <file1>-><file2> ..."
+
+            if let Some(idx) = line.find(" in ") {
+                // "CONFLICT (content): Merge conflict in <file>"
+                let file = line[idx + 4..].trim();
+                files.push(file.to_string());
+            } else if line.contains("deleted in") || line.contains("added in") {
+                // "CONFLICT (modify/delete): <file> deleted in ..."
+                if let Some(start) = line.find("): ") {
+                    let rest = &line[start + 3..];
+                    if let Some(end) = rest.find(" deleted") {
+                        files.push(rest[..end].trim().to_string());
+                    } else if let Some(end) = rest.find(" added") {
+                        files.push(rest[..end].trim().to_string());
+                    }
+                }
+            } else if line.contains("Rename") {
+                // "CONFLICT (rename/rename): Rename <file1>-><file2> ..."
+                if let Some(start) = line.find("Rename ") {
+                    let rest = &line[start + 7..];
+                    if let Some(end) = rest.find("->") {
+                        let file1 = rest[..end].trim();
+                        files.push(file1.to_string());
+                        // Also add the target file
+                        let after_arrow = &rest[end + 2..];
+                        if let Some(space_idx) = after_arrow.find(' ') {
+                            let file2 = after_arrow[..space_idx].trim();
+                            files.push(file2.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    files
+}
+
+/// Merge a branch into the current branch.
+///
+/// Performs `git merge --no-ff --no-edit <branch>` to merge the specified branch.
+/// Checks for a clean working directory first. If merge conflicts occur, aborts the merge.
+/// Returns Ok(()) on successful merge, Err() on conflict or other errors.
+pub async fn merge_branch<P: AsRef<Path>>(cwd: P, branch_name: &str) -> VcsResult<()> {
+    let cwd = cwd.as_ref();
+
+    // Check working directory is clean
+    if !is_working_directory_clean(cwd).await? {
+        return Err(VcsError::git_command(
+            "Working directory is not clean. Commit or stash changes before merging.".to_string(),
+        ));
+    }
+
+    // Perform the merge
+    let output = Command::new("git")
+        .args(["merge", "--no-ff", "--no-edit", branch_name])
+        .current_dir(cwd)
+        .output()
+        .await
+        .map_err(|e| VcsError::git_command(e.to_string()))?;
+
+    if output.status.success() {
+        debug!("Merged branch {} successfully", branch_name);
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Check if it's a conflict
+        if stderr.contains("CONFLICT") {
+            // Abort the merge
+            let _ = run_git(&["merge", "--abort"], cwd).await;
+
+            Err(VcsError::git_command(format!(
+                "Merge conflict detected. Merge aborted. Files: {}",
+                parse_conflict_files(&stderr).join(", ")
+            )))
+        } else {
+            // Other error
+            Err(VcsError::git_command(format!("Merge failed: {}", stderr)))
+        }
+    }
+}
+
 /// Delete a branch.
 pub async fn branch_delete<P: AsRef<Path>>(cwd: P, branch_name: &str) -> VcsResult<()> {
     debug!("Deleting branch {}", branch_name);
@@ -968,5 +1167,128 @@ mod tests {
             changes,
             vec!["change-a".to_string(), "change-b".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_worktrees() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let init_result = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init_result.is_err() {
+            return; // Skip if git not available
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create initial commit
+        std::fs::write(temp_dir.path().join("README.md"), "test").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create a worktree
+        let worktree_path = temp_dir.path().join("worktree1");
+        let _ = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "-b",
+                "feature-branch",
+                "HEAD",
+            ])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // List worktrees
+        let worktrees = list_worktrees(temp_dir.path()).await.unwrap();
+
+        assert_eq!(worktrees.len(), 2);
+
+        // First worktree is the main one
+        let (_path0, _head0, branch0, detached0, is_main0) = &worktrees[0];
+        assert_eq!(branch0, "main");
+        assert!(!detached0);
+        assert!(is_main0);
+
+        // Second worktree is the feature branch
+        let (_path1, _head1, branch1, detached1, is_main1) = &worktrees[1];
+        assert_eq!(branch1, "feature-branch");
+        assert!(!detached1);
+        assert!(!is_main1);
+    }
+
+    #[tokio::test]
+    async fn test_is_working_directory_clean() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let init_result = Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init_result.is_err() {
+            return;
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Initially clean (no commits yet, but no uncommitted changes either)
+        let _is_clean = is_working_directory_clean(temp_dir.path()).await.unwrap();
+        // Actually, empty repo with no commits shows untracked files, so not clean
+
+        // Create initial commit
+        std::fs::write(temp_dir.path().join("README.md"), "test").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Should be clean now
+        let is_clean = is_working_directory_clean(temp_dir.path()).await.unwrap();
+        assert!(is_clean);
+
+        // Add a file but don't commit
+        std::fs::write(temp_dir.path().join("test.txt"), "test").unwrap();
+        let is_clean = is_working_directory_clean(temp_dir.path()).await.unwrap();
+        assert!(!is_clean);
     }
 }

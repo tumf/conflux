@@ -9,6 +9,8 @@ pub use crate::events::{ExecutionEvent, LogEntry};
 // Alias for backward compatibility
 pub type OrchestratorEvent = ExecutionEvent;
 
+use std::path::PathBuf;
+
 /// Commands sent from TUI to orchestrator
 #[derive(Debug, Clone)]
 pub enum TuiCommand {
@@ -26,7 +28,15 @@ pub enum TuiCommand {
     #[allow(dead_code)]
     Stop,
     /// Delete worktrees associated with a change
+    #[allow(dead_code)]
     DeleteWorktree(String),
+    /// Delete a worktree by path (from worktree view)
+    DeleteWorktreeByPath(PathBuf),
     /// Resolve a deferred merge for a change
     ResolveMerge(String),
+    /// Merge a worktree branch into the base branch
+    MergeWorktreeBranch {
+        worktree_path: PathBuf,
+        branch_name: String,
+    },
 }
