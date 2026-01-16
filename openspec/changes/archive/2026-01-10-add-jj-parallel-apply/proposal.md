@@ -2,7 +2,7 @@
 
 ## Why
 
-Currently, `openspec-orchestrator` processes changes sequentially, which is inefficient when multiple independent changes could be applied in parallel. Using jj (Jujutsu) workspaces, we can execute independent changes concurrently in isolated environments, then merge the results back together.
+Currently, `cflx` processes changes sequentially, which is inefficient when multiple independent changes could be applied in parallel. Using jj (Jujutsu) workspaces, we can execute independent changes concurrently in isolated environments, then merge the results back together.
 
 ## What Changes
 

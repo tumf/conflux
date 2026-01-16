@@ -15,6 +15,6 @@
 
 - [x] 3.1 `cargo build` で正常にビルドできることを確認
 - [x] 3.2 `cargo clippy` でリントエラーがないことを確認
-- [x] 3.3 `openspec-orchestrator --help` でサブコマンド一覧が表示されることを確認
-- [x] 3.4 `openspec-orchestrator run --help` で run オプションが表示されることを確認
+- [x] 3.3 `cflx --help` でサブコマンド一覧が表示されることを確認
+- [x] 3.4 `cflx run --help` で run オプションが表示されることを確認
 - [x] 3.5 既存のテストが通ることを確認（`cargo test`）

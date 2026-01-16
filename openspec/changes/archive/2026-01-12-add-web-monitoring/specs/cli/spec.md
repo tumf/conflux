@@ -35,7 +35,7 @@ The CLI SHALL support flags to enable and configure web-based monitoring.
 - **AND** TUI shows web server URL (e.g., "Web monitoring: http://127.0.0.1:8080")
 
 #### Scenario: Web monitoring in run mode
-- **WHEN** user runs `openspec-orchestrator run --web`
+- **WHEN** user runs `cflx run --web`
 - **THEN** HTTP server starts before orchestration begins
 - **AND** server URL is logged to console
 - **AND** orchestration proceeds normally

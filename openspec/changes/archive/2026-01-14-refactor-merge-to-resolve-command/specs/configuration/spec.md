@@ -13,7 +13,7 @@
 
 #### Scenario: プロジェクト設定ファイルで hooks を設定
 
-- **WHEN** `.openspec-orchestrator.jsonc` に以下の設定が存在する:
+- **WHEN** `.cflx.jsonc` に以下の設定が存在する:
   ```jsonc
   {
     "hooks": {

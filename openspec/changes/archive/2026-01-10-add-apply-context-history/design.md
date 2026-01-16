@@ -200,7 +200,7 @@ if !output.status.success() {
 
 ## Configuration (Future Enhancement)
 
-Could add to `.openspec-orchestrator.jsonc`:
+Could add to `.cflx.jsonc`:
 
 ```jsonc
 {

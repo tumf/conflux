@@ -17,7 +17,7 @@ Add a `max_iterations` configuration option that limits the number of apply loop
 
 ## Key Features
 
-1. **Configuration Option**: `max_iterations` in `.openspec-orchestrator.jsonc`
+1. **Configuration Option**: `max_iterations` in `.cflx.jsonc`
 2. **Default Value**: 50 iterations
 3. **Graceful Stop**: When limit reached, finish with `iteration_limit` status
 4. **Hook Support**: `on_finish` hook receives `iteration_limit` status

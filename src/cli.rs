@@ -5,7 +5,7 @@ use tracing::debug;
 
 /// OpenSpec Orchestrator - Automate OpenSpec workflow
 #[derive(Parser, Debug)]
-#[command(name = "openspec-orchestrator")]
+#[command(name = "cflx")]
 #[command(version)]
 #[command(about = "Automates OpenSpec change workflow (list → apply → archive)", long_about = None)]
 pub struct Cli {
@@ -231,7 +231,7 @@ mod tests {
         env::remove_var("OPENSPEC_CMD");
 
         // When neither CLI arg nor env var is set, default value is used
-        let cli = Cli::parse_from(["openspec-orchestrator"]);
+        let cli = Cli::parse_from(["cflx"]);
 
         // Restore original env value
         if let Some(val) = original {
@@ -244,19 +244,14 @@ mod tests {
     #[test]
     fn test_cli_arg_openspec_cmd() {
         // CLI argument should override default
-        let cli = Cli::parse_from(["openspec-orchestrator", "--openspec-cmd", "./my-openspec"]);
+        let cli = Cli::parse_from(["cflx", "--openspec-cmd", "./my-openspec"]);
         assert_eq!(cli.openspec_cmd, "./my-openspec");
     }
 
     #[test]
     fn test_run_subcommand_openspec_cmd() {
         // Run subcommand should also accept --openspec-cmd
-        let cli = Cli::parse_from([
-            "openspec-orchestrator",
-            "run",
-            "--openspec-cmd",
-            "/usr/local/bin/openspec",
-        ]);
+        let cli = Cli::parse_from(["cflx", "run", "--openspec-cmd", "/usr/local/bin/openspec"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -269,12 +264,7 @@ mod tests {
     #[test]
     fn test_tui_subcommand_openspec_cmd() {
         // TUI subcommand should also accept --openspec-cmd
-        let cli = Cli::parse_from([
-            "openspec-orchestrator",
-            "tui",
-            "--openspec-cmd",
-            "/custom/openspec",
-        ]);
+        let cli = Cli::parse_from(["cflx", "tui", "--openspec-cmd", "/custom/openspec"]);
 
         match cli.command {
             Some(Commands::Tui(args)) => {
@@ -295,7 +285,7 @@ mod tests {
 
         // Parse CLI without --openspec-cmd argument
         // Note: clap caches env vars at parse time
-        let cli = Cli::try_parse_from(["openspec-orchestrator"]);
+        let cli = Cli::try_parse_from(["cflx"]);
 
         // Restore original env value
         if let Some(val) = original {
@@ -319,8 +309,7 @@ mod tests {
         env::set_var("OPENSPEC_CMD", "/env/openspec");
 
         // Parse CLI with --openspec-cmd argument
-        let cli =
-            Cli::try_parse_from(["openspec-orchestrator", "--openspec-cmd", "./cli-openspec"]);
+        let cli = Cli::try_parse_from(["cflx", "--openspec-cmd", "./cli-openspec"]);
 
         // Restore original env value
         if let Some(val) = original {
@@ -336,12 +325,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_config_option() {
-        let cli = Cli::parse_from([
-            "openspec-orchestrator",
-            "run",
-            "--config",
-            "/path/to/config.jsonc",
-        ]);
+        let cli = Cli::parse_from(["cflx", "run", "--config", "/path/to/config.jsonc"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -353,7 +337,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_change_option() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--change", "add-feature-x"]);
+        let cli = Cli::parse_from(["cflx", "run", "--change", "add-feature-x"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -365,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_multiple_changes_comma_separated() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--change", "a,b,c"]);
+        let cli = Cli::parse_from(["cflx", "run", "--change", "a,b,c"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -381,7 +365,7 @@ mod tests {
     #[test]
     fn test_run_subcommand_multiple_changes_with_spaces() {
         // Test that spaces around commas are handled
-        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--change", "a, b, c"]);
+        let cli = Cli::parse_from(["cflx", "run", "--change", "a, b, c"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -396,7 +380,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_no_change_option() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "run"]);
+        let cli = Cli::parse_from(["cflx", "run"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -408,19 +392,14 @@ mod tests {
 
     #[test]
     fn test_no_subcommand() {
-        let cli = Cli::parse_from(["openspec-orchestrator"]);
+        let cli = Cli::parse_from(["cflx"]);
         assert!(cli.command.is_none());
     }
 
     #[test]
     fn test_global_openspec_cmd_available_to_subcommands() {
         // Global flag should be available even with subcommand
-        let cli = Cli::parse_from([
-            "openspec-orchestrator",
-            "--openspec-cmd",
-            "/global/openspec",
-            "run",
-        ]);
+        let cli = Cli::parse_from(["cflx", "--openspec-cmd", "/global/openspec", "run"]);
 
         // The global --openspec-cmd is parsed at the Cli level
         assert_eq!(cli.openspec_cmd, "/global/openspec");
@@ -428,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_init_subcommand_default_template() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "init"]);
+        let cli = Cli::parse_from(["cflx", "init"]);
 
         match cli.command {
             Some(Commands::Init(args)) => {
@@ -441,7 +420,7 @@ mod tests {
 
     #[test]
     fn test_init_subcommand_opencode_template() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "init", "--template", "opencode"]);
+        let cli = Cli::parse_from(["cflx", "init", "--template", "opencode"]);
 
         match cli.command {
             Some(Commands::Init(args)) => {
@@ -453,7 +432,7 @@ mod tests {
 
     #[test]
     fn test_init_subcommand_claude_template() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "init", "--template", "claude"]);
+        let cli = Cli::parse_from(["cflx", "init", "--template", "claude"]);
 
         match cli.command {
             Some(Commands::Init(args)) => {
@@ -465,7 +444,7 @@ mod tests {
 
     #[test]
     fn test_init_subcommand_codex_template() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "init", "--template", "codex"]);
+        let cli = Cli::parse_from(["cflx", "init", "--template", "codex"]);
 
         match cli.command {
             Some(Commands::Init(args)) => {
@@ -477,7 +456,7 @@ mod tests {
 
     #[test]
     fn test_init_subcommand_short_template_flag() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "init", "-t", "opencode"]);
+        let cli = Cli::parse_from(["cflx", "init", "-t", "opencode"]);
 
         match cli.command {
             Some(Commands::Init(args)) => {
@@ -489,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_init_subcommand_force_flag() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "init", "--force"]);
+        let cli = Cli::parse_from(["cflx", "init", "--force"]);
 
         match cli.command {
             Some(Commands::Init(args)) => {
@@ -501,7 +480,7 @@ mod tests {
 
     #[test]
     fn test_init_subcommand_short_force_flag() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "init", "-f"]);
+        let cli = Cli::parse_from(["cflx", "init", "-f"]);
 
         match cli.command {
             Some(Commands::Init(args)) => {
@@ -514,7 +493,7 @@ mod tests {
     #[test]
     fn test_version_flag_exits_with_display_version() {
         // --version flag should cause parse to return an error (DisplayVersion)
-        let result = Cli::try_parse_from(["openspec-orchestrator", "--version"]);
+        let result = Cli::try_parse_from(["cflx", "--version"]);
         assert!(result.is_err());
 
         let err = result.unwrap_err();
@@ -525,7 +504,7 @@ mod tests {
     #[test]
     fn test_short_version_flag() {
         // -V flag should also display version
-        let result = Cli::try_parse_from(["openspec-orchestrator", "-V"]);
+        let result = Cli::try_parse_from(["cflx", "-V"]);
         assert!(result.is_err());
 
         let err = result.unwrap_err();
@@ -534,7 +513,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_max_iterations_default() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "run"]);
+        let cli = Cli::parse_from(["cflx", "run"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -546,7 +525,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_max_iterations_custom() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--max-iterations", "100"]);
+        let cli = Cli::parse_from(["cflx", "run", "--max-iterations", "100"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -558,7 +537,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_max_iterations_zero() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--max-iterations", "0"]);
+        let cli = Cli::parse_from(["cflx", "run", "--max-iterations", "0"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -570,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_parallel_flag_default() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "run"]);
+        let cli = Cli::parse_from(["cflx", "run"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -584,7 +563,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_parallel_flag_enabled() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--parallel"]);
+        let cli = Cli::parse_from(["cflx", "run", "--parallel"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -596,13 +575,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_max_concurrent() {
-        let cli = Cli::parse_from([
-            "openspec-orchestrator",
-            "run",
-            "--parallel",
-            "--max-concurrent",
-            "5",
-        ]);
+        let cli = Cli::parse_from(["cflx", "run", "--parallel", "--max-concurrent", "5"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -615,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_dry_run() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--parallel", "--dry-run"]);
+        let cli = Cli::parse_from(["cflx", "run", "--parallel", "--dry-run"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -628,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_tui_subcommand_logs_option() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "tui", "--logs", "debug.log"]);
+        let cli = Cli::parse_from(["cflx", "tui", "--logs", "debug.log"]);
 
         match cli.command {
             Some(Commands::Tui(args)) => {
@@ -640,7 +613,7 @@ mod tests {
 
     #[test]
     fn test_tui_subcommand_no_logs_option() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "tui"]);
+        let cli = Cli::parse_from(["cflx", "tui"]);
 
         match cli.command {
             Some(Commands::Tui(args)) => {
@@ -652,7 +625,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_web_port_default_auto_assign() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "run", "--web"]);
+        let cli = Cli::parse_from(["cflx", "run", "--web"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -666,13 +639,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_web_port_explicit() {
-        let cli = Cli::parse_from([
-            "openspec-orchestrator",
-            "run",
-            "--web",
-            "--web-port",
-            "9000",
-        ]);
+        let cli = Cli::parse_from(["cflx", "run", "--web", "--web-port", "9000"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -685,7 +652,7 @@ mod tests {
 
     #[test]
     fn test_tui_subcommand_web_port_default_auto_assign() {
-        let cli = Cli::parse_from(["openspec-orchestrator", "tui", "--web"]);
+        let cli = Cli::parse_from(["cflx", "tui", "--web"]);
 
         match cli.command {
             Some(Commands::Tui(args)) => {

@@ -314,6 +314,7 @@ fn build_parallel_hook_context(
 pub async fn execute_apply_in_workspace(
     change_id: &str,
     workspace_path: &Path,
+    repo_root: &Path,
     apply_cmd_template: &str,
     config: &OrchestratorConfig,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
@@ -459,21 +460,22 @@ pub async fn execute_apply_in_workspace(
         let command = OrchestratorConfig::expand_change_id(apply_cmd_template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
         debug!("Workspace path: {:?}", workspace_path);
+        debug!("Repository root: {:?}", repo_root);
         debug!("Apply command: {}", command);
 
-        // Execute command in workspace directory (worktree root = repository copy)
-        // The AI agent works within the isolated worktree at repository root level
+        // Execute command in repository root (not workspace directory)
+        // This allows the AI agent to access the full repository structure
         // Use null stdin to prevent any interactive behavior
         use tokio::io::{AsyncBufReadExt, BufReader};
 
         debug!(
             module = module_path!(),
-            "Executing shell command: sh -c {} (cwd: {:?})", command, workspace_path
+            "Executing shell command: sh -c {} (cwd: {:?})", command, repo_root
         );
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(&command)
-            .current_dir(workspace_path)
+            .current_dir(repo_root)
             .stdin(StdStdio::null())
             .stdout(StdStdio::piped())
             .stderr(StdStdio::piped())
@@ -498,7 +500,6 @@ pub async fn execute_apply_in_workspace(
                         .send(ParallelEvent::ApplyOutput {
                             change_id: change_id_for_stdout.clone(),
                             output: line,
-                            iteration: Some(iteration),
                         })
                         .await;
                 }
@@ -515,7 +516,6 @@ pub async fn execute_apply_in_workspace(
                         .send(ParallelEvent::ApplyOutput {
                             change_id: change_id_for_stderr.clone(),
                             output: line,
-                            iteration: Some(iteration),
                         })
                         .await;
                 }
@@ -532,18 +532,11 @@ pub async fn execute_apply_in_workspace(
             .await
             .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to wait: {}", e)))?;
 
-        // Note: Retry logic is now handled by CommandQueue.
-        // If command fails, the iteration loop will naturally retry via MAX_ITERATIONS.
-        // Short-lived crashes are expected to be handled by the iteration loop itself,
-        // as each iteration is a fresh apply attempt.
         if !status.success() {
-            warn!(
-                "Apply command failed (iteration {}), exit code: {:?}",
-                iteration,
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Apply command failed with exit code: {:?}",
                 status.code()
-            );
-            // Don't return error immediately - let the iteration loop handle retries
-            // by continuing to check progress and potentially trying again
+            )));
         }
 
         // Git worktrees already reflect working copy changes for task progress.
@@ -786,6 +779,7 @@ pub async fn execute_apply_in_workspace(
 pub async fn execute_archive_in_workspace(
     change_id: &str,
     workspace_path: &Path,
+    repo_root: &Path,
     archive_cmd_template: &str,
     config: &OrchestratorConfig,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
@@ -914,12 +908,12 @@ pub async fn execute_archive_in_workspace(
 
         debug!(
             "Executing shell command: sh -c {} (cwd: {:?})",
-            command, workspace_path
+            command, repo_root
         );
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(&command)
-            .current_dir(workspace_path)
+            .current_dir(repo_root)
             .stdin(StdStdio::null())
             .stdout(StdStdio::piped())
             .stderr(StdStdio::piped())
@@ -979,15 +973,11 @@ pub async fn execute_archive_in_workspace(
             OrchestratorError::AgentCommand(format!("Archive command failed: {}", e))
         })?;
 
-        // Note: Retry logic is now unified in CommandQueue.
-        // Archive failures are handled by the verification loop below.
         if !status.success() {
-            warn!(
-                "Archive command failed (attempt {}), exit code: {:?}",
-                attempt,
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Archive command failed with exit code: {:?}",
                 status.code()
-            );
-            // Continue to verification - the loop will retry if verification fails
+            )));
         }
 
         if is_git_repo {

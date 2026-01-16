@@ -1,4 +1,4 @@
-# Release workflow for openspec-orchestrator
+# Release workflow for Conflux
 # Triggered by version tags (v*.*.*)
 # Uses cargo-dist for cross-platform binary builds
 
@@ -144,7 +144,7 @@ jobs:
           # openspec installer script
           set -e
 
-          REPO="tumf/openspec-orchestrator"
+          REPO="tumf/conflux"
           BINARY="openspec"
 
           # Detect OS and architecture
@@ -190,7 +190,7 @@ jobs:
           # openspec installer script for Windows
           $ErrorActionPreference = "Stop"
 
-          $Repo = "tumf/openspec-orchestrator"
+          $Repo = "tumf/conflux"
           $Binary = "openspec"
           $Target = "x86_64-pc-windows-msvc"
 
@@ -290,28 +290,28 @@ jobs:
           cat > openspec.rb << FORMULA
           class Openspec < Formula
             desc "OpenSpec orchestrator for AI-assisted development workflows"
-            homepage "https://github.com/tumf/openspec-orchestrator"
+            homepage "https://github.com/tumf/conflux"
             version "${VERSION}"
             license "MIT"
 
             on_macos do
               on_arm do
-                url "https://github.com/tumf/openspec-orchestrator/releases/download/${TAG}/openspec-${TAG}-aarch64-apple-darwin.tar.gz"
+                url "https://github.com/tumf/conflux/releases/download/${TAG}/openspec-${TAG}-aarch64-apple-darwin.tar.gz"
                 sha256 "${DARWIN_ARM64_SHA}"
               end
               on_intel do
-                url "https://github.com/tumf/openspec-orchestrator/releases/download/${TAG}/openspec-${TAG}-x86_64-apple-darwin.tar.gz"
+                url "https://github.com/tumf/conflux/releases/download/${TAG}/openspec-${TAG}-x86_64-apple-darwin.tar.gz"
                 sha256 "${DARWIN_X64_SHA}"
               end
             end
 
             on_linux do
               on_arm do
-                url "https://github.com/tumf/openspec-orchestrator/releases/download/${TAG}/openspec-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/tumf/conflux/releases/download/${TAG}/openspec-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
                 sha256 "${LINUX_ARM64_SHA}"
               end
               on_intel do
-                url "https://github.com/tumf/openspec-orchestrator/releases/download/${TAG}/openspec-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/tumf/conflux/releases/download/${TAG}/openspec-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
                 sha256 "${LINUX_X64_SHA}"
               end
             end

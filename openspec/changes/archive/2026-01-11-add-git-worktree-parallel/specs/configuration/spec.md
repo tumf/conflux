@@ -6,7 +6,7 @@
 
 #### Scenario: Configure VCS backend in config file
 
-- **WHEN** `.openspec-orchestrator.jsonc` に以下が設定されている:
+- **WHEN** `.cflx.jsonc` に以下が設定されている:
   ```jsonc
   {
     "vcs_backend": "git"
@@ -39,7 +39,7 @@
 
 #### Scenario: Template includes VCS configuration
 
-- **WHEN** `openspec-orchestrator init` が実行される
+- **WHEN** `cflx init` が実行される
 - **THEN** 生成される設定ファイルに以下のコメント付き設定が含まれる:
   ```jsonc
   {

@@ -4,7 +4,7 @@
 
 The current implementation relies on `openspec list --json` to get task progress (`completedTasks`/`totalTasks`). However, OpenSpec CLI has a bug where numbered task lists (e.g., `1. [x] Task`) are not recognized - only bullet lists (`- [x] Task`) work. This is a known issue ([OpenSpec Issue #354](https://github.com/Fission-AI/OpenSpec/issues/354)).
 
-To make openspec-orchestrator independent of this upstream bug and provide more reliable task progress information, we should implement native `tasks.md` parsing in Rust.
+To make cflx independent of this upstream bug and provide more reliable task progress information, we should implement native `tasks.md` parsing in Rust.
 
 ## What Changes
 

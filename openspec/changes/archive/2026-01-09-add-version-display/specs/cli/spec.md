@@ -7,12 +7,12 @@
 The CLI SHALL support a `--version` flag to display the application version.
 
 #### Scenario: Display version with --version flag
-- **WHEN** user runs `openspec-orchestrator --version`
+- **WHEN** user runs `cflx --version`
 - **THEN** the application version from Cargo.toml is displayed
 - **AND** the program exits with code 0
 
 #### Scenario: Display version with -V short flag
-- **WHEN** user runs `openspec-orchestrator -V`
+- **WHEN** user runs `cflx -V`
 - **THEN** the application version is displayed (same as `--version`)
 
 ### Requirement: TUI Footer Version Display

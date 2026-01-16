@@ -17,7 +17,7 @@
 
 ## Configuration
 - JSONC format for config files (supports comments and trailing commas)
-- Config file: `.openspec-orchestrator.jsonc`
+- Config file: `.cflx.jsonc`
 
 ## Project Organization
 - Specifications in `openspec/specs/`

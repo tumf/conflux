@@ -100,7 +100,7 @@ targets = [
 ## File Structure
 
 ```
-openspec-orchestrator/
+cflx/
 ├── .github/
 │   └── workflows/
 │       └── release.yml          # GitHub Actions workflow
