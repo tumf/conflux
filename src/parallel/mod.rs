@@ -687,7 +687,7 @@ impl ParallelExecutor {
             let (workspace, resumed) = match workspace {
                 Some(ws) => {
                     // Track workspace in cleanup guard before adding to list
-                    cleanup_guard.track(ws.name.clone());
+                    cleanup_guard.track(ws.name.clone(), ws.path.clone());
 
                     send_event(
                         &self.event_tx,
@@ -716,7 +716,7 @@ impl ParallelExecutor {
                     {
                         Ok(ws) => {
                             // Track workspace in cleanup guard before adding to list
-                            cleanup_guard.track(ws.name.clone());
+                            cleanup_guard.track(ws.name.clone(), ws.path.clone());
 
                             send_event(
                                 &self.event_tx,
@@ -1017,6 +1017,7 @@ impl ParallelExecutor {
                 info!(
                     "To resume: run with the same change_id, workspace will be automatically detected"
                 );
+                cleanup_guard.preserve(&result.workspace_name);
             }
             // Emit WorkspacePreserved event
             send_event(
