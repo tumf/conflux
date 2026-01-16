@@ -16,6 +16,7 @@ TUIの選択モードで `e` キーを押すと、カーソル位置のchangeの
 - **THEN** TUIが一時停止する
 - **AND** `$EDITOR` 環境変数で指定されたエディタが起動する
 - **AND** エディタに `openspec/changes/{change_id}/proposal.md` のパスが引数として渡される
+- **AND** ログに "Launching editor: {editor} (file: openspec/changes/{change_id}/proposal.md)" が記録される
 
 #### Scenario: proposal.mdが存在しない場合のディレクトリフォールバック
 
@@ -28,6 +29,7 @@ TUIの選択モードで `e` キーを押すと、カーソル位置のchangeの
 - **AND** `$EDITOR` 環境変数で指定されたエディタが起動する
 - **AND** 作業ディレクトリが `openspec/changes/{change_id}/` に設定される
 - **AND** エディタに `.` が引数として渡される
+- **AND** ログに "Launching editor: {editor} (cwd: openspec/changes/{change_id}/)" が記録される
 
 #### Scenario: エディタ終了後のTUI復帰
 
@@ -49,6 +51,23 @@ TUIの選択モードで `e` キーを押すと、カーソル位置のchangeの
 - **GIVEN** TUIがErrorモードである
 - **WHEN** ユーザーが `e` キーを押す
 - **THEN** エディタは起動しない
+
+#### Scenario: changeディレクトリが存在しない場合のエラー
+
+- **GIVEN** TUIが選択モードである
+- **AND** カーソル位置のchangeディレクトリが存在しない
+- **AND** `proposal.md`ファイルも存在しない
+- **WHEN** ユーザーが `e` キーを押す
+- **THEN** エラーログ "Change not found: {change_id}" が表示される
+- **AND** TUIは正常に動作を継続する
+
+#### Scenario: エディタプロセス起動失敗
+
+- **GIVEN** `$EDITOR` で指定されたコマンドが存在しない
+- **WHEN** ユーザーが `e` キーを押す
+- **THEN** エラーログ "Failed to launch editor" が表示される
+- **AND** TUIが復帰する
+- **AND** TUIは正常に動作を継続する
 
 ### Requirement: EDITOR環境変数
 
@@ -219,3 +238,4 @@ The TUI SHALL detect git availability at startup and cache the result.
 - **THEN** git_available flag is set to false
 - **AND** parallel mode features are hidden
 - **AND** no error is displayed (silent degradation)
+

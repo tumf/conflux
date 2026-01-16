@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 /// Represents a Git worktree for parallel execution
@@ -53,8 +54,8 @@ pub struct GitWorkspaceManager {
     workspaces: Vec<GitWorkspace>,
     /// Maximum concurrent workspaces
     max_concurrent: usize,
-    /// Original branch name to return to after operations
-    original_branch: Option<String>,
+    /// Original branch name to return to after operations (with interior mutability)
+    original_branch: Mutex<Option<String>>,
 }
 
 impl GitWorkspaceManager {
@@ -70,7 +71,7 @@ impl GitWorkspaceManager {
             repo_root,
             workspaces: Vec::new(),
             max_concurrent,
-            original_branch: None,
+            original_branch: Mutex::new(None),
         }
     }
 
@@ -118,21 +119,28 @@ impl GitWorkspaceManager {
         commands::get_current_commit(&self.repo_root).await
     }
 
-    /// Create a new worktree for a change from a specific base commit
-    pub async fn create_worktree(
-        &mut self,
-        change_id: &str,
-        base_commit: Option<&str>,
-    ) -> VcsResult<GitWorkspace> {
-        // Store original branch if not already stored
-        if self.original_branch.is_none() {
-            self.original_branch = match commands::get_current_branch(&self.repo_root).await? {
+    /// Ensure the original branch is initialized (with interior mutability)
+    pub async fn ensure_original_branch(&self) -> VcsResult<()> {
+        let mut branch_guard = self.original_branch.lock().await;
+        if branch_guard.is_none() {
+            *branch_guard = match commands::get_current_branch(&self.repo_root).await? {
                 Some(branch) => Some(branch),
                 None => return Err(VcsError::git_command(
                     "Detached HEAD state detected. Checkout a branch before running parallel mode.",
                 )),
             };
         }
+        Ok(())
+    }
+
+    /// Create a new worktree for a change from a specific base commit
+    pub async fn create_worktree(
+        &mut self,
+        change_id: &str,
+        base_commit: Option<&str>,
+    ) -> VcsResult<GitWorkspace> {
+        // Ensure original branch is initialized
+        self.ensure_original_branch().await?;
 
         // Use change_id directly as branch name (sanitized)
         let branch_name = change_id.replace(['/', '\\', ' '], "-");
@@ -198,12 +206,21 @@ impl GitWorkspaceManager {
             return Err(VcsError::git_command("No branches to merge"));
         }
 
-        // Determine the target for merge
-        let original = self.original_branch.as_deref().unwrap_or("main");
+        // Ensure original branch is initialized
+        self.ensure_original_branch().await?;
+
+        // Determine the target for merge (clone to avoid holding the lock)
+        let original = self
+            .original_branch
+            .lock()
+            .await
+            .as_ref()
+            .ok_or_else(|| VcsError::git_command("Original branch not initialized"))?
+            .clone();
 
         // Always merge into the original branch
         info!("Checking out original branch '{}' for merge", original);
-        commands::checkout(&self.repo_root, original).await?;
+        commands::checkout(&self.repo_root, &original).await?;
 
         // Sequential merge: merge each branch one at a time
         for branch_name in branch_names {
@@ -991,7 +1008,11 @@ impl WorkspaceManager for GitWorkspaceManager {
     }
 
     fn original_branch(&self) -> Option<String> {
-        self.original_branch.clone()
+        // Use try_lock for synchronous access (should not block in practice)
+        self.original_branch
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     async fn find_existing_workspace(
@@ -1048,6 +1069,9 @@ impl WorkspaceManager for GitWorkspaceManager {
     }
 
     async fn reuse_workspace(&mut self, workspace_info: &WorkspaceInfo) -> VcsResult<Workspace> {
+        // Ensure original branch is initialized
+        self.ensure_original_branch().await?;
+
         info!(
             "Reusing existing worktree '{}' at {:?}",
             workspace_info.workspace_name, workspace_info.path

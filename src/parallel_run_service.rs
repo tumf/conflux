@@ -81,18 +81,6 @@ impl ParallelRunService {
         executor
     }
 
-    /// Create a configured ParallelExecutor instance.
-    ///
-    /// This allows external callers to access executor methods like `mark_queue_changed()`
-    /// while the executor is managed externally.
-    pub fn create_executor(
-        &self,
-        event_tx: Option<mpsc::Sender<ParallelEvent>>,
-        cancel_token: Option<CancellationToken>,
-    ) -> ParallelExecutor {
-        self.create_executor_with_queue_state(event_tx, cancel_token, None)
-    }
-
     async fn filter_committed_changes(
         &self,
         changes: Vec<Change>,
@@ -208,23 +196,6 @@ impl ParallelRunService {
             shared_queue_change,
         );
         self.run_parallel_with_executor(executor, changes, event_tx)
-            .await
-    }
-
-    /// Run parallel execution with an mpsc sender for events
-    ///
-    /// This variant is useful when integrating with existing channel-based
-    /// event systems (e.g., TUI).
-    ///
-    /// Uses dynamic re-analysis: after each group completes, the remaining changes
-    /// are re-analyzed to determine the next group.
-    pub async fn run_parallel_with_channel(
-        &self,
-        changes: Vec<Change>,
-        event_tx: mpsc::Sender<ParallelEvent>,
-        cancel_token: Option<CancellationToken>,
-    ) -> Result<()> {
-        self.run_parallel_with_channel_and_queue_state(changes, event_tx, cancel_token, None)
             .await
     }
 

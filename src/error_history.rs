@@ -65,19 +65,9 @@ impl ErrorHistory {
         }
     }
 
-    /// Clear the error history (useful after successful operations)
-    pub fn clear(&mut self) {
-        self.recent_errors.clear();
-    }
-
     /// Get the most recent error message (if any)
     pub fn last_error(&self) -> Option<&str> {
         self.recent_errors.back().map(|s| s.as_str())
-    }
-
-    /// Get the count of recorded errors
-    pub fn error_count(&self) -> usize {
-        self.recent_errors.len()
     }
 }
 
@@ -217,10 +207,10 @@ mod tests {
 
         history.record_error("Error 1");
         history.record_error("Error 2");
-        assert_eq!(history.error_count(), 2);
+        assert_eq!(history.recent_errors.len(), 2);
 
-        history.clear();
-        assert_eq!(history.error_count(), 0);
+        history.recent_errors.clear();
+        assert_eq!(history.recent_errors.len(), 0);
         assert!(!history.detect_same_error());
     }
 
