@@ -120,6 +120,8 @@ pub struct WorktreeInfo {
     pub is_main: bool,
     /// Merge conflict information (None if not checked or no conflicts)
     pub merge_conflict: Option<MergeConflictInfo>,
+    /// Whether this worktree has commits ahead of the base branch
+    pub has_commits_ahead: bool,
 }
 
 impl WorktreeInfo {
@@ -230,6 +232,7 @@ mod tests {
             is_detached: false,
             is_main: true,
             merge_conflict: None,
+            has_commits_ahead: false,
         };
         assert_eq!(wt.display_label(), "worktree");
     }
@@ -243,6 +246,7 @@ mod tests {
             is_detached: false,
             is_main: false,
             merge_conflict: None,
+            has_commits_ahead: true,
         };
         assert_eq!(wt.display_branch(), "feature-branch");
     }
@@ -256,6 +260,7 @@ mod tests {
             is_detached: true,
             is_main: false,
             merge_conflict: None,
+            has_commits_ahead: false,
         };
         assert_eq!(wt.display_branch(), "(detached: abc123)");
     }
@@ -269,6 +274,7 @@ mod tests {
             is_detached: false,
             is_main: true,
             merge_conflict: None,
+            has_commits_ahead: false,
         };
         assert!(!wt_no_conflict.has_merge_conflict());
 
@@ -281,6 +287,7 @@ mod tests {
             merge_conflict: Some(MergeConflictInfo {
                 conflict_files: vec!["file.rs".to_string()],
             }),
+            has_commits_ahead: true,
         };
         assert!(wt_with_conflict.has_merge_conflict());
     }
@@ -296,6 +303,7 @@ mod tests {
             merge_conflict: Some(MergeConflictInfo {
                 conflict_files: vec!["file1.rs".to_string(), "file2.rs".to_string()],
             }),
+            has_commits_ahead: true,
         };
         assert_eq!(wt.conflict_file_count(), 2);
     }

@@ -500,6 +500,7 @@ pub async fn execute_apply_in_workspace(
                         .send(ParallelEvent::ApplyOutput {
                             change_id: change_id_for_stdout.clone(),
                             output: line,
+                            iteration: None,
                         })
                         .await;
                 }
@@ -516,6 +517,7 @@ pub async fn execute_apply_in_workspace(
                         .send(ParallelEvent::ApplyOutput {
                             change_id: change_id_for_stderr.clone(),
                             output: line,
+                            iteration: None,
                         })
                         .await;
                 }

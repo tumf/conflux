@@ -321,31 +321,74 @@ impl AppState {
     /// Returns Some(TuiCommand) if merge should proceed, None if blocked.
     pub fn request_merge_worktree_branch(&mut self) -> Option<TuiCommand> {
         use crate::tui::types::ViewMode;
+        use tracing::debug;
+
+        debug!(
+            "request_merge_worktree_branch called: view_mode={:?}, worktrees_len={}, cursor_index={}",
+            self.view_mode,
+            self.worktrees.len(),
+            self.worktree_cursor_index
+        );
 
         if self.view_mode != ViewMode::Worktrees {
+            debug!(
+                "Merge blocked: view_mode is {:?}, not Worktrees",
+                self.view_mode
+            );
+            self.warning_message = Some("Switch to Worktrees view to merge".to_string());
             return None;
         }
 
-        if self.worktrees.is_empty() || self.worktree_cursor_index >= self.worktrees.len() {
+        if self.worktrees.is_empty() {
+            debug!("Merge blocked: worktrees list is empty");
+            self.warning_message = Some("No worktrees loaded".to_string());
+            return None;
+        }
+
+        if self.worktree_cursor_index >= self.worktrees.len() {
+            debug!(
+                "Merge blocked: cursor out of range: {} >= {}",
+                self.worktree_cursor_index,
+                self.worktrees.len()
+            );
+            self.warning_message = Some(format!(
+                "Cursor out of range: {} >= {}",
+                self.worktree_cursor_index,
+                self.worktrees.len()
+            ));
             return None;
         }
 
         let worktree = &self.worktrees[self.worktree_cursor_index];
+        debug!(
+            "Worktree selected: path={}, branch={}, is_main={}, is_detached={}, has_conflict={}",
+            worktree.path.display(),
+            worktree.branch,
+            worktree.is_main,
+            worktree.is_detached,
+            worktree.has_merge_conflict()
+        );
 
         // Cannot merge main worktree
         if worktree.is_main {
+            debug!("Merge blocked: is main worktree");
             self.warning_message = Some("Cannot merge main worktree".to_string());
             return None;
         }
 
         // Cannot merge detached HEAD
         if worktree.is_detached {
+            debug!("Merge blocked: is detached HEAD");
             self.warning_message = Some("Cannot merge detached HEAD".to_string());
             return None;
         }
 
         // Cannot merge if conflicts detected
         if worktree.has_merge_conflict() {
+            debug!(
+                "Merge blocked: has {} conflict(s)",
+                worktree.conflict_file_count()
+            );
             self.warning_message = Some(format!(
                 "Cannot merge: {} conflict(s) detected",
                 worktree.conflict_file_count()
@@ -358,10 +401,20 @@ impl AppState {
         let branch_name = worktree.branch.clone();
 
         if branch_name.is_empty() {
+            debug!("Merge blocked: branch name is empty");
             self.warning_message = Some("Cannot merge: no branch name".to_string());
             return None;
         }
 
+        // Cannot merge if no commits ahead of base branch
+        if !worktree.has_commits_ahead {
+            debug!("Merge blocked: no commits ahead of base branch");
+            self.warning_message =
+                Some("Cannot merge: no commits ahead of base branch".to_string());
+            return None;
+        }
+
+        debug!("Merge approved: creating TuiCommand::MergeWorktreeBranch");
         Some(TuiCommand::MergeWorktreeBranch {
             worktree_path: path,
             branch_name,
@@ -1664,6 +1717,7 @@ mod tests {
                 is_detached: false,
                 is_main: true,
                 merge_conflict: None,
+                has_commits_ahead: false,
             },
             WorktreeInfo {
                 path: PathBuf::from("/path/to/worktree2"),
@@ -1672,6 +1726,7 @@ mod tests {
                 is_detached: false,
                 is_main: false,
                 merge_conflict: None,
+                has_commits_ahead: true,
             },
             WorktreeInfo {
                 path: PathBuf::from("/path/to/worktree3"),
@@ -1680,6 +1735,7 @@ mod tests {
                 is_detached: true,
                 is_main: false,
                 merge_conflict: None,
+                has_commits_ahead: false,
             },
         ];
 
@@ -1724,6 +1780,7 @@ mod tests {
                 is_detached: false,
                 is_main: true,
                 merge_conflict: None,
+                has_commits_ahead: false,
             },
             WorktreeInfo {
                 path: PathBuf::from("/path/to/worktree2"),
@@ -1732,6 +1789,7 @@ mod tests {
                 is_detached: false,
                 is_main: false,
                 merge_conflict: None,
+                has_commits_ahead: true,
             },
         ];
 
@@ -1774,6 +1832,7 @@ mod tests {
             is_detached: false,
             is_main: true,
             merge_conflict: None,
+            has_commits_ahead: false,
         }];
 
         // Cannot delete main worktree
@@ -1802,6 +1861,7 @@ mod tests {
             is_detached: false,
             is_main: false,
             merge_conflict: None,
+            has_commits_ahead: false,
         }];
 
         // Simulate processing state
@@ -1835,6 +1895,7 @@ mod tests {
             is_detached: false,
             is_main: false,
             merge_conflict: None,
+            has_commits_ahead: false,
         }];
 
         // Valid deletion request
@@ -1864,6 +1925,7 @@ mod tests {
             is_detached: false,
             is_main: false,
             merge_conflict: None,
+            has_commits_ahead: false,
         }];
 
         app.pending_worktree_action = Some((
@@ -1899,6 +1961,7 @@ mod tests {
             is_detached: false,
             is_main: false,
             merge_conflict: None,
+            has_commits_ahead: false,
         }];
 
         app.pending_worktree_action = Some((
