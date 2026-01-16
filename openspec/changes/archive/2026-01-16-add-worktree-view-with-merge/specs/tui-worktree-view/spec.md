@@ -154,7 +154,7 @@ Worktreeビュー SHALL display context-sensitive key hints.
 - **GIVEN** Worktreeビューでdetached HEADのworktreeが選択されている
 - **THEN** "M: merge" キーヒントは表示されない
 
-## MODIFIED Requirements
+## ADDED Requirements
 ### Requirement: Changes View Key Hints
 
 Changesビュー SHALL display key hints that exclude worktree operations and include view switching.
