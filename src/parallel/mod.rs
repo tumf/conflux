@@ -221,14 +221,6 @@ impl ParallelExecutor {
         self.cancel_token = Some(cancel_token);
     }
 
-    /// Mark that the queue has changed (addition or removal).
-    /// This updates the timestamp used for debouncing re-analysis.
-    pub async fn mark_queue_changed(&self) {
-        let mut last_change = self.last_queue_change_at.lock().await;
-        *last_change = Some(std::time::Instant::now());
-        info!("Queue change marked for debouncing");
-    }
-
     /// Check if re-analysis should proceed based on debounce logic.
     ///
     /// Returns `true` if:
@@ -491,14 +483,18 @@ impl ParallelExecutor {
             }
 
             // Check debounce: a slot is available (after previous group completed)
-            // Wait for debounce period if queue recently changed
-            let slot_available = group_counter > 1; // First iteration has no previous completion
-            if !self.should_reanalyze(slot_available).await {
-                // Debounce period still active, wait before re-analyzing
-                let wait_duration = std::time::Duration::from_secs(1);
-                info!("Debounce active, waiting {:?} before retry", wait_duration);
-                tokio::time::sleep(wait_duration).await;
-                continue; // Retry the loop after waiting
+            // Skip debounce check on first iteration to start immediately
+            if group_counter > 1 {
+                let slot_available = true; // Slot is available after previous completion
+                if !self.should_reanalyze(slot_available).await {
+                    // Debounce period still active, wait before re-analyzing
+                    let wait_duration = std::time::Duration::from_secs(1);
+                    info!("Debounce active, waiting {:?} before retry", wait_duration);
+                    tokio::time::sleep(wait_duration).await;
+                    continue; // Retry the loop after waiting
+                }
+            } else {
+                info!("First iteration, skipping debounce check");
             }
 
             // Analyze remaining changes to get the next group
