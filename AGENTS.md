@@ -553,8 +553,8 @@ The parallel execution mode uses workspace state detection to enable idempotent 
 | **Created** | No commits, fresh workspace | Start apply from beginning |
 | **Applying** | WIP commits exist: `WIP(apply): <change_id> (iteration N/M)` | Resume apply from next iteration |
 | **Applied** | Apply commit exists: `Apply: <change_id>` | Skip apply, run archive only |
-| **Archived** | Archive commit exists: `Archive: <change_id>` (not in main) | Skip apply/archive, run merge only |
-| **Merged** | Archive commit found in main branch | Skip all operations, cleanup workspace |
+| **Archived** | Archive commit exists: `Archive: <change_id>` (not in base branch) | Skip apply/archive, run merge only |
+| **Merged** | Archive commit found in base branch | Skip all operations, cleanup workspace |
 
 ### State Detection Module
 
@@ -562,8 +562,8 @@ The parallel execution mode uses workspace state detection to enable idempotent 
 
 **Key Functions**:
 
-- `detect_workspace_state(change_id, repo_root)` - Main entry point, returns `WorkspaceState`
-- `is_merged_to_main(change_id, repo_root)` - Check if archive commit is in main branch
+- `detect_workspace_state(change_id, repo_root, base_branch)` - Main entry point, returns `WorkspaceState`
+- `is_merged_to_base(change_id, repo_root, base_branch)` - Check if archive commit is in base branch
 - `has_apply_commit(change_id, repo_root)` - Check for apply completion
 - `get_latest_wip_snapshot(change_id, repo_root)` - Get highest WIP iteration number
 - `is_archive_commit_complete(change_id, repo_root)` - Verify archive commit and clean working tree
@@ -575,7 +575,11 @@ The parallel execution mode uses workspace state detection to enable idempotent 
 When resuming a workspace:
 
 ```rust
-let workspace_state = detect_workspace_state(change_id, &workspace.path).await?;
+// Get the original/base branch name
+let original_branch = workspace_manager.original_branch()
+    .ok_or_else(|| OrchestratorError::GitCommand("Original branch not initialized".to_string()))?;
+
+let workspace_state = detect_workspace_state(change_id, &workspace.path, &original_branch).await?;
 
 match workspace_state {
     WorkspaceState::Merged => {
@@ -585,7 +589,7 @@ match workspace_state {
     WorkspaceState::Archived => {
         // Skip apply/archive, ensure archive commit, then merge
         ensure_archive_commit(change_id, &workspace.path, ...).await?;
-        // ... merge to main
+        // ... merge to base branch
     }
     WorkspaceState::Applied | WorkspaceState::Applying { .. } | WorkspaceState::Created => {
         // Continue with apply (or resume from iteration)

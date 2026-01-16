@@ -50,36 +50,41 @@ pub enum WorkspaceState {
     Merged,
 }
 
-/// Check if a change has been merged to main.
+/// Check if a change has been merged to the base branch.
 ///
 /// This function checks if the archive commit for the given change exists in
-/// the main branch's commit history.
+/// the base branch's commit history.
 ///
 /// # Arguments
 ///
 /// * `change_id` - The change ID to check
 /// * `repo_root` - The repository root path
+/// * `base_branch` - The base branch to check against
 ///
 /// # Returns
 ///
-/// * `Ok(true)` - Change has been merged to main
-/// * `Ok(false)` - Change has not been merged to main
+/// * `Ok(true)` - Change has been merged to base branch
+/// * `Ok(false)` - Change has not been merged to base branch
 /// * `Err` - Failed to check merge status
-pub async fn is_merged_to_main(change_id: &str, repo_root: &Path) -> Result<bool> {
+pub async fn is_merged_to_base(
+    change_id: &str,
+    repo_root: &Path,
+    base_branch: &str,
+) -> Result<bool> {
     // Check if the archive commit exists in main branch
     let expected_subject = format!("Archive: {}", change_id);
 
-    // Get the merge-base between current HEAD and main
+    // Get the merge-base between current HEAD and base branch
     let merge_base_output = Command::new("git")
-        .args(["merge-base", "HEAD", "main"])
+        .args(["merge-base", "HEAD", base_branch])
         .current_dir(repo_root)
         .output()
         .await
         .map_err(|e| OrchestratorError::GitCommand(format!("Failed to get merge-base: {}", e)))?;
 
     if !merge_base_output.status.success() {
-        // If merge-base fails, main might not exist or we're on main
-        // Check if we're on main branch
+        // If merge-base fails, base branch might not exist or we're on base branch
+        // Check if we're on the base branch
         let branch_output = Command::new("git")
             .args(["branch", "--show-current"])
             .current_dir(repo_root)
@@ -96,16 +101,16 @@ pub async fn is_merged_to_main(change_id: &str, repo_root: &Path) -> Result<bool
         let current_branch = String::from_utf8_lossy(&branch_output.stdout)
             .trim()
             .to_string();
-        if current_branch != "main" {
+        if current_branch != base_branch {
             return Ok(false);
         }
     }
 
-    // Search for the archive commit in main branch history
+    // Search for the archive commit in base branch history
     let log_output = Command::new("git")
         .args([
             "log",
-            "main",
+            base_branch,
             "--format=%s",
             "--all-match",
             "--grep",
@@ -129,9 +134,10 @@ pub async fn is_merged_to_main(change_id: &str, repo_root: &Path) -> Result<bool
 
     debug!(
         change_id = %change_id,
+        base_branch = %base_branch,
         expected_subject = %expected_subject,
         found = found,
-        "is_merged_to_main: checking main branch"
+        "is_merged_to_base: checking base branch"
     );
 
     Ok(found)
@@ -259,7 +265,7 @@ pub async fn has_apply_commit(change_id: &str, repo_root: &Path) -> Result<bool>
 ///
 /// # State Detection Logic
 ///
-/// 1. Check if merged to main → `Merged`
+/// 1. Check if merged to base branch → `Merged`
 /// 2. Check if archive commit complete → `Archived`
 /// 3. Check if apply commit exists → `Applied`
 /// 4. Check for WIP commits → `Applying { iteration }`
@@ -269,14 +275,19 @@ pub async fn has_apply_commit(change_id: &str, repo_root: &Path) -> Result<bool>
 ///
 /// * `change_id` - The change ID to check
 /// * `repo_root` - The repository root path (workspace path)
+/// * `base_branch` - The base branch to check against
 ///
 /// # Returns
 ///
 /// * `Ok(WorkspaceState)` - Detected workspace state
 /// * `Err` - Failed to detect state
-pub async fn detect_workspace_state(change_id: &str, repo_root: &Path) -> Result<WorkspaceState> {
-    // 1. Check if merged to main
-    if is_merged_to_main(change_id, repo_root).await? {
+pub async fn detect_workspace_state(
+    change_id: &str,
+    repo_root: &Path,
+    base_branch: &str,
+) -> Result<WorkspaceState> {
+    // 1. Check if merged to base branch
+    if is_merged_to_base(change_id, repo_root, base_branch).await? {
         debug!(change_id = %change_id, "State: Merged");
         return Ok(WorkspaceState::Merged);
     }
@@ -352,7 +363,7 @@ mod tests {
         init_git_repo(repo_root);
         commit(repo_root, "Initial commit");
 
-        let state = detect_workspace_state("test-change", repo_root)
+        let state = detect_workspace_state("test-change", repo_root, "main")
             .await
             .unwrap();
         assert_eq!(state, WorkspaceState::Created);
@@ -366,7 +377,7 @@ mod tests {
         commit(repo_root, "Initial commit");
         commit(repo_root, "WIP(apply): test-change (iteration 1/5)");
 
-        let state = detect_workspace_state("test-change", repo_root)
+        let state = detect_workspace_state("test-change", repo_root, "main")
             .await
             .unwrap();
         assert_eq!(state, WorkspaceState::Applying { iteration: 2 });
@@ -380,7 +391,7 @@ mod tests {
         commit(repo_root, "Initial commit");
         commit(repo_root, "Apply: test-change");
 
-        let state = detect_workspace_state("test-change", repo_root)
+        let state = detect_workspace_state("test-change", repo_root, "main")
             .await
             .unwrap();
         assert_eq!(state, WorkspaceState::Applied);
@@ -401,7 +412,7 @@ mod tests {
             .unwrap();
         commit(repo_root, "Archive: test-change");
 
-        let state = detect_workspace_state("test-change", repo_root)
+        let state = detect_workspace_state("test-change", repo_root, "main")
             .await
             .unwrap();
         assert_eq!(state, WorkspaceState::Archived);
@@ -416,7 +427,7 @@ mod tests {
         commit(repo_root, "Archive: test-change");
 
         // We're on main, so the archive commit is in main
-        let state = detect_workspace_state("test-change", repo_root)
+        let state = detect_workspace_state("test-change", repo_root, "main")
             .await
             .unwrap();
         assert_eq!(state, WorkspaceState::Merged);
@@ -475,19 +486,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_is_merged_to_main_true() {
+    async fn test_is_merged_to_base_true() {
         let temp_dir = TempDir::new().unwrap();
         let repo_root = temp_dir.path();
         init_git_repo(repo_root);
         commit(repo_root, "Initial commit");
         commit(repo_root, "Archive: test-change");
 
-        let result = is_merged_to_main("test-change", repo_root).await.unwrap();
+        let result = is_merged_to_base("test-change", repo_root, "main")
+            .await
+            .unwrap();
         assert!(result);
     }
 
     #[tokio::test]
-    async fn test_is_merged_to_main_false_on_branch() {
+    async fn test_is_merged_to_base_false_on_branch() {
         let temp_dir = TempDir::new().unwrap();
         let repo_root = temp_dir.path();
         init_git_repo(repo_root);
@@ -501,7 +514,9 @@ mod tests {
             .unwrap();
         commit(repo_root, "Archive: test-change");
 
-        let result = is_merged_to_main("test-change", repo_root).await.unwrap();
+        let result = is_merged_to_base("test-change", repo_root, "main")
+            .await
+            .unwrap();
         assert!(!result);
     }
 }

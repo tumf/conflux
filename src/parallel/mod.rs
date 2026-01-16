@@ -755,7 +755,13 @@ impl ParallelExecutor {
 
             // Detect workspace state for idempotent resume
             let workspace_state = if resumed {
-                match detect_workspace_state(change_id, &workspace.path).await {
+                // Get the original branch for state detection
+                let original_branch =
+                    self.workspace_manager.original_branch().ok_or_else(|| {
+                        OrchestratorError::GitCommand("Original branch not initialized".to_string())
+                    })?;
+
+                match detect_workspace_state(change_id, &workspace.path, &original_branch).await {
                     Ok(state) => state,
                     Err(e) => {
                         warn!(
@@ -1481,10 +1487,9 @@ impl ParallelExecutor {
             VcsBackend::Git | VcsBackend::Auto
         ) {
             let base_revision = self.workspace_manager.get_current_revision().await?;
-            let target_branch = self
-                .workspace_manager
-                .original_branch()
-                .unwrap_or_else(|| "main".to_string());
+            let target_branch = self.workspace_manager.original_branch().ok_or_else(|| {
+                OrchestratorError::GitCommand("Original branch not initialized".to_string())
+            })?;
 
             if change_ids.len() != revisions.len() {
                 return Err(OrchestratorError::GitCommand(format!(
