@@ -146,11 +146,19 @@ pub async fn archive_single_change(
                     match line {
                         Some(OutputLine::Stdout(s)) => {
                             tracing::debug!("Archive stdout: {}", s);
-                            let _ = tx.send(OrchestratorEvent::Log(LogEntry::info(s))).await;
+                            let _ = tx.send(OrchestratorEvent::Log(
+                                LogEntry::info(s)
+                                    .with_change_id(change_id)
+                                    .with_operation("archive")
+                            )).await;
                         }
                         Some(OutputLine::Stderr(s)) => {
                             tracing::debug!("Archive stderr: {}", s);
-                            let _ = tx.send(OrchestratorEvent::Log(LogEntry::warn(s))).await;
+                            let _ = tx.send(OrchestratorEvent::Log(
+                                LogEntry::warn(s)
+                                    .with_change_id(change_id)
+                                    .with_operation("archive")
+                            )).await;
                         }
                         None => {
                             tracing::debug!("Archive output stream closed");
@@ -716,10 +724,20 @@ pub async fn run_orchestrator(
                 line = output_rx.recv() => {
                     match line {
                         Some(OutputLine::Stdout(s)) => {
-                            let _ = tx.send(OrchestratorEvent::Log(LogEntry::info(s))).await;
+                            let _ = tx.send(OrchestratorEvent::Log(
+                                LogEntry::info(s)
+                                    .with_change_id(&change_id)
+                                    .with_operation("apply")
+                                    .with_iteration(apply_count)
+                            )).await;
                         }
                         Some(OutputLine::Stderr(s)) => {
-                            let _ = tx.send(OrchestratorEvent::Log(LogEntry::warn(s))).await;
+                            let _ = tx.send(OrchestratorEvent::Log(
+                                LogEntry::warn(s)
+                                    .with_change_id(&change_id)
+                                    .with_operation("apply")
+                                    .with_iteration(apply_count)
+                            )).await;
                         }
                         None => break,
                     }

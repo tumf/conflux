@@ -762,6 +762,7 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
             )];
 
             // Add change_id prefix with color if present
+            // Format: [change_id:operation:iteration] or [change_id:operation] or [change_id]
             let msg_width = if let Some(ref change_id) = entry.change_id {
                 // Use hash of change_id to pick a consistent color
                 let color_index = change_id
@@ -769,14 +770,23 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
                     .fold(0usize, |acc, b| acc.wrapping_add(b as usize))
                     % change_colors.len();
                 let prefix_color = change_colors[color_index];
+
+                // Build header with operation and iteration if present
+                let header = match (&entry.operation, entry.iteration) {
+                    (Some(op), Some(iter)) => format!("[{}:{}:{}] ", change_id, op, iter),
+                    (Some(op), None) => format!("[{}:{}] ", change_id, op),
+                    (None, _) => format!("[{}] ", change_id),
+                };
+
+                let header_len = header.len();
                 spans.push(Span::styled(
-                    format!("[{}] ", change_id),
+                    header,
                     Style::default()
                         .fg(prefix_color)
                         .add_modifier(Modifier::BOLD),
                 ));
                 // Reduce available width by prefix length
-                available_width.saturating_sub(change_id.len() + 3) // "[" + "]" + " "
+                available_width.saturating_sub(header_len)
             } else {
                 available_width
             };
