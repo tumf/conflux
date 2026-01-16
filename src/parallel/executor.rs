@@ -463,19 +463,19 @@ pub async fn execute_apply_in_workspace(
         debug!("Repository root: {:?}", repo_root);
         debug!("Apply command: {}", command);
 
-        // Execute command in repository root (not workspace directory)
-        // This allows the AI agent to access the full repository structure
+        // Execute command in worktree directory
+        // This ensures changes are applied to the isolated worktree, not the base repository
         // Use null stdin to prevent any interactive behavior
         use tokio::io::{AsyncBufReadExt, BufReader};
 
         debug!(
             module = module_path!(),
-            "Executing shell command: sh -c {} (cwd: {:?})", command, repo_root
+            "Executing shell command: sh -c {} (cwd: {:?})", command, workspace_path
         );
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(&command)
-            .current_dir(repo_root)
+            .current_dir(workspace_path)
             .stdin(StdStdio::null())
             .stdout(StdStdio::piped())
             .stderr(StdStdio::piped())
@@ -781,7 +781,7 @@ pub async fn execute_apply_in_workspace(
 pub async fn execute_archive_in_workspace(
     change_id: &str,
     workspace_path: &Path,
-    repo_root: &Path,
+    _repo_root: &Path,
     archive_cmd_template: &str,
     config: &OrchestratorConfig,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
@@ -910,12 +910,12 @@ pub async fn execute_archive_in_workspace(
 
         debug!(
             "Executing shell command: sh -c {} (cwd: {:?})",
-            command, repo_root
+            command, workspace_path
         );
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(&command)
-            .current_dir(repo_root)
+            .current_dir(workspace_path)
             .stdin(StdStdio::null())
             .stdout(StdStdio::piped())
             .stderr(StdStdio::piped())
