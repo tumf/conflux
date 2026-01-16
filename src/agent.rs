@@ -54,7 +54,6 @@ use crate::process_manager::ManagedChild;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
@@ -387,62 +386,179 @@ impl AgentRunner {
         output.to_string()
     }
 
-    /// Execute a shell command with output streaming
+    /// Execute a shell command with output streaming and automatic retry
     /// Returns a child process handle and a receiver for output lines
+    ///
+    /// This function uses the command queue's retry logic to automatically retry
+    /// transient failures. Retry notifications are sent through the output channel.
     async fn execute_shell_command_streaming(
         &self,
         command: &str,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
-        // Apply stagger delay before spawning command
-        let command_str = command.to_string();
-        let mut child = self
-            .command_queue
-            .execute_with_stagger(|| self.build_command(&command_str))
-            .await?;
+        use crate::command_queue::StreamingOutputLine;
 
+        // Create output channel
         let (tx, rx) = mpsc::channel::<OutputLine>(100);
 
-        // Take ownership of stdout and stderr
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        // Clone tx for callback
+        let tx_clone = tx.clone();
 
-        // Spawn task to read stdout
-        if let Some(stdout) = stdout {
-            let tx_stdout = tx.clone();
-            tokio::spawn(async move {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx_stdout.send(OutputLine::Stdout(line)).await.is_err() {
-                        break;
+        // Create callback to forward streaming output
+        let output_callback = move |line: StreamingOutputLine| {
+            let tx = tx_clone.clone();
+            async move {
+                let output_line = match line {
+                    StreamingOutputLine::Stdout(s) => OutputLine::Stdout(s),
+                    StreamingOutputLine::Stderr(s) => OutputLine::Stderr(s),
+                };
+                let _ = tx.send(output_line).await;
+            }
+        };
+
+        // Clone command queue and command string for background task
+        let command_queue = self.command_queue.clone();
+        let command_str = command.to_string();
+
+        // Create oneshot channel to communicate final status
+        let (status_tx, status_rx) = tokio::sync::oneshot::channel::<ExitStatus>();
+
+        // Spawn background task to run retry logic
+        tokio::spawn(async move {
+            let result = command_queue
+                .execute_with_retry_streaming(
+                    || {
+                        // Build command for each retry attempt
+                        if cfg!(target_os = "windows") {
+                            let mut cmd = Command::new("cmd");
+                            cmd.arg("/C")
+                                .arg(&command_str)
+                                .env_clear()
+                                .envs(std::env::vars())
+                                .env("NO_COLOR", "1")
+                                .env("CLICOLOR", "0")
+                                .env("CLICOLOR_FORCE", "0")
+                                .env("CI", "true")
+                                .env("PAGER", "type")
+                                .env("GIT_PAGER", "type")
+                                .env("LESS", "")
+                                .env("MORE", "")
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped());
+                            cmd
+                        } else {
+                            let shell =
+                                std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+                            let mut cmd = Command::new(&shell);
+                            cmd.arg("-l")
+                                .arg("-c")
+                                .arg(&command_str)
+                                .env_clear()
+                                .envs(std::env::vars())
+                                .env("TERM", "dumb")
+                                .env("NO_COLOR", "1")
+                                .env("CLICOLOR", "0")
+                                .env("CLICOLOR_FORCE", "0")
+                                .env("CI", "true")
+                                .env("CONTINUOUS_INTEGRATION", "true")
+                                .env("NON_INTERACTIVE", "1")
+                                .env("PAGER", "cat")
+                                .env("GIT_PAGER", "cat")
+                                .env("LESS", "-FX")
+                                .env("MORE", "-E")
+                                .env("MANPAGER", "cat")
+                                .env("SYSTEMD_PAGER", "cat")
+                                .env("GIT_TERMINAL_PROMPT", "0")
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped());
+
+                            #[cfg(unix)]
+                            unsafe {
+                                #[allow(unused_imports)]
+                                use std::os::unix::process::CommandExt;
+                                cmd.pre_exec(|| {
+                                    use nix::unistd::{setpgid, Pid};
+                                    setpgid(Pid::from_raw(0), Pid::from_raw(0))
+                                        .map_err(std::io::Error::other)?;
+                                    Ok(())
+                                });
+                            }
+
+                            cmd
+                        }
+                    },
+                    Some(output_callback),
+                )
+                .await;
+
+            // Send final status
+            match result {
+                Ok((status, _stderr)) => {
+                    let _ = status_tx.send(status);
+                }
+                Err(_) => {
+                    // Send failure status
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        let _ = status_tx.send(ExitStatus::from_raw(1));
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        // On Windows, we can't create ExitStatus easily
+                        // Just drop the channel
                     }
                 }
-            });
-        }
+            }
 
-        // Spawn task to read stderr
-        if let Some(stderr) = stderr {
-            let tx_stderr = tx;
-            tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx_stderr.send(OutputLine::Stderr(line)).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
+            // Close output channel
+            drop(tx);
+        });
 
-        // Wrap child in ManagedChild for reliable cleanup
-        let managed_child = ManagedChild::new(child).map_err(|e| {
+        // Create a dummy child process that waits for stdin to close
+        // When the background task completes, we'll close stdin which causes the process to exit
+        let mut dummy_child = if cfg!(target_os = "windows") {
+            // Use findstr with stdin - will exit when stdin closes
+            Command::new("findstr")
+                .arg(".*")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(OrchestratorError::Io)?
+        } else {
+            // Use cat with no args - reads stdin until it closes
+            Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(OrchestratorError::Io)?
+        };
+
+        // Take stdin so we can close it later
+        let dummy_stdin = dummy_child.stdin.take();
+
+        // Wrap dummy child in ManagedChild
+        let managed_child = ManagedChild::new(dummy_child).map_err(|e| {
             OrchestratorError::AgentCommand(format!("Failed to create managed child: {}", e))
         })?;
+
+        // Spawn a task to close stdin when real command completes
+        // This will cause the dummy process to exit cleanly
+        tokio::spawn(async move {
+            // Wait for status from background task
+            let _ = status_rx.await;
+            // Close stdin - this causes cat/findstr to exit cleanly
+            drop(dummy_stdin);
+        });
 
         Ok((managed_child, rx))
     }
 
     /// Build a command for execution (extracted for use with command queue)
+    #[allow(dead_code)]
     fn build_command(&self, command: &str) -> Command {
         if cfg!(target_os = "windows") {
             debug!(
@@ -527,59 +643,183 @@ impl AgentRunner {
         }
     }
 
+    /// Execute a shell command with output streaming and automatic retry in a specific directory
+    /// Returns a child process handle and a receiver for output lines
+    ///
+    /// This function uses the command queue's retry logic to automatically retry
+    /// transient failures. Retry notifications are sent through the output channel.
     async fn execute_shell_command_streaming_in_dir(
         &self,
         command: &str,
         cwd: &Path,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
-        // Apply stagger delay before spawning command
-        let command_str = command.to_string();
-        let cwd_path = cwd.to_path_buf();
-        let mut child = self
-            .command_queue
-            .execute_with_stagger(|| self.build_command_in_dir(&command_str, &cwd_path))
-            .await?;
+        use crate::command_queue::StreamingOutputLine;
 
+        // Create output channel
         let (tx, rx) = mpsc::channel::<OutputLine>(100);
 
-        // Take ownership of stdout and stderr
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        // Clone tx for callback
+        let tx_clone = tx.clone();
 
-        if let Some(stdout) = stdout {
-            let tx_stdout = tx.clone();
-            tokio::spawn(async move {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx_stdout.send(OutputLine::Stdout(line)).await.is_err() {
-                        break;
+        // Create callback to forward streaming output
+        let output_callback = move |line: StreamingOutputLine| {
+            let tx = tx_clone.clone();
+            async move {
+                let output_line = match line {
+                    StreamingOutputLine::Stdout(s) => OutputLine::Stdout(s),
+                    StreamingOutputLine::Stderr(s) => OutputLine::Stderr(s),
+                };
+                let _ = tx.send(output_line).await;
+            }
+        };
+
+        // Clone command queue, command string, and cwd for background task
+        let command_queue = self.command_queue.clone();
+        let command_str = command.to_string();
+        let cwd_path = cwd.to_path_buf();
+
+        // Create oneshot channel to communicate final status
+        let (status_tx, status_rx) = tokio::sync::oneshot::channel::<ExitStatus>();
+
+        // Spawn background task to run retry logic
+        tokio::spawn(async move {
+            let result = command_queue
+                .execute_with_retry_streaming(
+                    || {
+                        // Build command for each retry attempt
+                        if cfg!(target_os = "windows") {
+                            let mut cmd = Command::new("cmd");
+                            cmd.arg("/C")
+                                .arg(&command_str)
+                                .current_dir(&cwd_path)
+                                .env_clear()
+                                .envs(std::env::vars())
+                                .env("NO_COLOR", "1")
+                                .env("CLICOLOR", "0")
+                                .env("CLICOLOR_FORCE", "0")
+                                .env("CI", "true")
+                                .env("PAGER", "type")
+                                .env("GIT_PAGER", "type")
+                                .env("LESS", "")
+                                .env("MORE", "")
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped());
+                            cmd
+                        } else {
+                            let shell =
+                                std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+                            let mut cmd = Command::new(&shell);
+                            cmd.arg("-l")
+                                .arg("-c")
+                                .arg(&command_str)
+                                .current_dir(&cwd_path)
+                                .env_clear()
+                                .envs(std::env::vars())
+                                .env("TERM", "dumb")
+                                .env("NO_COLOR", "1")
+                                .env("CLICOLOR", "0")
+                                .env("CLICOLOR_FORCE", "0")
+                                .env("CI", "true")
+                                .env("CONTINUOUS_INTEGRATION", "true")
+                                .env("NON_INTERACTIVE", "1")
+                                .env("PAGER", "cat")
+                                .env("GIT_PAGER", "cat")
+                                .env("LESS", "-FX")
+                                .env("MORE", "-E")
+                                .env("MANPAGER", "cat")
+                                .env("SYSTEMD_PAGER", "cat")
+                                .env("GIT_TERMINAL_PROMPT", "0")
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped());
+
+                            #[cfg(unix)]
+                            unsafe {
+                                #[allow(unused_imports)]
+                                use std::os::unix::process::CommandExt;
+                                cmd.pre_exec(|| {
+                                    use nix::unistd::{setpgid, Pid};
+                                    setpgid(Pid::from_raw(0), Pid::from_raw(0))
+                                        .map_err(std::io::Error::other)?;
+                                    Ok(())
+                                });
+                            }
+
+                            cmd
+                        }
+                    },
+                    Some(output_callback),
+                )
+                .await;
+
+            // Send final status
+            match result {
+                Ok((status, _stderr)) => {
+                    let _ = status_tx.send(status);
+                }
+                Err(_) => {
+                    // Send failure status
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        let _ = status_tx.send(ExitStatus::from_raw(1));
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        // On Windows, we can't create ExitStatus easily
+                        // Just drop the channel
                     }
                 }
-            });
-        }
+            }
 
-        if let Some(stderr) = stderr {
-            let tx_stderr = tx;
-            tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx_stderr.send(OutputLine::Stderr(line)).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
+            // Close output channel
+            drop(tx);
+        });
 
-        let managed_child = ManagedChild::new(child).map_err(|e| {
+        // Create a dummy child process that waits for stdin to close
+        // When the background task completes, we'll close stdin which causes the process to exit
+        let mut dummy_child = if cfg!(target_os = "windows") {
+            // Use findstr with stdin - will exit when stdin closes
+            Command::new("findstr")
+                .arg(".*")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(OrchestratorError::Io)?
+        } else {
+            // Use cat with no args - reads stdin until it closes
+            Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(OrchestratorError::Io)?
+        };
+
+        // Take stdin so we can close it later
+        let dummy_stdin = dummy_child.stdin.take();
+
+        // Wrap dummy child in ManagedChild
+        let managed_child = ManagedChild::new(dummy_child).map_err(|e| {
             OrchestratorError::AgentCommand(format!("Failed to create managed child: {}", e))
         })?;
+
+        // Spawn a task to close stdin when real command completes
+        // This will cause the dummy process to exit cleanly
+        tokio::spawn(async move {
+            // Wait for status from background task
+            let _ = status_rx.await;
+            // Close stdin - this causes cat/findstr to exit cleanly
+            drop(dummy_stdin);
+        });
 
         Ok((managed_child, rx))
     }
 
     /// Build a command for execution in a specific directory
+    #[allow(dead_code)]
     fn build_command_in_dir(&self, command: &str, cwd: &Path) -> Command {
         if cfg!(target_os = "windows") {
             debug!("Building shell command: cmd /C {}", command);
