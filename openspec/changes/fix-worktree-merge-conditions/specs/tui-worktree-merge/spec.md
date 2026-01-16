@@ -127,3 +127,36 @@ Working directory clean check SHALL be performed on base repository.
 - **WHEN** user attempts to merge the worktree branch
 - **THEN** merge SHALL succeed
 - **AND** worktree uncommitted changes SHALL remain intact
+
+### Requirement: Merge Operation Debug Logging
+
+TUI SHALL log debug information for merge operations to enable troubleshooting.
+
+Merge operation SHOULD NOT crash TUI silently; errors SHALL be displayed to user.
+
+#### Scenario: Mキー押下時のデバッグログ出力
+
+- **GIVEN** RUST_LOG=debug is set
+- **AND** user is in Worktrees view
+- **WHEN** M key is pressed
+- **THEN** debug log SHALL include view_mode value
+- **AND** debug log SHALL include worktrees.len() value
+- **AND** debug log SHALL include worktree_cursor_index value
+- **AND** debug log SHALL include result of request_merge_worktree_branch()
+
+#### Scenario: マージコマンド実行時のデバッグログ
+
+- **GIVEN** RUST_LOG=debug is set
+- **AND** merge command is being processed
+- **WHEN** TuiCommand::MergeWorktreeBranch is received
+- **THEN** debug log SHALL include worktree_path
+- **AND** debug log SHALL include branch_name
+- **AND** debug log SHALL include merge execution directory (repo_root)
+
+#### Scenario: エラー時のTUI安定性
+
+- **GIVEN** merge operation encounters an error
+- **WHEN** error occurs during merge processing
+- **THEN** TUI SHALL NOT crash silently
+- **AND** error SHALL be displayed via warning_popup or log entry
+- **AND** TUI SHALL remain operational
