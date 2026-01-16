@@ -921,18 +921,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_archive_with_empty_default_prompt() {
-        // Test that archive uses empty default prompt when not specified
+        // Test that archive uses default prompt (with path context)
         let config = OrchestratorConfig {
             archive_command: Some("echo 'Archive {change_id}:{prompt}:end'".to_string()),
             ..Default::default()
         };
         let runner = AgentRunner::new(config);
-        // Default archive_prompt should be empty
+        // Default archive_prompt should include path context
         assert_eq!(
             runner.config().get_archive_prompt(),
             crate::config::DEFAULT_ARCHIVE_PROMPT
         );
-        assert_eq!(runner.config().get_archive_prompt(), "");
+        // Verify default includes path context
+        assert!(runner
+            .config()
+            .get_archive_prompt()
+            .contains("repository root"));
         let status = runner.run_archive("test-change").await.unwrap();
         assert!(status.success());
     }
