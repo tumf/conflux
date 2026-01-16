@@ -1042,7 +1042,8 @@ pub async fn execute_archive_in_workspace(
                             "Archive verification failed for {} (attempt {}/{}); retrying archive command",
                             change_id, attempt, max_attempts
                         ))
-                        .with_change_id(change_id),
+                        .with_change_id(change_id)
+                        .with_operation("archive"),
                     ))
                     .await;
             }
