@@ -459,9 +459,14 @@ pub async fn execute_apply_in_workspace(
         // Expand change_id and prompt in command
         let command = OrchestratorConfig::expand_change_id(apply_cmd_template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+
+        // Prepend cd to workspace directory to ensure the command runs in the worktree
+        let workspace_path_str = workspace_path.to_str().unwrap_or("");
+        let command_with_cd = format!("cd {} && {}", workspace_path_str, command);
+
         debug!("Workspace path: {:?}", workspace_path);
         debug!("Repository root: {:?}", repo_root);
-        debug!("Apply command: {}", command);
+        debug!("Apply command: {}", command_with_cd);
 
         // Execute command in worktree directory
         // This ensures changes are applied to the isolated worktree, not the base repository
@@ -470,11 +475,11 @@ pub async fn execute_apply_in_workspace(
 
         debug!(
             module = module_path!(),
-            "Executing shell command: sh -c {} (cwd: {:?})", command, workspace_path
+            "Executing shell command: sh -c {} (cwd: {:?})", command_with_cd, workspace_path
         );
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg(&command)
+            .arg(&command_with_cd)
             .current_dir(workspace_path)
             .stdin(StdStdio::null())
             .stdout(StdStdio::piped())
@@ -879,7 +884,11 @@ pub async fn execute_archive_in_workspace(
     let command = OrchestratorConfig::expand_change_id(archive_cmd_template, change_id);
     let command = OrchestratorConfig::expand_prompt(&command, config.get_archive_prompt());
 
-    debug!("Archive command in workspace: {}", command);
+    // Prepend cd to workspace directory to ensure the command runs in the worktree
+    let workspace_path_str = workspace_path.to_str().unwrap_or("");
+    let command_with_cd = format!("cd {} && {}", workspace_path_str, command);
+
+    debug!("Archive command in workspace: {}", command_with_cd);
 
     use crate::execution::archive::{
         build_archive_error_message, ensure_archive_commit, verify_archive_completion,
@@ -910,11 +919,11 @@ pub async fn execute_archive_in_workspace(
 
         debug!(
             "Executing shell command: sh -c {} (cwd: {:?})",
-            command, workspace_path
+            command_with_cd, workspace_path
         );
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg(&command)
+            .arg(&command_with_cd)
             .current_dir(workspace_path)
             .stdin(StdStdio::null())
             .stdout(StdStdio::piped())
