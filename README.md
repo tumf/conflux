@@ -30,28 +30,11 @@ Automates the OpenSpec change workflow: list → dependency analysis → apply �
 └─────────────────────────────────────────────┘
 ```
 
-## Installation
-
-### Build from source
-
-```bash
-cd openspec-orchestrator
-cargo build --release
-```
-
-The binary will be available at `target/release/openspec-orchestrator`.
-
-### Add to PATH (optional)
-
-```bash
-cargo install --path .
-```
-
 ## Usage
 
-### Default: Interactive TUI
+### Interactive TUI (Primary Interface)
 
-Running without any subcommand launches the interactive TUI dashboard:
+The primary way to use the orchestrator is through the interactive TUI dashboard:
 
 ```bash
 openspec-orchestrator
@@ -61,6 +44,7 @@ The TUI provides:
 - Real-time change status visualization
 - Progress tracking for all pending changes
 - Keyboard navigation and controls
+- Worktree management view
 
 #### TUI Change States
 
@@ -89,9 +73,12 @@ Changes have two independent states: **approval** and **selection/queue**.
 
 #### TUI Key Bindings
 
+**Changes View:**
+
 | Key | Select Mode | Running Mode |
 |-----|-------------|--------------|
 | `↑/↓` or `j/k` | Navigate list | Navigate list |
+| `Tab` | Switch to Worktrees view | Switch to Worktrees view |
 | `Space` | Toggle selection | Add/remove from queue |
 | `@` | Toggle approval | Toggle approval |
 | `e` | Open editor | Open editor |
@@ -103,13 +90,85 @@ Changes have two independent states: **approval** and **selection/queue**.
 | `q` | Quit | Quit |
 | `PageUp/Down` | - | Scroll logs |
 
+**Worktrees View:**
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| `Tab` | Switch to Changes view | Return to main changes list |
+| `↑/↓` or `j/k` | Navigate worktrees | Move between worktree entries |
+| `+` | Create new worktree | Creates new worktree with unique branch name |
+| `D` | Delete worktree | Remove non-main, non-processing worktree |
+| `M` | Merge to base branch | Merge current worktree branch (conflict-free only) |
+| `e` | Open editor | Open editor in worktree directory |
+| `Enter` | Open shell | Run `worktree_command` in worktree |
+| `q` | Quit | Exit application |
+
 *QR code is only available when web monitoring is enabled (`--web` flag). Press any key to close the QR popup.
 
 **Proposal Mode:**
+
 | Key | Action |
 |-----|--------|
 | `Ctrl+S` | Submit proposal |
 | `Esc` | Cancel and return |
+
+### TUI Worktree View
+
+The TUI includes a dedicated Worktree View for managing git worktrees directly from the interface.
+
+**Key Features:**
+
+- **View Switching**: Press `Tab` to switch between Changes and Worktrees views
+- **Worktree List**: Displays all worktrees with path (basename), branch name, and status
+- **Conflict Detection**: Automatically checks for merge conflicts in parallel (background)
+- **Branch Merge**: Merge worktree branches to base with `M` key (conflict-free only)
+- **Worktree Management**: Create (`+`), delete (`D`), open editor (`e`), open shell (`Enter`)
+
+**Workflow:**
+
+1. **Switch to Worktrees View**: Press `Tab` from Changes view
+   - Loads worktree list with conflict detection (runs in parallel)
+   - Display format: `<worktree-path> → <branch-name> [STATUS] [⚠conflicts]`
+
+2. **Navigate Worktrees**: Use `↑`/`↓` or `j`/`k` keys
+   - Main worktree shown with `[MAIN]` indicator (green)
+   - Detached HEAD shown with `[DETACHED]` indicator
+   - Conflicts shown with `⚠<count>` badge (red)
+
+3. **Merge Branch**: Press `M` (only enabled when safe)
+   - Validates: not main worktree, not detached HEAD, no conflicts
+   - Executes: `git merge --no-ff --no-edit <branch>` in base repository
+   - On success: Shows success log, refreshes worktree list
+   - On failure: Shows error popup with details
+
+4. **Create Worktree**: Press `+`
+   - Generates unique branch name: `ws-session-<timestamp>`
+   - Creates worktree with new branch (not detached HEAD)
+   - Requires `worktree_command` config option
+
+5. **Delete Worktree**: Press `D` (only for non-main, non-processing worktrees)
+   - Shows confirmation dialog (`Y` to confirm, `N`/`Esc` to cancel)
+   - Removes worktree directory and updates list
+
+6. **Open Editor/Shell**: Press `e` or `Enter`
+   - `e`: Opens editor in worktree directory (respects `$EDITOR`)
+   - `Enter`: Runs `worktree_command` in worktree (e.g., opens shell)
+
+**Conflict Detection:**
+
+- Runs automatically when switching to Worktrees view
+- Checks each non-main, non-detached worktree in parallel using `git merge --no-commit --no-ff`
+- Detects conflicts without modifying working tree (uses `git merge --abort`)
+- Displays conflict count as `⚠<count>` badge in red
+- Updates every 5 seconds (auto-refresh) in background
+- Disables `M` key when conflicts detected
+
+**Performance:**
+
+- Parallel conflict checking: Uses async concurrent execution
+- Typical performance: 4 worktrees checked in < 1 second
+- Non-blocking: Conflict checks run asynchronously, TUI remains responsive
+- Fallback: On check failure, assumes no conflict info (safe default)
 
 ### Initialize Configuration
 
@@ -153,12 +212,6 @@ Custom configuration file:
 
 ```bash
 openspec-orchestrator run --config /path/to/config.jsonc
-```
-
-### Launch TUI Explicitly
-
-```bash
-openspec-orchestrator tui
 ```
 
 ### Manage Change Approval
@@ -429,8 +482,7 @@ openspec-orchestrator
 Usage: openspec-orchestrator [OPTIONS] [COMMAND]
 
 Commands:
-  run      Run the OpenSpec change orchestration loop (non-interactive)
-  tui      Launch the interactive TUI dashboard
+  run      Run the OpenSpec change orchestration loop (non-interactive, headless mode)
   init     Initialize a new configuration file
   approve  Manage change approval status
 
@@ -454,6 +506,18 @@ Options:
   --web                 Enable web monitoring server
   --web-port <PORT>     Web server port (default: 0 = auto-assign by OS)
   --web-bind <ADDR>     Web server bind address (default: 127.0.0.1)
+```
+
+**TUI options:**
+
+The TUI (default mode) also supports web monitoring options:
+
+```bash
+# TUI with web monitoring
+openspec-orchestrator --web
+
+# Custom port and bind address
+openspec-orchestrator --web --web-port 9000 --web-bind 0.0.0.0
 ```
 
 ### Parallel Execution
@@ -630,27 +694,21 @@ The orchestrator includes a command execution queue that prevents resource confl
 # → Usually succeeds on retry
 ```
 
-### Web Monitoring (Optional Feature)
+### Web Monitoring
 
 The orchestrator supports an optional HTTP server for remote monitoring of orchestration progress via web browser.
-
-**Note:** Web monitoring requires compiling with the `web-monitoring` feature flag:
-
-```bash
-cargo build --release --features web-monitoring
-```
 
 **Usage:**
 
 ```bash
-# Enable web monitoring (OS auto-assigns an available port)
-openspec-orchestrator run --web
+# Enable web monitoring with TUI (OS auto-assigns an available port)
+openspec-orchestrator --web
 
 # Custom port and bind address
-openspec-orchestrator run --web --web-port 9000 --web-bind 0.0.0.0
+openspec-orchestrator --web --web-port 9000 --web-bind 0.0.0.0
 
-# With TUI mode
-openspec-orchestrator tui --web
+# With headless run mode
+openspec-orchestrator run --web
 ```
 
 When using the default port (0), the OS automatically assigns an available port.
@@ -792,6 +850,14 @@ Priority: CLI argument > Environment variable > Default value
 
 - Check logs for specific errors
 - Try processing a single change: `--change <id>`
+
+## Installation
+
+```bash
+cargo install --path .
+```
+
+This will build and install the orchestrator to your Cargo bin directory (typically `~/.cargo/bin`).
 
 ## Development
 
