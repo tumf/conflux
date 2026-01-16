@@ -224,7 +224,7 @@ impl Orchestrator {
                         found.push(change.clone());
                     } else {
                         warn!(
-                            "Skipping unapproved change '{}'. Approve it first with: openspec-orchestrator approve set {}",
+                            "Skipping unapproved change '{}'. Approve it first with: cflx approve set {}",
                             trimmed, trimmed
                         );
                     }
@@ -241,7 +241,7 @@ impl Orchestrator {
             // Warn about unapproved changes
             for change in &unapproved {
                 warn!(
-                    "Skipping unapproved change '{}'. Approve it first with: openspec-orchestrator approve set {}",
+                    "Skipping unapproved change '{}'. Approve it first with: cflx approve set {}",
                     change.id, change.id
                 );
             }
@@ -793,7 +793,7 @@ impl Orchestrator {
             println!("No approved changes found for parallel execution.");
             for change in changes {
                 println!(
-                    "  - {} (unapproved) - use: openspec-orchestrator approve set {}",
+                    "  - {} (unapproved) - use: cflx approve set {}",
                     change.id, change.id
                 );
             }

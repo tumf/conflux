@@ -8,7 +8,7 @@ The CLI SHALL provide an `approve` subcommand to manage change approval status.
 
 #### Scenario: Approve a change with set action
 
-- **WHEN** user runs `openspec-orchestrator approve set {change_id}`
+- **WHEN** user runs `cflx approve set {change_id}`
 - **AND** the change directory `openspec/changes/{change_id}/` exists
 - **THEN** an `approved` file is created in the change directory
 - **AND** the file contains MD5 checksums of all `.md` files (except `tasks.md`)
@@ -16,28 +16,28 @@ The CLI SHALL provide an `approve` subcommand to manage change approval status.
 
 #### Scenario: Approve a change that doesn't exist
 
-- **WHEN** user runs `openspec-orchestrator approve set {change_id}`
+- **WHEN** user runs `cflx approve set {change_id}`
 - **AND** the change directory does not exist
 - **THEN** an error message is displayed
 - **AND** exit code is non-zero
 
 #### Scenario: Unapprove a change with unset action
 
-- **WHEN** user runs `openspec-orchestrator approve unset {change_id}`
+- **WHEN** user runs `cflx approve unset {change_id}`
 - **AND** the `approved` file exists
 - **THEN** the `approved` file is deleted
 - **AND** a success message is displayed
 
 #### Scenario: Unapprove a change that is not approved
 
-- **WHEN** user runs `openspec-orchestrator approve unset {change_id}`
+- **WHEN** user runs `cflx approve unset {change_id}`
 - **AND** the `approved` file does not exist
 - **THEN** a message indicates the change was not approved
 - **AND** exit code is zero (no-op)
 
 #### Scenario: Check approval status
 
-- **WHEN** user runs `openspec-orchestrator approve status {change_id}`
+- **WHEN** user runs `cflx approve status {change_id}`
 - **THEN** the approval status is displayed
 - **AND** if approved, shows "approved" with file count
 - **AND** if not approved, shows reason (file missing, hash mismatch, etc.)
@@ -99,7 +99,7 @@ The system SHALL prevent unapproved changes from being added to the execution qu
 
 #### Scenario: CLI run with unapproved change
 
-- **WHEN** user runs `openspec-orchestrator run --change {change_id}`
+- **WHEN** user runs `cflx run --change {change_id}`
 - **AND** the change is not approved
 - **THEN** a warning message is displayed
 - **AND** the change is NOT added to the queue
@@ -107,7 +107,7 @@ The system SHALL prevent unapproved changes from being added to the execution qu
 
 #### Scenario: CLI run with mixed approved/unapproved changes
 
-- **WHEN** user runs `openspec-orchestrator run --change a,b,c`
+- **WHEN** user runs `cflx run --change a,b,c`
 - **AND** change `a` is approved, `b` is not approved, `c` is approved
 - **THEN** warning is displayed for change `b`
 - **AND** only changes `a` and `c` are processed

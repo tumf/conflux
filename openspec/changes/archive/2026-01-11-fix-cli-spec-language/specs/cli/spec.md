@@ -6,7 +6,7 @@ CLI SHALL have a subcommand structure that supports future command extensions.
 
 #### Scenario: Run without subcommand
 
-- **WHEN** user runs `openspec-orchestrator` without arguments
+- **WHEN** user runs `cflx` without arguments
 - **THEN** the interactive TUI is launched
 - **AND** the change list is displayed in selection mode
 
@@ -21,26 +21,26 @@ The `run` subcommand SHALL execute the OpenSpec change workflow orchestration lo
 
 #### Scenario: Run with specific change
 
-- **WHEN** user runs `openspec-orchestrator run --change <id>`
+- **WHEN** user runs `cflx run --change <id>`
 - **THEN** only the specified change is processed
 - **AND** the snapshot log shows only the specified change
 
 #### Scenario: Run with comma-separated changes
 
-- **WHEN** user runs `openspec-orchestrator run --change a,b,c`
+- **WHEN** user runs `cflx run --change a,b,c`
 - **THEN** only changes `a`, `b`, `c` are processed
 - **AND** the snapshot log shows only `a`, `b`, `c`
 
 #### Scenario: Run with non-existent change
 
-- **WHEN** user runs `openspec-orchestrator run --change nonexistent`
+- **WHEN** user runs `cflx run --change nonexistent`
 - **AND** no change named `nonexistent` exists
 - **THEN** a warning message "Specified change 'nonexistent' not found, skipping" is displayed
 - **AND** exits with "No changes found"
 
 #### Scenario: Run with mixed valid and invalid changes
 
-- **WHEN** user runs `openspec-orchestrator run --change a,nonexistent,c`
+- **WHEN** user runs `cflx run --change a,nonexistent,c`
 - **AND** `a` and `c` exist but `nonexistent` does not
 - **THEN** a warning message "Specified change 'nonexistent' not found, skipping" is displayed
 - **AND** only `a` and `c` are processed
@@ -52,13 +52,13 @@ When launched without a subcommand, the interactive TUI SHALL be displayed.
 
 #### Scenario: Launch without subcommand
 
-- **WHEN** user runs `openspec-orchestrator` without arguments
+- **WHEN** user runs `cflx` without arguments
 - **THEN** the interactive TUI is launched
 - **AND** the change list is displayed in selection mode
 
 #### Scenario: Launch with run subcommand (backward compatibility)
 
-- **WHEN** user runs `openspec-orchestrator run`
+- **WHEN** user runs `cflx run`
 - **THEN** the orchestration loop is executed directly as before
 
 ### Requirement: Change Selection Mode
@@ -342,32 +342,32 @@ CLI SHALL allow explicit VCS backend selection via `--vcs` flag.
 
 #### Scenario: Explicit jj selection
 
-- **WHEN** `openspec-orchestrator run --parallel --vcs jj` is executed
+- **WHEN** `cflx run --parallel --vcs jj` is executed
 - **THEN** jj backend is used
 - **AND** an error is displayed if jj is not available
 
 #### Scenario: Explicit git selection
 
-- **WHEN** `openspec-orchestrator run --parallel --vcs git` is executed
+- **WHEN** `cflx run --parallel --vcs git` is executed
 - **THEN** Git backend is used
 - **AND** Git is used even if jj exists
 - **AND** an error is displayed if Git is not available
 
 #### Scenario: Explicit auto selection
 
-- **WHEN** `openspec-orchestrator run --parallel --vcs auto` is executed
+- **WHEN** `cflx run --parallel --vcs auto` is executed
 - **THEN** VCS backend is auto-detected
 - **AND** jj is preferred, Git is used if jj is not available
 
 #### Scenario: Invalid VCS value
 
-- **WHEN** `openspec-orchestrator run --parallel --vcs invalid` is executed
+- **WHEN** `cflx run --parallel --vcs invalid` is executed
 - **THEN** error message "Invalid VCS backend: invalid. Valid options: auto, jj, git" is displayed
 - **AND** exit code is non-zero
 
 #### Scenario: --vcs without --parallel
 
-- **WHEN** `openspec-orchestrator run --vcs git` is executed
+- **WHEN** `cflx run --vcs git` is executed
 - **AND** `--parallel` flag is not specified
 - **THEN** `--vcs` option is ignored
 - **AND** normal sequential execution proceeds

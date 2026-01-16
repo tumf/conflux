@@ -30,7 +30,7 @@
 
 #### Scenario: カスタム遅延時間の設定
 
-- **GIVEN** `.openspec-orchestrator.jsonc` に以下の設定が存在する:
+- **GIVEN** `.cflx.jsonc` に以下の設定が存在する:
   ```jsonc
   {
     "command_queue_stagger_delay_ms": 5000
@@ -41,7 +41,7 @@
 
 #### Scenario: カスタムリトライ設定
 
-- **GIVEN** `.openspec-orchestrator.jsonc` に以下の設定が存在する:
+- **GIVEN** `.cflx.jsonc` に以下の設定が存在する:
   ```jsonc
   {
     "command_queue_max_retries": 5,
@@ -58,7 +58,7 @@
 
 #### Scenario: 空のリトライパターンリスト
 
-- **GIVEN** `.openspec-orchestrator.jsonc` に以下の設定が存在する:
+- **GIVEN** `.cflx.jsonc` に以下の設定が存在する:
   ```jsonc
   {
     "command_queue_retry_patterns": []
@@ -69,7 +69,7 @@
 
 #### Scenario: 遅延時間ゼロの設定
 
-- **GIVEN** `.openspec-orchestrator.jsonc` に以下の設定が存在する:
+- **GIVEN** `.cflx.jsonc` に以下の設定が存在する:
   ```jsonc
   {
     "command_queue_stagger_delay_ms": 0
@@ -80,7 +80,7 @@
 
 #### Scenario: 実行時間による自動リトライ
 
-- **GIVEN** `.openspec-orchestrator.jsonc` に以下の設定が存在する:
+- **GIVEN** `.cflx.jsonc` に以下の設定が存在する:
   ```jsonc
   {
     "command_queue_retry_if_duration_under_secs": 5
@@ -92,7 +92,7 @@
 
 #### Scenario: 長時間実行後のエラーはリトライしない
 
-- **GIVEN** `.openspec-orchestrator.jsonc` にデフォルト設定が使用される
+- **GIVEN** `.cflx.jsonc` にデフォルト設定が使用される
 - **WHEN** コマンド実行が30秒で失敗
 - **AND** エラーメッセージがリトライパターンにマッチしない
 - **THEN** 実行時間が5秒を超えているため、リトライされない

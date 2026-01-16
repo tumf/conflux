@@ -1,6 +1,6 @@
 //! Ralph Loop Compatibility Tests
 //!
-//! These tests verify that the openspec-orchestrator is compatible with
+//! These tests verify that Conflux is compatible with
 //! the Ralph Wiggum plugin for OpenCode.
 //!
 //! Key compatibility requirements:
@@ -11,10 +11,10 @@
 #[test]
 fn test_command_format_compatibility() {
     // OpenCode command format for Headless mode (used by Orchestrator)
-    let headless_command = "/openspec-apply add-feature";
+    let headless_command = "/conflux:apply add-feature";
 
     // Ralph loop uses the same command format in TUI mode
-    let tui_command = "/openspec-apply add-feature";
+    let tui_command = "/conflux:apply add-feature";
 
     assert_eq!(
         headless_command, tui_command,
@@ -23,7 +23,7 @@ fn test_command_format_compatibility() {
 
     // Verify command parsing
     let parts: Vec<&str> = headless_command.split_whitespace().collect();
-    assert_eq!(parts[0], "/openspec-apply");
+    assert_eq!(parts[0], "/conflux:apply");
     assert_eq!(parts[1], "add-feature");
 }
 
@@ -45,7 +45,7 @@ fn test_execution_mode_separation() {
     let ralph_api_functions = vec!["appendPrompt", "submitPrompt", "session.idle"];
 
     // Orchestrator uses CLI commands
-    let orchestrator_commands = vec!["opencode run", "/openspec-apply", "/openspec-archive"];
+    let orchestrator_commands = vec!["opencode run", "/conflux:apply", "/conflux:archive"];
 
     // No overlap in mechanisms
     for ralph_fn in &ralph_api_functions {
@@ -67,15 +67,15 @@ fn test_mode_switching() {
     // The key insight is that:
     // 1. Ralph loop works in TUI mode (interactive)
     // 2. Orchestrator works in Headless mode (batch processing)
-    // 3. The /openspec-apply command works in both modes
+    // 3. The /conflux:apply command works in both modes
 
     // Verify that the command definitions are consistent
-    let openspec_apply_command = "/openspec-apply";
-    let openspec_archive_command = "/openspec-archive";
+    let openspec_apply_command = "/conflux:apply";
+    let conflux_archive_command = "/conflux:archive";
 
     // Both commands should be available for use in either mode
     assert!(openspec_apply_command.starts_with('/'));
-    assert!(openspec_archive_command.starts_with('/'));
+    assert!(conflux_archive_command.starts_with('/'));
 
     // Commands take change-id as argument
     let example_apply = format!("{} {}", openspec_apply_command, "my-change");

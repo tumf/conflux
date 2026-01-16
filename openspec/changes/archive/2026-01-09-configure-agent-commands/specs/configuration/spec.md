@@ -11,11 +11,11 @@
 
 #### Scenario: プロジェクト設定ファイルが存在する場合
 
-- **WHEN** `.openspec-orchestrator.jsonc` に以下の設定が存在する:
+- **WHEN** `.cflx.jsonc` に以下の設定が存在する:
   ```jsonc
   {
     "apply_command": "codex run 'openspec-apply {change_id}'",
-    "archive_command": "codex run 'openspec-archive {change_id}'"
+    "archive_command": "codex run 'conflux:archive {change_id}'"
   }
   ```
 - **AND** 変更 `add-feature` を適用する
@@ -23,14 +23,14 @@
 
 #### Scenario: 設定ファイルが存在しない場合のフォールバック
 
-- **WHEN** `.openspec-orchestrator.jsonc` が存在しない
+- **WHEN** `.cflx.jsonc` が存在しない
 - **AND** グローバル設定も存在しない
 - **AND** 変更 `add-feature` を適用する
 - **THEN** デフォルトの OpenCode コマンド `opencode run '/openspec-apply add-feature'` が実行される
 
 #### Scenario: 部分的な設定のフォールバック
 
-- **WHEN** `.openspec-orchestrator.jsonc` に `apply_command` のみ設定されている
+- **WHEN** `.cflx.jsonc` に `apply_command` のみ設定されている
 - **AND** `archive_command` が設定されていない
 - **THEN** `archive_command` はデフォルトの OpenCode コマンドが使用される
 
@@ -38,18 +38,18 @@
 
 オーケストレーターは以下の優先順位で設定ファイルを読み込まなければならない (MUST):
 
-1. **プロジェクト設定** (優先): `.openspec-orchestrator.jsonc` (プロジェクトルート)
-2. **グローバル設定**: `~/.config/openspec-orchestrator/config.jsonc`
+1. **プロジェクト設定** (優先): `.cflx.jsonc` (プロジェクトルート)
+2. **グローバル設定**: `~/.config/cflx/config.jsonc`
 
 プロジェクト設定が存在する場合はそちらを使用し、存在しない場合のみグローバル設定を使用する。
 
 #### Scenario: プロジェクト設定がグローバル設定より優先される
 
-- **GIVEN** グローバル設定 `~/.config/openspec-orchestrator/config.jsonc` に:
+- **GIVEN** グローバル設定 `~/.config/cflx/config.jsonc` に:
   ```jsonc
   { "apply_command": "global-agent apply {change_id}" }
   ```
-- **AND** プロジェクト設定 `.openspec-orchestrator.jsonc` に:
+- **AND** プロジェクト設定 `.cflx.jsonc` に:
   ```jsonc
   { "apply_command": "project-agent apply {change_id}" }
   ```
@@ -58,8 +58,8 @@
 
 #### Scenario: プロジェクト設定がない場合はグローバル設定を使用
 
-- **GIVEN** プロジェクトルートに `.openspec-orchestrator.jsonc` が存在しない
-- **AND** グローバル設定 `~/.config/openspec-orchestrator/config.jsonc` に:
+- **GIVEN** プロジェクトルートに `.cflx.jsonc` が存在しない
+- **AND** グローバル設定 `~/.config/cflx/config.jsonc` に:
   ```jsonc
   { "apply_command": "global-agent apply {change_id}" }
   ```

@@ -7,7 +7,7 @@
 Run the orchestrator to process all pending changes:
 
 ```bash
-openspec-orchestrator run
+cflx run
 ```
 
 This will:
@@ -22,7 +22,7 @@ This will:
 Preview what the orchestrator would do without executing:
 
 ```bash
-openspec-orchestrator run --dry-run
+cflx run --dry-run
 ```
 
 Output:
@@ -39,7 +39,7 @@ Output:
 Work on a single change:
 
 ```bash
-openspec-orchestrator run --change add-feature-x
+cflx run --change add-feature-x
 ```
 
 This focuses only on `add-feature-x`, ignoring other changes.
@@ -51,7 +51,7 @@ This focuses only on `add-feature-x`, ignoring other changes.
 If `opencode` or `openspec` are not in your PATH:
 
 ```bash
-openspec-orchestrator run \
+cflx run \
   --opencode-path ~/bin/opencode \
   --openspec-path ~/bin/openspec
 ```
@@ -61,7 +61,7 @@ openspec-orchestrator run \
 View current orchestration state:
 
 ```bash
-openspec-orchestrator status
+cflx status
 ```
 
 Output:
@@ -89,10 +89,10 @@ Clear orchestration state to start fresh:
 
 ```bash
 # With confirmation prompt
-openspec-orchestrator reset
+cflx reset
 
 # Skip confirmation
-openspec-orchestrator reset --yes
+cflx reset --yes
 ```
 
 ## Workflow Examples
@@ -101,52 +101,52 @@ openspec-orchestrator reset --yes
 
 ```bash
 # Start orchestration
-openspec-orchestrator run
+cflx run
 
 # Check progress in another terminal
-watch -n 5 openspec-orchestrator status
+watch -n 5 cflx status
 ```
 
 ### Example 2: Step-by-Step Processing
 
 ```bash
 # Process first change
-openspec-orchestrator run --change change-1
+cflx run --change change-1
 
 # Verify completion
 openspec list
 
 # Process second change
-openspec-orchestrator run --change change-2
+cflx run --change change-2
 
 # Check final status
-openspec-orchestrator status
+cflx status
 ```
 
 ### Example 3: Recovery from Failure
 
 ```bash
 # Run orchestrator
-openspec-orchestrator run
+cflx run
 
 # If interrupted or failed, check status
-openspec-orchestrator status
+cflx status
 
 # Resume (state is automatically loaded)
-openspec-orchestrator run
+cflx run
 ```
 
 ### Example 4: Development Workflow
 
 ```bash
 # Dry run to see execution plan
-openspec-orchestrator run --dry-run
+cflx run --dry-run
 
 # Review changes manually
 openspec list
 
 # Execute for real
-openspec-orchestrator run
+cflx run
 
 # Monitor progress
 tail -f .opencode/orchestrator-state.json
@@ -172,11 +172,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          cargo install --path openspec-orchestrator
+          cargo install --path cflx
 
       - name: Run orchestrator
         run: |
-          openspec-orchestrator run
+          cflx run
         env:
           RUST_LOG: info
 
@@ -193,19 +193,19 @@ jobs:
 ```dockerfile
 FROM rust:1.75 as builder
 WORKDIR /app
-COPY openspec-orchestrator ./
+COPY cflx ./
 RUN cargo build --release
 
 FROM ubuntu:22.04
 RUN apt-get update && apt-get install -y openssl ca-certificates
-COPY --from=builder /app/target/release/openspec-orchestrator /usr/local/bin/
-ENTRYPOINT ["openspec-orchestrator"]
+COPY --from=builder /app/target/release/cflx /usr/local/bin/
+ENTRYPOINT ["cflx"]
 ```
 
 Run:
 ```bash
-docker build -t openspec-orchestrator .
-docker run -v $(pwd):/workspace openspec-orchestrator run
+docker build -t cflx .
+docker run -v $(pwd):/workspace cflx run
 ```
 
 ## Troubleshooting Examples
@@ -213,13 +213,13 @@ docker run -v $(pwd):/workspace openspec-orchestrator run
 ### Debug Mode
 
 ```bash
-RUST_LOG=debug openspec-orchestrator run --dry-run 2>&1 | tee debug.log
+RUST_LOG=debug cflx run --dry-run 2>&1 | tee debug.log
 ```
 
 ### Verbose Output
 
 ```bash
-RUST_LOG=trace openspec-orchestrator run --change test-change
+RUST_LOG=trace cflx run --change test-change
 ```
 
 ### Check Logs
@@ -238,10 +238,10 @@ ls -la ~/.opencode/logs/
 
 ```bash
 # See what would happen
-openspec-orchestrator run --dry-run
+cflx run --dry-run
 
 # If looks good, execute
-openspec-orchestrator run
+cflx run
 ```
 
 ### 2. Monitor Progress
@@ -249,10 +249,10 @@ openspec-orchestrator run
 Use a split terminal:
 ```bash
 # Terminal 1
-openspec-orchestrator run
+cflx run
 
 # Terminal 2
-watch -n 2 'openspec list && echo && openspec-orchestrator status'
+watch -n 2 'openspec list && echo && cflx status'
 ```
 
 ### 3. Incremental Processing
@@ -260,7 +260,7 @@ watch -n 2 'openspec list && echo && openspec-orchestrator status'
 For safety, process one change at a time:
 ```bash
 for change in $(openspec list | grep -oP '^\s*-\s+\K[^\s]+'); do
-  openspec-orchestrator run --change "$change"
+  cflx run --change "$change"
   if [ $? -ne 0 ]; then
     echo "Failed on $change"
     break
@@ -275,7 +275,7 @@ done
 openspec list
 
 # After completion
-openspec-orchestrator status
+cflx status
 ```
 
 ## Tips
@@ -295,10 +295,10 @@ openspec-orchestrator status
 # nightly-orchestrator.sh
 
 cd /path/to/project
-openspec-orchestrator run --dry-run > /tmp/orchestrator-plan.txt
+cflx run --dry-run > /tmp/orchestrator-plan.txt
 
 if [ $? -eq 0 ]; then
-  openspec-orchestrator run
+  cflx run
   echo "Orchestration completed" | mail -s "OpenSpec Orchestrator" admin@example.com
 fi
 ```
@@ -309,13 +309,13 @@ fi
 # Process only high-priority changes
 openspec list | grep -E 'urgent|critical' | \
   cut -d' ' -f3 | \
-  xargs -I {} openspec-orchestrator run --change {}
+  xargs -I {} cflx run --change {}
 ```
 
 ### Pattern 3: Progress Notification
 
 ```bash
-openspec-orchestrator run
+cflx run
 STATUS=$?
 
 if [ $STATUS -eq 0 ]; then

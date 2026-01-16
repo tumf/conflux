@@ -1,5 +1,5 @@
 ## Context
-`archive_command` は外部コマンド（例: `opencode run ... '/openspec-archive ...'`）で実行されます。ログ上、終了コード 0 を返しても実際のアーカイブ（`openspec/changes/<id>` の移動）が発生しないケースがあり、その直後の検証で false negative が発生します。
+`archive_command` は外部コマンド（例: `opencode run ... '/conflux:archive ...'`）で実行されます。ログ上、終了コード 0 を返しても実際のアーカイブ（`openspec/changes/<id>` の移動）が発生しないケースがあり、その直後の検証で false negative が発生します。
 
 ## Goals / Non-Goals
 - Goals:

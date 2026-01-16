@@ -336,7 +336,7 @@ Templates SHALL use simple string format (not object format with timeout/continu
 
 #### Scenario: Claude template hook examples
 
-- **WHEN** user runs `openspec-orchestrator init --template claude`
+- **WHEN** user runs `cflx init --template claude`
 - **THEN** the hooks section contains commented examples for each hook type
 - **AND** each example uses `echo` with all available placeholders for that hook
 - **AND** no hook uses object format (timeout, continue_on_failure)

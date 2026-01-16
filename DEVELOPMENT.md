@@ -1,6 +1,6 @@
 # Development Guide
 
-This document provides information for developers contributing to OpenSpec Orchestrator.
+This document provides information for developers contributing to Conflux.
 
 ## Prerequisites
 
@@ -21,7 +21,7 @@ cargo build
 cargo build --release
 ```
 
-The binary will be available at `target/release/openspec-orchestrator`.
+The binary will be available at `target/release/cflx`.
 
 ## Testing
 
@@ -71,10 +71,10 @@ Available log levels: `error`, `warn`, `info`, `debug`, `trace`
 
 ```bash
 # Log only orchestrator module
-RUST_LOG=openspec_orchestrator::orchestrator=debug cargo run -- run
+RUST_LOG=conflux::orchestrator=debug cargo run -- run
 
 # Log multiple modules
-RUST_LOG=openspec_orchestrator::agent=debug,openspec_orchestrator::hooks=debug cargo run -- run
+RUST_LOG=conflux::agent=debug,conflux::hooks=debug cargo run -- run
 ```
 
 ## Project Structure
@@ -121,7 +121,7 @@ src/
 ```
 User starts orchestrator
         ↓
-    Load config (.openspec-orchestrator.jsonc)
+    Load config (.cflx.jsonc)
         ↓
     Run on_start hook
         ↓

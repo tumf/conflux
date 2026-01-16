@@ -1,7 +1,7 @@
 # cli Specification
 
 ## Purpose
-Defines CLI commands, subcommands, flags, and their behaviors for the openspec-orchestrator binary.
+Defines CLI commands, subcommands, flags, and their behaviors for the cflx binary.
 ## Requirements
 ### Requirement: Subcommand Structure
 
@@ -9,7 +9,7 @@ CLI SHALL have a subcommand structure that supports future command extensions.
 
 #### Scenario: Run without subcommand
 
-- **WHEN** user runs `openspec-orchestrator` without arguments
+- **WHEN** user runs `cflx` without arguments
 - **THEN** the interactive TUI is launched
 - **AND** the change list is displayed in selection mode
 
@@ -24,26 +24,26 @@ The `run` subcommand SHALL execute the OpenSpec change workflow orchestration lo
 
 #### Scenario: Run with specific change
 
-- **WHEN** user runs `openspec-orchestrator run --change <id>`
+- **WHEN** user runs `cflx run --change <id>`
 - **THEN** only the specified change is processed
 - **AND** the snapshot log shows only the specified change
 
 #### Scenario: Run with comma-separated changes
 
-- **WHEN** user runs `openspec-orchestrator run --change a,b,c`
+- **WHEN** user runs `cflx run --change a,b,c`
 - **THEN** only changes `a`, `b`, `c` are processed
 - **AND** the snapshot log shows only `a`, `b`, `c`
 
 #### Scenario: Run with non-existent change
 
-- **WHEN** user runs `openspec-orchestrator run --change nonexistent`
+- **WHEN** user runs `cflx run --change nonexistent`
 - **AND** no change named `nonexistent` exists
 - **THEN** a warning message "Specified change 'nonexistent' not found, skipping" is displayed
 - **AND** exits with "No changes found"
 
 #### Scenario: Run with mixed valid and invalid changes
 
-- **WHEN** user runs `openspec-orchestrator run --change a,nonexistent,c`
+- **WHEN** user runs `cflx run --change a,nonexistent,c`
 - **AND** `a` and `c` exist but `nonexistent` does not
 - **THEN** a warning message "Specified change 'nonexistent' not found, skipping" is displayed
 - **AND** only `a` and `c` are processed
@@ -55,13 +55,13 @@ When launched without a subcommand, the interactive TUI SHALL be displayed.
 
 #### Scenario: Launch without subcommand
 
-- **WHEN** user runs `openspec-orchestrator` without arguments
+- **WHEN** user runs `cflx` without arguments
 - **THEN** the interactive TUI is launched
 - **AND** the change list is displayed in selection mode
 
 #### Scenario: Launch with run subcommand (backward compatibility)
 
-- **WHEN** user runs `openspec-orchestrator run`
+- **WHEN** user runs `cflx run`
 - **THEN** the orchestration loop is executed directly as before
 
 ### Requirement: Change Selection Mode
@@ -255,54 +255,54 @@ In error state, pressing F5 key SHALL retry processing of the failed Change.
 
 ### Requirement: init Subcommand
 
-`init` subcommand SHALL generate a `.openspec-orchestrator.jsonc` configuration template file in the current directory.
+`init` subcommand SHALL generate a `.cflx.jsonc` configuration template file in the current directory.
 
 #### Scenario: Generate default template (claude)
 
-- **WHEN** user runs `openspec-orchestrator init`
-- **AND** no `.openspec-orchestrator.jsonc` exists in the current directory
-- **THEN** a `.openspec-orchestrator.jsonc` file is created with Claude Code template
+- **WHEN** user runs `cflx init`
+- **AND** no `.cflx.jsonc` exists in the current directory
+- **THEN** a `.cflx.jsonc` file is created with Claude Code template
 - **AND** the template includes apply_command, archive_command, analyze_command, and hooks
 
 #### Scenario: Generate opencode template
 
-- **WHEN** user runs `openspec-orchestrator init --template opencode`
-- **AND** no `.openspec-orchestrator.jsonc` exists in the current directory
-- **THEN** a `.openspec-orchestrator.jsonc` file is created with OpenCode template
+- **WHEN** user runs `cflx init --template opencode`
+- **AND** no `.cflx.jsonc` exists in the current directory
+- **THEN** a `.cflx.jsonc` file is created with OpenCode template
 - **AND** commands use `opencode run` pattern
 
 #### Scenario: Generate claude template explicitly
 
-- **WHEN** user runs `openspec-orchestrator init --template claude`
-- **AND** no `.openspec-orchestrator.jsonc` exists in the current directory
-- **THEN** a `.openspec-orchestrator.jsonc` file is created with Claude Code template
+- **WHEN** user runs `cflx init --template claude`
+- **AND** no `.cflx.jsonc` exists in the current directory
+- **THEN** a `.cflx.jsonc` file is created with Claude Code template
 - **AND** commands use `claude --dangerously-skip-permissions -p` pattern
 
 #### Scenario: Generate codex template
 
-- **WHEN** user runs `openspec-orchestrator init --template codex`
-- **AND** no `.openspec-orchestrator.jsonc` exists in the current directory
-- **THEN** a `.openspec-orchestrator.jsonc` file is created with Codex template
+- **WHEN** user runs `cflx init --template codex`
+- **AND** no `.cflx.jsonc` exists in the current directory
+- **THEN** a `.cflx.jsonc` file is created with Codex template
 - **AND** commands use `codex` pattern
 
 #### Scenario: Config file already exists without force flag
 
-- **WHEN** user runs `openspec-orchestrator init`
-- **AND** `.openspec-orchestrator.jsonc` already exists in the current directory
+- **WHEN** user runs `cflx init`
+- **AND** `.cflx.jsonc` already exists in the current directory
 - **THEN** the command exits with an error
 - **AND** an error message indicates the file already exists
 - **AND** suggests using `--force` to overwrite
 
 #### Scenario: Overwrite existing config with force flag
 
-- **WHEN** user runs `openspec-orchestrator init --force`
-- **AND** `.openspec-orchestrator.jsonc` already exists in the current directory
+- **WHEN** user runs `cflx init --force`
+- **AND** `.cflx.jsonc` already exists in the current directory
 - **THEN** the existing file is overwritten with the new template
 - **AND** a success message is displayed
 
 #### Scenario: Invalid template name
 
-- **WHEN** user runs `openspec-orchestrator init --template invalid`
+- **WHEN** user runs `cflx init --template invalid`
 - **THEN** the command exits with an error
 - **AND** an error message lists valid template options (opencode, claude, codex)
 
@@ -485,12 +485,12 @@ The system SHALL use native task parsing as primary source when openspec CLI ret
 The CLI SHALL support a `--version` flag to display the application version.
 
 #### Scenario: Display version with --version flag
-- **WHEN** user runs `openspec-orchestrator --version`
+- **WHEN** user runs `cflx --version`
 - **THEN** the application version from Cargo.toml is displayed
 - **AND** the program exits with code 0
 
 #### Scenario: Display version with -V short flag
-- **WHEN** user runs `openspec-orchestrator -V`
+- **WHEN** user runs `cflx -V`
 - **THEN** the application version is displayed (same as `--version`)
 
 ### Requirement: TUI Header Version Display
@@ -698,7 +698,7 @@ The CLI SHALL provide an `approve` subcommand to manage change approval status.
 
 #### Scenario: Approve a change with set action
 
-- **WHEN** user runs `openspec-orchestrator approve set {change_id}`
+- **WHEN** user runs `cflx approve set {change_id}`
 - **AND** the change directory `openspec/changes/{change_id}/` exists
 - **THEN** an `approved` file is created in the change directory
 - **AND** the file contains MD5 checksums of all `.md` files (except `tasks.md`)
@@ -706,28 +706,28 @@ The CLI SHALL provide an `approve` subcommand to manage change approval status.
 
 #### Scenario: Approve a change that doesn't exist
 
-- **WHEN** user runs `openspec-orchestrator approve set {change_id}`
+- **WHEN** user runs `cflx approve set {change_id}`
 - **AND** the change directory does not exist
 - **THEN** an error message is displayed
 - **AND** exit code is non-zero
 
 #### Scenario: Unapprove a change with unset action
 
-- **WHEN** user runs `openspec-orchestrator approve unset {change_id}`
+- **WHEN** user runs `cflx approve unset {change_id}`
 - **AND** the `approved` file exists
 - **THEN** the `approved` file is deleted
 - **AND** a success message is displayed
 
 #### Scenario: Unapprove a change that is not approved
 
-- **WHEN** user runs `openspec-orchestrator approve unset {change_id}`
+- **WHEN** user runs `cflx approve unset {change_id}`
 - **AND** the `approved` file does not exist
 - **THEN** a message indicates the change was not approved
 - **AND** exit code is zero (no-op)
 
 #### Scenario: Check approval status
 
-- **WHEN** user runs `openspec-orchestrator approve status {change_id}`
+- **WHEN** user runs `cflx approve status {change_id}`
 - **THEN** the approval status is displayed
 - **AND** if approved, shows "approved" with file count
 - **AND** if not approved, shows reason (file missing, hash mismatch, etc.)
@@ -815,7 +815,7 @@ The system SHALL prevent unapproved changes from being added to the execution qu
 
 #### Scenario: CLI run with unapproved change
 
-- **WHEN** user runs `openspec-orchestrator run --change {change_id}`
+- **WHEN** user runs `cflx run --change {change_id}`
 - **AND** the change is not approved
 - **THEN** a warning message is displayed
 - **AND** the change is NOT added to the queue
@@ -823,7 +823,7 @@ The system SHALL prevent unapproved changes from being added to the execution qu
 
 #### Scenario: CLI run with mixed approved/unapproved changes
 
-- **WHEN** user runs `openspec-orchestrator run --change a,b,c`
+- **WHEN** user runs `cflx run --change a,b,c`
 - **AND** change `a` is approved, `b` is not approved, `c` is approved
 - **THEN** warning is displayed for change `b`
 - **AND** only changes `a` and `c` are processed
@@ -1040,24 +1040,24 @@ Changes interrupted by force stop SHALL be handled gracefully.
 The CLI SHALL support a `--parallel` flag to enable parallel change execution using git worktrees. Parallel mode is OFF by default.
 
 #### Scenario: Enable parallel mode via CLI flag
-- **WHEN** user runs `openspec-orchestrator run --parallel`
+- **WHEN** user runs `cflx run --parallel`
 - **AND** a `.git` directory exists
 - **THEN** the orchestrator enters parallel execution mode
 - **AND** changes are analyzed for parallelization opportunities
 
 #### Scenario: Parallel mode disabled by default
-- **WHEN** user runs `openspec-orchestrator run` without `--parallel` flag
+- **WHEN** user runs `cflx run` without `--parallel` flag
 - **THEN** the orchestrator uses sequential execution mode
 - **AND** no parallelization analysis is performed
 
 #### Scenario: Parallel mode requires git directory
-- **WHEN** user runs `openspec-orchestrator run --parallel`
+- **WHEN** user runs `cflx run --parallel`
 - **AND** no `.git` directory exists
 - **THEN** the command exits with error code 1
 - **AND** an error message indicates git repository is required for parallel mode
 
 #### Scenario: Parallel mode with max concurrent limit
-- **WHEN** user runs `openspec-orchestrator run --parallel --max-concurrent 4`
+- **WHEN** user runs `cflx run --parallel --max-concurrent 4`
 - **THEN** at most 4 workspaces are created simultaneously
 - **AND** additional changes wait until a workspace becomes available
 
@@ -1085,7 +1085,7 @@ The TUI SHALL display parallel execution progress when in parallel mode.
 The CLI SHALL support `--dry-run` to preview parallelization groups without execution.
 
 #### Scenario: Preview parallelization groups
-- **WHEN** user runs `openspec-orchestrator run --parallel --dry-run`
+- **WHEN** user runs `cflx run --parallel --dry-run`
 - **THEN** the analyzer determines parallelization groups
 - **AND** the groups are displayed without executing any changes
 - **AND** no workspaces are created
@@ -1103,25 +1103,25 @@ CLI SHALL allow explicit VCS backend selection via `--vcs` flag.
 
 #### Scenario: Explicit git selection
 
-- **WHEN** `openspec-orchestrator run --parallel --vcs git` is executed
+- **WHEN** `cflx run --parallel --vcs git` is executed
 - **THEN** Git backend is used
 - **AND** an error is displayed if Git is not available
 
 #### Scenario: Explicit auto selection
 
-- **WHEN** `openspec-orchestrator run --parallel --vcs auto` is executed
+- **WHEN** `cflx run --parallel --vcs auto` is executed
 - **THEN** VCS backend is auto-detected
 - **AND** Git backend is selected when a `.git` directory exists
 
 #### Scenario: Invalid VCS value
 
-- **WHEN** `openspec-orchestrator run --parallel --vcs invalid` is executed
+- **WHEN** `cflx run --parallel --vcs invalid` is executed
 - **THEN** error message "Invalid VCS backend: invalid. Valid options: auto, git" is displayed
 - **AND** exit code is non-zero
 
 #### Scenario: --vcs without --parallel
 
-- **WHEN** `openspec-orchestrator run --vcs git` is executed
+- **WHEN** `cflx run --vcs git` is executed
 - **AND** `--parallel` flag is not specified
 - **THEN** `--vcs` option is ignored
 - **AND** normal sequential execution proceeds
@@ -1200,7 +1200,7 @@ The CLI SHALL support flags to enable and configure web-based monitoring.
 - **AND** TUI shows web server URL (e.g., "Web monitoring: http://127.0.0.1:8080")
 
 #### Scenario: Web monitoring in run mode
-- **WHEN** user runs `openspec-orchestrator run --web`
+- **WHEN** user runs `cflx run --web`
 - **THEN** HTTP server starts before orchestration begins
 - **AND** server URL is logged to console
 - **AND** orchestration proceeds normally
@@ -1236,7 +1236,7 @@ The CLI SHALL detect whether the current directory is a git-managed repository b
 
 #### Scenario: git repository not detected
 - **WHEN** no `.git` directory exists in the current working directory
-- **AND** user runs `openspec-orchestrator run --parallel`
+- **AND** user runs `cflx run --parallel`
 - **THEN** the command exits with a non-zero exit code
 - **AND** an error message is displayed: "Error: --parallel requires a git repository (.git directory not found)"
 

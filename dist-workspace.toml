@@ -23,4 +23,4 @@ install-path = "CARGO_HOME"
 # Update README badges during release
 install-updater = false
 # Release downloads URL
-github-releases-repo = "tumf/openspec-orchestrator"
+github-releases-repo = "tumf/conflux"

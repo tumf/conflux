@@ -2,7 +2,7 @@
 
 ## Background
 
-The TUI mode of openspec-orchestrator generates excessive repetitive DEBUG logs every 5 seconds, even when there are no state changes. Analyzing `/tmp/tui-serial-debug.log` reveals the following repetitive patterns:
+The TUI mode of cflx generates excessive repetitive DEBUG logs every 5 seconds, even when there are no state changes. Analyzing `/tmp/tui-serial-debug.log` reveals the following repetitive patterns:
 
 ### Current Issues
 
@@ -138,7 +138,7 @@ impl LogDeduplicator {
 Add a configuration option to control this behavior:
 
 ```jsonc
-// .openspec-orchestrator.jsonc
+// .cflx.jsonc
 {
   "logging": {
     "suppress_repetitive_debug": true,  // Default: true
