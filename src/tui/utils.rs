@@ -55,6 +55,36 @@ pub fn launch_editor_for_change(change_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Launch editor in the specified directory
+///
+/// Opens the user's configured editor ($EDITOR) in the given directory.
+/// Falls back to "vi" if $EDITOR is not set.
+pub fn launch_editor_in_dir(dir_path: &str) -> Result<()> {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+
+    let path = Path::new(dir_path);
+
+    if !path.exists() {
+        return Err(OrchestratorError::ChangeNotFound(format!(
+            "Directory not found: {}",
+            dir_path
+        )));
+    }
+
+    info!(
+        module = module_path!(),
+        "Launching editor: {} (cwd: {:?})", editor, path
+    );
+
+    Command::new(&editor)
+        .arg(".")
+        .current_dir(path)
+        .status()
+        .map_err(|e| OrchestratorError::EditorLaunchFailed(e.to_string()))?;
+
+    Ok(())
+}
+
 /// Truncate a string to fit within a specified display width.
 ///
 /// This function respects Unicode character display widths, where CJK characters

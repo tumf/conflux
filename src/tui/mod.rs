@@ -14,7 +14,7 @@ mod queue;
 mod render;
 mod runner;
 mod state;
-mod types;
+pub mod types;
 mod utils;
 
 // Public API re-exports

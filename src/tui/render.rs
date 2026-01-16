@@ -3,7 +3,7 @@
 //! Contains all render_* functions for drawing the UI.
 
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
@@ -57,6 +57,8 @@ pub const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '
 
 /// Render the TUI
 pub fn render(frame: &mut Frame, app: &mut AppState) {
+    use crate::tui::types::ViewMode;
+
     let area = frame.area();
 
     // Check minimum terminal size
@@ -67,11 +69,19 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
         return;
     }
 
-    // Show logs panel when logs exist, regardless of mode
-    if app.logs.is_empty() {
-        render_select_mode(frame, app, area);
-    } else {
-        render_running_mode(frame, app, area);
+    // Route to appropriate view based on ViewMode
+    match app.view_mode {
+        ViewMode::Changes => {
+            // Show logs panel when logs exist, regardless of mode
+            if app.logs.is_empty() {
+                render_select_mode(frame, app, area);
+            } else {
+                render_running_mode(frame, app, area);
+            }
+        }
+        ViewMode::Worktrees => {
+            render_worktree_view(frame, app, area);
+        }
     }
 
     // Render QR popup on top if in QrPopup mode
@@ -333,13 +343,11 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
         if matches!(item.queue_status, QueueStatus::MergeWait) {
             keys.push("M: resolve");
         }
-        if item.has_worktree {
-            keys.push("D: delete WT");
-        }
     }
     if has_queue {
         keys.push("F5: run");
     }
+    keys.push("Tab: worktrees");
     // Show parallel toggle hint only if parallel execution is available
     if app.parallel_available {
         keys.push(if app.parallel_mode {
@@ -530,6 +538,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             keys.push("M: resolve");
         }
     }
+    keys.push("Tab: worktrees");
     // Show QR code hint if web server is enabled
     if app.web_url.is_some() {
         keys.push("w: QR");
@@ -854,6 +863,172 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
             .border_style(Style::default().fg(Color::Blue)),
     );
     frame.render_widget(footer, area);
+}
+
+/// Render worktree view
+fn render_worktree_view(frame: &mut Frame, app: &mut AppState, area: Rect) {
+    let chunks = Layout::vertical([
+        Constraint::Length(3), // Header
+        Constraint::Min(5),    // Worktree list
+        Constraint::Length(3), // Footer
+    ])
+    .split(area);
+
+    // Header
+    render_header(frame, app, chunks[0]);
+
+    // Worktree list
+    render_worktree_list(frame, app, chunks[1]);
+
+    // Footer
+    render_footer_worktree(frame, app, chunks[2]);
+}
+
+/// Render the worktree list
+fn render_worktree_list(frame: &mut Frame, app: &mut AppState, area: Rect) {
+    use crate::tui::types::ViewMode;
+
+    if app.view_mode != ViewMode::Worktrees {
+        return;
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Worktrees ")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.worktrees.is_empty() {
+        let empty_msg = Paragraph::new("No worktrees found")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center);
+        frame.render_widget(empty_msg, inner_area);
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .worktrees
+        .iter()
+        .enumerate()
+        .map(|(idx, wt)| {
+            let is_selected = idx == app.worktree_cursor_index;
+
+            // Build the display line
+            let label = wt.display_label();
+            let branch = wt.display_branch();
+
+            // Add conflict badge if present
+            let conflict_badge = if wt.has_merge_conflict() {
+                format!(" ⚠{}", wt.conflict_file_count())
+            } else {
+                String::new()
+            };
+
+            // Main/Detached indicators
+            let indicator = if wt.is_main {
+                " [MAIN]"
+            } else if wt.is_detached {
+                " [DETACHED]"
+            } else {
+                ""
+            };
+
+            let line = format!("{} → {}{}{}", label, branch, indicator, conflict_badge);
+
+            // Style based on conflict and selection
+            let mut style = Style::default();
+
+            if wt.has_merge_conflict() {
+                style = style.fg(Color::Red);
+            } else if wt.is_main {
+                style = style.fg(Color::Green);
+            } else {
+                style = style.fg(Color::White);
+            }
+
+            if is_selected {
+                style = style.add_modifier(Modifier::BOLD).bg(Color::DarkGray);
+            }
+
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    // Update list state
+    app.worktree_list_state
+        .select(Some(app.worktree_cursor_index));
+
+    frame.render_stateful_widget(list, inner_area, &mut app.worktree_list_state);
+}
+
+/// Render footer for worktree view
+fn render_footer_worktree(frame: &mut Frame, app: &AppState, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Build key hints
+    let mut key_hints = vec![("Tab", "changes"), ("↑↓/jk", "navigate"), ("+", "create")];
+
+    // Only show Delete if a non-main, non-detached worktree is selected
+    if let Some(wt) = app.get_selected_worktree() {
+        if !wt.is_main && !wt.is_detached {
+            key_hints.push(("D", "delete"));
+        }
+
+        // Show M (merge) key only if:
+        // - Not main worktree
+        // - Not detached HEAD
+        // - No merge conflicts
+        // - Has a branch name
+        if !wt.is_main && !wt.is_detached && !wt.has_merge_conflict() && !wt.branch.is_empty() {
+            key_hints.push(("M", "merge"));
+        }
+    }
+
+    // Show editor key if configured
+    key_hints.push(("e", "editor"));
+
+    // Show shell key if worktree_command is configured
+    // Note: We'll check this in the actual implementation
+    key_hints.push(("Enter", "shell"));
+
+    key_hints.push(("q", "quit"));
+
+    let hints_text = key_hints
+        .iter()
+        .map(|(k, v)| format!("{}: {}", k, v))
+        .collect::<Vec<_>>()
+        .join("  ");
+
+    // Status line
+    let status = if let Some(ref msg) = app.warning_message {
+        Span::styled(msg, Style::default().fg(Color::Yellow))
+    } else {
+        let count = app.worktrees.len();
+        Span::styled(
+            format!("{} worktree{}", count, if count == 1 { "" } else { "s" }),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+
+    let footer_line = Line::from(vec![
+        status,
+        Span::raw("  |  "),
+        Span::styled(hints_text, Style::default().fg(Color::Cyan)),
+    ]);
+
+    let footer = Paragraph::new(footer_line).alignment(Alignment::Left);
+    frame.render_widget(footer, inner_area);
 }
 
 /// Render the worktree delete confirmation modal

@@ -53,6 +53,94 @@ fn build_worktree_path(base_dir: &Path) -> PathBuf {
     base_dir.join(format!("proposal-{}", timestamp))
 }
 
+/// Load worktrees and check for merge conflicts in parallel
+async fn load_worktrees_with_conflict_check(
+    repo_root: &Path,
+) -> Result<Vec<super::types::WorktreeInfo>> {
+    use super::types::{MergeConflictInfo, WorktreeInfo};
+
+    // First, get the list of worktrees
+    let worktrees_data = crate::vcs::git::commands::list_worktrees(repo_root).await?;
+
+    // Convert to WorktreeInfo structs
+    let mut worktrees: Vec<WorktreeInfo> = worktrees_data
+        .into_iter()
+        .map(|(path, head, branch, is_detached, is_main)| WorktreeInfo {
+            path: PathBuf::from(path),
+            head,
+            branch: branch.clone(),
+            is_detached,
+            is_main,
+            merge_conflict: None,
+        })
+        .collect();
+
+    // Get the base branch name from the main worktree
+    let _base_branch = if let Some(main_wt) = worktrees.iter().find(|wt| wt.is_main) {
+        main_wt.branch.clone()
+    } else {
+        // Fallback: get current branch from repo root
+        match crate::vcs::git::commands::get_current_branch(repo_root).await {
+            Ok(Some(branch)) => branch,
+            Ok(None) | Err(_) => {
+                // If we can't get the base branch (detached HEAD or error), skip conflict checking
+                return Ok(worktrees);
+            }
+        }
+    };
+
+    // Check conflicts in parallel for non-main, non-detached worktrees
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for (idx, worktree) in worktrees.iter().enumerate() {
+        // Skip main worktree and detached HEADs
+        if worktree.is_main || worktree.is_detached || worktree.branch.is_empty() {
+            continue;
+        }
+
+        let wt_path = worktree.path.clone();
+        let branch_name = worktree.branch.clone();
+
+        tasks.spawn(async move {
+            // Check merge conflicts
+            let conflict_result =
+                crate::vcs::git::commands::check_merge_conflicts(&wt_path, &branch_name).await;
+
+            (idx, conflict_result)
+        });
+    }
+
+    // Collect results
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((idx, Ok(conflict_files_opt))) => {
+                if let Some(conflict_files) = conflict_files_opt {
+                    // Conflicts detected
+                    worktrees[idx].merge_conflict = Some(MergeConflictInfo { conflict_files });
+                } else {
+                    // No conflicts
+                    worktrees[idx].merge_conflict = None;
+                }
+            }
+            Ok((idx, Err(e))) => {
+                // Check failed - treat as unknown (no conflict info)
+                debug!(
+                    "Conflict check failed for worktree {}: {}",
+                    worktrees[idx].path.display(),
+                    e
+                );
+                worktrees[idx].merge_conflict = None;
+            }
+            Err(e) => {
+                // Join error
+                warn!("Conflict check task panicked: {}", e);
+            }
+        }
+    }
+
+    Ok(worktrees)
+}
+
 /// Run the TUI application
 pub async fn run_tui(
     initial_changes: Vec<Change>,
@@ -250,6 +338,24 @@ async fn run_tui_loop(
                         }
                     }
 
+                    // Refresh worktrees with conflict check (if in Worktrees view)
+                    // We do this in the background without blocking
+                    let wt_refresh_tx = refresh_tx.clone();
+                    let wt_refresh_repo_root = refresh_repo_root.clone();
+                    tokio::spawn(async move {
+                        match load_worktrees_with_conflict_check(&wt_refresh_repo_root).await {
+                            Ok(worktrees) => {
+                                let _ = wt_refresh_tx
+                                    .send(OrchestratorEvent::WorktreesRefreshed { worktrees })
+                                    .await;
+                            }
+                            Err(e) => {
+                                debug!("Failed to refresh worktrees: {}", e);
+                                // Don't spam logs on refresh failures
+                            }
+                        }
+                    });
+
                     log_deduplicator::maybe_log_summary();
                 }
             }
@@ -287,14 +393,16 @@ async fn run_tui_loop(
                     if app.mode == AppMode::ConfirmWorktreeDelete {
                         match (key.code, key.modifiers) {
                             (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
-                                if let Some(cmd) = app.confirm_worktree_delete() {
+                                if let Some(cmd) = app.confirm_worktree_action_delete() {
                                     let _ = cmd_tx.send(cmd).await;
+                                    app.mode = AppMode::Select;
                                 }
                             }
                             (KeyCode::Char('n'), _)
                             | (KeyCode::Char('N'), _)
                             | (KeyCode::Esc, _) => {
-                                app.cancel_worktree_delete();
+                                app.cancel_worktree_action();
+                                app.mode = AppMode::Select;
                             }
                             _ => {}
                         }
@@ -306,11 +414,54 @@ async fn run_tui_loop(
                             app.should_quit = true;
                             break;
                         }
+                        (KeyCode::Tab, _) => {
+                            // Switch between Changes and Worktrees views
+                            use crate::tui::types::ViewMode;
+                            let new_view = match app.view_mode {
+                                ViewMode::Changes => ViewMode::Worktrees,
+                                ViewMode::Worktrees => ViewMode::Changes,
+                            };
+
+                            // Load worktrees with conflict check when switching to Worktrees view
+                            if new_view == ViewMode::Worktrees {
+                                let load_tx = tx.clone();
+                                let load_repo_root = repo_root.clone();
+                                tokio::spawn(async move {
+                                    match load_worktrees_with_conflict_check(&load_repo_root).await
+                                    {
+                                        Ok(worktrees) => {
+                                            let _ = load_tx
+                                                .send(OrchestratorEvent::WorktreesRefreshed {
+                                                    worktrees,
+                                                })
+                                                .await;
+                                        }
+                                        Err(e) => {
+                                            let _ = load_tx
+                                                .send(OrchestratorEvent::Log(LogEntry::error(
+                                                    format!("Failed to load worktrees: {}", e),
+                                                )))
+                                                .await;
+                                        }
+                                    }
+                                });
+                            }
+
+                            app.view_mode = new_view;
+                        }
                         (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
-                            app.cursor_up();
+                            use crate::tui::types::ViewMode;
+                            match app.view_mode {
+                                ViewMode::Changes => app.cursor_up(),
+                                ViewMode::Worktrees => app.worktree_cursor_up(),
+                            }
                         }
                         (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
-                            app.cursor_down();
+                            use crate::tui::types::ViewMode;
+                            match app.view_mode {
+                                ViewMode::Changes => app.cursor_down(),
+                                ViewMode::Worktrees => app.worktree_cursor_down(),
+                            }
                         }
                         (KeyCode::Char(' '), _) => {
                             if let Some(cmd) = app.toggle_selection() {
@@ -324,42 +475,65 @@ async fn run_tui_loop(
                             }
                         }
                         (KeyCode::Char('e'), _) => {
-                            // Open editor in change directory
-                            if !app.changes.is_empty() && app.cursor_index < app.changes.len() {
-                                let change_id = app.changes[app.cursor_index].id.clone();
+                            use crate::tui::types::ViewMode;
 
-                                // Suspend TUI and launch editor
-                                disable_raw_mode()?;
-                                execute!(
-                                    std::io::stdout(),
-                                    LeaveAlternateScreen,
-                                    DisableMouseCapture
-                                )?;
+                            // Suspend TUI
+                            disable_raw_mode()?;
+                            execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
 
-                                // Launch editor
-                                if let Err(e) = super::utils::launch_editor_for_change(&change_id) {
-                                    eprintln!("Failed to launch editor: {}", e);
+                            // Launch editor based on view mode
+                            match app.view_mode {
+                                ViewMode::Changes => {
+                                    if !app.changes.is_empty()
+                                        && app.cursor_index < app.changes.len()
+                                    {
+                                        let change_id = app.changes[app.cursor_index].id.clone();
+                                        if let Err(e) =
+                                            super::utils::launch_editor_for_change(&change_id)
+                                        {
+                                            eprintln!("Failed to launch editor: {}", e);
+                                        }
+                                    }
                                 }
-
-                                // Restore TUI
-                                enable_raw_mode()?;
-                                execute!(
-                                    std::io::stdout(),
-                                    EnterAlternateScreen,
-                                    EnableMouseCapture
-                                )?;
-                                terminal.clear()?;
+                                ViewMode::Worktrees => {
+                                    if let Some(path) = app.get_selected_worktree_path() {
+                                        if let Err(e) = super::utils::launch_editor_in_dir(&path) {
+                                            eprintln!("Failed to launch editor: {}", e);
+                                        }
+                                    }
+                                }
                             }
+
+                            // Restore TUI
+                            enable_raw_mode()?;
+                            execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+                            terminal.clear()?;
                         }
                         (KeyCode::Char('m'), _) | (KeyCode::Char('M'), _) => {
-                            if let Some(cmd) = app.resolve_merge() {
-                                let _ = cmd_tx.send(cmd).await;
+                            use crate::tui::types::ViewMode;
+
+                            match app.view_mode {
+                                ViewMode::Changes => {
+                                    // Changes view: resolve deferred merge
+                                    if let Some(cmd) = app.resolve_merge() {
+                                        let _ = cmd_tx.send(cmd).await;
+                                    }
+                                }
+                                ViewMode::Worktrees => {
+                                    // Worktrees view: merge branch to base
+                                    if let Some(cmd) = app.request_merge_worktree_branch() {
+                                        let _ = cmd_tx.send(cmd).await;
+                                    }
+                                }
                             }
                         }
                         (KeyCode::Char('d'), _) | (KeyCode::Char('D'), _) => {
-                            if app.mode == AppMode::Select {
-                                app.request_worktree_delete();
+                            use crate::tui::types::ViewMode;
+                            if app.view_mode == ViewMode::Worktrees {
+                                // Worktree view: delete selected worktree
+                                app.request_worktree_delete_from_list();
                             }
+                            // Note: D key removed from Changes view as per spec
                         }
                         (KeyCode::Esc, _) => {
                             // Handle stop in Running or Stopping mode
@@ -486,7 +660,85 @@ async fn run_tui_loop(
                             // Toggle parallel mode (only if git is available)
                             app.toggle_parallel_mode();
                         }
+                        (KeyCode::Enter, _) => {
+                            use crate::tui::types::ViewMode;
+
+                            if app.view_mode != ViewMode::Worktrees {
+                                continue;
+                            }
+
+                            let Some(worktree_path_str) = app.get_selected_worktree_path() else {
+                                continue;
+                            };
+
+                            let Some(template) = config.get_worktree_command().map(str::to_string)
+                            else {
+                                continue;
+                            };
+
+                            let Some(repo_root_str) = repo_root.to_str() else {
+                                app.add_log(LogEntry::error(
+                                    "Failed to resolve repo root path".to_string(),
+                                ));
+                                continue;
+                            };
+
+                            let command = OrchestratorConfig::expand_worktree_command(
+                                &template,
+                                &worktree_path_str,
+                                repo_root_str,
+                            );
+
+                            app.add_log(LogEntry::info(format!(
+                                "Running worktree command in {}",
+                                worktree_path_str
+                            )));
+
+                            disable_raw_mode()?;
+                            execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+
+                            info!(
+                                module = module_path!(),
+                                "Running worktree command: sh -c {}", command
+                            );
+                            let status = std::process::Command::new("sh")
+                                .arg("-c")
+                                .arg(&command)
+                                .current_dir(&worktree_path_str)
+                                .status();
+
+                            enable_raw_mode()?;
+                            execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+                            terminal.clear()?;
+
+                            match status {
+                                Ok(exit_status) if exit_status.success() => {
+                                    app.add_log(LogEntry::success(
+                                        "Worktree command completed successfully",
+                                    ));
+                                }
+                                Ok(exit_status) => {
+                                    app.add_log(LogEntry::error(format!(
+                                        "Worktree command failed with exit code: {:?}",
+                                        exit_status.code()
+                                    )));
+                                }
+                                Err(err) => {
+                                    app.add_log(LogEntry::error(format!(
+                                        "Failed to execute worktree command: {}",
+                                        err
+                                    )));
+                                }
+                            }
+                        }
                         (KeyCode::Char('+'), _) => {
+                            use crate::tui::types::ViewMode;
+
+                            // Only work in Worktrees view
+                            if app.view_mode != ViewMode::Worktrees {
+                                continue;
+                            }
+
                             let Some(template) = config.get_worktree_command().map(str::to_string)
                             else {
                                 continue;
@@ -530,11 +782,11 @@ async fn run_tui_loop(
                                 continue;
                             };
 
-                            // Generate unique branch name with format: oso-session-<rand>
+                            // Generate unique branch name with format: ws-session-<timestamp>
                             let branch_name =
                                 match crate::vcs::git::commands::generate_unique_branch_name(
                                     &repo_root,
-                                    "oso-session",
+                                    "ws-session",
                                     10,
                                 )
                                 .await
@@ -795,6 +1047,107 @@ async fn run_tui_loop(
                             )));
                         }
                     }
+                }
+                TuiCommand::DeleteWorktreeByPath(path) => {
+                    match crate::vcs::git::commands::worktree_remove(
+                        &repo_root,
+                        path.to_string_lossy().as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            app.add_log(LogEntry::success(format!(
+                                "Deleted worktree: {}",
+                                path.display()
+                            )));
+
+                            // Refresh worktree list with conflict check
+                            match load_worktrees_with_conflict_check(&repo_root).await {
+                                Ok(worktrees) => {
+                                    let _ = tx
+                                        .send(OrchestratorEvent::WorktreesRefreshed { worktrees })
+                                        .await;
+                                }
+                                Err(e) => {
+                                    app.add_log(LogEntry::error(format!(
+                                        "Failed to refresh worktrees: {}",
+                                        e
+                                    )));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            app.warning_popup = Some(super::state::WarningPopup {
+                                title: "Worktree delete failed".to_string(),
+                                message: format!(
+                                    "Failed to delete worktree '{}': {}",
+                                    path.display(),
+                                    e
+                                ),
+                            });
+                            app.add_log(LogEntry::error(format!(
+                                "Worktree delete failed for '{}': {}",
+                                path.display(),
+                                e
+                            )));
+                        }
+                    }
+                }
+                TuiCommand::MergeWorktreeBranch {
+                    worktree_path,
+                    branch_name,
+                } => {
+                    let merge_tx = tx.clone();
+                    let merge_repo_root = repo_root.clone();
+                    let merge_branch = branch_name.clone();
+
+                    tokio::spawn(async move {
+                        let _ = merge_tx
+                            .send(OrchestratorEvent::BranchMergeStarted {
+                                branch_name: merge_branch.clone(),
+                            })
+                            .await;
+
+                        // Change to worktree directory to perform merge there
+                        match crate::vcs::git::commands::merge_branch(&worktree_path, &merge_branch)
+                            .await
+                        {
+                            Ok(_) => {
+                                let _ = merge_tx
+                                    .send(OrchestratorEvent::BranchMergeCompleted {
+                                        branch_name: merge_branch.clone(),
+                                    })
+                                    .await;
+
+                                // Refresh worktree list to update UI with conflict check
+                                match load_worktrees_with_conflict_check(&merge_repo_root).await {
+                                    Ok(worktrees) => {
+                                        let _ = merge_tx
+                                            .send(OrchestratorEvent::WorktreesRefreshed {
+                                                worktrees,
+                                            })
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        let _ = merge_tx
+                                            .send(OrchestratorEvent::Log(LogEntry::error(format!(
+                                                "Failed to refresh worktrees: {}",
+                                                e
+                                            ))))
+                                            .await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = merge_tx
+                                    .send(OrchestratorEvent::BranchMergeFailed {
+                                        branch_name: merge_branch,
+                                        error: format!("{}", e),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
                 }
                 TuiCommand::ResolveMerge(id) => {
                     let resolve_tx = tx.clone();

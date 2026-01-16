@@ -196,7 +196,7 @@ pub trait WorkspaceManager: Send + Sync {
     /// Update workspace status
     fn update_workspace_status(&mut self, workspace_name: &str, status: WorkspaceStatus);
 
-    /// Merge multiple workspace revisions into main.
+    /// Merge multiple workspace revisions into the base branch.
     ///
     /// Returns the final revision after merge.
     async fn merge_workspaces(&self, revisions: &[String]) -> VcsResult<String>;

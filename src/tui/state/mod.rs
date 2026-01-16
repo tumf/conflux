@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use super::events::{LogEntry, TuiCommand};
-use super::types::{AppMode, QueueStatus, StopMode};
+use super::types::{AppMode, QueueStatus, StopMode, ViewMode, WorktreeAction, WorktreeInfo};
 
 // Re-exports
 pub use change::ChangeState;
@@ -30,6 +30,8 @@ pub struct WarningPopup {
 
 /// Main application state for the TUI
 pub struct AppState {
+    /// Current view mode (Changes or Worktrees)
+    pub view_mode: ViewMode,
     /// Current mode
     pub mode: AppMode,
     /// List of changes with their states
@@ -38,6 +40,14 @@ pub struct AppState {
     pub cursor_index: usize,
     /// List widget state
     pub list_state: ListState,
+    /// List of worktrees
+    pub worktrees: Vec<WorktreeInfo>,
+    /// Current cursor position in the worktree list
+    pub worktree_cursor_index: usize,
+    /// Worktree list widget state
+    pub worktree_list_state: ListState,
+    /// Pending worktree action confirmation (path, action)
+    pub pending_worktree_action: Option<(String, WorktreeAction)>,
     /// ID of the currently processing change
     pub current_change: Option<String>,
     /// ID of the change that caused the error (for display in Error mode)
@@ -116,10 +126,15 @@ impl AppState {
         }
 
         Self {
+            view_mode: ViewMode::Changes,
             mode: AppMode::Select,
             changes: change_states,
             cursor_index: 0,
             list_state,
+            worktrees: Vec::new(),
+            worktree_cursor_index: 0,
+            worktree_list_state: ListState::default(),
+            pending_worktree_action: None,
             current_change: None,
             error_change_id: None,
             logs,
@@ -182,6 +197,175 @@ impl AppState {
         }
         self.cursor_index = (self.cursor_index + 1) % self.changes.len();
         self.list_state.select(Some(self.cursor_index));
+    }
+
+    /// Move worktree cursor up
+    pub fn worktree_cursor_up(&mut self) {
+        if self.worktrees.is_empty() {
+            return;
+        }
+        self.worktree_cursor_index = if self.worktree_cursor_index == 0 {
+            self.worktrees.len() - 1
+        } else {
+            self.worktree_cursor_index - 1
+        };
+        self.worktree_list_state
+            .select(Some(self.worktree_cursor_index));
+    }
+
+    /// Move worktree cursor down
+    pub fn worktree_cursor_down(&mut self) {
+        if self.worktrees.is_empty() {
+            return;
+        }
+        self.worktree_cursor_index = (self.worktree_cursor_index + 1) % self.worktrees.len();
+        self.worktree_list_state
+            .select(Some(self.worktree_cursor_index));
+    }
+
+    /// Get the selected worktree path (if any)
+    pub fn get_selected_worktree_path(&self) -> Option<String> {
+        if self.worktree_cursor_index < self.worktrees.len() {
+            Some(
+                self.worktrees[self.worktree_cursor_index]
+                    .path
+                    .display()
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Get the selected worktree (if any)
+    pub fn get_selected_worktree(&self) -> Option<&WorktreeInfo> {
+        if self.worktree_cursor_index < self.worktrees.len() {
+            Some(&self.worktrees[self.worktree_cursor_index])
+        } else {
+            None
+        }
+    }
+
+    /// Request worktree delete with validation
+    ///
+    /// Returns Some(TuiCommand) if deletion should proceed, None if it should be blocked
+    pub fn request_worktree_delete_from_list(&mut self) -> Option<TuiCommand> {
+        if self.worktrees.is_empty() || self.worktree_cursor_index >= self.worktrees.len() {
+            return None;
+        }
+
+        let worktree = &self.worktrees[self.worktree_cursor_index];
+
+        // Cannot delete main worktree
+        if worktree.is_main {
+            self.warning_message = Some("Cannot delete main worktree".to_string());
+            return None;
+        }
+
+        // Cannot delete if any change is being processed
+        // (We check if any change is processing to be safe, since we don't track worktree paths per change yet)
+        let is_any_processing = self.changes.iter().any(|c| {
+            matches!(
+                c.queue_status,
+                QueueStatus::Processing | QueueStatus::Archiving
+            )
+        });
+
+        if is_any_processing {
+            self.warning_message =
+                Some("Cannot delete worktree: changes are being processed".to_string());
+            return None;
+        }
+
+        // Get the worktree path as string
+        let path_str = worktree.path.display().to_string();
+
+        // Store pending action for confirmation
+        self.pending_worktree_action = Some((path_str, WorktreeAction::Delete));
+        self.previous_mode = Some(self.mode.clone());
+        self.mode = AppMode::ConfirmWorktreeDelete;
+
+        None // User needs to confirm first
+    }
+
+    /// Confirm and execute pending worktree action
+    pub fn confirm_worktree_action_delete(&mut self) -> Option<TuiCommand> {
+        if let Some((path, WorktreeAction::Delete)) = self.pending_worktree_action.take() {
+            // Restore previous mode
+            if let Some(mode) = self.previous_mode.take() {
+                self.mode = mode;
+            } else {
+                self.mode = AppMode::Select;
+            }
+
+            Some(TuiCommand::DeleteWorktreeByPath(path.into()))
+        } else {
+            None
+        }
+    }
+
+    /// Cancel pending worktree action
+    pub fn cancel_worktree_action(&mut self) {
+        self.pending_worktree_action = None;
+
+        // Restore previous mode
+        if let Some(mode) = self.previous_mode.take() {
+            self.mode = mode;
+        } else {
+            self.mode = AppMode::Select;
+        }
+    }
+
+    /// Request to merge worktree branch into base branch.
+    ///
+    /// Returns Some(TuiCommand) if merge should proceed, None if blocked.
+    pub fn request_merge_worktree_branch(&mut self) -> Option<TuiCommand> {
+        use crate::tui::types::ViewMode;
+
+        if self.view_mode != ViewMode::Worktrees {
+            return None;
+        }
+
+        if self.worktrees.is_empty() || self.worktree_cursor_index >= self.worktrees.len() {
+            return None;
+        }
+
+        let worktree = &self.worktrees[self.worktree_cursor_index];
+
+        // Cannot merge main worktree
+        if worktree.is_main {
+            self.warning_message = Some("Cannot merge main worktree".to_string());
+            return None;
+        }
+
+        // Cannot merge detached HEAD
+        if worktree.is_detached {
+            self.warning_message = Some("Cannot merge detached HEAD".to_string());
+            return None;
+        }
+
+        // Cannot merge if conflicts detected
+        if worktree.has_merge_conflict() {
+            self.warning_message = Some(format!(
+                "Cannot merge: {} conflict(s) detected",
+                worktree.conflict_file_count()
+            ));
+            return None;
+        }
+
+        // Get worktree path and branch name
+        let path = worktree.path.clone();
+        let branch_name = worktree.branch.clone();
+
+        if branch_name.is_empty() {
+            self.warning_message = Some("Cannot merge: no branch name".to_string());
+            return None;
+        }
+
+        Some(TuiCommand::MergeWorktreeBranch {
+            worktree_path: path,
+            branch_name,
+        })
     }
 
     /// Toggle selection of the current change
@@ -412,6 +596,7 @@ impl AppState {
     }
 
     /// Request worktree deletion for the selected change.
+    #[allow(dead_code)]
     pub fn request_worktree_delete(&mut self) {
         if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
             return;
@@ -437,6 +622,7 @@ impl AppState {
     }
 
     /// Confirm the pending worktree delete request.
+    #[allow(dead_code)]
     pub fn confirm_worktree_delete(&mut self) -> Option<TuiCommand> {
         let change_id = self.pending_worktree_delete.take()?;
         self.mode = AppMode::Select;
@@ -444,6 +630,7 @@ impl AppState {
     }
 
     /// Cancel worktree delete confirmation.
+    #[allow(dead_code)]
     pub fn cancel_worktree_delete(&mut self) {
         self.pending_worktree_delete = None;
         self.mode = AppMode::Select;
@@ -1430,5 +1617,297 @@ mod tests {
 
         // Simulate editor launch and exit: mode should remain Stopped
         assert_eq!(app.mode, AppMode::Stopped);
+    }
+
+    // === Tests for worktree cursor navigation ===
+
+    #[test]
+    fn test_worktree_cursor_up_with_empty_list() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        assert_eq!(app.worktree_cursor_index, 0);
+        assert!(app.worktrees.is_empty());
+
+        // Should not panic with empty worktree list
+        app.worktree_cursor_up();
+        assert_eq!(app.worktree_cursor_index, 0);
+    }
+
+    #[test]
+    fn test_worktree_cursor_down_with_empty_list() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        assert_eq!(app.worktree_cursor_index, 0);
+        assert!(app.worktrees.is_empty());
+
+        // Should not panic with empty worktree list
+        app.worktree_cursor_down();
+        assert_eq!(app.worktree_cursor_index, 0);
+    }
+
+    #[test]
+    fn test_worktree_cursor_navigation() {
+        use crate::tui::types::WorktreeInfo;
+        use std::path::PathBuf;
+
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Add some worktrees
+        app.worktrees = vec![
+            WorktreeInfo {
+                path: PathBuf::from("/path/to/worktree1"),
+                head: "abc123".to_string(),
+                branch: "main".to_string(),
+                is_detached: false,
+                is_main: true,
+                merge_conflict: None,
+            },
+            WorktreeInfo {
+                path: PathBuf::from("/path/to/worktree2"),
+                head: "def456".to_string(),
+                branch: "feature".to_string(),
+                is_detached: false,
+                is_main: false,
+                merge_conflict: None,
+            },
+            WorktreeInfo {
+                path: PathBuf::from("/path/to/worktree3"),
+                head: "ghi789".to_string(),
+                branch: String::new(),
+                is_detached: true,
+                is_main: false,
+                merge_conflict: None,
+            },
+        ];
+
+        assert_eq!(app.worktree_cursor_index, 0);
+
+        // Move down
+        app.worktree_cursor_down();
+        assert_eq!(app.worktree_cursor_index, 1);
+
+        app.worktree_cursor_down();
+        assert_eq!(app.worktree_cursor_index, 2);
+
+        // Wrap around to beginning
+        app.worktree_cursor_down();
+        assert_eq!(app.worktree_cursor_index, 0);
+
+        // Move up (wraps to end)
+        app.worktree_cursor_up();
+        assert_eq!(app.worktree_cursor_index, 2);
+
+        app.worktree_cursor_up();
+        assert_eq!(app.worktree_cursor_index, 1);
+    }
+
+    #[test]
+    fn test_get_selected_worktree_path() {
+        use crate::tui::types::WorktreeInfo;
+        use std::path::PathBuf;
+
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Empty list
+        assert!(app.get_selected_worktree_path().is_none());
+
+        // Add worktrees
+        app.worktrees = vec![
+            WorktreeInfo {
+                path: PathBuf::from("/path/to/worktree1"),
+                head: "abc123".to_string(),
+                branch: "main".to_string(),
+                is_detached: false,
+                is_main: true,
+                merge_conflict: None,
+            },
+            WorktreeInfo {
+                path: PathBuf::from("/path/to/worktree2"),
+                head: "def456".to_string(),
+                branch: "feature".to_string(),
+                is_detached: false,
+                is_main: false,
+                merge_conflict: None,
+            },
+        ];
+
+        // First worktree selected
+        assert_eq!(
+            app.get_selected_worktree_path(),
+            Some("/path/to/worktree1".to_string())
+        );
+
+        // Move cursor and check
+        app.worktree_cursor_down();
+        assert_eq!(
+            app.get_selected_worktree_path(),
+            Some("/path/to/worktree2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_request_worktree_delete_from_list_empty_list() {
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Empty worktree list should return None
+        let cmd = app.request_worktree_delete_from_list();
+        assert!(cmd.is_none());
+    }
+
+    #[test]
+    fn test_request_worktree_delete_from_list_main_worktree() {
+        use crate::tui::types::WorktreeInfo;
+        use std::path::PathBuf;
+
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.worktrees = vec![WorktreeInfo {
+            path: PathBuf::from("/path/to/main"),
+            head: "abc123".to_string(),
+            branch: "main".to_string(),
+            is_detached: false,
+            is_main: true,
+            merge_conflict: None,
+        }];
+
+        // Cannot delete main worktree
+        let cmd = app.request_worktree_delete_from_list();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app
+            .warning_message
+            .as_ref()
+            .unwrap()
+            .contains("Cannot delete main worktree"));
+    }
+
+    #[test]
+    fn test_request_worktree_delete_from_list_processing_worktree() {
+        use crate::tui::types::WorktreeInfo;
+        use std::path::PathBuf;
+
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.worktrees = vec![WorktreeInfo {
+            path: PathBuf::from("/path/to/worktree"),
+            head: "abc123".to_string(),
+            branch: "feature".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+        }];
+
+        // Simulate processing state
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Processing;
+
+        // Cannot delete worktree for processing change
+        let cmd = app.request_worktree_delete_from_list();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app
+            .warning_message
+            .as_ref()
+            .unwrap()
+            .contains("Cannot delete worktree"));
+    }
+
+    #[test]
+    fn test_request_worktree_delete_from_list_valid() {
+        use crate::tui::types::{ViewMode, WorktreeAction, WorktreeInfo};
+        use std::path::PathBuf;
+
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.view_mode = ViewMode::Worktrees;
+        app.worktrees = vec![WorktreeInfo {
+            path: PathBuf::from("/path/to/worktree"),
+            head: "abc123".to_string(),
+            branch: "feature".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+        }];
+
+        // Valid deletion request
+        let cmd = app.request_worktree_delete_from_list();
+        assert!(cmd.is_none()); // No command yet, just sets pending action
+        assert!(app.pending_worktree_action.is_some());
+        assert!(matches!(
+            app.pending_worktree_action,
+            Some((ref path, WorktreeAction::Delete)) if path == "/path/to/worktree"
+        ));
+    }
+
+    #[test]
+    fn test_confirm_worktree_action_delete() {
+        use crate::tui::types::{WorktreeAction, WorktreeInfo};
+        use std::path::PathBuf;
+
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        let worktree_path = PathBuf::from("/path/to/worktree");
+
+        app.worktrees = vec![WorktreeInfo {
+            path: worktree_path.clone(),
+            head: "abc123".to_string(),
+            branch: "feature".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+        }];
+
+        app.pending_worktree_action = Some((
+            worktree_path.to_string_lossy().to_string(),
+            WorktreeAction::Delete,
+        ));
+
+        // Confirm deletion
+        let cmd = app.confirm_worktree_action_delete();
+        assert!(cmd.is_some());
+        if let Some(TuiCommand::DeleteWorktreeByPath(path)) = &cmd {
+            assert_eq!(path, &worktree_path);
+        } else {
+            panic!("Expected DeleteWorktreeByPath command");
+        }
+        assert!(app.pending_worktree_action.is_none());
+    }
+
+    #[test]
+    fn test_cancel_worktree_action() {
+        use crate::tui::types::{WorktreeAction, WorktreeInfo};
+        use std::path::PathBuf;
+
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        let worktree_path = PathBuf::from("/path/to/worktree");
+
+        app.worktrees = vec![WorktreeInfo {
+            path: worktree_path.clone(),
+            head: "abc123".to_string(),
+            branch: "feature".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+        }];
+
+        app.pending_worktree_action = Some((
+            worktree_path.to_string_lossy().to_string(),
+            WorktreeAction::Delete,
+        ));
+
+        // Cancel action
+        app.cancel_worktree_action();
+        assert!(app.pending_worktree_action.is_none());
     }
 }
