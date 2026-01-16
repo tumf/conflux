@@ -24,7 +24,7 @@
 
 - [x] Run `cargo test` to verify all tests pass
 - [x] Run `cargo clippy` to check for warnings
-- [x] Test `openspec-orchestrator init --template claude` generates valid config
+- [x] Test `cflx init --template claude` generates valid config
 - [x] Verify generated config is parseable by `config.rs`
 
 ## Dependencies

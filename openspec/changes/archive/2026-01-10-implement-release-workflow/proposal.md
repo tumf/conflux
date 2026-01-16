@@ -11,7 +11,7 @@ Implement an automated release workflow similar to [jj-desc](https://github.com/
 
 ## Motivation
 
-Currently, openspec-orchestrator lacks a formal release process. Manual releases are error-prone and time-consuming. An automated workflow will:
+Currently, cflx lacks a formal release process. Manual releases are error-prone and time-consuming. An automated workflow will:
 - Ensure consistent release quality
 - Reduce manual steps and human error
 - Provide pre-built binaries for all major platforms

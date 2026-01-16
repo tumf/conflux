@@ -4,7 +4,7 @@ use crate::cli::Template;
 
 /// Claude Code agent configuration template
 pub const CLAUDE_TEMPLATE: &str = r#"{
-  // OpenSpec Orchestrator Configuration
+  // Conflux Configuration
   // Template: Claude Code
 
   // Command to analyze dependencies and select next change
@@ -54,7 +54,7 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
 
 /// OpenCode agent configuration template
 pub const OPENCODE_TEMPLATE: &str = r#"{
-  // OpenSpec Orchestrator Configuration
+  // Conflux Configuration
   // Template: OpenCode
 
   // Command to analyze dependencies and select next change
@@ -64,7 +64,7 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   "apply_command": "opencode run '/openspec-apply {change_id} {prompt}'",
 
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
-  "archive_command": "opencode run '/openspec-archive {change_id} {prompt}'",
+  "archive_command": "opencode run '/conflux:archive {change_id} {prompt}'",
 
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "opencode run {prompt}",
@@ -104,7 +104,7 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
 
 /// Codex agent configuration template
 pub const CODEX_TEMPLATE: &str = r#"{
-  // OpenSpec Orchestrator Configuration
+  // Conflux Configuration
   // Template: Codex
 
   // Command to analyze dependencies and select next change

@@ -8,7 +8,7 @@ The orchestrator SHALL support a configurable maximum iteration limit to prevent
 
 #### Scenario: Configure max iterations in config file
 
-- **GIVEN** `.openspec-orchestrator.jsonc` contains:
+- **GIVEN** `.cflx.jsonc` contains:
   ```jsonc
   {
     "max_iterations": 100
@@ -29,7 +29,7 @@ The orchestrator SHALL support a configurable maximum iteration limit to prevent
 #### Scenario: CLI flag overrides config
 
 - **GIVEN** config file has `"max_iterations": 100`
-- **WHEN** user runs `openspec-orchestrator run --max-iterations 50`
+- **WHEN** user runs `cflx run --max-iterations 50`
 - **THEN** the loop stops after 50 iterations
 - **AND** CLI value takes precedence over config file
 

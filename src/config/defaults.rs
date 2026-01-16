@@ -13,7 +13,7 @@ pub const GLOBAL_CONFIG_FILE: &str = "config.jsonc";
 pub const DEFAULT_APPLY_COMMAND: &str = "opencode run '/openspec-apply {change_id}'";
 
 /// Default archive command template (OpenCode)
-pub const DEFAULT_ARCHIVE_COMMAND: &str = "opencode run '/openspec-archive {change_id}'";
+pub const DEFAULT_ARCHIVE_COMMAND: &str = "opencode run '/conflux:archive {change_id}'";
 
 /// Default resolve command template (OpenCode)
 /// Supports `{prompt}` placeholder for the resolve prompt

@@ -1,6 +1,6 @@
 ## 1. 各仕様の Purpose フィールドを更新
 
-- [x] 1.1 cli/spec.md: "Defines CLI commands, subcommands, flags, and their behaviors for the openspec-orchestrator binary."
+- [x] 1.1 cli/spec.md: "Defines CLI commands, subcommands, flags, and their behaviors for the cflx binary."
 - [x] 1.2 configuration/spec.md: "Defines the configuration file format, agent command templates, and settings for the orchestrator."
 - [x] 1.3 documentation/spec.md: "Defines requirements for README files and project documentation accuracy."
 - [x] 1.4 hooks/spec.md: "Defines the lifecycle hook system including available hooks, context variables, and execution order."

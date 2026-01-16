@@ -1,6 +1,6 @@
 # Release Guide
 
-This document describes how to create releases for openspec-orchestrator.
+This document describes how to create releases for Conflux.
 
 ## Prerequisites
 
@@ -133,7 +133,7 @@ git checkout main
 
 ### GitHub Actions fails
 
-1. Check the workflow run at: https://github.com/tumf/openspec-orchestrator/actions
+1. Check the workflow run at: https://github.com/tumf/conflux/actions
 2. Look for errors in the failed job logs
 3. Common issues:
    - Missing repository secrets
@@ -164,12 +164,12 @@ After release, users can install via:
 
 ### Shell script (macOS/Linux)
 ```bash
-curl -fsSL https://github.com/tumf/openspec-orchestrator/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/tumf/conflux/releases/latest/download/install.sh | sh
 ```
 
 ### PowerShell (Windows)
 ```powershell
-irm https://github.com/tumf/openspec-orchestrator/releases/latest/download/install.ps1 | iex
+irm https://github.com/tumf/conflux/releases/latest/download/install.ps1 | iex
 ```
 
 ### Homebrew (macOS/Linux)
@@ -179,4 +179,4 @@ brew install openspec
 ```
 
 ### Direct download
-Download from [GitHub Releases](https://github.com/tumf/openspec-orchestrator/releases).
+Download from [GitHub Releases](https://github.com/tumf/conflux/releases).

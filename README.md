@@ -1,9 +1,9 @@
-# OpenSpec Orchestrator
+# Conflux
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Automates the OpenSpec change workflow: list → dependency analysis → apply → archive.
+Automates the OpenSpec change workflow (list → dependency analysis → apply → archive). Orchestrates `openspec` and AI coding agents to process changes autonomously.
 
 ## Features
 

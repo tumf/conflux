@@ -1,9 +1,9 @@
-# OpenSpec Orchestrator
+# Conflux
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-OpenSpec変更ワークフローを自動化: list → 依存関係分析 → apply → archive
+OpenSpec変更ワークフロー（list → 依存関係分析 → apply → archive）を自動化。`openspec` と AI コーディングエージェントを連携させて変更を自律的に処理します。
 
 ## 特徴
 

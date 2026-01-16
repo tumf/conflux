@@ -40,7 +40,7 @@ The orchestrator SHALL support configuring the base directory for git worktrees.
 The `init` command templates SHALL include parallel execution configuration options.
 
 #### Scenario: Claude template with parallel options
-- **WHEN** user runs `openspec-orchestrator init --template claude`
+- **WHEN** user runs `cflx init --template claude`
 - **THEN** the generated config includes commented parallel configuration:
   ```jsonc
   {
@@ -56,7 +56,7 @@ The `init` command templates SHALL include parallel execution configuration opti
 
 #### Scenario: Configure VCS backend in config file
 
-- **WHEN** `.openspec-orchestrator.jsonc` に以下が設定されている:
+- **WHEN** `.cflx.jsonc` に以下が設定されている:
   ```jsonc
   {
     "vcs_backend": "git"
@@ -89,7 +89,7 @@ The `init` command templates SHALL include parallel execution configuration opti
 
 #### Scenario: Template includes VCS configuration
 
-- **WHEN** `openspec-orchestrator init` が実行される
+- **WHEN** `cflx init` が実行される
 - **THEN** 生成される設定ファイルに以下のコメント付き設定が含まれる:
   ```jsonc
   {

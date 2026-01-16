@@ -238,11 +238,11 @@ pub enum QueueStatus {
 
 ```bash
 # TUIを起動（新しいデフォルト動作）
-openspec-orchestrator
+cflx
 
 # 従来の動作（直接実行、TUIなし）
-openspec-orchestrator run
-openspec-orchestrator run --change <id>
+cflx run
+cflx run --change <id>
 ```
 
 **理由**:

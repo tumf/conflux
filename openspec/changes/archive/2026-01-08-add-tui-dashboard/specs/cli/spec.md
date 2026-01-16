@@ -5,12 +5,12 @@
 サブコマンドなしで起動した場合、インタラクティブTUIを表示しなければならない（SHALL）。
 
 #### Scenario: サブコマンドなしでの起動
-- **WHEN** ユーザーが `openspec-orchestrator` を引数なしで実行する
+- **WHEN** ユーザーが `cflx` を引数なしで実行する
 - **THEN** インタラクティブTUIが起動する
 - **AND** 選択モードで変更一覧が表示される
 
 #### Scenario: runサブコマンドでの起動（後方互換性）
-- **WHEN** ユーザーが `openspec-orchestrator run` を実行する
+- **WHEN** ユーザーが `cflx run` を実行する
 - **THEN** 従来通りオーケストレーションループが直接実行される
 
 ### Requirement: 変更選択モード

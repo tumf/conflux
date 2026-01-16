@@ -617,7 +617,7 @@ mod tests {
             "apply_command": "codex run 'openspec-apply {change_id}'",
 
             /* Archive command - used after change completion */
-            "archive_command": "codex run 'openspec-archive {change_id}'",
+            "archive_command": "codex run 'conflux:archive {change_id}'",
 
             // Dependency analysis command
             "analyze_command": "claude '{prompt}'",
@@ -629,7 +629,7 @@ mod tests {
         );
         assert_eq!(
             config.archive_command,
-            Some("codex run 'openspec-archive {change_id}'".to_string())
+            Some("codex run 'conflux:archive {change_id}'".to_string())
         );
         assert_eq!(
             config.analyze_command,

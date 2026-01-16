@@ -454,13 +454,13 @@ fn test_openspec_apply_command_format() {
 }
 
 #[test]
-fn test_openspec_archive_command_format() {
+fn test_conflux_archive_command_format() {
     // Validate the archive command format
-    let command = "/openspec-archive";
+    let command = "/conflux:archive";
     let change_id = "completed-change";
     let full_command = format!("{} {}", command, change_id);
 
-    assert_eq!(full_command, "/openspec-archive completed-change");
+    assert_eq!(full_command, "/conflux:archive completed-change");
 }
 
 #[test]
