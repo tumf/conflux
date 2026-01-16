@@ -395,14 +395,12 @@ async fn run_tui_loop(
                             (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
                                 if let Some(cmd) = app.confirm_worktree_action_delete() {
                                     let _ = cmd_tx.send(cmd).await;
-                                    app.mode = AppMode::Select;
                                 }
                             }
                             (KeyCode::Char('n'), _)
                             | (KeyCode::Char('N'), _)
                             | (KeyCode::Esc, _) => {
                                 app.cancel_worktree_action();
-                                app.mode = AppMode::Select;
                             }
                             _ => {}
                         }

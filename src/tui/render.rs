@@ -1033,7 +1033,9 @@ fn render_footer_worktree(frame: &mut Frame, app: &AppState, area: Rect) {
 
 /// Render the worktree delete confirmation modal
 fn render_worktree_delete_confirm(frame: &mut Frame, app: &AppState, area: Rect) {
-    let Some(change_id) = app.pending_worktree_delete.as_ref() else {
+    use crate::tui::types::WorktreeAction;
+
+    let Some((path, WorktreeAction::Delete)) = &app.pending_worktree_action else {
         return;
     };
 
@@ -1046,7 +1048,7 @@ fn render_worktree_delete_confirm(frame: &mut Frame, app: &AppState, area: Rect)
     frame.render_widget(Clear, modal_area);
 
     let block = Block::default()
-        .title(" Delete worktree ")
+        .title(" Delete Worktree ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
 
@@ -1055,12 +1057,18 @@ fn render_worktree_delete_confirm(frame: &mut Frame, app: &AppState, area: Rect)
 
     let lines = vec![
         Line::from(Span::styled(
-            format!("Delete worktree for '{}'?", change_id),
+            format!("Delete worktree at '{}'?", path),
             Style::default().fg(Color::Yellow),
         )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "This will remove the worktree directory permanently.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
         Line::from(Span::styled(
             "Press Y to delete, N or Esc to cancel.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::White),
         )),
     ];
 
@@ -1303,14 +1311,17 @@ mod tests {
 
     #[test]
     fn test_render_shows_worktree_delete_confirm_modal() {
+        use crate::tui::types::WorktreeAction;
+
         let mut app = create_test_app(vec![create_test_change("change-a", true)]);
-        app.pending_worktree_delete = Some("change-a".to_string());
+        app.pending_worktree_action =
+            Some(("/path/to/worktree".to_string(), WorktreeAction::Delete));
         app.mode = AppMode::ConfirmWorktreeDelete;
 
         let buffer = render_buffer(&mut app, 80, 20);
         let content = buffer_to_string(&buffer);
-        assert!(content.contains("Delete worktree"));
-        assert!(content.contains("change-a"));
+        assert!(content.contains("Delete Worktree"));
+        assert!(content.contains("/path/to/worktree"));
     }
 
     #[test]
