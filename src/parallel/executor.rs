@@ -530,11 +530,18 @@ pub async fn execute_apply_in_workspace(
             .await
             .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to wait: {}", e)))?;
 
+        // Note: Retry logic is now handled by CommandQueue.
+        // If command fails, the iteration loop will naturally retry via MAX_ITERATIONS.
+        // Short-lived crashes are expected to be handled by the iteration loop itself,
+        // as each iteration is a fresh apply attempt.
         if !status.success() {
-            return Err(OrchestratorError::AgentCommand(format!(
-                "Apply command failed with exit code: {:?}",
+            warn!(
+                "Apply command failed (iteration {}), exit code: {:?}",
+                iteration,
                 status.code()
-            )));
+            );
+            // Don't return error immediately - let the iteration loop handle retries
+            // by continuing to check progress and potentially trying again
         }
 
         // Git worktrees already reflect working copy changes for task progress.
@@ -970,11 +977,15 @@ pub async fn execute_archive_in_workspace(
             OrchestratorError::AgentCommand(format!("Archive command failed: {}", e))
         })?;
 
+        // Note: Retry logic is now unified in CommandQueue.
+        // Archive failures are handled by the verification loop below.
         if !status.success() {
-            return Err(OrchestratorError::AgentCommand(format!(
-                "Archive command failed with exit code: {:?}",
+            warn!(
+                "Archive command failed (attempt {}), exit code: {:?}",
+                attempt,
                 status.code()
-            )));
+            );
+            // Continue to verification - the loop will retry if verification fails
         }
 
         if is_git_repo {
