@@ -25,6 +25,10 @@ pub struct LogEntry {
     pub color: Color,
     /// Optional change_id for parallel mode logs
     pub change_id: Option<String>,
+    /// Optional operation type (apply, archive, resolve)
+    pub operation: Option<String>,
+    /// Optional iteration number (for apply operations)
+    pub iteration: Option<u32>,
 }
 
 fn ansi_csi_regex() -> &'static Regex {
@@ -56,6 +60,8 @@ impl LogEntry {
             message,
             color: Color::White,
             change_id: None,
+            operation: None,
+            iteration: None,
         }
     }
 
@@ -68,6 +74,8 @@ impl LogEntry {
             message,
             color: Color::Green,
             change_id: None,
+            operation: None,
+            iteration: None,
         }
     }
 
@@ -80,6 +88,8 @@ impl LogEntry {
             message,
             color: Color::Yellow,
             change_id: None,
+            operation: None,
+            iteration: None,
         }
     }
 
@@ -92,6 +102,8 @@ impl LogEntry {
             message,
             color: Color::Red,
             change_id: None,
+            operation: None,
+            iteration: None,
         }
     }
 
@@ -99,6 +111,18 @@ impl LogEntry {
     #[allow(dead_code)]
     pub fn with_change_id(mut self, change_id: impl Into<String>) -> Self {
         self.change_id = Some(change_id.into());
+        self
+    }
+
+    /// Set operation type (apply, archive, resolve)
+    pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
+        self.operation = Some(operation.into());
+        self
+    }
+
+    /// Set iteration number (for apply operations)
+    pub fn with_iteration(mut self, iteration: u32) -> Self {
+        self.iteration = Some(iteration);
         self
     }
 }
@@ -131,7 +155,11 @@ pub enum ExecutionEvent {
     ApplyFailed { change_id: String, error: String },
     /// Apply output (summary of command output)
     #[allow(dead_code)]
-    ApplyOutput { change_id: String, output: String },
+    ApplyOutput {
+        change_id: String,
+        output: String,
+        iteration: Option<u32>,
+    },
 
     // Archive events
     /// Archive started for a change
@@ -384,5 +412,28 @@ mod tests {
         let debug_str = format!("{:?}", event);
         assert!(debug_str.contains("ProgressUpdated"));
         assert!(debug_str.contains("test-change"));
+    }
+
+    #[test]
+    fn test_log_entry_with_operation() {
+        let entry = LogEntry::info("test").with_operation("apply");
+        assert_eq!(entry.operation, Some("apply".to_string()));
+    }
+
+    #[test]
+    fn test_log_entry_with_iteration() {
+        let entry = LogEntry::info("test").with_iteration(2);
+        assert_eq!(entry.iteration, Some(2));
+    }
+
+    #[test]
+    fn test_log_entry_with_operation_and_iteration() {
+        let entry = LogEntry::info("test")
+            .with_change_id("test-change")
+            .with_operation("apply")
+            .with_iteration(3);
+        assert_eq!(entry.change_id, Some("test-change".to_string()));
+        assert_eq!(entry.operation, Some("apply".to_string()));
+        assert_eq!(entry.iteration, Some(3));
     }
 }
