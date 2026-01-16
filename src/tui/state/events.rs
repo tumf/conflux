@@ -263,11 +263,24 @@ impl AppState {
                 self.apply_worktree_status(&worktree_change_ids);
             }
             // Output events - add to log
-            OrchestratorEvent::ApplyOutput { change_id, output } => {
-                self.add_log(LogEntry::info(format!("[{}] {}", change_id, output)));
+            OrchestratorEvent::ApplyOutput {
+                change_id,
+                output,
+                iteration,
+            } => {
+                self.add_log(
+                    LogEntry::info(output)
+                        .with_change_id(change_id)
+                        .with_operation("apply")
+                        .with_iteration(iteration.unwrap_or(1)),
+                );
             }
             OrchestratorEvent::ArchiveOutput { change_id, output } => {
-                self.add_log(LogEntry::info(format!("[{}] {}", change_id, output)));
+                self.add_log(
+                    LogEntry::info(output)
+                        .with_change_id(change_id)
+                        .with_operation("archive"),
+                );
             }
             OrchestratorEvent::AnalysisOutput { output } => {
                 self.add_log(LogEntry::info(format!("[Analysis] {}", output)));
@@ -1120,17 +1133,16 @@ mod tests {
         app.handle_orchestrator_event(OrchestratorEvent::ApplyOutput {
             change_id: "change-a".to_string(),
             output: "Test output line".to_string(),
+            iteration: Some(1),
         });
 
         // Log should be added
         assert_eq!(app.logs.len(), initial_log_count + 1);
-        assert!(app.logs.last().unwrap().message.contains("change-a"));
-        assert!(app
-            .logs
-            .last()
-            .unwrap()
-            .message
-            .contains("Test output line"));
+        let log = app.logs.last().unwrap();
+        assert_eq!(log.change_id, Some("change-a".to_string()));
+        assert_eq!(log.operation, Some("apply".to_string()));
+        assert_eq!(log.iteration, Some(1));
+        assert_eq!(log.message, "Test output line");
     }
 
     /// Test that ArchiveOutput events are logged correctly
@@ -1148,13 +1160,11 @@ mod tests {
 
         // Log should be added
         assert_eq!(app.logs.len(), initial_log_count + 1);
-        assert!(app.logs.last().unwrap().message.contains("change-b"));
-        assert!(app
-            .logs
-            .last()
-            .unwrap()
-            .message
-            .contains("Archive output line"));
+        let log = app.logs.last().unwrap();
+        assert_eq!(log.change_id, Some("change-b".to_string()));
+        assert_eq!(log.operation, Some("archive".to_string()));
+        assert_eq!(log.iteration, None);
+        assert_eq!(log.message, "Archive output line");
     }
 
     /// Test that AnalysisOutput events are logged correctly
