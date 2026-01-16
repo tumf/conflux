@@ -2,7 +2,7 @@
 
 ## Overview
 
-This specification defines the automated release workflow for openspec-orchestrator, enabling semantic versioning, changelog generation, cross-platform builds, and distribution.
+This specification defines the automated release workflow for cflx, enabling semantic versioning, changelog generation, cross-platform builds, and distribution.
 
 ## ADDED Requirements
 

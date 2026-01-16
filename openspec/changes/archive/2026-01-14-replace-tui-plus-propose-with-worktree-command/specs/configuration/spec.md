@@ -16,7 +16,7 @@
 
 #### Scenario: worktree_command を設定できる
 
-- **GIVEN** `.openspec-orchestrator.jsonc` に以下の設定が存在する:
+- **GIVEN** `.cflx.jsonc` に以下の設定が存在する:
   ```jsonc
   {
     "worktree_command": "opencode run --cwd {workspace_dir} '/openspec:proposal'"

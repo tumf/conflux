@@ -10,7 +10,7 @@ The CLI SHALL detect whether the current directory is a jj-managed repository by
 
 #### Scenario: jj repository not detected
 - **WHEN** no `.jj` directory exists in the current working directory
-- **AND** user runs `openspec-orchestrator run --parallel`
+- **AND** user runs `cflx run --parallel`
 - **THEN** the command exits with a non-zero exit code
 - **AND** an error message is displayed: "Error: --parallel requires a jj repository (.jj directory not found)"
 
@@ -19,24 +19,24 @@ The CLI SHALL detect whether the current directory is a jj-managed repository by
 The CLI SHALL support a `--parallel` flag to enable parallel change execution using jj workspaces. Parallel mode is OFF by default.
 
 #### Scenario: Enable parallel mode via CLI flag
-- **WHEN** user runs `openspec-orchestrator run --parallel`
+- **WHEN** user runs `cflx run --parallel`
 - **AND** a `.jj` directory exists
 - **THEN** the orchestrator enters parallel execution mode
 - **AND** changes are analyzed for parallelization opportunities
 
 #### Scenario: Parallel mode disabled by default
-- **WHEN** user runs `openspec-orchestrator run` without `--parallel` flag
+- **WHEN** user runs `cflx run` without `--parallel` flag
 - **THEN** the orchestrator uses sequential execution mode
 - **AND** no parallelization analysis is performed
 
 #### Scenario: Parallel mode requires jj directory
-- **WHEN** user runs `openspec-orchestrator run --parallel`
+- **WHEN** user runs `cflx run --parallel`
 - **AND** no `.jj` directory exists
 - **THEN** the command exits with error code 1
 - **AND** an error message indicates jj repository is required for parallel mode
 
 #### Scenario: Parallel mode with max concurrent limit
-- **WHEN** user runs `openspec-orchestrator run --parallel --max-concurrent 4`
+- **WHEN** user runs `cflx run --parallel --max-concurrent 4`
 - **THEN** at most 4 workspaces are created simultaneously
 - **AND** additional changes wait until a workspace becomes available
 
@@ -64,7 +64,7 @@ The TUI SHALL display parallel execution progress when in parallel mode.
 The CLI SHALL support `--dry-run` to preview parallelization groups without execution.
 
 #### Scenario: Preview parallelization groups
-- **WHEN** user runs `openspec-orchestrator run --parallel --dry-run`
+- **WHEN** user runs `cflx run --parallel --dry-run`
 - **THEN** the analyzer determines parallelization groups
 - **AND** the groups are displayed without executing any changes
 - **AND** no workspaces are created

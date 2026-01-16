@@ -1,4 +1,4 @@
-# CI workflow for openspec-orchestrator
+# CI workflow for Conflux
 # Runs tests, lints, and format checks on PRs and pushes
 
 name: CI

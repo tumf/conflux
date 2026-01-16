@@ -266,7 +266,7 @@
 
 **内容**:
 - [x] 並列実行モードで orchestrator を実行
-  - `cargo run -- run --parallel --config .openspec-orchestrator.opencode.jsonc`
+  - `cargo run -- run --parallel --config .cflx.opencode.jsonc`
 - [x] 複数の変更を並列処理
 - [x] ログでキューの動作を確認
   - 時間差起動のログ

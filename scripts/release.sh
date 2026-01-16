@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Release script for openspec-orchestrator
+# Release script for Conflux
 # Usage: ./scripts/release.sh [patch|minor|major]
 
 set -euo pipefail
@@ -169,6 +169,6 @@ success "Release v$NEW_VERSION completed!"
 echo ""
 echo "Next steps:"
 echo "  1. GitHub Actions will automatically build and publish the release"
-echo "  2. Monitor the workflow at: https://github.com/tumf/openspec-orchestrator/actions"
+echo "  2. Monitor the workflow at: https://github.com/tumf/conflux/actions"
 echo "  3. Once complete, binaries will be available at:"
-echo "     https://github.com/tumf/openspec-orchestrator/releases/tag/v$NEW_VERSION"
+echo "     https://github.com/tumf/conflux/releases/tag/v$NEW_VERSION"

@@ -126,7 +126,7 @@ The parallelization analyzer MUST return dependency information between changes 
 The `init` command templates SHALL include parallel execution configuration options.
 
 #### Scenario: Claude template with parallel options
-- **WHEN** user runs `openspec-orchestrator init --template claude`
+- **WHEN** user runs `cflx init --template claude`
 - **THEN** the generated config includes commented parallel configuration:
   ```jsonc
   {

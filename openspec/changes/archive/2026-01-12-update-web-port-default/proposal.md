@@ -11,4 +11,4 @@
 
 ## Impact
 - Affected specs: `web-monitoring`
-- Affected code: `src/cli.rs`, `src/main.rs`, `src/web/*`, `README.md`, `.openspec-orchestrator.jsonc`（既定値説明）
+- Affected code: `src/cli.rs`, `src/main.rs`, `src/web/*`, `README.md`, `.cflx.jsonc`（既定値説明）

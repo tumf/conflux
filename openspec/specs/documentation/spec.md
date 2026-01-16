@@ -10,7 +10,7 @@ The README.md SHALL accurately document all current features, commands, and proj
 #### Scenario: Default behavior documentation
 
 - **WHEN** a user reads the README.md
-- **THEN** they understand that running `openspec-orchestrator` without subcommands launches the TUI
+- **THEN** they understand that running `cflx` without subcommands launches the TUI
 - **AND** the TUI is described as the default interactive mode
 
 #### Scenario: Init command documentation

@@ -34,17 +34,17 @@ OpenSpec Orchestrator は現在 OpenCode に密結合されている。他のエ
 
 | 優先度 | パス | 用途 |
 |--------|------|------|
-| 1 (高) | `.openspec-orchestrator.jsonc` | プロジェクト固有設定 |
-| 2 (低) | `~/.config/openspec-orchestrator/config.jsonc` | グローバル設定 |
+| 1 (高) | `.cflx.jsonc` | プロジェクト固有設定 |
+| 2 (低) | `~/.config/cflx/config.jsonc` | グローバル設定 |
 
 **理由**:
-- プロジェクト設定は `.openspec-orchestrator.jsonc` でルートに配置（ドットファイルで目立たない）
-- グローバル設定は `~/.config/openspec-orchestrator/` ディレクトリ内に配置（XDG Base Directory 準拠）
+- プロジェクト設定は `.cflx.jsonc` でルートに配置（ドットファイルで目立たない）
+- グローバル設定は `~/.config/cflx/` ディレクトリ内に配置（XDG Base Directory 準拠）
 - プロジェクト設定が存在すればそちらを優先、なければグローバルを使用
 
 **代替案**:
 - `.opencode/orchestrator.jsonc`: opencode 非依存なのに `.opencode` フォルダは違和感あり（却下）
-- `openspec-orchestrator.jsonc` (ドットなし): ルートが煩雑になる
+- `cflx.jsonc` (ドットなし): ルートが煩雑になる
 
 ### 3. コマンドテンプレート形式
 
@@ -54,7 +54,7 @@ OpenSpec Orchestrator は現在 OpenCode に密結合されている。他のエ
   "apply_command": "codex run 'openspec-apply {change_id}'",
 
   // archive コマンド
-  "archive_command": "codex run 'openspec-archive {change_id}'",
+  "archive_command": "codex run 'conflux:archive {change_id}'",
 
   // 依存関係分析コマンド: {prompt} は分析プロンプトに置換される
   "analyze_command": "claude '{prompt}'"
@@ -77,7 +77,7 @@ OpenSpec Orchestrator は現在 OpenCode に密結合されている。他のエ
 ```jsonc
 {
   "apply_command": "opencode run '/openspec-apply {change_id}'",
-  "archive_command": "opencode run '/openspec-archive {change_id}'",
+  "archive_command": "opencode run '/conflux:archive {change_id}'",
   "analyze_command": "opencode run --format json '{prompt}'"
 }
 ```

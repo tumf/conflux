@@ -16,5 +16,5 @@
 - Affected specs: cli (新規)
 - Affected code: `src/cli.rs`, `src/main.rs`
 - **BREAKING**: コマンドライン引数の構造が変更される
-  - 旧: `openspec-orchestrator --change foo`
-  - 新: `openspec-orchestrator run --change foo`
+  - 旧: `cflx --change foo`
+  - 新: `cflx run --change foo`
