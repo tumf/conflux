@@ -1134,7 +1134,6 @@ impl ParallelExecutor {
             let change_id = workspace.change_id.clone();
             let workspace_path = workspace.path.clone();
             let workspace_name = workspace.name.clone();
-            let repo_root = self.repo_root.clone();
             let apply_cmd = self.apply_command.clone();
             let archive_cmd = self.archive_command.clone();
             let config = self.config.clone();
@@ -1164,7 +1163,6 @@ impl ParallelExecutor {
                 let apply_result = execute_apply_in_workspace(
                     &change_id,
                     &workspace_path,
-                    &repo_root,
                     &apply_cmd,
                     &config,
                     event_tx.clone(),
@@ -1197,7 +1195,6 @@ impl ParallelExecutor {
                         let archive_result = execute_archive_in_workspace(
                             &change_id,
                             &workspace_path,
-                            &repo_root,
                             &archive_cmd,
                             &config,
                             event_tx.clone(),

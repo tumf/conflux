@@ -22,28 +22,12 @@ pub const DEFAULT_RESOLVE_COMMAND: &str = "opencode run {prompt}";
 /// Default analyze command template (OpenCode)
 pub const DEFAULT_ANALYZE_COMMAND: &str = "opencode run --format json {prompt}";
 
-/// Default prompt for apply command - includes path context.
+/// Default prompt for apply command - empty by default.
 /// The hardcoded system prompt in agent.rs is always appended.
-pub const DEFAULT_APPLY_PROMPT: &str = r#"
-<system-context>
-IMPORTANT: You are running in the repository root directory.
-The change you are working on is located at: openspec/changes/{change_id}/
-All file paths should be relative to the repository root.
-</system-context>
-"#;
+pub const DEFAULT_APPLY_PROMPT: &str = "";
 
-/// Default prompt for archive command - includes path context
-pub const DEFAULT_ARCHIVE_PROMPT: &str = r#"
-<system-context>
-IMPORTANT: You are running in the repository root directory.
-To archive the change, move the directory from:
-  openspec/changes/{change_id}/
-to:
-  openspec/specs/{change_id}/
-
-All file paths should be relative to the repository root.
-</system-context>
-"#;
+/// Default prompt for archive command - empty (no additional instructions)
+pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
 
 /// Default maximum iterations for the orchestration loop
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
