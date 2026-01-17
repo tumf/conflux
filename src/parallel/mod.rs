@@ -89,10 +89,9 @@ pub struct ParallelExecutor {
     /// Dynamic queue for runtime change additions (TUI mode)
     dynamic_queue: Option<Arc<crate::tui::queue::DynamicQueue>>,
     /// Shared AI command runner for stagger coordination
-    #[allow(dead_code)] // Infrastructure ready, integration pending (tasks 3.2, 3.3)
     ai_runner: AiCommandRunner,
     /// Shared stagger state for resolve operations
-    #[allow(dead_code)] // Infrastructure ready, integration pending (tasks 4.1-4.3)
+    #[allow(dead_code)] // Reserved for future resolve integration
     shared_stagger_state: SharedStaggerState,
 }
 
@@ -890,6 +889,17 @@ impl ParallelExecutor {
                         "Change '{}' already merged to main in workspace '{}', skipping all operations",
                         change_id, workspace.name
                     );
+
+                    // Send MergeCompleted event to update TUI state
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::MergeCompleted {
+                            change_id: change_id.clone(),
+                            revision: "already-merged".to_string(),
+                        },
+                    )
+                    .await;
+
                     send_event(
                         &self.event_tx,
                         ParallelEvent::CleanupStarted {
@@ -1251,6 +1261,7 @@ impl ParallelExecutor {
             let vcs_backend = self.workspace_manager.backend_type();
             let hooks = self.hooks.clone();
             let cancel_token = self.cancel_token.clone();
+            let ai_runner = self.ai_runner.clone();
 
             // Build parallel hook context
             let parallel_ctx = ParallelHookContext {
@@ -1281,6 +1292,7 @@ impl ParallelExecutor {
                     hooks.as_ref().map(|h| h.as_ref()),
                     Some(&parallel_ctx),
                     cancel_token.as_ref(),
+                    &ai_runner,
                 )
                 .await;
 
@@ -1314,6 +1326,7 @@ impl ParallelExecutor {
                             hooks.as_ref().map(|h| h.as_ref()),
                             Some(&parallel_ctx),
                             cancel_token.as_ref(),
+                            &ai_runner,
                         )
                         .await;
 

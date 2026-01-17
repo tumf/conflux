@@ -53,6 +53,152 @@ impl AiCommandRunner {
         }
     }
 
+    /// Get access to the underlying CommandQueue configuration.
+    ///
+    /// This is useful for implementing custom retry logic that respects
+    /// the configured retry parameters.
+    #[allow(dead_code)] // Used by parallel executor for retry logic
+    pub fn queue_config(&self) -> &crate::command_queue::CommandQueueConfig {
+        self.command_queue.config()
+    }
+
+    /// Execute a command with streaming output, stagger delay, and automatic retry.
+    ///
+    /// This method executes a command through CommandQueue with both stagger and retry.
+    /// It automatically retries transient failures based on the CommandQueue configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `command` - The shell command to execute (will be run via `sh -c`)
+    /// * `cwd` - Optional working directory (for worktree execution)
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (ManagedChild, Receiver<OutputLine>) for output streaming.
+    /// Note: The child process may have already completed by the time this returns,
+    /// as retry logic runs in a background task.
+    ///
+    /// # Retry Behavior
+    ///
+    /// Retries are attempted based on CommandQueue configuration:
+    /// - Error pattern matching (retry_error_patterns)
+    /// - Short execution duration (retry_if_duration_under_secs)
+    /// - Non-zero exit code (agent crash)
+    ///
+    /// Retry notifications are sent through the output channel as stderr lines.
+    pub async fn execute_streaming_with_retry(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
+        use crate::command_queue::StreamingOutputLine;
+        use std::process::ExitStatus;
+
+        // Create output channel
+        let (tx, rx) = mpsc::channel::<OutputLine>(1024);
+
+        // Clone tx for callback
+        let tx_clone = tx.clone();
+
+        // Create callback to forward streaming output
+        let output_callback = move |line: StreamingOutputLine| {
+            let tx = tx_clone.clone();
+            async move {
+                let output_line = match line {
+                    StreamingOutputLine::Stdout(s) => OutputLine::Stdout(s),
+                    StreamingOutputLine::Stderr(s) => OutputLine::Stderr(s),
+                };
+                let _ = tx.send(output_line).await;
+            }
+        };
+
+        // Clone command queue, command string, and cwd for background task
+        let command_queue = self.command_queue.clone();
+        let command_str = command.to_string();
+        let cwd_owned = cwd.map(|p| p.to_path_buf());
+
+        // Create oneshot channel to communicate final status
+        let (status_tx, status_rx) = tokio::sync::oneshot::channel::<ExitStatus>();
+
+        // Spawn background task to run retry logic
+        tokio::spawn(async move {
+            let result = command_queue
+                .execute_with_retry_streaming(
+                    || {
+                        // Build command for each retry attempt
+                        let mut cmd = Command::new("sh");
+                        cmd.arg("-c")
+                            .arg(&command_str)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped());
+
+                        if let Some(ref dir) = cwd_owned {
+                            cmd.current_dir(dir);
+                        }
+                        cmd
+                    },
+                    Some(output_callback),
+                )
+                .await;
+
+            match result {
+                Ok((status, _stderr)) => {
+                    let _ = status_tx.send(status);
+                }
+                Err(e) => {
+                    tracing::error!("Command retry failed: {}", e);
+                    // Send a synthetic error status
+                    #[cfg(unix)]
+                    let status = std::os::unix::process::ExitStatusExt::from_raw(1);
+                    #[cfg(windows)]
+                    let status = std::os::windows::process::ExitStatusExt::from_raw(1);
+                    let _ = status_tx.send(status);
+                }
+            }
+        });
+
+        // Create a dummy child process that waits for stdin to close
+        // When the background task completes, we'll close stdin which causes the process to exit
+        let mut dummy_child = if cfg!(target_os = "windows") {
+            // Use findstr with stdin - will exit when stdin closes
+            Command::new("findstr")
+                .arg(".*")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(OrchestratorError::Io)?
+        } else {
+            // Use cat with no args - reads stdin until it closes
+            Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(OrchestratorError::Io)?
+        };
+
+        // Take stdin so we can close it later
+        let dummy_stdin = dummy_child.stdin.take();
+
+        // Wrap dummy child in ManagedChild
+        let managed_child = ManagedChild::new(dummy_child)?;
+
+        // Spawn a task to close stdin when real command completes
+        // This will cause the dummy process to exit cleanly
+        tokio::spawn(async move {
+            // Wait for status from background task
+            let _ = status_rx.await;
+            // Close stdin - this causes cat/findstr to exit cleanly
+            drop(dummy_stdin);
+            // Close output channel to signal completion
+            drop(tx);
+        });
+
+        Ok((managed_child, rx))
+    }
+
     /// Execute a command with streaming output and stagger delay.
     ///
     /// This is the core execution method used by all AI-driven commands.
