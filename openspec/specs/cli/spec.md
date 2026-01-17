@@ -997,24 +997,11 @@ The TUI SHALL provide a Stopped mode where users can review progress and manage 
 
 The TUI help text SHALL include stop key binding information.
 
-#### Scenario: Running mode help text
-
-- **WHEN** TUI is in Running mode
-- **THEN** help text includes "Esc: stop"
-- **AND** help text continues to show "q: quit"
-
 #### Scenario: Stopping mode help text
-
 - **WHEN** TUI is in Stopping mode
 - **THEN** help text includes "Esc: force stop"
+- **AND** help text includes "F5: continue"
 - **AND** help text shows "Waiting for current process..."
-
-#### Scenario: Stopped mode help text
-
-- **WHEN** TUI is in Stopped mode
-- **THEN** help text includes "F5: resume"
-- **AND** help text includes "Space: toggle queue"
-- **AND** help text includes "q: quit"
 
 ### Requirement: Interrupted Change Handling
 

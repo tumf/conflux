@@ -102,19 +102,30 @@ impl ParallelizationAnalyzer {
             OrchestratorError::AgentCommand(format!("Analysis process failed: {}", e))
         })?;
 
+        // Extract result from stream-json format if applicable
+        let response = self.extract_stream_json_result(&full_output);
+        debug!("LLM response: {}", response);
+
+        // Parse JSON response with strict validation
+        // Even if exit code is 0, fail if JSON is invalid
+        let result = self.parse_response(&response, changes).map_err(|e| {
+            // Provide context from output for debugging
+            let preview = response.chars().take(200).collect::<String>();
+            OrchestratorError::Parse(format!(
+                "Analysis returned invalid JSON (exit code: {:?}): {}. Response preview: {}",
+                status.code(),
+                e,
+                preview
+            ))
+        })?;
+
+        // Now check exit code after successful JSON parsing
         if !status.success() {
             return Err(OrchestratorError::AgentCommand(format!(
                 "Analysis failed with exit code: {:?}",
                 status.code()
             )));
         }
-
-        // Extract result from stream-json format if applicable
-        let response = self.extract_stream_json_result(&full_output);
-        debug!("LLM response: {}", response);
-
-        // Parse JSON response
-        let result = self.parse_response(&response, changes)?;
 
         // Validate dependency graph (no circular dependencies)
         self.validate_dependency_graph(&result.groups)?;
@@ -215,7 +226,10 @@ Rules:
         // Try to extract JSON from response (may have surrounding text)
         let json_str = self.extract_json(response)?;
 
-        // Parse JSON
+        // Strict JSON schema validation
+        self.validate_json_schema(&json_str)?;
+
+        // Parse JSON into structured type
         let result: AnalysisResult = serde_json::from_str(&json_str).map_err(|e| {
             OrchestratorError::Parse(format!("Failed to parse parallelization response: {}", e))
         })?;
@@ -224,6 +238,38 @@ Rules:
         self.validate_change_ids(&result, changes)?;
 
         Ok(result)
+    }
+
+    /// Validate JSON schema for analysis result.
+    ///
+    /// Checks that:
+    /// - JSON is parseable
+    /// - `groups` key exists
+    /// - `groups` is an array
+    fn validate_json_schema(&self, json_str: &str) -> Result<()> {
+        // Parse as generic JSON value first
+        let value: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| OrchestratorError::Parse(format!("Invalid JSON syntax: {}", e)))?;
+
+        // Check for required `groups` key
+        if !value.is_object() {
+            return Err(OrchestratorError::Parse(
+                "JSON root must be an object".to_string(),
+            ));
+        }
+
+        let groups = value.get("groups").ok_or_else(|| {
+            OrchestratorError::Parse("Missing required key 'groups' in JSON".to_string())
+        })?;
+
+        // Check that groups is an array
+        if !groups.is_array() {
+            return Err(OrchestratorError::Parse(
+                "Key 'groups' must be an array".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Extract JSON from response text (handles markdown code blocks)

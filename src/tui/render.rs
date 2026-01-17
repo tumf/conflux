@@ -624,7 +624,7 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
         }
         AppMode::Running => ("Processing... Esc: stop", Color::Cyan),
         AppMode::Stopping => (
-            "Stopping after current change... Esc: force stop",
+            "Stopping after current change... F5: continue, Esc: force stop",
             Color::Yellow,
         ),
         AppMode::Stopped => (
@@ -708,7 +708,7 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
     // Build title with app control keys based on mode
     let title = match app.mode {
         AppMode::Running => " Status (Esc: stop, q: quit) ".to_string(),
-        AppMode::Stopping => " Status (Esc: force stop, q: quit) ".to_string(),
+        AppMode::Stopping => " Status (F5: continue, Esc: force stop, q: quit) ".to_string(),
         AppMode::Stopped => " Status (F5: resume, q: quit) ".to_string(),
         AppMode::ConfirmWorktreeDelete => " Status (Y/N: confirm, q: quit) ".to_string(),
         _ => " Status (q: quit) ".to_string(),
@@ -945,7 +945,18 @@ fn render_worktree_list(frame: &mut Frame, app: &mut AppState, area: Rect) {
                 ""
             };
 
-            let line = format!("{} → {}{}{}", label, branch, indicator, conflict_badge);
+            // Merge status indicator
+            let merge_status = wt.merge_status_label();
+            let merge_indicator = if !merge_status.is_empty() {
+                format!(" [{}]", merge_status)
+            } else {
+                String::new()
+            };
+
+            let line = format!(
+                "{} → {}{}{}{}",
+                label, branch, indicator, merge_indicator, conflict_badge
+            );
 
             // Style based on conflict and selection
             let mut style = Style::default();
@@ -1008,6 +1019,7 @@ fn render_footer_worktree(frame: &mut Frame, app: &AppState, area: Rect) {
             && !wt.branch.is_empty()
             && wt.has_commits_ahead
             && !app.is_resolving
+            && !wt.is_merging
         {
             key_hints.push(("M", "merge"));
         }

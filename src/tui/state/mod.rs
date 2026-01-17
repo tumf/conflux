@@ -421,6 +421,14 @@ impl AppState {
             debug!("Merge blocked: no commits ahead of base branch");
             self.warning_message =
                 Some("Cannot merge: no commits ahead of base branch".to_string());
+
+        // Cannot merge if already merging
+        if worktree.is_merging {
+            debug!("Merge blocked: merge already in progress");
+            self.warning_message =
+                Some("Cannot merge: merge already in progress".to_string());
+            return None;
+        }
             return None;
         }
 
@@ -1734,6 +1742,7 @@ mod tests {
                 is_main: true,
                 merge_conflict: None,
                 has_commits_ahead: false,
+                is_merging: false,
             },
             WorktreeInfo {
                 path: PathBuf::from("/path/to/worktree2"),
@@ -1743,6 +1752,7 @@ mod tests {
                 is_main: false,
                 merge_conflict: None,
                 has_commits_ahead: true,
+                is_merging: false,
             },
             WorktreeInfo {
                 path: PathBuf::from("/path/to/worktree3"),
@@ -1752,6 +1762,7 @@ mod tests {
                 is_main: false,
                 merge_conflict: None,
                 has_commits_ahead: false,
+                is_merging: false,
             },
         ];
 
@@ -1797,6 +1808,7 @@ mod tests {
                 is_main: true,
                 merge_conflict: None,
                 has_commits_ahead: false,
+                is_merging: false,
             },
             WorktreeInfo {
                 path: PathBuf::from("/path/to/worktree2"),
@@ -1806,6 +1818,7 @@ mod tests {
                 is_main: false,
                 merge_conflict: None,
                 has_commits_ahead: true,
+                is_merging: false,
             },
         ];
 
@@ -1849,6 +1862,7 @@ mod tests {
             is_main: true,
             merge_conflict: None,
             has_commits_ahead: false,
+            is_merging: false,
         }];
 
         // Cannot delete main worktree
@@ -1878,6 +1892,7 @@ mod tests {
             is_main: false,
             merge_conflict: None,
             has_commits_ahead: false,
+            is_merging: false,
         }];
 
         // Simulate processing state
@@ -1912,6 +1927,7 @@ mod tests {
             is_main: false,
             merge_conflict: None,
             has_commits_ahead: false,
+            is_merging: false,
         }];
 
         // Valid deletion request
@@ -1942,6 +1958,7 @@ mod tests {
             is_main: false,
             merge_conflict: None,
             has_commits_ahead: false,
+            is_merging: false,
         }];
 
         app.pending_worktree_action = Some((
@@ -1978,6 +1995,7 @@ mod tests {
             is_main: false,
             merge_conflict: None,
             has_commits_ahead: false,
+            is_merging: false,
         }];
 
         app.pending_worktree_action = Some((
@@ -2057,6 +2075,7 @@ mod tests {
             is_main: false,
             merge_conflict: None,
             has_commits_ahead: true,
+            is_merging: false,
         }];
         app.worktree_cursor_index = 0;
 
@@ -2097,6 +2116,7 @@ mod tests {
             is_main: false,
             merge_conflict: None,
             has_commits_ahead: true,
+            is_merging: false,
         }];
         app.worktree_cursor_index = 0;
 
