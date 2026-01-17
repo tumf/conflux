@@ -6,11 +6,33 @@ echo "Root worktree: $ROOT_WORKTREE_PATH"
 echo "Creating test marker file..."
 touch .setup-completed
 
+hooks_dir="$(git rev-parse --git-dir 2>/dev/null)/hooks"
+if [ -n "$hooks_dir" ]; then
+  case "$hooks_dir" in
+    /*) ;;
+    *) repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"
+       hooks_dir="${repo_root}/${hooks_dir}"
+       ;;
+  esac
+
+  if command -v pre-commit >/dev/null 2>&1; then
+    echo "Generating worktree pre-commit hook..."
+    mkdir -p "$hooks_dir"
+    cat >"${hooks_dir}/pre-commit" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
 if command -v pre-commit >/dev/null 2>&1; then
-  echo "Installing pre-commit hooks..."
-  pre-commit install
+  exec pre-commit hook-impl --config=.pre-commit-config.yaml --hook-type=pre-commit -- "$@"
 else
-  echo "pre-commit not found; skipping hook install"
+  echo 'pre-commit not found; skipping hook' 1>&2
+  exit 1
+fi
+EOF
+    chmod +x "${hooks_dir}/pre-commit"
+  else
+    echo "pre-commit not found; skipping hook install"
+  fi
 fi
 
 echo "Setup completed successfully!"
