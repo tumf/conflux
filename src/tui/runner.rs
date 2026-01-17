@@ -72,6 +72,7 @@ async fn load_worktrees_with_conflict_check(
             is_detached,
             is_main,
             merge_conflict: None,
+            has_commits_ahead: false, // Will be populated later in parallel check
         })
         .collect();
 
@@ -89,7 +90,7 @@ async fn load_worktrees_with_conflict_check(
         }
     };
 
-    // Check conflicts in parallel for non-main, non-detached worktrees
+    // Check conflicts and commits ahead in parallel for non-main, non-detached worktrees
     let mut tasks = tokio::task::JoinSet::new();
 
     for (idx, worktree) in worktrees.iter().enumerate() {
@@ -100,40 +101,76 @@ async fn load_worktrees_with_conflict_check(
 
         let wt_path = worktree.path.clone();
         let branch_name = worktree.branch.clone();
+        let base_branch = _base_branch.clone();
 
         tasks.spawn(async move {
             // Check merge conflicts
             let conflict_result =
-                crate::vcs::git::commands::check_merge_conflicts(&wt_path, &branch_name).await;
+                crate::vcs::git::commands::check_merge_conflicts(&wt_path, &base_branch).await;
 
-            (idx, conflict_result)
+            // Check commits ahead
+            let ahead_result = crate::vcs::git::commands::count_commits_ahead(
+                &wt_path,
+                &base_branch,
+                &branch_name,
+            )
+            .await;
+
+            (idx, conflict_result, ahead_result)
         });
     }
 
     // Collect results
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok((idx, Ok(conflict_files_opt))) => {
-                if let Some(conflict_files) = conflict_files_opt {
-                    // Conflicts detected
-                    worktrees[idx].merge_conflict = Some(MergeConflictInfo { conflict_files });
-                } else {
-                    // No conflicts
-                    worktrees[idx].merge_conflict = None;
+            Ok((idx, conflict_result, ahead_result)) => {
+                // Process conflict check result
+                match conflict_result {
+                    Ok(conflict_files_opt) => {
+                        if let Some(conflict_files) = conflict_files_opt {
+                            // Conflicts detected
+                            worktrees[idx].merge_conflict =
+                                Some(MergeConflictInfo { conflict_files });
+                        } else {
+                            // No conflicts
+                            worktrees[idx].merge_conflict = None;
+                        }
+                    }
+                    Err(e) => {
+                        // Check failed - treat as unknown (no conflict info)
+                        debug!(
+                            "Conflict check failed for worktree {}: {}",
+                            worktrees[idx].path.display(),
+                            e
+                        );
+                        worktrees[idx].merge_conflict = None;
+                    }
                 }
-            }
-            Ok((idx, Err(e))) => {
-                // Check failed - treat as unknown (no conflict info)
-                debug!(
-                    "Conflict check failed for worktree {}: {}",
-                    worktrees[idx].path.display(),
-                    e
-                );
-                worktrees[idx].merge_conflict = None;
+
+                // Process commits ahead check result
+                match ahead_result {
+                    Ok(count) => {
+                        worktrees[idx].has_commits_ahead = count > 0;
+                        debug!(
+                            "Worktree {} has {} commits ahead of base",
+                            worktrees[idx].path.display(),
+                            count
+                        );
+                    }
+                    Err(e) => {
+                        // Check failed - treat as no commits ahead (safe default)
+                        debug!(
+                            "Commits ahead check failed for worktree {}: {}",
+                            worktrees[idx].path.display(),
+                            e
+                        );
+                        worktrees[idx].has_commits_ahead = false;
+                    }
+                }
             }
             Err(e) => {
                 // Join error
-                warn!("Conflict check task panicked: {}", e);
+                warn!("Worktree check task panicked: {}", e);
             }
         }
     }
@@ -509,18 +546,29 @@ async fn run_tui_loop(
                         }
                         (KeyCode::Char('m'), _) | (KeyCode::Char('M'), _) => {
                             use crate::tui::types::ViewMode;
+                            use tracing::debug;
+
+                            debug!("M key pressed: view_mode={:?}", app.view_mode);
 
                             match app.view_mode {
                                 ViewMode::Changes => {
                                     // Changes view: resolve deferred merge
+                                    debug!("M key (Changes view): attempting resolve_merge");
                                     if let Some(cmd) = app.resolve_merge() {
+                                        debug!("M key (Changes view): sending command {:?}", cmd);
                                         let _ = cmd_tx.send(cmd).await;
+                                    } else {
+                                        debug!("M key (Changes view): resolve_merge returned None");
                                     }
                                 }
                                 ViewMode::Worktrees => {
                                     // Worktrees view: merge branch to base
+                                    debug!("M key (Worktrees view): attempting request_merge_worktree_branch");
                                     if let Some(cmd) = app.request_merge_worktree_branch() {
+                                        debug!("M key (Worktrees view): sending command {:?}", cmd);
                                         let _ = cmd_tx.send(cmd).await;
+                                    } else {
+                                        debug!("M key (Worktrees view): request_merge_worktree_branch returned None");
                                     }
                                 }
                             }
@@ -1095,22 +1143,44 @@ async fn run_tui_loop(
                     worktree_path,
                     branch_name,
                 } => {
+                    use tracing::debug;
+
+                    debug!(
+                        "Processing TuiCommand::MergeWorktreeBranch: worktree_path={}, branch_name={}",
+                        worktree_path.display(),
+                        branch_name
+                    );
+
                     let merge_tx = tx.clone();
                     let merge_repo_root = repo_root.clone();
                     let merge_branch = branch_name.clone();
 
                     tokio::spawn(async move {
+                        debug!(
+                            "Sending BranchMergeStarted event for branch: {}",
+                            merge_branch
+                        );
                         let _ = merge_tx
                             .send(OrchestratorEvent::BranchMergeStarted {
                                 branch_name: merge_branch.clone(),
                             })
                             .await;
 
-                        // Change to worktree directory to perform merge there
-                        match crate::vcs::git::commands::merge_branch(&worktree_path, &merge_branch)
-                            .await
+                        // FIX: Merge in base (main worktree), not in worktree directory
+                        // This ensures working directory clean check happens on base side
+                        debug!(
+                            "Executing merge in base repository: repo_root={}, branch={}",
+                            merge_repo_root.display(),
+                            merge_branch
+                        );
+                        match crate::vcs::git::commands::merge_branch(
+                            &merge_repo_root,
+                            &merge_branch,
+                        )
+                        .await
                         {
                             Ok(_) => {
+                                debug!("Merge succeeded for branch: {}", merge_branch);
                                 let _ = merge_tx
                                     .send(OrchestratorEvent::BranchMergeCompleted {
                                         branch_name: merge_branch.clone(),
@@ -1118,8 +1188,13 @@ async fn run_tui_loop(
                                     .await;
 
                                 // Refresh worktree list to update UI with conflict check
+                                debug!("Refreshing worktree list after successful merge");
                                 match load_worktrees_with_conflict_check(&merge_repo_root).await {
                                     Ok(worktrees) => {
+                                        debug!(
+                                            "Worktree list refreshed: {} worktrees",
+                                            worktrees.len()
+                                        );
                                         let _ = merge_tx
                                             .send(OrchestratorEvent::WorktreesRefreshed {
                                                 worktrees,
@@ -1127,6 +1202,7 @@ async fn run_tui_loop(
                                             .await;
                                     }
                                     Err(e) => {
+                                        debug!("Failed to refresh worktrees: {}", e);
                                         let _ = merge_tx
                                             .send(OrchestratorEvent::Log(LogEntry::error(format!(
                                                 "Failed to refresh worktrees: {}",
@@ -1137,6 +1213,7 @@ async fn run_tui_loop(
                                 }
                             }
                             Err(e) => {
+                                debug!("Merge failed for branch {}: {}", merge_branch, e);
                                 let _ = merge_tx
                                     .send(OrchestratorEvent::BranchMergeFailed {
                                         branch_name: merge_branch,
