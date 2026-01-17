@@ -145,21 +145,36 @@ pub async fn squash_archive_wip_commits<P: AsRef<Path>>(cwd: P, change_id: &str)
 /// List change IDs from the HEAD commit tree.
 ///
 /// Reads directories under `openspec/changes` in the HEAD tree and filters out
-/// archive and hidden entries.
+/// archive, hidden entries, and changes without proposal.md.
 pub async fn list_changes_in_head<P: AsRef<Path>>(cwd: P) -> VcsResult<Vec<String>> {
+    let cwd_ref = cwd.as_ref();
+
     let output = run_git(
         &["ls-tree", "-d", "--name-only", "HEAD:openspec/changes"],
-        cwd,
+        cwd_ref,
     )
     .await?;
 
-    let mut change_ids: Vec<String> = output
-        .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .filter(|name| *name != "archive" && !name.starts_with('.'))
-        .map(String::from)
-        .collect();
+    let mut change_ids: Vec<String> = Vec::new();
+
+    for name in output.lines().map(str::trim) {
+        if name.is_empty() || name == "archive" || name.starts_with('.') {
+            continue;
+        }
+
+        // Check if proposal.md exists in HEAD for this change
+        let proposal_path = format!("HEAD:openspec/changes/{}/proposal.md", name);
+        match run_git(&["cat-file", "-e", &proposal_path], cwd_ref).await {
+            Ok(_) => {
+                // proposal.md exists, include this change
+                change_ids.push(name.to_string());
+            }
+            Err(_) => {
+                // proposal.md doesn't exist, skip this change
+                debug!("Skipping change '{}' in HEAD - no proposal.md found", name);
+            }
+        }
+    }
 
     change_ids.sort();
     Ok(change_ids)
@@ -1192,6 +1207,67 @@ mod tests {
         assert_eq!(
             changes,
             vec!["change-a".to_string(), "change-b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_changes_in_head_excludes_without_proposal() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let init_result = Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init_result.is_err() {
+            return; // Skip if git not available
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        let base_dir = temp_dir.path().join("openspec/changes");
+
+        // Create change-a WITH proposal.md
+        std::fs::create_dir_all(base_dir.join("change-a")).unwrap();
+        std::fs::write(base_dir.join("change-a").join("proposal.md"), "test").unwrap();
+        std::fs::write(base_dir.join("change-a").join("tasks.md"), "- [ ] Task 1").unwrap();
+
+        // Create change-b WITHOUT proposal.md (only tasks.md)
+        std::fs::create_dir_all(base_dir.join("change-b")).unwrap();
+        std::fs::write(base_dir.join("change-b").join("tasks.md"), "- [ ] Task 1").unwrap();
+
+        // Create change-c WITH proposal.md
+        std::fs::create_dir_all(base_dir.join("change-c")).unwrap();
+        std::fs::write(base_dir.join("change-c").join("proposal.md"), "test").unwrap();
+
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "add changes"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        let changes = list_changes_in_head(temp_dir.path()).await.unwrap();
+
+        // Should only include change-a and change-c (have proposal.md)
+        // change-b should be excluded (no proposal.md)
+        assert_eq!(
+            changes,
+            vec!["change-a".to_string(), "change-c".to_string()]
         );
     }
 

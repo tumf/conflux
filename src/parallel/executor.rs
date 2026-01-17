@@ -1,6 +1,7 @@
 //! Workspace execution logic for apply and archive operations.
 
 use crate::agent::{build_apply_prompt, AgentRunner, OutputLine};
+use crate::ai_command_runner::AiCommandRunner;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::execution::apply as common_apply;
@@ -25,6 +26,12 @@ use super::events::ParallelEvent;
 /// regardless of whether progress was made. This ensures that work is not lost if the
 /// process is interrupted or reaches the maximum iteration limit.
 ///
+/// # IMPORTANT: Message Format Consistency
+///
+/// This function uses the SAME commit message format as the unified apply loop
+/// in `src/execution/apply.rs::format_wip_commit_message()` to ensure consistency
+/// between serial and parallel execution modes.
+///
 /// # Arguments
 ///
 /// * `workspace_path` - Path to the workspace directory
@@ -38,6 +45,8 @@ use super::events::ParallelEvent;
 ///
 /// The commit message follows the format: `WIP: {change_id} ({completed}/{total} tasks, apply#{iteration})`
 /// For example: `WIP: add-feature (5/10 tasks, apply#3)`
+///
+/// This MUST match `src/execution/apply.rs::format_wip_commit_message()`.
 async fn create_iteration_snapshot(
     workspace_path: &Path,
     change_id: &str,
@@ -323,6 +332,7 @@ pub async fn execute_apply_in_workspace(
     hooks: Option<&HookRunner>,
     parallel_ctx: Option<&ParallelHookContext>,
     cancel_token: Option<&CancellationToken>,
+    ai_runner: &AiCommandRunner,
 ) -> Result<String> {
     const MAX_ITERATIONS: u32 = 50;
     let mut iteration = 0;
@@ -471,70 +481,41 @@ pub async fn execute_apply_in_workspace(
         debug!("Repository root: {:?}", repo_root);
         debug!("Apply command: {}", command_with_cd);
 
-        // Execute command in worktree directory
-        // This ensures changes are applied to the isolated worktree, not the base repository
-        // Use null stdin to prevent any interactive behavior
-        use tokio::io::{AsyncBufReadExt, BufReader};
-
+        // Execute command via AiCommandRunner (with stagger and retry)
+        // Execute in repository root (cd is part of command string)
         debug!(
             module = module_path!(),
-            "Executing shell command: sh -c {} (cwd: {:?})", command_with_cd, workspace_path
+            "Executing shell command via AiCommandRunner with retry: {} (cwd: {:?})",
+            command_with_cd,
+            repo_root
         );
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(&command_with_cd)
-            .current_dir(workspace_path)
-            .stdin(StdStdio::null())
-            .stdout(StdStdio::piped())
-            .stderr(StdStdio::piped())
-            .spawn()
-            .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to spawn: {}", e)))?;
+        let (mut child, mut output_rx) = ai_runner
+            .execute_streaming_with_retry(&command_with_cd, Some(repo_root))
+            .await?;
 
-        // Stream stdout and stderr in real-time
-        let stdout = child.stdout.take().ok_or_else(|| {
-            OrchestratorError::AgentCommand("Failed to capture stdout".to_string())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            OrchestratorError::AgentCommand("Failed to capture stderr".to_string())
-        })?;
-
-        let change_id_for_stdout = change_id.to_string();
-        let event_tx_for_stdout = event_tx.clone();
-        let stdout_handle = tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                if let Some(ref tx) = event_tx_for_stdout {
+        // Forward output to event channel
+        use crate::ai_command_runner::OutputLine as AiOutputLine;
+        let change_id_clone = change_id.to_string();
+        let event_tx_clone = event_tx.clone();
+        let output_handle = tokio::spawn(async move {
+            while let Some(line) = output_rx.recv().await {
+                if let Some(ref tx) = event_tx_clone {
+                    let output_text = match line {
+                        AiOutputLine::Stdout(s) | AiOutputLine::Stderr(s) => s,
+                    };
                     let _ = tx
                         .send(ParallelEvent::ApplyOutput {
-                            change_id: change_id_for_stdout.clone(),
-                            output: line,
-                            iteration: None,
+                            change_id: change_id_clone.clone(),
+                            output: output_text,
+                            iteration: Some(iteration),
                         })
                         .await;
                 }
             }
         });
 
-        let change_id_for_stderr = change_id.to_string();
-        let event_tx_for_stderr = event_tx.clone();
-        let stderr_handle = tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                if let Some(ref tx) = event_tx_for_stderr {
-                    let _ = tx
-                        .send(ParallelEvent::ApplyOutput {
-                            change_id: change_id_for_stderr.clone(),
-                            output: line,
-                            iteration: None,
-                        })
-                        .await;
-                }
-            }
-        });
-
-        // Wait for streams to complete
-        let _ = stdout_handle.await;
-        let _ = stderr_handle.await;
+        // Wait for output streaming to complete
+        let _ = output_handle.await;
 
         // Wait for process to finish
         let status = child
@@ -789,7 +770,7 @@ pub async fn execute_apply_in_workspace(
 pub async fn execute_archive_in_workspace(
     change_id: &str,
     workspace_path: &Path,
-    _repo_root: &Path,
+    repo_root: &Path,
     archive_cmd_template: &str,
     config: &OrchestratorConfig,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
@@ -797,6 +778,7 @@ pub async fn execute_archive_in_workspace(
     hooks: Option<&HookRunner>,
     parallel_ctx: Option<&ParallelHookContext>,
     cancel_token: Option<&CancellationToken>,
+    ai_runner: &AiCommandRunner,
 ) -> Result<String> {
     if cancel_token.is_some_and(|token| token.is_cancelled()) {
         return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
@@ -899,7 +881,6 @@ pub async fn execute_archive_in_workspace(
         build_archive_error_message, ensure_archive_commit, verify_archive_completion,
         ARCHIVE_COMMAND_MAX_RETRIES,
     };
-    use tokio::io::{AsyncBufReadExt, BufReader};
 
     let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
     let mut attempt: u32 = 0;
@@ -922,69 +903,41 @@ pub async fn execute_archive_in_workspace(
     loop {
         attempt += 1;
 
+        // Execute command via AiCommandRunner (with stagger and retry)
+        // Execute in repository root (cd is part of command string)
         debug!(
-            "Executing shell command: sh -c {} (cwd: {:?})",
-            command_with_cd, workspace_path
+            module = module_path!(),
+            "Executing shell command via AiCommandRunner with retry: {} (cwd: {:?})",
+            command_with_cd,
+            repo_root
         );
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(&command_with_cd)
-            .current_dir(workspace_path)
-            .stdin(StdStdio::null())
-            .stdout(StdStdio::piped())
-            .stderr(StdStdio::piped())
-            .spawn()
-            .map_err(|e| {
-                OrchestratorError::AgentCommand(format!("Failed to spawn archive command: {}", e))
-            })?;
+        let (mut child, mut output_rx) = ai_runner
+            .execute_streaming_with_retry(&command_with_cd, Some(repo_root))
+            .await?;
 
-        // Stream stdout
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        // Forward output to event channel
+        use crate::ai_command_runner::OutputLine as AiOutputLine;
         let change_id_clone = change_id.to_string();
         let event_tx_clone = event_tx.clone();
-
-        let stdout_handle = tokio::spawn(async move {
-            if let Some(stdout) = stdout {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if let Some(ref tx) = event_tx_clone {
-                        let _ = tx
-                            .send(ParallelEvent::ArchiveOutput {
-                                change_id: change_id_clone.clone(),
-                                output: line,
-                                iteration: None,
-                            })
-                            .await;
-                    }
+        let output_handle = tokio::spawn(async move {
+            while let Some(line) = output_rx.recv().await {
+                if let Some(ref tx) = event_tx_clone {
+                    let output_text = match line {
+                        AiOutputLine::Stdout(s) | AiOutputLine::Stderr(s) => s,
+                    };
+                    let _ = tx
+                        .send(ParallelEvent::ArchiveOutput {
+                            change_id: change_id_clone.clone(),
+                            output: output_text,
+                            iteration: None,
+                        })
+                        .await;
                 }
             }
         });
 
-        let change_id_clone2 = change_id.to_string();
-        let event_tx_clone2 = event_tx.clone();
-        let stderr_handle = tokio::spawn(async move {
-            if let Some(stderr) = stderr {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if let Some(ref tx) = event_tx_clone2 {
-                        let _ = tx
-                            .send(ParallelEvent::ArchiveOutput {
-                                change_id: change_id_clone2.clone(),
-                                output: line,
-                                iteration: None,
-                            })
-                            .await;
-                    }
-                }
-            }
-        });
-
-        // Wait for streams to complete
-        let _ = stdout_handle.await;
-        let _ = stderr_handle.await;
+        // Wait for output streaming to complete
+        let _ = output_handle.await;
 
         // Wait for process to complete
         let status = child.wait().await.map_err(|e| {
