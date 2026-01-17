@@ -377,6 +377,7 @@ impl AppState {
         for fetched in &fetched_changes {
             if let Some(existing) = self.changes.iter_mut().find(|c| c.id == fetched.id) {
                 let was_archived = existing.queue_status == QueueStatus::Archived;
+                let is_merge_wait = existing.queue_status == QueueStatus::MergeWait;
 
                 if was_archived {
                     // If change still exists after archiving, it means archive failed
@@ -388,6 +389,15 @@ impl AppState {
                     };
                     existing.completed_tasks = fetched.completed_tasks;
                     existing.total_tasks = fetched.total_tasks;
+                } else if is_merge_wait {
+                    // Preserve MergeWait status during auto-refresh
+                    // MergeWait is a persistent state that requires explicit user action (M key)
+                    // to transition to Resolving, and should not be cleared by progress updates
+                    // Only update progress, not status
+                    if fetched.total_tasks > 0 {
+                        existing.completed_tasks = fetched.completed_tasks;
+                        existing.total_tasks = fetched.total_tasks;
+                    }
                 } else if fetched.total_tasks > 0 {
                     // Only update progress if we have valid data (total > 0)
                     // and the change is NOT being processed (parallel mode uses workspace)
@@ -1404,5 +1414,157 @@ mod tests {
         assert_eq!(app.changes[0].queue_status, QueueStatus::Archiving);
         assert_eq!(app.changes[0].completed_tasks, 7);
         assert_eq!(app.changes[0].total_tasks, 10);
+    }
+
+    // === Tests for update-tui-resolve-wait-status ===
+
+    /// Test that MergeWait status is preserved during auto-refresh
+    #[test]
+    fn test_merge_wait_status_preserved_on_refresh() {
+        // GIVEN: A change in MergeWait status
+        let changes = vec![create_approved_change("change-a", 5, 10)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+
+        // WHEN: Auto-refresh updates the change list
+        let fetched = vec![create_approved_change("change-a", 7, 10)];
+        app.update_changes(fetched);
+
+        // THEN: MergeWait status is preserved (not changed to NotQueued)
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::MergeWait,
+            "MergeWait status should be preserved during auto-refresh"
+        );
+        // AND: Progress is updated
+        assert_eq!(app.changes[0].completed_tasks, 7);
+        assert_eq!(app.changes[0].total_tasks, 10);
+    }
+
+    /// Test that MergeWait status is preserved even when tasks are 0/0
+    #[test]
+    fn test_merge_wait_status_preserved_with_zero_tasks() {
+        // GIVEN: A change in MergeWait status with progress
+        let changes = vec![create_approved_change("change-a", 5, 10)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].completed_tasks = 5;
+        app.changes[0].total_tasks = 10;
+
+        // WHEN: Auto-refresh returns 0/0 (e.g., file moved)
+        let fetched = vec![create_approved_change("change-a", 0, 0)];
+        app.update_changes(fetched);
+
+        // THEN: MergeWait status is preserved
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::MergeWait,
+            "MergeWait status should be preserved even when fetched has 0/0"
+        );
+        // AND: Progress is preserved (not updated to 0/0)
+        assert_eq!(app.changes[0].completed_tasks, 5);
+        assert_eq!(app.changes[0].total_tasks, 10);
+    }
+
+    /// Test that MergeWait changes are retained when removed from filesystem
+    #[test]
+    fn test_merge_wait_changes_retained_after_removal() {
+        // GIVEN: A change in MergeWait status
+        let changes = vec![
+            create_approved_change("change-a", 5, 10),
+            create_approved_change("change-b", 3, 5),
+        ];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+
+        // WHEN: Auto-refresh no longer includes the MergeWait change
+        let fetched = vec![create_approved_change("change-b", 3, 5)];
+        app.update_changes(fetched);
+
+        // THEN: MergeWait change is retained (not removed)
+        assert_eq!(app.changes.len(), 2, "MergeWait change should be retained");
+        assert_eq!(app.changes[0].id, "change-a");
+        assert_eq!(app.changes[0].queue_status, QueueStatus::MergeWait);
+        assert_eq!(app.changes[1].id, "change-b");
+    }
+
+    /// Test that ProgressUpdated event does not modify MergeWait status
+    #[test]
+    fn test_progress_updated_preserves_merge_wait_status() {
+        // GIVEN: A change in MergeWait status
+        let changes = vec![create_approved_change("change-a", 5, 10)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+
+        // WHEN: ProgressUpdated event is received
+        app.handle_orchestrator_event(OrchestratorEvent::ProgressUpdated {
+            change_id: "change-a".to_string(),
+            completed: 8,
+            total: 10,
+        });
+
+        // THEN: MergeWait status is preserved (not changed)
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::MergeWait,
+            "MergeWait status should not be modified by ProgressUpdated"
+        );
+        // AND: Progress is NOT updated (MergeWait is in terminal-like state)
+        assert_eq!(
+            app.changes[0].completed_tasks, 5,
+            "Progress should not be updated for MergeWait changes"
+        );
+    }
+
+    /// Test scenario: resolve待ち状態の表示を維持する
+    #[test]
+    fn test_scenario_merge_wait_display_preserved() {
+        // GIVEN: 変更が merge 待機状態として記録されている
+        let changes = vec![create_approved_change("change-a", 10, 10)];
+        let mut app = AppState::new(changes);
+
+        // Set MergeWait status via event
+        app.handle_orchestrator_event(OrchestratorEvent::MergeDeferred {
+            change_id: "change-a".to_string(),
+            reason: "Base working tree dirty".to_string(),
+        });
+
+        assert_eq!(app.changes[0].queue_status, QueueStatus::MergeWait);
+
+        // WHEN: TUI が変更リストを再描画する (auto-refresh)
+        let fetched = vec![create_approved_change("change-a", 10, 10)];
+        app.update_changes(fetched);
+
+        // THEN: 変更のステータスは resolve待ちとして表示される
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::MergeWait,
+            "Status should remain as MergeWait"
+        );
+        // AND: NotQueued として表示されない (implicitly tested by above assertion)
+    }
+
+    /// Test scenario: resolve待ち状態は自動更新で保持される
+    #[test]
+    fn test_scenario_merge_wait_preserved_on_auto_update() {
+        // GIVEN: 変更が resolve待ち状態である
+        let changes = vec![create_approved_change("change-a", 10, 10)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+
+        // WHEN: TUI が変更一覧を更新する (multiple auto-refreshes)
+        for _ in 0..3 {
+            let fetched = vec![create_approved_change("change-a", 10, 10)];
+            app.update_changes(fetched);
+        }
+
+        // THEN: 変更の状態は resolve待ちのまま保持される
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::MergeWait,
+            "MergeWait status should persist across multiple auto-refreshes"
+        );
+        // AND: ユーザー操作がない限りキューから外れた表示にならない
+        // (MergeWait is not NotQueued, verified by above assertion)
     }
 }
