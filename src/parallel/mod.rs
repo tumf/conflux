@@ -7,6 +7,7 @@ mod cleanup;
 mod conflict;
 mod events;
 mod executor;
+mod output_bridge;
 mod types;
 
 // Re-export ExecutionEvent as ParallelEvent for backward compatibility
