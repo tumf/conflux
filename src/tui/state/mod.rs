@@ -1336,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn test_warning_popup_set_on_warning_event() {
+    fn test_uncommitted_changes_warning_logs_only() {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
 
@@ -1345,14 +1345,34 @@ mod tests {
             message: "Warning: Uncommitted changes detected.".to_string(),
         });
 
-        assert!(app.warning_popup.is_some());
-        let popup = app.warning_popup.as_ref().unwrap();
-        assert_eq!(popup.title, "Uncommitted Changes Detected");
-        assert!(popup.message.contains("Warning: Uncommitted"));
+        // Uncommitted changes warning should NOT show popup
+        assert!(app.warning_popup.is_none());
+        // But should be logged
         assert!(app
             .logs
             .iter()
             .any(|log| log.message.contains("Warning: Uncommitted")));
+    }
+
+    #[test]
+    fn test_other_warning_popup_set_on_warning_event() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.handle_orchestrator_event(OrchestratorEvent::Warning {
+            title: "Some Other Warning".to_string(),
+            message: "Warning: Something else happened.".to_string(),
+        });
+
+        // Other warnings should still show popup
+        assert!(app.warning_popup.is_some());
+        let popup = app.warning_popup.as_ref().unwrap();
+        assert_eq!(popup.title, "Some Other Warning");
+        assert!(popup.message.contains("Warning: Something else"));
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("Warning: Something else")));
     }
 
     #[test]
