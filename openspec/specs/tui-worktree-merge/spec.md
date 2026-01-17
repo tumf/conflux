@@ -38,28 +38,14 @@ TUI Worktree View SHALL display "M: merge" key hint only when ALL of the followi
 - No merge conflicts
 - Has branch name
 - Has commits ahead of base branch
+- No resolve operation in progress
 
-TUI SHALL NOT display merge key hint when worktree branch has no commits ahead of base branch.
+TUI SHALL NOT display merge key hint when resolve is in progress.
 
-#### Scenario: M key displayed only when commits ahead
-
+#### Scenario: M key hidden while resolve in progress
 - **GIVEN** TUI is in Worktrees view
-- **AND** cursor is on a worktree that is not main, not detached, has no conflicts, and has a branch name
-- **AND** the worktree branch has commits ahead of base branch
-- **WHEN** the footer is rendered
-- **THEN** the key hints SHALL include "M: merge"
-
-#### Scenario: M key hidden when no commits ahead
-
-- **GIVEN** TUI is in Worktrees view
-- **AND** cursor is on a worktree that meets all conditions EXCEPT has no commits ahead
-- **WHEN** the footer is rendered
-- **THEN** the key hints SHALL NOT include "M: merge"
-
-#### Scenario: M key hidden for main worktree
-
-- **GIVEN** TUI is in Worktrees view
-- **AND** cursor is on main worktree
+- **AND** cursor is on a worktree that otherwise meets merge conditions
+- **AND** a resolve operation is in progress
 - **WHEN** the footer is rendered
 - **THEN** the key hints SHALL NOT include "M: merge"
 
@@ -188,3 +174,4 @@ Merge operation SHOULD NOT crash TUI silently; errors SHALL be displayed to user
 - **THEN** TUI SHALL NOT crash silently
 - **AND** error SHALL be displayed via warning_popup or log entry
 - **AND** TUI SHALL remain operational
+
