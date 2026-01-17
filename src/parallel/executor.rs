@@ -949,6 +949,7 @@ pub async fn execute_archive_in_workspace(
                             .send(ParallelEvent::ArchiveOutput {
                                 change_id: change_id_clone.clone(),
                                 output: line,
+                                iteration: None,
                             })
                             .await;
                     }
@@ -968,6 +969,7 @@ pub async fn execute_archive_in_workspace(
                             .send(ParallelEvent::ArchiveOutput {
                                 change_id: change_id_clone2.clone(),
                                 output: line,
+                                iteration: None,
                             })
                             .await;
                     }
@@ -1096,6 +1098,7 @@ pub async fn execute_archive_in_workspace(
                         .send(ParallelEvent::ArchiveOutput {
                             change_id,
                             output: text,
+                            iteration: None,
                         })
                         .await;
                 }

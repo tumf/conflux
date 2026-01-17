@@ -186,7 +186,11 @@ pub enum ExecutionEvent {
     ArchiveFailed { change_id: String, error: String },
     /// Archive output (streaming)
     #[allow(dead_code)]
-    ArchiveOutput { change_id: String, output: String },
+    ArchiveOutput {
+        change_id: String,
+        output: String,
+        iteration: Option<u32>,
+    },
 
     // Progress events
     /// Progress updated for a change (task completion tracking)
@@ -272,13 +276,19 @@ pub enum ExecutionEvent {
     AnalysisStarted { remaining_changes: usize },
     /// Analysis output (streaming)
     #[allow(dead_code)]
-    AnalysisOutput { output: String },
+    AnalysisOutput {
+        output: String,
+        iteration: Option<u32>,
+    },
     /// Analysis completed
     #[allow(dead_code)]
     AnalysisCompleted { groups_found: usize },
     /// Resolve output (streaming)
     #[allow(dead_code)]
-    ResolveOutput { output: String },
+    ResolveOutput {
+        output: String,
+        iteration: Option<u32>,
+    },
 
     // Hook events
     /// Hook execution started

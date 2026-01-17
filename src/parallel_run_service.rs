@@ -339,6 +339,7 @@ impl ParallelRunService {
                 .analyze_groups_with_callback(changes, move |output| {
                     let _ = tx.try_send(ParallelEvent::AnalysisOutput {
                         output: output.clone(),
+                        iteration: None,
                     });
                 })
                 .await

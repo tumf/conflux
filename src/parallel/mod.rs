@@ -977,6 +977,7 @@ impl ParallelExecutor {
                                     .send(ParallelEvent::ArchiveOutput {
                                         change_id,
                                         output: text,
+                                        iteration: None,
                                     })
                                     .await;
                             }
