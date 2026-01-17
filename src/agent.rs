@@ -7,6 +7,8 @@
 use crate::command_queue::{CommandQueue, CommandQueueConfig};
 use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Hardcoded system prompt for apply commands.
 /// This is always appended after the user-configurable apply_prompt.
@@ -102,6 +104,50 @@ impl AgentRunner {
         Self {
             config,
             command_queue: CommandQueue::new(queue_config),
+            apply_history: ApplyHistory::new(),
+            archive_history: ArchiveHistory::new(),
+        }
+    }
+
+    /// Create a new AgentRunner with shared stagger state.
+    ///
+    /// This allows multiple AgentRunner instances to coordinate their
+    /// stagger delays through a shared last_execution timestamp.
+    /// Useful for parallel execution modes where multiple runners
+    /// need to avoid simultaneous command starts.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Orchestrator configuration
+    /// * `shared_state` - Shared last execution timestamp (Arc<Mutex<Option<Instant>>>)
+    #[allow(dead_code)] // Infrastructure ready, integration pending (tasks 4.1-4.3)
+    pub fn new_with_shared_state(
+        config: OrchestratorConfig,
+        shared_state: Arc<Mutex<Option<Instant>>>,
+    ) -> Self {
+        // Build command queue configuration from orchestrator config
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: config
+                .command_queue_stagger_delay_ms
+                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+            max_retries: config
+                .command_queue_max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_delay_ms: config
+                .command_queue_retry_delay_ms
+                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+            retry_error_patterns: config
+                .command_queue_retry_patterns
+                .clone()
+                .unwrap_or_else(default_retry_patterns),
+            retry_if_duration_under_secs: config
+                .command_queue_retry_if_duration_under_secs
+                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+        };
+
+        Self {
+            config,
+            command_queue: CommandQueue::new_with_shared_state(queue_config, shared_state),
             apply_history: ApplyHistory::new(),
             archive_history: ArchiveHistory::new(),
         }
