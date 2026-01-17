@@ -173,6 +173,9 @@ impl GitWorkspaceManager {
         )
         .await?;
 
+        // Execute setup script if it exists
+        commands::run_worktree_setup(&self.repo_root, &worktree_path).await?;
+
         let workspace = GitWorkspace {
             name: branch_name,
             path: worktree_path,

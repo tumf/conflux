@@ -1,0 +1,8 @@
+#!/bin/sh
+# Worktree setup script for testing
+echo "=== Worktree Setup Script ==="
+echo "Running in: $(pwd)"
+echo "Root worktree: $ROOT_WORKTREE_PATH"
+echo "Creating test marker file..."
+touch .setup-completed
+echo "Setup completed successfully!"

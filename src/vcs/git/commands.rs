@@ -8,7 +8,7 @@ use crate::vcs::{VcsBackend, VcsError, VcsResult};
 use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Execute a Git command and return the trimmed stdout output.
 ///
@@ -743,6 +743,87 @@ pub async fn add_and_commit<P: AsRef<Path>>(cwd: P, message: &str) -> VcsResult<
 pub async fn has_changes_to_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
     let output = run_git(&["status", "--porcelain"], cwd).await?;
     Ok(!output.is_empty())
+}
+
+/// Execute the worktree setup script if it exists.
+///
+/// Checks for `.wt/setup` in the repository root and executes it in the worktree directory.
+/// Sets the `ROOT_WORKTREE_PATH` environment variable to the repository root path.
+///
+/// # Arguments
+/// * `repo_root` - Path to the repository root directory
+/// * `worktree_path` - Path to the newly created worktree directory
+///
+/// # Returns
+/// Ok(()) if setup script doesn't exist or executes successfully, Err() if setup script fails.
+pub async fn run_worktree_setup<P1: AsRef<Path>, P2: AsRef<Path>>(
+    repo_root: P1,
+    worktree_path: P2,
+) -> VcsResult<()> {
+    let repo_root = repo_root.as_ref();
+    let worktree_path = worktree_path.as_ref();
+
+    // Check if .wt/setup exists in the repository root
+    let setup_script = repo_root.join(".wt").join("setup");
+
+    if !setup_script.exists() {
+        debug!(
+            "Setup script not found at {:?}, skipping setup",
+            setup_script
+        );
+        return Ok(());
+    }
+
+    info!(
+        "Found setup script at {:?}, executing in worktree {:?}",
+        setup_script, worktree_path
+    );
+
+    // Make sure the script is executable (Unix only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(&setup_script).map_err(|e| {
+            VcsError::git_command(format!("Failed to read setup script metadata: {}", e))
+        })?;
+        let mut permissions = metadata.permissions();
+        // Add execute permission for owner, group, and others
+        permissions.set_mode(permissions.mode() | 0o111);
+        std::fs::set_permissions(&setup_script, permissions).map_err(|e| {
+            VcsError::git_command(format!("Failed to set setup script permissions: {}", e))
+        })?;
+    }
+
+    // Execute the setup script
+    debug!(
+        module = module_path!(),
+        "Executing setup script: {:?} (cwd: {:?}, env: ROOT_WORKTREE_PATH={:?})",
+        setup_script,
+        worktree_path,
+        repo_root
+    );
+
+    let output = Command::new(&setup_script)
+        .current_dir(worktree_path)
+        .env("ROOT_WORKTREE_PATH", repo_root)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| VcsError::git_command(format!("Failed to execute setup script: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        return Err(VcsError::git_command(format!(
+            "Setup script failed with exit code {}\nstdout: {}\nstderr: {}",
+            exit_code, stdout, stderr
+        )));
+    }
+
+    info!("Setup script completed successfully");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1484,5 +1565,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count_same, 0, "Branch should be 0 commits ahead of itself");
+    }
+
+    #[tokio::test]
+    async fn test_run_worktree_setup_no_script() {
+        let temp_dir = TempDir::new().unwrap();
+        let worktree_dir = temp_dir.path().join("worktree");
+        std::fs::create_dir(&worktree_dir).unwrap();
+
+        // No .wt/setup script exists - should succeed without error
+        let result = run_worktree_setup(temp_dir.path(), &worktree_dir).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_run_worktree_setup_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let worktree_dir = temp_dir.path().join("worktree");
+        std::fs::create_dir(&worktree_dir).unwrap();
+
+        // Create .wt/setup script
+        let wt_dir = temp_dir.path().join(".wt");
+        std::fs::create_dir(&wt_dir).unwrap();
+        let setup_script = wt_dir.join("setup");
+
+        // Create a simple test script that creates a marker file
+        #[cfg(unix)]
+        let script_content = "#!/bin/sh\ntouch $ROOT_WORKTREE_PATH/setup_ran\n";
+        #[cfg(windows)]
+        let script_content = "@echo off\ntype nul > %ROOT_WORKTREE_PATH%\\setup_ran\n";
+
+        std::fs::write(&setup_script, script_content).unwrap();
+
+        // Execute setup
+        let result = run_worktree_setup(temp_dir.path(), &worktree_dir).await;
+        assert!(result.is_ok());
+
+        // Verify marker file was created
+        assert!(temp_dir.path().join("setup_ran").exists());
+    }
+
+    #[tokio::test]
+    async fn test_run_worktree_setup_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let worktree_dir = temp_dir.path().join("worktree");
+        std::fs::create_dir(&worktree_dir).unwrap();
+
+        // Create .wt/setup script that fails
+        let wt_dir = temp_dir.path().join(".wt");
+        std::fs::create_dir(&wt_dir).unwrap();
+        let setup_script = wt_dir.join("setup");
+
+        // Create a script that exits with error
+        #[cfg(unix)]
+        let script_content = "#!/bin/sh\nexit 1\n";
+        #[cfg(windows)]
+        let script_content = "@echo off\nexit /b 1\n";
+
+        std::fs::write(&setup_script, script_content).unwrap();
+
+        // Execute setup - should fail
+        let result = run_worktree_setup(temp_dir.path(), &worktree_dir).await;
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Setup script failed"));
     }
 }
