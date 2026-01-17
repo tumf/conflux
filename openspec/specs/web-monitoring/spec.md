@@ -187,7 +187,6 @@ The web dashboard SHALL display a list of all changes with their current progres
 The web dashboard SHALL automatically update when orchestrator state changes.
 The web dashboard SHALL render a fresh initial state snapshot on page load.
 The web dashboard SHALL fall back to polling when WebSocket updates are unavailable.
-The web dashboard SHALL display the product name as "Conflux" in the header and page title.
 
 #### Scenario: Initial state render
 - **WHEN** dashboard loads
@@ -221,11 +220,6 @@ The web dashboard SHALL display the product name as "Conflux" in the header and 
 - **WHEN** user reloads the dashboard page
 - **THEN** the dashboard renders the latest orchestrator state
 - **AND** the displayed progress reflects current `/api/state` content
-
-#### Scenario: Web UI header branding
-- **WHEN** the dashboard page is loaded
-- **THEN** the header displays "Conflux" as the product name
-- **AND** the browser tab title includes "Conflux"
 
 ### Requirement: Dashboard UI - Task Status Visualization
 The web dashboard SHALL show detailed task status for each change.
@@ -479,4 +473,3 @@ Webダッシュボードは、各変更カードに承認/承認解除のトグ�
 - **WHEN** 承認ボタンがモバイルデバイスに表示される
 - **THEN** ボタンのタップ可能領域は最小44x44ピクセルである
 - **AND** タップ時に視覚的フィードバックが表示される
-

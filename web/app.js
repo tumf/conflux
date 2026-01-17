@@ -1,4 +1,4 @@
-// Conflux Web Monitor - Client Application
+// OpenSpec Orchestrator Web Monitor - Client Application
 // Responsive mobile-first implementation with touch support
 
 class WebMonitor {
