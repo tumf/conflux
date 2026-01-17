@@ -151,6 +151,7 @@ pub async fn resolve_conflicts_with_retry(
                 event_tx,
                 ParallelEvent::ResolveOutput {
                     output: text.clone(),
+                    iteration: Some(attempt),
                 },
             )
             .await;
@@ -388,6 +389,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                 event_tx,
                 ParallelEvent::ResolveOutput {
                     output: text.clone(),
+                    iteration: Some(attempt),
                 },
             )
             .await;
@@ -421,6 +423,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         event_tx,
                         ParallelEvent::ResolveOutput {
                             output: reason.clone(),
+                            iteration: Some(attempt),
                         },
                     )
                     .await;
@@ -471,6 +474,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         event_tx,
                         ParallelEvent::ResolveOutput {
                             output: reason.clone(),
+                            iteration: Some(attempt),
                         },
                     )
                     .await;
@@ -518,6 +522,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         event_tx,
                         ParallelEvent::ResolveOutput {
                             output: reason.clone(),
+                            iteration: Some(attempt),
                         },
                     )
                     .await;
@@ -550,6 +555,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         event_tx,
                         ParallelEvent::ResolveOutput {
                             output: reason.clone(),
+                            iteration: Some(attempt),
                         },
                     )
                     .await;
@@ -636,6 +642,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         event_tx,
                         ParallelEvent::ResolveOutput {
                             output: reason.clone(),
+                            iteration: Some(attempt),
                         },
                     )
                     .await;
@@ -659,6 +666,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                                 "Removed approved-only change directories: {}",
                                 removed_changes.join(", ")
                             ),
+                            iteration: Some(attempt),
                         },
                     )
                     .await;
