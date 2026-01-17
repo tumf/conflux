@@ -1481,10 +1481,27 @@ impl ParallelExecutor {
         revisions: &[String],
         change_ids: &[String],
     ) -> Result<MergeAttempt> {
+        use crate::execution::archive::verify_archive_completion;
+
         let _merge_guard = global_merge_lock().lock().await;
         if let Some(reason) = base_dirty_reason(&self.repo_root).await? {
             return Ok(MergeAttempt::Deferred(reason));
         }
+
+        // Verify that all changes are actually archived before attempting merge
+        for change_id in change_ids {
+            let verification = verify_archive_completion(change_id, Some(&self.repo_root));
+            if !verification.is_success() {
+                let reason = format!(
+                    "Archive verification failed for '{}': change directory still exists in openspec/changes/. \
+                     The change was not properly archived and cannot be merged.",
+                    change_id
+                );
+                warn!("{}", reason);
+                return Ok(MergeAttempt::Deferred(reason));
+            }
+        }
+
         self.merge_and_resolve(revisions, change_ids).await?;
         Ok(MergeAttempt::Merged)
     }
@@ -3213,5 +3230,212 @@ mod tests {
 
         // After debounce: should reanalyze
         assert!(executor.should_reanalyze(true).await);
+    }
+
+    #[tokio::test]
+    async fn test_attempt_merge_defers_when_change_not_archived() {
+        use std::fs;
+        use tempfile::TempDir;
+        use tokio::sync::mpsc;
+
+        // Create temporary repository
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+
+        // Initialize git repo
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        // Create initial commit
+        fs::write(repo_root.join("README.md"), "initial").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Initial"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        // Create openspec/changes/test-change directory (simulating incomplete archive)
+        let change_dir = repo_root.join("openspec/changes/test-change");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(change_dir.join("spec.md"), "# Test").unwrap();
+
+        // Commit the change directory to ensure working tree is clean
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add test change (not archived)"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        // Create executor
+        let config = OrchestratorConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
+
+        let revisions = vec!["test-workspace".to_string()];
+        let change_ids = vec!["test-change".to_string()];
+
+        // Attempt merge should be deferred because change directory exists
+        let result = executor.attempt_merge(&revisions, &change_ids).await;
+
+        match result {
+            Ok(MergeAttempt::Deferred(reason)) => {
+                assert!(
+                    reason.contains("Archive verification failed"),
+                    "Expected deferred reason to mention archive verification, got: {}",
+                    reason
+                );
+                assert!(
+                    reason.contains("test-change"),
+                    "Expected reason to include change ID, got: {}",
+                    reason
+                );
+            }
+            Ok(MergeAttempt::Merged) => {
+                panic!("Merge should have been deferred when change directory exists");
+            }
+            Err(e) => {
+                panic!("Expected MergeDeferred, got error: {}", e);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_attempt_merge_succeeds_when_change_archived() {
+        use std::fs;
+        use tempfile::TempDir;
+        use tokio::sync::mpsc;
+
+        // Create temporary repository
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+
+        // Initialize git repo
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        // Create initial commit
+        fs::write(repo_root.join("README.md"), "initial").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Initial"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        // Create archive directory but NOT openspec/changes/test-change (proper archive)
+        let archive_dir = repo_root.join("openspec/changes/archive/test-change");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("spec.md"), "# Archived").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Archive: test-change"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        // Create worktree for the change (outside the main repo to avoid dirty working tree)
+        let workspace_base = TempDir::new().unwrap();
+        let workspace_path = workspace_base.path().join("ws-test-change");
+
+        Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "ws-test-change",
+                workspace_path.to_str().unwrap(),
+                "HEAD",
+            ])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        // Create executor
+        let mut config = OrchestratorConfig::default();
+        config.workspace_base_dir = Some(workspace_base.path().to_string_lossy().to_string());
+        let (tx, _rx) = mpsc::channel(10);
+        let executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
+
+        let revisions = vec!["ws-test-change".to_string()];
+        let change_ids = vec!["test-change".to_string()];
+
+        // Attempt merge should succeed because change is properly archived
+        let result = executor.attempt_merge(&revisions, &change_ids).await;
+
+        match result {
+            Ok(MergeAttempt::Merged) => {
+                // Success - merge was allowed
+            }
+            Ok(MergeAttempt::Deferred(reason)) => {
+                panic!(
+                    "Merge should have succeeded when change is archived, got deferred: {}",
+                    reason
+                );
+            }
+            Err(e) => {
+                // This is also acceptable - merge may fail for other reasons (e.g., merge conflicts)
+                // but it should not be deferred due to archive verification
+                println!("Merge failed with error (acceptable): {}", e);
+            }
+        }
     }
 }

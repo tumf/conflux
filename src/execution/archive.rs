@@ -104,8 +104,10 @@ pub fn is_change_archived(change_id: &str, base_path: Option<&Path>) -> bool {
 
 /// Check if the archive commit is complete for a change.
 ///
-/// The archive commit is considered complete when the working tree is clean
-/// and the latest commit subject matches `Archive: <change_id>`.
+/// The archive commit is considered complete when:
+/// 1. The working tree is clean
+/// 2. The latest commit subject matches `Archive: <change_id>`
+/// 3. The change directory does not exist in `openspec/changes/<change_id>`
 pub async fn is_archive_commit_complete(change_id: &str, base_path: Option<&Path>) -> Result<bool> {
     let repo_root = base_path.unwrap_or_else(|| Path::new("."));
 
@@ -148,21 +150,30 @@ pub async fn is_archive_commit_complete(change_id: &str, base_path: Option<&Path
         .to_string();
     let expected_subject = format!("Archive: {}", change_id);
 
+    // Check if openspec/changes/<change_id> exists (should NOT exist for complete archive)
+    let change_path = repo_root.join("openspec/changes").join(change_id);
+    let change_exists = change_path.exists();
+
     debug!(
         change_id = %change_id,
         is_clean = is_clean,
         subject = %subject,
         expected_subject = %expected_subject,
+        change_path = %change_path.display(),
+        change_exists = change_exists,
         "is_archive_commit_complete: checking commit state"
     );
 
-    Ok(is_clean && subject == expected_subject)
+    Ok(is_clean && subject == expected_subject && !change_exists)
 }
 
 /// Ensure the archive commit exists for a change.
 ///
 /// When the working tree is dirty after archive, this function runs the resolve
 /// command to create a commit with subject `Archive: <change_id>`.
+///
+/// Returns an error if `openspec/changes/<change_id>` still exists, indicating
+/// the change was not properly archived.
 pub async fn ensure_archive_commit<F, Fut>(
     change_id: &str,
     repo_root: &Path,
@@ -188,6 +199,17 @@ where
                     )));
                 }
                 return Ok(());
+            }
+
+            // Check if openspec/changes/<change_id> exists before attempting to create archive commit
+            let change_path = repo_root.join("openspec/changes").join(change_id);
+            if change_path.exists() {
+                return Err(OrchestratorError::AgentCommand(format!(
+                    "Cannot create archive commit for '{}': change directory still exists at {}. \
+                     The archive operation did not properly move the change to the archive directory.",
+                    change_id,
+                    change_path.display()
+                )));
             }
 
             if is_archive_commit_complete(change_id, Some(repo_root)).await? {
@@ -1239,5 +1261,177 @@ fi\n";
         assert!(msg.contains("add-feature"));
         assert!(msg.contains("not actually archived"));
         assert!(msg.contains("openspec/changes"));
+    }
+
+    // ===========================
+    // Archive guardrail tests
+    // ===========================
+
+    #[tokio::test]
+    async fn test_is_archive_commit_complete_false_when_change_exists() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+
+        // Initialize git repo
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        // Create archive commit
+        fs::write(repo_root.join("README.md"), "base").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Archive: test-change"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        // Create openspec/changes/test-change directory (simulating archive reversion)
+        let change_dir = repo_root.join("openspec/changes/test-change");
+        fs::create_dir_all(&change_dir).unwrap();
+
+        // Archive commit should be incomplete because change directory exists
+        let result = is_archive_commit_complete("test-change", Some(repo_root))
+            .await
+            .unwrap();
+        assert!(
+            !result,
+            "Archive commit should be incomplete when change directory exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_archive_commit_complete_true_when_change_removed() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+
+        // Initialize git repo
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        // Create archive commit
+        fs::write(repo_root.join("README.md"), "base").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Archive: test-change"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        // Do NOT create openspec/changes/test-change directory (proper archive)
+
+        // Archive commit should be complete
+        let result = is_archive_commit_complete("test-change", Some(repo_root))
+            .await
+            .unwrap();
+        assert!(
+            result,
+            "Archive commit should be complete when change directory does not exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_archive_commit_fails_when_change_exists() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+
+        // Initialize git repo
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        // Create initial commit
+        fs::write(repo_root.join("README.md"), "base").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Initial"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        // Create openspec/changes/test-change directory (simulating incomplete archive)
+        let change_dir = repo_root.join("openspec/changes/test-change");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(change_dir.join("spec.md"), "# Test change").unwrap();
+
+        // Add files to working tree
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        let config = OrchestratorConfig::default();
+        let agent = AgentRunner::new(config);
+
+        // ensure_archive_commit should fail because change directory exists
+        let result = ensure_archive_commit(
+            "test-change",
+            repo_root,
+            &agent,
+            VcsBackend::Git,
+            |_| async {},
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "ensure_archive_commit should fail when change directory exists"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("change directory still exists"),
+            "Error message should mention change directory exists, got: {}",
+            err_msg
+        );
     }
 }
