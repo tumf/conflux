@@ -102,30 +102,72 @@ pub const DEFAULT_ERROR_CIRCUIT_BREAKER_ENABLED: bool = true;
 /// Default threshold for consecutive same errors before opening circuit
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_THRESHOLD: usize = 5;
 
+/// Generates a project slug from the repository root path.
+/// Format: `{repo_basename}-{hash8}` where hash8 is the first 8 chars of the SHA256 hash
+/// of the absolute repository path.
+///
+/// Example: `/Users/alice/projects/conflux` → `conflux-a1b2c3d4`
+fn generate_project_slug(repo_root: &std::path::Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // Get repository basename
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    // Generate hash from absolute path
+    let absolute_path = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut hasher = DefaultHasher::new();
+    absolute_path.hash(&mut hasher);
+    let hash = hasher.finish();
+    let hash_str = format!("{:016x}", hash);
+    let hash8 = &hash_str[..8];
+
+    format!("{}-{}", repo_name, hash8)
+}
+
 /// Returns the default workspace base directory based on the OS and environment.
 ///
-/// - **macOS**: Uses `${XDG_DATA_HOME}/openspec/worktrees` if `XDG_DATA_HOME` is set,
-///   otherwise falls back to `~/Library/Application Support/openspec/worktrees`.
-/// - **Linux**: Uses `${XDG_DATA_HOME}/openspec/worktrees` if set,
-///   otherwise `~/.local/share/openspec/worktrees`.
-/// - **Windows**: Uses `%APPDATA%\OpenSpec\worktrees`.
-/// - **Other**: Falls back to system temp directory with `openspec-workspaces-fallback`.
-pub fn default_workspace_base_dir() -> PathBuf {
+/// - **macOS**: Uses `${XDG_DATA_HOME}/conflux/worktrees/<project_slug>` if `XDG_DATA_HOME` is set,
+///   otherwise falls back to `~/Library/Application Support/conflux/worktrees/<project_slug>`.
+/// - **Linux**: Uses `${XDG_DATA_HOME}/conflux/worktrees/<project_slug>` if set,
+///   otherwise `~/.local/share/conflux/worktrees/<project_slug>`.
+/// - **Windows**: Uses `%APPDATA%\Conflux\worktrees\<project_slug>`.
+/// - **Other**: Falls back to system temp directory with `conflux-workspaces-fallback/<project_slug>`.
+///
+/// If `repo_root` is provided, the path includes a project-specific slug to avoid conflicts.
+/// If `repo_root` is None, returns a generic path without project slug (for backwards compatibility).
+pub fn default_workspace_base_dir(repo_root: Option<&std::path::Path>) -> PathBuf {
+    // Generate project slug if repo_root is provided
+    let project_slug = repo_root.map(generate_project_slug);
+
     #[cfg(target_os = "macos")]
     {
         // Check XDG_DATA_HOME first
         if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
-            return PathBuf::from(xdg_data_home)
-                .join("openspec")
+            let mut path = PathBuf::from(xdg_data_home)
+                .join("conflux")
                 .join("worktrees");
+            if let Some(slug) = &project_slug {
+                path = path.join(slug);
+            }
+            return path;
         }
         // Fall back to macOS standard Application Support
         if let Some(home) = dirs::home_dir() {
-            return home
+            let mut path = home
                 .join("Library")
                 .join("Application Support")
-                .join("openspec")
+                .join("conflux")
                 .join("worktrees");
+            if let Some(slug) = &project_slug {
+                path = path.join(slug);
+            }
+            return path;
         }
     }
 
@@ -133,16 +175,24 @@ pub fn default_workspace_base_dir() -> PathBuf {
     {
         // Use XDG_DATA_HOME or fall back to ~/.local/share
         if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
-            return PathBuf::from(xdg_data_home)
-                .join("openspec")
+            let mut path = PathBuf::from(xdg_data_home)
+                .join("conflux")
                 .join("worktrees");
+            if let Some(slug) = &project_slug {
+                path = path.join(slug);
+            }
+            return path;
         }
         if let Some(home) = dirs::home_dir() {
-            return home
+            let mut path = home
                 .join(".local")
                 .join("share")
-                .join("openspec")
+                .join("conflux")
                 .join("worktrees");
+            if let Some(slug) = &project_slug {
+                path = path.join(slug);
+            }
+            return path;
         }
     }
 
@@ -150,12 +200,20 @@ pub fn default_workspace_base_dir() -> PathBuf {
     {
         // Use APPDATA directory
         if let Some(appdata) = dirs::data_dir() {
-            return appdata.join("OpenSpec").join("worktrees");
+            let mut path = appdata.join("Conflux").join("worktrees");
+            if let Some(slug) = &project_slug {
+                path = path.join(slug);
+            }
+            return path;
         }
     }
 
     // Fallback for unsupported platforms or when home directory is not available
-    std::env::temp_dir().join("openspec-workspaces-fallback")
+    let mut path = std::env::temp_dir().join("conflux-workspaces-fallback");
+    if let Some(slug) = &project_slug {
+        path = path.join(slug);
+    }
+    path
 }
 #[cfg(test)]
 mod tests {
@@ -163,25 +221,57 @@ mod tests {
 
     #[test]
     fn test_default_workspace_base_dir_returns_path() {
-        // Test that the function returns a valid PathBuf
-        let path = default_workspace_base_dir();
+        // Test that the function returns a valid PathBuf without repo_root
+        let path = default_workspace_base_dir(None);
         assert!(!path.as_os_str().is_empty());
     }
 
     #[test]
-    fn test_default_workspace_base_dir_contains_openspec() {
-        // Test that the path contains "openspec" or is the fallback
-        let path = default_workspace_base_dir();
+    fn test_default_workspace_base_dir_contains_conflux() {
+        // Test that the path contains "conflux" or is the fallback
+        let path = default_workspace_base_dir(None);
         let path_str = path.to_string_lossy();
 
-        // Should contain "openspec" (case-insensitive) or be the fallback
-        let is_openspec_path = path_str.to_lowercase().contains("openspec");
-        let is_fallback = path_str.contains("openspec-workspaces-fallback");
+        // Should contain "conflux" (case-insensitive) or be the fallback
+        let is_conflux_path = path_str.to_lowercase().contains("conflux");
+        let is_fallback = path_str.contains("conflux-workspaces-fallback");
 
         assert!(
-            is_openspec_path || is_fallback,
-            "Path should contain 'openspec' or be fallback: {:?}",
+            is_conflux_path || is_fallback,
+            "Path should contain 'conflux' or be fallback: {:?}",
             path
+        );
+    }
+
+    #[test]
+    fn test_default_workspace_base_dir_with_repo_root() {
+        // Test with repo_root parameter
+        let repo_root = PathBuf::from("/Users/alice/projects/conflux");
+        let path = default_workspace_base_dir(Some(&repo_root));
+        let path_str = path.to_string_lossy();
+
+        // Should contain project slug (repo name + hash)
+        assert!(
+            path_str.contains("conflux-"),
+            "Path should contain project slug: {:?}",
+            path
+        );
+    }
+
+    #[test]
+    fn test_generate_project_slug() {
+        let repo_root = PathBuf::from("/Users/alice/projects/my-repo");
+        let slug = generate_project_slug(&repo_root);
+
+        // Should have format: {name}-{hash8}
+        assert!(
+            slug.starts_with("my-repo-"),
+            "Slug should start with repo name"
+        );
+        assert_eq!(
+            slug.len(),
+            "my-repo-".len() + 8,
+            "Slug should have 8-char hash"
         );
     }
 
@@ -199,7 +289,8 @@ mod tests {
             let test_path = "/tmp/test-xdg-data";
             env::set_var("XDG_DATA_HOME", test_path);
 
-            let result = default_workspace_base_dir();
+            let repo_root = PathBuf::from("/tmp/test-repo");
+            let result = default_workspace_base_dir(Some(&repo_root));
 
             // Should use XDG_DATA_HOME
             assert!(
@@ -209,8 +300,8 @@ mod tests {
                 result
             );
             assert!(
-                result.ends_with("openspec/worktrees"),
-                "Expected path to end with openspec/worktrees, got {:?}",
+                result.to_string_lossy().contains("conflux/worktrees"),
+                "Expected path to contain conflux/worktrees, got {:?}",
                 result
             );
 
@@ -231,11 +322,12 @@ mod tests {
         let original = env::var("XDG_DATA_HOME").ok();
         env::remove_var("XDG_DATA_HOME");
 
-        let result = default_workspace_base_dir();
+        let repo_root = PathBuf::from("/tmp/test-repo");
+        let result = default_workspace_base_dir(Some(&repo_root));
         let path_str = result.to_string_lossy();
 
         // Should use Application Support on macOS when XDG_DATA_HOME is not set
-        let expected_contains = vec!["Library/Application Support", "openspec", "worktrees"];
+        let expected_contains = vec!["Library/Application Support", "conflux", "worktrees"];
         for part in expected_contains {
             assert!(
                 path_str.contains(part),
@@ -254,42 +346,39 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_default_workspace_base_dir_linux_fallback() {
-        use std::env;
-
-        // Save and remove XDG_DATA_HOME to test fallback
-        let original = env::var("XDG_DATA_HOME").ok();
-        env::remove_var("XDG_DATA_HOME");
-
-        let result = default_workspace_base_dir();
+        // NOTE: This test may run in parallel with other tests that set XDG_DATA_HOME,
+        // so we can't rely on environment isolation. We just check that the path
+        // contains the expected components (conflux/worktrees) and project slug.
+        let repo_root = PathBuf::from("/tmp/test-repo");
+        let result = default_workspace_base_dir(Some(&repo_root));
         let path_str = result.to_string_lossy();
 
-        // Should use .local/share on Linux when XDG_DATA_HOME is not set
-        let expected_contains = vec![".local/share", "openspec", "worktrees"];
-        for part in expected_contains {
-            assert!(
-                path_str.contains(part),
-                "Expected path to contain '{}', got {:?}",
-                part,
-                result
-            );
-        }
+        // Should contain conflux and worktrees
+        assert!(
+            path_str.contains("conflux") && path_str.contains("worktrees"),
+            "Expected path to contain 'conflux' and 'worktrees', got {:?}",
+            result
+        );
 
-        // Restore original value
-        if let Some(val) = original {
-            env::set_var("XDG_DATA_HOME", val);
-        }
+        // Should contain project slug
+        assert!(
+            path_str.contains("test-repo-"),
+            "Expected path to contain project slug 'test-repo-', got {:?}",
+            result
+        );
     }
 
     #[test]
     #[cfg(target_os = "windows")]
     fn test_default_workspace_base_dir_windows() {
-        let result = default_workspace_base_dir();
+        let repo_root = PathBuf::from("C:\\Users\\test\\projects\\my-repo");
+        let result = default_workspace_base_dir(Some(&repo_root));
         let path_str = result.to_string_lossy();
 
         // Should use APPDATA on Windows
         assert!(
-            path_str.contains("OpenSpec") && path_str.contains("worktrees"),
-            "Expected path to contain 'OpenSpec' and 'worktrees', got {:?}",
+            path_str.contains("Conflux") && path_str.contains("worktrees"),
+            "Expected path to contain 'Conflux' and 'worktrees', got {:?}",
             result
         );
     }

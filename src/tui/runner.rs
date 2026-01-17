@@ -244,7 +244,7 @@ async fn run_tui_loop(
     let worktree_base_dir = config
         .get_workspace_base_dir()
         .map(PathBuf::from)
-        .unwrap_or_else(crate::config::defaults::default_workspace_base_dir);
+        .unwrap_or_else(|| crate::config::defaults::default_workspace_base_dir(Some(&repo_root)));
     let worktree_manager = GitWorkspaceManager::new(
         worktree_base_dir.clone(),
         repo_root.clone(),
