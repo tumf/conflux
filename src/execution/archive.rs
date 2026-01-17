@@ -344,11 +344,12 @@ pub fn verify_archive_completion(
         "verify_archive_completion: checking paths"
     );
 
-    // Archive is successful if:
-    // 1. Change no longer exists in original location, OR
-    // 2. Change exists in archive directory
-    // We check archive_exists first because the change may briefly exist in both locations
-    if archive_exists || !change_exists {
+    // Archive is successful ONLY if:
+    // 1. Change no longer exists in openspec/changes/{change_id}
+    // If the change directory exists, the archive is incomplete regardless of
+    // whether an archive entry exists (the archive command may have failed
+    // to move/remove the original change directory).
+    if !change_exists {
         ArchiveVerificationResult::Success
     } else {
         ArchiveVerificationResult::NotArchived {
@@ -919,7 +920,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base = temp_dir.path();
 
-        // Edge case: both change and archive exist (transient state)
+        // Edge case: both change and archive exist (incomplete archive)
         let changes_dir = base.join("openspec/changes");
         let archive_dir = base.join("openspec/changes/archive");
         fs::create_dir_all(&changes_dir).unwrap();
@@ -931,9 +932,15 @@ mod tests {
         fs::create_dir(&change_path).unwrap();
         fs::create_dir(&archive_path).unwrap();
 
-        // If archive exists, consider it success even if change also exists
+        // If change directory still exists, archive is incomplete regardless of archive entry
         let result = verify_archive_completion(change_id, Some(base));
-        assert!(result.is_success());
+        assert!(!result.is_success());
+        assert_eq!(
+            result,
+            ArchiveVerificationResult::NotArchived {
+                change_id: "my-change".to_string()
+            }
+        );
     }
 
     // ===========================
