@@ -890,6 +890,34 @@ async fn run_tui_loop(
                                 branch_name
                             )));
 
+                            // Execute setup script if it exists
+                            if let Err(err) = crate::vcs::git::commands::run_worktree_setup(
+                                &repo_root,
+                                &worktree_path,
+                            )
+                            .await
+                            {
+                                app.add_log(LogEntry::error(format!(
+                                    "Failed to run worktree setup: {}",
+                                    err
+                                )));
+                                // Don't continue - setup failure is considered an error
+                                // but the worktree was already created, so we should clean it up
+                                if let Err(cleanup_err) =
+                                    crate::vcs::git::commands::worktree_remove(
+                                        &repo_root,
+                                        worktree_path_str,
+                                    )
+                                    .await
+                                {
+                                    app.add_log(LogEntry::error(format!(
+                                        "Failed to cleanup worktree after setup failure: {}",
+                                        cleanup_err
+                                    )));
+                                }
+                                continue;
+                            }
+
                             let command = OrchestratorConfig::expand_worktree_command(
                                 &template,
                                 worktree_path_str,
