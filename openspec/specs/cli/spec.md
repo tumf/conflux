@@ -333,32 +333,11 @@ The selection mode footer SHALL display appropriate guidance messages based on a
 
 The running mode footer SHALL display a progress bar for overall processing progress.
 
-#### Scenario: Progress bar display during execution
-
-- **WHEN** TUI is in running mode
-- **THEN** the footer displays a progress bar for all tasks in the queue
-- **AND** the progress bar is calculated based on completed tasks / total tasks
-- **AND** the percentage is displayed numerically
-
-#### Scenario: Progress bar calculation method
-
-- **WHEN** displaying the progress bar
-- **THEN** total tasks is the sum of `total_tasks` for all target changes (Queued, Processing, Completed, Archived)
-- **AND** completed tasks is the sum of `completed_tasks` for all target changes
-- **AND** progress rate is calculated as `completed_tasks / total_tasks * 100`
-- **AND** NotQueued and Error state changes are NOT included in progress calculation
-
 #### Scenario: Completed task progress retention
-
-- **WHEN** a change transitions to Completed or Archived state
-- **THEN** its task progress continues to be included in progress bar calculation
-- **AND** progress percentage does not decrease (monotonically increasing)
-
-#### Scenario: When task count is 0
-
-- **WHEN** displaying the progress bar
-- **AND** total task count is 0
-- **THEN** the progress bar displays as 0%
+- **WHEN** a change transitions to Completed, Archived, or Merged state
+- **AND** the latest tasks.md is available at apply completion or archive start
+- **THEN** the TUI preserves the last known task counts for that change
+- **AND** the progress percentage does not decrease (monotonically increasing)
 
 ### Requirement: Processing Item Spinner Animation
 
@@ -1409,4 +1388,3 @@ resolve コンテキストは、人間とAIが読みやすい形式で構造化�
 - **THEN** 「This is attempt X of Y」という形式で試行回数が示される
 - **AND** 「Previous attempt (N):」というラベルで前回の結果が示される
 - **AND** 「Continue resolving...」などの指示が含まれる
-
