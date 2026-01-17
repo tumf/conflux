@@ -1,5 +1,7 @@
 //! Default values and constants for orchestrator configuration.
 
+use std::path::PathBuf;
+
 /// Project-level configuration file name
 pub const PROJECT_CONFIG_FILE: &str = ".cflx.jsonc";
 
@@ -99,3 +101,196 @@ pub const DEFAULT_ERROR_CIRCUIT_BREAKER_ENABLED: bool = true;
 
 /// Default threshold for consecutive same errors before opening circuit
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_THRESHOLD: usize = 5;
+
+/// Returns the default workspace base directory based on the OS and environment.
+///
+/// - **macOS**: Uses `${XDG_DATA_HOME}/openspec/worktrees` if `XDG_DATA_HOME` is set,
+///   otherwise falls back to `~/Library/Application Support/openspec/worktrees`.
+/// - **Linux**: Uses `${XDG_DATA_HOME}/openspec/worktrees` if set,
+///   otherwise `~/.local/share/openspec/worktrees`.
+/// - **Windows**: Uses `%APPDATA%\OpenSpec\worktrees`.
+/// - **Other**: Falls back to system temp directory with `openspec-workspaces-fallback`.
+pub fn default_workspace_base_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        // Check XDG_DATA_HOME first
+        if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
+            return PathBuf::from(xdg_data_home)
+                .join("openspec")
+                .join("worktrees");
+        }
+        // Fall back to macOS standard Application Support
+        if let Some(home) = dirs::home_dir() {
+            return home
+                .join("Library")
+                .join("Application Support")
+                .join("openspec")
+                .join("worktrees");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Use XDG_DATA_HOME or fall back to ~/.local/share
+        if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
+            return PathBuf::from(xdg_data_home)
+                .join("openspec")
+                .join("worktrees");
+        }
+        if let Some(home) = dirs::home_dir() {
+            return home
+                .join(".local")
+                .join("share")
+                .join("openspec")
+                .join("worktrees");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Use APPDATA directory
+        if let Some(appdata) = dirs::data_dir() {
+            return appdata.join("OpenSpec").join("worktrees");
+        }
+    }
+
+    // Fallback for unsupported platforms or when home directory is not available
+    std::env::temp_dir().join("openspec-workspaces-fallback")
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_workspace_base_dir_returns_path() {
+        // Test that the function returns a valid PathBuf
+        let path = default_workspace_base_dir();
+        assert!(!path.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn test_default_workspace_base_dir_contains_openspec() {
+        // Test that the path contains "openspec" or is the fallback
+        let path = default_workspace_base_dir();
+        let path_str = path.to_string_lossy();
+
+        // Should contain "openspec" (case-insensitive) or be the fallback
+        let is_openspec_path = path_str.to_lowercase().contains("openspec");
+        let is_fallback = path_str.contains("openspec-workspaces-fallback");
+
+        assert!(
+            is_openspec_path || is_fallback,
+            "Path should contain 'openspec' or be fallback: {:?}",
+            path
+        );
+    }
+
+    #[test]
+    fn test_default_workspace_base_dir_with_xdg_data_home() {
+        // Test XDG_DATA_HOME override (only on Unix-like systems)
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            use std::env;
+
+            // Save original value
+            let original = env::var("XDG_DATA_HOME").ok();
+
+            // Set XDG_DATA_HOME
+            let test_path = "/tmp/test-xdg-data";
+            env::set_var("XDG_DATA_HOME", test_path);
+
+            let result = default_workspace_base_dir();
+
+            // Should use XDG_DATA_HOME
+            assert!(
+                result.starts_with(test_path),
+                "Expected path to start with {}, got {:?}",
+                test_path,
+                result
+            );
+            assert!(
+                result.ends_with("openspec/worktrees"),
+                "Expected path to end with openspec/worktrees, got {:?}",
+                result
+            );
+
+            // Restore original value
+            match original {
+                Some(val) => env::set_var("XDG_DATA_HOME", val),
+                None => env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_default_workspace_base_dir_macos_fallback() {
+        use std::env;
+
+        // Save and remove XDG_DATA_HOME to test fallback
+        let original = env::var("XDG_DATA_HOME").ok();
+        env::remove_var("XDG_DATA_HOME");
+
+        let result = default_workspace_base_dir();
+        let path_str = result.to_string_lossy();
+
+        // Should use Application Support on macOS when XDG_DATA_HOME is not set
+        let expected_contains = vec!["Library/Application Support", "openspec", "worktrees"];
+        for part in expected_contains {
+            assert!(
+                path_str.contains(part),
+                "Expected path to contain '{}', got {:?}",
+                part,
+                result
+            );
+        }
+
+        // Restore original value
+        if let Some(val) = original {
+            env::set_var("XDG_DATA_HOME", val);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_default_workspace_base_dir_linux_fallback() {
+        use std::env;
+
+        // Save and remove XDG_DATA_HOME to test fallback
+        let original = env::var("XDG_DATA_HOME").ok();
+        env::remove_var("XDG_DATA_HOME");
+
+        let result = default_workspace_base_dir();
+        let path_str = result.to_string_lossy();
+
+        // Should use .local/share on Linux when XDG_DATA_HOME is not set
+        let expected_contains = vec![".local/share", "openspec", "worktrees"];
+        for part in expected_contains {
+            assert!(
+                path_str.contains(part),
+                "Expected path to contain '{}', got {:?}",
+                part,
+                result
+            );
+        }
+
+        // Restore original value
+        if let Some(val) = original {
+            env::set_var("XDG_DATA_HOME", val);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_default_workspace_base_dir_windows() {
+        let result = default_workspace_base_dir();
+        let path_str = result.to_string_lossy();
+
+        // Should use APPDATA on Windows
+        assert!(
+            path_str.contains("OpenSpec") && path_str.contains("worktrees"),
+            "Expected path to contain 'OpenSpec' and 'worktrees', got {:?}",
+            result
+        );
+    }
+}
