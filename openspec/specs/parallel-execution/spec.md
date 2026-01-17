@@ -576,7 +576,7 @@ WIPコミットメッセージは `WIP: {change_id} ({completed}/{total} tasks, 
 #### Scenario: Git backend snapshot handling
 - Given: Gitバックエンドを使用している
 - When: WIPスナップショットを作成する
-- Then: `git add -A` と `git commit --allow-empty` 相当の操作で新規WIPコミットが作成される
+- Then: `git add -A` と `git commit --no-verify --allow-empty` 相当の操作で新規WIPコミットが作成される
 
 ### Requirement: Final Apply Squash
 
