@@ -83,6 +83,8 @@ pub struct ParallelExecutor {
     cancel_token: Option<CancellationToken>,
     /// Last queue change timestamp for debouncing re-analysis
     last_queue_change_at: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Dynamic queue for runtime change additions (TUI mode)
+    dynamic_queue: Option<Arc<crate::tui::queue::DynamicQueue>>,
 }
 
 pub async fn base_dirty_reason(repo_root: &Path) -> Result<Option<String>> {
@@ -198,6 +200,7 @@ impl ParallelExecutor {
             hooks: None,
             cancel_token: None,
             last_queue_change_at,
+            dynamic_queue: None,
         }
     }
 
@@ -229,6 +232,11 @@ impl ParallelExecutor {
     /// Set the cancellation token for force stop cleanup.
     pub fn set_cancel_token(&mut self, cancel_token: CancellationToken) {
         self.cancel_token = Some(cancel_token);
+    }
+
+    /// Set the dynamic queue for runtime change additions (TUI mode).
+    pub fn set_dynamic_queue(&mut self, dynamic_queue: Arc<crate::tui::queue::DynamicQueue>) {
+        self.dynamic_queue = Some(dynamic_queue);
     }
 
     /// Check if re-analysis should proceed based on debounce logic.
@@ -454,6 +462,70 @@ impl ParallelExecutor {
                 .await;
                 return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
             }
+
+            // Check dynamic queue for newly added changes (TUI mode)
+            if let Some(queue) = &self.dynamic_queue {
+                let mut queue_changed = false;
+                while let Some(dynamic_id) = queue.pop().await {
+                    // Check if change is already in the list
+                    if !changes.iter().any(|c| c.id == dynamic_id) {
+                        // Load change details from openspec by listing all changes and filtering
+                        match crate::openspec::list_changes_native() {
+                            Ok(all_changes) => {
+                                if let Some(new_change) =
+                                    all_changes.into_iter().find(|c| c.id == dynamic_id)
+                                {
+                                    info!("Dynamically adding change to execution: {}", dynamic_id);
+                                    send_event(
+                                        &self.event_tx,
+                                        ParallelEvent::Log(LogEntry::info(format!(
+                                            "Dynamically added to parallel execution: {}",
+                                            dynamic_id
+                                        ))),
+                                    )
+                                    .await;
+                                    changes.push(new_change);
+                                    queue_changed = true;
+                                } else {
+                                    warn!(
+                                        "Dynamically added change '{}' not found in openspec",
+                                        dynamic_id
+                                    );
+                                    send_event(
+                                        &self.event_tx,
+                                        ParallelEvent::Log(LogEntry::warn(format!(
+                                            "Dynamically added change '{}' not found in openspec",
+                                            dynamic_id
+                                        ))),
+                                    )
+                                    .await;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to load dynamically added change '{}': {}",
+                                    dynamic_id, e
+                                );
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::Log(LogEntry::warn(format!(
+                                        "Failed to load dynamically added change '{}': {}",
+                                        dynamic_id, e
+                                    ))),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+
+                // Update queue change timestamp if items were added
+                if queue_changed {
+                    let mut last_change = self.last_queue_change_at.lock().await;
+                    *last_change = Some(std::time::Instant::now());
+                }
+            }
+
             // Filter out changes that depend on failed changes
             let executable_changes: Vec<_> = changes
                 .iter()
@@ -1977,6 +2049,7 @@ mod tests {
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
+            dynamic_queue: None,
         };
 
         assert_eq!(
@@ -2191,6 +2264,7 @@ mod tests {
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
+            dynamic_queue: None,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2329,6 +2403,7 @@ mod tests {
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
+            dynamic_queue: None,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2439,6 +2514,7 @@ mod tests {
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
+            dynamic_queue: None,
         };
 
         let revisions = vec![workspace_a.name];
@@ -2578,6 +2654,7 @@ mod tests {
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
+            dynamic_queue: None,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2731,6 +2808,7 @@ mod tests {
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
+            dynamic_queue: None,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2890,6 +2968,7 @@ mod tests {
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
+            dynamic_queue: None,
         };
 
         let revisions = vec![workspace_a.name];
@@ -2906,5 +2985,61 @@ mod tests {
 
         let hook_contents = std::fs::read_to_string(repo_root.join("hooked.txt")).unwrap();
         assert!(hook_contents.contains("hooked"));
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_queue_injection() {
+        use crate::tui::queue::DynamicQueue;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        // Create a dynamic queue and add a change ID
+        let queue = Arc::new(DynamicQueue::new());
+        queue.push("test-change-2".to_string()).await;
+
+        // Verify the queue has one item
+        assert_eq!(queue.len().await, 1);
+
+        // Create a simple parallel executor with the queue
+        let config = OrchestratorConfig::default();
+        let repo_root = PathBuf::from("/tmp/test-repo");
+        let (tx, _rx) = mpsc::channel(10);
+        let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
+        executor.set_dynamic_queue(queue.clone());
+
+        // The queue reference should be set
+        assert!(executor.dynamic_queue.is_some());
+
+        // After this point, the execute_with_reanalysis method would poll the queue
+        // and inject the change into the execution. This is tested via integration tests.
+    }
+
+    #[tokio::test]
+    async fn test_debounce_with_queue_changes() {
+        use std::time::{Duration, Instant};
+        use tokio::sync::mpsc;
+
+        let config = OrchestratorConfig::default();
+        let repo_root = PathBuf::from("/tmp/test-repo");
+        let (tx, _rx) = mpsc::channel(10);
+        let executor = ParallelExecutor::new(repo_root, config, Some(tx));
+
+        // First check: no queue changes, should reanalyze
+        assert!(executor.should_reanalyze(true).await);
+
+        // Simulate a queue change
+        {
+            let mut last_change = executor.last_queue_change_at.lock().await;
+            *last_change = Some(Instant::now());
+        }
+
+        // Immediate check: should NOT reanalyze (debounce active)
+        assert!(!executor.should_reanalyze(true).await);
+
+        // Wait for debounce period to expire (10 seconds + margin)
+        tokio::time::sleep(Duration::from_secs(11)).await;
+
+        // After debounce: should reanalyze
+        assert!(executor.should_reanalyze(true).await);
     }
 }
