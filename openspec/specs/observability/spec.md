@@ -1,76 +1,105 @@
-# observability Specification
+# Observability Specification
 
 ## Purpose
-TBD - created by archiving change add-command-logging. Update Purpose after archive.
+
+This specification defines the logging and observability requirements for the Conflux orchestrator. It ensures that all command executions, TUI events, and system operations are properly logged for debugging and troubleshooting purposes.
+
+The specification covers:
+- Command execution logging (VCS, AI agents, hooks)
+- TUI log synchronization to debug files
+- Log level classification and formatting standards
+
 ## Requirements
-### Requirement: REQ-OBS-001 すべてのコマンド実行のログ記録
 
-オーケストレーターは外部コマンド（`tokio::process::Command`, `std::process::Command`）を実行する前に、コマンド情報をログに記録しなければならない (MUST)。
+### Requirement: REQ-OBS-001 Command Execution Logging
 
-ログには以下の情報を含めなければならない：
-- 実行可能ファイル名
-- 引数リスト
-- 作業ディレクトリ（設定されている場合）
+The orchestrator MUST log command information before executing external commands (`tokio::process::Command`, `std::process::Command`).
 
-#### Scenario: VCSコマンド実行時のログ出力
+The log MUST include the following information:
+- Executable name
+- Argument list
+- Working directory (if set)
 
-- **GIVEN** git worktreeを作成する
-- **WHEN** `git worktree add` コマンドが実行される
-- **THEN** ログに `debug!` レベルでコマンドライン全体が記録される
-- **AND** ログに作業ディレクトリが含まれる
+**Addition**: All log entries displayed in the TUI Logs View MUST also be output to the debug log file when the `--logs` option is specified.
 
-#### Scenario: AIエージェントコマンド実行時のログ出力
+#### Scenario: VCS Command Execution Logging
 
-- **GIVEN** changeをapplyする
-- **WHEN** OpenCodeエージェントコマンドが実行される
-- **THEN** ログに `info!` レベルでコマンドラインが記録される
+- **GIVEN** creating a git worktree
+- **WHEN** the `git worktree add` command is executed
+- **THEN** the entire command line is logged at `debug!` level
+- **AND** the working directory is included in the log
 
-#### Scenario: フック実行時のログ出力
+#### Scenario: AI Agent Command Execution Logging
 
-- **GIVEN** on_apply_startフックが設定されている
-- **WHEN** フックコマンドが実行される
-- **THEN** ログに `info!` レベルでコマンドラインが記録される
-- **AND** ログに "Running on_apply_start hook" というコンテキストが含まれる
+- **GIVEN** applying a change
+- **WHEN** an OpenCode agent command is executed
+- **THEN** the command line is logged at `info!` level
 
-### Requirement: REQ-OBS-002 適切なログレベル分類
+#### Scenario: Hook Execution Logging
 
-オーケストレーターはコマンドの重要度に応じて適切なログレベルを使用しなければならない (MUST)。
+- **GIVEN** an on_apply_start hook is configured
+- **WHEN** the hook command is executed
+- **THEN** the command line is logged at `info!` level
+- **AND** the log includes "Running on_apply_start hook" context
 
-ログレベルの基準：
-- `info!`: ユーザー向けの主要操作（apply, archive, analyze, hooks実行）
-- `debug!`: 内部的なVCSコマンド、補助的なコマンド実行
+#### Scenario: TUI Logs Sync to Debug File
 
-#### Scenario: デフォルトログレベルでの出力制御
+- **GIVEN** the TUI is started with `--logs /tmp/debug.log` option
+- **WHEN** an error occurs during agent processing and is displayed in TUI Logs View
+- **THEN** the same error message is also recorded in the debug log file at `ERROR` level
+- **AND** the log includes the `tui_log` target
 
-- **GIVEN** RUST_LOG環境変数が設定されていない（デフォルト）
-- **WHEN** orchestratorを実行する
-- **THEN** `info!` レベルのコマンドログが表示される
-- **AND** `debug!` レベルのVCSコマンドログは表示されない
+#### Scenario: Warning Log Sync
 
-#### Scenario: デバッグモードでの詳細ログ出力
+- **GIVEN** the TUI is started with `--logs /tmp/debug.log` option
+- **WHEN** a merge is deferred and a warning is displayed in TUI Logs View
+- **THEN** the same warning message is also recorded in the debug log file at `WARN` level
 
-- **GIVEN** RUST_LOG=debug が設定されている
-- **WHEN** orchestratorを実行する
-- **THEN** すべてのVCSコマンドログが表示される
-- **AND** 内部的な補助コマンドのログも表示される
+#### Scenario: Info Log Sync
 
-### Requirement: REQ-OBS-003 統一されたログフォーマット
+- **GIVEN** the TUI is started with `--logs /tmp/debug.log` option
+- **WHEN** processing starts and an info log is displayed in TUI Logs View
+- **THEN** the same message is also recorded in the debug log file at `INFO` level
 
-オーケストレーターは一貫性のあるログフォーマットを使用しなければならない (MUST)。
+### Requirement: REQ-OBS-002 Appropriate Log Level Classification
 
-フォーマット規則：
-- コマンド実行前: `"Running {context}: {command}"` または `"Executing {command}"`
-- コンテキスト情報を可能な限り含める（例：change ID, workspace path）
+The orchestrator MUST use appropriate log levels based on command importance.
 
-#### Scenario: 統一フォーマットでのログ出力
+Log level criteria:
+- `info!`: Major user-facing operations (apply, archive, analyze, hook execution)
+- `debug!`: Internal VCS commands, auxiliary command execution
 
-- **GIVEN** 複数の種類のコマンドが実行される
-- **WHEN** ログを確認する
-- **THEN** すべてのコマンドログが統一されたフォーマットで出力されている
-- **AND** コンテキスト情報（change ID等）が含まれている
+#### Scenario: Output Control with Default Log Level
 
-#### Scenario: 長いコマンドラインの扱い
+- **GIVEN** RUST_LOG environment variable is not set (default)
+- **WHEN** running the orchestrator
+- **THEN** `info!` level command logs are displayed
+- **AND** `debug!` level VCS command logs are not displayed
 
-- **GIVEN** 非常に長い引数を持つコマンドを実行する
-- **WHEN** ログを確認する
-- **THEN** コマンドライン全体が記録されている（切り詰めない）
+#### Scenario: Detailed Log Output in Debug Mode
+
+- **GIVEN** RUST_LOG=debug is set
+- **WHEN** running the orchestrator
+- **THEN** all VCS command logs are displayed
+- **AND** internal auxiliary command logs are also displayed
+
+### Requirement: REQ-OBS-003 Unified Log Format
+
+The orchestrator MUST use a consistent log format.
+
+Format rules:
+- Before command execution: `"Running {context}: {command}"` or `"Executing {command}"`
+- Include context information whenever possible (e.g., change ID, workspace path)
+
+#### Scenario: Unified Format Log Output
+
+- **GIVEN** multiple types of commands are executed
+- **WHEN** checking the logs
+- **THEN** all command logs are output in a unified format
+- **AND** context information (change ID, etc.) is included
+
+#### Scenario: Handling Long Command Lines
+
+- **GIVEN** executing a command with very long arguments
+- **WHEN** checking the logs
+- **THEN** the entire command line is recorded (not truncated)

@@ -4,7 +4,7 @@
 //! This module now re-exports the unified ExecutionEvent type.
 
 // Re-export unified event types
-pub use crate::events::{ExecutionEvent, LogEntry};
+pub use crate::events::{ExecutionEvent, LogEntry, LogLevel};
 
 // Alias for backward compatibility
 pub type OrchestratorEvent = ExecutionEvent;

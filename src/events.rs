@@ -14,6 +14,15 @@ use regex::Regex;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+/// Log level for TUI logs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Info,
+    Success,
+    Warn,
+    Error,
+}
+
 /// Log entry for the TUI
 #[derive(Debug, Clone)]
 pub struct LogEntry {
@@ -23,6 +32,8 @@ pub struct LogEntry {
     pub message: String,
     /// Log level color
     pub color: Color,
+    /// Log level
+    pub level: LogLevel,
     /// Optional change_id for parallel mode logs
     pub change_id: Option<String>,
     /// Optional operation type (apply, archive, resolve)
@@ -59,6 +70,7 @@ impl LogEntry {
             timestamp: Local::now().format("%H:%M:%S").to_string(),
             message,
             color: Color::White,
+            level: LogLevel::Info,
             change_id: None,
             operation: None,
             iteration: None,
@@ -73,6 +85,7 @@ impl LogEntry {
             timestamp: Local::now().format("%H:%M:%S").to_string(),
             message,
             color: Color::Green,
+            level: LogLevel::Success,
             change_id: None,
             operation: None,
             iteration: None,
@@ -87,6 +100,7 @@ impl LogEntry {
             timestamp: Local::now().format("%H:%M:%S").to_string(),
             message,
             color: Color::Yellow,
+            level: LogLevel::Warn,
             change_id: None,
             operation: None,
             iteration: None,
@@ -101,6 +115,7 @@ impl LogEntry {
             timestamp: Local::now().format("%H:%M:%S").to_string(),
             message,
             color: Color::Red,
+            level: LogLevel::Error,
             change_id: None,
             operation: None,
             iteration: None,
@@ -435,5 +450,39 @@ mod tests {
         assert_eq!(entry.change_id, Some("test-change".to_string()));
         assert_eq!(entry.operation, Some("apply".to_string()));
         assert_eq!(entry.iteration, Some(3));
+    }
+
+    #[test]
+    fn test_log_entry_info_level() {
+        let entry = LogEntry::info("test");
+        assert_eq!(entry.level, LogLevel::Info);
+        assert!(matches!(entry.color, Color::White));
+    }
+
+    #[test]
+    fn test_log_entry_success_level() {
+        let entry = LogEntry::success("test");
+        assert_eq!(entry.level, LogLevel::Success);
+        assert!(matches!(entry.color, Color::Green));
+    }
+
+    #[test]
+    fn test_log_entry_warn_level() {
+        let entry = LogEntry::warn("test");
+        assert_eq!(entry.level, LogLevel::Warn);
+        assert!(matches!(entry.color, Color::Yellow));
+    }
+
+    #[test]
+    fn test_log_entry_error_level() {
+        let entry = LogEntry::error("test");
+        assert_eq!(entry.level, LogLevel::Error);
+        assert!(matches!(entry.color, Color::Red));
+    }
+
+    #[test]
+    fn test_log_level_equality() {
+        assert_eq!(LogLevel::Info, LogLevel::Info);
+        assert_ne!(LogLevel::Info, LogLevel::Error);
     }
 }
