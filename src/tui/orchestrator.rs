@@ -705,7 +705,8 @@ pub async fn run_orchestrator(
             .await;
 
         // Run apply command with streaming output
-        let (mut child, mut output_rx, start_time) = agent.run_apply_streaming(&change_id, None).await?;
+        let (mut child, mut output_rx, start_time) =
+            agent.run_apply_streaming(&change_id, None).await?;
 
         // Stream output to TUI log, with cancellation support
         loop {
