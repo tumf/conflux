@@ -101,40 +101,20 @@ DynamicQueueは以下の操作をサポートすること：
 TUI は実行イベントを受信して内部状態を更新しなければならない（SHALL）。
 
 **変更内容**:
-- `MergeCompleted` イベント処理時に、状態を `Archived` ではなく **`Merged`** に設定する
-- `QueueStatus` enum に **`Merged`** 状態を追加し、並列モードの最終状態として使用する
+- resolve待ちの変更は `NotQueued` ではなく、待機状態として視覚的に識別できる状態で表示する
+- resolve待ち状態はユーザーの明示操作がない限り、auto-refresh やリスト更新で消失しない
 
-#### Scenario: Parallel mode での MergeCompleted イベント受信時に Merged 状態に遷移
+#### Scenario: resolve待ち状態の表示を維持する
+- **GIVEN** 変更が merge 待機状態として記録されている
+- **WHEN** TUI が変更リストを再描画する
+- **THEN** 変更のステータスは resolve待ちとして表示される
+- **AND** `NotQueued` として表示されない
 
-- **GIVEN** TUIが並列モードで実行中
-- **WHEN** `ExecutionEvent::MergeCompleted { change_id, revision }` イベントを受信する
-- **THEN** TUIは `change_id` に該当する変更のステータスを **`Merged`** に設定する
-- **AND** 変更の `elapsed_time` を記録する（`started_at` から経過時間を計算）
-- **AND** ログに "Merge completed for '{change_id}'" が追加される
-
-#### Scenario: Merged ステータスは terminal state として扱われる
-
-- **GIVEN** 変更のステータスが `Merged` である
-- **WHEN** TUIが terminal state をチェックする
-- **THEN** `Merged` は `Archived`, `Completed`, `Error` と同様に terminal state として扱われる
-- **AND** Progress 更新は実行されない
-- **AND** リスト更新時も保持される
-
-#### Scenario: Merged ステータスは明確に表示される
-
-- **GIVEN** 変更のステータスが `Merged` である
-- **WHEN** TUIが変更リストをレンダリングする
-- **THEN** ステータスが "merged" として表示される
-- **AND** 色は `Color::LightBlue` で表示される（青系で "完了かつ統合済み" を表現）
-- **AND** チェックボックスは `[x]` でグレーアウト表示される
-
-#### Scenario: Serial モードでは Archived が最終状態として維持される
-
-- **GIVEN** Serial モードで実行中
-- **WHEN** 変更がアーカイブされる
-- **THEN** 状態は `Archived` となる
-- **AND** `Merged` 状態には遷移しない
-- **AND** `Archived` が最終状態として扱われる
+#### Scenario: resolve待ち状態は自動更新で保持される
+- **GIVEN** 変更が resolve待ち状態である
+- **WHEN** TUI が変更一覧を更新する
+- **THEN** 変更の状態は resolve待ちのまま保持される
+- **AND** ユーザー操作がない限りキューから外れた表示にならない
 
 ### Requirement: Log Entry Structure and Display
 TUIのログエントリーは、タイムスタンプ、メッセージ、色に加えて、オプションのコンテキスト情報（change ID、オペレーション、イテレーション番号）を含まなければならない（SHALL）。
@@ -186,4 +166,3 @@ pub struct LogEntry {
 - **WHEN** TUIがログをレンダリングする
 - **THEN** ログヘッダーは `[test-change]` と表示される
 - **AND** 既存の動作が維持される
-
