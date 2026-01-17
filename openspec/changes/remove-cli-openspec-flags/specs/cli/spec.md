@@ -1,25 +1,28 @@
-## MODIFIED Requirements
-### Requirement: CLIフラグ一覧
+## ADDED Requirements
+### Requirement: Deprecated Flags Removal
 
-CLIは以下のフラグを提供しなければならない（SHALL）。
+The CLI SHALL NOT accept --opencode-path or --openspec-cmd flags.
 
-- 共通: `--version`, `-V`, `--help`, `-h`
-- `run` サブコマンド: `--change`, `--config`, `--max-iterations`, `--parallel`, `--max-concurrent`, `--dry-run`, `--vcs`, `--no-resume`, `--web`, `--web-port`, `--web-bind`
-- `tui` サブコマンド: `--config`, `--logs`, `--web`, `--web-port`, `--web-bind`
-- `init` サブコマンド: `--template`, `--force`
-- `approve` サブコマンド: `set`, `unset`, `status`
+Configuration-based command templates SHALL be the only way to customize OpenSpec and agent execution.
 
-`--opencode-path` と `--openspec-cmd` はCLIに存在してはならない（MUST NOT）。
+#### Scenario: Deprecated flags are not available
 
-#### Scenario: CLIフラグ一覧にOpenSpec/Opencode関連フラグが含まれない
-- **WHEN** ユーザーが `cflx --help` を確認する
-- **THEN** `--opencode-path` と `--openspec-cmd` は表示されない
-- **AND** `run` と `tui` の主要フラグが一覧に含まれる
+- **WHEN** user runs `cflx --help`
+- **THEN** --opencode-path and --openspec-cmd are not listed
+- **AND** no environment variable OPENSPEC_CMD is supported
 
-### Requirement: 拡張ヘルプ出力
+#### Scenario: Configuration file is the only command customization method
 
-CLIは `cflx --help` に全サブコマンドと主要オプション一覧を明示的に表示しなければならない（SHALL）。
+- **WHEN** user wants to customize OpenSpec command execution
+- **THEN** user must use configuration file settings
+- **AND** CLI flags do not override configuration
 
-#### Scenario: web監視フラグがヘルプに表示される
-- **WHEN** ユーザーが `cflx --help` を実行する
-- **THEN** `--web` / `--web-port` / `--web-bind` が `run` と `tui` のオプション一覧に含まれる
+### Requirement: Enhanced Help Output
+
+The CLI SHALL display all subcommands and main options explicitly in `cflx --help`.
+
+#### Scenario: Web monitoring flags are shown in help
+
+- **WHEN** user runs `cflx --help`
+- **THEN** --web, --web-port, --web-bind are listed for `run` and `tui` subcommands
+- **AND** --parallel, --max-concurrent, --dry-run, --vcs are listed for `run` subcommand

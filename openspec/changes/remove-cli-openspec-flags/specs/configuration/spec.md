@@ -1,10 +1,18 @@
-## MODIFIED Requirements
-### Requirement: OpenSpecコマンドの設定方法
+## ADDED Requirements
+### Requirement: Configuration File is the Only Command Customization Method
 
-OpenSpecコマンドはCLIフラグや環境変数で上書きできない（MUST NOT）。
-オーケストレーターは設定ファイルのコマンドテンプレートを通じてOpenSpec/エージェントの実行方法を定義しなければならない（SHALL）。
+OpenSpec command execution MUST NOT be overridden by CLI flags or environment variables.
 
-#### Scenario: CLIフラグによるOpenSpecコマンド上書きが無効
-- **WHEN** ユーザーが `cflx --help` を確認する
-- **THEN** `--openspec-cmd` は表示されない
-- **AND** CLIからOpenSpecコマンドを上書きできない
+The orchestrator SHALL define OpenSpec and agent execution methods through configuration file command templates only.
+
+#### Scenario: CLI flag command override is disabled
+
+- **WHEN** user runs `cflx --help`
+- **THEN** --openspec-cmd is not listed
+- **AND** CLI does not allow OpenSpec command override
+
+#### Scenario: Environment variable command override is disabled
+
+- **WHEN** OPENSPEC_CMD environment variable is set
+- **THEN** CLI does not read or use this environment variable
+- **AND** configuration file settings are used instead
