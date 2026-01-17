@@ -553,26 +553,13 @@ The TUI SHALL NOT rely on retry loops to detect task completion for archiving pu
 
 ### Requirement: Reliable Archive Tracking
 
-The TUI SHALL track archived changes reliably and report accurate final status. Archive verification SHALL treat a change as not archived if `openspec/changes/{change_id}` exists, regardless of archive entry presence.
+archive 検証は `openspec/changes/{change_id}` が存在する場合に未アーカイブとして扱わなければならない（SHALL）。
 
-#### Scenario: All changes archived successfully
-- **WHEN** all queued changes have been processed and archived
-- **THEN** the final verification reports "All processed changes have been archived"
-- **AND** no unarchived warnings are displayed
-
-#### Scenario: Archive failure handling
-- **WHEN** an archive command fails for a change
-- **THEN** the change is marked as errored
-- **AND** the error is logged with details
-- **AND** the change is not removed from tracking until explicitly handled
-
-#### Scenario: Archive command succeeded but change directory remains
-- **WHEN** an archive command exits successfully (exit code 0)
-- **AND** `openspec/changes/{change_id}` still exists
-- **THEN** archive verification treats the change as not archived
-- **AND** the orchestrator re-runs the archive command up to N times before marking the change as errored
-- **AND** each retry attempt is logged
-- **AND** no arbitrary delay-based polling is used
+#### Scenario: changes が残っている場合は未アーカイブ扱い
+- **WHEN** archive コマンドが成功する
+- **AND** `openspec/changes/{change_id}` が存在している
+- **THEN** archive 検証は未アーカイブとして扱われる
+- **AND** archive コマンドは再実行される
 
 ### Requirement: TUI Uses Native Change Discovery
 

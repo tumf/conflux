@@ -1,12 +1,12 @@
 # Change: Archive verification fails when changes directory remains
 
 ## Why
-Archive後に `openspec/changes/{change_id}` が残っているにも関わらず archive 検証が成功扱いとなり、後続の `ensure_archive_commit` で失敗して TUI にエラーが出る。検証が正しく失敗として扱われるようにし、未アーカイブ状態のまま次の処理へ進まないようにする。
+Archive verification currently reports success even when `openspec/changes/{change_id}` still exists, which causes `ensure_archive_commit` to fail and surfaces errors in the TUI. This change ensures the verification fails in that case so the workflow does not continue while the change is still unarchived.
 
 ## What Changes
-- `verify_archive_completion` は `openspec/changes/{change_id}` が存在する場合、archive エントリの有無に関わらず未アーカイブとして扱う。
-- 既存の「change が存在しない場合は成功」とする挙動は維持する。
-- 並列/逐次/TUI の共通検証が同じ判定を共有する。
+- `verify_archive_completion` treats a change as unarchived when `openspec/changes/{change_id}` exists, regardless of archive entries.
+- The existing behavior that treats missing changes as successful remains unchanged.
+- The parallel, serial, and TUI archive checks share the same decision logic.
 
 ## Impact
 - Affected specs: `parallel-execution`, `cli`
