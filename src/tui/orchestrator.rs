@@ -1145,6 +1145,7 @@ pub async fn run_orchestrator_parallel(
                 parallel_tx,
                 Some(cancel_token.clone()),
                 Some(shared_queue_change.clone()),
+                Some(Arc::new(dynamic_queue.clone())),
             ) => {
                 result
             }

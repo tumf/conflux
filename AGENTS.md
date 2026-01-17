@@ -695,6 +695,64 @@ match workspace_state {
 3. **Resume Correctness**: Interrupted operations resume from the correct step
 4. **No Duplicate Work**: Skips completed operations automatically
 
+## Dynamic Queue Immediate Execution (TUI Mode)
+
+### Overview
+
+In TUI mode, when users add changes to the queue via Space key during parallel batch execution, the newly queued items now start executing immediately when execution slots are available, rather than waiting for the current batch to complete.
+
+### Implementation
+
+**Location**: `src/parallel/mod.rs` - `execute_with_reanalysis` method
+
+The parallel executor polls the dynamic queue at the beginning of each iteration of the main execution loop:
+
+1. **Queue Polling**: Checks `DynamicQueue::pop()` for newly added change IDs
+2. **Change Loading**: Loads change details via `openspec::list_changes_native()`
+3. **Injection**: Adds new changes to the pending changes vector
+4. **Re-analysis**: New changes go through dependency analysis with remaining changes
+5. **Debounce**: Updates the queue change timestamp to trigger debounce logic
+
+### Configuration
+
+The dynamic queue is optional and only enabled in TUI mode:
+
+- **TUI Mode**: `DynamicQueue` is passed to `ParallelExecutor` via `set_dynamic_queue()`
+- **CLI Mode**: No `DynamicQueue` provided, executor operates normally
+
+### Debounce Logic
+
+Queue changes trigger a 10-second debounce period to prevent excessive re-analysis:
+
+- New items are added to the pending set immediately
+- Re-analysis only occurs after the debounce period expires
+- Allows multiple changes to be queued before expensive dependency analysis
+
+### Event Flow
+
+When a change is dynamically added:
+
+1. `ParallelEvent::Log` - "Dynamically added to parallel execution: {change_id}"
+2. Queue change timestamp updated (triggers debounce)
+3. `ParallelEvent::AnalysisStarted` - When re-analysis begins (after debounce)
+4. Standard execution events (`WorkspaceCreated`, `ApplyStarted`, etc.)
+
+### Benefits
+
+1. **Immediate Feedback**: Users see changes progress from "Queued" to "Analyzing"/"Processing" when slots are available
+2. **Better Resource Utilization**: Available parallelism capacity is used instead of sitting idle
+3. **Seamless UX**: No need to wait for batch completion to start new work
+
+### Troubleshooting
+
+**Issue**: Newly queued items not starting immediately
+- **Cause**: Debounce period active or all slots occupied
+- **Solution**: Wait for debounce period (10 seconds) or for a slot to become available
+
+**Issue**: Multiple re-analysis cycles for single queue addition
+- **Cause**: Queue changes triggering debounce repeatedly
+- **Solution**: Expected behavior; debounce prevents excessive re-analysis overhead
+
 ## JJ Merge Guidance
 
 - Keep merge commits empty: use `jj new --no-edit` and then `jj edit <merge_rev>` followed by `jj new <merge_rev>`.

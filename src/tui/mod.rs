@@ -10,7 +10,7 @@ mod events;
 pub mod log_deduplicator;
 mod orchestrator;
 mod qr;
-mod queue;
+pub mod queue;
 mod render;
 mod runner;
 mod state;
