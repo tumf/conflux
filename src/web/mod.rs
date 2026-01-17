@@ -28,7 +28,7 @@ use tower_http::cors::{Any, CorsLayer};
 #[cfg(feature = "web-monitoring")]
 use tower_http::trace::TraceLayer;
 #[cfg(feature = "web-monitoring")]
-use tracing::info;
+use tracing::{debug, info};
 
 #[cfg(feature = "web-monitoring")]
 pub use state::WebState;
@@ -45,6 +45,8 @@ pub struct WebConfig {
     pub port: u16,
     /// Address to bind the HTTP server
     pub bind: String,
+    /// Interval in seconds for periodic state refresh from disk (0 to disable)
+    pub refresh_interval_secs: u64,
 }
 
 impl Default for WebConfig {
@@ -53,6 +55,7 @@ impl Default for WebConfig {
             enabled: false,
             port: 0, // Auto-assign by OS
             bind: "127.0.0.1".to_string(),
+            refresh_interval_secs: 5, // Default: refresh every 5 seconds
         }
     }
 }
@@ -64,7 +67,15 @@ impl WebConfig {
             enabled: true,
             port,
             bind,
+            refresh_interval_secs: 5, // Default: refresh every 5 seconds
         }
+    }
+
+    /// Set the refresh interval
+    #[allow(dead_code)]
+    pub fn with_refresh_interval(mut self, secs: u64) -> Self {
+        self.refresh_interval_secs = secs;
+        self
     }
 }
 
@@ -221,7 +232,7 @@ pub async fn spawn_server_with_url(
         .route("/ws", get(websocket::ws_handler))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(state.clone());
 
     // Bind to the specified address (port 0 = OS auto-assign)
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -232,6 +243,23 @@ pub async fn spawn_server_with_url(
     // Build accessible URL using local IP for 0.0.0.0 bind
     let url = build_access_url(&config.bind, actual_port);
     info!("Web monitoring server listening on {}", url);
+
+    // Spawn periodic refresh task if enabled
+    if config.refresh_interval_secs > 0 {
+        let state_clone = state;
+        let interval = config.refresh_interval_secs;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+                if let Err(e) = state_clone.refresh_from_disk().await {
+                    debug!("Periodic refresh failed: {}", e);
+                }
+            }
+        });
+    }
 
     // Spawn the server in a background task
     let handle = tokio::spawn(async move {
