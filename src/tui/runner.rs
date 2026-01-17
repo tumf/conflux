@@ -73,6 +73,7 @@ async fn load_worktrees_with_conflict_check(
             is_main,
             merge_conflict: None,
             has_commits_ahead: false, // Will be populated later in parallel check
+            is_merging: false,
         })
         .collect();
 

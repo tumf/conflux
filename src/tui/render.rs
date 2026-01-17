@@ -945,7 +945,18 @@ fn render_worktree_list(frame: &mut Frame, app: &mut AppState, area: Rect) {
                 ""
             };
 
-            let line = format!("{} → {}{}{}", label, branch, indicator, conflict_badge);
+            // Merge status indicator
+            let merge_status = wt.merge_status_label();
+            let merge_indicator = if !merge_status.is_empty() {
+                format!(" [{}]", merge_status)
+            } else {
+                String::new()
+            };
+
+            let line = format!(
+                "{} → {}{}{}{}",
+                label, branch, indicator, merge_indicator, conflict_badge
+            );
 
             // Style based on conflict and selection
             let mut style = Style::default();
@@ -1008,6 +1019,7 @@ fn render_footer_worktree(frame: &mut Frame, app: &AppState, area: Rect) {
             && !wt.branch.is_empty()
             && wt.has_commits_ahead
             && !app.is_resolving
+            && !wt.is_merging
         {
             key_hints.push(("M", "merge"));
         }
