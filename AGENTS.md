@@ -266,100 +266,163 @@ The TUI includes a dedicated Worktree View for managing git worktrees with integ
 
 ### Imports
 
-- Use `crate::` prefix for internal module imports
-- Group imports: std -> external crates -> internal modules
-- Use specific imports, avoid glob imports
+- Group imports in three sections: `std` → external crates → `crate::`
+- Use `crate::` prefix for all internal module imports
+- Use specific imports, avoid glob imports (`use foo::*`)
+- Sort imports alphabetically within each group
 
 ```rust
-use crate::error::{OrchestratorError, Result};
-use regex::Regex;
+// std imports
+use std::path::PathBuf;
 use std::process::Command;
+
+// External crates
+use regex::Regex;
 use tracing::{debug, info};
+
+// Internal modules
+use crate::error::{OrchestratorError, Result};
+use crate::openspec;
 ```
 
 ### Error Handling
 
-- Use `thiserror` for error type definitions
-- Define custom `Result<T>` type alias
+- Use `thiserror` for custom error type definitions
+- Define custom `Result<T>` type alias: `pub type Result<T> = std::result::Result<T, OrchestratorError>;`
 - Use `?` operator for error propagation
-- Use `map_err` for error context conversion
+- Use `map_err` for adding context to errors
+- Use `#[from]` attribute for automatic error conversions
 
 ```rust
+use thiserror::Error;
+
 #[derive(Error, Debug)]
 pub enum OrchestratorError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("OpenSpec command failed: {0}")]
-    OpenSpecCommand(String),
+    #[error("Agent command failed: {0}")]
+    AgentCommand(String),
+
+    #[error("VCS error: {0}")]
+    Vcs(#[from] VcsError),
 }
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;
+
+// Usage
+fn example() -> Result<String> {
+    let data = std::fs::read_to_string("file.txt")?;  // Auto-converts io::Error
+    Ok(data)
+}
 ```
 
 ### Naming Conventions
 
-- Types: `PascalCase` (e.g., `OrchestratorState`, `OpenCodeRunner`)
-- Functions/methods: `snake_case` (e.g., `list_changes`, `run_command`)
-- Constants: `SCREAMING_SNAKE_CASE` (e.g., `STATE_FILE`)
-- Modules: `snake_case` (e.g., `openspec.rs`, `orchestrator.rs`)
+- **Types/Structs/Enums**: `PascalCase` (e.g., `OrchestratorState`, `AgentRunner`, `VcsBackend`)
+- **Functions/Methods**: `snake_case` (e.g., `list_changes`, `run_command`, `detect_workspace_state`)
+- **Constants**: `SCREAMING_SNAKE_CASE` (e.g., `STATE_FILE`, `DEFAULT_MAX_RETRIES`, `APPLY_SYSTEM_PROMPT`)
+- **Modules**: `snake_case` (e.g., `openspec.rs`, `orchestrator.rs`, `command_queue.rs`)
+- **Lifetimes**: Single lowercase letter or descriptive (e.g., `'a`, `'static`)
 
 ### Struct Definitions
 
-- Use `#[derive(...)]` for common traits
-- Place `#[allow(dead_code)]` on unused fields if intentional
-- Use doc comments for public APIs
+- Use `#[derive(...)]` for common traits (Debug, Clone, Serialize, Deserialize)
+- Place `#[allow(dead_code)]` on unused fields only if intentional (document why)
+- Use doc comments (`///`) for all public APIs
+- Use module-level doc comments (`//!`) at the top of files
 
 ```rust
-#[derive(Debug, Clone)]
+//! Agent runner module for executing configurable agent commands.
+
+use serde::{Deserialize, Serialize};
+
+/// Manages agent process execution based on configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Change {
+    /// Unique identifier for the change
     pub id: String,
+    /// Number of completed tasks
     pub completed_tasks: u32,
+    /// Total number of tasks
     pub total_tasks: u32,
-    #[allow(dead_code)]
+    /// Last modification timestamp (ISO 8601)
+    #[allow(dead_code)] // Kept for future audit features
     pub last_modified: String,
 }
 ```
 
 ### Async Code
 
-- Use `tokio` runtime with `#[tokio::main]`
-- Use `async/await` for async functions
-- Prefer `tokio::process::Command` for async process execution
+- Use `tokio` runtime with `#[tokio::main]` or `#[tokio::test]`
+- Use `async/await` for all async functions
+- Prefer `tokio::process::Command` for async process execution (not `std::process::Command`)
+- Use `tokio::time::sleep` for delays (not `std::thread::sleep`)
+- Use `tokio::fs` for async file operations when in async context
+
+```rust
+#[tokio::main]
+async fn main() -> Result<()> {
+    let output = tokio::process::Command::new("ls")
+        .arg("-la")
+        .output()
+        .await?;
+    Ok(())
+}
+```
 
 ### Logging
 
-- Use `tracing` crate for structured logging
-- Log levels: `error!`, `warn!`, `info!`, `debug!`
-- Initialize with `tracing_subscriber`
+- Use `tracing` crate for all logging (not `println!` or `eprintln!`)
+- Log levels: `error!`, `warn!`, `info!`, `debug!`, `trace!`
+- Initialize with `tracing_subscriber` in `main.rs`
+- Use structured logging with key-value pairs when helpful
 
 ```rust
 use tracing::{debug, error, info, warn};
 
 info!("Starting orchestrator");
-debug!("OpenCode command exited with status: {:?}", status);
-error!("Archive failed for {}: {}", id, e);
+debug!(status = ?exit_status, "Agent command exited");
+warn!(change_id = %id, "Archive verification failed");
+error!(error = %e, "Failed to execute command");
 ```
 
 ### Testing
 
-- Unit tests in `#[cfg(test)]` modules within source files
-- Integration tests in `tests/` directory
-- Use `tempfile` crate for test fixtures
+- Unit tests: Place in `#[cfg(test)]` modules within source files
+- Integration tests: Place in `tests/` directory as separate files
+- Use `tempfile` crate for temporary test files/directories
+- Use `#[tokio::test]` for async tests
 - Mock external commands with shell scripts for E2E tests
+- Name test functions descriptively: `test_<what>_<expected_behavior>`
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
-    fn test_example() {
-        let result = some_function();
-        assert_eq!(result, expected);
+    fn test_parse_task_counts() {
+        let result = parse_tasks("- [x] Done\n- [ ] Todo");
+        assert_eq!(result.completed, 1);
+        assert_eq!(result.total, 2);
+    }
+
+    #[tokio::test]
+    async fn test_async_operation() {
+        let result = async_function().await;
+        assert!(result.is_ok());
     }
 }
 ```
+
+### Comments
+
+- Use `//` for line comments, `/* */` for block comments
+- Write comments that explain **why**, not **what** (code should be self-documenting)
+- Use `TODO:` comments sparingly with context
+- Use doc comments (`///` or `//!`) for public APIs
 
 ## Key Dependencies
 
@@ -450,7 +513,7 @@ async fn execute_with_stagger(&self, command_fn: F) -> Result<Child> {
         }
     }
     *last = Some(Instant::now());
-    
+
     // Spawn command
     command_fn().spawn()
 }
@@ -478,11 +541,11 @@ fn should_retry(&self, attempt: u32, duration: Duration, stderr: &str, exit_code
     if attempt >= self.config.max_retries || exit_code == 0 {
         return false;
     }
-    
+
     // Retry if: error pattern match OR short execution
     let matches_pattern = self.is_retryable_error(stderr);
     let is_short = duration < Duration::from_secs(self.config.retry_if_duration_under_secs);
-    
+
     matches_pattern || is_short
 }
 ```

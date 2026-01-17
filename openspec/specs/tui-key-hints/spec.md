@@ -88,13 +88,15 @@ The TUI SHALL allow approval without auto-queuing in running mode.
 
 さらに、`M` による merge resolve の実行中、TUI は対象 change のステータス表示を `resolving` として示し、TUI の描画ループをブロックしてはならない（SHALL NOT）。
 
-#### Scenario: resolve 実行中は `resolving` を表示する
+resolve実行中は `M` による追加操作を受け付けてはならない（SHALL NOT）。
+
+#### Scenario: resolve中は `M` を受け付けない
 - **GIVEN** the TUI is in stopped mode
 - **AND** the cursor is on a change in `MergeWait`
+- **AND** a resolve operation is in progress
 - **WHEN** the user presses `M`
-- **THEN** the TUI SHALL set the selected change status to `Resolving` immediately
-- **AND** the Changes list status text SHALL show `resolving` while the resolve operation is running
-- **AND** the TUI SHALL continue rendering and accepting key input during the resolve operation
+- **THEN** the resolve command SHALL NOT be triggered
+- **AND** the user SHALL receive a warning message
 
 ### Requirement: 未コミット change の操作ヒントを非表示にする
 並列モードで未コミットの change が選択中の場合、Changes パネルのキーヒントは選択・承認に関する操作を表示してはならない（SHALL）。
@@ -128,3 +130,4 @@ The TUI SHALL allow approval without auto-queuing in running mode.
 - **THEN** the row SHALL be grayed out
 - **AND** the row SHALL NOT display a checkbox
 - **AND** the row SHALL display the `UNCOMMITED` badge
+

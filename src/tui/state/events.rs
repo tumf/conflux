@@ -119,6 +119,7 @@ impl AppState {
                 )));
             }
             OrchestratorEvent::ResolveStarted { change_id } => {
+                self.is_resolving = true;
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                     if change.started_at.is_none() {
                         change.started_at = Some(Instant::now());
@@ -135,6 +136,7 @@ impl AppState {
                 change_id,
                 worktree_change_ids,
             } => {
+                self.is_resolving = false;
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                     change.queue_status = QueueStatus::Archived;
                     if let Some(started) = change.started_at {
@@ -165,6 +167,7 @@ impl AppState {
                 )));
             }
             OrchestratorEvent::ResolveFailed { change_id, error } => {
+                self.is_resolving = false;
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                     change.queue_status = QueueStatus::MergeWait;
                     if let Some(started) = change.started_at {

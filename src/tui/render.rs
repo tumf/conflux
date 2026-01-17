@@ -340,7 +340,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             "@: approve"
         });
         keys.push("e: edit");
-        if matches!(item.queue_status, QueueStatus::MergeWait) {
+        if matches!(item.queue_status, QueueStatus::MergeWait) && !app.is_resolving {
             keys.push("M: resolve");
         }
     }
@@ -534,7 +534,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             "@: approve"
         });
         keys.push("e: edit");
-        if matches!(item.queue_status, QueueStatus::MergeWait) {
+        if matches!(item.queue_status, QueueStatus::MergeWait) && !app.is_resolving {
             keys.push("M: resolve");
         }
     }
@@ -1001,11 +1001,13 @@ fn render_footer_worktree(frame: &mut Frame, app: &AppState, area: Rect) {
         // - No merge conflicts
         // - Has a branch name
         // - Has commits ahead of base branch
+        // - No resolve operation in progress
         if !wt.is_main
             && !wt.is_detached
             && !wt.has_merge_conflict()
             && !wt.branch.is_empty()
             && wt.has_commits_ahead
+            && !app.is_resolving
         {
             key_hints.push(("M", "merge"));
         }
