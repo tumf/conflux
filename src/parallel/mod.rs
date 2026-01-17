@@ -1034,7 +1034,22 @@ impl ParallelExecutor {
                     "Merging archived {} (workspace: {})",
                     result.change_id, result.workspace_name
                 );
-                let merge_result = self.attempt_merge(&revisions, &change_ids).await;
+                let workspace_path = self
+                    .workspace_manager
+                    .workspaces()
+                    .iter()
+                    .find(|workspace| workspace.name == result.workspace_name)
+                    .map(|workspace| workspace.path.clone())
+                    .ok_or_else(|| {
+                        OrchestratorError::GitCommand(format!(
+                            "Workspace not found for archive verification: {}",
+                            result.workspace_name
+                        ))
+                    })?;
+                let archive_paths = vec![workspace_path];
+                let merge_result = self
+                    .attempt_merge(&revisions, &change_ids, &archive_paths)
+                    .await;
                 match merge_result {
                     Ok(MergeAttempt::Merged) => {}
                     Ok(MergeAttempt::Deferred(reason)) => {
@@ -1410,7 +1425,21 @@ impl ParallelExecutor {
                             "Merging {} (workspace: {})",
                             workspace_result.change_id, workspace_result.workspace_name
                         );
-                        let merge_result = self.attempt_merge(&revisions, &change_ids).await;
+                        let archive_paths = vec![self
+                            .workspace_manager
+                            .workspaces()
+                            .iter()
+                            .find(|workspace| workspace.name == workspace_result.workspace_name)
+                            .map(|workspace| workspace.path.clone())
+                            .ok_or_else(|| {
+                                OrchestratorError::GitCommand(format!(
+                                    "Workspace not found for archive verification: {}",
+                                    workspace_result.workspace_name
+                                ))
+                            })?];
+                        let merge_result = self
+                            .attempt_merge(&revisions, &change_ids, &archive_paths)
+                            .await;
                         match merge_result {
                             Ok(MergeAttempt::Merged) => {
                                 info!(
@@ -1480,6 +1509,7 @@ impl ParallelExecutor {
         &self,
         revisions: &[String],
         change_ids: &[String],
+        archive_paths: &[PathBuf],
     ) -> Result<MergeAttempt> {
         use crate::execution::archive::verify_archive_completion;
 
@@ -1488,9 +1518,17 @@ impl ParallelExecutor {
             return Ok(MergeAttempt::Deferred(reason));
         }
 
+        if change_ids.len() != archive_paths.len() {
+            return Err(OrchestratorError::GitCommand(format!(
+                "Expected {} archive paths for {} changes",
+                change_ids.len(),
+                archive_paths.len()
+            )));
+        }
+
         // Verify that all changes are actually archived before attempting merge
-        for change_id in change_ids {
-            let verification = verify_archive_completion(change_id, Some(&self.repo_root));
+        for (change_id, archive_path) in change_ids.iter().zip(archive_paths.iter()) {
+            let verification = verify_archive_completion(change_id, Some(archive_path));
             if !verification.is_success() {
                 let reason = format!(
                     "Archive verification failed for '{}': change directory still exists in openspec/changes/. \
@@ -1531,7 +1569,11 @@ impl ParallelExecutor {
         )
         .await;
 
-        match self.attempt_merge(&revisions, &change_ids).await? {
+        let archive_paths = vec![workspace.path.clone()];
+        match self
+            .attempt_merge(&revisions, &change_ids, &archive_paths)
+            .await?
+        {
             MergeAttempt::Merged => {
                 send_event(
                     &self.event_tx,
@@ -3305,7 +3347,10 @@ mod tests {
         let change_ids = vec!["test-change".to_string()];
 
         // Attempt merge should be deferred because change directory exists
-        let result = executor.attempt_merge(&revisions, &change_ids).await;
+        let archive_paths = vec![repo_root.to_path_buf()];
+        let result = executor
+            .attempt_merge(&revisions, &change_ids, &archive_paths)
+            .await;
 
         match result {
             Ok(MergeAttempt::Deferred(reason)) => {
@@ -3421,7 +3466,10 @@ mod tests {
         let change_ids = vec!["test-change".to_string()];
 
         // Attempt merge should succeed because change is properly archived
-        let result = executor.attempt_merge(&revisions, &change_ids).await;
+        let archive_paths = vec![workspace_path.clone()];
+        let result = executor
+            .attempt_merge(&revisions, &change_ids, &archive_paths)
+            .await;
 
         match result {
             Ok(MergeAttempt::Merged) => {
