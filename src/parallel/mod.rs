@@ -7,6 +7,7 @@ mod cleanup;
 mod conflict;
 mod events;
 mod executor;
+mod output_bridge;
 mod types;
 
 // Re-export ExecutionEvent as ParallelEvent for backward compatibility
@@ -889,6 +890,17 @@ impl ParallelExecutor {
                         "Change '{}' already merged to main in workspace '{}', skipping all operations",
                         change_id, workspace.name
                     );
+
+                    // Send MergeCompleted event to update TUI state
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::MergeCompleted {
+                            change_id: change_id.clone(),
+                            revision: "already-merged".to_string(),
+                        },
+                    )
+                    .await;
+
                     send_event(
                         &self.event_tx,
                         ParallelEvent::CleanupStarted {
