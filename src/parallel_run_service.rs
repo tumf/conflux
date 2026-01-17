@@ -248,14 +248,14 @@ impl ParallelRunService {
 
         // Use execute_with_reanalysis to re-analyze after each group
         executor
-            .execute_with_reanalysis(changes, move |remaining| {
+            .execute_with_reanalysis(changes, move |remaining, iteration| {
                 let config = config.clone();
                 let repo_root = repo_root.clone();
                 let event_tx = event_tx.clone();
                 Box::pin(async move {
                     let service = ParallelRunService::new(repo_root, config);
                     service
-                        .analyze_and_group_with_sender(remaining, Some(&event_tx))
+                        .analyze_and_group_with_sender(remaining, Some(&event_tx), Some(iteration))
                         .await
                 })
             })
@@ -275,7 +275,8 @@ impl ParallelRunService {
     /// If `use_llm_analysis` is enabled (default), uses LLM to analyze dependencies.
     /// Otherwise, runs all changes in parallel (no dependency inference).
     async fn analyze_and_group(&self, changes: &[Change]) -> Vec<ParallelGroup> {
-        self.analyze_and_group_with_sender(changes, None).await
+        self.analyze_and_group_with_sender(changes, None, None)
+            .await
     }
 
     /// Analyze changes and group them for parallel execution with optional event sender.
@@ -287,11 +288,15 @@ impl ParallelRunService {
         &self,
         changes: &[Change],
         event_tx: Option<&mpsc::Sender<ParallelEvent>>,
+        iteration: Option<u32>,
     ) -> Vec<ParallelGroup> {
         // Check if LLM analysis is enabled (default: true)
         if self.config.use_llm_analysis() {
             info!("Using LLM analysis for parallelization (analyze_command)");
-            match self.analyze_with_llm_streaming(changes, event_tx).await {
+            match self
+                .analyze_with_llm_streaming(changes, event_tx, iteration)
+                .await
+            {
                 Ok(groups) => {
                     info!("LLM analysis successful: {} groups", groups.len());
                     return groups;
@@ -329,6 +334,7 @@ impl ParallelRunService {
         &self,
         changes: &[Change],
         event_tx: Option<&mpsc::Sender<ParallelEvent>>,
+        iteration: Option<u32>,
     ) -> Result<Vec<ParallelGroup>> {
         let agent = AgentRunner::new(self.config.clone());
         let analyzer = ParallelizationAnalyzer::new(agent);
@@ -339,7 +345,7 @@ impl ParallelRunService {
                 .analyze_groups_with_callback(changes, move |output| {
                     let _ = tx.try_send(ParallelEvent::AnalysisOutput {
                         output: output.clone(),
-                        iteration: None,
+                        iteration,
                     });
                 })
                 .await
