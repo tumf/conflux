@@ -2,8 +2,9 @@
 //!
 //! Contains log-related methods and constants for the TUI state.
 
-use super::super::events::LogEntry;
+use super::super::events::{LogEntry, LogLevel};
 use super::AppState;
+use tracing::{error, info, warn};
 
 /// Maximum number of log entries to keep
 pub const MAX_LOG_ENTRIES: usize = 1000;
@@ -11,6 +12,19 @@ pub const MAX_LOG_ENTRIES: usize = 1000;
 impl AppState {
     /// Add a log entry
     pub fn add_log(&mut self, entry: LogEntry) {
+        // Send to tracing for debug file output (if --logs enabled)
+        match entry.level {
+            LogLevel::Info | LogLevel::Success => {
+                info!(target: "tui_log", "{}", entry.message);
+            }
+            LogLevel::Warn => {
+                warn!(target: "tui_log", "{}", entry.message);
+            }
+            LogLevel::Error => {
+                error!(target: "tui_log", "{}", entry.message);
+            }
+        }
+
         self.logs.push(entry);
         if self.logs.len() > MAX_LOG_ENTRIES {
             self.logs.remove(0);
