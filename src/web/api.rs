@@ -207,8 +207,8 @@ mod tests {
         )
         .await;
         // Should find the actual change we're working on
-        if result.is_ok() {
-            assert_eq!(result.unwrap().id, "update-web-dashboard-state-refresh");
+        if let Ok(change) = result {
+            assert_eq!(change.id, "update-web-dashboard-state-refresh");
         }
     }
 

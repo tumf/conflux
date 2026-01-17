@@ -302,9 +302,42 @@ impl WebState {
     pub async fn refresh_from_disk(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::openspec;
 
+        let repo_root =
+            std::env::current_dir().map_err(|e| format!("Failed to resolve repo root: {}", e))?;
+
         // Read changes from disk using native parser
-        let changes = openspec::list_changes_native()
+        let mut changes = openspec::list_changes_native()
             .map_err(|e| format!("Failed to refresh changes from disk: {}", e))?;
+
+        // Enrich progress from worktrees (uncommitted tasks.md)
+        for change in &mut changes {
+            match crate::vcs::git::get_worktree_path_for_change(&repo_root, &change.id).await {
+                Ok(Some(wt_path)) => {
+                    match crate::task_parser::parse_change_with_worktree_fallback(
+                        &change.id,
+                        Some(&wt_path),
+                    ) {
+                        Ok(progress) => {
+                            change.completed_tasks = progress.completed;
+                            change.total_tasks = progress.total;
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "Failed to read worktree progress for {}: {}",
+                                change.id,
+                                e
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // No worktree exists, use progress from base tree
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to get worktree path for {}: {}", change.id, e);
+                }
+            }
+        }
 
         // Update state with refreshed changes
         self.update(&changes).await;
