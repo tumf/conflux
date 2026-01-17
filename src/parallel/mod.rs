@@ -435,6 +435,7 @@ impl ParallelExecutor {
     where
         F: Fn(
                 &[crate::openspec::Change],
+                u32,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Vec<ParallelGroup>> + Send + '_>,
             > + Send
@@ -606,8 +607,9 @@ impl ParallelExecutor {
 
             // Analyze remaining changes to get the next group
             info!(
-                "Analyzing {} remaining changes for next group",
-                changes.len()
+                "Analyzing {} remaining changes for next group (iteration {})",
+                changes.len(),
+                group_counter
             );
             send_event(
                 &self.event_tx,
@@ -617,7 +619,7 @@ impl ParallelExecutor {
             )
             .await;
 
-            let groups = analyzer(&changes).await;
+            let groups = analyzer(&changes, group_counter).await;
 
             if groups.is_empty() {
                 warn!("No groups returned from analysis");
