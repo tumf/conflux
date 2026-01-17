@@ -5,4 +5,12 @@ echo "Running in: $(pwd)"
 echo "Root worktree: $ROOT_WORKTREE_PATH"
 echo "Creating test marker file..."
 touch .setup-completed
+
+if command -v pre-commit >/dev/null 2>&1; then
+  echo "Installing pre-commit hooks..."
+  pre-commit install
+else
+  echo "pre-commit not found; skipping hook install"
+fi
+
 echo "Setup completed successfully!"
