@@ -59,7 +59,14 @@ Tasks format requirements:
   * `- Task` → Convert to `- [ ] Task`
   * `1. Task` → Convert to `1. [ ] Task`
 - If you encounter 0/0 tasks detected, check and fix tasks.md format first
-- Fix any malformed tasks before proceeding with implementation"#;
+- Fix any malformed tasks before proceeding with implementation
+
+MANDATORY: Keep tasks.md updated throughout the apply process
+- IMMEDIATELY update tasks.md after completing each task (mark `- [ ]` as `- [x]`)
+- Do NOT batch task updates - update after EVERY completed task
+- If you split or refine a task during implementation, update tasks.md at the same time
+- Before finishing apply, verify that tasks.md accurately reflects all completed work
+- Never leave completed work unmarked in tasks.md - progress visibility is critical"#;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{ApplyAttempt, ApplyHistory, ArchiveAttempt, ArchiveHistory};
 use crate::process_manager::ManagedChild;

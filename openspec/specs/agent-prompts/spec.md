@@ -3,14 +3,10 @@
 ## Purpose
 
 This specification defines the behavior and constraints for AI agent system prompts, particularly the apply prompt (`APPLY_SYSTEM_PROMPT`), to ensure reliable and autonomous task execution.
-
 ## Requirements
 ### Requirement: Apply system prompt MUST include task format guidance
 
-The AI agent's apply prompt (`APPLY_SYSTEM_PROMPT`) MUST include guidance on how to fix tasks.md format issues.
-
-#### Rationale
-When tasks.md has invalid format (missing checkboxes) causing 0/0 tasks detection errors, enable the AI agent to automatically fix the format.
+The AI agent's apply prompt (`APPLY_SYSTEM_PROMPT`) MUST include guidance on how to fix tasks.md format issues and keep tasks.md updated as work progresses.
 
 #### Scenario: AI agent fixes invalid format
 
@@ -29,14 +25,11 @@ When tasks.md has invalid format (missing checkboxes) causing 0/0 tasks detectio
   - Steps to follow when 0/0 is detected
 - AI agent fixes tasks.md following the guidance
 - After fix, re-parsing detects correct task count
+- After each completed task, the agent updates tasks.md to reflect progress
 
 ### Requirement: Apply system prompt MUST enforce non-interactive iteration
 
 The apply system prompt (`APPLY_SYSTEM_PROMPT`) MUST explicitly state that the agent cannot ask questions to the user and must continue working until MaxIteration is reached, making autonomous decisions under operational constraints.
-
-#### Rationale
-
-In production operation, the apply agent runs without human interaction. The agent must understand this constraint and continue execution autonomously rather than deferring decisions or asking for clarification.
 
 #### Scenario: Continue iteration without asking questions
 
@@ -55,10 +48,6 @@ In production operation, the apply agent runs without human interaction. The age
 
 The apply system prompt MUST explicitly prohibit moving tasks to Future Work based on difficulty, regression risk, or need for additional testing (MUST NOT).
 
-#### Rationale
-
-Deferring tasks due to perceived complexity or risk undermines the autonomous execution model. Only tasks explicitly marked as deferred scope should be treated as Future Work.
-
 #### Scenario: Prohibit moving tasks to Future Work except for pre-marked items
 
 **Given:**
@@ -71,9 +60,3 @@ Deferring tasks due to perceived complexity or risk undermines the autonomous ex
 - Agent does NOT move tasks to Future Work based solely on difficulty
 - Agent treats only tasks already marked with `(future work)` as Future Work
 
-**Verification:**
-```bash
-# 1. Create test change with invalid format
-mkdir -p openspec/changes/test-invalid-format
-cat > openspec/changes/test-invalid-format/tasks.md <<EOF
-# Tasks
