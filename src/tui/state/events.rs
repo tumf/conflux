@@ -294,15 +294,24 @@ impl AppState {
             // Branch merge events (TUI worktree view)
             OrchestratorEvent::BranchMergeStarted { branch_name } => {
                 self.add_log(LogEntry::info(format!(
-                    "Merging branch '{}'...",
+                    "merging branch '{}'...",
                     branch_name
                 )));
+                // Set is_merging flag on the worktree with this branch
+                if let Some(wt) = self.worktrees.iter_mut().find(|w| w.branch == *branch_name) {
+                    wt.is_merging = true;
+                }
             }
             OrchestratorEvent::BranchMergeCompleted { branch_name } => {
                 self.add_log(LogEntry::success(format!(
-                    "Merged branch '{}' successfully",
+                    "merged branch '{}' successfully",
                     branch_name
                 )));
+                // Clear is_merging flag and update has_commits_ahead
+                if let Some(wt) = self.worktrees.iter_mut().find(|w| w.branch == *branch_name) {
+                    wt.is_merging = false;
+                    wt.has_commits_ahead = false; // Merged to base, so no longer ahead
+                }
             }
             OrchestratorEvent::BranchMergeFailed { branch_name, error } => {
                 self.warning_popup = Some(WarningPopup {
@@ -313,6 +322,10 @@ impl AppState {
                     "Merge failed for '{}': {}",
                     branch_name, error
                 )));
+                // Clear is_merging flag on failure
+                if let Some(wt) = self.worktrees.iter_mut().find(|w| w.branch == *branch_name) {
+                    wt.is_merging = false;
+                }
             }
             // Ignore other parallel-specific events that don't affect TUI state
             _ => {

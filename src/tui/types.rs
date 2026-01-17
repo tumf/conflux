@@ -122,6 +122,8 @@ pub struct WorktreeInfo {
     pub merge_conflict: Option<MergeConflictInfo>,
     /// Whether this worktree has commits ahead of the base branch
     pub has_commits_ahead: bool,
+    /// Whether a merge operation is in progress for this worktree
+    pub is_merging: bool,
 }
 
 impl WorktreeInfo {
@@ -159,6 +161,18 @@ impl WorktreeInfo {
             .as_ref()
             .map(|c| c.conflict_files.len())
             .unwrap_or(0)
+    }
+
+    /// Get merge status label for display
+    /// Returns "merging" if merge in progress, "merged" if not ahead of base, empty otherwise
+    pub fn merge_status_label(&self) -> &str {
+        if self.is_merging {
+            "merging"
+        } else if !self.has_commits_ahead && !self.is_main && !self.is_detached {
+            "merged"
+        } else {
+            ""
+        }
     }
 }
 
@@ -233,6 +247,7 @@ mod tests {
             is_main: true,
             merge_conflict: None,
             has_commits_ahead: false,
+            is_merging: false,
         };
         assert_eq!(wt.display_label(), "worktree");
     }
@@ -247,6 +262,7 @@ mod tests {
             is_main: false,
             merge_conflict: None,
             has_commits_ahead: true,
+            is_merging: false,
         };
         assert_eq!(wt.display_branch(), "feature-branch");
     }
@@ -261,6 +277,7 @@ mod tests {
             is_main: false,
             merge_conflict: None,
             has_commits_ahead: false,
+            is_merging: false,
         };
         assert_eq!(wt.display_branch(), "(detached: abc123)");
     }
@@ -275,6 +292,7 @@ mod tests {
             is_main: true,
             merge_conflict: None,
             has_commits_ahead: false,
+            is_merging: false,
         };
         assert!(!wt_no_conflict.has_merge_conflict());
 
@@ -288,6 +306,7 @@ mod tests {
                 conflict_files: vec!["file.rs".to_string()],
             }),
             has_commits_ahead: true,
+            is_merging: false,
         };
         assert!(wt_with_conflict.has_merge_conflict());
     }
@@ -304,6 +323,7 @@ mod tests {
                 conflict_files: vec!["file1.rs".to_string(), "file2.rs".to_string()],
             }),
             has_commits_ahead: true,
+            is_merging: false,
         };
         assert_eq!(wt.conflict_file_count(), 2);
     }
