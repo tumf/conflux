@@ -744,14 +744,15 @@ impl ParallelExecutor {
             self.repo_root.clone(),
         );
 
-        // Create or reuse workspaces for all changes in the group
-        // If resume is enabled (default), try to find existing workspaces first
-        let mut workspaces: Vec<Workspace> = Vec::new();
+        // Categorize changes by workspace state (no upfront workspace creation for apply/archive)
+        // Workspace creation will happen inside execute_apply_and_archive_parallel under semaphore control
+        let mut changes_for_apply: Vec<String> = Vec::new();
         let mut archived_results: Vec<WorkspaceResult> = Vec::new();
         let mut archived_workspaces: Vec<Workspace> = Vec::new();
+
         for change_id in &changes_to_execute {
-            // Try to find and reuse existing workspace (unless --no-resume is set)
-            let workspace = if self.no_resume {
+            // Check if workspace already exists (for resume scenario)
+            let existing_workspace = if self.no_resume {
                 None
             } else {
                 match self
@@ -760,9 +761,8 @@ impl ParallelExecutor {
                     .await
                 {
                     Ok(Some(workspace_info)) => {
-                        // Found existing workspace, reuse it
                         info!(
-                            "Resuming existing workspace for '{}' (last modified: {:?})",
+                            "Found existing workspace for '{}' (last modified: {:?})",
                             change_id, workspace_info.last_modified
                         );
                         match self
@@ -773,7 +773,7 @@ impl ParallelExecutor {
                             Ok(ws) => Some(ws),
                             Err(e) => {
                                 warn!(
-                                    "Failed to reuse workspace for '{}': {}, creating new",
+                                    "Failed to reuse workspace for '{}': {}, will create new under semaphore",
                                     change_id, e
                                 );
                                 None
@@ -783,7 +783,7 @@ impl ParallelExecutor {
                     Ok(None) => None,
                     Err(e) => {
                         warn!(
-                            "Failed to find existing workspace for '{}': {}, creating new",
+                            "Failed to find existing workspace for '{}': {}, will create new under semaphore",
                             change_id, e
                         );
                         None
@@ -791,84 +791,14 @@ impl ParallelExecutor {
                 }
             };
 
-            let (workspace, resumed) = match workspace {
-                Some(ws) => {
-                    // Track workspace in cleanup guard before adding to list
-                    cleanup_guard.track(ws.name.clone(), ws.path.clone());
-
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::WorkspaceResumed {
-                            change_id: change_id.clone(),
-                            workspace: ws.name.clone(),
-                        },
-                    )
-                    .await;
-
-                    // Send ProcessingStarted event early to show processing status in TUI
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::ProcessingStarted(change_id.clone()),
-                    )
-                    .await;
-
-                    (ws, true)
-                }
-                None => {
-                    // Create new workspace from the base revision
-                    match self
-                        .workspace_manager
-                        .create_workspace(change_id, Some(&base_revision))
-                        .await
-                    {
-                        Ok(ws) => {
-                            // Track workspace in cleanup guard before adding to list
-                            cleanup_guard.track(ws.name.clone(), ws.path.clone());
-
-                            send_event(
-                                &self.event_tx,
-                                ParallelEvent::WorkspaceCreated {
-                                    change_id: change_id.clone(),
-                                    workspace: ws.name.clone(),
-                                },
-                            )
-                            .await;
-
-                            // Send ProcessingStarted event early to show processing status in TUI
-                            send_event(
-                                &self.event_tx,
-                                ParallelEvent::ProcessingStarted(change_id.clone()),
-                            )
-                            .await;
-
-                            (ws, false)
-                        }
-                        Err(e) => {
-                            let error_msg = format!("Failed to create workspace: {}", e);
-                            error!("{} for {}", error_msg, change_id);
-                            send_event(
-                                &self.event_tx,
-                                ParallelEvent::Error {
-                                    message: format!("[{}] {}", change_id, error_msg),
-                                },
-                            )
-                            .await;
-                            // cleanup_guard will clean up previously created workspaces on drop
-                            return Err(e.into());
-                        }
-                    }
-                }
-            };
-
-            // Detect workspace state for idempotent resume
-            let workspace_state = if resumed {
-                // Get the original branch for state detection
+            // Detect workspace state for resumed workspaces
+            let workspace_state = if let Some(ref ws) = existing_workspace {
                 let original_branch =
                     self.workspace_manager.original_branch().ok_or_else(|| {
                         OrchestratorError::GitCommand("Original branch not initialized".to_string())
                     })?;
 
-                match detect_workspace_state(change_id, &workspace.path, &original_branch).await {
+                match detect_workspace_state(change_id, &ws.path, &original_branch).await {
                     Ok(state) => state,
                     Err(e) => {
                         warn!(
@@ -886,12 +816,14 @@ impl ParallelExecutor {
             match workspace_state {
                 WorkspaceState::Merged => {
                     // Already merged to main - skip all operations and cleanup
+                    let workspace = existing_workspace.unwrap();
+                    cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
+
                     info!(
                         "Change '{}' already merged to main in workspace '{}', skipping all operations",
                         change_id, workspace.name
                     );
 
-                    // Send MergeCompleted event to update TUI state
                     send_event(
                         &self.event_tx,
                         ParallelEvent::MergeCompleted {
@@ -929,100 +861,103 @@ impl ParallelExecutor {
                     continue;
                 }
                 WorkspaceState::Archived => {
-                    // Archive complete, skip apply/archive, only merge
+                    // Archive complete, ensure archive commit then merge
+                    let workspace = existing_workspace.unwrap();
+                    cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
+
                     info!(
-                        "Change '{}' already archived in workspace '{}', skipping apply/archive, will merge",
+                        "Change '{}' already archived in workspace '{}', skipping apply/archive",
                         change_id, workspace.name
                     );
+
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::WorkspaceResumed {
+                            change_id: change_id.clone(),
+                            workspace: workspace.name.clone(),
+                        },
+                    )
+                    .await;
+
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::ArchiveStarted(change_id.clone()),
+                    )
+                    .await;
+
+                    let resolve_agent = AgentRunner::new(self.config.clone());
+                    let change_id_owned = change_id.clone();
+                    let event_tx = self.event_tx.clone();
+                    if let Err(err) = ensure_archive_commit(
+                        change_id,
+                        &workspace.path,
+                        &resolve_agent,
+                        self.workspace_manager.backend_type(),
+                        move |line| {
+                            let event_tx = event_tx.clone();
+                            let change_id = change_id_owned.clone();
+                            async move {
+                                let text = match line {
+                                    OutputLine::Stdout(text) | OutputLine::Stderr(text) => text,
+                                };
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::ArchiveOutput {
+                                            change_id,
+                                            output: text,
+                                            iteration: None,
+                                        })
+                                        .await;
+                                }
+                            }
+                        },
+                    )
+                    .await
+                    {
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::ArchiveFailed {
+                                change_id: change_id.clone(),
+                                error: err.to_string(),
+                            },
+                        )
+                        .await;
+                        return Err(err);
+                    }
+
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::ChangeArchived(change_id.clone()),
+                    )
+                    .await;
+
+                    let revision = self
+                        .workspace_manager
+                        .get_revision_in_workspace(&workspace.path)
+                        .await
+                        .map_err(OrchestratorError::from)?;
+                    self.workspace_manager.update_workspace_status(
+                        &workspace.name,
+                        WorkspaceStatus::Applied(revision.clone()),
+                    );
+
+                    archived_results.push(WorkspaceResult {
+                        change_id: change_id.clone(),
+                        workspace_name: workspace.name.clone(),
+                        final_revision: Some(revision),
+                        error: None,
+                    });
+                    archived_workspaces.push(workspace);
+                    continue;
                 }
                 WorkspaceState::Applied
                 | WorkspaceState::Applying { .. }
                 | WorkspaceState::Created => {
                     // These states require apply (or resume apply)
-                    // They will be handled normally by the apply execution
+                    // Add change_id to list - workspace creation will happen under semaphore control
+                    changes_for_apply.push(change_id.clone());
                 }
             }
-
-            // For Archived state, ensure archive commit and add to archived_results for merge
-            if matches!(workspace_state, WorkspaceState::Archived) {
-                info!(
-                    "Change '{}' already archived in workspace '{}', skipping apply/archive",
-                    change_id, workspace.name
-                );
-
-                send_event(
-                    &self.event_tx,
-                    ParallelEvent::ArchiveStarted(change_id.clone()),
-                )
-                .await;
-
-                let resolve_agent = AgentRunner::new(self.config.clone());
-                let change_id_owned = change_id.clone();
-                let event_tx = self.event_tx.clone();
-                if let Err(err) = ensure_archive_commit(
-                    change_id,
-                    &workspace.path,
-                    &resolve_agent,
-                    self.workspace_manager.backend_type(),
-                    move |line| {
-                        let event_tx = event_tx.clone();
-                        let change_id = change_id_owned.clone();
-                        async move {
-                            let text = match line {
-                                OutputLine::Stdout(text) | OutputLine::Stderr(text) => text,
-                            };
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx
-                                    .send(ParallelEvent::ArchiveOutput {
-                                        change_id,
-                                        output: text,
-                                        iteration: None,
-                                    })
-                                    .await;
-                            }
-                        }
-                    },
-                )
-                .await
-                {
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::ArchiveFailed {
-                            change_id: change_id.clone(),
-                            error: err.to_string(),
-                        },
-                    )
-                    .await;
-                    return Err(err);
-                }
-
-                send_event(
-                    &self.event_tx,
-                    ParallelEvent::ChangeArchived(change_id.clone()),
-                )
-                .await;
-
-                let revision = self
-                    .workspace_manager
-                    .get_revision_in_workspace(&workspace.path)
-                    .await
-                    .map_err(OrchestratorError::from)?;
-                self.workspace_manager.update_workspace_status(
-                    &workspace.name,
-                    WorkspaceStatus::Applied(revision.clone()),
-                );
-
-                archived_results.push(WorkspaceResult {
-                    change_id: change_id.clone(),
-                    workspace_name: workspace.name.clone(),
-                    final_revision: Some(revision),
-                    error: None,
-                });
-                archived_workspaces.push(workspace);
-                continue;
-            }
-
-            workspaces.push(workspace);
         }
 
         for result in &archived_results {
@@ -1110,15 +1045,23 @@ impl ParallelExecutor {
         }
 
         // Execute apply + archive in parallel with concurrency limit
-        // Each task: apply -> (if success) -> archive
+        // Workspace creation happens inside execute_apply_and_archive_parallel under semaphore control
         let mut results = archived_results;
-        if !workspaces.is_empty() {
+        if !changes_for_apply.is_empty() {
+            // Create change-workspace pairs: (change_id, None) for changes that need workspace creation
+            let change_workspace_pairs: Vec<(String, Option<Workspace>)> = changes_for_apply
+                .iter()
+                .map(|id| (id.clone(), None))
+                .collect();
+
             let apply_results = match self
                 .execute_apply_and_archive_parallel(
-                    &workspaces,
+                    &change_workspace_pairs,
+                    &base_revision,
                     Some(group.id),
                     total_changes,
                     changes_processed,
+                    &mut cleanup_guard,
                 )
                 .await
             {
@@ -1187,14 +1130,27 @@ impl ParallelExecutor {
         // Cleanup only successful workspaces (preserve failed ones)
         let failed_workspace_names: std::collections::HashSet<_> =
             failed.iter().map(|r| r.workspace_name.clone()).collect();
-        let workspace_statuses: std::collections::HashMap<_, _> = self
-            .workspace_manager
-            .workspaces()
-            .into_iter()
-            .map(|workspace| (workspace.name, workspace.status))
+
+        // Get all workspaces from workspace_manager (includes both apply and archived workspaces)
+        let all_workspaces = self.workspace_manager.workspaces();
+        let workspace_statuses: std::collections::HashMap<_, _> = all_workspaces
+            .iter()
+            .map(|workspace| (workspace.name.clone(), workspace.status.clone()))
             .collect();
-        let mut cleanup_workspaces = workspaces.clone();
-        cleanup_workspaces.extend(archived_workspaces);
+
+        // Combine archived workspaces with workspaces from apply results
+        let mut cleanup_workspaces = archived_workspaces;
+        for result in &results {
+            if let Some(ws) = all_workspaces
+                .iter()
+                .find(|w| w.name == result.workspace_name)
+            {
+                if !cleanup_workspaces.iter().any(|w| w.name == ws.name) {
+                    cleanup_workspaces.push(ws.clone());
+                }
+            }
+        }
+
         for workspace in &cleanup_workspaces {
             // Skip cleanup for failed workspaces - they are preserved
             if failed_workspace_names.contains(&workspace.name) {
@@ -1249,23 +1205,140 @@ impl ParallelExecutor {
         Ok(())
     }
 
-    /// Execute apply + archive in parallel across workspaces
-    /// Each task: apply -> (if success) -> archive
-    /// Archive starts immediately after apply completes for each change
+    /// Execute apply + archive in parallel with workspace creation under semaphore control.
+    ///
+    /// Workspaces are created sequentially under semaphore control to ensure that
+    /// workspace creation + execution never exceeds max_concurrent limit.
+    ///
+    /// Flow for each change:
+    /// 1. Acquire semaphore permit (blocks if max_concurrent limit reached)
+    /// 2. Create/resume workspace (sequential, in main task with &mut self access)
+    /// 3. Spawn async task for apply + archive
+    /// 4. Release permit when task completes
+    ///
+    /// This ensures workspace creation rate is controlled by the concurrency limit.
     async fn execute_apply_and_archive_parallel(
         &mut self,
-        workspaces: &[Workspace],
+        change_workspace_pairs: &[(String, Option<Workspace>)],
+        base_revision: &str,
         group_index: Option<u32>,
         total_changes: usize,
         changes_processed: usize,
+        cleanup_guard: &mut WorkspaceCleanupGuard,
     ) -> Result<Vec<WorkspaceResult>> {
         let max_concurrent = self.workspace_manager.max_concurrent();
         let semaphore = Arc::new(Semaphore::new(max_concurrent));
         let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
-        let total_changes_in_group = workspaces.len();
+        let total_changes_in_group = change_workspace_pairs.len();
 
-        for workspace in workspaces {
-            let sem = semaphore.clone();
+        for (change_id, existing_workspace) in change_workspace_pairs {
+            // Acquire semaphore BEFORE creating workspace to enforce concurrency limit
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+
+            // Create or reuse workspace under semaphore control
+            let workspace = if let Some(ws) = existing_workspace {
+                // Workspace was already resumed (passed from archived changes)
+                ws.clone()
+            } else {
+                // Create new workspace or find existing one
+                let workspace_opt = if self.no_resume {
+                    None
+                } else {
+                    match self
+                        .workspace_manager
+                        .find_existing_workspace(change_id)
+                        .await
+                    {
+                        Ok(Some(workspace_info)) => {
+                            info!(
+                                "Resuming existing workspace for '{}' (last modified: {:?})",
+                                change_id, workspace_info.last_modified
+                            );
+                            match self
+                                .workspace_manager
+                                .reuse_workspace(&workspace_info)
+                                .await
+                            {
+                                Ok(ws) => {
+                                    send_event(
+                                        &self.event_tx,
+                                        ParallelEvent::WorkspaceResumed {
+                                            change_id: change_id.clone(),
+                                            workspace: ws.name.clone(),
+                                        },
+                                    )
+                                    .await;
+                                    Some(ws)
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to reuse workspace for '{}': {}, creating new",
+                                        change_id, e
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Ok(None) => None,
+                        Err(e) => {
+                            warn!(
+                                "Failed to find existing workspace for '{}': {}, creating new",
+                                change_id, e
+                            );
+                            None
+                        }
+                    }
+                };
+
+                match workspace_opt {
+                    Some(ws) => ws,
+                    None => {
+                        // Create new workspace
+                        match self
+                            .workspace_manager
+                            .create_workspace(change_id, Some(base_revision))
+                            .await
+                        {
+                            Ok(ws) => {
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::WorkspaceCreated {
+                                        change_id: change_id.clone(),
+                                        workspace: ws.name.clone(),
+                                    },
+                                )
+                                .await;
+                                ws
+                            }
+                            Err(e) => {
+                                let error_msg = format!("Failed to create workspace: {}", e);
+                                error!("{} for {}", error_msg, change_id);
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::Error {
+                                        message: format!("[{}] {}", change_id, error_msg),
+                                    },
+                                )
+                                .await;
+                                // Drop permit and return error
+                                drop(permit);
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+            };
+
+            // Track workspace in cleanup guard
+            cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
+
+            // Send ProcessingStarted event
+            send_event(
+                &self.event_tx,
+                ParallelEvent::ProcessingStarted(change_id.clone()),
+            )
+            .await;
+
             let change_id = workspace.change_id.clone();
             let workspace_path = workspace.path.clone();
             let workspace_name = workspace.name.clone();
@@ -1292,8 +1365,8 @@ impl ParallelExecutor {
                 .update_workspace_status(&workspace_name, WorkspaceStatus::Applying);
 
             join_set.spawn(async move {
-                // Acquire semaphore inside spawn to allow all tasks to be created
-                let _permit = sem.acquire_owned().await.unwrap();
+                // Keep permit until task completes
+                let _permit = permit;
 
                 // Step 1: Execute apply
                 let apply_result = execute_apply_in_workspace(
