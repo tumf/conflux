@@ -297,6 +297,21 @@ impl WebState {
         diff
     }
 
+    /// Refresh state from disk by re-reading changes using native parser.
+    /// This ensures the web state reflects the latest task progress from worktree.
+    pub async fn refresh_from_disk(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::openspec;
+
+        // Read changes from disk using native parser
+        let changes = openspec::list_changes_native()
+            .map_err(|e| format!("Failed to refresh changes from disk: {}", e))?;
+
+        // Update state with refreshed changes
+        self.update(&changes).await;
+
+        Ok(())
+    }
+
     /// Subscribe to state updates
     pub fn subscribe(&self) -> broadcast::Receiver<StateUpdate> {
         self.tx.subscribe()
