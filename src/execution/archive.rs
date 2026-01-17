@@ -285,6 +285,61 @@ Requirements:\n\
     Ok(())
 }
 
+/// Delete the change directory after successful archive.
+///
+/// This function removes the `openspec/changes/{change_id}` directory after
+/// the archive command has successfully moved it to the archive directory.
+///
+/// # Arguments
+///
+/// * `change_id` - The ID of the change to delete
+/// * `base_path` - Base path to delete from. Pass `None` for current directory (serial mode),
+///   or `Some(path)` for workspace directory (parallel mode).
+///
+/// # Returns
+///
+/// * `Ok(())` - Directory was deleted successfully or didn't exist
+/// * `Err(e)` - Failed to delete the directory
+pub fn delete_change_directory(change_id: &str, base_path: Option<&Path>) -> Result<()> {
+    let change_path = match base_path {
+        Some(base) => base.join("openspec/changes").join(change_id),
+        None => Path::new("openspec/changes").join(change_id),
+    };
+
+    debug!(
+        change_id = %change_id,
+        change_path = %change_path.display(),
+        "delete_change_directory: attempting to delete"
+    );
+
+    // If the directory doesn't exist, consider it success (idempotent)
+    if !change_path.exists() {
+        debug!(
+            change_id = %change_id,
+            "delete_change_directory: directory does not exist, skipping"
+        );
+        return Ok(());
+    }
+
+    // Remove the directory and all its contents
+    std::fs::remove_dir_all(&change_path).map_err(|e| {
+        OrchestratorError::ConfigLoad(format!(
+            "Failed to delete change directory '{}' at {}: {}",
+            change_id,
+            change_path.display(),
+            e
+        ))
+    })?;
+
+    info!(
+        change_id = %change_id,
+        change_path = %change_path.display(),
+        "delete_change_directory: successfully deleted"
+    );
+
+    Ok(())
+}
+
 /// Verify that a change was actually archived.
 ///
 /// This function checks that the archive operation actually moved the change
@@ -718,6 +773,28 @@ where
         let status = child.wait().await.map_err(|e| {
             OrchestratorError::AgentCommand(format!("Failed to wait for archive command: {}", e))
         })?;
+
+        // If archive command succeeded, delete the change directory
+        if status.success() {
+            if let Err(e) = delete_change_directory(change_id, Some(workspace_path)) {
+                // Deletion failure is treated as archive failure
+                let error_msg = format!(
+                    "Archive command succeeded but failed to delete change directory: {}",
+                    e
+                );
+                error!("{}", error_msg);
+
+                // Run on_error hook
+                if let Some(hook_runner) = hooks {
+                    let error_ctx = hook_ctx
+                        .build_hook_context(change_id, progress.completed, progress.total)
+                        .with_error(&error_msg);
+                    let _ = hook_runner.run_hook(HookType::OnError, &error_ctx).await;
+                }
+
+                return Err(OrchestratorError::AgentCommand(error_msg));
+            }
+        }
 
         // Verify archive completion
         let verification = verify_archive_completion(change_id, Some(workspace_path));
@@ -1440,5 +1517,74 @@ fi\n";
             "Error message should mention change directory exists, got: {}",
             err_msg
         );
+    }
+
+    // ===========================
+    // delete_change_directory tests
+    // ===========================
+
+    #[test]
+    fn test_delete_change_directory_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        // Create change directory with content
+        let change_id = "test-change";
+        let change_dir = base.join("openspec/changes").join(change_id);
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(change_dir.join("tasks.md"), "test content").unwrap();
+
+        // Verify directory exists
+        assert!(change_dir.exists());
+
+        // Delete directory
+        let result = delete_change_directory(change_id, Some(base));
+        assert!(result.is_ok(), "Delete should succeed");
+
+        // Verify directory is gone
+        assert!(!change_dir.exists());
+    }
+
+    #[test]
+    fn test_delete_change_directory_idempotent() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        let change_id = "nonexistent-change";
+        let changes_dir = base.join("openspec/changes");
+        fs::create_dir_all(&changes_dir).unwrap();
+
+        // Delete non-existent directory should succeed (idempotent)
+        let result = delete_change_directory(change_id, Some(base));
+        assert!(
+            result.is_ok(),
+            "Delete of non-existent directory should succeed"
+        );
+    }
+
+    #[test]
+    fn test_delete_change_directory_with_nested_content() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        // Create change directory with nested structure
+        let change_id = "nested-change";
+        let change_dir = base.join("openspec/changes").join(change_id);
+        let specs_dir = change_dir.join("specs");
+        fs::create_dir_all(&specs_dir).unwrap();
+        fs::write(change_dir.join("tasks.md"), "tasks").unwrap();
+        fs::write(specs_dir.join("spec.md"), "spec content").unwrap();
+
+        // Verify directory exists
+        assert!(change_dir.exists());
+        assert!(specs_dir.exists());
+
+        // Delete directory
+        let result = delete_change_directory(change_id, Some(base));
+        assert!(result.is_ok(), "Delete should succeed");
+
+        // Verify entire directory tree is gone
+        assert!(!change_dir.exists());
+        assert!(!specs_dir.exists());
     }
 }
