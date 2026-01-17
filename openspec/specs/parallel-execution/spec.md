@@ -300,60 +300,13 @@ resolve の目標（完了条件）は、少なくとも以下を満たすこと
 - Git マージが完了している（例: `MERGE_HEAD` が存在しない）
 - 対象の各 `change_id` について、`Merge change: <change_id>` を含むマージコミットが存在する
 
+resolve のプロンプトには、`--no-verify` を使用してはならない旨を明示しなければならない（MUST）。
+
 上記の目標が満たされない場合、システムは継続理由を記録し、次回の `resolve_command` プロンプトに含めて再実行しなければならない（SHALL）。
 
-#### Scenario: コンフリクト解消後もマージ未完了なら理由を伝えて継続
-
-- **GIVEN** `git diff --name-only --diff-filter=U` が空である
-- **AND** Git がマージ進行中状態である（例: `MERGE_HEAD` が存在する）
-- **WHEN** `resolve_command` が成功終了する
-- **THEN** システムは継続理由「Merge still in progress (MERGE_HEAD exists); retrying resolve」を記録する
-- **AND** システムは次回の `resolve_command` プロンプトに前回の試行結果と継続理由を含める
-- **AND** `resolve_command` を再実行する
-
-#### Scenario: マージコミットが不足している場合は理由を伝えて継続
-
-- **GIVEN** 対象の `change_id` のうち一部について `Merge change: <change_id>` を含むマージコミットが存在しない
-- **WHEN** `resolve_command` が成功終了する
-- **THEN** システムは継続理由「Missing merge commits for change_ids」と不足している ID リストを記録する
-- **AND** システムは次回の `resolve_command` プロンプトに前回の試行結果と継続理由を含める
-- **AND** `resolve_command` を再実行する
-
-#### Scenario: Worktree マージ未完了なら理由を伝えて継続
-
-- **GIVEN** 並列実行モードで resolve が実行されている
-- **AND** worktree でマージが未完了（`MERGE_HEAD` が存在）
-- **WHEN** `resolve_command` が成功終了する
-- **THEN** システムは継続理由「Worktree merge still in progress for '{revision}'」を記録する
-- **AND** システムは次回の `resolve_command` プロンプトに前回の試行結果と継続理由を含める
-- **AND** `resolve_command` を再実行する
-
-#### Scenario: Worktree コンフリクトが残っている場合は理由を伝えて継続
-
-- **GIVEN** 並列実行モードで resolve が実行されている
-- **AND** worktree でコンフリクトが残っている
-- **WHEN** システムが検証を実行する
-- **THEN** システムは継続理由「Worktree conflicts still present for '{revision}' ({files})」を記録する
-- **AND** システムは次回の `resolve_command` プロンプトに前回の試行結果とコンフリクトファイルリストを含める
-- **AND** `resolve_command` を再実行する
-
-#### Scenario: Pre-sync コミットサブジェクト不正なら理由を伝えて継続
-
-- **GIVEN** 並列実行モードで resolve が実行されている
-- **AND** pre-sync マージコミットのサブジェクトが期待値「Pre-sync base into {change_id}」と異なる
-- **WHEN** システムが検証を実行する
-- **THEN** システムは継続理由「Invalid pre-sync merge commit subject in worktree '{revision}'」を記録する
-- **AND** 期待されるサブジェクトと実際のサブジェクトを含める
-- **AND** システムは次回の `resolve_command` プロンプトに前回の試行結果と継続理由を含める
-- **AND** `resolve_command` を再実行する
-
-#### Scenario: 最大試行回数後のエラーメッセージに全履歴が含まれる
-
-- **GIVEN** resolve が最大試行回数に達した
-- **AND** 目標がまだ満たされていない
-- **WHEN** システムがエラーを報告する
-- **THEN** エラーメッセージには試行回数が含まれる
-- **AND** 最後の継続理由が含まれる
+#### Scenario: resolveプロンプトに--no-verify禁止を含める
+- **WHEN** システムが resolve プロンプトを生成する
+- **THEN** プロンプトに「`--no-verify` を使用しない」指示が含まれる
 
 ### Requirement: Workspace Resume Detection
 
