@@ -52,6 +52,25 @@ impl CommandQueue {
         }
     }
 
+    /// Create a new command queue with shared stagger state.
+    ///
+    /// This allows multiple CommandQueue instances to coordinate
+    /// their stagger delays through a shared last_execution timestamp.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - CommandQueue configuration
+    /// * `shared_state` - Shared last execution timestamp (Arc<Mutex<Option<Instant>>>)
+    pub fn new_with_shared_state(
+        config: CommandQueueConfig,
+        shared_state: Arc<Mutex<Option<Instant>>>,
+    ) -> Self {
+        Self {
+            config,
+            last_execution: shared_state,
+        }
+    }
+
     /// Execute a command with staggered start
     ///
     /// Ensures minimum delay between consecutive command executions
