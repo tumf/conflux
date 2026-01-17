@@ -152,25 +152,13 @@ impl ParallelExecutor {
         vcs_backend: VcsBackend,
         shared_queue_change: Option<Arc<Mutex<Option<std::time::Instant>>>>,
     ) -> Self {
-        // Create a unique temp directory for this execution
+        // Resolve workspace base directory
         let base_dir = if let Some(configured_dir) = config.get_workspace_base_dir() {
             // User configured a specific directory
             PathBuf::from(configured_dir)
         } else {
-            // Use tempfile to create a unique temp directory
-            match tempfile::Builder::new().prefix("openspec-ws-").tempdir() {
-                Ok(temp_dir) => {
-                    // Keep the path but leak the TempDir so it doesn't get cleaned up immediately
-                    let path = temp_dir.path().to_path_buf();
-                    std::mem::forget(temp_dir);
-                    path
-                }
-                Err(e) => {
-                    error!("Failed to create temp directory: {}", e);
-                    // Fallback to a fixed temp directory
-                    std::env::temp_dir().join("openspec-workspaces-fallback")
-                }
-            }
+            // Use OS-specific default workspace directory
+            crate::config::defaults::default_workspace_base_dir()
         };
         info!("Using workspace base directory: {:?}", base_dir);
 

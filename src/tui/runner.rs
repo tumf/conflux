@@ -244,7 +244,7 @@ async fn run_tui_loop(
     let worktree_base_dir = config
         .get_workspace_base_dir()
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("openspec-tui-worktrees"));
+        .unwrap_or_else(crate::config::defaults::default_workspace_base_dir);
     let worktree_manager = GitWorkspaceManager::new(
         worktree_base_dir.clone(),
         repo_root.clone(),
