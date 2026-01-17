@@ -466,13 +466,14 @@ mod tests {
         commit(repo_root, "Archive: test-change");
 
         // Archive commit exists in main, but change directory still exists
-        // Should NOT be considered Merged
+        // With the new guardrails, this should NOT be considered Archived
+        // because the archive is incomplete (change directory still exists)
         let state = detect_workspace_state("test-change", repo_root, "main")
             .await
             .unwrap();
 
-        // Should be Archived state instead (archive commit exists, but not merged)
-        assert_eq!(state, WorkspaceState::Archived);
+        // Should be Created state (archive incomplete, no apply commit, no WIP)
+        assert_eq!(state, WorkspaceState::Created);
     }
 
     #[tokio::test]
