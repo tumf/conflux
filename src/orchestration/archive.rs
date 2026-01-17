@@ -331,7 +331,8 @@ where
         attempt += 1;
 
         // Execute archive command with streaming
-        let (mut child, mut output_rx, start) = agent.run_archive_streaming(&change.id).await?;
+        let (mut child, mut output_rx, start) =
+            agent.run_archive_streaming(&change.id, None).await?;
 
         // Stream output
         loop {

@@ -609,7 +609,9 @@ where
         }
 
         // Execute apply command with history context
-        let (mut child, mut rx, start_time) = agent.run_apply_streaming(change_id).await?;
+        let (mut child, mut rx, start_time) = agent
+            .run_apply_streaming(change_id, Some(workspace_path))
+            .await?;
 
         // Stream output
         while let Some(line) = rx.recv().await {
