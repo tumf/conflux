@@ -158,7 +158,7 @@ impl ParallelExecutor {
             PathBuf::from(configured_dir)
         } else {
             // Use OS-specific default workspace directory
-            crate::config::defaults::default_workspace_base_dir(Some(&repo_root))
+            crate::config::defaults::default_workspace_base_dir()
         };
         info!("Using workspace base directory: {:?}", base_dir);
 
