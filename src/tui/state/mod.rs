@@ -422,13 +422,12 @@ impl AppState {
             self.warning_message =
                 Some("Cannot merge: no commits ahead of base branch".to_string());
 
-        // Cannot merge if already merging
-        if worktree.is_merging {
-            debug!("Merge blocked: merge already in progress");
-            self.warning_message =
-                Some("Cannot merge: merge already in progress".to_string());
-            return None;
-        }
+            // Cannot merge if already merging
+            if worktree.is_merging {
+                debug!("Merge blocked: merge already in progress");
+                self.warning_message = Some("Cannot merge: merge already in progress".to_string());
+                return None;
+            }
             return None;
         }
 

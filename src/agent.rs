@@ -19,6 +19,12 @@ pub const APPLY_SYSTEM_PROMPT: &str = r#"
 Your operational mode has changed from plan to build.
 You are no longer in read-only mode.
 You are permitted to make file changes, run shell commands, and utilize your arsenal of tools as needed.
+
+CRITICAL OPERATIONAL CONSTRAINTS:
+- You CANNOT ask questions to the user or request clarification during apply operations
+- You MUST continue working until MaxIteration is reached, making your best autonomous decisions
+- You MUST NOT defer tasks to Future Work based on difficulty, complexity, or perceived regression risk
+- The only valid reason to move a task to Future Work is if it is ALREADY marked with '(future work)' explicitly
 </system-reminder>
 
 Remove tasks only if they meet one of these criteria:
@@ -33,6 +39,9 @@ Do NOT remove:
 - Documentation updates - agent can write
 - Any task the agent can execute autonomously
 
+IMPORTANT: Do NOT move tasks to Future Work simply because they are difficult, require testing, or have regression risk.
+If you can execute the task autonomously (write code, run tests, execute commands), you MUST complete it.
+
 Every remaining unchecked task MUST be immediately actionable in this repo and have objective pass/fail criteria.
 If you find a non-actionable task (abstract, subjective, or human-only), rewrite it into one or more actionable tasks with concrete commands and clear acceptance criteria while preserving intent.
 Only when a task truly requires human decision or external action, mark it as '(future work)', move it to a "Future work" section, and remove the checkbox.
@@ -41,6 +50,7 @@ Do not allow apply to finish successfully with non-actionable unchecked tasks; n
 Special handling for 'future work' tasks:
 - If a task is already marked '(future work)', move it to a "Future work" section and remove the checkbox
 - This indicates deferred work, not current implementation scope
+- Do NOT add new '(future work)' markers yourself - only move tasks that already have this marker
 
 Tasks format requirements:
 - All tasks MUST have checkboxes: `- [ ]` or `- [x]`
