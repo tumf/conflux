@@ -13,11 +13,17 @@
 // incrementally as parallel/executor.rs is refactored to use common functions.
 #![allow(dead_code)]
 
+use crate::agent::{AgentRunner, OutputLine};
 use crate::config::OrchestratorConfig;
+use crate::error::{OrchestratorError, Result};
+use crate::hooks::{HookContext, HookRunner, HookType};
+use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser::TaskProgress;
-use crate::vcs::{VcsResult, WorkspaceManager};
+use crate::vcs::{VcsBackend, VcsResult, WorkspaceManager};
+use std::future::Future;
 use std::path::Path;
-use tracing::{debug, info};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 /// Default maximum iterations for apply loops.
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
@@ -346,6 +352,479 @@ pub fn summarize_output(output: &str, max_lines: usize) -> String {
     } else {
         output.to_string()
     }
+}
+
+/// Event handler for apply loop events.
+///
+/// This trait allows the apply loop to send events to different handlers
+/// (e.g., TUI event channel, CLI logger, parallel event bus).
+pub trait ApplyEventHandler {
+    /// Called when apply iteration starts
+    fn on_apply_started(&self, change_id: &str);
+    /// Called when progress is updated
+    fn on_progress_updated(&self, change_id: &str, completed: u32, total: u32);
+    /// Called when hook starts
+    fn on_hook_started(&self, change_id: &str, hook_type: &str);
+    /// Called when hook completes
+    fn on_hook_completed(&self, change_id: &str, hook_type: &str);
+    /// Called when hook fails
+    fn on_hook_failed(&self, change_id: &str, hook_type: &str, error: &str);
+    /// Called when apply output is generated
+    fn on_apply_output(&self, change_id: &str, line: &OutputLine);
+}
+
+/// No-op event handler for cases where events are not needed
+pub struct NoOpEventHandler;
+
+impl ApplyEventHandler for NoOpEventHandler {
+    fn on_apply_started(&self, _change_id: &str) {}
+    fn on_progress_updated(&self, _change_id: &str, _completed: u32, _total: u32) {}
+    fn on_hook_started(&self, _change_id: &str, _hook_type: &str) {}
+    fn on_hook_completed(&self, _change_id: &str, _hook_type: &str) {}
+    fn on_hook_failed(&self, _change_id: &str, _hook_type: &str, _error: &str) {}
+    fn on_apply_output(&self, _change_id: &str, _line: &OutputLine) {}
+}
+
+/// Context for building hook contexts in the apply loop
+pub struct ApplyLoopHookContext {
+    /// Changes processed so far
+    pub changes_processed: usize,
+    /// Total changes in this run
+    pub total_changes: usize,
+    /// Remaining changes
+    pub remaining_changes: usize,
+    /// Workspace path for parallel mode (optional)
+    pub workspace_path: Option<String>,
+    /// Group index for parallel mode (optional)
+    pub group_index: Option<usize>,
+}
+
+impl ApplyLoopHookContext {
+    /// Create a new hook context for serial mode
+    pub fn serial(
+        changes_processed: usize,
+        total_changes: usize,
+        remaining_changes: usize,
+    ) -> Self {
+        Self {
+            changes_processed,
+            total_changes,
+            remaining_changes,
+            workspace_path: None,
+            group_index: None,
+        }
+    }
+
+    /// Create a new hook context for parallel mode
+    pub fn parallel(
+        changes_processed: usize,
+        total_changes: usize,
+        remaining_changes: usize,
+        workspace_path: String,
+        group_index: usize,
+    ) -> Self {
+        Self {
+            changes_processed,
+            total_changes,
+            remaining_changes,
+            workspace_path: Some(workspace_path),
+            group_index: Some(group_index),
+        }
+    }
+
+    /// Build a HookContext from this apply loop context
+    fn build_hook_context(
+        &self,
+        change_id: &str,
+        completed: u32,
+        total: u32,
+        apply_count: u32,
+    ) -> HookContext {
+        let mut ctx = HookContext::new(
+            self.changes_processed,
+            self.total_changes,
+            self.remaining_changes,
+            false,
+        )
+        .with_change(change_id, completed, total)
+        .with_apply_count(apply_count);
+
+        if let Some(ref workspace_path) = self.workspace_path {
+            if let Some(group_index) = self.group_index {
+                ctx = ctx.with_parallel_context(workspace_path, Some(group_index as u32));
+            }
+        }
+
+        ctx
+    }
+}
+
+/// Result of the unified apply loop
+#[derive(Debug)]
+pub struct ApplyLoopResult {
+    /// Final revision ID (e.g., git commit hash)
+    pub revision: String,
+    /// Whether all tasks were completed
+    pub completed: bool,
+    /// Number of iterations executed
+    pub iterations: u32,
+}
+
+/// Execute apply iterations until tasks are complete or max iterations reached.
+///
+/// This is the unified apply loop used by both serial and parallel modes.
+///
+/// # Arguments
+///
+/// * `change_id` - The change to apply
+/// * `workspace_path` - Working directory (worktree for parallel, repo root for serial)
+/// * `config` - Orchestrator configuration
+/// * `agent` - Agent runner for executing commands
+/// * `vcs_backend` - VCS backend (Git, Auto, etc.)
+/// * `hooks` - Optional hook runner
+/// * `hook_ctx` - Context for building hook contexts
+/// * `event_handler` - Event handler for sending progress/hook events
+/// * `cancel_token` - Optional cancellation token
+///
+/// # Returns
+///
+/// * `Ok(ApplyLoopResult)` - Apply loop completed (success or max iterations)
+/// * `Err(e)` - An error occurred (hook failure, command spawn failure, etc.)
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_apply_loop<E, F, Fut>(
+    change_id: &str,
+    workspace_path: &Path,
+    config: &OrchestratorConfig,
+    agent: &mut AgentRunner,
+    vcs_backend: VcsBackend,
+    workspace_manager: Option<&dyn WorkspaceManager>,
+    hooks: Option<&HookRunner>,
+    hook_ctx: &ApplyLoopHookContext,
+    event_handler: &E,
+    cancel_token: Option<&CancellationToken>,
+    mut output_handler: F,
+) -> Result<ApplyLoopResult>
+where
+    E: ApplyEventHandler,
+    F: FnMut(OutputLine) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let max_iterations = config.get_max_iterations();
+    let mut iteration = 0;
+    let mut first_apply = true;
+    let mut apply_succeeded = false;
+    let mut stall_detector = StallDetector::new(config.get_stall_detection());
+
+    // Check if VCS is Git for WIP/stall features
+    let is_git = matches!(vcs_backend, VcsBackend::Git);
+
+    loop {
+        iteration += 1;
+
+        // Check cancellation
+        if cancel_token.is_some_and(|token| token.is_cancelled()) {
+            return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+        }
+
+        // Check max iterations
+        if iteration > max_iterations {
+            let error_msg = format!(
+                "Max iterations ({}) reached for change {}",
+                max_iterations, change_id
+            );
+
+            // Run on_error hook
+            if let Some(hook_runner) = hooks {
+                let progress = check_task_progress(workspace_path, change_id).unwrap_or_default();
+                let error_ctx = hook_ctx
+                    .build_hook_context(change_id, progress.completed, progress.total, iteration)
+                    .with_error(&error_msg);
+                if let Err(e) = hook_runner.run_hook(HookType::OnError, &error_ctx).await {
+                    error!("on_error hook failed: {}", e);
+                }
+            }
+
+            return Err(OrchestratorError::AgentCommand(error_msg));
+        }
+
+        // Check current task progress
+        let progress = match check_task_progress(workspace_path, change_id) {
+            Some(progress) => progress,
+            None => {
+                return Err(OrchestratorError::AgentCommand(format!(
+                    "Tasks file not found for change {} in workspace",
+                    change_id
+                )));
+            }
+        };
+
+        // Send progress event
+        if progress.total > 0 {
+            event_handler.on_progress_updated(change_id, progress.completed, progress.total);
+        }
+
+        // Check if already complete
+        if is_progress_complete(&progress) {
+            info!(
+                "Change {} is already complete ({}/{})",
+                change_id, progress.completed, progress.total
+            );
+            apply_succeeded = true;
+            break;
+        }
+
+        info!(
+            "Executing apply #{} for {} ({}/{} tasks)",
+            iteration, change_id, progress.completed, progress.total
+        );
+
+        // Send ApplyStarted event on first iteration
+        if first_apply {
+            first_apply = false;
+            event_handler.on_apply_started(change_id);
+        }
+
+        // Run pre_apply hook
+        if let Some(hook_runner) = hooks {
+            let current_hook_ctx = hook_ctx.build_hook_context(
+                change_id,
+                progress.completed,
+                progress.total,
+                iteration,
+            );
+
+            event_handler.on_hook_started(change_id, "pre_apply");
+
+            match hook_runner
+                .run_hook(HookType::PreApply, &current_hook_ctx)
+                .await
+            {
+                Ok(()) => {
+                    event_handler.on_hook_completed(change_id, "pre_apply");
+                }
+                Err(e) => {
+                    error!("pre_apply hook failed for {}: {}", change_id, e);
+                    event_handler.on_hook_failed(change_id, "pre_apply", &e.to_string());
+                    return Err(e);
+                }
+            }
+        }
+
+        // Execute apply command with history context
+        let (mut child, mut rx, start_time) = agent.run_apply_streaming(change_id).await?;
+
+        // Stream output
+        while let Some(line) = rx.recv().await {
+            event_handler.on_apply_output(change_id, &line);
+            output_handler(line).await;
+        }
+
+        // Wait for child process
+        let status = child.wait().await.map_err(|e| {
+            OrchestratorError::AgentCommand(format!("Failed to wait for apply command: {}", e))
+        })?;
+
+        // Record apply attempt for history
+        agent.record_apply_attempt(change_id, &status, start_time);
+
+        if !status.success() {
+            let error_msg = format!("Apply command failed with exit code: {:?}", status.code());
+
+            // Run on_error hook
+            if let Some(hook_runner) = hooks {
+                let error_ctx = hook_ctx
+                    .build_hook_context(change_id, progress.completed, progress.total, iteration)
+                    .with_error(&error_msg);
+                let _ = hook_runner.run_hook(HookType::OnError, &error_ctx).await;
+            }
+
+            return Err(OrchestratorError::AgentCommand(error_msg));
+        }
+
+        // Check task progress after apply
+        let new_progress = match check_task_progress(workspace_path, change_id) {
+            Some(progress) => progress,
+            None => {
+                return Err(OrchestratorError::AgentCommand(format!(
+                    "Tasks file not found for change {} after apply",
+                    change_id
+                )));
+            }
+        };
+
+        // Send progress event after apply
+        if new_progress.total > 0 {
+            event_handler.on_progress_updated(
+                change_id,
+                new_progress.completed,
+                new_progress.total,
+            );
+        }
+
+        info!(
+            "After apply #{}: {}/{} tasks complete",
+            iteration, new_progress.completed, new_progress.total
+        );
+
+        // Run post_apply hook
+        if let Some(hook_runner) = hooks {
+            let current_hook_ctx = hook_ctx.build_hook_context(
+                change_id,
+                new_progress.completed,
+                new_progress.total,
+                iteration,
+            );
+
+            event_handler.on_hook_started(change_id, "post_apply");
+
+            match hook_runner
+                .run_hook(HookType::PostApply, &current_hook_ctx)
+                .await
+            {
+                Ok(()) => {
+                    event_handler.on_hook_completed(change_id, "post_apply");
+                }
+                Err(e) => {
+                    error!("post_apply hook failed for {}: {}", change_id, e);
+                    event_handler.on_hook_failed(change_id, "post_apply", &e.to_string());
+                    return Err(e);
+                }
+            }
+        }
+
+        // Create iteration snapshot (Git-only)
+        if is_git {
+            if let Some(ws_mgr) = workspace_manager {
+                match create_progress_commit(
+                    ws_mgr,
+                    workspace_path,
+                    change_id,
+                    &new_progress,
+                    iteration,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        // Check for stall (Git-only)
+                        if let Ok(is_empty) =
+                            crate::vcs::git::commands::is_head_empty_commit(workspace_path).await
+                        {
+                            if !is_progress_complete(&new_progress)
+                                && stall_detector.register_commit(
+                                    change_id,
+                                    StallPhase::Apply,
+                                    is_empty,
+                                )
+                            {
+                                let count =
+                                    stall_detector.current_count(change_id, StallPhase::Apply);
+                                let threshold = stall_detector.config().threshold;
+                                let message = format!(
+                                    "Stall detected for {} after {} empty WIP commits (apply)",
+                                    change_id, count
+                                );
+                                warn!("{} (threshold {})", message, threshold);
+                                return Err(OrchestratorError::AgentCommand(message));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to create iteration snapshot for {}: {}",
+                            change_id, e
+                        );
+                    }
+                }
+            }
+        } else {
+            debug!("Skipping WIP snapshot for {} (non-Git backend)", change_id);
+        }
+
+        // Check if complete
+        if is_progress_complete(&new_progress) {
+            // Run on_change_complete hook
+            if let Some(hook_runner) = hooks {
+                let current_hook_ctx = hook_ctx.build_hook_context(
+                    change_id,
+                    new_progress.completed,
+                    new_progress.total,
+                    iteration,
+                );
+
+                event_handler.on_hook_started(change_id, "on_change_complete");
+
+                match hook_runner
+                    .run_hook(HookType::OnChangeComplete, &current_hook_ctx)
+                    .await
+                {
+                    Ok(()) => {
+                        event_handler.on_hook_completed(change_id, "on_change_complete");
+                    }
+                    Err(e) => {
+                        error!("on_change_complete hook failed for {}: {}", change_id, e);
+                        event_handler.on_hook_failed(
+                            change_id,
+                            "on_change_complete",
+                            &e.to_string(),
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+
+            info!(
+                "Change {} completed after {} iteration(s)",
+                change_id, iteration
+            );
+            apply_succeeded = true;
+            break;
+        }
+
+        // Warn if no progress
+        if new_progress.completed <= progress.completed && iteration > 1 {
+            warn!(
+                "No progress made for {} (still {}/{}), continuing...",
+                change_id, new_progress.completed, new_progress.total
+            );
+        }
+    }
+
+    // Create final commit (Git-only)
+    if apply_succeeded && is_git {
+        if let Some(ws_mgr) = workspace_manager {
+            info!(
+                "Creating final Apply commit for {} after {} iterations",
+                change_id, iteration
+            );
+            if let Err(e) = create_final_commit(ws_mgr, workspace_path, change_id).await {
+                warn!("Failed to create final commit for {}: {}", change_id, e);
+            }
+        }
+    } else if !apply_succeeded {
+        info!(
+            "Apply loop exited without completion for {}; WIP snapshots preserved",
+            change_id
+        );
+    }
+
+    // Get final revision
+    let revision = if let Some(ws_mgr) = workspace_manager {
+        match get_workspace_revision(ws_mgr, workspace_path).await {
+            Ok(rev) => rev,
+            Err(e) => {
+                warn!("Failed to get workspace revision: {}", e);
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    Ok(ApplyLoopResult {
+        revision,
+        completed: apply_succeeded,
+        iterations: iteration,
+    })
 }
 
 #[cfg(test)]

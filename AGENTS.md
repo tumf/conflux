@@ -595,6 +595,35 @@ fn should_retry(&self, attempt: u32, duration: Duration, stderr: &str, exit_code
 - Project config: `.cflx.jsonc` (JSONC format with comments)
 - Global config: `~/.cflx.jsonc`
 
+### Workspace Base Directory
+
+The workspace base directory determines where git worktrees are created for parallel execution and TUI worktree management.
+
+**Configuration Key**: `workspace_base_dir`
+
+**Default Behavior** (when `workspace_base_dir` is not configured):
+
+| Platform | Default Location |
+|----------|------------------|
+| **macOS** | `${XDG_DATA_HOME}/openspec/worktrees` if `XDG_DATA_HOME` is set<br/>Otherwise: `~/Library/Application Support/openspec/worktrees` |
+| **Linux** | `${XDG_DATA_HOME}/openspec/worktrees` if `XDG_DATA_HOME` is set<br/>Otherwise: `~/.local/share/openspec/worktrees` |
+| **Windows** | `%APPDATA%\OpenSpec\worktrees` |
+
+**Implementation**: `src/config/defaults.rs` - `default_workspace_base_dir()` function
+
+**Configuration Example**:
+```jsonc
+{
+  "workspace_base_dir": "/var/tmp/openspec-ws"
+}
+```
+
+**Notes**:
+- The default uses OS-specific persistent directories instead of temporary directories
+- This prevents worktree loss in environments where `/tmp` is RAM-backed or cleared on reboot
+- Existing worktrees in old locations are not automatically migrated
+- Users with explicit `workspace_base_dir` configuration are unaffected by the default change
+
 ## Retry Context History
 
 The orchestrator tracks retry history for apply, archive, and resolve operations to help AI agents learn from previous attempts.
