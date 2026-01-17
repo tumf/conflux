@@ -65,6 +65,7 @@ impl ParallelRunService {
         event_tx: Option<mpsc::Sender<ParallelEvent>>,
         cancel_token: Option<CancellationToken>,
         shared_queue_change: Option<std::sync::Arc<tokio::sync::Mutex<Option<std::time::Instant>>>>,
+        dynamic_queue: Option<std::sync::Arc<crate::tui::queue::DynamicQueue>>,
     ) -> ParallelExecutor {
         let vcs_backend = self.config.get_vcs_backend();
         let mut executor = ParallelExecutor::with_backend_and_queue_state(
@@ -77,6 +78,9 @@ impl ParallelRunService {
         executor.set_no_resume(self.no_resume);
         if let Some(token) = cancel_token {
             executor.set_cancel_token(token);
+        }
+        if let Some(queue) = dynamic_queue {
+            executor.set_dynamic_queue(queue);
         }
         executor
     }
@@ -189,11 +193,13 @@ impl ParallelRunService {
         event_tx: mpsc::Sender<ParallelEvent>,
         cancel_token: Option<CancellationToken>,
         shared_queue_change: Option<std::sync::Arc<tokio::sync::Mutex<Option<std::time::Instant>>>>,
+        dynamic_queue: Option<std::sync::Arc<crate::tui::queue::DynamicQueue>>,
     ) -> Result<()> {
         let executor = self.create_executor_with_queue_state(
             Some(event_tx.clone()),
             cancel_token,
             shared_queue_change,
+            dynamic_queue,
         );
         self.run_parallel_with_executor(executor, changes, event_tx)
             .await
