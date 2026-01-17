@@ -1,6 +1,6 @@
-# tui-worktree-merge 変更デルタ
+# tui-worktree-merge Change Delta
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Merge Key Hint Display Conditions
 
@@ -13,7 +13,7 @@ TUI Worktree View SHALL display "M: merge" key hint only when ALL of the followi
 
 TUI SHALL NOT display merge key hint when worktree branch has no commits ahead of base branch.
 
-#### Scenario: Mキーは差分がある場合のみ表示
+#### Scenario: M key displayed only when commits ahead
 
 - **GIVEN** TUI is in Worktrees view
 - **AND** cursor is on a worktree that is not main, not detached, has no conflicts, and has a branch name
@@ -21,14 +21,14 @@ TUI SHALL NOT display merge key hint when worktree branch has no commits ahead o
 - **WHEN** the footer is rendered
 - **THEN** the key hints SHALL include "M: merge"
 
-#### Scenario: 差分がない場合はMキーを非表示
+#### Scenario: M key hidden when no commits ahead
 
 - **GIVEN** TUI is in Worktrees view
 - **AND** cursor is on a worktree that meets all conditions EXCEPT has no commits ahead
 - **WHEN** the footer is rendered
 - **THEN** the key hints SHALL NOT include "M: merge"
 
-#### Scenario: main worktreeではMキーを非表示
+#### Scenario: M key hidden for main worktree
 
 - **GIVEN** TUI is in Worktrees view
 - **AND** cursor is on main worktree
@@ -41,7 +41,7 @@ When merge request fails validation, TUI SHALL display clear warning message ind
 
 `request_merge_worktree_branch()` SHALL set appropriate warning message for each failure condition.
 
-#### Scenario: view_mode条件の失敗メッセージ
+#### Scenario: Failure message for view_mode condition
 
 - **GIVEN** M key is pressed
 - **AND** view_mode is not Worktrees
@@ -49,7 +49,7 @@ When merge request fails validation, TUI SHALL display clear warning message ind
 - **THEN** warning message SHALL be set to "Switch to Worktrees view to merge"
 - **AND** merge request SHALL return None
 
-#### Scenario: worktrees空の失敗メッセージ
+#### Scenario: Failure message for empty worktrees
 
 - **GIVEN** M key is pressed in Worktrees view
 - **AND** worktrees list is empty
@@ -57,7 +57,7 @@ When merge request fails validation, TUI SHALL display clear warning message ind
 - **THEN** warning message SHALL be set to "No worktrees loaded"
 - **AND** merge request SHALL return None
 
-#### Scenario: カーソル範囲外の失敗メッセージ
+#### Scenario: Failure message for cursor out of range
 
 - **GIVEN** M key is pressed in Worktrees view
 - **AND** cursor index is out of bounds
@@ -65,7 +65,7 @@ When merge request fails validation, TUI SHALL display clear warning message ind
 - **THEN** warning message SHALL contain cursor position and list length
 - **AND** merge request SHALL return None
 
-#### Scenario: 差分なしの失敗メッセージ
+#### Scenario: Failure message for no commits ahead
 
 - **GIVEN** M key is pressed in Worktrees view
 - **AND** selected worktree has no commits ahead of base
@@ -79,19 +79,19 @@ TUI SHALL detect whether worktree branch has commits ahead of base branch during
 
 Detection SHALL run in parallel with conflict checking for performance.
 
-#### Scenario: baseより先のコミットを検出
+#### Scenario: Detect commits ahead of base
 
 - **GIVEN** a worktree with branch that has 2 commits ahead of base
 - **WHEN** worktree list is loaded with ahead detection
 - **THEN** WorktreeInfo.has_commits_ahead SHALL be true
 
-#### Scenario: 差分なしを検出
+#### Scenario: Detect no commits ahead
 
 - **GIVEN** a worktree with branch at same commit as base
 - **WHEN** worktree list is loaded with ahead detection
 - **THEN** WorktreeInfo.has_commits_ahead SHALL be false
 
-#### Scenario: 並列実行での差分チェック
+#### Scenario: Parallel execution of commits ahead check
 
 - **GIVEN** multiple worktrees exist
 - **WHEN** worktree list is loaded
@@ -105,14 +105,14 @@ Worktree branch merge SHALL be executed on base repository (main worktree), NOT 
 
 Working directory clean check SHALL be performed on base repository.
 
-#### Scenario: base側でマージを実行
+#### Scenario: Execute merge on base side
 
 - **GIVEN** user presses M key on a mergeable worktree
 - **WHEN** merge command is executed
 - **THEN** `git merge` SHALL run in repo_root (base repository) directory
 - **AND** `git merge` SHALL NOT run in worktree directory
 
-#### Scenario: base側のworking directory cleanチェック
+#### Scenario: Working directory clean check on base side
 
 - **GIVEN** base repository has uncommitted changes
 - **AND** worktree has uncommitted changes
@@ -120,7 +120,7 @@ Working directory clean check SHALL be performed on base repository.
 - **THEN** merge SHALL fail with "Working directory is not clean" error
 - **AND** error message SHALL refer to base repository state
 
-#### Scenario: worktree側のdirty状態はマージをブロックしない
+#### Scenario: Worktree dirty state does not block merge
 
 - **GIVEN** base repository is clean (no uncommitted changes)
 - **AND** worktree has uncommitted changes
@@ -134,7 +134,7 @@ TUI SHALL log debug information for merge operations to enable troubleshooting.
 
 Merge operation SHOULD NOT crash TUI silently; errors SHALL be displayed to user.
 
-#### Scenario: Mキー押下時のデバッグログ出力
+#### Scenario: Debug log output when M key is pressed
 
 - **GIVEN** RUST_LOG=debug is set
 - **AND** user is in Worktrees view
@@ -144,7 +144,7 @@ Merge operation SHOULD NOT crash TUI silently; errors SHALL be displayed to user
 - **AND** debug log SHALL include worktree_cursor_index value
 - **AND** debug log SHALL include result of request_merge_worktree_branch()
 
-#### Scenario: マージコマンド実行時のデバッグログ
+#### Scenario: Debug log during merge command execution
 
 - **GIVEN** RUST_LOG=debug is set
 - **AND** merge command is being processed
@@ -153,7 +153,7 @@ Merge operation SHOULD NOT crash TUI silently; errors SHALL be displayed to user
 - **AND** debug log SHALL include branch_name
 - **AND** debug log SHALL include merge execution directory (repo_root)
 
-#### Scenario: エラー時のTUI安定性
+#### Scenario: TUI stability on error
 
 - **GIVEN** merge operation encounters an error
 - **WHEN** error occurs during merge processing
