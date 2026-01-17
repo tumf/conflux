@@ -326,6 +326,7 @@ async fn run_tui_loop(
                                     &change.id
                                 ).await {
                                     Ok(Some(wt_path)) => {
+                                        // Try active change location first
                                         match crate::task_parser::parse_change_with_worktree_fallback(
                                             &change.id,
                                             Some(&wt_path)
@@ -334,9 +335,22 @@ async fn run_tui_loop(
                                                 change.completed_tasks = progress.completed;
                                                 change.total_tasks = progress.total;
                                             }
-                                            Err(e) => {
-                                                debug!("Failed to read worktree progress for {}: {}", change.id, e);
-                                                // Keep existing progress (from base tree)
+                                            Err(_) => {
+                                                // If not found in active location, try archived location
+                                                // This handles changes that have been archived but not yet merged
+                                                match crate::task_parser::parse_archived_change_with_worktree_fallback(
+                                                    &change.id,
+                                                    Some(&wt_path)
+                                                ) {
+                                                    Ok(progress) => {
+                                                        change.completed_tasks = progress.completed;
+                                                        change.total_tasks = progress.total;
+                                                    }
+                                                    Err(e) => {
+                                                        debug!("Failed to read worktree progress for {}: {}", change.id, e);
+                                                        // Keep existing progress (from base tree)
+                                                    }
+                                                }
                                             }
                                         }
                                     }
