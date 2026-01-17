@@ -893,34 +893,15 @@ The TUI archive phase SHALL NOT send redundant status transition events for chan
 
 ### Requirement: Apply Context History
 
-The orchestrator MUST capture the agent's final summary message from each apply attempt and include it in subsequent apply prompts for the same change.
+オーケストレーターは、各 apply 試行の最終サマリーメッセージを記録し、同一 change の次回 apply プロンプトに含めなければならない（MUST）。
 
-#### Scenario: First apply attempt has no history
-
-- **WHEN** the orchestrator executes apply for a change for the first time
-- **THEN** the prompt contains only the base apply_prompt from configuration
-- **AND** no `<last_apply>` tags are included
-
-#### Scenario: Second apply includes previous attempt summary
-
-- **WHEN** the orchestrator executes apply for a change for the second time
-- **AND** the first attempt returned a summary message from the agent
-- **THEN** the prompt contains the base apply_prompt
-- **AND** the prompt contains a `<last_apply attempt="1">` block
-- **AND** the block contains the agent's summary message from the first attempt
-
-#### Scenario: Multiple previous attempts are included
-
-- **WHEN** the orchestrator executes apply for a change for the third time
-- **THEN** the prompt contains `<last_apply attempt="1">` and `<last_apply attempt="2">` blocks
-- **AND** blocks are ordered by attempt number (oldest first)
-- **AND** each block contains the agent's summary message from that attempt
-
-#### Scenario: History is cleared on archive
-
-- **WHEN** a change is successfully archived
-- **THEN** the apply history for that change is cleared from memory
-- **AND** subsequent apply attempts for the same change_id (if unarchived) start fresh
+#### Scenario: parallel の2回目 apply に履歴が含まれる
+- **GIVEN** parallel mode で change が apply 実行中である
+- **AND** 1回目の apply がエージェントのサマリーを返している
+- **WHEN** 2回目の apply が実行される
+- **THEN** プロンプトは base apply_prompt を含む
+- **AND** プロンプトは `<last_apply attempt="1">` ブロックを含む
+- **AND** ブロックには 1回目のサマリーが含まれる
 
 ### Requirement: Apply History Context Format
 
