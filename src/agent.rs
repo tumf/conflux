@@ -25,7 +25,6 @@ CRITICAL OPERATIONAL CONSTRAINTS:
 - You MUST continue working until MaxIteration is reached, making your best autonomous decisions
 - You MUST NOT defer tasks to Future Work based on difficulty, complexity, or perceived regression risk
 - The only valid reason to move a task to Future Work is if it is ALREADY marked with '(future work)' explicitly
-- You MUST NOT use --no-verify flag when running git commands (hooks must not be bypassed)
 </system-reminder>
 
 Remove tasks only if they meet one of these criteria:

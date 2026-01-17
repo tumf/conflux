@@ -6,27 +6,12 @@ This specification defines the behavior and constraints for AI agent system prom
 ## Requirements
 ### Requirement: Apply system prompt MUST include task format guidance
 
-The AI agent's apply prompt (`APPLY_SYSTEM_PROMPT`) MUST include guidance on how to fix tasks.md format issues, keep tasks.md updated as work progresses, and explicitly forbid using `--no-verify` when running git commands.
+apply プロンプトは tasks.md のフォーマット修正と進捗更新の指示を含めなければならない（MUST）。加えて、WIP スナップショット作成を妨げないため、apply プロンプトは `--no-verify` を一律禁止してはならない（MUST NOT）。
 
-#### Scenario: AI agent fixes invalid format
-
-**Given:**
-- tasks.md contains invalid format (`## 1. Task`, `- Task`, `1. Task`)
-- Parser detects 0/0 tasks and apply is executed
-
-**When:**
-- AI agent receives the apply prompt
-
-**Then:**
-- Prompt includes tasks.md format requirements:
-  - Checkboxes are mandatory (`- [ ]`, `- [x]`)
-  - Examples of invalid format patterns
-  - How to fix each pattern
-  - Steps to follow when 0/0 is detected
-- Prompt forbids using `--no-verify` in git commands
-- AI agent fixes tasks.md following the guidance
-- After fix, re-parsing detects correct task count
-- After each completed task, the agent updates tasks.md to reflect progress
+#### Scenario: apply プロンプトが `--no-verify` を一律禁止しない
+- **GIVEN** apply プロンプトを生成する
+- **WHEN** 進捗スナップショットの作成を行う
+- **THEN** プロンプトに `--no-verify` の一律禁止が含まれない
 
 ### Requirement: Apply system prompt MUST enforce non-interactive iteration
 
@@ -60,4 +45,3 @@ The apply system prompt MUST explicitly prohibit moving tasks to Future Work bas
 **Then:**
 - Agent does NOT move tasks to Future Work based solely on difficulty
 - Agent treats only tasks already marked with `(future work)` as Future Work
-

@@ -859,10 +859,11 @@ impl WorkspaceManager for GitWorkspaceManager {
         // Stage all changes
         commands::run_git(&["add", "-A"], workspace_path).await?;
 
-        // Create a new WIP commit with --allow-empty to ensure snapshot is created
-        // even if there are no file changes
+        // Create a new WIP commit with --no-verify --allow-empty to ensure snapshot is created
+        // even if there are no file changes. --no-verify bypasses pre-commit hooks to prevent
+        // WIP snapshot failures from blocking progress tracking.
         let result = commands::run_git(
-            &["commit", "--allow-empty", "-m", &wip_message],
+            &["commit", "--no-verify", "--allow-empty", "-m", &wip_message],
             workspace_path,
         )
         .await;
