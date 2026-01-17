@@ -22,11 +22,13 @@ use std::future::Future;
 use std::path::Path;
 
 use tokio::process::Command;
-use tracing::{debug, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 use crate::agent::{AgentRunner, OutputLine};
 use crate::error::{OrchestratorError, Result};
-use crate::task_parser;
+use crate::hooks::{HookContext, HookRunner, HookType};
+use crate::task_parser::{self, TaskProgress};
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::VcsBackend;
 
@@ -452,6 +454,339 @@ pub fn build_archive_error_message(change_id: &str) -> String {
          The archive command may not have executed 'openspec archive' correctly.",
         change_id
     )
+}
+
+/// Event handler for archive loop events.
+///
+/// This trait allows the archive loop to send events to different handlers
+/// (e.g., TUI event channel, CLI logger, parallel event bus).
+pub trait ArchiveEventHandler {
+    /// Called when archive iteration starts
+    fn on_archive_started(&self, change_id: &str);
+    /// Called when hook starts
+    fn on_hook_started(&self, change_id: &str, hook_type: &str);
+    /// Called when hook completes
+    fn on_hook_completed(&self, change_id: &str, hook_type: &str);
+    /// Called when hook fails
+    fn on_hook_failed(&self, change_id: &str, hook_type: &str, error: &str);
+    /// Called when archive output is generated
+    fn on_archive_output(&self, change_id: &str, line: &OutputLine);
+}
+
+/// No-op event handler for cases where events are not needed
+pub struct NoOpArchiveEventHandler;
+
+impl ArchiveEventHandler for NoOpArchiveEventHandler {
+    fn on_archive_started(&self, _change_id: &str) {}
+    fn on_hook_started(&self, _change_id: &str, _hook_type: &str) {}
+    fn on_hook_completed(&self, _change_id: &str, _hook_type: &str) {}
+    fn on_hook_failed(&self, _change_id: &str, _hook_type: &str, _error: &str) {}
+    fn on_archive_output(&self, _change_id: &str, _line: &OutputLine) {}
+}
+
+/// Context for building hook contexts in the archive loop
+pub struct ArchiveLoopHookContext {
+    /// Changes processed so far
+    pub changes_processed: usize,
+    /// Total changes in this run
+    pub total_changes: usize,
+    /// Remaining changes
+    pub remaining_changes: usize,
+    /// Apply count for this change
+    pub apply_count: u32,
+    /// Workspace path for parallel mode (optional)
+    pub workspace_path: Option<String>,
+    /// Group index for parallel mode (optional)
+    pub group_index: Option<usize>,
+}
+
+impl ArchiveLoopHookContext {
+    /// Create a new hook context for serial mode
+    pub fn serial(
+        changes_processed: usize,
+        total_changes: usize,
+        remaining_changes: usize,
+        apply_count: u32,
+    ) -> Self {
+        Self {
+            changes_processed,
+            total_changes,
+            remaining_changes,
+            apply_count,
+            workspace_path: None,
+            group_index: None,
+        }
+    }
+
+    /// Create a new hook context for parallel mode
+    pub fn parallel(
+        changes_processed: usize,
+        total_changes: usize,
+        remaining_changes: usize,
+        apply_count: u32,
+        workspace_path: String,
+        group_index: usize,
+    ) -> Self {
+        Self {
+            changes_processed,
+            total_changes,
+            remaining_changes,
+            apply_count,
+            workspace_path: Some(workspace_path),
+            group_index: Some(group_index),
+        }
+    }
+
+    /// Build a HookContext from this archive loop context
+    fn build_hook_context(&self, change_id: &str, completed: u32, total: u32) -> HookContext {
+        let mut ctx = HookContext::new(
+            self.changes_processed,
+            self.total_changes,
+            self.remaining_changes,
+            false,
+        )
+        .with_change(change_id, completed, total)
+        .with_apply_count(self.apply_count);
+
+        if let Some(ref workspace_path) = self.workspace_path {
+            if let Some(group_index) = self.group_index {
+                ctx = ctx.with_parallel_context(workspace_path, Some(group_index as u32));
+            }
+        }
+
+        ctx
+    }
+}
+
+/// Result of the unified archive loop
+#[derive(Debug)]
+pub struct ArchiveLoopResult {
+    /// Whether the archive succeeded
+    pub succeeded: bool,
+    /// Number of attempts made
+    pub attempts: u32,
+}
+
+/// Execute archive iterations until verification succeeds or max retries reached.
+///
+/// This is the unified archive loop used by both serial and parallel modes.
+///
+/// # Arguments
+///
+/// * `change_id` - The change to archive
+/// * `workspace_path` - Working directory (worktree for parallel, repo root for serial)
+/// * `agent` - Agent runner for executing commands
+/// * `vcs_backend` - VCS backend (Git, Auto, etc.)
+/// * `hooks` - Optional hook runner
+/// * `hook_ctx` - Context for building hook contexts
+/// * `event_handler` - Event handler for sending events
+/// * `cancel_token` - Optional cancellation token
+///
+/// # Returns
+///
+/// * `Ok(ArchiveLoopResult)` - Archive loop completed (success or max attempts)
+/// * `Err(e)` - An error occurred (hook failure, command spawn failure, etc.)
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_archive_loop<E, F, Fut>(
+    change_id: &str,
+    workspace_path: &Path,
+    agent: &mut AgentRunner,
+    vcs_backend: VcsBackend,
+    hooks: Option<&HookRunner>,
+    hook_ctx: &ArchiveLoopHookContext,
+    event_handler: &E,
+    cancel_token: Option<&CancellationToken>,
+    mut output_handler: F,
+) -> Result<ArchiveLoopResult>
+where
+    E: ArchiveEventHandler,
+    F: FnMut(OutputLine) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    // Check cancellation before starting
+    if cancel_token.is_some_and(|token| token.is_cancelled()) {
+        return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+    }
+
+    // Get task progress for hook context
+    let progress = get_task_progress(change_id, Some(workspace_path))?.unwrap_or_default();
+
+    // Run on_change_complete hook
+    if let Some(hook_runner) = hooks {
+        let complete_ctx =
+            hook_ctx.build_hook_context(change_id, progress.completed, progress.total);
+
+        event_handler.on_hook_started(change_id, "on_change_complete");
+
+        match hook_runner
+            .run_hook(HookType::OnChangeComplete, &complete_ctx)
+            .await
+        {
+            Ok(()) => {
+                event_handler.on_hook_completed(change_id, "on_change_complete");
+            }
+            Err(e) => {
+                error!("on_change_complete hook failed for {}: {}", change_id, e);
+                event_handler.on_hook_failed(change_id, "on_change_complete", &e.to_string());
+                return Err(e);
+            }
+        }
+    }
+
+    // Run pre_archive hook
+    if let Some(hook_runner) = hooks {
+        let pre_archive_ctx =
+            hook_ctx.build_hook_context(change_id, progress.completed, progress.total);
+
+        event_handler.on_hook_started(change_id, "pre_archive");
+
+        match hook_runner
+            .run_hook(HookType::PreArchive, &pre_archive_ctx)
+            .await
+        {
+            Ok(()) => {
+                event_handler.on_hook_completed(change_id, "pre_archive");
+            }
+            Err(e) => {
+                error!("pre_archive hook failed for {}: {}", change_id, e);
+                event_handler.on_hook_failed(change_id, "pre_archive", &e.to_string());
+                return Err(e);
+            }
+        }
+    }
+
+    // Send ArchiveStarted event
+    event_handler.on_archive_started(change_id);
+
+    let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
+    let mut attempt: u32 = 0;
+
+    let archive_succeeded = loop {
+        attempt += 1;
+
+        // Check cancellation
+        if cancel_token.is_some_and(|token| token.is_cancelled()) {
+            return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+        }
+
+        info!(
+            "Executing archive attempt #{} for {} (max: {})",
+            attempt, change_id, max_attempts
+        );
+
+        // Execute archive command with history context
+        let (mut child, mut rx, start_time) = agent.run_archive_streaming(change_id).await?;
+
+        // Stream output
+        while let Some(line) = rx.recv().await {
+            event_handler.on_archive_output(change_id, &line);
+            output_handler(line).await;
+        }
+
+        // Wait for child process
+        let status = child.wait().await.map_err(|e| {
+            OrchestratorError::AgentCommand(format!("Failed to wait for archive command: {}", e))
+        })?;
+
+        // Verify archive completion
+        let verification = verify_archive_completion(change_id, Some(workspace_path));
+
+        // Record archive attempt for history
+        let verification_msg = if verification.is_success() {
+            None
+        } else {
+            Some(build_archive_error_message(change_id))
+        };
+        agent.record_archive_attempt(change_id, &status, start_time, verification_msg.clone());
+
+        if !status.success() {
+            let error_msg = format!("Archive command failed with exit code: {:?}", status.code());
+
+            // Run on_error hook
+            if let Some(hook_runner) = hooks {
+                let error_ctx = hook_ctx
+                    .build_hook_context(change_id, progress.completed, progress.total)
+                    .with_error(&error_msg);
+                let _ = hook_runner.run_hook(HookType::OnError, &error_ctx).await;
+            }
+
+            return Err(OrchestratorError::AgentCommand(error_msg));
+        }
+
+        // Check verification
+        if verification.is_success() {
+            info!("Archive verification passed for {}", change_id);
+            break true;
+        }
+
+        // Verification failed
+        warn!(
+            "Archive verification failed for {} (attempt {}/{})",
+            change_id, attempt, max_attempts
+        );
+
+        if attempt >= max_attempts {
+            let error_msg = build_archive_error_message(change_id);
+
+            // Run on_error hook
+            if let Some(hook_runner) = hooks {
+                let error_ctx = hook_ctx
+                    .build_hook_context(change_id, progress.completed, progress.total)
+                    .with_error(&error_msg);
+                let _ = hook_runner.run_hook(HookType::OnError, &error_ctx).await;
+            }
+
+            return Err(OrchestratorError::AgentCommand(error_msg));
+        }
+    };
+
+    // Ensure archive commit is clean (Git-only)
+    if archive_succeeded && matches!(vcs_backend, VcsBackend::Git | VcsBackend::Auto) {
+        info!("Ensuring clean archive commit for {}", change_id);
+        ensure_archive_commit(
+            change_id,
+            workspace_path,
+            agent,
+            vcs_backend,
+            output_handler,
+        )
+        .await?;
+    }
+
+    // Clear history on successful archive
+    if archive_succeeded {
+        agent.clear_apply_history(change_id);
+        agent.clear_archive_history(change_id);
+    }
+
+    // Run post_archive hook
+    if archive_succeeded {
+        if let Some(hook_runner) = hooks {
+            let post_archive_ctx =
+                hook_ctx.build_hook_context(change_id, progress.completed, progress.total);
+
+            event_handler.on_hook_started(change_id, "post_archive");
+
+            match hook_runner
+                .run_hook(HookType::PostArchive, &post_archive_ctx)
+                .await
+            {
+                Ok(()) => {
+                    event_handler.on_hook_completed(change_id, "post_archive");
+                }
+                Err(e) => {
+                    error!("post_archive hook failed for {}: {}", change_id, e);
+                    event_handler.on_hook_failed(change_id, "post_archive", &e.to_string());
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    Ok(ArchiveLoopResult {
+        succeeded: archive_succeeded,
+        attempts: attempt,
+    })
 }
 
 #[cfg(test)]
