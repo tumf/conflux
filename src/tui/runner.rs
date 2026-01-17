@@ -617,6 +617,27 @@ async fn run_tui_loop(
                             }
                         }
                         (KeyCode::F(5), _) => {
+                            // Handle F5 in Stopping mode to cancel graceful stop
+                            if app.mode == AppMode::Stopping {
+                                // Check if orchestrator is still running
+                                if orchestrator_handle
+                                    .as_ref()
+                                    .is_some_and(|h| !h.is_finished())
+                                {
+                                    // Cancel graceful stop and return to Running mode
+                                    graceful_stop_flag.store(false, Ordering::SeqCst);
+                                    app.stop_mode = StopMode::None;
+                                    app.mode = AppMode::Running;
+                                    app.add_log(LogEntry::info("Stop canceled, continuing..."));
+                                } else {
+                                    // Already stopped, cannot cancel
+                                    app.add_log(LogEntry::warn(
+                                        "Cannot cancel stop: processing already completed",
+                                    ));
+                                }
+                                continue;
+                            }
+
                             // Determine which command to use based on mode
                             let cmd = if app.mode == AppMode::Error {
                                 app.retry_error_changes()
@@ -949,6 +970,14 @@ async fn run_tui_loop(
 
         // Handle orchestrator events
         while let Ok(event) = rx.try_recv() {
+            // Update web state when changes are refreshed (web-monitoring feature only)
+            #[cfg(feature = "web-monitoring")]
+            if let OrchestratorEvent::ChangesRefreshed { ref changes, .. } = event {
+                if let Some(ref web_state) = web_state {
+                    web_state.update(changes).await;
+                }
+            }
+
             app.handle_orchestrator_event(event);
         }
 
