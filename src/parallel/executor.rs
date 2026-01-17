@@ -499,7 +499,7 @@ pub async fn execute_apply_in_workspace(
                         .send(ParallelEvent::ApplyOutput {
                             change_id: change_id_clone.clone(),
                             output: output_text,
-                            iteration: None,
+                            iteration: Some(iteration),
                         })
                         .await;
                 }
