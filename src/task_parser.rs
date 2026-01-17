@@ -150,6 +150,26 @@ pub fn parse_change_with_worktree_fallback(
     parse_change(change_id)
 }
 
+/// Parse task progress from the archive directory.
+///
+/// Looks for tasks.md at `openspec/changes/archive/{change_id}/tasks.md`.
+/// This is used to retrieve final progress for archived changes when
+/// the change is no longer in the active changes directory.
+pub fn parse_archived_change(change_id: &str) -> Result<TaskProgress> {
+    let tasks_path = Path::new("openspec/changes/archive")
+        .join(change_id)
+        .join("tasks.md");
+
+    if !tasks_path.exists() {
+        return Err(OrchestratorError::ConfigLoad(format!(
+            "Archived tasks file not found: {:?}",
+            tasks_path
+        )));
+    }
+
+    parse_file(&tasks_path, Some(change_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::openspec::Change;
+use crate::task_parser;
 
 use super::super::events::{LogEntry, OrchestratorEvent};
 use super::super::types::{AppMode, QueueStatus, StopMode};
@@ -63,6 +64,11 @@ impl AppState {
             OrchestratorEvent::ProcessingCompleted(id) => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
                     change.queue_status = QueueStatus::Completed;
+                    // Reload final progress from tasks.md to preserve it
+                    if let Ok(progress) = task_parser::parse_change(&id) {
+                        change.completed_tasks = progress.completed;
+                        change.total_tasks = progress.total;
+                    }
                 }
                 self.add_log(LogEntry::success(format!("Completed: {}", id)));
             }
@@ -96,6 +102,11 @@ impl AppState {
                         change.started_at = Some(Instant::now());
                     }
                     change.queue_status = QueueStatus::Archiving;
+                    // Reload final progress from tasks.md to preserve it before archiving
+                    if let Ok(progress) = task_parser::parse_change(&id) {
+                        change.completed_tasks = progress.completed;
+                        change.total_tasks = progress.total;
+                    }
                 }
                 self.add_log(LogEntry::info(format!("Archiving: {}", id)));
             }
@@ -396,6 +407,23 @@ impl AppState {
                             existing.completed_tasks = fetched.completed_tasks;
                             existing.total_tasks = fetched.total_tasks;
                         }
+                    }
+                } else {
+                    // fetched.total_tasks == 0: For Archived/Merged changes with 0/0,
+                    // try to補完 progress from archive directory
+                    match existing.queue_status {
+                        QueueStatus::Archived | QueueStatus::Merged => {
+                            if existing.completed_tasks == 0 && existing.total_tasks == 0 {
+                                // Try to read from archive
+                                if let Ok(progress) =
+                                    task_parser::parse_archived_change(&fetched.id)
+                                {
+                                    existing.completed_tasks = progress.completed;
+                                    existing.total_tasks = progress.total;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1262,5 +1290,119 @@ mod tests {
             app.logs[initial_log_count + 1].message,
             "Claude output line 2"
         );
+    }
+
+    // === Tests for update-tui-task-progress-retention ===
+
+    /// Test that ProcessingCompleted reloads and preserves final progress
+    #[test]
+    fn test_processing_completed_preserves_progress() {
+        let changes = vec![create_approved_change("change-a", 3, 5)];
+        let mut app = AppState::new(changes);
+
+        // Simulate processing with progress updates
+        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[0].completed_tasks = 3;
+        app.changes[0].total_tasks = 5;
+
+        // Handle ProcessingCompleted event
+        app.handle_orchestrator_event(OrchestratorEvent::ProcessingCompleted(
+            "change-a".to_string(),
+        ));
+
+        // Status should be Completed
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Completed);
+
+        // Progress should be preserved (or reloaded from tasks.md if file exists)
+        // Since we're in a test environment without actual files, we expect the existing progress to be kept
+        assert!(app.changes[0].completed_tasks > 0 || app.changes[0].total_tasks > 0);
+    }
+
+    /// Test that ArchiveStarted reloads and preserves final progress
+    #[test]
+    fn test_archive_started_preserves_progress() {
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set initial progress
+        app.changes[0].completed_tasks = 5;
+        app.changes[0].total_tasks = 5;
+
+        // Handle ArchiveStarted event
+        app.handle_orchestrator_event(OrchestratorEvent::ArchiveStarted("change-a".to_string()));
+
+        // Status should be Archiving
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archiving);
+
+        // Progress should be preserved
+        assert!(app.changes[0].completed_tasks > 0 || app.changes[0].total_tasks > 0);
+    }
+
+    /// Test that Archived change is retained when removed from filesystem
+    /// This is the production scenario where archived changes are moved to archive directory
+    #[test]
+    fn test_archived_status_retained_when_removed_from_fetched() {
+        let changes = vec![create_approved_change("change-a", 7, 10)];
+        let mut app = AppState::new(changes);
+
+        // Set up archived change with progress
+        app.changes[0].queue_status = QueueStatus::Archived;
+        app.changes[0].completed_tasks = 7;
+        app.changes[0].total_tasks = 10;
+
+        // Simulate refresh where archived change no longer exists in filesystem
+        // (it has been moved to archive directory)
+        let fetched: Vec<Change> = vec![];
+        app.update_changes(fetched);
+
+        // Archived change should still be in the list with preserved progress
+        assert_eq!(app.changes.len(), 1);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archived);
+        assert_eq!(app.changes[0].completed_tasks, 7);
+        assert_eq!(app.changes[0].total_tasks, 10);
+    }
+
+    /// Test that Merged change is retained when removed from filesystem
+    #[test]
+    fn test_merged_status_retained_when_removed_from_fetched() {
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set up merged change with progress
+        app.changes[0].queue_status = QueueStatus::Merged;
+        app.changes[0].completed_tasks = 5;
+        app.changes[0].total_tasks = 5;
+
+        // Simulate refresh where merged change no longer exists in active changes
+        let fetched: Vec<Change> = vec![];
+        app.update_changes(fetched);
+
+        // Merged change should still be in the list with preserved progress
+        assert_eq!(app.changes.len(), 1);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Merged);
+        assert_eq!(app.changes[0].completed_tasks, 5);
+        assert_eq!(app.changes[0].total_tasks, 5);
+    }
+
+    /// Test that Archiving status preserves progress when fetched data is 0/0
+    /// This scenario occurs when tasks.md is moved during archiving
+    #[test]
+    fn test_archiving_status_preserves_progress_on_zero_zero_update() {
+        let changes = vec![create_approved_change("change-a", 7, 10)];
+        let mut app = AppState::new(changes);
+
+        // Set up archiving change with progress
+        app.changes[0].queue_status = QueueStatus::Archiving;
+        app.changes[0].completed_tasks = 7;
+        app.changes[0].total_tasks = 10;
+
+        // Simulate refresh with 0/0 (tasks.md is being moved during archive)
+        let fetched = vec![create_approved_change("change-a", 0, 0)];
+        app.update_changes(fetched);
+
+        // Progress should be preserved (Archiving status blocks updates)
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archiving);
+        assert_eq!(app.changes[0].completed_tasks, 7);
+        assert_eq!(app.changes[0].total_tasks, 10);
     }
 }
