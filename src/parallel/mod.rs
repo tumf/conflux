@@ -3410,8 +3410,10 @@ mod tests {
             .unwrap();
 
         // Create executor
-        let mut config = OrchestratorConfig::default();
-        config.workspace_base_dir = Some(workspace_base.path().to_string_lossy().to_string());
+        let config = OrchestratorConfig {
+            workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
         let (tx, _rx) = mpsc::channel(10);
         let executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
 

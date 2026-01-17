@@ -166,7 +166,7 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
 
     // Build header spans
     let mut header_spans = vec![
-        Span::styled("OpenSpec Orchestrator", Style::default().fg(Color::White)),
+        Span::styled("Conflux", Style::default().fg(Color::White)),
         Span::raw("  "),
         Span::styled(
             format!("[{}]", mode_text),
@@ -1386,7 +1386,7 @@ mod tests {
         let mut app = create_test_app(vec![create_test_change("change-a", true)]);
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
-        assert!(content.contains("OpenSpec Orchestrator"));
+        assert!(content.contains("Conflux"));
         assert!(content.contains("Press F5 to start processing"));
     }
 
