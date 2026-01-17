@@ -175,7 +175,6 @@ impl AgentRunner {
     pub async fn run_apply_streaming(
         &self,
         change_id: &str,
-        cwd: Option<&Path>,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
         let start = Instant::now();
         let template = self.config.get_apply_command();
@@ -191,13 +190,7 @@ impl AgentRunner {
             module = module_path!(),
             "Running apply command: {}", command
         );
-        let (child, rx) = match cwd {
-            Some(dir) => {
-                self.execute_shell_command_streaming_in_dir(&command, dir)
-                    .await?
-            }
-            None => self.execute_shell_command_streaming(&command).await?,
-        };
+        let (child, rx) = self.execute_shell_command_streaming(&command).await?;
         Ok((child, rx, start))
     }
 
@@ -230,7 +223,6 @@ impl AgentRunner {
     pub async fn run_archive_streaming(
         &self,
         change_id: &str,
-        cwd: Option<&Path>,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
         let start = Instant::now();
         let template = self.config.get_archive_command();
@@ -246,13 +238,7 @@ impl AgentRunner {
             module = module_path!(),
             "Running archive command: {}", command
         );
-        let (child, rx) = match cwd {
-            Some(dir) => {
-                self.execute_shell_command_streaming_in_dir(&command, dir)
-                    .await?
-            }
-            None => self.execute_shell_command_streaming(&command).await?,
-        };
+        let (child, rx) = self.execute_shell_command_streaming(&command).await?;
         Ok((child, rx, start))
     }
 
@@ -1186,7 +1172,7 @@ mod tests {
             ..Default::default()
         };
         let runner = AgentRunner::new(config);
-        let (mut child, mut rx, _start) = runner.run_apply_streaming("test-change", None).await.unwrap();
+        let (mut child, mut rx, _start) = runner.run_apply_streaming("test-change").await.unwrap();
 
         let mut lines = Vec::new();
         while let Some(line) = rx.recv().await {
@@ -1260,7 +1246,7 @@ mod tests {
             ..Default::default()
         };
         let runner = AgentRunner::new(config);
-        let (mut child, mut rx, _start) = runner.run_apply_streaming("my-change", None).await.unwrap();
+        let (mut child, mut rx, _start) = runner.run_apply_streaming("my-change").await.unwrap();
 
         let mut lines = Vec::new();
         while let Some(line) = rx.recv().await {

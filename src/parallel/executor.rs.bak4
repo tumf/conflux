@@ -315,6 +315,7 @@ fn build_parallel_hook_context(
 pub async fn execute_apply_in_workspace(
     change_id: &str,
     workspace_path: &Path,
+    _repo_root: &Path, // No longer used - workspace_path is the working directory
     apply_cmd_template: &str,
     config: &OrchestratorConfig,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
@@ -753,6 +754,7 @@ pub async fn execute_apply_in_workspace(
 pub async fn execute_archive_in_workspace(
     change_id: &str,
     workspace_path: &Path,
+    _repo_root: &Path, // No longer used - workspace_path is the working directory
     archive_cmd_template: &str,
     config: &OrchestratorConfig,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,

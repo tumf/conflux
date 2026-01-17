@@ -189,7 +189,8 @@ where
     output.on_info(&format!("Applying: {}", change.id));
 
     // Execute apply command with streaming
-    let (mut child, mut output_rx, start_time) = agent.run_apply_streaming(&change.id).await?;
+    let (mut child, mut output_rx, start_time) =
+        agent.run_apply_streaming(&change.id, None).await?;
 
     // Stream output
     loop {
