@@ -616,6 +616,27 @@ async fn run_tui_loop(
                             }
                         }
                         (KeyCode::F(5), _) => {
+                            // Handle F5 in Stopping mode to cancel graceful stop
+                            if app.mode == AppMode::Stopping {
+                                // Check if orchestrator is still running
+                                if orchestrator_handle
+                                    .as_ref()
+                                    .is_some_and(|h| !h.is_finished())
+                                {
+                                    // Cancel graceful stop and return to Running mode
+                                    graceful_stop_flag.store(false, Ordering::SeqCst);
+                                    app.stop_mode = StopMode::None;
+                                    app.mode = AppMode::Running;
+                                    app.add_log(LogEntry::info("Stop canceled, continuing..."));
+                                } else {
+                                    // Already stopped, cannot cancel
+                                    app.add_log(LogEntry::warn(
+                                        "Cannot cancel stop: processing already completed",
+                                    ));
+                                }
+                                continue;
+                            }
+
                             // Determine which command to use based on mode
                             let cmd = if app.mode == AppMode::Error {
                                 app.retry_error_changes()
