@@ -278,18 +278,32 @@ impl AppState {
                         .with_iteration(iteration.unwrap_or(1)),
                 );
             }
-            OrchestratorEvent::ArchiveOutput { change_id, output } => {
-                self.add_log(
-                    LogEntry::info(output)
-                        .with_change_id(change_id)
-                        .with_operation("archive"),
-                );
+            OrchestratorEvent::ArchiveOutput {
+                change_id,
+                output,
+                iteration,
+            } => {
+                let mut entry = LogEntry::info(output)
+                    .with_change_id(change_id)
+                    .with_operation("archive");
+                if let Some(iter) = iteration {
+                    entry = entry.with_iteration(iter);
+                }
+                self.add_log(entry);
             }
-            OrchestratorEvent::AnalysisOutput { output } => {
-                self.add_log(LogEntry::info(format!("[Analysis] {}", output)));
+            OrchestratorEvent::AnalysisOutput { output, iteration } => {
+                let mut entry = LogEntry::info(output).with_operation("analysis");
+                if let Some(iter) = iteration {
+                    entry = entry.with_iteration(iter);
+                }
+                self.add_log(entry);
             }
-            OrchestratorEvent::ResolveOutput { output } => {
-                self.add_log(LogEntry::info(format!("[Resolve] {}", output)));
+            OrchestratorEvent::ResolveOutput { output, iteration } => {
+                let mut entry = LogEntry::info(output).with_operation("resolve");
+                if let Some(iter) = iteration {
+                    entry = entry.with_iteration(iter);
+                }
+                self.add_log(entry);
             }
             // Branch merge events (TUI worktree view)
             OrchestratorEvent::BranchMergeStarted { branch_name } => {
@@ -1172,6 +1186,7 @@ mod tests {
         app.handle_orchestrator_event(OrchestratorEvent::ArchiveOutput {
             change_id: "change-b".to_string(),
             output: "Archive output line".to_string(),
+            iteration: Some(2),
         });
 
         // Log should be added
@@ -1179,7 +1194,7 @@ mod tests {
         let log = app.logs.last().unwrap();
         assert_eq!(log.change_id, Some("change-b".to_string()));
         assert_eq!(log.operation, Some("archive".to_string()));
-        assert_eq!(log.iteration, None);
+        assert_eq!(log.iteration, Some(2));
         assert_eq!(log.message, "Archive output line");
     }
 
@@ -1193,17 +1208,15 @@ mod tests {
         // Send AnalysisOutput event
         app.handle_orchestrator_event(OrchestratorEvent::AnalysisOutput {
             output: "Analyzing dependencies...".to_string(),
+            iteration: Some(1),
         });
 
         // Log should be added
         assert_eq!(app.logs.len(), initial_log_count + 1);
-        assert!(app.logs.last().unwrap().message.contains("Analysis"));
-        assert!(app
-            .logs
-            .last()
-            .unwrap()
-            .message
-            .contains("Analyzing dependencies"));
+        let log = app.logs.last().unwrap();
+        assert_eq!(log.operation, Some("analysis".to_string()));
+        assert_eq!(log.iteration, Some(1));
+        assert!(log.message.contains("Analyzing dependencies"));
     }
 
     /// Test that ResolveOutput events are logged correctly
@@ -1216,17 +1229,15 @@ mod tests {
         // Send ResolveOutput event
         app.handle_orchestrator_event(OrchestratorEvent::ResolveOutput {
             output: "Resolving conflicts...".to_string(),
+            iteration: Some(1),
         });
 
         // Log should be added
         assert_eq!(app.logs.len(), initial_log_count + 1);
-        assert!(app.logs.last().unwrap().message.contains("Resolve"));
-        assert!(app
-            .logs
-            .last()
-            .unwrap()
-            .message
-            .contains("Resolving conflicts"));
+        let log = app.logs.last().unwrap();
+        assert_eq!(log.operation, Some("resolve".to_string()));
+        assert_eq!(log.iteration, Some(1));
+        assert!(log.message.contains("Resolving conflicts"));
     }
 
     /// Test that Log events with stdout/stderr content are processed correctly

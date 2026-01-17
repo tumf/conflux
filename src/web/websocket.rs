@@ -24,6 +24,9 @@ pub async fn ws_handler(
 async fn handle_socket(mut socket: WebSocket, state: Arc<WebState>) {
     info!("WebSocket client connected");
 
+    // Refresh state from disk to ensure latest data
+    let _ = state.refresh_from_disk().await;
+
     // Send initial state to the client
     let initial_state = state.get_state().await;
     let initial_msg = serde_json::json!({

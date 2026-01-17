@@ -58,6 +58,7 @@ The HTTP server SHALL provide a health check endpoint for monitoring service ava
 The HTTP server SHALL expose complete orchestrator state via REST API.
 The HTTP server SHALL prevent stale responses for `/api/state` by disabling HTTP caching.
 The server SHALL return the latest change state even when updates originate from the TUI auto-refresh loop.
+The server SHALL refresh the state from disk/worktree sources before responding to REST API state requests.
 
 #### Scenario: Get full state
 - **WHEN** client sends `GET /api/state`
@@ -75,6 +76,12 @@ The server SHALL return the latest change state even when updates originate from
 - **WHEN** user reloads the dashboard page
 - **THEN** the dashboard renders the latest orchestrator state
 - **AND** `/api/state` には TUI の更新結果が反映されている
+
+#### Scenario: REST API refreshes state from disk
+- **GIVEN** タスク進捗が作業ツリーの tasks.md に反映されている
+- **WHEN** client sends `GET /api/state`
+- **THEN** server refreshes the state from disk/worktree sources before responding
+- **AND** response reflects the latest progress
 
 ### Requirement: REST API - Changes List
 The HTTP server SHALL provide a summary list of all changes.
