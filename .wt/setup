@@ -22,8 +22,10 @@ if [ -n "$hooks_dir" ]; then
 #!/usr/bin/env bash
 set -euo pipefail
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
 if command -v pre-commit >/dev/null 2>&1; then
-  exec pre-commit hook-impl --config=.pre-commit-config.yaml --hook-type=pre-commit -- "$@"
+  exec pre-commit hook-impl --config=.pre-commit-config.yaml --hook-type=pre-commit --hook-dir "$HERE" -- "$@"
 else
   echo 'pre-commit not found; skipping hook' 1>&2
   exit 1
