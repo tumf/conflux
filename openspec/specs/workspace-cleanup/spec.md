@@ -5,62 +5,84 @@ Defines workspace cleanup behavior after parallel execution.
 ## Requirements
 ### Requirement: Workspace Cleanup Guard
 
-The system SHALL provide a `WorkspaceCleanupGuard` that ensures workspaces are cleaned up on partial failures using the RAII pattern.
+`WorkspaceCleanupGuard`は、失敗したワークスペースを正しく保護し、正しい順序でクリーンアップを実行しなければならない（MUST）。
 
-The guard SHALL track created workspaces and automatically clean them up when dropped, unless explicitly committed.
+ガードは以下を実装する：
+1. ワークスペース名とパスの両方を追跡する
+2. `preserve()`で指定されたワークスペースはDrop時にクリーンアップしない
+3. Drop時のクリーンアップでは、ワークツリー削除を先に実行し、その後ブランチを削除する
 
-#### Scenario: Normal completion with commit
+#### Scenario: 失敗したワークスペースの保護
 
-- **GIVEN** workspaces are created and tracked by the guard
-- **WHEN** all operations complete successfully
-- **AND** `guard.commit()` is called
-- **THEN** the guard SHALL NOT clean up the workspaces on drop
+- **GIVEN** ワークスペースAが作成され、トラッキングされている
+- **AND** ワークスペースAの処理が失敗した
+- **WHEN** `cleanup_guard.preserve("workspace-a")`が呼ばれる
+- **AND** ガードがDrop時にクリーンアップを試みる
+- **THEN** ワークスペースAはクリーンアップされない
+- **AND** 他の保護されていないワークスペースはクリーンアップされる
 
-#### Scenario: Early failure without commit
+#### Scenario: ワークツリー削除後のブランチ削除
 
-- **GIVEN** workspace A is created and tracked
-- **AND** workspace B creation fails
-- **WHEN** the guard is dropped (due to error propagation)
-- **THEN** workspace A SHALL be cleaned up automatically
+- **GIVEN** ワークスペースがトラッキングされている（名前とパスの両方）
+- **WHEN** ガードがDrop時にクリーンアップを実行する
+- **THEN** 最初に`git worktree remove <path> --force`が実行される
+- **AND** その後`git branch -D <branch_name>`が実行される
+- **AND** Gitエラー（ブランチが使用中）が発生しない
 
-#### Scenario: Panic during execution
+#### Scenario: ワークスペースのトラッキング時にパスも保持
 
-- **GIVEN** workspaces are created and tracked by the guard
-- **WHEN** a panic occurs during execution
-- **THEN** the guard SHALL clean up all tracked workspaces during unwinding
+- **GIVEN** 新しいワークスペースが作成された（名前: "ws-test", パス: "/tmp/ws-test"）
+- **WHEN** `cleanup_guard.track("ws-test", PathBuf::from("/tmp/ws-test"))`が呼ばれる
+- **THEN** ガードはワークスペース名とパスの両方を保持する
+- **AND** Drop時にパスを使用してワークツリーを削除できる
 
 ### Requirement: Guard Integration with Parallel Executor
 
-The `ParallelExecutor::execute_group()` method SHALL use `WorkspaceCleanupGuard` to ensure resource cleanup on any failure path.
+`ParallelExecutor::execute_group()`メソッドは、失敗したワークスペースに対して`cleanup_guard.preserve()`を呼び出さなければならない（MUST）。
 
-#### Scenario: Workspace creation failure cleanup
+#### Scenario: 失敗したワークスペースの保護呼び出し
 
-- **GIVEN** a group with 5 changes to process
-- **WHEN** workspace creation succeeds for the first 3 changes
-- **AND** workspace creation fails for the 4th change
-- **THEN** the 3 successfully created workspaces SHALL be cleaned up
-- **AND** an appropriate error SHALL be returned
+- **GIVEN** 並列実行で3つの変更を処理中
+- **WHEN** 1つの変更が失敗する（`WorkspaceResult.error.is_some()`）
+- **THEN** 失敗したワークスペースに対して`cleanup_guard.preserve(workspace_name)`が呼ばれる
+- **AND** エラーログに「workspace preserved」が出力される
+- **AND** `WorkspacePreserved`イベントが発行される
 
-#### Scenario: Apply execution failure cleanup
+#### Scenario: 保護されたワークスペースは正常系クリーンアップでスキップ
 
-- **GIVEN** a group with 3 changes and 3 successfully created workspaces
-- **WHEN** apply execution fails for one workspace
-- **THEN** all 3 workspaces SHALL remain (for debugging/retry)
-- **AND** the guard SHALL be committed after the apply phase
-- **Note:** Cleanup happens after the full group completes, not on individual apply failures
+- **GIVEN** 失敗したワークスペースAが`preserve()`で保護されている
+- **AND** 成功したワークスペースBが存在する
+- **WHEN** 正常系のクリーンアップループが実行される
+- **THEN** ワークスペースAはスキップされる（`failed_workspace_names`に含まれるため）
+- **AND** ワークスペースBは正常にクリーンアップされる
+- **AND** `cleanup_guard.commit()`が呼ばれる
+
+#### Scenario: 早期リターン時の保護されたワークスペースのスキップ
+
+- **GIVEN** 失敗したワークスペースAが`preserve()`で保護されている
+- **AND** ワークスペースBはトラッキングされているが保護されていない
+- **WHEN** 関数が早期リターンし、`cleanup_guard`がDropされる
+- **THEN** ワークスペースAはクリーンアップされない
+- **AND** ワークスペースBはクリーンアップされる
 
 ### Requirement: Cleanup Logging
 
-The cleanup guard SHALL log cleanup operations for debugging and monitoring.
+クリーンアップガードは、ワークツリーとブランチの両方の削除ログを出力しなければならない（MUST）。
 
-#### Scenario: Cleanup on failure
+#### Scenario: ワークツリー削除の成功ログ
 
-- **WHEN** the guard performs cleanup on drop (uncommitted)
-- **THEN** a warning log entry SHALL be emitted for each cleaned workspace
-- **AND** the log SHALL include the reason (guard not committed)
+- **WHEN** ガードがワークツリー削除に成功する
+- **THEN** `"Successfully removed worktree '<name>'"`がdebugログに出力される
 
-#### Scenario: Cleanup errors
+#### Scenario: ワークツリー削除の失敗ログ
 
-- **WHEN** workspace cleanup fails (e.g., workspace already deleted)
-- **THEN** the error SHALL be logged but not propagated
-- **AND** cleanup SHALL continue for remaining workspaces
+- **WHEN** ワークツリー削除が失敗する
+- **THEN** `"Failed to remove worktree '<name>': <error>"`がdebugログに出力される
+- **AND** クリーンアップは続行される（次のワークスペースやブランチ削除）
+
+#### Scenario: ブランチ削除の失敗ログ
+
+- **WHEN** ブランチ削除が失敗する
+- **THEN** `"Failed to delete git branch '<name>': <error>"`がdebugログに出力される
+- **AND** エラーは抑制される（パニックしない）
+
