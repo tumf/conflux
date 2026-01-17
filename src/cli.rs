@@ -217,6 +217,12 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::env;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     // Note: These tests need to run sequentially due to environment variable manipulation
     // Run with: cargo test --test-threads=1
@@ -224,6 +230,8 @@ mod tests {
     // OPENSPEC: openspec/specs/configuration/spec.md#environment-variable-configuration-for-openspec-command/どちらも未設定時はデフォルト値を使用
     #[test]
     fn test_default_openspec_cmd() {
+        let _lock = env_lock();
+
         // Save original env value
         let original = env::var("OPENSPEC_CMD").ok();
 
@@ -277,6 +285,8 @@ mod tests {
     // OPENSPEC: openspec/specs/configuration/spec.md#environment-variable-configuration-for-openspec-command/環境変数のみ設定
     #[test]
     fn test_env_var_openspec_cmd() {
+        let _lock = env_lock();
+
         // Save original env value
         let original = env::var("OPENSPEC_CMD").ok();
 
@@ -302,6 +312,8 @@ mod tests {
     // OPENSPEC: openspec/specs/configuration/spec.md#environment-variable-configuration-for-openspec-command/cli-引数が環境変数より優先
     #[test]
     fn test_cli_arg_overrides_env_var() {
+        let _lock = env_lock();
+
         // Save original env value
         let original = env::var("OPENSPEC_CMD").ok();
 
