@@ -53,7 +53,8 @@ pub enum WorkspaceState {
 /// Check if a change has been merged to the base branch.
 ///
 /// This function checks if the archive commit for the given change exists in
-/// the base branch's commit history.
+/// the base branch's commit history AND the change directory has been removed
+/// from openspec/changes/.
 ///
 /// # Arguments
 ///
@@ -63,8 +64,8 @@ pub enum WorkspaceState {
 ///
 /// # Returns
 ///
-/// * `Ok(true)` - Change has been merged to base branch
-/// * `Ok(false)` - Change has not been merged to base branch
+/// * `Ok(true)` - Change has been merged to base branch and change directory removed
+/// * `Ok(false)` - Change has not been merged to base branch or change directory still exists
 /// * `Err` - Failed to check merge status
 pub async fn is_merged_to_base(
     change_id: &str,
@@ -130,17 +131,33 @@ pub async fn is_merged_to_base(
     }
 
     let commits = String::from_utf8_lossy(&log_output.stdout);
-    let found = commits.lines().any(|line| line.trim() == expected_subject);
+    let archive_commit_found = commits.lines().any(|line| line.trim() == expected_subject);
+
+    // Check if the changes directory still exists
+    let change_path = repo_root.join("openspec/changes").join(change_id);
+    let change_dir_exists = change_path.exists();
 
     debug!(
         change_id = %change_id,
         base_branch = %base_branch,
         expected_subject = %expected_subject,
-        found = found,
-        "is_merged_to_base: checking base branch"
+        archive_commit_found = archive_commit_found,
+        change_dir_exists = change_dir_exists,
+        "is_merged_to_base: checking base branch and change directory"
     );
 
-    Ok(found)
+    // Only consider merged if archive commit exists AND change directory is gone
+    if archive_commit_found && change_dir_exists {
+        tracing::warn!(
+            change_id = %change_id,
+            change_path = %change_path.display(),
+            "Archive commit found in base branch but change directory still exists at {}",
+            change_path.display()
+        );
+        return Ok(false);
+    }
+
+    Ok(archive_commit_found && !change_dir_exists)
 }
 
 /// Get the latest WIP snapshot iteration number.
@@ -427,10 +444,35 @@ mod tests {
         commit(repo_root, "Archive: test-change");
 
         // We're on main, so the archive commit is in main
+        // State should be Merged when change directory is gone
         let state = detect_workspace_state("test-change", repo_root, "main")
             .await
             .unwrap();
         assert_eq!(state, WorkspaceState::Merged);
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspace_state_merged_with_remaining_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        init_git_repo(repo_root);
+        commit(repo_root, "Initial commit");
+
+        // Create changes directory before archiving
+        let changes_dir = repo_root.join("openspec/changes/test-change");
+        fs::create_dir_all(&changes_dir).unwrap();
+        fs::write(changes_dir.join("proposal.md"), "# Test Change").unwrap();
+
+        commit(repo_root, "Archive: test-change");
+
+        // Archive commit exists in main, but change directory still exists
+        // Should NOT be considered Merged
+        let state = detect_workspace_state("test-change", repo_root, "main")
+            .await
+            .unwrap();
+
+        // Should be Archived state instead (archive commit exists, but not merged)
+        assert_eq!(state, WorkspaceState::Archived);
     }
 
     #[tokio::test]
