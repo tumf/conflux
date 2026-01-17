@@ -7,23 +7,33 @@ use tracing::debug;
 #[derive(Parser, Debug)]
 #[command(name = "cflx")]
 #[command(version)]
-#[command(about = "Automates OpenSpec change workflow (list → apply → archive)", long_about = None)]
+#[command(about = "Automates OpenSpec change workflow (list → apply → archive)")]
+#[command(long_about = "Conflux - OpenSpec Change Orchestrator
+
+Automates the OpenSpec change workflow:
+  1. Lists pending changes in openspec/changes/
+  2. Applies changes using configured AI agent
+  3. Archives completed changes to openspec/specs/
+
+SUBCOMMANDS:
+  run      Execute orchestration loop (non-interactive)
+  tui      Launch interactive TUI dashboard (default)
+  init     Generate configuration template
+  approve  Manage change approval status
+
+KEY OPTIONS:
+  --parallel            Enable parallel execution using git worktrees
+  --max-concurrent N    Limit concurrent workspaces (default: 3)
+  --dry-run             Preview parallelization groups without execution
+  --vcs BACKEND         VCS backend: auto, git (default: auto)
+  --web                 Enable web monitoring server
+  --web-port PORT       Web server port (default: 0 = auto-assign)
+  --web-bind ADDR       Web server bind address (default: 127.0.0.1)
+
+Use 'cflx <subcommand> --help' for more information on a specific command.")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
-
-    /// Path to opencode binary (used when no subcommand is provided, deprecated - use config file instead)
-    #[arg(long, default_value = "opencode", global = true)]
-    pub opencode_path: String,
-
-    /// OpenSpec command (can include arguments, e.g., "npx @fission-ai/openspec@latest")
-    #[arg(
-        long,
-        env = "OPENSPEC_CMD",
-        default_value = "npx @fission-ai/openspec@latest",
-        global = true
-    )]
-    pub openspec_cmd: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -43,6 +53,27 @@ pub enum Commands {
 
 /// Arguments for the run subcommand
 #[derive(Parser, Debug)]
+#[command(
+    long_about = "Execute the OpenSpec change orchestration loop in non-interactive mode.
+
+This mode processes changes sequentially or in parallel (with --parallel flag),
+applying each change using the configured AI agent and archiving when complete.
+
+PARALLEL EXECUTION:
+  --parallel enables concurrent processing using git worktrees. Changes are
+  analyzed for dependencies and executed in optimal parallel groups.
+
+WEB MONITORING:
+  --web enables remote monitoring via HTTP. Access progress from any browser
+  while orchestration runs in background.
+
+EXAMPLES:
+  cflx run                           # Process all approved changes
+  cflx run --change my-feature       # Process specific change
+  cflx run --parallel --max-concurrent 5  # Parallel with 5 workers
+  cflx run --parallel --dry-run      # Preview parallelization plan
+  cflx run --web --web-port 8080     # Enable web monitoring on port 8080"
+)]
 pub struct RunArgs {
     /// Process only the specified changes (comma-separated, e.g., --change a,b,c)
     #[arg(long, value_delimiter = ',')]
@@ -51,14 +82,6 @@ pub struct RunArgs {
     /// Path to custom configuration file (JSONC format)
     #[arg(long, short = 'c')]
     pub config: Option<PathBuf>,
-
-    /// OpenSpec command (can include arguments, e.g., "npx @fission-ai/openspec@latest")
-    #[arg(
-        long,
-        env = "OPENSPEC_CMD",
-        default_value = "npx @fission-ai/openspec@latest"
-    )]
-    pub openspec_cmd: String,
 
     /// Maximum number of iterations for the orchestration loop (overrides config, 0 = no limit)
     #[arg(long)]
@@ -101,22 +124,35 @@ pub struct RunArgs {
 
 /// Arguments for the TUI subcommand
 #[derive(Parser, Debug)]
-pub struct TuiArgs {
-    /// Path to opencode binary (deprecated - use config file instead)
-    #[arg(long, default_value = "opencode")]
-    pub opencode_path: String,
+#[command(long_about = "Launch the interactive Terminal UI dashboard.
 
+The TUI provides real-time visualization of change processing with:
+  • Change selection and queue management
+  • Live progress tracking with task completion percentages
+  • Streaming logs from AI agent execution
+  • Approval management (@key to approve/unapprove)
+  • Git worktree visualization and management
+  • Parallel execution monitoring
+
+KEY BINDINGS:
+  Space     Toggle change selection/queue status
+  F5        Start/resume processing
+  @         Toggle approval status
+  Esc       Stop processing (press twice to force)
+  Tab       Switch between Changes/Worktrees view
+  q         Quit
+
+WEB MONITORING:
+  --web enables simultaneous web-based monitoring alongside the TUI.
+
+EXAMPLES:
+  cflx tui                    # Launch TUI (default when no subcommand)
+  cflx tui --logs debug.log   # TUI with file logging
+  cflx tui --web              # TUI with web monitoring enabled")]
+pub struct TuiArgs {
     /// Path to custom configuration file (JSONC format)
     #[arg(long, short = 'c')]
     pub config: Option<PathBuf>,
-
-    /// OpenSpec command (can include arguments, e.g., "npx @fission-ai/openspec@latest")
-    #[arg(
-        long,
-        env = "OPENSPEC_CMD",
-        default_value = "npx @fission-ai/openspec@latest"
-    )]
-    pub openspec_cmd: String,
 
     /// Write debug logs to the specified file (e.g., --logs debug.log)
     #[arg(long)]
@@ -216,124 +252,6 @@ pub fn check_parallel_available() -> bool {
 mod tests {
     use super::*;
     use clap::Parser;
-    use std::env;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
-
-    // Note: These tests need to run sequentially due to environment variable manipulation
-    // Run with: cargo test --test-threads=1
-
-    // OPENSPEC: openspec/specs/configuration/spec.md#environment-variable-configuration-for-openspec-command/どちらも未設定時はデフォルト値を使用
-    #[test]
-    fn test_default_openspec_cmd() {
-        let _lock = env_lock();
-
-        // Save original env value
-        let original = env::var("OPENSPEC_CMD").ok();
-
-        // Remove environment variable to test default
-        env::remove_var("OPENSPEC_CMD");
-
-        // When neither CLI arg nor env var is set, default value is used
-        let cli = Cli::parse_from(["cflx"]);
-
-        // Restore original env value
-        if let Some(val) = original {
-            env::set_var("OPENSPEC_CMD", val);
-        }
-
-        assert_eq!(cli.openspec_cmd, "npx @fission-ai/openspec@latest");
-    }
-
-    #[test]
-    fn test_cli_arg_openspec_cmd() {
-        // CLI argument should override default
-        let cli = Cli::parse_from(["cflx", "--openspec-cmd", "./my-openspec"]);
-        assert_eq!(cli.openspec_cmd, "./my-openspec");
-    }
-
-    #[test]
-    fn test_run_subcommand_openspec_cmd() {
-        // Run subcommand should also accept --openspec-cmd
-        let cli = Cli::parse_from(["cflx", "run", "--openspec-cmd", "/usr/local/bin/openspec"]);
-
-        match cli.command {
-            Some(Commands::Run(args)) => {
-                assert_eq!(args.openspec_cmd, "/usr/local/bin/openspec");
-            }
-            _ => panic!("Expected Run subcommand"),
-        }
-    }
-
-    #[test]
-    fn test_tui_subcommand_openspec_cmd() {
-        // TUI subcommand should also accept --openspec-cmd
-        let cli = Cli::parse_from(["cflx", "tui", "--openspec-cmd", "/custom/openspec"]);
-
-        match cli.command {
-            Some(Commands::Tui(args)) => {
-                assert_eq!(args.openspec_cmd, "/custom/openspec");
-            }
-            _ => panic!("Expected Tui subcommand"),
-        }
-    }
-
-    // OPENSPEC: openspec/specs/configuration/spec.md#environment-variable-configuration-for-openspec-command/環境変数のみ設定
-    #[test]
-    fn test_env_var_openspec_cmd() {
-        let _lock = env_lock();
-
-        // Save original env value
-        let original = env::var("OPENSPEC_CMD").ok();
-
-        // Set environment variable
-        env::set_var("OPENSPEC_CMD", "/usr/local/bin/openspec");
-
-        // Parse CLI without --openspec-cmd argument
-        // Note: clap caches env vars at parse time
-        let cli = Cli::try_parse_from(["cflx"]);
-
-        // Restore original env value
-        if let Some(val) = original {
-            env::set_var("OPENSPEC_CMD", val);
-        } else {
-            env::remove_var("OPENSPEC_CMD");
-        }
-
-        // Verify environment variable is used
-        let cli = cli.unwrap();
-        assert_eq!(cli.openspec_cmd, "/usr/local/bin/openspec");
-    }
-
-    // OPENSPEC: openspec/specs/configuration/spec.md#environment-variable-configuration-for-openspec-command/cli-引数が環境変数より優先
-    #[test]
-    fn test_cli_arg_overrides_env_var() {
-        let _lock = env_lock();
-
-        // Save original env value
-        let original = env::var("OPENSPEC_CMD").ok();
-
-        // Set environment variable
-        env::set_var("OPENSPEC_CMD", "/env/openspec");
-
-        // Parse CLI with --openspec-cmd argument
-        let cli = Cli::try_parse_from(["cflx", "--openspec-cmd", "./cli-openspec"]);
-
-        // Restore original env value
-        if let Some(val) = original {
-            env::set_var("OPENSPEC_CMD", val);
-        } else {
-            env::remove_var("OPENSPEC_CMD");
-        }
-
-        // Verify CLI argument takes precedence over env var
-        let cli = cli.unwrap();
-        assert_eq!(cli.openspec_cmd, "./cli-openspec");
-    }
 
     #[test]
     fn test_run_subcommand_config_option() {
@@ -406,15 +324,6 @@ mod tests {
     fn test_no_subcommand() {
         let cli = Cli::parse_from(["cflx"]);
         assert!(cli.command.is_none());
-    }
-
-    #[test]
-    fn test_global_openspec_cmd_available_to_subcommands() {
-        // Global flag should be available even with subcommand
-        let cli = Cli::parse_from(["cflx", "--openspec-cmd", "/global/openspec", "run"]);
-
-        // The global --openspec-cmd is parsed at the Cli level
-        assert_eq!(cli.openspec_cmd, "/global/openspec");
     }
 
     #[test]
