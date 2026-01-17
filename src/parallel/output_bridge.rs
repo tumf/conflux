@@ -15,11 +15,13 @@ use tracing::{debug, error, info, warn};
 /// This allows the common orchestration loops (which use OutputHandler)
 /// to work with parallel execution (which uses ParallelEvent channels).
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct ParallelOutputHandler {
     change_id: String,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
 }
 
+#[allow(dead_code)]
 impl ParallelOutputHandler {
     /// Create a new parallel output handler.
     ///
@@ -86,11 +88,14 @@ impl OutputHandler for ParallelOutputHandler {
 /// This allows the unified apply loop (which uses ApplyEventHandler)
 /// to work with parallel execution (which uses ParallelEvent channels).
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct ParallelApplyEventHandler {
+    #[allow(dead_code)]
     change_id: String,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
 }
 
+#[allow(dead_code)]
 impl ParallelApplyEventHandler {
     /// Create a new parallel apply event handler.
     ///

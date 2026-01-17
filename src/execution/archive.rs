@@ -28,7 +28,7 @@ use tracing::{debug, error, info, warn};
 use crate::agent::{AgentRunner, OutputLine};
 use crate::error::{OrchestratorError, Result};
 use crate::hooks::{HookContext, HookRunner, HookType};
-use crate::task_parser::{self, TaskProgress};
+use crate::task_parser;
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::VcsBackend;
 
@@ -460,6 +460,7 @@ pub fn build_archive_error_message(change_id: &str) -> String {
 ///
 /// This trait allows the archive loop to send events to different handlers
 /// (e.g., TUI event channel, CLI logger, parallel event bus).
+#[allow(dead_code)]
 pub trait ArchiveEventHandler {
     /// Called when archive iteration starts
     fn on_archive_started(&self, change_id: &str);
@@ -474,6 +475,7 @@ pub trait ArchiveEventHandler {
 }
 
 /// No-op event handler for cases where events are not needed
+#[allow(dead_code)]
 pub struct NoOpArchiveEventHandler;
 
 impl ArchiveEventHandler for NoOpArchiveEventHandler {
@@ -485,6 +487,7 @@ impl ArchiveEventHandler for NoOpArchiveEventHandler {
 }
 
 /// Context for building hook contexts in the archive loop
+#[allow(dead_code)]
 pub struct ArchiveLoopHookContext {
     /// Changes processed so far
     pub changes_processed: usize,
@@ -500,6 +503,7 @@ pub struct ArchiveLoopHookContext {
     pub group_index: Option<usize>,
 }
 
+#[allow(dead_code)]
 impl ArchiveLoopHookContext {
     /// Create a new hook context for serial mode
     pub fn serial(
@@ -560,6 +564,7 @@ impl ArchiveLoopHookContext {
 
 /// Result of the unified archive loop
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ArchiveLoopResult {
     /// Whether the archive succeeded
     pub succeeded: bool,
@@ -587,6 +592,7 @@ pub struct ArchiveLoopResult {
 /// * `Ok(ArchiveLoopResult)` - Archive loop completed (success or max attempts)
 /// * `Err(e)` - An error occurred (hook failure, command spawn failure, etc.)
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub async fn execute_archive_loop<E, F, Fut>(
     change_id: &str,
     workspace_path: &Path,
@@ -675,7 +681,9 @@ where
         );
 
         // Execute archive command with history context
-        let (mut child, mut rx, start_time) = agent.run_archive_streaming(change_id).await?;
+        let (mut child, mut rx, start_time) = agent
+            .run_archive_streaming(change_id, Some(workspace_path))
+            .await?;
 
         // Stream output
         while let Some(line) = rx.recv().await {

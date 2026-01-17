@@ -1193,7 +1193,10 @@ mod tests {
             ..Default::default()
         };
         let runner = AgentRunner::new(config);
-        let (mut child, mut rx, _start) = runner.run_apply_streaming("test-change", None).await.unwrap();
+        let (mut child, mut rx, _start) = runner
+            .run_apply_streaming("test-change", None)
+            .await
+            .unwrap();
 
         let mut lines = Vec::new();
         while let Some(line) = rx.recv().await {
@@ -1267,7 +1270,8 @@ mod tests {
             ..Default::default()
         };
         let runner = AgentRunner::new(config);
-        let (mut child, mut rx, _start) = runner.run_apply_streaming("my-change", None).await.unwrap();
+        let (mut child, mut rx, _start) =
+            runner.run_apply_streaming("my-change", None).await.unwrap();
 
         let mut lines = Vec::new();
         while let Some(line) = rx.recv().await {
