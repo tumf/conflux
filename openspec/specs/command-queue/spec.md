@@ -216,6 +216,13 @@ TBD - created by archiving change add-command-execution-queue. Update Purpose af
 - **THEN** resolve は apply と同じ `last_execution` 状態を参照する
 - **AND** 遅延時間内であれば待機してから実行される
 
+#### Scenario: parallel の apply/archive が CommandQueue 経由で実行される
+
+- **GIVEN** parallel 実行モードで apply/archive が実行される
+- **WHEN** apply/archive コマンドが起動される
+- **THEN** CommandQueue の stagger と retry が適用される
+- **AND** streaming 出力のリトライ通知が既存の出力経路に送信される
+
 ### Requirement: Streaming 対応リトライ
 
 コマンドキューは streaming 出力を伴うコマンド実行でも、既存のリトライ判定ロジック（エラーパターン、実行時間、exit code）を適用しなければならない (MUST)。
