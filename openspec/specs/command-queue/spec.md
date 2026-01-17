@@ -195,34 +195,18 @@ TBD - created by archiving change add-command-execution-queue. Update Purpose af
 
 ### Requirement: Streaming 対応リトライ
 
-コマンドキューは streaming 出力を伴うコマンド実行でもリトライ機構を適用しなければならない (MUST)。
+コマンドキューは streaming 出力を伴うコマンド実行でも、既存のリトライ判定ロジック（エラーパターン、実行時間、exit code）を適用しなければならない (MUST)。
 
 Streaming リトライの動作は以下の通りとする：
-- コマンド実行中、stdout/stderr を逐次出力チャネルに送信
-- stderr を同時にバッファリングしてリトライ判定に使用
-- コマンド失敗時、通常のリトライ判定ロジックを適用
-- リトライ時は出力チャネルにリトライ通知を送信
-- 新しいコマンドを spawn して再度 streaming を開始
+- コマンド実行中、stdout/stderr を逐次出力チャネルに送信する
+- stderr を同時にバッファリングしてリトライ判定に使用する
+- コマンド失敗時、通常のリトライ判定ロジックを適用する
+- リトライ時は出力チャネルにリトライ通知を送信する
+- 新しいコマンドを spawn して再度 streaming を開始する
 
-#### Scenario: Streaming コマンドのリトライ
+#### Scenario: Streaming 実行でリトライが適用される
+- **GIVEN** streaming 実行経路でコマンドが失敗する
+- **WHEN** exit code が 0 以外で終了する
+- **THEN** 既存のリトライ判定ロジックが適用される
+- **AND** リトライ通知が出力チャネルに送信される
 
-- **GIVEN** 最大リトライ回数が2回に設定されている
-- **AND** 出力チャネルが設定されている
-- **WHEN** streaming コマンドがクラッシュ（exit code != 0）で失敗
-- **THEN** 出力チャネルにリトライ通知が送信される
-- **AND** 設定された待機時間後に新しいコマンドが spawn される
-- **AND** 新しいコマンドの出力が同じチャネルに streaming される
-
-#### Scenario: Streaming 出力の逐次送信
-
-- **GIVEN** 出力チャネルが設定されている
-- **WHEN** コマンドが stdout に "line1\nline2\n" を出力
-- **THEN** "line1" と "line2" が個別に出力チャネルに送信される
-- **AND** 送信はコマンド完了を待たずに逐次行われる
-
-#### Scenario: 出力チャネルなしでの実行
-
-- **GIVEN** 出力チャネルが None
-- **WHEN** コマンドを実行
-- **THEN** リトライ機構は正常に動作する
-- **AND** 出力は破棄される（エラー判定用の stderr は内部でバッファリング）
