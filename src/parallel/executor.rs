@@ -9,6 +9,7 @@ use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser::TaskProgress;
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::VcsBackend;
+use std::borrow::Cow;
 use std::path::Path;
 use std::process::Stdio as StdStdio;
 use tokio::process::Command;
@@ -462,7 +463,9 @@ pub async fn execute_apply_in_workspace(
 
         // Prepend cd to workspace directory to ensure the command runs in the worktree
         let workspace_path_str = workspace_path.to_str().unwrap_or("");
-        let command_with_cd = format!("cd {} && {}", workspace_path_str, command);
+        let workspace_path_escaped =
+            shlex::try_quote(workspace_path_str).unwrap_or(Cow::Borrowed(workspace_path_str));
+        let command_with_cd = format!("cd {} && {}", workspace_path_escaped, command);
 
         debug!("Workspace path: {:?}", workspace_path);
         debug!("Repository root: {:?}", repo_root);
@@ -886,7 +889,9 @@ pub async fn execute_archive_in_workspace(
 
     // Prepend cd to workspace directory to ensure the command runs in the worktree
     let workspace_path_str = workspace_path.to_str().unwrap_or("");
-    let command_with_cd = format!("cd {} && {}", workspace_path_str, command);
+    let workspace_path_escaped =
+        shlex::try_quote(workspace_path_str).unwrap_or(Cow::Borrowed(workspace_path_str));
+    let command_with_cd = format!("cd {} && {}", workspace_path_escaped, command);
 
     debug!("Archive command in workspace: {}", command_with_cd);
 

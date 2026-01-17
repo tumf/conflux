@@ -512,13 +512,12 @@ where
     let max_iterations = config.get_max_iterations();
     let mut iteration = 0;
     let mut first_apply = true;
-    let mut apply_succeeded = false;
     let mut stall_detector = StallDetector::new(config.get_stall_detection());
 
     // Check if VCS is Git for WIP/stall features
     let is_git = matches!(vcs_backend, VcsBackend::Git);
 
-    loop {
+    let apply_succeeded = loop {
         iteration += 1;
 
         // Check cancellation
@@ -569,8 +568,7 @@ where
                 "Change {} is already complete ({}/{})",
                 change_id, progress.completed, progress.total
             );
-            apply_succeeded = true;
-            break;
+            break true;
         }
 
         info!(
@@ -776,8 +774,7 @@ where
                 "Change {} completed after {} iteration(s)",
                 change_id, iteration
             );
-            apply_succeeded = true;
-            break;
+            break true;
         }
 
         // Warn if no progress
@@ -787,7 +784,7 @@ where
                 change_id, new_progress.completed, new_progress.total
             );
         }
-    }
+    };
 
     // Create final commit (Git-only)
     if apply_succeeded && is_git {
