@@ -1,4 +1,5 @@
 mod agent;
+mod ai_command_runner;
 mod analyzer;
 mod approval;
 mod cli;

@@ -969,6 +969,14 @@ async fn run_tui_loop(
 
         // Handle orchestrator events
         while let Ok(event) = rx.try_recv() {
+            // Update web state when changes are refreshed (web-monitoring feature only)
+            #[cfg(feature = "web-monitoring")]
+            if let OrchestratorEvent::ChangesRefreshed { ref changes, .. } = event {
+                if let Some(ref web_state) = web_state {
+                    web_state.update(changes).await;
+                }
+            }
+
             app.handle_orchestrator_event(event);
         }
 
