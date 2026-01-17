@@ -545,7 +545,10 @@ impl AppState {
             return None;
         }
 
-        if !matches!(self.mode, AppMode::Select | AppMode::Stopped) {
+        if !matches!(
+            self.mode,
+            AppMode::Select | AppMode::Stopped | AppMode::Running
+        ) {
             return None;
         }
 
@@ -2050,6 +2053,28 @@ mod tests {
         let cmd = app.resolve_merge();
 
         // Should return ResolveMerge command
+        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(_))));
+    }
+
+    #[test]
+    fn test_resolve_merge_allowed_in_running_mode() {
+        // Test that M key works for MergeWait changes in Running mode
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set mode to Running
+        app.mode = AppMode::Running;
+
+        // Set change to MergeWait status
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+
+        // Ensure is_resolving is false
+        app.is_resolving = false;
+
+        // Attempt to resolve merge
+        let cmd = app.resolve_merge();
+
+        // Should return ResolveMerge command even in Running mode
         assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(_))));
     }
 
