@@ -1340,6 +1340,45 @@ mod tests {
     }
 
     #[test]
+    fn test_render_merge_wait_status_shows_label() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.add_log(LogEntry::info("log"));
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(content.contains("merge wait"));
+    }
+
+    #[test]
+    fn test_render_merge_wait_shows_resolve_key_hint() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = false; // Not currently resolving
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            content.contains("M: resolve"),
+            "Should show M key hint for MergeWait status"
+        );
+    }
+
+    #[test]
+    fn test_render_merge_wait_hides_resolve_key_hint_when_resolving() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = true; // Currently resolving
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            !content.contains("M: resolve"),
+            "Should NOT show M key hint when resolve is in progress"
+        );
+    }
+
+    #[test]
     fn test_render_shows_worktree_delete_confirm_modal() {
         use crate::tui::types::WorktreeAction;
 
