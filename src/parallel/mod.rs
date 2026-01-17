@@ -26,7 +26,7 @@ use crate::vcs::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -39,6 +39,18 @@ use executor::{execute_apply_in_workspace, execute_archive_in_workspace, Paralle
 use crate::hooks::HookRunner;
 
 const DEFAULT_MAX_CONFLICT_RETRIES: u32 = 3;
+
+/// Global lock for serializing all merge/resolve operations to base branch.
+///
+/// This ensures that only one merge operation can modify the base branch
+/// at any given time, regardless of which ParallelExecutor instance
+/// initiates the operation.
+static GLOBAL_MERGE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Get the global merge lock, initializing it if necessary.
+fn global_merge_lock() -> &'static Mutex<()> {
+    GLOBAL_MERGE_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Parallel executor for running changes in git worktrees
 pub struct ParallelExecutor {
@@ -55,7 +67,6 @@ pub struct ParallelExecutor {
     /// Maximum retries for conflict resolution
     max_conflict_retries: u32,
     /// Serialize merges into the target branch.
-    merge_lock: Arc<Mutex<()>>,
     /// Repository root path for archive operations
     repo_root: PathBuf,
     /// Disable automatic workspace resume (always create new workspaces)
@@ -179,7 +190,6 @@ impl ParallelExecutor {
             archive_command,
             event_tx,
             max_conflict_retries: DEFAULT_MAX_CONFLICT_RETRIES,
-            merge_lock: Arc::new(Mutex::new(())),
             repo_root,
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
@@ -1362,7 +1372,7 @@ impl ParallelExecutor {
         revisions: &[String],
         change_ids: &[String],
     ) -> Result<MergeAttempt> {
-        let _merge_guard = self.merge_lock.lock().await;
+        let _merge_guard = global_merge_lock().lock().await;
         if let Some(reason) = base_dirty_reason(&self.repo_root).await? {
             return Ok(MergeAttempt::Deferred(reason));
         }
@@ -1959,7 +1969,6 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 1,
-            merge_lock: Arc::new(Mutex::new(())),
             repo_root: PathBuf::from("/tmp/test-repo"),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
@@ -2174,7 +2183,6 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
-            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
@@ -2313,7 +2321,6 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
-            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
@@ -2424,7 +2431,6 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
-            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
@@ -2564,7 +2570,6 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
-            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
@@ -2718,7 +2723,6 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
-            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
@@ -2878,7 +2882,6 @@ mod tests {
             archive_command: String::new(),
             event_tx: None,
             max_conflict_retries: 2,
-            merge_lock: Arc::new(Mutex::new(())),
             repo_root: repo_root.to_path_buf(),
             no_resume: false,
             failed_tracker: FailedChangeTracker::new(),
