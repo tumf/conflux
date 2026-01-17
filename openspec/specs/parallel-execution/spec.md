@@ -216,26 +216,12 @@ Git バックエンド使用時、システムは `git worktree` コマンドを
 ### Requirement: Git Clean Working Directory Requirement
 When using the Git backend, the system SHALL warn about uncommitted changes and continue parallel execution.
 
-#### Scenario: CLI warning on uncommitted changes
-- **WHEN** the command runs with `--parallel`
-- **AND** the Git backend is selected
-- **AND** uncommitted or untracked files exist
-- **THEN** the following warning message is displayed:
-  ```
-  Warning: Uncommitted changes detected.
-  Parallel mode will continue, but uncommitted changes remain in your working directory.
-  Consider committing or stashing if you need isolated workspaces.
-  ```
-- **AND** parallel execution starts
-- **AND** the warning alone does not produce a non-zero exit code
-
 #### Scenario: TUI warning on uncommitted changes
 - **WHEN** F5 is pressed in the TUI
 - **AND** the Git backend is selected
 - **AND** uncommitted or untracked files exist
-- **THEN** a popup dialog is displayed
-- **AND** the title is "Uncommitted Changes Detected"
-- **AND** the body explains the warning and that execution continues
+- **THEN** a warning message is logged in the TUI logs
+- **AND** the warning is not shown as a popup dialog
 - **AND** parallel execution starts
 
 ### Requirement: Git Sequential Merge
