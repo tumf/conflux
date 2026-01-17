@@ -353,6 +353,32 @@ pub async fn check_merge_conflicts<P: AsRef<Path>>(
     }
 }
 
+/// Count commits ahead of base branch.
+///
+/// Returns the number of commits that `worktree_branch` has ahead of `base_branch`.
+/// Uses `git rev-list --count <base>..<worktree_branch>` to get the count.
+///
+/// # Arguments
+/// * `cwd` - Working directory (can be worktree or main repo)
+/// * `base_branch` - Base branch name (e.g., "main", "master")
+/// * `worktree_branch` - Worktree branch name
+///
+/// # Returns
+/// The number of commits ahead, or 0 if branches are at the same commit or on error.
+pub async fn count_commits_ahead<P: AsRef<Path>>(
+    cwd: P,
+    base_branch: &str,
+    worktree_branch: &str,
+) -> VcsResult<usize> {
+    let range = format!("{}..{}", base_branch, worktree_branch);
+    let output = run_git(&["rev-list", "--count", &range], cwd).await?;
+    let count = output
+        .trim()
+        .parse::<usize>()
+        .map_err(|e| VcsError::git_command(format!("Invalid count: {}", e)))?;
+    Ok(count)
+}
+
 /// Parse conflict files from git merge output.
 ///
 /// Extracts file paths from lines like "CONFLICT (content): Merge conflict in src/main.rs"
@@ -1290,5 +1316,97 @@ mod tests {
         std::fs::write(temp_dir.path().join("test.txt"), "test").unwrap();
         let is_clean = is_working_directory_clean(temp_dir.path()).await.unwrap();
         assert!(!is_clean);
+    }
+
+    #[tokio::test]
+    async fn test_count_commits_ahead() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let init = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init.is_err() {
+            // Skip if git not available
+            return;
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create initial commit on main
+        std::fs::write(temp_dir.path().join("file1.txt"), "base").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create a branch and add commits
+        let _ = Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        std::fs::write(temp_dir.path().join("file2.txt"), "feature1").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Feature commit 1"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        std::fs::write(temp_dir.path().join("file3.txt"), "feature2").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Feature commit 2"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Count commits ahead
+        let count = count_commits_ahead(temp_dir.path(), "main", "feature")
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "Feature branch should be 2 commits ahead of main");
+
+        // Check reverse (main should be 0 commits ahead of feature)
+        let count_reverse = count_commits_ahead(temp_dir.path(), "feature", "main")
+            .await
+            .unwrap();
+        assert_eq!(
+            count_reverse, 0,
+            "Main branch should be 0 commits ahead of feature"
+        );
+
+        // Check same branch
+        let count_same = count_commits_ahead(temp_dir.path(), "main", "main")
+            .await
+            .unwrap();
+        assert_eq!(count_same, 0, "Branch should be 0 commits ahead of itself");
     }
 }

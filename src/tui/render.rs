@@ -1000,7 +1000,13 @@ fn render_footer_worktree(frame: &mut Frame, app: &AppState, area: Rect) {
         // - Not detached HEAD
         // - No merge conflicts
         // - Has a branch name
-        if !wt.is_main && !wt.is_detached && !wt.has_merge_conflict() && !wt.branch.is_empty() {
+        // - Has commits ahead of base branch
+        if !wt.is_main
+            && !wt.is_detached
+            && !wt.has_merge_conflict()
+            && !wt.branch.is_empty()
+            && wt.has_commits_ahead
+        {
             key_hints.push(("M", "merge"));
         }
     }
