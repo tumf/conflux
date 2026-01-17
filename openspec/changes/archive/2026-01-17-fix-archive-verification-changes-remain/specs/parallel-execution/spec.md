@@ -1,12 +1,12 @@
 ## MODIFIED Requirements
 ### Requirement: Individual Merge on Archive Completion
 
-並列実行モードにおいて、システムは merge 実行前に `verify_archive_completion` を再検証し、`openspec/changes/{change_id}` が存在する場合は未アーカイブとして `MergeDeferred` を返して `MergeWait` に留めなければならない（SHALL）。
+In parallel execution mode, the system SHALL re-check `verify_archive_completion` before starting a merge. If `openspec/changes/{change_id}` exists, it is treated as unarchived, `MergeDeferred` is returned, and the change remains in `MergeWait`.
 
-#### Scenario: Merge 直前に changes が残っている場合は MergeDeferred
-- **GIVEN** 変更 A が archive 完了として処理された
-- **AND** `openspec/changes/{change_id}` が存在している
-- **WHEN** merge を開始する
-- **THEN** `verify_archive_completion` は未アーカイブを返す
-- **AND** `MergeDeferred` を返す
-- **AND** 変更 A は `MergeWait` に留まる
+#### Scenario: merge deferred when changes directory still exists
+- **GIVEN** change A was processed as archived
+- **AND** `openspec/changes/{change_id}` still exists
+- **WHEN** the merge begins
+- **THEN** `verify_archive_completion` reports unarchived
+- **AND** `MergeDeferred` is returned
+- **AND** change A remains in `MergeWait`
