@@ -49,3 +49,22 @@ Given openspec/changes directory does not exist
 When list_changes_native() is called
 Then it returns empty Vec<Change>
 ```
+
+#### Scenario: List changes from HEAD tree (list_changes_in_head)
+
+```
+Given HEAD commit contains openspec/changes/change-a with proposal.md
+And HEAD commit contains openspec/changes/change-b without proposal.md
+When list_changes_in_head() is called
+Then it returns Vec<String> with ["change-a"] (change-b excluded)
+And the result is sorted alphabetically
+```
+
+#### Scenario: Skip change without proposal.md in HEAD tree
+
+```
+Given HEAD commit contains openspec/changes/my-change directory
+And proposal.md file does not exist in HEAD:openspec/changes/my-change/
+When list_changes_in_head() is called
+Then "my-change" is not included in the result
+```

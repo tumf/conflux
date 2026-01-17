@@ -1,4 +1,4 @@
-//! Web monitoring module for OpenSpec Orchestrator.
+//! Web monitoring module for Conflux.
 //!
 //! Provides an optional HTTP server with REST API and WebSocket support
 //! for monitoring orchestration state remotely via web browser.

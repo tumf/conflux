@@ -168,6 +168,13 @@ pub fn list_changes_native() -> Result<Vec<Change>> {
             continue;
         }
 
+        // Skip changes without proposal.md
+        let proposal_path = path.join("proposal.md");
+        if !proposal_path.exists() {
+            debug!("Skipping change '{}' - no proposal.md found", dir_name);
+            continue;
+        }
+
         // Parse tasks.md for this change
         let (completed_tasks, total_tasks) = match task_parser::parse_change(dir_name) {
             Ok(progress) => (progress.completed, progress.total),
@@ -322,6 +329,40 @@ mod tests {
     }
 
     #[test]
+    fn test_list_changes_native_excludes_without_proposal() {
+        // Test that changes without proposal.md are excluded
+        let temp_dir = TempDir::new().unwrap();
+        let changes_dir = temp_dir.path().join("openspec").join("changes");
+        fs::create_dir_all(&changes_dir).unwrap();
+
+        // Create change-a WITH proposal.md
+        let change_a_dir = changes_dir.join("change-a");
+        fs::create_dir_all(&change_a_dir).unwrap();
+        fs::File::create(change_a_dir.join("proposal.md")).unwrap();
+        let mut tasks_a = fs::File::create(change_a_dir.join("tasks.md")).unwrap();
+        writeln!(tasks_a, "- [x] Task 1\n- [ ] Task 2").unwrap();
+
+        // Create change-b WITHOUT proposal.md
+        let change_b_dir = changes_dir.join("change-b");
+        fs::create_dir_all(&change_b_dir).unwrap();
+        let mut tasks_b = fs::File::create(change_b_dir.join("tasks.md")).unwrap();
+        writeln!(tasks_b, "- [ ] Task 1").unwrap();
+
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = list_changes_native().unwrap();
+
+        env::set_current_dir(original_dir).unwrap();
+
+        // Should only include change-a (has proposal.md), not change-b (no proposal.md)
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "change-a");
+        assert_eq!(result[0].completed_tasks, 1);
+        assert_eq!(result[0].total_tasks, 2);
+    }
+
+    #[test]
     fn test_list_changes_native_suppresses_repetitive_logs() {
         let log_lock = LOG_TEST_MUTEX.get_or_init(|| Mutex::new(()));
         let _guard = log_lock.lock().expect("log mutex poisoned");
@@ -333,6 +374,8 @@ mod tests {
             .join("changes")
             .join("sample-change");
         fs::create_dir_all(&change_dir).unwrap();
+        // Create proposal.md (required for change to be included)
+        fs::File::create(change_dir.join("proposal.md")).unwrap();
         let mut tasks_file = fs::File::create(change_dir.join("tasks.md")).unwrap();
         writeln!(tasks_file, "- [ ] Task 1").unwrap();
 
