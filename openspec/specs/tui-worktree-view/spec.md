@@ -28,4 +28,5 @@ Worktreeリスト SHALL be automatically refreshed.
 - **GIVEN** `workspace_base_dir` が未設定
 - **AND** TUI が worktree の作成先を決定する
 - **THEN** デフォルトディレクトリは設定仕様に従って解決される
+- **AND** worktree は `<data_dir>/conflux/worktrees/<project_slug>` 配下に作成される
 

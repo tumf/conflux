@@ -893,10 +893,18 @@ The TUI archive phase SHALL NOT send redundant status transition events for chan
 
 ### Requirement: Apply Context History
 
-オーケストレーターは、各 apply 試行の最終サマリーメッセージを記録し、同一 change の次回 apply プロンプトに含めなければならない（MUST）。
+オーケストレーターは、逐次/並列のどちらの apply でも共通ループで同一の履歴注入ロジックを使用し、各 apply 試行の最終サマリーメッセージを記録して同一 change の次回 apply プロンプトに含めなければならない（MUST）。
 
 #### Scenario: parallel の2回目 apply に履歴が含まれる
 - **GIVEN** parallel mode で change が apply 実行中である
+- **AND** 1回目の apply がエージェントのサマリーを返している
+- **WHEN** 2回目の apply が実行される
+- **THEN** プロンプトは base apply_prompt を含む
+- **AND** プロンプトは `<last_apply attempt="1">` ブロックを含む
+- **AND** ブロックには 1回目のサマリーが含まれる
+
+#### Scenario: serial の2回目 apply に履歴が含まれる
+- **GIVEN** 逐次モードで change が apply 実行中である
 - **AND** 1回目の apply がエージェントのサマリーを返している
 - **WHEN** 2回目の apply が実行される
 - **THEN** プロンプトは base apply_prompt を含む
@@ -1262,9 +1270,14 @@ WIPコミットメッセージは `WIP: {change_id} ({completed}/{total} tasks, 
 - When: applyコマンドが失敗してイテレーションが終了する
 - Then: 失敗時点の作業内容がWIPスナップショットとして保存される
 
+#### Scenario: WIP created when no progress is made
+- Given: 逐次applyループが実行中である
+- When: applyコマンドは成功したがタスク進捗が増加しない
+- Then: 最新の作業内容を反映したWIPスナップショットが作成される
+
 ### Requirement: Archive Context History
 
-オーケストレータは、各 archive 試行の結果をキャプチャし、同じ change に対する後続の archive プロンプトに含めなければならない（MUST）。
+オーケストレータは、逐次/並列のどちらの archive でも共通ループで同一の履歴注入ロジックを使用し、各 archive 試行の結果をキャプチャして同じ change に対する後続の archive プロンプトに含めなければならない（MUST）。
 
 #### Scenario: 初回 archive 試行には履歴がない
 
@@ -1293,6 +1306,14 @@ WIPコミットメッセージは `WIP: {change_id} ({completed}/{total} tasks, 
 - **WHEN** archive が成功し、change が完全に処理される
 - **THEN** その change の archive 履歴はクリアされる
 - **AND** 次に同じ change ID が処理される場合、履歴は空の状態から始まる
+
+#### Scenario: parallel の2回目 archive に履歴が含まれる
+- **GIVEN** parallel mode で change が archive 実行中である
+- **AND** 1回目の archive が検証失敗している
+- **WHEN** 2回目の archive が実行される
+- **THEN** プロンプトは base archive_prompt を含む
+- **AND** プロンプトは `<last_archive attempt="1">` ブロックを含む
+- **AND** ブロックには 1回目の試行結果が含まれる
 
 ### Requirement: Archive History Context Format
 

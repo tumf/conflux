@@ -25,6 +25,12 @@ use super::events::ParallelEvent;
 /// regardless of whether progress was made. This ensures that work is not lost if the
 /// process is interrupted or reaches the maximum iteration limit.
 ///
+/// # IMPORTANT: Message Format Consistency
+///
+/// This function uses the SAME commit message format as the unified apply loop
+/// in `src/execution/apply.rs::format_wip_commit_message()` to ensure consistency
+/// between serial and parallel execution modes.
+///
 /// # Arguments
 ///
 /// * `workspace_path` - Path to the workspace directory
@@ -38,6 +44,8 @@ use super::events::ParallelEvent;
 ///
 /// The commit message follows the format: `WIP: {change_id} ({completed}/{total} tasks, apply#{iteration})`
 /// For example: `WIP: add-feature (5/10 tasks, apply#3)`
+///
+/// This MUST match `src/execution/apply.rs::format_wip_commit_message()`.
 async fn create_iteration_snapshot(
     workspace_path: &Path,
     change_id: &str,

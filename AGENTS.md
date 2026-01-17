@@ -605,11 +605,16 @@ The workspace base directory determines where git worktrees are created for para
 
 | Platform | Default Location |
 |----------|------------------|
-| **macOS** | `${XDG_DATA_HOME}/openspec/worktrees` if `XDG_DATA_HOME` is set<br/>Otherwise: `~/Library/Application Support/openspec/worktrees` |
-| **Linux** | `${XDG_DATA_HOME}/openspec/worktrees` if `XDG_DATA_HOME` is set<br/>Otherwise: `~/.local/share/openspec/worktrees` |
-| **Windows** | `%APPDATA%\OpenSpec\worktrees` |
+| **macOS** | `${XDG_DATA_HOME}/conflux/worktrees/<project_slug>` if `XDG_DATA_HOME` is set<br/>Otherwise: `~/Library/Application Support/conflux/worktrees/<project_slug>` |
+| **Linux** | `${XDG_DATA_HOME}/conflux/worktrees/<project_slug>` if `XDG_DATA_HOME` is set<br/>Otherwise: `~/.local/share/conflux/worktrees/<project_slug>` |
+| **Windows** | `%APPDATA%\Conflux\worktrees\<project_slug>` |
 
-**Implementation**: `src/config/defaults.rs` - `default_workspace_base_dir()` function
+**Project Slug Format**: `<repo_basename>-<hash8>`
+- `<repo_basename>`: Repository directory name (e.g., "conflux")
+- `<hash8>`: First 8 characters of hash of absolute repository path
+- Example: `/Users/alice/projects/conflux` → `conflux-a1b2c3d4`
+
+**Implementation**: `src/config/defaults.rs` - `default_workspace_base_dir()` and `generate_project_slug()` functions
 
 **Configuration Example**:
 ```jsonc
@@ -619,7 +624,8 @@ The workspace base directory determines where git worktrees are created for para
 ```
 
 **Notes**:
-- The default uses OS-specific persistent directories instead of temporary directories
+- The default uses OS-specific persistent directories with project-specific slugs to prevent conflicts
+- The project slug ensures multiple clones of the same repository use different worktree directories
 - This prevents worktree loss in environments where `/tmp` is RAM-backed or cleared on reboot
 - Existing worktrees in old locations are not automatically migrated
 - Users with explicit `workspace_base_dir` configuration are unaffected by the default change
