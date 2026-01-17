@@ -92,6 +92,8 @@ pub struct AppState {
     pub previous_mode: Option<AppMode>,
     /// Web UI URL (set when web server is enabled)
     pub web_url: Option<String>,
+    /// Whether resolve is currently executing (blocks M key operations)
+    pub is_resolving: bool,
 }
 
 impl AppState {
@@ -157,6 +159,7 @@ impl AppState {
             orchestration_elapsed: None,
             previous_mode: None,
             web_url: None,
+            is_resolving: false,
         }
     }
 
@@ -336,6 +339,13 @@ impl AppState {
                 self.view_mode
             );
             self.warning_message = Some("Switch to Worktrees view to merge".to_string());
+            return None;
+        }
+
+        // Block M key during resolve execution
+        if self.is_resolving {
+            debug!("Merge blocked: resolve operation in progress");
+            self.warning_message = Some("Cannot merge: resolve operation in progress".to_string());
             return None;
         }
 
@@ -529,6 +539,12 @@ impl AppState {
         }
 
         if !matches!(self.mode, AppMode::Select | AppMode::Stopped) {
+            return None;
+        }
+
+        // Block M key during resolve execution
+        if self.is_resolving {
+            self.warning_message = Some("Cannot merge: resolve operation in progress".to_string());
             return None;
         }
 
@@ -1972,5 +1988,125 @@ mod tests {
         // Cancel action
         app.cancel_worktree_action();
         assert!(app.pending_worktree_action.is_none());
+    }
+
+    // === Tests for update-tui-disable-merge-during-resolve ===
+
+    #[test]
+    fn test_resolve_merge_blocked_during_resolve() {
+        // Test that M key is blocked during resolve operation in Changes view
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set change to MergeWait status
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+
+        // Set is_resolving to true (simulating resolve in progress)
+        app.is_resolving = true;
+
+        // Attempt to resolve merge
+        let cmd = app.resolve_merge();
+
+        // Should return None and set warning message
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app
+            .warning_message
+            .as_ref()
+            .unwrap()
+            .contains("resolve operation in progress"));
+    }
+
+    #[test]
+    fn test_resolve_merge_allowed_when_not_resolving() {
+        // Test that M key works when resolve is not in progress
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set change to MergeWait status
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+
+        // Ensure is_resolving is false
+        app.is_resolving = false;
+
+        // Attempt to resolve merge
+        let cmd = app.resolve_merge();
+
+        // Should return ResolveMerge command
+        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(_))));
+    }
+
+    #[test]
+    fn test_request_merge_worktree_branch_blocked_during_resolve() {
+        // Test that M key is blocked during resolve operation in Worktrees view
+        use crate::tui::types::{ViewMode, WorktreeInfo};
+        use std::path::PathBuf;
+
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        // Switch to Worktrees view
+        app.view_mode = ViewMode::Worktrees;
+
+        // Set up a worktree that would normally allow merge
+        app.worktrees = vec![WorktreeInfo {
+            path: PathBuf::from("/tmp/worktree"),
+            head: "abc123".to_string(),
+            branch: "feature".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: true,
+        }];
+        app.worktree_cursor_index = 0;
+
+        // Set is_resolving to true (simulating resolve in progress)
+        app.is_resolving = true;
+
+        // Attempt to merge worktree branch
+        let cmd = app.request_merge_worktree_branch();
+
+        // Should return None and set warning message
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app
+            .warning_message
+            .as_ref()
+            .unwrap()
+            .contains("resolve operation in progress"));
+    }
+
+    #[test]
+    fn test_request_merge_worktree_branch_allowed_when_not_resolving() {
+        // Test that M key works in Worktrees view when resolve is not in progress
+        use crate::tui::types::{ViewMode, WorktreeInfo};
+        use std::path::PathBuf;
+
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        // Switch to Worktrees view
+        app.view_mode = ViewMode::Worktrees;
+
+        // Set up a worktree that allows merge
+        app.worktrees = vec![WorktreeInfo {
+            path: PathBuf::from("/tmp/worktree"),
+            head: "abc123".to_string(),
+            branch: "feature".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: true,
+        }];
+        app.worktree_cursor_index = 0;
+
+        // Ensure is_resolving is false
+        app.is_resolving = false;
+
+        // Attempt to merge worktree branch
+        let cmd = app.request_merge_worktree_branch();
+
+        // Should return MergeWorktreeBranch command
+        assert!(matches!(cmd, Some(TuiCommand::MergeWorktreeBranch { .. })));
     }
 }
