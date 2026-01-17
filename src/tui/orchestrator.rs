@@ -330,7 +330,6 @@ pub async fn archive_single_change(
 #[allow(clippy::too_many_arguments)]
 pub async fn archive_all_complete_changes(
     pending_ids: &HashSet<String>,
-    _openspec_cmd: &str, // Kept for API compatibility, native impl doesn't need it
     agent: &mut AgentRunner,
     hooks: &crate::hooks::HookRunner,
     tx: &mpsc::Sender<OrchestratorEvent>,
@@ -444,7 +443,6 @@ pub async fn archive_all_complete_changes(
 /// This ensures complete changes are never skipped.
 pub async fn run_orchestrator(
     change_ids: Vec<String>,
-    openspec_cmd: String,
     config: OrchestratorConfig,
     tx: mpsc::Sender<OrchestratorEvent>,
     cancel_token: CancellationToken,
@@ -570,7 +568,6 @@ pub async fn run_orchestrator(
         // Phase 1: Archive all complete changes
         let archived_count = archive_all_complete_changes(
             &pending_changes,
-            &openspec_cmd,
             &mut agent,
             &hooks,
             &tx,
@@ -898,7 +895,6 @@ pub async fn run_orchestrator(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_orchestrator_parallel(
     change_ids: Vec<String>,
-    _openspec_cmd: String,
     config: OrchestratorConfig,
     tx: mpsc::Sender<OrchestratorEvent>,
     cancel_token: CancellationToken,

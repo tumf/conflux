@@ -182,8 +182,6 @@ async fn load_worktrees_with_conflict_check(
 /// Run the TUI application
 pub async fn run_tui(
     initial_changes: Vec<Change>,
-    openspec_cmd: String,
-    _opencode_path: String, // Deprecated - use config instead
     config: OrchestratorConfig,
     web_url: Option<String>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
@@ -204,7 +202,6 @@ pub async fn run_tui(
     let result = run_tui_loop(
         &mut terminal,
         initial_changes,
-        openspec_cmd,
         config,
         web_url,
         #[cfg(feature = "web-monitoring")]
@@ -222,7 +219,6 @@ pub async fn run_tui(
 async fn run_tui_loop(
     terminal: &mut DefaultTerminal,
     initial_changes: Vec<Change>,
-    openspec_cmd: String,
     config: OrchestratorConfig,
     web_url: Option<String>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
@@ -657,7 +653,6 @@ async fn run_tui_loop(
                                 if !selected_ids.is_empty() {
                                     graceful_stop_flag.store(false, Ordering::SeqCst);
                                     let orch_tx = tx.clone();
-                                    let orch_openspec_cmd = openspec_cmd.clone();
                                     let orch_config = config.clone();
                                     let orch_cancel = CancellationToken::new();
                                     let orch_dynamic_queue = dynamic_queue.clone();
@@ -671,7 +666,6 @@ async fn run_tui_loop(
                                         let result = if use_parallel {
                                             run_orchestrator_parallel(
                                                 selected_ids,
-                                                orch_openspec_cmd,
                                                 orch_config,
                                                 orch_tx.clone(),
                                                 orch_cancel,
@@ -684,7 +678,6 @@ async fn run_tui_loop(
                                         } else {
                                             run_orchestrator(
                                                 selected_ids,
-                                                orch_openspec_cmd,
                                                 orch_config,
                                                 orch_tx.clone(),
                                                 orch_cancel,

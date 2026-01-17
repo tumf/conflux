@@ -72,8 +72,6 @@ async fn main() -> Result<()> {
         None => {
             // Don't initialize tracing subscriber for TUI mode
             // (TUI handles its own output)
-            let openspec_cmd = cli.openspec_cmd;
-            let opencode_path = cli.opencode_path;
 
             // Load config (uses default paths)
             let config = OrchestratorConfig::load(None)?;
@@ -85,8 +83,6 @@ async fn main() -> Result<()> {
             // Run TUI (no web server in default mode)
             tui::run_tui(
                 changes,
-                openspec_cmd,
-                opencode_path,
                 config,
                 None,
                 #[cfg(feature = "web-monitoring")]
@@ -138,8 +134,6 @@ async fn main() -> Result<()> {
             // Run TUI
             tui::run_tui(
                 changes,
-                args.openspec_cmd,
-                args.opencode_path,
                 config,
                 web_url,
                 #[cfg(feature = "web-monitoring")]
