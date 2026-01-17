@@ -119,7 +119,8 @@ pub async fn resolve_conflicts_with_retry(
              VCS log for conflicting changes:\n\
              {}\n\n\
              Conflicting files: {}\n\n\
-             Please resolve the merge conflicts in the listed files.",
+             Please resolve the merge conflicts in the listed files.\n\n\
+             IMPORTANT: Do NOT use --no-verify flag when committing. Always run pre-commit hooks.",
             vcs_prompt_prefix,
             revisions.join(", "),
             vcs_error,
@@ -339,7 +340,8 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
              Requirements:\n\
              - Before merging each branch into the target branch, you MUST pre-sync base into that worktree branch (base -> worktree) from inside the worktree directory.\n\
              - If a pre-sync merge commit is created, its subject MUST be exactly: \"Pre-sync base into <change_id>\".\n\
-             - The final merge into the target branch MUST create a merge commit with subject exactly: \"Merge change: <change_id>\".\n\n\
+             - The final merge into the target branch MUST create a merge commit with subject exactly: \"Merge change: <change_id>\".\n\
+             - Do NOT use --no-verify flag when committing. Always run pre-commit hooks.\n\n\
              Instructions (repeat for each branch in order):\n\
              1) Pre-sync in the worktree directory:\n\
                 - cd <worktree_path>\n\
