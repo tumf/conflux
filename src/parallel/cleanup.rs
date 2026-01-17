@@ -14,8 +14,8 @@ use tracing::{debug, warn};
 /// prevent their cleanup on drop to allow for manual investigation or
 /// resume functionality.
 pub(crate) struct WorkspaceCleanupGuard {
-    /// Workspace names to clean up
-    workspace_names: Vec<String>,
+    /// Workspace names and paths to clean up
+    workspaces: std::collections::HashMap<String, PathBuf>,
     /// Workspace names to preserve (not cleaned up on drop)
     preserved_workspaces: std::collections::HashSet<String>,
     /// VCS backend type
@@ -30,7 +30,7 @@ impl WorkspaceCleanupGuard {
     /// Create a new cleanup guard
     pub fn new(vcs_backend: VcsBackend, repo_root: PathBuf) -> Self {
         Self {
-            workspace_names: Vec::new(),
+            workspaces: std::collections::HashMap::new(),
             preserved_workspaces: std::collections::HashSet::new(),
             vcs_backend,
             repo_root,
@@ -39,8 +39,8 @@ impl WorkspaceCleanupGuard {
     }
 
     /// Add a workspace to be tracked for cleanup
-    pub fn track(&mut self, workspace_name: String) {
-        self.workspace_names.push(workspace_name);
+    pub fn track(&mut self, workspace_name: String, workspace_path: PathBuf) {
+        self.workspaces.insert(workspace_name, workspace_path);
     }
 
     /// Mark a workspace for preservation (will not be cleaned up on drop).
@@ -63,15 +63,15 @@ impl WorkspaceCleanupGuard {
 
 impl Drop for WorkspaceCleanupGuard {
     fn drop(&mut self) {
-        if self.committed || self.workspace_names.is_empty() {
+        if self.committed || self.workspaces.is_empty() {
             return;
         }
 
         // Filter out preserved workspaces from cleanup
         let workspaces_to_clean: Vec<_> = self
-            .workspace_names
+            .workspaces
             .iter()
-            .filter(|name| !self.preserved_workspaces.contains(*name))
+            .filter(|(name, _path)| !self.preserved_workspaces.contains(*name))
             .collect();
 
         if workspaces_to_clean.is_empty() {
@@ -86,17 +86,48 @@ impl Drop for WorkspaceCleanupGuard {
 
         // Use synchronous cleanup since we're in Drop
         // This is a best-effort cleanup - errors are logged but not propagated
-        for workspace_name in &workspaces_to_clean {
+        for (workspace_name, workspace_path) in &workspaces_to_clean {
             debug!(
-                "Emergency cleanup: forgetting workspace '{}'",
-                workspace_name
+                "Emergency cleanup: removing workspace '{}' at {:?}",
+                workspace_name, workspace_path
             );
 
             match self.vcs_backend {
                 VcsBackend::Git | VcsBackend::Auto => {
-                    // For Git, we need the worktree path, but we only have the name
-                    // This is a best-effort cleanup; the worktree will be orphaned
-                    // but can be cleaned up later with `git worktree prune`
+                    // First, remove the worktree
+                    debug!(
+                        module = module_path!(),
+                        "Executing git command: git worktree remove {:?} --force (cwd: {:?})",
+                        workspace_path,
+                        self.repo_root
+                    );
+                    let result = std::process::Command::new("git")
+                        .args([
+                            "worktree",
+                            "remove",
+                            workspace_path.to_str().unwrap(),
+                            "--force",
+                        ])
+                        .current_dir(&self.repo_root)
+                        .output();
+
+                    match result {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            debug!(
+                                "Failed to remove git worktree at {:?}: {}",
+                                workspace_path, stderr
+                            );
+                        }
+                        Err(e) => {
+                            debug!("Failed to run git worktree remove: {}", e);
+                        }
+                        _ => {
+                            debug!("Successfully removed git worktree at {:?}", workspace_path);
+                        }
+                    }
+
+                    // Then, delete the branch
                     debug!(
                         module = module_path!(),
                         "Executing git command: git branch -D {} (cwd: {:?})",
@@ -143,7 +174,7 @@ mod tests {
 
         // Guard should start with no workspaces and not committed
         assert!(!guard.committed);
-        assert!(guard.workspace_names.is_empty());
+        assert!(guard.workspaces.is_empty());
     }
 
     #[test]
@@ -151,16 +182,12 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
 
-        guard.track("ws-change-a-1234".to_string());
-        guard.track("ws-change-b-5678".to_string());
+        guard.track("ws-change-a-1234".to_string(), PathBuf::from("/tmp/ws-a"));
+        guard.track("ws-change-b-5678".to_string(), PathBuf::from("/tmp/ws-b"));
 
-        assert_eq!(guard.workspace_names.len(), 2);
-        assert!(guard
-            .workspace_names
-            .contains(&"ws-change-a-1234".to_string()));
-        assert!(guard
-            .workspace_names
-            .contains(&"ws-change-b-5678".to_string()));
+        assert_eq!(guard.workspaces.len(), 2);
+        assert!(guard.workspaces.contains_key("ws-change-a-1234"));
+        assert!(guard.workspaces.contains_key("ws-change-b-5678"));
     }
 
     #[test]
@@ -168,7 +195,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
 
-        guard.track("ws-change-a-1234".to_string());
+        guard.track("ws-change-a-1234".to_string(), PathBuf::from("/tmp/ws-a"));
         assert!(!guard.committed);
 
         // Commit the guard
@@ -206,7 +233,7 @@ mod tests {
     fn test_cleanup_guard_drop_with_committed_guard_does_nothing() {
         let temp_dir = TempDir::new().unwrap();
         let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
-        guard.track("ws-test-1234".to_string());
+        guard.track("ws-test-1234".to_string(), PathBuf::from("/tmp/ws-test"));
 
         // Commit and then drop - should not attempt cleanup
         guard.commit();
@@ -223,7 +250,7 @@ mod tests {
         {
             let mut guard =
                 WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
-            guard.track("ws-test-1234".to_string());
+            guard.track("ws-test-1234".to_string(), PathBuf::from("/tmp/ws-test"));
             // Not committed - will attempt cleanup on drop
         } // guard drops here
 
@@ -236,7 +263,10 @@ mod tests {
 
         // Simulate successful operation
         let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
-        guard.track("ws-success-1234".to_string());
+        guard.track(
+            "ws-success-1234".to_string(),
+            PathBuf::from("/tmp/ws-success"),
+        );
 
         // On success, commit to prevent cleanup
         guard.commit();
@@ -262,8 +292,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
 
-        guard.track("ws-change-a-1234".to_string());
-        guard.track("ws-change-b-5678".to_string());
+        guard.track("ws-change-a-1234".to_string(), PathBuf::from("/tmp/ws-a"));
+        guard.track("ws-change-b-5678".to_string(), PathBuf::from("/tmp/ws-b"));
 
         // Preserve one workspace (simulating error)
         guard.preserve("ws-change-a-1234");
@@ -280,8 +310,14 @@ mod tests {
         {
             let mut guard =
                 WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
-            guard.track("ws-success-1234".to_string());
-            guard.track("ws-failed-5678".to_string());
+            guard.track(
+                "ws-success-1234".to_string(),
+                PathBuf::from("/tmp/ws-success"),
+            );
+            guard.track(
+                "ws-failed-5678".to_string(),
+                PathBuf::from("/tmp/ws-failed"),
+            );
 
             // Preserve the failed workspace
             guard.preserve("ws-failed-5678");
@@ -300,8 +336,8 @@ mod tests {
         {
             let mut guard =
                 WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
-            guard.track("ws-failed-1".to_string());
-            guard.track("ws-failed-2".to_string());
+            guard.track("ws-failed-1".to_string(), PathBuf::from("/tmp/ws-failed-1"));
+            guard.track("ws-failed-2".to_string(), PathBuf::from("/tmp/ws-failed-2"));
 
             // Preserve all workspaces
             guard.preserve("ws-failed-1");
