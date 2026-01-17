@@ -14,7 +14,10 @@ pub use crate::events::ExecutionEvent as ParallelEvent;
 pub use types::{FailedChangeTracker, WorkspaceResult};
 
 use crate::agent::{AgentRunner, OutputLine};
+use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
 use crate::analyzer::{extract_change_dependencies, ParallelGroup};
+use crate::command_queue::CommandQueueConfig;
+use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
@@ -85,6 +88,12 @@ pub struct ParallelExecutor {
     last_queue_change_at: Arc<Mutex<Option<std::time::Instant>>>,
     /// Dynamic queue for runtime change additions (TUI mode)
     dynamic_queue: Option<Arc<crate::tui::queue::DynamicQueue>>,
+    /// Shared AI command runner for stagger coordination
+    #[allow(dead_code)] // Infrastructure ready, integration pending (tasks 3.2, 3.3)
+    ai_runner: AiCommandRunner,
+    /// Shared stagger state for resolve operations
+    #[allow(dead_code)] // Infrastructure ready, integration pending (tasks 4.1-4.3)
+    shared_stagger_state: SharedStaggerState,
 }
 
 pub async fn base_dirty_reason(repo_root: &Path) -> Result<Option<String>> {
@@ -185,6 +194,32 @@ impl ParallelExecutor {
         let last_queue_change_at =
             shared_queue_change.unwrap_or_else(|| Arc::new(Mutex::new(None)));
 
+        // Create shared stagger state for AI command coordination
+        let shared_stagger_state = Arc::new(Mutex::new(None));
+
+        // Build CommandQueue configuration from orchestrator config
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: config
+                .command_queue_stagger_delay_ms
+                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+            max_retries: config
+                .command_queue_max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_delay_ms: config
+                .command_queue_retry_delay_ms
+                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+            retry_error_patterns: config
+                .command_queue_retry_patterns
+                .clone()
+                .unwrap_or_else(default_retry_patterns),
+            retry_if_duration_under_secs: config
+                .command_queue_retry_if_duration_under_secs
+                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+        };
+
+        // Create shared AI command runner
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+
         Self {
             workspace_manager,
             config,
@@ -201,6 +236,8 @@ impl ParallelExecutor {
             cancel_token: None,
             last_queue_change_at,
             dynamic_queue: None,
+            ai_runner,
+            shared_stagger_state,
         }
     }
 
@@ -2034,9 +2071,22 @@ mod tests {
         change_dependencies.insert("change-b".to_string(), vec!["change-a".to_string()]);
         let mut merge_deferred_changes = HashSet::new();
         merge_deferred_changes.insert("change-a".to_string());
+
+        // Create test AI runner
+        let shared_stagger_state = Arc::new(Mutex::new(None));
+        let config = OrchestratorConfig::default();
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+            retry_error_patterns: default_retry_patterns(),
+            retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        };
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+
         let executor = ParallelExecutor {
             workspace_manager: Box::new(manager),
-            config: OrchestratorConfig::default(),
+            config,
             apply_command: String::new(),
             archive_command: String::new(),
             event_tx: None,
@@ -2050,6 +2100,8 @@ mod tests {
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
+            ai_runner,
+            shared_stagger_state,
         };
 
         assert_eq!(
@@ -2249,6 +2301,24 @@ mod tests {
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
 
+        // Create test AI runner
+
+        let shared_stagger_state = Arc::new(Mutex::new(None));
+
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+
+            max_retries: DEFAULT_MAX_RETRIES,
+
+            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+
+            retry_error_patterns: default_retry_patterns(),
+
+            retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        };
+
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+
         let executor = ParallelExecutor {
             workspace_manager: Box::new(manager),
             config,
@@ -2265,6 +2335,8 @@ mod tests {
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
+            ai_runner,
+            shared_stagger_state,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2388,6 +2460,24 @@ mod tests {
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
 
+        // Create test AI runner
+
+        let shared_stagger_state = Arc::new(Mutex::new(None));
+
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+
+            max_retries: DEFAULT_MAX_RETRIES,
+
+            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+
+            retry_error_patterns: default_retry_patterns(),
+
+            retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        };
+
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+
         let executor = ParallelExecutor {
             workspace_manager: Box::new(manager),
             config,
@@ -2404,6 +2494,8 @@ mod tests {
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
+            ai_runner,
+            shared_stagger_state,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2499,6 +2591,24 @@ mod tests {
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
 
+        // Create test AI runner
+
+        let shared_stagger_state = Arc::new(Mutex::new(None));
+
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+
+            max_retries: DEFAULT_MAX_RETRIES,
+
+            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+
+            retry_error_patterns: default_retry_patterns(),
+
+            retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        };
+
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+
         let executor = ParallelExecutor {
             workspace_manager: Box::new(manager),
             config,
@@ -2515,6 +2625,8 @@ mod tests {
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
+            ai_runner,
+            shared_stagger_state,
         };
 
         let revisions = vec![workspace_a.name];
@@ -2639,6 +2751,24 @@ mod tests {
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
 
+        // Create test AI runner
+
+        let shared_stagger_state = Arc::new(Mutex::new(None));
+
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+
+            max_retries: DEFAULT_MAX_RETRIES,
+
+            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+
+            retry_error_patterns: default_retry_patterns(),
+
+            retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        };
+
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+
         let executor = ParallelExecutor {
             workspace_manager: Box::new(manager),
             config,
@@ -2655,6 +2785,8 @@ mod tests {
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
+            ai_runner,
+            shared_stagger_state,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2793,6 +2925,24 @@ mod tests {
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
 
+        // Create test AI runner
+
+        let shared_stagger_state = Arc::new(Mutex::new(None));
+
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+
+            max_retries: DEFAULT_MAX_RETRIES,
+
+            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+
+            retry_error_patterns: default_retry_patterns(),
+
+            retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        };
+
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+
         let executor = ParallelExecutor {
             workspace_manager: Box::new(manager),
             config,
@@ -2809,6 +2959,8 @@ mod tests {
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
+            ai_runner,
+            shared_stagger_state,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2953,6 +3105,24 @@ mod tests {
         );
         std::fs::write(&resolver_script, script_contents).unwrap();
 
+        // Create test AI runner
+
+        let shared_stagger_state = Arc::new(Mutex::new(None));
+
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+
+            max_retries: DEFAULT_MAX_RETRIES,
+
+            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+
+            retry_error_patterns: default_retry_patterns(),
+
+            retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        };
+
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+
         let executor = ParallelExecutor {
             workspace_manager: Box::new(manager),
             config,
@@ -2969,6 +3139,8 @@ mod tests {
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
+            ai_runner,
+            shared_stagger_state,
         };
 
         let revisions = vec![workspace_a.name];
