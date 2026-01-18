@@ -689,7 +689,11 @@ where
 {
     // Check cancellation before starting
     if cancel_token.is_some_and(|token| token.is_cancelled()) {
-        return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+        return Err(OrchestratorError::AgentCommand(format!(
+            "Cancelled archive for '{}' in workspace '{}'",
+            change_id,
+            workspace_path.display()
+        )));
     }
 
     // Get task progress for hook context
@@ -750,7 +754,12 @@ where
 
         // Check cancellation
         if cancel_token.is_some_and(|token| token.is_cancelled()) {
-            return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Cancelled archive for '{}' in workspace '{}' (attempt {})",
+                change_id,
+                workspace_path.display(),
+                attempt
+            )));
         }
 
         info!(
@@ -771,7 +780,13 @@ where
 
         // Wait for child process
         let status = child.wait().await.map_err(|e| {
-            OrchestratorError::AgentCommand(format!("Failed to wait for archive command: {}", e))
+            OrchestratorError::AgentCommand(format!(
+                "Failed to wait for archive command for '{}' in workspace '{}' (attempt {}): {}",
+                change_id,
+                workspace_path.display(),
+                attempt,
+                e
+            ))
         })?;
 
         // If archive command succeeded, delete the change directory

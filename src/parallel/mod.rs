@@ -402,12 +402,13 @@ impl ParallelExecutor {
 
         for group in groups {
             if self.is_cancelled() {
+                let cancel_msg = "Cancelled parallel execution";
                 send_event(
                     &self.event_tx,
-                    ParallelEvent::Log(LogEntry::warn("Parallel execution cancelled")),
+                    ParallelEvent::Log(LogEntry::warn(cancel_msg)),
                 )
                 .await;
-                return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+                return Err(OrchestratorError::AgentCommand(cancel_msg.to_string()));
             }
             let group_size = group.changes.len();
             self.execute_group(&group, total_changes, changes_processed)
@@ -481,12 +482,13 @@ impl ParallelExecutor {
 
         while !changes.is_empty() {
             if self.is_cancelled() {
+                let cancel_msg = "Cancelled parallel execution during reanalysis";
                 send_event(
                     &self.event_tx,
-                    ParallelEvent::Log(LogEntry::warn("Parallel execution cancelled")),
+                    ParallelEvent::Log(LogEntry::warn(cancel_msg)),
                 )
                 .await;
-                return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+                return Err(OrchestratorError::AgentCommand(cancel_msg.to_string()));
             }
 
             // Check dynamic queue for newly added changes (TUI mode)
@@ -671,12 +673,13 @@ impl ParallelExecutor {
         changes_processed: usize,
     ) -> Result<()> {
         if self.is_cancelled() {
+            let cancel_msg = "Cancelled parallel execution";
             send_event(
                 &self.event_tx,
-                ParallelEvent::Log(LogEntry::warn("Parallel execution cancelled")),
+                ParallelEvent::Log(LogEntry::warn(cancel_msg)),
             )
             .await;
-            return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+            return Err(OrchestratorError::AgentCommand(cancel_msg.to_string()));
         }
         // First, check which changes should be skipped due to failed dependencies
         let mut changes_to_execute: Vec<String> = Vec::new();

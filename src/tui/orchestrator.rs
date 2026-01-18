@@ -1131,12 +1131,13 @@ pub async fn run_orchestrator_parallel(
         // Execute batch using ParallelRunService with channel and shared queue state
         let result = tokio::select! {
             _ = cancel_token.cancelled() => {
+                let cancel_msg = "Cancelled parallel execution";
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::warn(
-                        "Parallel execution cancelled".to_string(),
+                        cancel_msg.to_string(),
                     )))
                     .await;
-                Err(crate::error::OrchestratorError::AgentCommand("Cancelled".to_string()))
+                Err(crate::error::OrchestratorError::AgentCommand(cancel_msg.to_string()))
             }
             result = batch_service.run_parallel_with_channel_and_queue_state(
                 batch_changes.clone(),

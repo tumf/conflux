@@ -579,7 +579,11 @@ where
 
         // Check cancellation
         if cancel_token.is_some_and(|token| token.is_cancelled()) {
-            return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Cancelled apply for '{}' in workspace '{}'",
+                change_id,
+                workspace_path.display()
+            )));
         }
 
         // Check max iterations
@@ -671,7 +675,13 @@ where
 
         // Wait for child process
         let status = child.wait().await.map_err(|e| {
-            OrchestratorError::AgentCommand(format!("Failed to wait for apply command: {}", e))
+            OrchestratorError::AgentCommand(format!(
+                "Failed to wait for apply command for '{}' in workspace '{}' (iteration {}): {}",
+                change_id,
+                workspace_path.display(),
+                iteration,
+                e
+            ))
         })?;
 
         // Record apply attempt for history
