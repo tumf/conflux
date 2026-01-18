@@ -11,3 +11,11 @@
 ## 3. 検証
 - [x] 3.1 変更に影響するテストを実行する（コマンド: cargo test）
 - [x] 3.2 解析/resolve ログにヘッダが表示されることを確認する（確認先: TUI ログパネル表示）
+
+
+## 4. Acceptance Failure Follow-up
+- [x] 4.1 Fix render.rs to display operation-only headers when change_id is absent (確認先: src/tui/render.rs:766-792)
+- [x] 4.2 Add unit test for analysis log header rendering (確認先: src/tui/render.rs or new test module)
+- [x] 4.3 Add unit test for resolve log header rendering (確認先: src/tui/render.rs or new test module)
+- [x] 4.4 Run all tests to verify fix (コマンド: cargo test)
+- [x] 4.5 Verify analysis log headers display correctly in TUI (確認先: manual TUI inspection or existing tests)

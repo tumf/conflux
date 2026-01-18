@@ -687,6 +687,23 @@ The TUI log panel SHALL support scrolling to view older log entries.
 - **THEN** log view scrolls down by a few lines (e.g., 3 lines)
 - **AND** if scroll position reaches the bottom, auto-scroll is re-enabled
 
+#### Scenario: Analysis log header includes iteration
+- **WHEN** the TUI receives analysis output logs with an iteration number
+- **THEN** the log entry header is displayed as `[analysis:<iteration>]`
+- **AND** the header is rendered even when no change_id is present
+
+#### Scenario: Analysis log header without iteration
+- **WHEN** the TUI receives analysis output logs without an iteration number
+- **THEN** the log entry header is displayed as `[analysis]`
+
+#### Scenario: Resolve log header includes change id and iteration
+- **WHEN** the TUI receives resolve output logs with change_id and iteration
+- **THEN** the log entry header is displayed as `[{change_id}:resolve:<iteration>]`
+
+#### Scenario: Resolve log header without iteration
+- **WHEN** the TUI receives resolve output logs with change_id but no iteration
+- **THEN** the log entry header is displayed as `[{change_id}:resolve]`
+
 ### Requirement: approve Subcommand
 
 The CLI SHALL provide an `approve` subcommand to manage change approval status.
