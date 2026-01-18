@@ -34,18 +34,8 @@ All file paths should be relative to the repository root.
 </system-context>
 "#;
 
-/// Default prompt for archive command - includes path context
-pub const DEFAULT_ARCHIVE_PROMPT: &str = r#"
-<system-context>
-IMPORTANT: You are running in the repository root directory.
-To archive the change, move the directory from:
-  openspec/changes/{change_id}/
-to:
-  openspec/specs/{change_id}/
-
-All file paths should be relative to the repository root.
-</system-context>
-"#;
+/// Default prompt for archive command - empty by default
+pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
 
 /// Default maximum iterations for the orchestration loop
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;

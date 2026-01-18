@@ -94,6 +94,10 @@ pub struct ParallelExecutor {
     /// Shared stagger state for resolve operations
     #[allow(dead_code)] // Reserved for future resolve integration
     shared_stagger_state: SharedStaggerState,
+    /// History of apply attempts per change for context injection
+    apply_history: Arc<Mutex<crate::history::ApplyHistory>>,
+    /// History of archive attempts per change for context injection
+    archive_history: Arc<Mutex<crate::history::ArchiveHistory>>,
 }
 
 pub async fn base_dirty_reason(repo_root: &Path) -> Result<Option<String>> {
@@ -226,6 +230,8 @@ impl ParallelExecutor {
             dynamic_queue: None,
             ai_runner,
             shared_stagger_state,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         }
     }
 
@@ -1445,6 +1451,9 @@ impl ParallelExecutor {
             let hooks = self.hooks.clone();
             let cancel_token = self.cancel_token.clone();
             let ai_runner = self.ai_runner.clone();
+            let repo_root = self.repo_root.clone();
+            let apply_history = self.apply_history.clone();
+            let archive_history = self.archive_history.clone();
 
             // Build parallel hook context
             let parallel_ctx = ParallelHookContext {
@@ -1475,6 +1484,8 @@ impl ParallelExecutor {
                     Some(&parallel_ctx),
                     cancel_token.as_ref(),
                     &ai_runner,
+                    &repo_root,
+                    &apply_history,
                 )
                 .await;
 
@@ -1508,6 +1519,8 @@ impl ParallelExecutor {
                             Some(&parallel_ctx),
                             cancel_token.as_ref(),
                             &ai_runner,
+                            &archive_history,
+                            &apply_history,
                         )
                         .await;
 
@@ -2329,6 +2342,8 @@ mod tests {
             dynamic_queue: None,
             ai_runner,
             shared_stagger_state,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         };
 
         assert_eq!(
@@ -2563,6 +2578,8 @@ mod tests {
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
             ai_runner,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
         };
 
@@ -2722,6 +2739,8 @@ mod tests {
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
             ai_runner,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
         };
 
@@ -2853,6 +2872,8 @@ mod tests {
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
             ai_runner,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
         };
 
@@ -3013,6 +3034,8 @@ mod tests {
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
             ai_runner,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
         };
 
@@ -3188,6 +3211,8 @@ mod tests {
             dynamic_queue: None,
             ai_runner,
             shared_stagger_state,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -3368,6 +3393,8 @@ mod tests {
             dynamic_queue: None,
             ai_runner,
             shared_stagger_state,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         };
 
         let revisions = vec![workspace_a.name];

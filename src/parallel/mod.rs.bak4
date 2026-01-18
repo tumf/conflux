@@ -2573,6 +2573,8 @@ mod tests {
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
             ai_runner,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
         };
 
@@ -2732,6 +2734,8 @@ mod tests {
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
             ai_runner,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
         };
 
@@ -2863,6 +2867,8 @@ mod tests {
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
             ai_runner,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
         };
 
