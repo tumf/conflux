@@ -135,6 +135,9 @@ pub const DEFAULT_ERROR_CIRCUIT_BREAKER_ENABLED: bool = true;
 /// Default threshold for consecutive same errors before opening circuit
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_THRESHOLD: usize = 5;
 
+/// Default maximum number of acceptance CONTINUE retries before treating as FAIL
+pub const DEFAULT_ACCEPTANCE_MAX_CONTINUES: u32 = 2;
+
 /// Generates a project slug from the repository root path.
 /// Format: `{repo_basename}-{hash8}` where hash8 is the first 8 chars of the SHA256 hash
 /// of the absolute repository path.
