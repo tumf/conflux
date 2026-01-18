@@ -14,14 +14,14 @@ use std::sync::Arc;
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
-    pub version: &'static str,
+    pub version: String,
 }
 
 /// Health check endpoint
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        version: env!("CARGO_PKG_VERSION"),
+        version: format!("v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER")),
     })
 }
 
