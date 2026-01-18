@@ -31,17 +31,13 @@ The apply system prompt (`APPLY_SYSTEM_PROMPT`) MUST explicitly state that the a
 - Agent continues iteration until MaxIteration is reached
 
 ### Requirement: Future Work restrictions MUST be strictly enforced
+Future Work への移動は、**人間の作業**、**外部システムのデプロイ/承認**、または**長時間待機が必要な検証**に限って許可されなければならない（MUST）。
 
-The apply system prompt MUST explicitly prohibit moving tasks to Future Work based on difficulty, regression risk, or need for additional testing (MUST NOT).
+面倒さ、難易度、テストの手間、回帰リスクなどを理由に Future Work へ移動してはならない（MUST NOT）。
 
-#### Scenario: Prohibit moving tasks to Future Work except for pre-marked items
-
-**Given:**
-- tasks.md contains high-difficulty items
-
-**When:**
-- apply agent determines implementation approach
-
-**Then:**
-- Agent does NOT move tasks to Future Work based solely on difficulty
-- Agent treats only tasks already marked with `(future work)` as Future Work
+#### Scenario: 人間作業や外部作業のみ Future Work へ移動する
+- **GIVEN** tasks.md に人間作業や外部デプロイが必要なタスクがある
+- **AND** tasks.md に難易度が高いが自動化可能なタスクがある
+- **WHEN** apply エージェントがタスクの扱いを判断する
+- **THEN** 人間作業や外部デプロイのタスクのみ Future Work に移動する
+- **AND** 自動化可能なタスクは Future Work に移動しない
