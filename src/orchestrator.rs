@@ -6,8 +6,9 @@ use crate::execution::apply::{check_task_progress, create_progress_commit, is_pr
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::{
-    acceptance_test_streaming, apply_change, archive_change, selection, AcceptanceResult,
-    ApplyContext, ApplyResult, ArchiveContext, ArchiveResult, LogOutputHandler,
+    acceptance_test_streaming, apply_change, archive_change, selection,
+    update_tasks_on_acceptance_failure, AcceptanceResult, ApplyContext, ApplyResult,
+    ArchiveContext, ArchiveResult, LogOutputHandler,
 };
 use crate::parallel_run_service::ParallelRunService;
 use crate::progress::ProgressDisplay;
@@ -541,10 +542,28 @@ impl Orchestrator {
                                         next.id,
                                         findings.len()
                                     );
+                                    // Update tasks.md with acceptance findings
+                                    if let Err(e) = update_tasks_on_acceptance_failure(
+                                        &next.id, &findings, None,
+                                    )
+                                    .await
+                                    {
+                                        warn!("Failed to update tasks.md for {}: {}", next.id, e);
+                                    }
                                     // Change will be selected again for apply in next iteration
                                 }
                                 Ok(AcceptanceResult::CommandFailed { error }) => {
                                     error!("Acceptance command failed for {}: {}", next.id, error);
+                                    // Update tasks.md with command failure
+                                    if let Err(e) = update_tasks_on_acceptance_failure(
+                                        &next.id,
+                                        std::slice::from_ref(&error),
+                                        None,
+                                    )
+                                    .await
+                                    {
+                                        warn!("Failed to update tasks.md for {}: {}", next.id, e);
+                                    }
                                     // Change will be selected again for apply in next iteration
                                 }
                                 Ok(AcceptanceResult::Cancelled) => {

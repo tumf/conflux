@@ -318,7 +318,9 @@ fn build_parallel_hook_context(
     ctx
 }
 
-/// Execute apply command in a single workspace, repeating until tasks are 100% complete
+/// Execute apply command in a single workspace, repeating until tasks are 100% complete.
+///
+/// Returns (revision, final_iteration_count) on success.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_apply_in_workspace(
     change_id: &str,
@@ -333,9 +335,10 @@ pub async fn execute_apply_in_workspace(
     ai_runner: &AiCommandRunner,
     repo_root: &Path,
     apply_history: &Arc<Mutex<crate::history::ApplyHistory>>,
-) -> Result<String> {
+    initial_iteration: u32,
+) -> Result<(String, u32)> {
     const MAX_ITERATIONS: u32 = 50;
-    let mut iteration = 0;
+    let mut iteration = initial_iteration;
     let mut first_apply = true;
     let mut apply_succeeded = false; // Track if all iterations succeeded
     let mut stall_detector = StallDetector::new(config.get_stall_detection());
@@ -826,7 +829,7 @@ pub async fn execute_apply_in_workspace(
         }
     };
 
-    Ok(revision)
+    Ok((revision, iteration))
 }
 
 /// Execute archive command in a workspace with streaming output
