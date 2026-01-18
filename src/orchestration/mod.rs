@@ -3,6 +3,7 @@
 //! This module provides common implementations for:
 //! - Archive operations
 //! - Apply operations
+//! - Acceptance test operations
 //! - State management
 //! - Hook context helpers
 //! - Change selection logic
@@ -13,6 +14,7 @@
 //! Note: Some items are currently unused as CLI/TUI integration is in progress.
 //! These will be used as the refactoring continues in subsequent phases.
 
+pub mod acceptance;
 pub mod apply;
 pub mod archive;
 pub mod hooks;
@@ -22,6 +24,8 @@ pub mod state;
 
 // Re-exports for convenient access.
 // Some exports are unused until TUI integration is complete.
+#[allow(unused_imports)]
+pub use acceptance::{acceptance_test_streaming, AcceptanceResult};
 #[allow(unused_imports)]
 pub use apply::{apply_change, apply_change_streaming, ApplyContext, ApplyResult};
 #[allow(unused_imports)]

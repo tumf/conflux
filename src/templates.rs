@@ -16,6 +16,9 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
   "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id} {prompt}'",
 
+  // Command to run acceptance tests after apply (supports {change_id} and {prompt} placeholders)
+  "acceptance_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/conflux:acceptance {change_id} {prompt}'",
+
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p {prompt}",
 
@@ -25,6 +28,10 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
 
   // System prompt for archive command (injected into {prompt} placeholder)
   "archive_prompt": "",
+
+  // System prompt for acceptance command (injected into {prompt} placeholder)
+  // Note: A hardcoded acceptance prompt is always prepended before this value
+  "acceptance_prompt": "",
 
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
@@ -66,6 +73,9 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
   "archive_command": "opencode run '/conflux:archive {change_id} {prompt}'",
 
+  // Command to run acceptance tests after apply (supports {change_id} and {prompt} placeholders)
+  "acceptance_command": "opencode run '/conflux:acceptance {change_id} {prompt}'",
+
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "opencode run {prompt}",
 
@@ -75,6 +85,10 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
 
   // System prompt for archive command (injected into {prompt} placeholder)
   "archive_prompt": "",
+
+  // System prompt for acceptance command (injected into {prompt} placeholder)
+  // Note: A hardcoded acceptance prompt is always prepended before this value
+  "acceptance_prompt": "",
 
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
@@ -116,6 +130,9 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
   "archive_command": "codex '/openspec:archive {change_id} {prompt}'",
 
+  // Command to run acceptance tests after apply (supports {change_id} and {prompt} placeholders)
+  "acceptance_command": "codex '/conflux:acceptance {change_id} {prompt}'",
+
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "codex {prompt}",
 
@@ -125,6 +142,10 @@ pub const CODEX_TEMPLATE: &str = r#"{
 
   // System prompt for archive command (injected into {prompt} placeholder)
   "archive_prompt": "",
+
+  // System prompt for acceptance command (injected into {prompt} placeholder)
+  // Note: A hardcoded acceptance prompt is always prepended before this value
+  "acceptance_prompt": "",
 
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,

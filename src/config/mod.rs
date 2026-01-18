@@ -127,10 +127,20 @@ pub struct OrchestratorConfig {
     #[serde(default)]
     pub analyze_command: Option<String>,
 
+    /// Command template for acceptance testing after apply.
+    /// Supports `{change_id}` and `{prompt}` placeholders.
+    #[serde(default)]
+    pub acceptance_command: Option<String>,
+
     /// System prompt for apply command.
     /// Injected into the `{prompt}` placeholder in apply_command.
     #[serde(default)]
     pub apply_prompt: Option<String>,
+
+    /// System prompt for acceptance command.
+    /// Injected into the `{prompt}` placeholder in acceptance_command.
+    #[serde(default)]
+    pub acceptance_prompt: Option<String>,
 
     /// System prompt for archive command.
     /// Injected into the `{prompt}` placeholder in archive_command.
@@ -279,6 +289,20 @@ impl OrchestratorConfig {
         self.archive_prompt
             .as_deref()
             .unwrap_or(DEFAULT_ARCHIVE_PROMPT)
+    }
+
+    /// Get the acceptance command, falling back to default if not set
+    pub fn get_acceptance_command(&self) -> &str {
+        self.acceptance_command
+            .as_deref()
+            .unwrap_or(DEFAULT_ACCEPTANCE_COMMAND)
+    }
+
+    /// Get the acceptance prompt, falling back to default if not set
+    pub fn get_acceptance_prompt(&self) -> &str {
+        self.acceptance_prompt
+            .as_deref()
+            .unwrap_or(DEFAULT_ACCEPTANCE_PROMPT)
     }
 
     /// Get the hooks configuration, returning default (empty) if not set
@@ -457,9 +481,10 @@ pub fn get_global_config_path() -> Option<PathBuf> {
 
 // Re-export commonly used items for convenience
 pub use defaults::{
-    DEFAULT_ANALYZE_COMMAND, DEFAULT_APPLY_COMMAND, DEFAULT_APPLY_PROMPT, DEFAULT_ARCHIVE_COMMAND,
-    DEFAULT_ARCHIVE_PROMPT, DEFAULT_MAX_CONCURRENT_WORKSPACES, DEFAULT_MAX_ITERATIONS,
-    GLOBAL_CONFIG_DIR, GLOBAL_CONFIG_FILE, PROJECT_CONFIG_FILE,
+    DEFAULT_ACCEPTANCE_COMMAND, DEFAULT_ACCEPTANCE_PROMPT, DEFAULT_ANALYZE_COMMAND,
+    DEFAULT_APPLY_COMMAND, DEFAULT_APPLY_PROMPT, DEFAULT_ARCHIVE_COMMAND, DEFAULT_ARCHIVE_PROMPT,
+    DEFAULT_MAX_CONCURRENT_WORKSPACES, DEFAULT_MAX_ITERATIONS, GLOBAL_CONFIG_DIR,
+    GLOBAL_CONFIG_FILE, PROJECT_CONFIG_FILE,
 };
 
 #[cfg(test)]
