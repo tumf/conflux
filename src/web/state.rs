@@ -2,8 +2,9 @@
 //!
 //! Provides thread-safe state access and broadcasting for WebSocket clients.
 
-use crate::events::ExecutionEvent;
+use crate::events::{ExecutionEvent, LogEntry};
 use crate::openspec::Change;
+use crate::tui::types::WorktreeInfo;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
 
@@ -17,6 +18,15 @@ pub struct StateUpdate {
     pub timestamp: String,
     /// List of changes with current status
     pub changes: Vec<ChangeStatus>,
+    /// Log entries (optional, sent with log events)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<Vec<LogEntry>>,
+    /// Worktree list (optional, sent with worktree refresh events)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktrees: Option<Vec<WorktreeInfo>>,
+    /// Application mode (optional, sent with mode change events)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_mode: Option<String>,
 }
 
 /// Change status for WebSocket updates
@@ -36,6 +46,9 @@ pub struct ChangeStatus {
     pub is_approved: bool,
     /// Dependencies on other changes
     pub dependencies: Vec<String>,
+    /// Queue status (for parallel/serial execution tracking)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_status: Option<String>,
 }
 
 impl From<&Change> for ChangeStatus {
@@ -56,6 +69,7 @@ impl From<&Change> for ChangeStatus {
             status: status.to_string(),
             is_approved: change.is_approved,
             dependencies: change.dependencies.clone(),
+            queue_status: None, // Set by event handlers based on execution state
         }
     }
 }
@@ -75,6 +89,12 @@ pub struct OrchestratorState {
     pub pending_changes: usize,
     /// Timestamp of last update
     pub last_updated: String,
+    /// Log entries (TUI-equivalent)
+    pub logs: Vec<LogEntry>,
+    /// Worktree list (TUI-equivalent)
+    pub worktrees: Vec<WorktreeInfo>,
+    /// Application mode (e.g., "select", "running", "stopped")
+    pub app_mode: String,
 }
 
 impl OrchestratorState {
@@ -102,6 +122,9 @@ impl OrchestratorState {
             pending_changes: pending,
             changes: change_statuses,
             last_updated: chrono::Utc::now().to_rfc3339(),
+            logs: Vec::new(),
+            worktrees: Vec::new(),
+            app_mode: "select".to_string(),
         }
     }
 }
@@ -196,33 +219,64 @@ impl WebState {
 
     /// Apply an execution event to the web state and broadcast updates.
     pub async fn apply_execution_event(&self, event: &ExecutionEvent) {
-        let mut changes_snapshot = None;
+        let mut broadcast_update = None;
 
         {
             let mut state = self.state.write().await;
             let mut updated = false;
+            let mut log_broadcast = None;
+            let mut worktree_broadcast = None;
+            let mut mode_broadcast = None;
 
             match event {
+                // Lifecycle events
                 ExecutionEvent::ProcessingStarted(change_id) => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
                         change.status = "in_progress".to_string();
+                        change.queue_status = Some("processing".to_string());
                         change.progress_percent =
                             progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
                     }
+                    state.app_mode = "running".to_string();
+                    mode_broadcast = Some("running".to_string());
                 }
-                ExecutionEvent::ProcessingCompleted(change_id)
-                | ExecutionEvent::ChangeArchived(change_id) => {
+                ExecutionEvent::ProcessingCompleted(change_id) => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
                         if change.completed_tasks < change.total_tasks {
                             change.completed_tasks = change.total_tasks;
                         }
                         change.status = "complete".to_string();
+                        change.queue_status = Some("completed".to_string());
                         change.progress_percent =
                             progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
                     }
                 }
+                ExecutionEvent::ProcessingError { id, error } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *id) {
+                        change.status = "error".to_string();
+                        change.queue_status = Some(format!("error: {}", error));
+                        updated = true;
+                    }
+                }
+
+                // Archive events
+                ExecutionEvent::ArchiveStarted(change_id) => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.queue_status = Some("archiving".to_string());
+                        updated = true;
+                    }
+                }
+                ExecutionEvent::ChangeArchived(change_id) => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.status = "archived".to_string();
+                        change.queue_status = Some("archived".to_string());
+                        updated = true;
+                    }
+                }
+
+                // Progress events
                 ExecutionEvent::ProgressUpdated {
                     change_id,
                     completed,
@@ -236,17 +290,114 @@ impl WebState {
                         updated = true;
                     }
                 }
+
+                // Merge events
+                ExecutionEvent::MergeCompleted { change_id, .. } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.queue_status = Some("merged".to_string());
+                        updated = true;
+                    }
+                }
+                ExecutionEvent::ResolveStarted { change_id } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.queue_status = Some("resolving".to_string());
+                        updated = true;
+                    }
+                }
+                ExecutionEvent::ResolveCompleted { change_id, .. } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.queue_status = Some("completed".to_string());
+                        updated = true;
+                    }
+                }
+                ExecutionEvent::ResolveFailed { change_id, error } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.queue_status = Some(format!("error: {}", error));
+                        updated = true;
+                    }
+                }
+
+                // Log events
+                ExecutionEvent::Log(log_entry) => {
+                    state.logs.push(log_entry.clone());
+                    // Keep only recent logs (last 1000 entries)
+                    let logs_len = state.logs.len();
+                    if logs_len > 1000 {
+                        state.logs.drain(0..(logs_len - 1000));
+                    }
+                    log_broadcast = Some(vec![log_entry.clone()]);
+                }
+
+                // Changes refresh events
+                ExecutionEvent::ChangesRefreshed {
+                    changes,
+                    committed_change_ids,
+                    worktree_change_ids,
+                } => {
+                    // Update changes with new data
+                    let mut new_change_statuses: Vec<ChangeStatus> =
+                        changes.iter().map(ChangeStatus::from).collect();
+
+                    // Preserve queue_status from existing state where applicable
+                    for new_change in &mut new_change_statuses {
+                        if let Some(existing) = state.changes.iter().find(|c| c.id == new_change.id)
+                        {
+                            new_change.queue_status = existing.queue_status.clone();
+                        }
+                    }
+
+                    state.changes = new_change_statuses;
+                    refresh_summary(&mut state);
+                    updated = true;
+
+                    // Store metadata for parallel eligibility tracking
+                    // (This would be used if we track parallel eligibility in web state)
+                    let _ = (committed_change_ids, worktree_change_ids);
+                }
+
+                // Worktree refresh events
+                ExecutionEvent::WorktreesRefreshed { worktrees } => {
+                    state.worktrees = worktrees.clone();
+                    worktree_broadcast = Some(worktrees.clone());
+                }
+
+                // Completion events
+                ExecutionEvent::Stopped => {
+                    state.app_mode = "stopped".to_string();
+                    mode_broadcast = Some("stopped".to_string());
+                }
+                ExecutionEvent::AllCompleted => {
+                    state.app_mode = "select".to_string();
+                    mode_broadcast = Some("select".to_string());
+                }
+
                 _ => {}
             }
 
             if updated {
                 refresh_summary(&mut state);
-                changes_snapshot = Some(state.changes.clone());
+            }
+
+            // Prepare broadcast message
+            if updated
+                || log_broadcast.is_some()
+                || worktree_broadcast.is_some()
+                || mode_broadcast.is_some()
+            {
+                broadcast_update = Some(StateUpdate {
+                    msg_type: "state_update".to_string(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    changes: state.changes.clone(),
+                    logs: log_broadcast,
+                    worktrees: worktree_broadcast,
+                    app_mode: mode_broadcast,
+                });
             }
         }
 
-        if let Some(changes) = changes_snapshot {
-            self.broadcast_snapshot(changes);
+        // Broadcast outside the lock
+        if let Some(update) = broadcast_update {
+            let _ = self.tx.send(update);
         }
     }
 
@@ -255,6 +406,9 @@ impl WebState {
             msg_type: "state_update".to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
             changes,
+            logs: None,
+            worktrees: None,
+            app_mode: None,
         };
 
         let _ = self.tx.send(update);

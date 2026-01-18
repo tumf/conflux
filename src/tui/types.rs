@@ -3,6 +3,7 @@
 //! Contains enums and basic structs used throughout the TUI.
 
 use ratatui::style::Color;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// View mode for TUI navigation
@@ -106,7 +107,7 @@ impl QueueStatus {
 }
 
 /// Information about a git worktree
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorktreeInfo {
     /// Path to the worktree
     pub path: PathBuf,
@@ -177,7 +178,7 @@ impl WorktreeInfo {
 }
 
 /// Merge conflict information for a worktree
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MergeConflictInfo {
     /// List of files with merge conflicts
     pub conflict_files: Vec<String>,

@@ -11,11 +11,13 @@ use std::sync::OnceLock;
 use chrono::Local;
 use ratatui::style::Color;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::debug;
 
 /// Log level for TUI logs
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Info,
     Success,
@@ -24,13 +26,14 @@ pub enum LogLevel {
 }
 
 /// Log entry for the TUI
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     /// Timestamp
     pub timestamp: String,
     /// Log message
     pub message: String,
-    /// Log level color
+    /// Log level color (serialized as RGB string for web)
+    #[serde(skip)]
     pub color: Color,
     /// Log level
     pub level: LogLevel,
