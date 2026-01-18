@@ -340,6 +340,8 @@ pub enum ExecutionEvent {
         changes: Vec<crate::openspec::Change>,
         committed_change_ids: std::collections::HashSet<String>,
         worktree_change_ids: std::collections::HashSet<String>,
+        /// Map of change_id to worktree path for active worktrees
+        worktree_paths: std::collections::HashMap<String, std::path::PathBuf>,
     },
     /// Worktrees list refreshed (for worktree view)
     WorktreesRefreshed {
