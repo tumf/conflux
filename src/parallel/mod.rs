@@ -2063,11 +2063,258 @@ impl ParallelExecutor {
                 // Create agent for this workspace
                 let mut agent = AgentRunner::new(config.clone());
 
-                // Step 1: Execute apply
-                let apply_result = execute_apply_in_workspace(
+                // Track apply+acceptance cycles to prevent infinite loops
+                const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
+                let mut cycle_count = 0u32;
+                let mut cumulative_iteration = 0u32; // Track total apply iterations across all cycles
+
+                // Apply+Acceptance loop: retry apply when acceptance fails
+                let _apply_revision = loop {
+                    cycle_count += 1;
+                    if cycle_count > MAX_APPLY_ACCEPTANCE_CYCLES {
+                        error!(
+                            "Max apply+acceptance cycles ({}) reached for {}",
+                            MAX_APPLY_ACCEPTANCE_CYCLES, change_id
+                        );
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name,
+                            final_revision: None,
+                            error: Some(format!(
+                                "Max apply+acceptance cycles ({}) reached",
+                                MAX_APPLY_ACCEPTANCE_CYCLES
+                            )),
+                        };
+                    }
+
+                    // Step 1: Execute apply with cumulative iteration count
+                    let apply_result = execute_apply_in_workspace(
+                        &change_id,
+                        &workspace_path,
+                        &apply_cmd,
+                        &config,
+                        event_tx.clone(),
+                        vcs_backend,
+                        hooks.as_ref().map(|h| h.as_ref()),
+                        Some(&parallel_ctx),
+                        cancel_token.as_ref(),
+                        &ai_runner,
+                        &repo_root,
+                        &apply_history,
+                        cumulative_iteration, // Pass current iteration count
+                    )
+                    .await;
+
+                    let (revision, final_iteration) = match apply_result {
+                        Ok((rev, iter)) => (rev, iter),
+                        Err(e) => {
+                            // Apply failed - return error immediately
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name,
+                                final_revision: None,
+                                error: Some(format!("Apply failed: {}", e)),
+                            };
+                        }
+                    };
+
+                    // Update cumulative iteration count
+                    cumulative_iteration = final_iteration;
+
+                    // Send ApplyCompleted event
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::ApplyCompleted {
+                                change_id: change_id.clone(),
+                                revision: revision.clone(),
+                            })
+                            .await;
+                    }
+
+                    // Step 2: Execute acceptance test after apply succeeds
+                    info!(
+                        "Running acceptance test for {} after apply completion (cycle {})",
+                        change_id, cycle_count
+                    );
+                    let acceptance_result = execute_acceptance_in_workspace(
+                        &change_id,
+                        &workspace_path,
+                        &mut agent,
+                        event_tx.clone(),
+                        cancel_token.as_ref(),
+                    )
+                    .await;
+
+                    match acceptance_result {
+                        Ok(crate::orchestration::AcceptanceResult::Pass) => {
+                            info!("Acceptance passed for {}, proceeding to archive", change_id);
+                            // Break out of loop, proceed to archive
+                            break revision;
+                        }
+                        Ok(crate::orchestration::AcceptanceResult::Continue) => {
+                            let continue_count = agent.count_consecutive_acceptance_continues(&change_id);
+                            let max_continues = config.get_acceptance_max_continues();
+
+                            if continue_count >= max_continues {
+                                warn!(
+                                    "Acceptance CONTINUE limit ({}) exceeded for {} (cycle {}), treating as FAIL",
+                                    max_continues, change_id, cycle_count
+                                );
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(
+                                            LogEntry::warn(format!(
+                                                "Acceptance CONTINUE limit exceeded (cycle {}), change will not be archived",
+                                                cycle_count
+                                            ))
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance"),
+                                        ))
+                                        .await;
+                                }
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name,
+                                    final_revision: None,
+                                    error: Some(format!(
+                                        "Acceptance CONTINUE limit ({}) exceeded",
+                                        max_continues
+                                    )),
+                                };
+                            } else {
+                                info!(
+                                    "Acceptance requires continuation for {} (attempt {}/{}, cycle {}), retrying acceptance",
+                                    change_id,
+                                    continue_count,
+                                    max_continues,
+                                    cycle_count
+                                );
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(
+                                            LogEntry::info(format!(
+                                                "Acceptance requires continuation (attempt {}/{}, cycle {}), retrying",
+                                                continue_count,
+                                                max_continues,
+                                                cycle_count
+                                            ))
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance"),
+                                        ))
+                                        .await;
+                                }
+                                // Continue the acceptance loop - retry acceptance without re-applying
+                                continue;
+                            }
+                        }
+                        Ok(crate::orchestration::AcceptanceResult::Fail { findings }) => {
+                            warn!(
+                                "Acceptance failed for {} with {} findings (cycle {}), returning to apply loop",
+                                change_id,
+                                findings.len(),
+                                cycle_count
+                            );
+                            // Update tasks.md with acceptance findings
+                            if let Err(e) =
+                                crate::orchestration::update_tasks_on_acceptance_failure(
+                                    &change_id,
+                                    &findings,
+                                    Some(&workspace_path),
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "Failed to update tasks.md for {}: {}",
+                                    change_id, e
+                                );
+                            }
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::Log(
+                                        LogEntry::warn(format!(
+                                            "Acceptance failed with {} findings, returning to apply loop (cycle {})",
+                                            findings.len(),
+                                            cycle_count
+                                        ))
+                                        .with_change_id(&change_id)
+                                        .with_operation("acceptance"),
+                                    ))
+                                    .await;
+                            }
+                            // Continue loop - retry apply with updated tasks
+                            continue;
+                        }
+                        Ok(crate::orchestration::AcceptanceResult::CommandFailed { error }) => {
+                            error!(
+                                "Acceptance command failed for {} (cycle {}): {}",
+                                change_id, cycle_count, error
+                            );
+                            // Update tasks.md with command failure
+                            if let Err(e) =
+                                crate::orchestration::update_tasks_on_acceptance_failure(
+                                    &change_id,
+                                    std::slice::from_ref(&error),
+                                    Some(&workspace_path),
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "Failed to update tasks.md for {}: {}",
+                                    change_id, e
+                                );
+                            }
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::Log(
+                                        LogEntry::error(format!(
+                                            "Acceptance command failed (cycle {}): {}",
+                                            cycle_count, error
+                                        ))
+                                        .with_change_id(&change_id)
+                                        .with_operation("acceptance"),
+                                    ))
+                                    .await;
+                            }
+                            // Command failed - this is a critical error, don't retry
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name,
+                                final_revision: None,
+                                error: Some(format!("Acceptance command failed: {}", error)),
+                            };
+                        }
+                        Ok(crate::orchestration::AcceptanceResult::Cancelled) => {
+                            info!("Acceptance cancelled for {}", change_id);
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name,
+                                final_revision: None,
+                                error: Some("Acceptance cancelled".to_string()),
+                            };
+                        }
+                        Err(e) => {
+                            error!("Acceptance error for {}: {}", change_id, e);
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name,
+                                final_revision: None,
+                                error: Some(format!("Acceptance error: {}", e)),
+                            };
+                        }
+                    }
+                };
+
+                // Step 3: Execute archive after acceptance passes
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::ArchiveStarted(change_id.clone()))
+                        .await;
+                }
+
+                let archive_result = execute_archive_in_workspace(
                     &change_id,
                     &workspace_path,
-                    &apply_cmd,
+                    &archive_cmd,
                     &config,
                     event_tx.clone(),
                     vcs_backend,
@@ -2075,245 +2322,44 @@ impl ParallelExecutor {
                     Some(&parallel_ctx),
                     cancel_token.as_ref(),
                     &ai_runner,
-                    &repo_root,
+                    &archive_history,
                     &apply_history,
                 )
                 .await;
 
-                match apply_result {
-                    Ok(apply_revision) => {
-                        // Send ApplyCompleted event
+                match archive_result {
+                    Ok(archive_revision) => {
+                        // Clear acceptance history after successful archive
+                        agent.clear_acceptance_history(&change_id);
+
                         if let Some(ref tx) = event_tx {
                             let _ = tx
-                                .send(ParallelEvent::ApplyCompleted {
-                                    change_id: change_id.clone(),
-                                    revision: apply_revision.clone(),
-                                })
-                                .await;
-                        }
-
-                        // Step 2: Execute acceptance test after apply succeeds
-                        info!("Running acceptance test for {} after apply completion", change_id);
-                        let acceptance_result = execute_acceptance_in_workspace(
-                            &change_id,
-                            &workspace_path,
-                            &mut agent,
-                            event_tx.clone(),
-                            cancel_token.as_ref(),
-                        )
-                        .await;
-
-                        match acceptance_result {
-                            Ok(crate::orchestration::AcceptanceResult::Pass) => {
-                                info!("Acceptance passed for {}, proceeding to archive", change_id);
-                                // Continue to archive
-                            }
-                            Ok(crate::orchestration::AcceptanceResult::Continue) => {
-                                let continue_count =
-                                    agent.count_consecutive_acceptance_continues(&change_id);
-                                let max_continues = config.get_acceptance_max_continues();
-
-                                if continue_count >= max_continues {
-                                    warn!(
-                                        "Acceptance CONTINUE limit ({}) exceeded for {}, treating as FAIL",
-                                        max_continues, change_id
-                                    );
-                                    if let Some(ref tx) = event_tx {
-                                        let _ = tx
-                                            .send(ParallelEvent::Log(
-                                                LogEntry::warn(
-                                                    "Acceptance CONTINUE limit exceeded, change will not be archived".to_string()
-                                                )
-                                                .with_change_id(&change_id)
-                                                .with_operation("acceptance"),
-                                            ))
-                                            .await;
-                                    }
-                                    return WorkspaceResult {
-                                        change_id,
-                                        workspace_name,
-                                        final_revision: None,
-                                        error: Some(format!(
-                                            "Acceptance CONTINUE limit ({}) exceeded",
-                                            max_continues
-                                        )),
-                                    };
-                                } else {
-                                    info!(
-                                        "Acceptance requires continuation for {} (attempt {}/{}), not proceeding to archive",
-                                        change_id,
-                                        continue_count,
-                                        max_continues
-                                    );
-                                    if let Some(ref tx) = event_tx {
-                                        let _ = tx
-                                            .send(ParallelEvent::Log(
-                                                LogEntry::info(format!(
-                                                    "Acceptance requires continuation (attempt {}/{}), change will not be archived",
-                                                    continue_count,
-                                                    max_continues
-                                                ))
-                                                .with_change_id(&change_id)
-                                                .with_operation("acceptance"),
-                                            ))
-                                            .await;
-                                    }
-                                    return WorkspaceResult {
-                                        change_id,
-                                        workspace_name,
-                                        final_revision: None,
-                                        error: Some(format!(
-                                            "Acceptance requires continuation (attempt {}/{})",
-                                            continue_count,
-                                            max_continues
-                                        )),
-                                    };
-                                }
-                            }
-                            Ok(crate::orchestration::AcceptanceResult::Fail { findings }) => {
-                                warn!(
-                                    "Acceptance failed for {} with {} findings",
-                                    change_id,
-                                    findings.len()
-                                );
-                                if let Some(ref tx) = event_tx {
-                                    let _ = tx
-                                        .send(ParallelEvent::Log(
-                                            LogEntry::warn(format!(
-                                                "Acceptance failed with {} findings, change will not be archived",
-                                                findings.len()
-                                            ))
-                                            .with_change_id(&change_id)
-                                            .with_operation("acceptance"),
-                                        ))
-                                        .await;
-                                }
-                                // Return error result - do not proceed to archive
-                                return WorkspaceResult {
-                                    change_id,
-                                    workspace_name,
-                                    final_revision: None,
-                                    error: Some(format!(
-                                        "Acceptance failed with {} findings",
-                                        findings.len()
-                                    )),
-                                };
-                            }
-                            Ok(crate::orchestration::AcceptanceResult::CommandFailed { error }) => {
-                                error!("Acceptance command failed for {}: {}", change_id, error);
-                                if let Some(ref tx) = event_tx {
-                                    let _ = tx
-                                        .send(ParallelEvent::Log(
-                                            LogEntry::error(format!(
-                                                "Acceptance command failed: {}",
-                                                error
-                                            ))
-                                            .with_change_id(&change_id)
-                                            .with_operation("acceptance"),
-                                        ))
-                                        .await;
-                                }
-                                return WorkspaceResult {
-                                    change_id,
-                                    workspace_name,
-                                    final_revision: None,
-                                    error: Some(format!("Acceptance command failed: {}", error)),
-                                };
-                            }
-                            Ok(crate::orchestration::AcceptanceResult::Cancelled) => {
-                                info!("Acceptance cancelled for {}", change_id);
-                                return WorkspaceResult {
-                                    change_id,
-                                    workspace_name,
-                                    final_revision: None,
-                                    error: Some("Acceptance cancelled".to_string()),
-                                };
-                            }
-                            Err(e) => {
-                                error!("Acceptance error for {}: {}", change_id, e);
-                                return WorkspaceResult {
-                                    change_id,
-                                    workspace_name,
-                                    final_revision: None,
-                                    error: Some(format!("Acceptance error: {}", e)),
-                                };
-                            }
-                        }
-
-                        // Step 3: Execute archive after acceptance passes
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx
-                                .send(ParallelEvent::ArchiveStarted(change_id.clone()))
-                                .await;
-                        }
-
-                        let archive_result = execute_archive_in_workspace(
-                            &change_id,
-                            &workspace_path,
-                            &archive_cmd,
-                            &config,
-                            event_tx.clone(),
-                            vcs_backend,
-                            hooks.as_ref().map(|h| h.as_ref()),
-                            Some(&parallel_ctx),
-                            cancel_token.as_ref(),
-                            &ai_runner,
-                            &archive_history,
-                            &apply_history,
-                        )
-                        .await;
-
-                        match archive_result {
-                            Ok(archive_revision) => {
-                                // Clear acceptance history after successful archive
-                                agent.clear_acceptance_history(&change_id);
-
-                                if let Some(ref tx) = event_tx {
-                                    let _ = tx
-                                        .send(ParallelEvent::ChangeArchived(change_id.clone()))
-                                        .await;
-                                }
-                                WorkspaceResult {
-                                    change_id,
-                                    workspace_name,
-                                    final_revision: Some(archive_revision),
-                                    error: None,
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Archive failed for {}: {}", change_id, e);
-                                if let Some(ref tx) = event_tx {
-                                    let _ = tx
-                                        .send(ParallelEvent::ArchiveFailed {
-                                            change_id: change_id.clone(),
-                                            error: e.to_string(),
-                                        })
-                                        .await;
-                                }
-                                // Archive failed - do not merge unarchived changes
-                                WorkspaceResult {
-                                    change_id,
-                                    workspace_name,
-                                    final_revision: None,
-                                    error: Some(format!("Archive failed: {}", e)),
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx
-                                .send(ParallelEvent::ApplyFailed {
-                                    change_id: change_id.clone(),
-                                    error: e.to_string(),
-                                })
+                                .send(ParallelEvent::ChangeArchived(change_id.clone()))
                                 .await;
                         }
                         WorkspaceResult {
                             change_id,
                             workspace_name,
+                            final_revision: Some(archive_revision),
+                            error: None,
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Archive failed for {}: {}", change_id, e);
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::ArchiveFailed {
+                                    change_id: change_id.clone(),
+                                    error: e.to_string(),
+                                })
+                                .await;
+                        }
+                        // Archive failed - do not merge unarchived changes
+                        WorkspaceResult {
+                            change_id,
+                            workspace_name,
                             final_revision: None,
-                            error: Some(e.to_string()),
+                            error: Some(format!("Archive failed: {}", e)),
                         }
                     }
                 }

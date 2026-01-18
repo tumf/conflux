@@ -170,6 +170,7 @@ pub enum ExecutionEvent {
         revision: String,
     },
     /// Apply failed in a workspace
+    #[allow(dead_code)]
     ApplyFailed { change_id: String, error: String },
     /// Apply output (summary of command output)
     #[allow(dead_code)]
