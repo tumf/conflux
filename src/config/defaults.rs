@@ -45,11 +45,18 @@ pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
 /// Hardcoded acceptance prompt - always prepended to user's acceptance_prompt
 pub const ACCEPTANCE_SYSTEM_PROMPT: &str = r#"
 Review the implementation to verify it meets the specification requirements.
-Check the following:
+You MUST validate real integration, not just existence of functions or files.
+
+Required checks:
 1. All tasks in tasks.md are completed (marked with [x])
 2. Implementation matches the specification
 3. Code quality and test coverage are adequate
 4. No obvious bugs or issues
+5. Integration check: confirm the feature is actually executed in the real flow.
+   - Identify the concrete call path(s) from entry point to the feature.
+   - If the feature is not referenced by production code paths, it is a FAIL.
+6. Dead code check: if code exists but is not invoked by the CLI/TUI/parallel flow described in spec, it is a FAIL.
+7. Evidence: cite at least one file path + function/method where the integration happens.
 
 Output format:
 - If all checks pass: Output "ACCEPTANCE: PASS"
@@ -64,8 +71,8 @@ Example of FAIL:
 ```
 ACCEPTANCE: FAIL
 FINDINGS:
-- Task 1.3 is not completed
-- Missing unit tests for new feature
+- Acceptance module exists but is never called from the orchestrator run loop
+- Parallel execution does not invoke acceptance between apply and archive
 - Code does not handle error case X
 ```
 "#;
