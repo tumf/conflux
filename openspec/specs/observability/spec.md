@@ -8,9 +8,7 @@ The specification covers:
 - Command execution logging (VCS, AI agents, hooks)
 - TUI log synchronization to debug files
 - Log level classification and formatting standards
-
 ## Requirements
-
 ### Requirement: REQ-OBS-001 Command Execution Logging
 
 The orchestrator MUST log command information before executing external commands (`tokio::process::Command`, `std::process::Command`).
@@ -142,3 +140,14 @@ Context information MUST include:
 - **WHEN** the error is displayed in both TUI and log files
 - **THEN** the TUI event message and the log message contain identical context information
 - **AND** both include the operation type, change ID, and workspace path
+
+### Requirement: REQ-OBS-005 TUI Input Rejection Logging
+
+The orchestrator MUST log warning messages when user input is ignored in the TUI to help users understand why their actions had no effect.
+
+#### Scenario: Enter Key Ignored in Worktrees View
+
+- **GIVEN** the TUI is displaying the Worktrees view
+- **WHEN** the Enter key is pressed but ignored due to missing conditions
+- **THEN** a warning log is displayed with a message explaining the rejection reason
+- **AND** the message enables the user to determine the required conditions
