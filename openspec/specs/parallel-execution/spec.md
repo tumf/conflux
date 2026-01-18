@@ -117,6 +117,7 @@ The acceptance prompt MUST include a hardcoded acceptance prompt followed by con
 - Task updates MUST either add a new follow-up task or uncheck a previously completed task that must be revisited.
 - The acceptance failure reason MUST be recorded in tasks.md together with the task update.
 - The apply loop MUST resume with the same iteration counter value (no reset) after acceptance failure.
+When resuming a workspace that has not completed archive, the orchestrator SHALL re-run acceptance before starting archive, even if tasks are already complete.
 
 #### Scenario: Parallel acceptance failure returns to apply loop with task updates
 - **GIVEN** a change completes an apply iteration successfully in parallel mode
@@ -124,6 +125,18 @@ The acceptance prompt MUST include a hardcoded acceptance prompt followed by con
 - **THEN** the orchestrator updates tasks.md with a follow-up task or unchecks a completed task
 - **AND** the acceptance failure reason is recorded in tasks.md
 - **AND** the orchestrator returns the change to the apply loop without resetting the iteration counter
+
+#### Scenario: Resume forces acceptance before archive
+- **GIVEN** a workspace is resumed after interruption
+- **AND** archive is not yet complete for the change
+- **WHEN** the orchestrator resumes processing
+- **THEN** acceptance_command is executed before any archive command
+
+**Implementation Notes:**
+- Acceptance results are not persisted across orchestrator sessions
+- When resuming in `Applied` or `Archiving` states, acceptance must re-run before archive
+- This ensures quality checks are not skipped even if acceptance completed before interruption
+- Acceptance history is cleared after successful archive to prevent history bloat
 
 ### Requirement: Parallel apply runs in worktree
 parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。

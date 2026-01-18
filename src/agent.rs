@@ -427,6 +427,12 @@ impl AgentRunner {
         self.acceptance_history.count(change_id) + 1
     }
 
+    /// Get the count of consecutive CONTINUE attempts for a change.
+    pub fn count_consecutive_acceptance_continues(&self, change_id: &str) -> u32 {
+        self.acceptance_history
+            .count_consecutive_continues(change_id)
+    }
+
     /// Run archive command for the given change ID (blocking, no streaming)
     pub async fn run_archive(&self, change_id: &str) -> Result<ExitStatus> {
         let template = self.config.get_archive_command();

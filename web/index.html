@@ -25,6 +25,19 @@
 
         <div id="toast-container" class="toast-container" aria-live="assertive"></div>
 
+        <section class="overall-progress" id="overall-progress" aria-label="Overall Progress">
+            <h2 class="overall-progress-title">Overall Progress</h2>
+            <div class="overall-progress-bar-container">
+                <div class="overall-progress-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
+                    <div class="overall-progress-fill" id="overall-progress-fill" style="width: 0%"></div>
+                </div>
+                <div class="overall-progress-text">
+                    <span id="overall-progress-tasks">0 / 0 tasks</span>
+                    <span id="overall-progress-percent">0%</span>
+                </div>
+            </div>
+        </section>
+
         <section class="stats-bar" id="stats-bar" aria-label="Statistics">
             <div class="stat">
                 <span class="stat-value" id="total-changes" aria-label="Total changes">-</span>

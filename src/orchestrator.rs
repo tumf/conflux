@@ -536,6 +536,27 @@ impl Orchestrator {
                                     info!("Acceptance passed for {}, ready for archive", next.id);
                                     // Change will be archived in next iteration
                                 }
+                                Ok(AcceptanceResult::Continue) => {
+                                    let continue_count =
+                                        self.agent.count_consecutive_acceptance_continues(&next.id);
+                                    let max_continues = self.config.get_acceptance_max_continues();
+
+                                    if continue_count >= max_continues {
+                                        warn!(
+                                            "Acceptance CONTINUE limit ({}) exceeded for {}, treating as FAIL",
+                                            max_continues, next.id
+                                        );
+                                        // Exceeded limit - treat as FAIL and return to apply loop
+                                    } else {
+                                        info!(
+                                            "Acceptance requires continuation for {} (attempt {}/{}), retrying...",
+                                            next.id,
+                                            continue_count,
+                                            max_continues
+                                        );
+                                        // Will retry acceptance in next iteration
+                                    }
+                                }
                                 Ok(AcceptanceResult::Fail { findings }) => {
                                     warn!(
                                         "Acceptance failed for {} with {} findings, will retry apply",

@@ -20,6 +20,8 @@ pub enum AcceptanceResult {
     Pass,
     /// Acceptance failed - must return to apply loop.
     Fail { findings: Vec<String> },
+    /// Acceptance requires more investigation - retry acceptance.
+    Continue,
     /// Acceptance command execution failed (non-zero exit).
     CommandFailed { error: String },
     /// Acceptance was cancelled (e.g., by user or timeout).
@@ -145,6 +147,21 @@ where
             agent.record_acceptance_attempt(&change.id, attempt);
             output.on_success("Acceptance test passed");
             Ok(AcceptanceResult::Pass)
+        }
+        ParseResult::Continue => {
+            info!("Acceptance requires continuation for: {}", change.id);
+            let attempt = AcceptanceAttempt {
+                attempt: agent.next_acceptance_attempt_number(&change.id),
+                passed: false,
+                duration: start_time.elapsed(),
+                findings: Some(vec!["Investigation incomplete - continue later".to_string()]),
+                exit_code: status.code(),
+                stdout_tail,
+                stderr_tail,
+            };
+            agent.record_acceptance_attempt(&change.id, attempt);
+            output.on_info("Acceptance test requires continuation");
+            Ok(AcceptanceResult::Continue)
         }
         ParseResult::Fail { findings } => {
             info!(
