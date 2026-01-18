@@ -1389,12 +1389,14 @@ impl ParallelExecutor {
                     continue;
                 }
                 WorkspaceState::Archiving => {
-                    // Archive files moved but commit not complete - go to archive loop
+                    // Archive files moved but commit not complete
+                    // IMPORTANT: Must run acceptance before committing archive
+                    // Acceptance results are not persisted, so we must re-run on resume
                     let workspace = existing_workspace.unwrap();
                     cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
 
                     info!(
-                        "Change '{}' in archiving state (files moved, commit incomplete) in workspace '{}', proceeding to archive",
+                        "Change '{}' in archiving state (files moved, commit incomplete) in workspace '{}', running acceptance before archive commit",
                         change_id, workspace.name
                     );
 
@@ -1407,6 +1409,95 @@ impl ParallelExecutor {
                     )
                     .await;
 
+                    // Step 1: Run acceptance test before archive commit
+                    let mut agent = AgentRunner::new(self.config.clone());
+                    info!(
+                        "Running acceptance test for {} before archive (resume)",
+                        change_id
+                    );
+                    let acceptance_result = execute_acceptance_in_workspace(
+                        change_id,
+                        &workspace.path,
+                        &mut agent,
+                        self.event_tx.clone(),
+                        self.cancel_token.as_ref(),
+                    )
+                    .await;
+
+                    // Handle acceptance result
+                    match acceptance_result {
+                        Ok(crate::orchestration::AcceptanceResult::Pass) => {
+                            info!(
+                                "Acceptance passed for {} on resume, proceeding to archive commit",
+                                change_id
+                            );
+                            // Continue to archive commit below
+                        }
+                        Ok(crate::orchestration::AcceptanceResult::Fail { findings }) => {
+                            warn!(
+                                "Acceptance failed for {} with {} findings on resume, will not commit archive",
+                                change_id,
+                                findings.len()
+                            );
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::Log(
+                                    LogEntry::warn(format!(
+                                        "Acceptance failed with {} findings on resume, archive will not be committed. Change needs to return to apply loop.",
+                                        findings.len()
+                                    ))
+                                    .with_change_id(change_id)
+                                    .with_operation("acceptance"),
+                                ),
+                            )
+                            .await;
+                            // Add to changes_for_apply to retry the full cycle
+                            changes_for_apply.push(change_id.clone());
+                            continue;
+                        }
+                        Ok(crate::orchestration::AcceptanceResult::CommandFailed { error }) => {
+                            error!(
+                                "Acceptance command failed for {} on resume: {}",
+                                change_id, error
+                            );
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::Log(
+                                    LogEntry::error(format!(
+                                        "Acceptance command failed on resume: {}",
+                                        error
+                                    ))
+                                    .with_change_id(change_id)
+                                    .with_operation("acceptance"),
+                                ),
+                            )
+                            .await;
+                            // Add to changes_for_apply to retry
+                            changes_for_apply.push(change_id.clone());
+                            continue;
+                        }
+                        Ok(crate::orchestration::AcceptanceResult::Cancelled) => {
+                            info!("Acceptance cancelled for {} on resume", change_id);
+                            continue;
+                        }
+                        Err(e) => {
+                            error!("Acceptance error for {} on resume: {}", change_id, e);
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::Log(
+                                    LogEntry::error(format!("Acceptance error on resume: {}", e))
+                                        .with_change_id(change_id)
+                                        .with_operation("acceptance"),
+                                ),
+                            )
+                            .await;
+                            // Add to changes_for_apply to retry
+                            changes_for_apply.push(change_id.clone());
+                            continue;
+                        }
+                    }
+
+                    // Step 2: Commit archive (acceptance passed)
                     send_event(
                         &self.event_tx,
                         ParallelEvent::ArchiveStarted(change_id.clone()),
@@ -1478,9 +1569,35 @@ impl ParallelExecutor {
                     archived_workspaces.push(workspace);
                     continue;
                 }
-                WorkspaceState::Applied
-                | WorkspaceState::Applying { .. }
-                | WorkspaceState::Created => {
+                WorkspaceState::Applied => {
+                    // Apply complete but archive not started/complete
+                    // IMPORTANT: Must run acceptance before archive
+                    // Acceptance results are not persisted, so we must re-run on resume
+                    let workspace = existing_workspace.unwrap();
+                    cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
+
+                    info!(
+                        "Change '{}' in applied state in workspace '{}', running acceptance before archive",
+                        change_id, workspace.name
+                    );
+
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::WorkspaceResumed {
+                            change_id: change_id.clone(),
+                            workspace: workspace.name.clone(),
+                        },
+                    )
+                    .await;
+
+                    // Add to changes_for_apply to go through acceptance+archive
+                    // The apply loop will detect Apply commit exists and skip to acceptance+archive
+                    // For now, send through normal flow which is safest
+                    changes_for_apply.push(change_id.clone());
+                    // Store the workspace for reuse
+                    // Note: This is handled by existing_workspace detection above
+                }
+                WorkspaceState::Applying { .. } | WorkspaceState::Created => {
                     // These states require apply (or resume apply)
                     // Add change_id to list - workspace creation will happen under semaphore control
                     changes_for_apply.push(change_id.clone());
