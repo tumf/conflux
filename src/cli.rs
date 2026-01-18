@@ -60,6 +60,9 @@ pub enum Commands {
 
     /// Manage change approval status
     Approve(ApproveArgs),
+
+    /// Check for conflicts between spec delta files across changes
+    CheckConflicts(CheckConflictsArgs),
 }
 
 /// Arguments for the run subcommand
@@ -211,6 +214,14 @@ pub struct InitArgs {
 pub struct ApproveArgs {
     #[command(subcommand)]
     pub action: ApproveAction,
+}
+
+/// Arguments for the check-conflicts subcommand
+#[derive(Parser, Debug)]
+pub struct CheckConflictsArgs {
+    /// Output results in JSON format
+    #[arg(long, short = 'j')]
+    pub json: bool,
 }
 
 /// Approve subcommand actions
@@ -593,6 +604,42 @@ mod tests {
                 assert_eq!(args.web_bind, "127.0.0.1");
             }
             _ => panic!("Expected Tui subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_check_conflicts_subcommand_default() {
+        let cli = Cli::parse_from(["cflx", "check-conflicts"]);
+
+        match cli.command {
+            Some(Commands::CheckConflicts(args)) => {
+                assert!(!args.json);
+            }
+            _ => panic!("Expected CheckConflicts subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_check_conflicts_subcommand_json_flag() {
+        let cli = Cli::parse_from(["cflx", "check-conflicts", "--json"]);
+
+        match cli.command {
+            Some(Commands::CheckConflicts(args)) => {
+                assert!(args.json);
+            }
+            _ => panic!("Expected CheckConflicts subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_check_conflicts_subcommand_short_json_flag() {
+        let cli = Cli::parse_from(["cflx", "check-conflicts", "-j"]);
+
+        match cli.command {
+            Some(Commands::CheckConflicts(args)) => {
+                assert!(args.json);
+            }
+            _ => panic!("Expected CheckConflicts subcommand"),
         }
     }
 }
