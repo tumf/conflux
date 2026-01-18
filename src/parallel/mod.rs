@@ -24,6 +24,7 @@ use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
 use crate::execution::archive::ensure_archive_commit;
 use crate::execution::state::{detect_workspace_state, WorkspaceState};
+use crate::merge_stall_monitor::MergeStallMonitor;
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{
     GitWorkspaceManager, VcsBackend, VcsError, Workspace, WorkspaceManager, WorkspaceStatus,
@@ -513,6 +514,35 @@ impl ParallelExecutor {
             changes.len()
         );
 
+        // Start merge stall monitor if enabled
+        let merge_stall_monitor_handle = if let Some(cancel_token) = &self.cancel_token {
+            let merge_stall_config = self.config.get_merge_stall_detection();
+            if merge_stall_config.enabled {
+                // Get base branch name
+                if let Some(original_branch) = self.workspace_manager.original_branch() {
+                    info!(
+                        threshold_minutes = merge_stall_config.threshold_minutes,
+                        check_interval_seconds = merge_stall_config.check_interval_seconds,
+                        base_branch = %original_branch,
+                        "Starting merge stall monitor for parallel execution"
+                    );
+                    let monitor = MergeStallMonitor::new(
+                        merge_stall_config,
+                        &self.repo_root,
+                        original_branch.to_string(),
+                    );
+                    Some(monitor.spawn_monitor(cancel_token.clone()))
+                } else {
+                    warn!("Cannot start merge stall monitor: base branch not initialized");
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Prepare for parallel execution (clean check for git)
         info!("Preparing for parallel execution...");
         match self.workspace_manager.prepare_for_parallel().await {
@@ -813,6 +843,11 @@ impl ParallelExecutor {
             group_counter += 1;
         }
 
+        // Clean up merge stall monitor
+        if let Some(handle) = merge_stall_monitor_handle {
+            handle.abort();
+        }
+
         if self.has_merge_deferred() {
             send_event(&self.event_tx, ParallelEvent::Stopped).await;
         } else {
@@ -871,6 +906,35 @@ impl ParallelExecutor {
             "Starting order-based execution with re-analysis for {} changes",
             changes.len()
         );
+
+        // Start merge stall monitor if enabled
+        let merge_stall_monitor_handle = if let Some(cancel_token) = &self.cancel_token {
+            let merge_stall_config = self.config.get_merge_stall_detection();
+            if merge_stall_config.enabled {
+                // Get base branch name
+                if let Some(original_branch) = self.workspace_manager.original_branch() {
+                    info!(
+                        threshold_minutes = merge_stall_config.threshold_minutes,
+                        check_interval_seconds = merge_stall_config.check_interval_seconds,
+                        base_branch = %original_branch,
+                        "Starting merge stall monitor for parallel execution"
+                    );
+                    let monitor = MergeStallMonitor::new(
+                        merge_stall_config,
+                        &self.repo_root,
+                        original_branch.to_string(),
+                    );
+                    Some(monitor.spawn_monitor(cancel_token.clone()))
+                } else {
+                    warn!("Cannot start merge stall monitor: base branch not initialized");
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Prepare for parallel execution (clean check for git)
         info!("Preparing for parallel execution...");
@@ -1148,13 +1212,16 @@ impl ParallelExecutor {
                 .set_dependencies(analysis_result.dependencies.clone());
             self.change_dependencies = analysis_result.dependencies.clone();
 
-            // Calculate available slots
-            let active_count = self.workspace_manager.workspaces().len();
+            // Calculate available slots based on active workspaces only
+            // Active workspaces are those with status Created, Applying, or Applied
+            // Merged, Failed, and Cleaned workspaces do not count towards the limit
+            let active_count = self.workspace_manager.active_workspace_count();
             let available_slots = max_parallelism.saturating_sub(active_count);
 
+            let total_workspaces = self.workspace_manager.workspaces().len();
             info!(
-                "Available slots: {} (max: {}, active: {})",
-                available_slots, max_parallelism, active_count
+                "Available slots: {} (max: {}, active: {}, total workspaces: {})",
+                available_slots, max_parallelism, active_count, total_workspaces
             );
 
             if available_slots == 0 {
@@ -1263,6 +1330,11 @@ impl ParallelExecutor {
 
             changes_processed += batch_size;
             iteration += 1;
+        }
+
+        // Clean up merge stall monitor
+        if let Some(handle) = merge_stall_monitor_handle {
+            handle.abort();
         }
 
         if self.has_merge_deferred() {
