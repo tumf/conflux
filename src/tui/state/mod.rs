@@ -10,7 +10,8 @@ mod modes;
 
 use crate::openspec::Change;
 use ratatui::widgets::ListState;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::events::{LogEntry, TuiCommand};
@@ -94,6 +95,8 @@ pub struct AppState {
     pub web_url: Option<String>,
     /// Whether resolve is currently executing (blocks M key operations)
     pub is_resolving: bool,
+    /// Map of change_id to worktree path for active worktrees (for progress fallback)
+    pub worktree_paths: HashMap<String, PathBuf>,
 }
 
 impl AppState {
@@ -160,6 +163,7 @@ impl AppState {
             previous_mode: None,
             web_url: None,
             is_resolving: false,
+            worktree_paths: HashMap::new(),
         }
     }
 
