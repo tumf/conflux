@@ -19,6 +19,7 @@ mod parallel;
 mod parallel_run_service;
 mod process_manager;
 mod progress;
+mod spec_delta;
 #[cfg(test)]
 mod spec_test_annotations;
 mod stall;
@@ -337,6 +338,48 @@ async fn main() -> Result<()> {
                 }
             }
         },
+
+        // CheckConflicts subcommand: detect conflicts between spec delta files
+        Some(Commands::CheckConflicts(args)) => {
+            // Get list of all non-archived changes
+            let changes = openspec::list_changes_native()?;
+
+            // Collect all deltas from all changes
+            let mut all_deltas = Vec::new();
+            for change in &changes {
+                match spec_delta::parse_change_deltas(&change.id) {
+                    Ok(deltas) => all_deltas.extend(deltas),
+                    Err(e) => {
+                        eprintln!("Error parsing deltas for change '{}': {}", change.id, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            // Detect conflicts
+            let conflicts = spec_delta::detect_conflicts(&all_deltas);
+
+            // Output results
+            if args.json {
+                match spec_delta::format_conflicts_json(&conflicts) {
+                    Ok(json) => {
+                        println!("{}", json);
+                    }
+                    Err(e) => {
+                        eprintln!("Error formatting JSON output: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                let output = spec_delta::format_conflicts_human(&conflicts);
+                println!("{}", output);
+            }
+
+            // Exit with non-zero status if conflicts found
+            if !conflicts.is_empty() {
+                std::process::exit(2);
+            }
+        }
     }
 
     Ok(())
