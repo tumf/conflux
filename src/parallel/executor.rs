@@ -1307,6 +1307,11 @@ pub async fn execute_acceptance_in_workspace(
     // Send AcceptanceStarted event
     if let Some(ref tx) = event_tx {
         let _ = tx
+            .send(ParallelEvent::AcceptanceStarted {
+                change_id: change_id.to_string(),
+            })
+            .await;
+        let _ = tx
             .send(ParallelEvent::Log(
                 crate::events::LogEntry::info(format!("Running acceptance test: {}", change_id))
                     .with_change_id(change_id)
@@ -1409,6 +1414,11 @@ pub async fn execute_acceptance_in_workspace(
                         .with_operation("acceptance"),
                 ))
                 .await;
+            let _ = tx
+                .send(ParallelEvent::AcceptanceCompleted {
+                    change_id: change_id.to_string(),
+                })
+                .await;
         }
 
         return Ok(crate::orchestration::AcceptanceResult::CommandFailed { error: error_msg });
@@ -1437,6 +1447,11 @@ pub async fn execute_acceptance_in_workspace(
                             .with_operation("acceptance"),
                     ))
                     .await;
+                let _ = tx
+                    .send(ParallelEvent::AcceptanceCompleted {
+                        change_id: change_id.to_string(),
+                    })
+                    .await;
             }
 
             Ok(crate::orchestration::AcceptanceResult::Pass)
@@ -1461,6 +1476,11 @@ pub async fn execute_acceptance_in_workspace(
                             .with_change_id(change_id)
                             .with_operation("acceptance"),
                     ))
+                    .await;
+                let _ = tx
+                    .send(ParallelEvent::AcceptanceCompleted {
+                        change_id: change_id.to_string(),
+                    })
                     .await;
             }
 
@@ -1493,6 +1513,11 @@ pub async fn execute_acceptance_in_workspace(
                         .with_change_id(change_id)
                         .with_operation("acceptance"),
                     ))
+                    .await;
+                let _ = tx
+                    .send(ParallelEvent::AcceptanceCompleted {
+                        change_id: change_id.to_string(),
+                    })
                     .await;
             }
 

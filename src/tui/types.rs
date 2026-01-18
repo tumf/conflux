@@ -58,6 +58,8 @@ pub enum QueueStatus {
     Processing,
     /// Processing completed, waiting for archive
     Completed,
+    /// Running acceptance tests
+    Accepting,
     /// Currently being archived
     Archiving,
     /// Archived after completion
@@ -80,6 +82,7 @@ impl QueueStatus {
             QueueStatus::Queued => "queued",
             QueueStatus::Processing => "processing",
             QueueStatus::Completed => "completed",
+            QueueStatus::Accepting => "accepting",
             QueueStatus::Archiving => "archiving",
             QueueStatus::Archived => "archived",
             QueueStatus::Merged => "merged",
@@ -96,6 +99,7 @@ impl QueueStatus {
             QueueStatus::Queued => Color::Yellow,
             QueueStatus::Processing => Color::Cyan,
             QueueStatus::Completed => Color::Green,
+            QueueStatus::Accepting => Color::LightGreen,
             QueueStatus::Archiving => Color::Magenta,
             QueueStatus::Archived => Color::Blue,
             QueueStatus::Merged => Color::LightBlue,
@@ -206,6 +210,7 @@ mod tests {
         assert_eq!(QueueStatus::Queued.display(), "queued");
         assert_eq!(QueueStatus::Processing.display(), "processing");
         assert_eq!(QueueStatus::Completed.display(), "completed");
+        assert_eq!(QueueStatus::Accepting.display(), "accepting");
         assert_eq!(QueueStatus::Archiving.display(), "archiving");
         assert_eq!(QueueStatus::Archived.display(), "archived");
         assert_eq!(QueueStatus::Merged.display(), "merged");
@@ -220,6 +225,7 @@ mod tests {
         assert_eq!(QueueStatus::Queued.color(), Color::Yellow);
         assert_eq!(QueueStatus::Processing.color(), Color::Cyan);
         assert_eq!(QueueStatus::Completed.color(), Color::Green);
+        assert_eq!(QueueStatus::Accepting.color(), Color::LightGreen);
         assert_eq!(QueueStatus::Archiving.color(), Color::Magenta);
         assert_eq!(QueueStatus::Archived.color(), Color::Blue);
         assert_eq!(QueueStatus::Merged.color(), Color::LightBlue);
