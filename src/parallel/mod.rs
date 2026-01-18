@@ -1404,7 +1404,7 @@ impl ParallelExecutor {
                     cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
 
                     info!(
-                        "Change '{}' in archiving state (files moved, commit incomplete) in workspace '{}', running acceptance before archive commit",
+                        "Change '{}' in archiving state (files moved, commit incomplete) in workspace '{}'. Acceptance results are not persisted; will re-run acceptance before archive commit.",
                         change_id, workspace.name
                     );
 
@@ -1417,7 +1417,20 @@ impl ParallelExecutor {
                     )
                     .await;
 
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::Log(
+                            LogEntry::info(
+                                "Archive files moved but commit incomplete. Acceptance results are not persisted, so acceptance will be re-run before archive commit."
+                            )
+                            .with_change_id(change_id)
+                            .with_operation("resume"),
+                        ),
+                    )
+                    .await;
+
                     // Step 1: Run acceptance test before archive commit
+                    // NOTE: Acceptance results are NOT persisted, so we must re-run on every resume
                     let mut agent = AgentRunner::new(self.config.clone());
                     info!(
                         "Running acceptance test for {} before archive (resume)",
@@ -1633,7 +1646,7 @@ impl ParallelExecutor {
                     cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
 
                     info!(
-                        "Change '{}' in applied state in workspace '{}', running acceptance before archive",
+                        "Change '{}' in applied state in workspace '{}'. Acceptance results are not persisted; will re-run acceptance before archive.",
                         change_id, workspace.name
                     );
 
@@ -1646,9 +1659,21 @@ impl ParallelExecutor {
                     )
                     .await;
 
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::Log(
+                            LogEntry::info(
+                                "Apply complete on resume. Acceptance results are not persisted, so acceptance will be re-run before archive."
+                            )
+                            .with_change_id(change_id)
+                            .with_operation("resume"),
+                        ),
+                    )
+                    .await;
+
                     // Add to changes_for_apply to go through acceptance+archive
-                    // The apply loop will detect Apply commit exists and skip to acceptance+archive
-                    // For now, send through normal flow which is safest
+                    // The apply loop will quickly exit (tasks already complete), then run acceptance+archive
+                    // NOTE: Acceptance results are NOT persisted, so we must re-run on every resume
                     changes_for_apply.push(change_id.clone());
                     // Store the workspace for reuse
                     // Note: This is handled by existing_workspace detection above
@@ -2150,6 +2175,9 @@ impl ParallelExecutor {
                     }
 
                     // Step 2: Execute acceptance test after apply succeeds
+                    // IMPORTANT: Acceptance results are NOT persisted to disk or git commits.
+                    // This means acceptance will always run after apply completes, even on resume.
+                    // This ensures quality gates are enforced regardless of interruptions.
                     info!(
                         "Running acceptance test for {} after apply completion (cycle {})",
                         change_id, cycle_count
