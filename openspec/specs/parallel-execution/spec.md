@@ -113,21 +113,17 @@ These helpers SHALL be pure functions where possible, enabling unit testing.
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
 The acceptance loop SHALL parse stdout to determine pass/fail, and MUST NOT use exit code to determine acceptance verdict.
 The acceptance prompt MUST include a hardcoded acceptance prompt followed by configured `acceptance_prompt`.
+- When acceptance fails, the orchestrator MUST update tasks.md before returning to the apply loop.
+- Task updates MUST either add a new follow-up task or uncheck a previously completed task that must be revisited.
+- The acceptance failure reason MUST be recorded in tasks.md together with the task update.
+- The apply loop MUST resume with the same iteration counter value (no reset) after acceptance failure.
 
-#### Scenario: Parallel acceptance success proceeds to archive
-- **GIVEN** a change completes an apply iteration successfully in parallel mode
-- **WHEN** acceptance output indicates PASS
-- **THEN** the orchestrator proceeds to archive in that workspace
-
-#### Scenario: Parallel acceptance failure returns to apply loop
+#### Scenario: Parallel acceptance failure returns to apply loop with task updates
 - **GIVEN** a change completes an apply iteration successfully in parallel mode
 - **WHEN** acceptance output indicates FAIL with findings
-- **THEN** the orchestrator returns the change to the apply loop and records the findings
-
-#### Scenario: Parallel acceptance command execution failure
-- **GIVEN** a change completes an apply iteration successfully in parallel mode
-- **WHEN** the acceptance_command exits with non-zero status
-- **THEN** the orchestrator records the command failure and returns the change to the apply loop
+- **THEN** the orchestrator updates tasks.md with a follow-up task or unchecks a completed task
+- **AND** the acceptance failure reason is recorded in tasks.md
+- **AND** the orchestrator returns the change to the apply loop without resetting the iteration counter
 
 ### Requirement: Parallel apply runs in worktree
 parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。
