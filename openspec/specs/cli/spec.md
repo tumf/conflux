@@ -687,6 +687,23 @@ The TUI log panel SHALL support scrolling to view older log entries.
 - **THEN** log view scrolls down by a few lines (e.g., 3 lines)
 - **AND** if scroll position reaches the bottom, auto-scroll is re-enabled
 
+#### Scenario: Analysis log header includes iteration
+- **WHEN** the TUI receives analysis output logs with an iteration number
+- **THEN** the log entry header is displayed as `[analysis:<iteration>]`
+- **AND** the header is rendered even when no change_id is present
+
+#### Scenario: Analysis log header without iteration
+- **WHEN** the TUI receives analysis output logs without an iteration number
+- **THEN** the log entry header is displayed as `[analysis]`
+
+#### Scenario: Resolve log header includes change id and iteration
+- **WHEN** the TUI receives resolve output logs with change_id and iteration
+- **THEN** the log entry header is displayed as `[{change_id}:resolve:<iteration>]`
+
+#### Scenario: Resolve log header without iteration
+- **WHEN** the TUI receives resolve output logs with change_id but no iteration
+- **THEN** the log entry header is displayed as `[{change_id}:resolve]`
+
 ### Requirement: approve Subcommand
 
 The CLI SHALL provide an `approve` subcommand to manage change approval status.
@@ -832,6 +849,26 @@ The TUI SHALL maintain a maximum limit on stored log entries to prevent unbounde
 - **AND** the total log count exceeds 1000 entries
 - **THEN** the oldest log entry is removed
 - **AND** scroll offset is adjusted if necessary to prevent display issues
+
+### Requirement: Log Entry Headers
+
+The TUI SHALL display structured headers for analysis and resolve operation logs to improve traceability.
+
+#### Scenario: Analysis log header format
+- **WHEN** an analysis operation outputs a log message
+- **THEN** the log entry displays with header `[analysis:N]`
+- **AND** N represents the iteration number of the analysis operation
+
+#### Scenario: Resolve log header format
+- **WHEN** a resolve operation outputs a log message
+- **THEN** the log entry displays with header `[{change_id}:resolve:N]`
+- **AND** change_id identifies the change being resolved
+- **AND** N represents the iteration number of the resolve operation
+
+#### Scenario: Log headers use consistent color coding
+- **WHEN** log entries with headers are displayed
+- **THEN** headers use color coding based on change_id hash
+- **AND** headers are displayed in bold text for visibility
 
 ### Requirement: TUI Status Transition on Apply Completion
 

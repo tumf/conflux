@@ -761,8 +761,9 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             )];
 
-            // Add change_id prefix with color if present
+            // Add header with color if change_id or operation is present
             // Format: [change_id:operation:iteration] or [change_id:operation] or [change_id]
+            //     or: [operation:iteration] or [operation] (when no change_id)
             let msg_width = if let Some(ref change_id) = entry.change_id {
                 // Use hash of change_id to pick a consistent color
                 let color_index = change_id
@@ -776,6 +777,25 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
                     (Some(op), Some(iter)) => format!("[{}:{}:{}] ", change_id, op, iter),
                     (Some(op), None) => format!("[{}:{}] ", change_id, op),
                     (None, _) => format!("[{}] ", change_id),
+                };
+
+                let header_len = header.len();
+                spans.push(Span::styled(
+                    header,
+                    Style::default()
+                        .fg(prefix_color)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                // Reduce available width by prefix length
+                available_width.saturating_sub(header_len)
+            } else if let Some(ref operation) = entry.operation {
+                // No change_id, but operation is present (e.g., analysis logs)
+                // Use a default color for operation-only headers
+                let prefix_color = Color::Cyan;
+
+                let header = match entry.iteration {
+                    Some(iter) => format!("[{}:{}] ", operation, iter),
+                    None => format!("[{}] ", operation),
                 };
 
                 let header_len = header.len();
@@ -1439,5 +1459,112 @@ mod tests {
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
         assert!(content.contains("UNCOMMITED"));
+    }
+
+    #[test]
+    fn test_log_header_analysis_with_iteration() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+
+        // Add analysis log with iteration
+        let entry = LogEntry::info("Analyzing dependencies")
+            .with_operation("analysis")
+            .with_iteration(2);
+        app.add_log(entry);
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        // Should display [analysis:2] header
+        assert!(
+            content.contains("[analysis:2]"),
+            "Buffer should contain '[analysis:2]' header, but got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_log_header_analysis_without_iteration() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+
+        // Add analysis log without iteration
+        let entry = LogEntry::info("Starting analysis").with_operation("analysis");
+        app.add_log(entry);
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        // Should display [analysis] header
+        assert!(
+            content.contains("[analysis]"),
+            "Buffer should contain '[analysis]' header, but got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_log_header_resolve_with_change_id_and_iteration() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+
+        // Add resolve log with change_id and iteration
+        let entry = LogEntry::info("Resolving conflicts")
+            .with_change_id("my-change")
+            .with_operation("resolve")
+            .with_iteration(1);
+        app.add_log(entry);
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        // Should display [my-change:resolve:1] header
+        assert!(
+            content.contains("[my-change:resolve:1]"),
+            "Buffer should contain '[my-change:resolve:1]' header, but got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_log_header_with_change_id_only() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+
+        // Add log with only change_id (no operation or iteration)
+        let entry = LogEntry::info("Processing change").with_change_id("test-change");
+        app.add_log(entry);
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        // Should display [test-change] header
+        assert!(
+            content.contains("[test-change]"),
+            "Buffer should contain '[test-change]' header, but got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_log_no_header_when_no_change_id_or_operation() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+
+        // Add plain log with no change_id or operation
+        let entry = LogEntry::info("Regular log message");
+        app.add_log(entry);
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        // Should display message without header
+        assert!(
+            content.contains("Regular log message"),
+            "Buffer should contain log message"
+        );
+        // Should not contain bracket headers
+        let has_headers = content.contains("[analysis]")
+            || content.contains("[resolve]")
+            || content.contains("[test-change]");
+        assert!(
+            !has_headers,
+            "Buffer should not contain headers for plain log messages"
+        );
     }
 }
