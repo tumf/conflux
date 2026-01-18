@@ -155,7 +155,7 @@ impl AppState {
             } => {
                 self.is_resolving = false;
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-                    change.queue_status = QueueStatus::Archived;
+                    change.queue_status = QueueStatus::Merged;
                     if let Some(started) = change.started_at {
                         change.elapsed_time = Some(started.elapsed());
                     }
@@ -644,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_completed_sets_archived_and_updates_worktrees() {
+    fn test_resolve_completed_sets_merged_and_updates_worktrees() {
         let changes = vec![create_approved_change("change-a", 0, 5)];
         let mut app = AppState::new(changes);
         app.changes[0].queue_status = QueueStatus::Resolving;
@@ -658,7 +658,7 @@ mod tests {
             worktree_change_ids: Some(ids),
         });
 
-        assert_eq!(app.changes[0].queue_status, QueueStatus::Archived);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Merged);
         assert!(app.changes[0].elapsed_time.is_some());
         assert!(app.changes[0].has_worktree);
     }
