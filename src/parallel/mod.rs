@@ -2894,16 +2894,21 @@ impl ParallelExecutor {
 
     /// Merge revisions and resolve any conflicts
     async fn merge_and_resolve(&self, revisions: &[String], change_ids: &[String]) -> Result<()> {
-        self.merge_and_resolve_with(revisions, change_ids, |revisions, details| async move {
-            conflict::resolve_conflicts_with_retry(
-                self.workspace_manager.as_ref(),
-                &self.config,
-                &self.event_tx,
-                &revisions,
-                &details,
-                self.max_conflict_retries,
-            )
-            .await
+        let change_ids_vec = change_ids.to_vec();
+        self.merge_and_resolve_with(revisions, change_ids, |revisions, details| {
+            let change_ids_clone = change_ids_vec.clone();
+            async move {
+                conflict::resolve_conflicts_with_retry(
+                    self.workspace_manager.as_ref(),
+                    &self.config,
+                    &self.event_tx,
+                    &revisions,
+                    &change_ids_clone,
+                    &details,
+                    self.max_conflict_retries,
+                )
+                .await
+            }
         })
         .await
     }
