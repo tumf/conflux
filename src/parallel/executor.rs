@@ -341,7 +341,12 @@ pub async fn execute_apply_in_workspace(
     loop {
         iteration += 1;
         if cancel_token.is_some_and(|token| token.is_cancelled()) {
-            return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Cancelled apply for '{}' in workspace '{}' (iteration {})",
+                change_id,
+                workspace_path.display(),
+                iteration
+            )));
         }
         if iteration > MAX_ITERATIONS {
             // Run on_error hook if configured
@@ -501,10 +506,15 @@ pub async fn execute_apply_in_workspace(
         let _ = output_handle.await;
 
         // Wait for process to finish
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| OrchestratorError::AgentCommand(format!("Failed to wait: {}", e)))?;
+        let status = child.wait().await.map_err(|e| {
+            OrchestratorError::AgentCommand(format!(
+                "Failed to wait for apply command for '{}' in workspace '{}' (iteration {}): {}",
+                change_id,
+                workspace_path.display(),
+                iteration,
+                e
+            ))
+        })?;
 
         if !status.success() {
             return Err(OrchestratorError::AgentCommand(format!(
@@ -755,7 +765,11 @@ pub async fn execute_archive_in_workspace(
     ai_runner: &AiCommandRunner,
 ) -> Result<String> {
     if cancel_token.is_some_and(|token| token.is_cancelled()) {
-        return Err(OrchestratorError::AgentCommand("Cancelled".to_string()));
+        return Err(OrchestratorError::AgentCommand(format!(
+            "Cancelled archive for '{}' in workspace '{}'",
+            change_id,
+            workspace_path.display()
+        )));
     }
 
     // Verify task completion before archiving using common function

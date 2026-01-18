@@ -254,10 +254,16 @@ impl AiCommandRunner {
 
         // Take stdout/stderr from the child field
         let stdout = managed.child.stdout.take().ok_or_else(|| {
-            OrchestratorError::AgentCommand("Failed to capture stdout".to_string())
+            OrchestratorError::AgentCommand(format!(
+                "Failed to capture stdout for command '{}' (cwd: {:?})",
+                command, cwd
+            ))
         })?;
         let stderr = managed.child.stderr.take().ok_or_else(|| {
-            OrchestratorError::AgentCommand("Failed to capture stderr".to_string())
+            OrchestratorError::AgentCommand(format!(
+                "Failed to capture stderr for command '{}' (cwd: {:?})",
+                command, cwd
+            ))
         })?;
 
         // Create channel for output streaming
