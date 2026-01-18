@@ -2064,6 +2064,68 @@ impl ParallelExecutor {
                                 info!("Acceptance passed for {}, proceeding to archive", change_id);
                                 // Continue to archive
                             }
+                            Ok(crate::orchestration::AcceptanceResult::Continue) => {
+                                let continue_count =
+                                    agent.count_consecutive_acceptance_continues(&change_id);
+                                let max_continues = config.get_acceptance_max_continues();
+
+                                if continue_count >= max_continues {
+                                    warn!(
+                                        "Acceptance CONTINUE limit ({}) exceeded for {}, treating as FAIL",
+                                        max_continues, change_id
+                                    );
+                                    if let Some(ref tx) = event_tx {
+                                        let _ = tx
+                                            .send(ParallelEvent::Log(
+                                                LogEntry::warn(
+                                                    "Acceptance CONTINUE limit exceeded, change will not be archived".to_string()
+                                                )
+                                                .with_change_id(&change_id)
+                                                .with_operation("acceptance"),
+                                            ))
+                                            .await;
+                                    }
+                                    return WorkspaceResult {
+                                        change_id,
+                                        workspace_name,
+                                        final_revision: None,
+                                        error: Some(format!(
+                                            "Acceptance CONTINUE limit ({}) exceeded",
+                                            max_continues
+                                        )),
+                                    };
+                                } else {
+                                    info!(
+                                        "Acceptance requires continuation for {} (attempt {}/{}), not proceeding to archive",
+                                        change_id,
+                                        continue_count,
+                                        max_continues
+                                    );
+                                    if let Some(ref tx) = event_tx {
+                                        let _ = tx
+                                            .send(ParallelEvent::Log(
+                                                LogEntry::info(format!(
+                                                    "Acceptance requires continuation (attempt {}/{}), change will not be archived",
+                                                    continue_count,
+                                                    max_continues
+                                                ))
+                                                .with_change_id(&change_id)
+                                                .with_operation("acceptance"),
+                                            ))
+                                            .await;
+                                    }
+                                    return WorkspaceResult {
+                                        change_id,
+                                        workspace_name,
+                                        final_revision: None,
+                                        error: Some(format!(
+                                            "Acceptance requires continuation (attempt {}/{})",
+                                            continue_count,
+                                            max_continues
+                                        )),
+                                    };
+                                }
+                            }
                             Ok(crate::orchestration::AcceptanceResult::Fail { findings }) => {
                                 warn!(
                                     "Acceptance failed for {} with {} findings",

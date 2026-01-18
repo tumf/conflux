@@ -1438,6 +1438,31 @@ pub async fn execute_acceptance_in_workspace(
 
             Ok(crate::orchestration::AcceptanceResult::Pass)
         }
+        ParseResult::Continue => {
+            info!("Acceptance requires continuation for: {}", change_id);
+            let attempt = crate::history::AcceptanceAttempt {
+                attempt: agent.next_acceptance_attempt_number(change_id),
+                passed: false,
+                duration: start_time.elapsed(),
+                findings: Some(vec!["Investigation incomplete - continue later".to_string()]),
+                exit_code: status.code(),
+                stdout_tail,
+                stderr_tail,
+            };
+            agent.record_acceptance_attempt(change_id, attempt);
+
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::Log(
+                        crate::events::LogEntry::info("Acceptance test requires continuation")
+                            .with_change_id(change_id)
+                            .with_operation("acceptance"),
+                    ))
+                    .await;
+            }
+
+            Ok(crate::orchestration::AcceptanceResult::Continue)
+        }
         ParseResult::Fail { findings } => {
             info!(
                 "Acceptance failed for: {} with {} findings",
