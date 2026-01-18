@@ -196,6 +196,15 @@ pub enum ExecutionEvent {
         iteration: Option<u32>,
     },
 
+    // Acceptance events
+    /// Acceptance started for a change
+    AcceptanceStarted { change_id: String },
+    /// Acceptance completed for a change
+    AcceptanceCompleted { change_id: String },
+    /// Acceptance failed for a change
+    #[allow(dead_code)]
+    AcceptanceFailed { change_id: String, error: String },
+
     // Progress events
     /// Progress updated for a change (task completion tracking)
     ProgressUpdated {
