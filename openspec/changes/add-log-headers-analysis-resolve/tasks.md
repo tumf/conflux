@@ -1,0 +1,13 @@
+## 1. 仕様・設計
+- [ ] 1.1 既存ログ表示仕様の確認と変更点の整理（確認先: openspec/specs/cli/spec.md）
+- [ ] 1.2 ログヘッダ追加の設計方針を決定し proposal.md に反映（確認先: openspec/changes/add-log-headers-analysis-resolve/proposal.md）
+
+## 2. 実装
+- [ ] 2.1 解析ログヘッダ表示の追加（確認先: src/tui/render.rs のログ描画処理）
+- [ ] 2.2 ResolveOutput に change_id を含めるイベント拡張（確認先: src/events.rs, src/tui/state/events.rs）
+- [ ] 2.3 resolve ログ出力時に change_id を設定（確認先: src/parallel/conflict.rs）
+- [ ] 2.4 既存ログテストの更新（確認先: src/tui/state/events.rs の該当テスト）
+
+## 3. 検証
+- [ ] 3.1 変更に影響するテストを実行する（コマンド: cargo test）
+- [ ] 3.2 解析/resolve ログにヘッダが表示されることを確認する（確認先: TUI ログパネル表示）
