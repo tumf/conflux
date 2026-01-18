@@ -739,15 +739,20 @@ async fn run_tui_loop(
                             use crate::tui::types::ViewMode;
 
                             if app.view_mode != ViewMode::Worktrees {
+                                app.add_log(LogEntry::warn("Enter ignored: not in Worktrees view"));
                                 continue;
                             }
 
                             let Some(worktree_path_str) = app.get_selected_worktree_path() else {
+                                app.add_log(LogEntry::warn("Enter ignored: no worktree selected"));
                                 continue;
                             };
 
                             let Some(template) = config.get_worktree_command().map(str::to_string)
                             else {
+                                app.add_log(LogEntry::warn(
+                                    "Enter ignored: worktree_command not configured",
+                                ));
                                 continue;
                             };
 
