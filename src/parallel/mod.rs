@@ -955,6 +955,96 @@ impl ParallelExecutor {
                     archived_workspaces.push(workspace);
                     continue;
                 }
+                WorkspaceState::Archiving => {
+                    // Archive files moved but commit not complete - go to archive loop
+                    let workspace = existing_workspace.unwrap();
+                    cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
+
+                    info!(
+                        "Change '{}' in archiving state (files moved, commit incomplete) in workspace '{}', proceeding to archive",
+                        change_id, workspace.name
+                    );
+
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::WorkspaceResumed {
+                            change_id: change_id.clone(),
+                            workspace: workspace.name.clone(),
+                        },
+                    )
+                    .await;
+
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::ArchiveStarted(change_id.clone()),
+                    )
+                    .await;
+
+                    let resolve_agent = AgentRunner::new(self.config.clone());
+                    let change_id_owned = change_id.clone();
+                    let event_tx = self.event_tx.clone();
+                    if let Err(err) = ensure_archive_commit(
+                        change_id,
+                        &workspace.path,
+                        &resolve_agent,
+                        self.workspace_manager.backend_type(),
+                        move |line| {
+                            let event_tx = event_tx.clone();
+                            let change_id = change_id_owned.clone();
+                            async move {
+                                let text = match line {
+                                    OutputLine::Stdout(text) | OutputLine::Stderr(text) => text,
+                                };
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::ArchiveOutput {
+                                            change_id,
+                                            output: text,
+                                            iteration: None,
+                                        })
+                                        .await;
+                                }
+                            }
+                        },
+                    )
+                    .await
+                    {
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::ArchiveFailed {
+                                change_id: change_id.clone(),
+                                error: err.to_string(),
+                            },
+                        )
+                        .await;
+                        return Err(err);
+                    }
+
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::ChangeArchived(change_id.clone()),
+                    )
+                    .await;
+
+                    let revision = self
+                        .workspace_manager
+                        .get_revision_in_workspace(&workspace.path)
+                        .await
+                        .map_err(OrchestratorError::from)?;
+                    self.workspace_manager.update_workspace_status(
+                        &workspace.name,
+                        WorkspaceStatus::Applied(revision.clone()),
+                    );
+
+                    archived_results.push(WorkspaceResult {
+                        change_id: change_id.clone(),
+                        workspace_name: workspace.name.clone(),
+                        final_revision: Some(revision),
+                        error: None,
+                    });
+                    archived_workspaces.push(workspace);
+                    continue;
+                }
                 WorkspaceState::Applied
                 | WorkspaceState::Applying { .. }
                 | WorkspaceState::Created => {

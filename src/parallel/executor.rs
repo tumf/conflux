@@ -7,7 +7,6 @@ use crate::error::{OrchestratorError, Result};
 use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::stall::{StallDetector, StallPhase};
-use crate::task_parser::TaskProgress;
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::VcsBackend;
 use std::path::Path;
@@ -777,31 +776,40 @@ pub async fn execute_archive_in_workspace(
 
     let progress = match get_task_progress(change_id, Some(workspace_path)) {
         Ok(Some(progress)) => {
-            if progress.total > 0 && progress.completed < progress.total {
+            if progress.total == 0 {
                 return Err(OrchestratorError::AgentCommand(format!(
-                    "Cannot archive {}: tasks not complete ({}/{})",
+                    "Cannot archive {}: tasks.md exists but contains no tasks (0 tasks found)",
+                    change_id
+                )));
+            }
+            if progress.completed < progress.total {
+                return Err(OrchestratorError::AgentCommand(format!(
+                    "Cannot archive {}: tasks not complete ({}/{} tasks completed)",
                     change_id, progress.completed, progress.total
                 )));
             }
             info!(
-                "Task verification passed for {}: {}/{}",
+                "Task verification passed for {}: {}/{} tasks completed",
                 change_id, progress.completed, progress.total
             );
             progress
         }
         Ok(None) => {
-            warn!(
-                "Tasks file not found for {} in workspace, proceeding with archive",
-                change_id
-            );
-            TaskProgress::default()
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Cannot archive {}: tasks.md not found in workspace at {}",
+                change_id,
+                workspace_path
+                    .join("openspec/changes")
+                    .join(change_id)
+                    .join("tasks.md")
+                    .display()
+            )));
         }
         Err(e) => {
-            warn!(
-                "Failed to parse tasks for {}: {}, proceeding with archive",
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Cannot archive {}: failed to parse tasks.md: {}",
                 change_id, e
-            );
-            TaskProgress::default()
+            )));
         }
     };
 

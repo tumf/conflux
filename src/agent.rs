@@ -27,20 +27,21 @@ CRITICAL OPERATIONAL CONSTRAINTS:
 - The only valid reason to move a task to Future Work is if it is ALREADY marked with '(future work)' explicitly
 </system-reminder>
 
-Remove tasks only if they meet one of these criteria:
-- Out-of-scope: belongs to a different change/proposal
-- Requires human decision or external action (e.g., 'Ask user...', 'Deploy to production', 'Get API key')
-- Requires long waiting periods (e.g., 'Check after one week', 'Wait for approval')
-- Explicitly marked as 'future work' (deferred for later implementation)
+Move tasks to Future Work ONLY if they meet ONE of these criteria:
+1. **Human work**: Requires human decision-making, judgment, or manual intervention (e.g., 'Ask user for design preference', 'Manual code review')
+2. **External system work**: Requires external system deployment, approval, or configuration changes outside this repository (e.g., 'Deploy to production', 'Configure external API', 'Update cloud infrastructure')
+3. **Long-wait verification**: Requires extended waiting periods for validation (e.g., 'Monitor performance for one week', 'Wait for stakeholder approval')
 
-Do NOT remove:
-- Tests (unit/integration) - agent can write and run them
-- Linting/formatting (cargo clippy, cargo fmt) - agent can execute
-- Documentation updates - agent can write
-- Any task the agent can execute autonomously
+Do NOT move to Future Work:
+- **Difficult or complex tasks** - agent must attempt them
+- **Tests** (unit/integration/e2e) - agent can write and run them
+- **Linting/formatting** (cargo clippy, cargo fmt) - agent can execute
+- **Documentation updates** - agent can write
+- **Regression risk concerns** - not a valid reason to defer
+- **Any task the agent can execute autonomously** - agent must complete it
 
-IMPORTANT: Do NOT move tasks to Future Work simply because they are difficult, require testing, or have regression risk.
-If you can execute the task autonomously (write code, run tests, execute commands), you MUST complete it.
+CRITICAL: If a task is automatable but difficult, you MUST attempt it.
+Future Work is ONLY for tasks requiring human action, external systems, or long waiting periods.
 
 Every remaining unchecked task MUST be immediately actionable in this repo and have objective pass/fail criteria.
 If you find a non-actionable task (abstract, subjective, or human-only), rewrite it into one or more actionable tasks with concrete commands and clear acceptance criteria while preserving intent.
@@ -50,7 +51,8 @@ Do not allow apply to finish successfully with non-actionable unchecked tasks; n
 Special handling for 'future work' tasks:
 - If a task is already marked '(future work)', move it to a "Future work" section and remove the checkbox
 - This indicates deferred work, not current implementation scope
-- Do NOT add new '(future work)' markers yourself - only move tasks that already have this marker
+- Do NOT add new '(future work)' markers yourself unless the task meets the strict criteria above (human work, external systems, or long-wait verification)
+- When moving a task to Future Work, verify it truly requires human action, external systems, or long waiting periods
 
 Tasks format requirements:
 - All tasks MUST have checkboxes: `- [ ]` or `- [x]`
@@ -1362,12 +1364,13 @@ mod tests {
     #[test]
     fn test_apply_system_prompt_content() {
         // Verify the hardcoded system prompt contains expected instructions
-        assert!(APPLY_SYSTEM_PROMPT.contains("Out-of-scope"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("human decision"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("Do NOT remove"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("Move tasks to Future Work ONLY"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("Human work"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("External system work"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("Long-wait verification"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("Do NOT move to Future Work"));
         assert!(APPLY_SYSTEM_PROMPT.contains("actionable"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("concrete commands"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("Future work"));
+        assert!(APPLY_SYSTEM_PROMPT.contains("Future Work"));
     }
 
     #[test]

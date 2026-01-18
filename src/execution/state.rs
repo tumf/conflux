@@ -9,8 +9,9 @@
 //! 1. **Created**: Workspace created, no apply commits → Start apply
 //! 2. **Applying**: WIP commits exist, apply in progress → Resume apply (next iteration)
 //! 3. **Applied**: Apply complete, archive not complete → Archive only
-//! 4. **Archived**: Archive complete, not merged to main → Merge only
-//! 5. **Merged**: Merged to main → Skip & Cleanup
+//! 4. **Archiving**: Archive files moved, commit not complete → Archive loop
+//! 5. **Archived**: Archive complete, not merged to main → Merge only
+//! 6. **Merged**: Merged to main → Skip & Cleanup
 //!
 //! # Example
 //!
@@ -22,6 +23,7 @@
 //!     WorkspaceState::Created => { /* start apply */ }
 //!     WorkspaceState::Applying { iteration } => { /* resume from iteration */ }
 //!     WorkspaceState::Applied => { /* archive only */ }
+//!     WorkspaceState::Archiving => { /* archive loop */ }
 //!     WorkspaceState::Archived => { /* merge only */ }
 //!     WorkspaceState::Merged => { /* skip & cleanup */ }
 //! }
@@ -44,6 +46,8 @@ pub enum WorkspaceState {
     Applying { iteration: u32 },
     /// Apply complete, archive not complete.
     Applied,
+    /// Archive files moved but commit not complete.
+    Archiving,
     /// Archive complete, not merged to main.
     Archived,
     /// Merged to main.
@@ -223,6 +227,72 @@ pub async fn get_latest_wip_snapshot(change_id: &str, repo_root: &Path) -> Resul
     Ok(max_iteration)
 }
 
+/// Check if archive files exist in the worktree (files moved but commit not complete).
+///
+/// This function checks if the change directory has been moved to the archive directory
+/// in the worktree's filesystem, indicating that archiving has started but the commit
+/// may not yet be complete.
+///
+/// # Arguments
+///
+/// * `change_id` - The change ID to check
+/// * `repo_root` - The repository root path (workspace path)
+///
+/// # Returns
+///
+/// * `Ok(true)` - Archive directory exists (files moved)
+/// * `Ok(false)` - Archive directory does not exist
+/// * `Err` - Failed to check archive directory
+pub async fn has_archive_files(change_id: &str, repo_root: &Path) -> Result<bool> {
+    // Check for archive directory (supports both formats)
+    // 1. openspec/changes/archive/{change_id}
+    // 2. openspec/changes/archive/{date}-{change_id}
+
+    let archive_base = repo_root.join("openspec/changes/archive");
+
+    if !archive_base.exists() {
+        return Ok(false);
+    }
+
+    // Check for exact match first
+    let exact_match = archive_base.join(change_id);
+    if exact_match.exists() && exact_match.is_dir() {
+        debug!(
+            change_id = %change_id,
+            archive_path = %exact_match.display(),
+            "has_archive_files: found exact match archive directory"
+        );
+        return Ok(true);
+    }
+
+    // Check for date-prefixed match
+    let entries = match std::fs::read_dir(&archive_base) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(false),
+    };
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Check if it ends with "-{change_id}" and is a directory
+        if name_str.ends_with(&format!("-{}", change_id)) && entry.path().is_dir() {
+            debug!(
+                change_id = %change_id,
+                archive_path = %entry.path().display(),
+                "has_archive_files: found date-prefixed archive directory"
+            );
+            return Ok(true);
+        }
+    }
+
+    debug!(
+        change_id = %change_id,
+        "has_archive_files: no archive directory found"
+    );
+    Ok(false)
+}
+
 /// Check if an apply commit exists for a change.
 ///
 /// An apply commit is a non-WIP commit that indicates apply completion.
@@ -284,9 +354,10 @@ pub async fn has_apply_commit(change_id: &str, repo_root: &Path) -> Result<bool>
 ///
 /// 1. Check if merged to base branch → `Merged`
 /// 2. Check if archive commit complete → `Archived`
-/// 3. Check if apply commit exists → `Applied`
-/// 4. Check for WIP commits → `Applying { iteration }`
-/// 5. Otherwise → `Created`
+/// 3. Check if archive files exist (but commit incomplete) → `Archiving`
+/// 4. Check if apply commit exists → `Applied`
+/// 5. Check for WIP commits → `Applying { iteration }`
+/// 6. Otherwise → `Created`
 ///
 /// # Arguments
 ///
@@ -315,13 +386,19 @@ pub async fn detect_workspace_state(
         return Ok(WorkspaceState::Archived);
     }
 
-    // 3. Check if apply commit exists
+    // 3. Check if archive files exist (but commit incomplete) → Archiving
+    if has_archive_files(change_id, repo_root).await? {
+        debug!(change_id = %change_id, "State: Archiving (files moved, commit incomplete)");
+        return Ok(WorkspaceState::Archiving);
+    }
+
+    // 4. Check if apply commit exists
     if has_apply_commit(change_id, repo_root).await? {
         debug!(change_id = %change_id, "State: Applied");
         return Ok(WorkspaceState::Applied);
     }
 
-    // 4. Check for WIP commits
+    // 5. Check for WIP commits
     if let Some(iteration) = get_latest_wip_snapshot(change_id, repo_root).await? {
         debug!(change_id = %change_id, iteration = iteration, "State: Applying");
         return Ok(WorkspaceState::Applying {
@@ -329,7 +406,7 @@ pub async fn detect_workspace_state(
         });
     }
 
-    // 5. No commits found - workspace just created
+    // 6. No commits found - workspace just created
     debug!(change_id = %change_id, "State: Created");
     Ok(WorkspaceState::Created)
 }
@@ -561,5 +638,108 @@ mod tests {
             .await
             .unwrap();
         assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_has_archive_files_exact_match() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        init_git_repo(repo_root);
+        commit(repo_root, "Initial commit");
+
+        // Create archive directory (exact match)
+        let archive_dir = repo_root.join("openspec/changes/archive/test-archiving");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("proposal.md"), "# Test").unwrap();
+
+        let result = has_archive_files("test-archiving", repo_root)
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn test_has_archive_files_date_prefixed() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        init_git_repo(repo_root);
+        commit(repo_root, "Initial commit");
+
+        // Create archive directory (date-prefixed)
+        let archive_dir = repo_root.join("openspec/changes/archive/2024-01-15-test-archiving");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("proposal.md"), "# Test").unwrap();
+
+        let result = has_archive_files("test-archiving", repo_root)
+            .await
+            .unwrap();
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn test_has_archive_files_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        init_git_repo(repo_root);
+        commit(repo_root, "Initial commit");
+
+        let result = has_archive_files("nonexistent", repo_root).await.unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspace_state_archiving() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        init_git_repo(repo_root);
+        commit(repo_root, "Initial commit");
+
+        // Create a branch to simulate workspace
+        StdCommand::new("git")
+            .args(["checkout", "-b", "workspace-test-archiving"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        // Add apply commit
+        commit(repo_root, "Apply: test-archiving");
+
+        // Create archive directory (files moved but no Archive commit yet)
+        let archive_dir = repo_root.join("openspec/changes/archive/test-archiving");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("proposal.md"), "# Test").unwrap();
+
+        let state = detect_workspace_state("test-archiving", repo_root, "main")
+            .await
+            .unwrap();
+        assert_eq!(state, WorkspaceState::Archiving);
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspace_state_archiving_date_prefixed() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        init_git_repo(repo_root);
+        commit(repo_root, "Initial commit");
+
+        // Create a branch to simulate workspace
+        StdCommand::new("git")
+            .args(["checkout", "-b", "workspace-test-date-arch"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        // Add apply commit
+        commit(repo_root, "Apply: test-date-arch");
+
+        // Create date-prefixed archive directory (files moved but no Archive commit yet)
+        let archive_dir = repo_root.join("openspec/changes/archive/2024-01-15-test-date-arch");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("proposal.md"), "# Test").unwrap();
+
+        let state = detect_workspace_state("test-date-arch", repo_root, "main")
+            .await
+            .unwrap();
+        assert_eq!(state, WorkspaceState::Archiving);
     }
 }
