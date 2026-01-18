@@ -140,12 +140,3 @@ The project SHALL include a cargo-dist configuration file.
 #### Scenario: Platform targets
 - When cargo-dist runs
 - Then it SHALL build for the targets specified in dist-workspace.toml
-
-### Requirement: UTC Build Number Generation
-
-The release workflow SHALL generate a UTC build number in `YYYYMMDDHHmmss` format during build packaging.
-
-#### Scenario: Build number generation format
-- **WHEN** a release build is executed
-- **THEN** the build number is generated from the current UTC time
-- **AND** the build number format matches `YYYYMMDDHHmmss`
