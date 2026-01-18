@@ -1445,6 +1445,7 @@ impl ParallelExecutor {
             let hooks = self.hooks.clone();
             let cancel_token = self.cancel_token.clone();
             let ai_runner = self.ai_runner.clone();
+            let repo_root = self.repo_root.clone();
 
             // Build parallel hook context
             let parallel_ctx = ParallelHookContext {
@@ -1475,6 +1476,7 @@ impl ParallelExecutor {
                     Some(&parallel_ctx),
                     cancel_token.as_ref(),
                     &ai_runner,
+                    &repo_root,
                 )
                 .await;
 

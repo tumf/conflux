@@ -110,19 +110,14 @@ These helpers SHALL be pure functions where possible, enabling unit testing.
 - **THEN** it SHALL return the last 5 lines prefixed with a line count indicator
 
 ### Requirement: Parallel apply runs in worktree
-parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。
+parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。
 
-#### Scenario: apply 実行が worktree 内で行われる
+#### Scenario: apply 実行が worktree 以外の場合は失敗する
 - **GIVEN** parallel mode で change が実行対象に選ばれている
+- **AND** apply 実行ディレクトリが worktree パスではない
 - **WHEN** apply コマンドが実行される
-- **THEN** 実行ディレクトリは worktree パスである
-- **AND** base リポジトリの作業ツリーは変更されない
-
-#### Scenario: デフォルトworkspaceディレクトリの解決
-- **GIVEN** `workspace_base_dir` が未設定
-- **WHEN** parallel 実行が workspace の作成先を決定する
-- **THEN** デフォルトディレクトリは設定仕様に従って解決される
-- **AND** worktree は `<data_dir>/conflux/worktrees/<project_slug>` 配下に作成される
+- **THEN** システムはエラーを返し apply を停止する
+- **AND** エラーメッセージに change_id と実行ディレクトリが含まれる
 
 ### Requirement: VCS Backend Abstraction
 
