@@ -113,30 +113,18 @@ These helpers SHALL be pure functions where possible, enabling unit testing.
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
 The acceptance loop SHALL parse stdout to determine pass/fail, and MUST NOT use exit code to determine acceptance verdict.
 The acceptance prompt MUST include a hardcoded acceptance prompt followed by configured `acceptance_prompt`.
+- The acceptance verdict parsing MUST recognize PASS/FAIL/CONTINUE markers even when the marker line includes non-semantic decoration (example: Markdown emphasis or surrounding punctuation).
 - When acceptance fails, the orchestrator MUST update tasks.md before returning to the apply loop.
 - Task updates MUST either add a new follow-up task or uncheck a previously completed task that must be revisited.
 - The acceptance failure reason MUST be recorded in tasks.md together with the task update.
 - The apply loop MUST resume with the same iteration counter value (no reset) after acceptance failure.
 When resuming a workspace that has not completed archive, the orchestrator SHALL re-run acceptance before starting archive, even if tasks are already complete.
 
-#### Scenario: Parallel acceptance failure returns to apply loop with task updates
+#### Scenario: Parallel acceptance output includes PASS with decoration
 - **GIVEN** a change completes an apply iteration successfully in parallel mode
-- **WHEN** acceptance output indicates FAIL with findings
-- **THEN** the orchestrator updates tasks.md with a follow-up task or unchecks a completed task
-- **AND** the acceptance failure reason is recorded in tasks.md
-- **AND** the orchestrator returns the change to the apply loop without resetting the iteration counter
-
-#### Scenario: Resume forces acceptance before archive
-- **GIVEN** a workspace is resumed after interruption
-- **AND** archive is not yet complete for the change
-- **WHEN** the orchestrator resumes processing
-- **THEN** acceptance_command is executed before any archive command
-
-**Implementation Notes:**
-- Acceptance results are not persisted across orchestrator sessions
-- When resuming in `Applied` or `Archiving` states, acceptance must re-run before archive
-- This ensures quality checks are not skipped even if acceptance completed before interruption
-- Acceptance history is cleared after successful archive to prevent history bloat
+- **WHEN** acceptance output contains a decorated PASS marker such as `**ACCEPTANCE: PASS**`
+- **THEN** the orchestrator treats the outcome as PASS
+- **AND** tasks.md is not updated for acceptance failure
 
 ### Requirement: Parallel apply runs in worktree
 parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。

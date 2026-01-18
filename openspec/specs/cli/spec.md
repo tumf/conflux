@@ -55,6 +55,7 @@ The orchestrator SHALL execute an acceptance loop after a successful apply and b
 The acceptance loop SHALL run `acceptance_command` for the change, parse the output text to determine acceptance success, failure, or continue, and route the change accordingly.
 - Exit code indicates command execution success, not acceptance verdict.
 - Acceptance prompt MUST include a hardcoded acceptance prompt followed by configured `acceptance_prompt`.
+- The acceptance verdict parsing MUST recognize PASS/FAIL/CONTINUE markers even when the marker line includes non-semantic decoration (example: Markdown emphasis or surrounding punctuation).
 - When acceptance fails, the orchestrator MUST update tasks.md before returning to the apply loop.
 - Task updates MUST either add a new follow-up task or uncheck a previously completed task that must be revisited.
 - The acceptance failure reason MUST be recorded in tasks.md together with the task update.
@@ -62,24 +63,11 @@ The acceptance loop SHALL run `acceptance_command` for the change, parse the out
 - If the output indicates CONTINUE, the orchestrator MUST retry acceptance up to `acceptance_max_continues` times.
 - If the CONTINUE limit is exceeded, the orchestrator MUST treat the outcome as FAIL and return to the apply loop.
 
-#### Scenario: Acceptance failure returns to apply loop with task updates
+#### Scenario: Acceptance output includes PASS with decoration
 - **GIVEN** a change completes an apply iteration successfully
-- **WHEN** acceptance output indicates FAIL with findings
-- **THEN** the orchestrator updates tasks.md with a follow-up task or unchecks a completed task
-- **AND** the acceptance failure reason is recorded in tasks.md
-- **AND** the orchestrator returns the change to the apply loop without resetting the iteration counter
-
-#### Scenario: Acceptance continue retries
-- **GIVEN** a change completes an apply iteration successfully
-- **WHEN** acceptance output indicates CONTINUE
-- **THEN** the orchestrator retries acceptance for the same change
-- **AND** the retry count is incremented
-
-#### Scenario: Acceptance continue limit exceeded
-- **GIVEN** acceptance has returned CONTINUE `acceptance_max_continues` times for a change
-- **WHEN** the next acceptance output indicates CONTINUE
-- **THEN** the orchestrator treats the outcome as FAIL
-- **AND** the change returns to the apply loop
+- **WHEN** acceptance output contains a decorated PASS marker such as `**ACCEPTANCE: PASS**`
+- **THEN** the orchestrator treats the outcome as PASS
+- **AND** tasks.md is not updated for acceptance failure
 
 ### Requirement: Default TUI Launch
 

@@ -13,8 +13,12 @@ TBD - created by archiving change pass-approved-changes-to-analyzer. Update Purp
 - 各 change の完全なファイルパス（`openspec/changes/{change_id}/proposal.md`）
 - 「選択済み change のみ分析する」という明示的な指示
 - 依存関係分析結果を `order`（依存関係を満たした上での推奨実行順序）と `dependencies` の両方で返すためのレスポンス指示
+- `dependencies` は「片方の change が他方の成果物・仕様・APIに明確に依存し、それがないと成立しない場合」にのみ付与することを明示する
+- `order` は優先度や実行効率の推奨順序であり、依存関係とは独立した概念であることを明示する
 
-#### Scenario: `order` の実行順序が並列実行で直接使われる
-- **GIVEN** 依存関係分析の結果として `order` が返される
-- **WHEN** 並列実行が次の起動候補を評価する
-- **THEN** `order` は group 変換を経ずに実行候補の順位付けとして扱われる
+#### Scenario: 必須条件のみを依存関係として返す
+- **GIVEN** 依存関係分析対象の change が複数存在する
+- **AND** そのうち一方が他方の成果物・仕様・APIを必須条件として使用している
+- **WHEN** 依存関係分析が実行される
+- **THEN** `dependencies` には必須条件の関係のみが含まれる
+- **AND** 優先度や順序の好みだけの関係は `dependencies` に含まれない

@@ -17,7 +17,7 @@ pub enum AcceptanceResult {
 /// Parse acceptance output text and determine pass/fail/continue status.
 ///
 /// Expected format:
-/// - PASS: `ACCEPTANCE: PASS`
+/// - PASS: `ACCEPTANCE: PASS` (with optional markdown decorations like `**ACCEPTANCE: PASS**`)
 /// - FAIL: `ACCEPTANCE: FAIL` followed by `FINDINGS:` and items prefixed with `- `
 /// - CONTINUE: `ACCEPTANCE: CONTINUE`
 ///
@@ -49,13 +49,15 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
     let mut acceptance_status = None;
     for line in &lines {
         let trimmed = line.trim();
-        if trimmed == "ACCEPTANCE: PASS" {
+        // Strip markdown decorations (**, *, _, etc.) before matching
+        let normalized = strip_markdown_decorations(trimmed);
+        if normalized == "ACCEPTANCE: PASS" {
             acceptance_status = Some("pass");
             break;
-        } else if trimmed == "ACCEPTANCE: FAIL" {
+        } else if normalized == "ACCEPTANCE: FAIL" {
             acceptance_status = Some("fail");
             break;
-        } else if trimmed == "ACCEPTANCE: CONTINUE" {
+        } else if normalized == "ACCEPTANCE: CONTINUE" {
             acceptance_status = Some("continue");
             break;
         }
@@ -78,6 +80,16 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
             }
         }
     }
+}
+
+/// Strip markdown decorations from a string.
+/// Removes bold (**), italic (*), underline (_), and other common markdown formatting.
+fn strip_markdown_decorations(text: &str) -> String {
+    // Simple approach: remove all common markdown decoration characters
+    text.replace("**", "")
+        .replace(['*', '_'], "")
+        .trim()
+        .to_string()
 }
 
 /// Parse findings from acceptance output.
@@ -207,5 +219,72 @@ Additional output here
     fn test_parse_continue_with_extra_output() {
         let output = "Some debug output\nACCEPTANCE: CONTINUE\nMore output\n";
         assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_pass_with_bold_decoration() {
+        let output = "**ACCEPTANCE: PASS**\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_pass_with_bold_decoration_and_extra_output() {
+        let output = "Some debug output\n**ACCEPTANCE: PASS**\nMore output\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_fail_with_bold_decoration() {
+        let output = "**ACCEPTANCE: FAIL**\nFINDINGS:\n- Issue 1\n- Issue 2\n";
+        match parse_acceptance_output(output) {
+            AcceptanceResult::Fail { findings } => {
+                assert_eq!(findings.len(), 2);
+                assert_eq!(findings[0], "Issue 1");
+                assert_eq!(findings[1], "Issue 2");
+            }
+            _ => panic!("Expected Fail"),
+        }
+    }
+
+    #[test]
+    fn test_parse_continue_with_bold_decoration() {
+        let output = "**ACCEPTANCE: CONTINUE**\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_pass_with_italic_decoration() {
+        let output = "*ACCEPTANCE: PASS*\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_pass_with_mixed_decorations() {
+        let output = "**_ACCEPTANCE: PASS_**\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_strip_markdown_decorations() {
+        assert_eq!(
+            strip_markdown_decorations("**ACCEPTANCE: PASS**"),
+            "ACCEPTANCE: PASS"
+        );
+        assert_eq!(
+            strip_markdown_decorations("*ACCEPTANCE: PASS*"),
+            "ACCEPTANCE: PASS"
+        );
+        assert_eq!(
+            strip_markdown_decorations("_ACCEPTANCE: PASS_"),
+            "ACCEPTANCE: PASS"
+        );
+        assert_eq!(
+            strip_markdown_decorations("**_ACCEPTANCE: PASS_**"),
+            "ACCEPTANCE: PASS"
+        );
+        assert_eq!(
+            strip_markdown_decorations("ACCEPTANCE: PASS"),
+            "ACCEPTANCE: PASS"
+        );
     }
 }

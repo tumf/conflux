@@ -249,7 +249,7 @@ Read the proposal files at the specified paths to understand their dependencies:
 Your task:
 1. Read each change's proposal.md at the given path to understand what it does
 2. Identify dependencies between these changes
-3. Determine the recommended execution order (considering dependencies)
+3. Determine the recommended execution order (considering dependencies and priorities)
 4. Return execution order and dependencies
 
 Return ONLY valid JSON in this exact format:
@@ -261,11 +261,17 @@ Return ONLY valid JSON in this exact format:
 }}
 
 Rules:
-- `order`: Array of change IDs in recommended execution sequence (dependencies first)
-- `dependencies`: Object mapping change IDs to arrays of their dependency IDs
+- `order`: Array of change IDs in recommended execution sequence
+  - This represents the RECOMMENDED execution order considering dependencies, priorities, and efficiency
+  - Independent changes can be ordered by priority or logical flow
+- `dependencies`: Object mapping change IDs to arrays of their REQUIRED dependency IDs
+  - STRICT CRITERIA: Only include a dependency if one change REQUIRES the artifacts, specs, or APIs from another change to function
+  - DO NOT include dependencies based on priority, preferred order, or efficiency alone
+  - Example of REQUIRED dependency: "change-b implements a feature using the API defined in change-a"
+  - Example of NOT a dependency: "change-a should ideally be done before change-b for efficiency"
 - Every change ID must appear exactly once in `order`
-- Changes with no dependencies can be listed in any position (considering best parallelism)
-- Dependencies are constraints: a change CANNOT start until all its dependencies are merged to base
+- Dependencies are hard constraints: a change CANNOT start until all its dependencies are merged to base
+- Order preferences without required dependencies should be reflected in `order` only, not in `dependencies`
 - Return valid JSON only, no markdown, no explanation"#
         )
     }
@@ -934,5 +940,79 @@ That's all."#;
 
         // But structure should still be there
         assert!(prompt.contains("Analyze ONLY the changes marked with [x]"));
+    }
+
+    #[test]
+    fn test_prompt_clarifies_dependency_vs_order() {
+        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
+        let analyzer = ParallelizationAnalyzer::new(agent);
+
+        let changes = vec![create_test_change("a")];
+        let prompt = analyzer.build_parallelization_prompt(&changes);
+
+        // Verify prompt clarifies that dependencies are REQUIRED relationships
+        assert!(prompt.contains("REQUIRED"));
+        assert!(prompt.contains("artifacts, specs, or APIs"));
+
+        // Verify prompt explains order is for recommended sequence
+        assert!(prompt.contains("recommended execution"));
+
+        // Verify prompt warns against confusing priority with dependency
+        assert!(prompt.contains("DO NOT include dependencies based on priority"));
+    }
+
+    #[test]
+    fn test_validate_dependency_strict_criteria() {
+        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
+        let analyzer = ParallelizationAnalyzer::new(agent);
+
+        // Valid case: b requires a's API
+        let mut deps_valid = HashMap::new();
+        deps_valid.insert("b".to_string(), vec!["a".to_string()]);
+
+        let result_valid = AnalysisResult {
+            order: vec!["a".to_string(), "b".to_string()],
+            dependencies: deps_valid,
+            groups: None,
+        };
+
+        // Should pass validation (dependency graph is valid)
+        assert!(analyzer.validate_dependency_graph(&result_valid).is_ok());
+
+        // Invalid case: self-dependency (still caught)
+        let mut deps_invalid = HashMap::new();
+        deps_invalid.insert("a".to_string(), vec!["a".to_string()]);
+
+        let result_invalid = AnalysisResult {
+            order: vec!["a".to_string()],
+            dependencies: deps_invalid,
+            groups: None,
+        };
+
+        // Should fail validation (self-dependency)
+        assert!(analyzer.validate_dependency_graph(&result_invalid).is_err());
+    }
+
+    #[test]
+    fn test_order_can_differ_from_dependency_graph() {
+        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
+        let analyzer = ParallelizationAnalyzer::new(agent);
+
+        // Case: a and b are independent, but order suggests b before a (by priority)
+        let result = AnalysisResult {
+            order: vec!["b".to_string(), "a".to_string(), "c".to_string()],
+            dependencies: HashMap::new(), // No dependencies!
+            groups: None,
+        };
+
+        let changes = vec![
+            create_test_change("a"),
+            create_test_change("b"),
+            create_test_change("c"),
+        ];
+
+        // Should validate successfully - order is just a recommendation
+        assert!(analyzer.validate_change_ids(&result, &changes).is_ok());
+        assert!(analyzer.validate_dependency_graph(&result).is_ok());
     }
 }
