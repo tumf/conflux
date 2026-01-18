@@ -117,6 +117,12 @@ impl AppState {
                     if let Some(started) = change.started_at {
                         change.elapsed_time = Some(started.elapsed());
                     }
+                    // Reload progress from archived tasks.md (with fallback guard)
+                    if let Ok(progress) = task_parser::parse_archived_change(&id) {
+                        change.completed_tasks = progress.completed;
+                        change.total_tasks = progress.total;
+                    }
+                    // If reload fails, preserve existing progress (no action needed)
                 }
                 self.add_log(LogEntry::info(format!("Archived: {}", id)));
             }
@@ -153,6 +159,12 @@ impl AppState {
                     if let Some(started) = change.started_at {
                         change.elapsed_time = Some(started.elapsed());
                     }
+                    // Reload progress from archived tasks.md (with fallback guard)
+                    if let Ok(progress) = task_parser::parse_archived_change(&change_id) {
+                        change.completed_tasks = progress.completed;
+                        change.total_tasks = progress.total;
+                    }
+                    // If reload fails, preserve existing progress (no action needed)
                 }
                 if let Some(ids) = worktree_change_ids {
                     self.apply_worktree_status(&ids);
@@ -171,6 +183,12 @@ impl AppState {
                     if let Some(started) = change.started_at {
                         change.elapsed_time = Some(started.elapsed());
                     }
+                    // Reload progress from archived tasks.md (with fallback guard)
+                    if let Ok(progress) = task_parser::parse_archived_change(&change_id) {
+                        change.completed_tasks = progress.completed;
+                        change.total_tasks = progress.total;
+                    }
+                    // If reload fails, preserve existing progress (no action needed)
                 }
                 self.add_log(LogEntry::success(format!(
                     "Merge completed for '{}'",
