@@ -728,20 +728,22 @@ impl ParallelExecutor {
         Ok(())
     }
 
-    /// Execute changes with order-based re-analysis after each batch completes.
+    /// Execute changes with order-based re-analysis triggered by slot availability.
     ///
     /// This method uses the `order` field directly from analysis results,
     /// selecting changes based on available execution slots and dependency constraints.
     ///
-    /// # Order-based Execution Logic
+    /// # Order-based Execution Logic (Slot-Driven)
     ///
     /// 1. Analyze remaining changes to get `order` and `dependencies`
-    /// 2. Calculate available execution slots (max_parallelism - active_count)
-    /// 3. Select changes from `order` that:
+    /// 2. Launch changes from `order` that:
     ///    - Have no unresolved dependencies (dependencies merged to base)
-    ///    - Fit within available slots
-    /// 4. Execute selected changes in parallel
-    /// 5. Repeat until all changes are processed
+    ///    - Fit within available execution slots
+    /// 3. When any change completes (slot becomes available):
+    ///    - Check debounce condition (10s since last queue change)
+    ///    - Re-analyze if debounce passed or no queue changes
+    ///    - Launch next change(s) from updated `order`
+    /// 4. Repeat until all changes are processed
     ///
     /// # Dependency Constraints
     ///
@@ -928,7 +930,7 @@ impl ParallelExecutor {
                 let slot_available = true; // Slot is available after previous completion
                 if !self.should_reanalyze(slot_available).await {
                     // Debounce period still active, wait before re-analyzing
-                    let wait_duration = std::time::Duration::from_secs(1);
+                    let wait_duration = std::time::Duration::from_millis(500);
                     info!("Debounce active, waiting {:?} before retry", wait_duration);
                     tokio::time::sleep(wait_duration).await;
                     continue; // Retry the loop after waiting
@@ -980,14 +982,8 @@ impl ParallelExecutor {
             }
 
             // Select changes from order based on available slots and dependency constraints
-            // Limit batch size to enable frequent re-analysis during execution
-            let batch_size_limit = if available_slots > 2 {
-                // For larger slot counts, execute in smaller batches to allow frequent re-analysis
-                (available_slots / 2).max(1)
-            } else {
-                // For small slot counts, use all available slots
-                available_slots
-            };
+            // SLOT-DRIVEN: Launch one change at a time to enable frequent re-analysis
+            let batch_size_limit = 1;
             let mut selected_changes: Vec<String> = Vec::new();
             let mut blocked_changes: HashSet<String> = HashSet::new();
 
@@ -1389,12 +1385,14 @@ impl ParallelExecutor {
                     continue;
                 }
                 WorkspaceState::Archiving => {
-                    // Archive files moved but commit not complete - go to archive loop
+                    // Archive files moved but commit not complete
+                    // IMPORTANT: Must run acceptance before committing archive
+                    // Acceptance results are not persisted, so we must re-run on resume
                     let workspace = existing_workspace.unwrap();
                     cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
 
                     info!(
-                        "Change '{}' in archiving state (files moved, commit incomplete) in workspace '{}', proceeding to archive",
+                        "Change '{}' in archiving state (files moved, commit incomplete) in workspace '{}', running acceptance before archive commit",
                         change_id, workspace.name
                     );
 
@@ -1407,6 +1405,143 @@ impl ParallelExecutor {
                     )
                     .await;
 
+                    // Step 1: Run acceptance test before archive commit
+                    let mut agent = AgentRunner::new(self.config.clone());
+                    info!(
+                        "Running acceptance test for {} before archive (resume)",
+                        change_id
+                    );
+                    let acceptance_result = execute_acceptance_in_workspace(
+                        change_id,
+                        &workspace.path,
+                        &mut agent,
+                        self.event_tx.clone(),
+                        self.cancel_token.as_ref(),
+                    )
+                    .await;
+
+                    // Handle acceptance result
+                    match acceptance_result {
+                        Ok(crate::orchestration::AcceptanceResult::Pass) => {
+                            info!(
+                                "Acceptance passed for {} on resume, proceeding to archive commit",
+                                change_id
+                            );
+                            // Continue to archive commit below
+                        }
+                        Ok(crate::orchestration::AcceptanceResult::Continue) => {
+                            let continue_count =
+                                agent.count_consecutive_acceptance_continues(change_id);
+                            let max_continues = self.config.get_acceptance_max_continues();
+
+                            if continue_count >= max_continues {
+                                warn!(
+                                    "Acceptance CONTINUE limit ({}) exceeded for {} on resume, treating as FAIL",
+                                    max_continues,
+                                    change_id
+                                );
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::Log(
+                                        LogEntry::warn(format!(
+                                            "Acceptance CONTINUE limit exceeded ({}), archive will not be committed. Change needs to return to apply loop.",
+                                            max_continues
+                                        ))
+                                        .with_change_id(change_id)
+                                        .with_operation("acceptance"),
+                                    ),
+                                )
+                                .await;
+                            } else {
+                                info!(
+                                    "Acceptance requires continuation for {} on resume (attempt {}/{}), returning to apply loop",
+                                    change_id,
+                                    continue_count,
+                                    max_continues
+                                );
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::Log(
+                                        LogEntry::info(format!(
+                                            "Acceptance requires continuation on resume (attempt {}/{}), archive will not be committed. Change needs to return to apply loop.",
+                                            continue_count,
+                                            max_continues
+                                        ))
+                                        .with_change_id(change_id)
+                                        .with_operation("acceptance"),
+                                    ),
+                                )
+                                .await;
+                            }
+
+                            changes_for_apply.push(change_id.clone());
+                            continue;
+                        }
+                        Ok(crate::orchestration::AcceptanceResult::Fail { findings }) => {
+                            warn!(
+                                "Acceptance failed for {} with {} findings on resume, will not commit archive",
+                                change_id,
+                                findings.len()
+                            );
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::Log(
+                                    LogEntry::warn(format!(
+                                        "Acceptance failed with {} findings on resume, archive will not be committed. Change needs to return to apply loop.",
+                                        findings.len()
+                                    ))
+                                    .with_change_id(change_id)
+                                    .with_operation("acceptance"),
+                                ),
+                            )
+                            .await;
+                            // Add to changes_for_apply to retry the full cycle
+                            changes_for_apply.push(change_id.clone());
+                            continue;
+                        }
+                        Ok(crate::orchestration::AcceptanceResult::CommandFailed { error }) => {
+                            error!(
+                                "Acceptance command failed for {} on resume: {}",
+                                change_id, error
+                            );
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::Log(
+                                    LogEntry::error(format!(
+                                        "Acceptance command failed on resume: {}",
+                                        error
+                                    ))
+                                    .with_change_id(change_id)
+                                    .with_operation("acceptance"),
+                                ),
+                            )
+                            .await;
+                            // Add to changes_for_apply to retry
+                            changes_for_apply.push(change_id.clone());
+                            continue;
+                        }
+                        Ok(crate::orchestration::AcceptanceResult::Cancelled) => {
+                            info!("Acceptance cancelled for {} on resume", change_id);
+                            continue;
+                        }
+                        Err(e) => {
+                            error!("Acceptance error for {} on resume: {}", change_id, e);
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::Log(
+                                    LogEntry::error(format!("Acceptance error on resume: {}", e))
+                                        .with_change_id(change_id)
+                                        .with_operation("acceptance"),
+                                ),
+                            )
+                            .await;
+                            // Add to changes_for_apply to retry
+                            changes_for_apply.push(change_id.clone());
+                            continue;
+                        }
+                    }
+
+                    // Step 2: Commit archive (acceptance passed)
                     send_event(
                         &self.event_tx,
                         ParallelEvent::ArchiveStarted(change_id.clone()),
@@ -1478,9 +1613,35 @@ impl ParallelExecutor {
                     archived_workspaces.push(workspace);
                     continue;
                 }
-                WorkspaceState::Applied
-                | WorkspaceState::Applying { .. }
-                | WorkspaceState::Created => {
+                WorkspaceState::Applied => {
+                    // Apply complete but archive not started/complete
+                    // IMPORTANT: Must run acceptance before archive
+                    // Acceptance results are not persisted, so we must re-run on resume
+                    let workspace = existing_workspace.unwrap();
+                    cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
+
+                    info!(
+                        "Change '{}' in applied state in workspace '{}', running acceptance before archive",
+                        change_id, workspace.name
+                    );
+
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::WorkspaceResumed {
+                            change_id: change_id.clone(),
+                            workspace: workspace.name.clone(),
+                        },
+                    )
+                    .await;
+
+                    // Add to changes_for_apply to go through acceptance+archive
+                    // The apply loop will detect Apply commit exists and skip to acceptance+archive
+                    // For now, send through normal flow which is safest
+                    changes_for_apply.push(change_id.clone());
+                    // Store the workspace for reuse
+                    // Note: This is handled by existing_workspace detection above
+                }
+                WorkspaceState::Applying { .. } | WorkspaceState::Created => {
                     // These states require apply (or resume apply)
                     // Add change_id to list - workspace creation will happen under semaphore control
                     changes_for_apply.push(change_id.clone());
@@ -1946,6 +2107,68 @@ impl ParallelExecutor {
                             Ok(crate::orchestration::AcceptanceResult::Pass) => {
                                 info!("Acceptance passed for {}, proceeding to archive", change_id);
                                 // Continue to archive
+                            }
+                            Ok(crate::orchestration::AcceptanceResult::Continue) => {
+                                let continue_count =
+                                    agent.count_consecutive_acceptance_continues(&change_id);
+                                let max_continues = config.get_acceptance_max_continues();
+
+                                if continue_count >= max_continues {
+                                    warn!(
+                                        "Acceptance CONTINUE limit ({}) exceeded for {}, treating as FAIL",
+                                        max_continues, change_id
+                                    );
+                                    if let Some(ref tx) = event_tx {
+                                        let _ = tx
+                                            .send(ParallelEvent::Log(
+                                                LogEntry::warn(
+                                                    "Acceptance CONTINUE limit exceeded, change will not be archived".to_string()
+                                                )
+                                                .with_change_id(&change_id)
+                                                .with_operation("acceptance"),
+                                            ))
+                                            .await;
+                                    }
+                                    return WorkspaceResult {
+                                        change_id,
+                                        workspace_name,
+                                        final_revision: None,
+                                        error: Some(format!(
+                                            "Acceptance CONTINUE limit ({}) exceeded",
+                                            max_continues
+                                        )),
+                                    };
+                                } else {
+                                    info!(
+                                        "Acceptance requires continuation for {} (attempt {}/{}), not proceeding to archive",
+                                        change_id,
+                                        continue_count,
+                                        max_continues
+                                    );
+                                    if let Some(ref tx) = event_tx {
+                                        let _ = tx
+                                            .send(ParallelEvent::Log(
+                                                LogEntry::info(format!(
+                                                    "Acceptance requires continuation (attempt {}/{}), change will not be archived",
+                                                    continue_count,
+                                                    max_continues
+                                                ))
+                                                .with_change_id(&change_id)
+                                                .with_operation("acceptance"),
+                                            ))
+                                            .await;
+                                    }
+                                    return WorkspaceResult {
+                                        change_id,
+                                        workspace_name,
+                                        final_revision: None,
+                                        error: Some(format!(
+                                            "Acceptance requires continuation (attempt {}/{})",
+                                            continue_count,
+                                            max_continues
+                                        )),
+                                    };
+                                }
                             }
                             Ok(crate::orchestration::AcceptanceResult::Fail { findings }) => {
                                 warn!(
