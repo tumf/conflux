@@ -7,7 +7,7 @@
 - 未選択 change を `[ ]` でマーク（将来の拡張性のため）
 - 各 change の完全なファイルパス（`openspec/changes/{change_id}/proposal.md`）
 - 「選択済み change のみ分析する」という明示的な指示
-- 依存関係分析結果を `order` と `dependencies` の両方で返すためのレスポンス指示
+- 依存関係分析結果を `order`（依存関係を満たした上での推奨実行順序）と `dependencies` の両方で返すためのレスポンス指示
 
 #### Scenario: 選択済みと未選択が混在する場合
 - **GIVEN** 以下の change リスト:
@@ -22,7 +22,7 @@
   [ ] add-feature-c (openspec/changes/add-feature-c/proposal.md)
   ```
 - **AND** プロンプトに「Analyze ONLY the changes marked with [x]」という指示が含まれること
-- **AND** レスポンス形式は以下の `order` 形式であること:
+- **AND** レスポンス形式は以下の `order`（依存関係を満たした上での推奨実行順序）形式であること:
   ```json
   {
     "order": ["add-feature-a", "add-feature-b"],
