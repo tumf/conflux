@@ -9,3 +9,4 @@
 
 ## Acceptance Failure Follow-up
 - [x] Address acceptance findings: No acceptance.md file found; all implementation requirements verified via tests
+- [x] Fix worktree recreation for dependency-resolved changes (MUST requirement from spec:9)

@@ -86,6 +86,8 @@ pub struct ParallelExecutor {
     merge_deferred_changes: HashSet<String>,
     /// Changes that previously had unresolved dependencies (for worktree recreation tracking)
     previously_blocked_changes: HashSet<String>,
+    /// Changes that need forced worktree recreation (dependency just resolved)
+    force_recreate_worktree: HashSet<String>,
     /// Hook runner for executing hooks (optional)
     hooks: Option<Arc<HookRunner>>,
     /// Cancellation token for force stop cleanup
@@ -230,6 +232,7 @@ impl ParallelExecutor {
             change_dependencies: HashMap::new(),
             merge_deferred_changes: HashSet::new(),
             previously_blocked_changes: HashSet::new(),
+            force_recreate_worktree: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at,
@@ -1018,10 +1021,10 @@ impl ParallelExecutor {
                             "Change '{}' dependency resolved, will recreate worktree",
                             change_id
                         );
+                        // Mark for forced worktree recreation
+                        self.force_recreate_worktree.insert(change_id.clone());
                         // Remove from previously_blocked to avoid repeated recreation
                         self.previously_blocked_changes.remove(change_id);
-                        // Mark for no-resume (force new worktree)
-                        // This is handled in execute_group by checking previously_blocked_changes before it's removed
                     }
                 }
 
@@ -1186,7 +1189,16 @@ impl ParallelExecutor {
 
         for change_id in &changes_to_execute {
             // Check if workspace already exists (for resume scenario)
-            let existing_workspace = if self.no_resume {
+            // Skip resume if: global no_resume flag OR change needs forced recreation
+            let existing_workspace = if self.no_resume
+                || self.force_recreate_worktree.contains(change_id)
+            {
+                if self.force_recreate_worktree.contains(change_id) {
+                    info!(
+                        "Forcing worktree recreation for '{}' (dependency just resolved)",
+                        change_id
+                    );
+                }
                 None
             } else {
                 match self
@@ -1890,6 +1902,12 @@ impl ParallelExecutor {
             ParallelEvent::GroupCompleted { group_id: group.id },
         )
         .await;
+
+        // Clear force_recreate_worktree flags for changes in this group
+        // (they've now been recreated or failed)
+        for change_id in &group.changes {
+            self.force_recreate_worktree.remove(change_id);
+        }
 
         Ok(())
     }
@@ -3125,6 +3143,7 @@ mod tests {
             change_dependencies,
             merge_deferred_changes,
             previously_blocked_changes: HashSet::new(),
+            force_recreate_worktree: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
@@ -3363,6 +3382,7 @@ mod tests {
             change_dependencies: HashMap::new(),
             merge_deferred_changes: HashSet::new(),
             previously_blocked_changes: HashSet::new(),
+            force_recreate_worktree: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
@@ -3525,6 +3545,7 @@ mod tests {
             change_dependencies: HashMap::new(),
             merge_deferred_changes: HashSet::new(),
             previously_blocked_changes: HashSet::new(),
+            force_recreate_worktree: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
@@ -3659,6 +3680,7 @@ mod tests {
             change_dependencies: HashMap::new(),
             merge_deferred_changes: HashSet::new(),
             previously_blocked_changes: HashSet::new(),
+            force_recreate_worktree: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
@@ -3822,6 +3844,7 @@ mod tests {
             change_dependencies: HashMap::new(),
             merge_deferred_changes: HashSet::new(),
             previously_blocked_changes: HashSet::new(),
+            force_recreate_worktree: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
@@ -3999,6 +4022,7 @@ mod tests {
             change_dependencies: HashMap::new(),
             merge_deferred_changes: HashSet::new(),
             previously_blocked_changes: HashSet::new(),
+            force_recreate_worktree: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
@@ -4182,6 +4206,7 @@ mod tests {
             change_dependencies: HashMap::new(),
             merge_deferred_changes: HashSet::new(),
             previously_blocked_changes: HashSet::new(),
+            force_recreate_worktree: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
