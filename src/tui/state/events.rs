@@ -134,6 +134,24 @@ impl AppState {
                 }
                 self.add_log(LogEntry::info(format!("Archived: {}", id)));
             }
+            OrchestratorEvent::AcceptanceStarted { change_id } => {
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+                    if change.started_at.is_none() {
+                        change.started_at = Some(Instant::now());
+                    }
+                    change.queue_status = QueueStatus::Accepting;
+                }
+                self.add_log(LogEntry::info(format!("Acceptance started: {}", change_id)));
+            }
+            OrchestratorEvent::AcceptanceCompleted { change_id } => {
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+                    change.queue_status = QueueStatus::Completed;
+                }
+                self.add_log(LogEntry::info(format!(
+                    "Acceptance completed: {}",
+                    change_id
+                )));
+            }
             OrchestratorEvent::MergeDeferred { change_id, reason } => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                     change.queue_status = QueueStatus::MergeWait;

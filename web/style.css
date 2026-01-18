@@ -121,6 +121,48 @@ header h1 {
     50% { opacity: 0.5; }
 }
 
+/* Overall Progress Section */
+.overall-progress {
+    margin-bottom: var(--space-md);
+    padding: var(--space-lg);
+    background-color: var(--bg-secondary);
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+}
+
+.overall-progress-title {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: var(--space-md);
+}
+
+.overall-progress-bar-container {
+    width: 100%;
+}
+
+.overall-progress-bar {
+    height: 20px;
+    background-color: var(--bg-card);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: var(--space-sm);
+}
+
+.overall-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent-blue), var(--accent-green));
+    border-radius: 10px;
+    transition: width 0.5s ease;
+}
+
+.overall-progress-text {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+}
+
 /* Toast Container */
 .toast-container {
     position: fixed;
@@ -325,6 +367,19 @@ main {
     word-break: break-all;
 }
 
+.change-status-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+    align-items: center;
+}
+
+.change-iteration {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
 .change-badges {
     display: flex;
     flex-wrap: wrap;
@@ -341,6 +396,12 @@ main {
     min-height: calc(var(--touch-target) / 2);
     display: inline-flex;
     align-items: center;
+    gap: var(--space-xs);
+}
+
+.status-icon {
+    font-size: 0.875rem;
+    line-height: 1;
 }
 
 .badge-status {
@@ -358,6 +419,47 @@ main {
 
 .badge-status.complete {
     background-color: var(--accent-green);
+}
+
+/* TUI-aligned queue status colors */
+.badge-status.not-queued {
+    background-color: var(--text-secondary);
+}
+
+.badge-status.queued {
+    background-color: var(--accent-yellow);
+}
+
+.badge-status.processing {
+    background-color: var(--accent-blue);
+}
+
+.badge-status.completed {
+    background-color: var(--accent-green);
+}
+
+.badge-status.archiving {
+    background-color: #c77dff; /* Magenta */
+}
+
+.badge-status.archived {
+    background-color: #4361ee; /* Blue */
+}
+
+.badge-status.merged {
+    background-color: #7209b7; /* Light Blue */
+}
+
+.badge-status.merge-wait {
+    background-color: #f72585; /* Light Magenta */
+}
+
+.badge-status.resolving {
+    background-color: #06d6a0; /* Light Cyan */
+}
+
+.badge-status.error {
+    background-color: var(--accent-red);
 }
 
 .badge-approved {
@@ -403,9 +505,18 @@ main {
     align-items: center;
 }
 
+/* Approval Section (inside collapsible details) */
+.approval-section {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: var(--space-md);
+    padding-bottom: var(--space-md);
+    border-bottom: 1px solid var(--border-color);
+}
+
 /* Approval Actions */
 .approval-actions {
-    margin-top: var(--space-md);
     display: flex;
     justify-content: flex-end;
 }

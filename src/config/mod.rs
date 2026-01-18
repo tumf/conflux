@@ -249,6 +249,11 @@ pub struct OrchestratorConfig {
     /// Default: 5 seconds
     #[serde(default)]
     pub command_queue_retry_if_duration_under_secs: Option<u64>,
+
+    /// Maximum number of acceptance CONTINUE retries before treating as FAIL.
+    /// Default: 2
+    #[serde(default)]
+    pub acceptance_max_continues: Option<u32>,
 }
 
 impl OrchestratorConfig {
@@ -415,6 +420,13 @@ impl OrchestratorConfig {
         expand::expand_conflict_files(template, conflict_files)
     }
 
+    /// Get the maximum number of acceptance CONTINUE retries.
+    /// Default: 2
+    pub fn get_acceptance_max_continues(&self) -> u32 {
+        self.acceptance_max_continues
+            .unwrap_or(defaults::DEFAULT_ACCEPTANCE_MAX_CONTINUES)
+    }
+
     /// Expand `{change_id}` placeholder in a command template
     pub fn expand_change_id(template: &str, change_id: &str) -> String {
         expand::expand_change_id(template, change_id)
@@ -486,6 +498,9 @@ pub use defaults::{
     DEFAULT_MAX_CONCURRENT_WORKSPACES, DEFAULT_MAX_ITERATIONS, GLOBAL_CONFIG_DIR,
     GLOBAL_CONFIG_FILE, PROJECT_CONFIG_FILE,
 };
+
+#[allow(unused_imports)]
+pub use defaults::DEFAULT_ACCEPTANCE_MAX_CONTINUES;
 
 #[cfg(test)]
 mod tests {
@@ -1270,5 +1285,34 @@ mod tests {
 
         assert_eq!(config.command_queue_stagger_delay_ms, Some(1500));
         assert_eq!(config.command_queue_max_retries, Some(5));
+    }
+
+    #[test]
+    fn test_acceptance_max_continues_default() {
+        let config = OrchestratorConfig::default();
+        assert_eq!(
+            config.get_acceptance_max_continues(),
+            DEFAULT_ACCEPTANCE_MAX_CONTINUES
+        );
+        assert_eq!(config.get_acceptance_max_continues(), 2);
+    }
+
+    #[test]
+    fn test_acceptance_max_continues_custom() {
+        let config = OrchestratorConfig {
+            acceptance_max_continues: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(config.get_acceptance_max_continues(), 4);
+    }
+
+    #[test]
+    fn test_parse_jsonc_with_acceptance_max_continues() {
+        let jsonc = r#"{
+            "acceptance_max_continues": 5
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        assert_eq!(config.acceptance_max_continues, Some(5));
+        assert_eq!(config.get_acceptance_max_continues(), 5);
     }
 }

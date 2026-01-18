@@ -318,7 +318,9 @@ fn build_parallel_hook_context(
     ctx
 }
 
-/// Execute apply command in a single workspace, repeating until tasks are 100% complete
+/// Execute apply command in a single workspace, repeating until tasks are 100% complete.
+///
+/// Returns (revision, final_iteration_count) on success.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_apply_in_workspace(
     change_id: &str,
@@ -333,9 +335,10 @@ pub async fn execute_apply_in_workspace(
     ai_runner: &AiCommandRunner,
     repo_root: &Path,
     apply_history: &Arc<Mutex<crate::history::ApplyHistory>>,
-) -> Result<String> {
+    initial_iteration: u32,
+) -> Result<(String, u32)> {
     const MAX_ITERATIONS: u32 = 50;
-    let mut iteration = 0;
+    let mut iteration = initial_iteration;
     let mut first_apply = true;
     let mut apply_succeeded = false; // Track if all iterations succeeded
     let mut stall_detector = StallDetector::new(config.get_stall_detection());
@@ -826,7 +829,7 @@ pub async fn execute_apply_in_workspace(
         }
     };
 
-    Ok(revision)
+    Ok((revision, iteration))
 }
 
 /// Execute archive command in a workspace with streaming output
@@ -1304,6 +1307,11 @@ pub async fn execute_acceptance_in_workspace(
     // Send AcceptanceStarted event
     if let Some(ref tx) = event_tx {
         let _ = tx
+            .send(ParallelEvent::AcceptanceStarted {
+                change_id: change_id.to_string(),
+            })
+            .await;
+        let _ = tx
             .send(ParallelEvent::Log(
                 crate::events::LogEntry::info(format!("Running acceptance test: {}", change_id))
                     .with_change_id(change_id)
@@ -1406,6 +1414,11 @@ pub async fn execute_acceptance_in_workspace(
                         .with_operation("acceptance"),
                 ))
                 .await;
+            let _ = tx
+                .send(ParallelEvent::AcceptanceCompleted {
+                    change_id: change_id.to_string(),
+                })
+                .await;
         }
 
         return Ok(crate::orchestration::AcceptanceResult::CommandFailed { error: error_msg });
@@ -1434,9 +1447,44 @@ pub async fn execute_acceptance_in_workspace(
                             .with_operation("acceptance"),
                     ))
                     .await;
+                let _ = tx
+                    .send(ParallelEvent::AcceptanceCompleted {
+                        change_id: change_id.to_string(),
+                    })
+                    .await;
             }
 
             Ok(crate::orchestration::AcceptanceResult::Pass)
+        }
+        ParseResult::Continue => {
+            info!("Acceptance requires continuation for: {}", change_id);
+            let attempt = crate::history::AcceptanceAttempt {
+                attempt: agent.next_acceptance_attempt_number(change_id),
+                passed: false,
+                duration: start_time.elapsed(),
+                findings: Some(vec!["Investigation incomplete - continue later".to_string()]),
+                exit_code: status.code(),
+                stdout_tail,
+                stderr_tail,
+            };
+            agent.record_acceptance_attempt(change_id, attempt);
+
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::Log(
+                        crate::events::LogEntry::info("Acceptance test requires continuation")
+                            .with_change_id(change_id)
+                            .with_operation("acceptance"),
+                    ))
+                    .await;
+                let _ = tx
+                    .send(ParallelEvent::AcceptanceCompleted {
+                        change_id: change_id.to_string(),
+                    })
+                    .await;
+            }
+
+            Ok(crate::orchestration::AcceptanceResult::Continue)
         }
         ParseResult::Fail { findings } => {
             info!(
@@ -1465,6 +1513,11 @@ pub async fn execute_acceptance_in_workspace(
                         .with_change_id(change_id)
                         .with_operation("acceptance"),
                     ))
+                    .await;
+                let _ = tx
+                    .send(ParallelEvent::AcceptanceCompleted {
+                        change_id: change_id.to_string(),
+                    })
                     .await;
             }
 

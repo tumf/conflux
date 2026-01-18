@@ -170,6 +170,7 @@ pub enum ExecutionEvent {
         revision: String,
     },
     /// Apply failed in a workspace
+    #[allow(dead_code)]
     ApplyFailed { change_id: String, error: String },
     /// Apply output (summary of command output)
     #[allow(dead_code)]
@@ -194,6 +195,15 @@ pub enum ExecutionEvent {
         output: String,
         iteration: Option<u32>,
     },
+
+    // Acceptance events
+    /// Acceptance started for a change
+    AcceptanceStarted { change_id: String },
+    /// Acceptance completed for a change
+    AcceptanceCompleted { change_id: String },
+    /// Acceptance failed for a change
+    #[allow(dead_code)]
+    AcceptanceFailed { change_id: String, error: String },
 
     // Progress events
     /// Progress updated for a change (task completion tracking)

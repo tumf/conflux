@@ -113,34 +113,25 @@ These helpers SHALL be pure functions where possible, enabling unit testing.
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
 The acceptance loop SHALL parse stdout to determine pass/fail, and MUST NOT use exit code to determine acceptance verdict.
 The acceptance prompt MUST include a hardcoded acceptance prompt followed by configured `acceptance_prompt`.
+- The acceptance verdict parsing MUST recognize PASS/FAIL/CONTINUE markers even when the marker line includes non-semantic decoration (example: Markdown emphasis or surrounding punctuation).
+- When acceptance fails, the orchestrator MUST update tasks.md before returning to the apply loop.
+- Task updates MUST either add a new follow-up task or uncheck a previously completed task that must be revisited.
+- The acceptance failure reason MUST be recorded in tasks.md together with the task update.
+- The apply loop MUST resume with the same iteration counter value (no reset) after acceptance failure.
+- If no acceptance marker is present, the orchestrator MUST treat the outcome as CONTINUE and retry according to `acceptance_max_continues`.
 When resuming a workspace that has not completed archive, the orchestrator SHALL re-run acceptance before starting archive, even if tasks are already complete.
 
-#### Scenario: Parallel acceptance success proceeds to archive
+#### Scenario: Parallel acceptance output includes PASS with decoration
 - **GIVEN** a change completes an apply iteration successfully in parallel mode
-- **WHEN** acceptance output indicates PASS
-- **THEN** the orchestrator proceeds to archive in that workspace
+- **WHEN** acceptance output contains a decorated PASS marker such as `**ACCEPTANCE: PASS**`
+- **THEN** the orchestrator treats the outcome as PASS
+- **AND** tasks.md is not updated for acceptance failure
 
-#### Scenario: Parallel acceptance failure returns to apply loop
+#### Scenario: Parallel acceptance output with no marker defaults to CONTINUE
 - **GIVEN** a change completes an apply iteration successfully in parallel mode
-- **WHEN** acceptance output indicates FAIL with findings
-- **THEN** the orchestrator returns the change to the apply loop and records the findings
-
-#### Scenario: Parallel acceptance command execution failure
-- **GIVEN** a change completes an apply iteration successfully in parallel mode
-- **WHEN** the acceptance_command exits with non-zero status
-- **THEN** the orchestrator records the command failure and returns the change to the apply loop
-
-#### Scenario: Resume forces acceptance before archive
-- **GIVEN** a workspace is resumed after interruption
-- **AND** archive is not yet complete for the change
-- **WHEN** the orchestrator resumes processing
-- **THEN** acceptance_command is executed before any archive command
-
-**Implementation Notes:**
-- Acceptance results are not persisted across orchestrator sessions
-- When resuming in `Applied` or `Archiving` states, acceptance must re-run before archive
-- This ensures quality checks are not skipped even if acceptance completed before interruption
-- Acceptance history is cleared after successful archive to prevent history bloat
+- **WHEN** acceptance output includes no PASS/FAIL/CONTINUE marker
+- **THEN** the orchestrator treats the outcome as CONTINUE
+- **AND** the retry count is incremented
 
 ### Requirement: Parallel apply runs in worktree
 parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。
@@ -860,16 +851,18 @@ Parallel実行で `MergeWait` の change をユーザーが resolve した場合
 ### Requirement: キュー変更デバウンスとスロット駆動の再分析
 並列実行中、システムはキュー変更（追加・削除）を実行中でも監視し、変更から10秒経過した後に再分析を行い、実行スロットが空いたタイミングで依存関係を考慮して次の変更を選定しなければならない（SHALL）。
 
-加えて、システムは再分析時に実行スロットの空き数を算出し、依存関係分析の `order`（依存関係を満たした上での推奨実行順序）に従って空き数分の change を起動しなければならない（SHALL）。
+加えて、システムは再分析時に実行スロットの空き数を算出し、依存関係分析の `order`（依存関係を満たした上での推奨実行順序）に従って空き数分の change を同時に起動しなければならない（SHALL）。
 
 依存関係は実行制約として扱い、`order` の上位にあっても依存先が base に Git マージされた状態（依存先の成果物を使って実行できる状態）になるまで開始してはならない（MUST）。
 
 依存制約が解決した change は、依存解決後の実行開始時点で worktree を新規作成し、既存の worktree がある場合も作り直さなければならない（MUST）。この挙動は依存 change に固有であり、resume が常に成立することを保証しない前提の例外とする。
 
-#### Scenario: 実行中のキュー変更でもデバウンス後に再分析が走る
-- **GIVEN** 並列実行中に change がキューへ追加または削除される
-- **WHEN** キュー変更から10秒が経過する
-- **THEN** システムは再分析を行い実行スロットに応じて次の change を選定する
+#### Scenario: 空きスロット数に応じて同時起動する
+- **GIVEN** `max_concurrent_workspaces` が 3 に設定されている
+- **AND** 依存関係が解決済みの change が 3 件以上ある
+- **WHEN** 再分析が実行される
+- **THEN** システムは空きスロット数に応じて最大 3 件まで同時に起動する
+- **AND** 依存関係が未解決の change は起動しない
 
 ### Requirement: AI エージェントクラッシュリカバリー
 

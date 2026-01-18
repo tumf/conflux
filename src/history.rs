@@ -374,6 +374,26 @@ impl AcceptanceHistory {
         self.attempts.remove(change_id);
     }
 
+    /// Count consecutive CONTINUE attempts from the end of the history.
+    /// A CONTINUE attempt is detected by checking if findings contain "Investigation incomplete - continue later".
+    pub fn count_consecutive_continues(&self, change_id: &str) -> u32 {
+        let Some(attempts) = self.attempts.get(change_id) else {
+            return 0;
+        };
+
+        attempts
+            .iter()
+            .rev()
+            .take_while(|a| {
+                a.findings
+                    .as_ref()
+                    .and_then(|f| f.first())
+                    .map(|s| s.contains("Investigation incomplete - continue later"))
+                    .unwrap_or(false)
+            })
+            .count() as u32
+    }
+
     /// Format history as context string for prompt injection.
     /// Returns an empty string if there are no previous attempts.
     pub fn format_context(&self, change_id: &str) -> String {

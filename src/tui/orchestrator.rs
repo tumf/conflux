@@ -7,6 +7,10 @@ use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::history::OutputCollector;
 use crate::openspec::Change;
+use crate::orchestration::acceptance::{
+    acceptance_test_streaming, update_tasks_on_acceptance_failure, AcceptanceResult,
+};
+use crate::orchestration::output::{ChannelOutputHandler, OutputMessage};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -482,6 +486,7 @@ pub async fn run_orchestrator(
 
     let hooks = HookRunner::new(config.get_hooks());
     let max_iterations = config.get_max_iterations();
+    let acceptance_max_continues = config.get_acceptance_max_continues();
     let mut agent = AgentRunner::new(config);
 
     let mut total_changes = change_ids.len();
@@ -820,24 +825,255 @@ pub async fn run_orchestrator(
             // Apply succeeded - check if tasks are now 100% complete
             // Re-fetch change to get updated task counts after apply
             let updated_changes = crate::openspec::list_changes_native().unwrap_or_default();
-            let is_complete = updated_changes
-                .iter()
-                .find(|c| c.id == change_id)
-                .is_some_and(|c| c.is_complete());
+            let updated_change = updated_changes.iter().find(|c| c.id == change_id).cloned();
+            let is_complete = updated_change.as_ref().is_some_and(|c| c.is_complete());
 
             if is_complete {
-                // Only send ProcessingCompleted when tasks are 100% done
                 let _ = tx
-                    .send(OrchestratorEvent::ProcessingCompleted(change_id.clone()))
+                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                        "Tasks complete for {}, running acceptance test...",
+                        change_id
+                    ))))
+                    .await;
+
+                // Run acceptance test after apply completion
+                let updated_change = updated_change.unwrap(); // Safe: we checked is_complete above
+
+                // Send AcceptanceStarted event
+                let _ = tx
+                    .send(OrchestratorEvent::AcceptanceStarted {
+                        change_id: change_id.clone(),
+                    })
+                    .await;
+
+                // Create output handler that forwards to TUI events
+                let tx_clone = tx.clone();
+                let change_id_clone = change_id.clone();
+                let output = ChannelOutputHandler::new(move |msg: OutputMessage| {
+                    let tx = tx_clone.clone();
+                    let change_id = change_id_clone.clone();
+                    tokio::spawn(async move {
+                        match msg {
+                            OutputMessage::Stdout(s) => {
+                                let _ = tx
+                                    .send(OrchestratorEvent::Log(
+                                        LogEntry::info(s)
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance"),
+                                    ))
+                                    .await;
+                            }
+                            OutputMessage::Stderr(s) => {
+                                let _ = tx
+                                    .send(OrchestratorEvent::Log(
+                                        LogEntry::warn(s)
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance"),
+                                    ))
+                                    .await;
+                            }
+                            OutputMessage::Info(s) => {
+                                let _ = tx
+                                    .send(OrchestratorEvent::Log(
+                                        LogEntry::info(s)
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance"),
+                                    ))
+                                    .await;
+                            }
+                            OutputMessage::Warn(s) => {
+                                let _ = tx
+                                    .send(OrchestratorEvent::Log(
+                                        LogEntry::warn(s)
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance"),
+                                    ))
+                                    .await;
+                            }
+                            OutputMessage::Error(s) => {
+                                let _ = tx
+                                    .send(OrchestratorEvent::Log(
+                                        LogEntry::error(s)
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance"),
+                                    ))
+                                    .await;
+                            }
+                            OutputMessage::Success(s) => {
+                                let _ = tx
+                                    .send(OrchestratorEvent::Log(
+                                        LogEntry::success(s)
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance"),
+                                    ))
+                                    .await;
+                            }
+                        }
+                    });
+                });
+
+                // Check for cancellation
+                let cancel_check = || cancel_token.is_cancelled();
+
+                match acceptance_test_streaming(&updated_change, &mut agent, &output, cancel_check)
+                    .await
+                {
+                    Ok(AcceptanceResult::Pass) => {
+                        let _ = tx
+                            .send(OrchestratorEvent::Log(LogEntry::success(format!(
+                                "Acceptance passed for {}, ready for archive",
+                                change_id
+                            ))))
+                            .await;
+
+                        // Send AcceptanceCompleted event
+                        let _ = tx
+                            .send(OrchestratorEvent::AcceptanceCompleted {
+                                change_id: change_id.clone(),
+                            })
+                            .await;
+
+                        // Only send ProcessingCompleted when tasks are 100% done and acceptance passes
+                        let _ = tx
+                            .send(OrchestratorEvent::ProcessingCompleted(change_id.clone()))
+                            .await;
+                    }
+                    Ok(AcceptanceResult::Continue) => {
+                        let continue_count =
+                            agent.count_consecutive_acceptance_continues(&change_id);
+                        let max_continues = acceptance_max_continues;
+
+                        // Send AcceptanceCompleted event
+                        let _ = tx
+                            .send(OrchestratorEvent::AcceptanceCompleted {
+                                change_id: change_id.clone(),
+                            })
+                            .await;
+
+                        if continue_count >= max_continues {
+                            let _ = tx
+                                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                                    "Acceptance CONTINUE limit ({}) exceeded for {}, treating as FAIL",
+                                    max_continues, change_id
+                                ))))
+                                .await;
+                            // Exceeded limit - change will be selected again for apply in next iteration
+                        } else {
+                            let _ = tx
+                                .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                                    "Acceptance requires continuation for {} (attempt {}/{}), retrying...",
+                                    change_id, continue_count, max_continues
+                                ))))
+                                .await;
+                            // Will retry acceptance in next iteration
+                        }
+                    }
+                    Ok(AcceptanceResult::Fail { findings }) => {
+                        let _ = tx
+                            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                                "Acceptance failed for {} with {} findings, will retry apply",
+                                change_id,
+                                findings.len()
+                            ))))
+                            .await;
+
+                        // Send AcceptanceCompleted event
+                        let _ = tx
+                            .send(OrchestratorEvent::AcceptanceCompleted {
+                                change_id: change_id.clone(),
+                            })
+                            .await;
+
+                        // Update tasks.md with acceptance findings
+                        if let Err(e) =
+                            update_tasks_on_acceptance_failure(&change_id, &findings, None).await
+                        {
+                            let _ = tx
+                                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                                    "Failed to update tasks.md for {}: {}",
+                                    change_id, e
+                                ))))
+                                .await;
+                        }
+                        // Change will be selected again for apply in next iteration
+                    }
+                    Ok(AcceptanceResult::CommandFailed { error }) => {
+                        let _ = tx
+                            .send(OrchestratorEvent::Log(LogEntry::error(format!(
+                                "Acceptance command failed for {}: {}",
+                                change_id, error
+                            ))))
+                            .await;
+
+                        // Send AcceptanceCompleted event
+                        let _ = tx
+                            .send(OrchestratorEvent::AcceptanceCompleted {
+                                change_id: change_id.clone(),
+                            })
+                            .await;
+
+                        // Update tasks.md with command failure
+                        if let Err(e) = update_tasks_on_acceptance_failure(
+                            &change_id,
+                            std::slice::from_ref(&error),
+                            None,
+                        )
+                        .await
+                        {
+                            let _ = tx
+                                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                                    "Failed to update tasks.md for {}: {}",
+                                    change_id, e
+                                ))))
+                                .await;
+                        }
+                        // Change will be selected again for apply in next iteration
+                    }
+                    Ok(AcceptanceResult::Cancelled) => {
+                        let _ = tx
+                            .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                                "Acceptance cancelled for {}",
+                                change_id
+                            ))))
+                            .await;
+
+                        // Send AcceptanceCompleted event even on cancellation
+                        let _ = tx
+                            .send(OrchestratorEvent::AcceptanceCompleted {
+                                change_id: change_id.clone(),
+                            })
+                            .await;
+
+                        // Exit the main loop
+                        pending_changes.clear();
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(OrchestratorEvent::Log(LogEntry::error(format!(
+                                "Acceptance error for {}: {}",
+                                change_id, e
+                            ))))
+                            .await;
+
+                        // Send AcceptanceCompleted event even on error
+                        let _ = tx
+                            .send(OrchestratorEvent::AcceptanceCompleted {
+                                change_id: change_id.clone(),
+                            })
+                            .await;
+
+                        // Exit the main loop
+                        pending_changes.clear();
+                    }
+                }
+            } else {
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                        "Apply completed for {}, but tasks not yet complete",
+                        change_id
+                    ))))
                     .await;
             }
-
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                    "Apply completed for {}, checking for completion...",
-                    change_id
-                ))))
-                .await;
         } else {
             let error_msg = format!("Apply failed with exit code: {:?}", status.code());
 

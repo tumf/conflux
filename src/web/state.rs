@@ -47,8 +47,13 @@ pub struct ChangeStatus {
     /// Dependencies on other changes
     pub dependencies: Vec<String>,
     /// Queue status (for parallel/serial execution tracking)
+    /// Aligned with TUI QueueStatus display values: "not queued", "queued", "processing",
+    /// "completed", "archiving", "archived", "merged", "merge wait", "resolving", "error"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_status: Option<String>,
+    /// Current iteration number for apply/archive loops
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iteration_number: Option<u32>,
 }
 
 impl From<&Change> for ChangeStatus {
@@ -70,6 +75,7 @@ impl From<&Change> for ChangeStatus {
             is_approved: change.is_approved,
             dependencies: change.dependencies.clone(),
             queue_status: None, // Set by event handlers based on execution state
+            iteration_number: None, // Set by event handlers during apply/archive loops
         }
     }
 }
@@ -208,6 +214,9 @@ impl WebState {
                 // Preserve queue_status
                 new_change.queue_status = existing.queue_status.clone();
 
+                // Preserve iteration_number
+                new_change.iteration_number = existing.iteration_number;
+
                 // Preserve existing progress if retrieval failed (new data is 0/0)
                 // This prevents resetting progress to 0 on retrieval failure
                 if new_change.total_tasks == 0
@@ -282,6 +291,20 @@ impl WebState {
                     }
                 }
 
+                // Apply output with iteration tracking
+                ExecutionEvent::ApplyOutput {
+                    change_id,
+                    iteration,
+                    ..
+                } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        if let Some(iter) = iteration {
+                            change.iteration_number = Some(*iter);
+                            updated = true;
+                        }
+                    }
+                }
+
                 // Archive events
                 ExecutionEvent::ArchiveStarted(change_id) => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
@@ -294,6 +317,18 @@ impl WebState {
                         change.status = "archived".to_string();
                         change.queue_status = Some("archived".to_string());
                         updated = true;
+                    }
+                }
+                ExecutionEvent::ArchiveOutput {
+                    change_id,
+                    iteration,
+                    ..
+                } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        if let Some(iter) = iteration {
+                            change.iteration_number = Some(*iter);
+                            updated = true;
+                        }
                     }
                 }
 
@@ -366,11 +401,12 @@ impl WebState {
                     let mut new_change_statuses: Vec<ChangeStatus> =
                         changes.iter().map(ChangeStatus::from).collect();
 
-                    // Preserve queue_status and progress from existing state where applicable
+                    // Preserve queue_status, iteration_number, and progress from existing state where applicable
                     for new_change in &mut new_change_statuses {
                         if let Some(existing) = state.changes.iter().find(|c| c.id == new_change.id)
                         {
                             new_change.queue_status = existing.queue_status.clone();
+                            new_change.iteration_number = existing.iteration_number;
 
                             // Preserve existing progress if retrieval failed (new data is 0/0)
                             // This prevents resetting progress to 0 on retrieval failure

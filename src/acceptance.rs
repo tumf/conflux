@@ -10,13 +10,16 @@ pub enum AcceptanceResult {
     Pass,
     /// Acceptance failed with findings
     Fail { findings: Vec<String> },
+    /// Acceptance requires more investigation - continue later
+    Continue,
 }
 
-/// Parse acceptance output text and determine pass/fail status.
+/// Parse acceptance output text and determine pass/fail/continue status.
 ///
 /// Expected format:
-/// - PASS: `ACCEPTANCE: PASS`
+/// - PASS: `ACCEPTANCE: PASS` (with optional markdown decorations like `**ACCEPTANCE: PASS**`)
 /// - FAIL: `ACCEPTANCE: FAIL` followed by `FINDINGS:` and items prefixed with `- `
+/// - CONTINUE: `ACCEPTANCE: CONTINUE`
 ///
 /// # Examples
 ///
@@ -35,39 +38,55 @@ pub enum AcceptanceResult {
 ///     }
 ///     _ => panic!("Expected Fail"),
 /// }
+///
+/// let continue_output = "ACCEPTANCE: CONTINUE\n";
+/// assert_eq!(parse_acceptance_output(continue_output), AcceptanceResult::Continue);
 /// ```
 pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
     let lines: Vec<&str> = output.lines().collect();
 
-    // Look for ACCEPTANCE: PASS or ACCEPTANCE: FAIL
+    // Look for ACCEPTANCE: PASS, ACCEPTANCE: FAIL, or ACCEPTANCE: CONTINUE
     let mut acceptance_status = None;
     for line in &lines {
         let trimmed = line.trim();
-        if trimmed == "ACCEPTANCE: PASS" {
-            acceptance_status = Some(true);
+        // Strip markdown decorations (**, *, _, etc.) before matching
+        let normalized = strip_markdown_decorations(trimmed);
+        if normalized == "ACCEPTANCE: PASS" {
+            acceptance_status = Some("pass");
             break;
-        } else if trimmed == "ACCEPTANCE: FAIL" {
-            acceptance_status = Some(false);
+        } else if normalized == "ACCEPTANCE: FAIL" {
+            acceptance_status = Some("fail");
+            break;
+        } else if normalized == "ACCEPTANCE: CONTINUE" {
+            acceptance_status = Some("continue");
             break;
         }
     }
 
     match acceptance_status {
-        Some(true) => AcceptanceResult::Pass,
-        Some(false) => {
+        Some("pass") => AcceptanceResult::Pass,
+        Some("continue") => AcceptanceResult::Continue,
+        Some("fail") => {
             // Parse findings
             let findings = parse_findings(output);
             AcceptanceResult::Fail { findings }
         }
-        None => {
-            // Default to fail if no explicit status found
-            AcceptanceResult::Fail {
-                findings: vec![
-                    "No explicit ACCEPTANCE: PASS or ACCEPTANCE: FAIL found in output".to_string(),
-                ],
-            }
+        _ => {
+            // Default to continue if no explicit status found
+            // This allows the acceptance loop to retry and investigate further
+            AcceptanceResult::Continue
         }
     }
+}
+
+/// Strip markdown decorations from a string.
+/// Removes bold (**), italic (*), underline (_), and other common markdown formatting.
+fn strip_markdown_decorations(text: &str) -> String {
+    // Simple approach: remove all common markdown decoration characters
+    text.replace("**", "")
+        .replace(['*', '_'], "")
+        .trim()
+        .to_string()
 }
 
 /// Parse findings from acceptance output.
@@ -159,13 +178,22 @@ FINDINGS:
     #[test]
     fn test_parse_no_status() {
         let output = "Some random output\n";
-        match parse_acceptance_output(output) {
-            AcceptanceResult::Fail { findings } => {
-                assert_eq!(findings.len(), 1);
-                assert!(findings[0].contains("No explicit ACCEPTANCE"));
-            }
-            _ => panic!("Expected Fail"),
-        }
+        // When no explicit marker is present, default to CONTINUE
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_no_marker_defaults_to_continue() {
+        // Empty output defaults to CONTINUE
+        assert_eq!(parse_acceptance_output(""), AcceptanceResult::Continue);
+
+        // Output with no acceptance marker defaults to CONTINUE
+        let output = "Some debug output\nNo marker here\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+
+        // Output with findings but no marker defaults to CONTINUE
+        let output = "FINDINGS:\n- Issue 1\n- Issue 2\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
     }
 
     #[test]
@@ -185,5 +213,84 @@ Additional output here
             }
             _ => panic!("Expected Fail"),
         }
+    }
+
+    #[test]
+    fn test_parse_continue() {
+        let output = "ACCEPTANCE: CONTINUE\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_continue_with_extra_output() {
+        let output = "Some debug output\nACCEPTANCE: CONTINUE\nMore output\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_pass_with_bold_decoration() {
+        let output = "**ACCEPTANCE: PASS**\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_pass_with_bold_decoration_and_extra_output() {
+        let output = "Some debug output\n**ACCEPTANCE: PASS**\nMore output\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_fail_with_bold_decoration() {
+        let output = "**ACCEPTANCE: FAIL**\nFINDINGS:\n- Issue 1\n- Issue 2\n";
+        match parse_acceptance_output(output) {
+            AcceptanceResult::Fail { findings } => {
+                assert_eq!(findings.len(), 2);
+                assert_eq!(findings[0], "Issue 1");
+                assert_eq!(findings[1], "Issue 2");
+            }
+            _ => panic!("Expected Fail"),
+        }
+    }
+
+    #[test]
+    fn test_parse_continue_with_bold_decoration() {
+        let output = "**ACCEPTANCE: CONTINUE**\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_pass_with_italic_decoration() {
+        let output = "*ACCEPTANCE: PASS*\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_pass_with_mixed_decorations() {
+        let output = "**_ACCEPTANCE: PASS_**\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_strip_markdown_decorations() {
+        assert_eq!(
+            strip_markdown_decorations("**ACCEPTANCE: PASS**"),
+            "ACCEPTANCE: PASS"
+        );
+        assert_eq!(
+            strip_markdown_decorations("*ACCEPTANCE: PASS*"),
+            "ACCEPTANCE: PASS"
+        );
+        assert_eq!(
+            strip_markdown_decorations("_ACCEPTANCE: PASS_"),
+            "ACCEPTANCE: PASS"
+        );
+        assert_eq!(
+            strip_markdown_decorations("**_ACCEPTANCE: PASS_**"),
+            "ACCEPTANCE: PASS"
+        );
+        assert_eq!(
+            strip_markdown_decorations("ACCEPTANCE: PASS"),
+            "ACCEPTANCE: PASS"
+        );
     }
 }

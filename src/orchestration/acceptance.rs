@@ -20,6 +20,8 @@ pub enum AcceptanceResult {
     Pass,
     /// Acceptance failed - must return to apply loop.
     Fail { findings: Vec<String> },
+    /// Acceptance requires more investigation - retry acceptance.
+    Continue,
     /// Acceptance command execution failed (non-zero exit).
     CommandFailed { error: String },
     /// Acceptance was cancelled (e.g., by user or timeout).
@@ -146,6 +148,21 @@ where
             output.on_success("Acceptance test passed");
             Ok(AcceptanceResult::Pass)
         }
+        ParseResult::Continue => {
+            info!("Acceptance requires continuation for: {}", change.id);
+            let attempt = AcceptanceAttempt {
+                attempt: agent.next_acceptance_attempt_number(&change.id),
+                passed: false,
+                duration: start_time.elapsed(),
+                findings: Some(vec!["Investigation incomplete - continue later".to_string()]),
+                exit_code: status.code(),
+                stdout_tail,
+                stderr_tail,
+            };
+            agent.record_acceptance_attempt(&change.id, attempt);
+            output.on_info("Acceptance test requires continuation");
+            Ok(AcceptanceResult::Continue)
+        }
         ParseResult::Fail { findings } => {
             info!(
                 "Acceptance failed for: {} with {} findings",
@@ -172,6 +189,80 @@ where
             Ok(AcceptanceResult::Fail { findings })
         }
     }
+}
+
+/// Update tasks.md on acceptance failure.
+///
+/// Adds a follow-up task at the end of tasks.md with the acceptance failure reason.
+/// The task is added in unchecked state to signal that work needs to be done.
+///
+/// # Arguments
+/// * `change_id` - The change ID
+/// * `findings` - The acceptance failure findings
+/// * `workspace_path` - Optional workspace path for parallel execution
+///
+/// # Returns
+/// * `Ok(())` - Task file updated successfully
+/// * `Err(e)` - Failed to update task file
+pub async fn update_tasks_on_acceptance_failure(
+    change_id: &str,
+    findings: &[String],
+    workspace_path: Option<&std::path::Path>,
+) -> Result<()> {
+    use std::path::PathBuf;
+    use tokio::fs;
+
+    // Determine tasks.md path (worktree or base tree)
+    let tasks_path: PathBuf = if let Some(wt_path) = workspace_path {
+        wt_path
+            .join("openspec/changes")
+            .join(change_id)
+            .join("tasks.md")
+    } else {
+        PathBuf::from("openspec/changes")
+            .join(change_id)
+            .join("tasks.md")
+    };
+
+    // Read current tasks.md content
+    let content = fs::read_to_string(&tasks_path).await.map_err(|e| {
+        OrchestratorError::ConfigLoad(format!("Failed to read tasks file {:?}: {}", tasks_path, e))
+    })?;
+
+    // Format findings into a single follow-up task
+    let findings_text = if findings.len() == 1 {
+        findings[0].clone()
+    } else {
+        findings
+            .iter()
+            .enumerate()
+            .map(|(i, f)| format!("  {}) {}", i + 1, f))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // Create follow-up task
+    let follow_up_task = format!(
+        "\n\n## Acceptance Failure Follow-up\n- [ ] Address acceptance findings:\n{}",
+        findings_text
+    );
+
+    // Append to tasks.md
+    let updated_content = format!("{}{}", content, follow_up_task);
+    fs::write(&tasks_path, updated_content).await.map_err(|e| {
+        OrchestratorError::ConfigLoad(format!(
+            "Failed to write tasks file {:?}: {}",
+            tasks_path, e
+        ))
+    })?;
+
+    info!(
+        "Updated tasks.md for {} with {} acceptance findings",
+        change_id,
+        findings.len()
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]
