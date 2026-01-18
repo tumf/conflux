@@ -231,8 +231,6 @@ pub async fn resolve_conflicts_with_retry(
             duration,
             continuation_reason,
             exit_code: status.code(),
-            stdout_tail: output_collector.stdout_tail(),
-            stderr_tail: output_collector.stderr_tail(),
         });
     }
 
@@ -466,8 +464,6 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         duration,
                         continuation_reason: Some(reason),
                         exit_code: status.code(),
-                        stdout_tail: output_collector.stdout_tail(),
-                        stderr_tail: output_collector.stderr_tail(),
                     });
                     continue;
                 }
@@ -519,8 +515,6 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         duration,
                         continuation_reason: Some(reason),
                         exit_code: status.code(),
-                        stdout_tail: output_collector.stdout_tail(),
-                        stderr_tail: output_collector.stderr_tail(),
                     });
                     continue;
                 }
@@ -569,8 +563,6 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         duration,
                         continuation_reason: Some(reason),
                         exit_code: status.code(),
-                        stdout_tail: output_collector.stdout_tail(),
-                        stderr_tail: output_collector.stderr_tail(),
                     });
                     continue;
                 }
@@ -604,8 +596,6 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         duration,
                         continuation_reason: Some(reason),
                         exit_code: status.code(),
-                        stdout_tail: output_collector.stdout_tail(),
-                        stderr_tail: output_collector.stderr_tail(),
                     });
                     continue;
                 }
@@ -693,8 +683,6 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         duration,
                         continuation_reason: Some(reason),
                         exit_code: status.code(),
-                        stdout_tail: output_collector.stdout_tail(),
-                        stderr_tail: output_collector.stderr_tail(),
                     });
                     continue;
                 }
@@ -725,9 +713,9 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             resolve_context.record(ResolveAttempt {
                 attempt,
                 command_success: status_success,
-                verification_success: true,
+                verification_success: false,
                 duration,
-                continuation_reason: None,
+                continuation_reason,
                 exit_code: status.code(),
                 stdout_tail: output_collector.stdout_tail(),
                 stderr_tail: output_collector.stderr_tail(),
@@ -777,8 +765,6 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             duration,
             continuation_reason,
             exit_code: status.code(),
-            stdout_tail: output_collector.stdout_tail(),
-            stderr_tail: output_collector.stderr_tail(),
         });
     }
 
