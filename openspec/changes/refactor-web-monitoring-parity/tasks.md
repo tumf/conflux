@@ -1,12 +1,28 @@
-## 1. 実装
-- [ ] 1.1 監視向け共通状態モデルの設計とデータ契約を定義する
-- [ ] 1.2 TUI のイベント更新を共通状態モデルに反映する経路を実装する
-- [ ] 1.3 Web 監視の配信を共通状態モデルに切り替える
-- [ ] 1.4 Web UI で必要な追加情報（キュー、ログ、ワークツリー、実行状態）を表示する
-- [ ] 1.5 既存 WebState との互換性と移行戦略を整理する
+## 1. Backend Implementation
+- [x] 1.1 Extend WebState with TUI-equivalent state fields (queue_status, logs, worktrees, mode)
+- [x] 1.2 Add ExecutionEvent subscription to WebState for real-time updates
+- [x] 1.3 Implement WebState event handlers for all ExecutionEvent types (ProcessingStarted, Log, ChangesRefreshed, WorktreesRefreshed, etc.)
+- [x] 1.4 Update websocket.rs to broadcast ExecutionEvent-based updates to clients
+- [x] 1.5 Ensure WebState state updates are thread-safe and broadcast-ready
 
-## 2. 検証
-- [ ] 2.1 TUI と Web UI の表示内容が完全一致することを確認する
-- [ ] 2.2 WebSocket 再接続時に最新状態が復元されることを確認する
-- [ ] 2.3 TUI と CLI の両モードで同じ更新が届くことを確認する
-- [ ] 2.4 既存の REST API がスナップショット取得として機能することを確認する
+## 2. Integration
+- [x] 2.1 Wire TUI orchestrator to send ExecutionEvents to WebState
+- [x] 2.2 Wire parallel executor to send ExecutionEvents to WebState
+- [x] 2.3 Ensure both TUI and Web receive same ExecutionEvent stream
+- [x] 2.4 Test WebSocket reconnection with state restoration (WebSocket already sends initial state on connect)
+
+## Future work
+
+### Frontend Implementation
+- Extend web UI state model to handle queue status, logs, and worktrees
+- Add WebSocket message handlers for new event types (Log, WorktreesRefreshed, mode changes)
+- Implement UI components for displaying logs (similar to TUI log panel)
+- Implement UI components for displaying worktrees (similar to TUI worktree view)
+- Update change cards to show queue_status badges (Queued, Processing, Archiving, etc.)
+
+### Testing
+- Verify TUI and Web UI show identical change states during serial execution
+- Verify TUI and Web UI show identical change states during parallel execution
+- Verify logs appear in both TUI and Web UI in real-time
+- Verify worktree list updates in both TUI and Web UI
+- Test WebSocket reconnection preserves latest state

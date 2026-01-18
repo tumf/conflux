@@ -3,10 +3,21 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tracing::debug;
 
+/// Get version string with build number
+const fn get_version_string() -> &'static str {
+    concat!(
+        "v",
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("BUILD_NUMBER"),
+        ")"
+    )
+}
+
 /// OpenSpec Orchestrator - Automate OpenSpec workflow
 #[derive(Parser, Debug)]
 #[command(name = "cflx")]
-#[command(version)]
+#[command(version = get_version_string())]
 #[command(about = "Automates OpenSpec change workflow (list → apply → archive)")]
 #[command(long_about = "Conflux - OpenSpec Change Orchestrator
 
