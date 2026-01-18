@@ -319,10 +319,12 @@ pub async fn is_working_directory_clean<P: AsRef<Path>>(cwd: P) -> VcsResult<boo
 }
 
 #[allow(dead_code)]
-/// Check for merge conflicts by attempting a test merge.
+/// Check for merge conflicts without modifying the working tree.
 ///
-/// Performs a `git merge --no-commit --no-ff <branch>` to detect potential conflicts.
-/// Aborts the merge immediately after checking, leaving the working directory clean.
+/// Uses `git merge-tree` to simulate a merge and detect conflicts without touching
+/// the working directory or index. This is safe to run while agents are working
+/// in the worktree.
+///
 /// Returns Ok(Some(conflict_files)) if conflicts are detected, Ok(None) if no conflicts.
 pub async fn check_merge_conflicts<P: AsRef<Path>>(
     cwd: P,
@@ -330,41 +332,61 @@ pub async fn check_merge_conflicts<P: AsRef<Path>>(
 ) -> VcsResult<Option<Vec<String>>> {
     let cwd = cwd.as_ref();
 
-    // Attempt test merge without commit
+    // Get the current HEAD commit
+    let head_commit = run_git(&["rev-parse", "HEAD"], cwd).await?;
+    let head_commit = head_commit.trim();
+
+    // Get the branch commit
+    let branch_commit = run_git(&["rev-parse", branch_name], cwd).await?;
+    let branch_commit = branch_commit.trim();
+
+    // Get the merge base
+    let merge_base = run_git(&["merge-base", head_commit, branch_commit], cwd).await?;
+    let merge_base = merge_base.trim();
+
+    // Use git merge-tree to simulate the merge (available in Git 2.38+)
+    // Format: git merge-tree --write-tree <base> <branch1> <branch2>
     let output = Command::new("git")
-        .args(["merge", "--no-commit", "--no-ff", branch_name])
+        .args([
+            "merge-tree",
+            "--write-tree",
+            merge_base,
+            head_commit,
+            branch_commit,
+        ])
         .current_dir(cwd)
         .output()
         .await
         .map_err(|e| VcsError::git_command(e.to_string()))?;
 
-    // Check if merge succeeded
-    if output.status.success() {
-        // Merge would succeed - abort and return no conflicts
-        let _ = run_git(&["merge", "--abort"], cwd).await;
-        return Ok(None);
-    }
-
-    // Parse stderr to detect conflicts
+    let _stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
+    // Check for conflicts in stderr
+    // git merge-tree outputs conflict markers and messages to stderr
     if stderr.contains("CONFLICT") {
-        // Extract conflict files
+        // Extract conflict files from stderr
         let conflict_files = parse_conflict_files(&stderr);
-
-        // Abort the merge
-        let _ = run_git(&["merge", "--abort"], cwd).await;
-
+        debug!(
+            "Detected {} conflicts in worktree at {}",
+            conflict_files.len(),
+            cwd.display()
+        );
         Ok(Some(conflict_files))
-    } else {
-        // Other error (not a conflict)
-        // Attempt to abort anyway
-        let _ = run_git(&["merge", "--abort"], cwd).await;
-
+    } else if !output.status.success() {
+        // merge-tree failed for another reason
         Err(VcsError::git_command(format!(
-            "Merge test failed (not a conflict): {}",
+            "Merge tree simulation failed: {}",
             stderr
         )))
+    } else {
+        // No conflicts - merge would succeed cleanly
+        debug!(
+            "No conflicts detected for {} in {}",
+            branch_name,
+            cwd.display()
+        );
+        Ok(None)
     }
 }
 
