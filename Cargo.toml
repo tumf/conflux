@@ -49,3 +49,6 @@ nix = { version = "0.27", features = ["signal", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52", features = ["Win32_System_JobObjects", "Win32_Foundation", "Win32_System_Threading"] }
+
+[build-dependencies]
+chrono = "0.4"
