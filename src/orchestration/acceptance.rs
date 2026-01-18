@@ -173,3 +173,22 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_acceptance_result_is_pass() {
+        assert!(AcceptanceResult::Pass.is_pass());
+        assert!(!AcceptanceResult::Fail {
+            findings: vec!["error".to_string()]
+        }
+        .is_pass());
+        assert!(!AcceptanceResult::CommandFailed {
+            error: "test".to_string()
+        }
+        .is_pass());
+        assert!(!AcceptanceResult::Cancelled.is_pass());
+    }
+}

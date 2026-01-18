@@ -42,23 +42,15 @@ impl AppState {
                 total,
             } => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-                    // Only update progress, never modify queue_status.
-                    // In Stopped mode, task completion does not trigger auto-queue.
-                    // After Completed, the tasks.md file may be moved/archived.
-                    match change.queue_status {
-                        QueueStatus::Completed
-                        | QueueStatus::Archiving
-                        | QueueStatus::Archived
-                        | QueueStatus::Merged
-                        | QueueStatus::MergeWait
-                        | QueueStatus::Resolving => {
-                            // Don't update progress after completion - file may be moved
-                        }
-                        _ => {
-                            change.completed_tasks = completed;
-                            change.total_tasks = total;
-                        }
+                    // Update progress for all states when valid data is available.
+                    // Only update if total > 0 to avoid resetting progress on retrieval failure.
+                    // Progress retrieval failure (0/0) should preserve existing progress.
+                    if total > 0 {
+                        change.completed_tasks = completed;
+                        change.total_tasks = total;
                     }
+                    // Never modify queue_status here.
+                    // In Stopped mode, task completion does not trigger auto-queue.
                 }
             }
             OrchestratorEvent::ProcessingCompleted(id) => {
@@ -408,54 +400,47 @@ impl AppState {
                     } else {
                         QueueStatus::NotQueued
                     };
-                    existing.completed_tasks = fetched.completed_tasks;
-                    existing.total_tasks = fetched.total_tasks;
-                } else if is_merge_wait {
-                    // Preserve MergeWait status during auto-refresh
-                    // MergeWait is a persistent state that requires explicit user action (M key)
-                    // to transition to Resolving, and should not be cleared by progress updates
-                    // Only update progress, not status
+                    // Update progress for unarchived changes
                     if fetched.total_tasks > 0 {
                         existing.completed_tasks = fetched.completed_tasks;
                         existing.total_tasks = fetched.total_tasks;
                     }
-                } else if fetched.total_tasks > 0 {
-                    // Only update progress if we have valid data (total > 0)
-                    // Note: Processing changes are now updated because auto-refresh enriches
-                    // progress from worktrees (see runner.rs auto-refresh task)
-                    match existing.queue_status {
-                        QueueStatus::Completed
-                        | QueueStatus::Archiving
-                        | QueueStatus::Archived
-                        | QueueStatus::Merged
-                        | QueueStatus::MergeWait
-                        | QueueStatus::Resolving => {
-                            // Don't update progress after completion
-                            // - After completion: file may be moved/archived
-                        }
-                        _ => {
-                            // Update progress for all other states (including Processing)
-                            // For Processing: auto-refresh enriches from worktree tasks.md
-                            existing.completed_tasks = fetched.completed_tasks;
-                            existing.total_tasks = fetched.total_tasks;
-                        }
+                    // If fetched.total_tasks == 0, preserve existing progress
+                } else if is_merge_wait {
+                    // Preserve MergeWait status during auto-refresh
+                    // MergeWait is a persistent state that requires explicit user action (M key)
+                    // to transition to Resolving, and should not be cleared by progress updates
+                    // Update progress for all states (including MergeWait)
+                    if fetched.total_tasks > 0 {
+                        existing.completed_tasks = fetched.completed_tasks;
+                        existing.total_tasks = fetched.total_tasks;
                     }
+                    // If fetched.total_tasks == 0, preserve existing progress
                 } else {
-                    // fetched.total_tasks == 0: For Archived/Merged changes with 0/0,
-                    // try to補完 progress from archive directory
-                    match existing.queue_status {
-                        QueueStatus::Archived | QueueStatus::Merged => {
-                            if existing.completed_tasks == 0 && existing.total_tasks == 0 {
-                                // Try to read from archive
-                                if let Ok(progress) =
-                                    task_parser::parse_archived_change(&fetched.id)
-                                {
-                                    existing.completed_tasks = progress.completed;
-                                    existing.total_tasks = progress.total;
+                    // Update progress for all other states when valid data is available
+                    // Only update if total > 0 to avoid resetting progress on retrieval failure
+                    if fetched.total_tasks > 0 {
+                        existing.completed_tasks = fetched.completed_tasks;
+                        existing.total_tasks = fetched.total_tasks;
+                    } else {
+                        // fetched.total_tasks == 0: Retrieval failed, preserve existing progress
+                        // For Archived/Merged changes with existing 0/0, try archive directory
+                        match existing.queue_status {
+                            QueueStatus::Archived | QueueStatus::Merged => {
+                                if existing.completed_tasks == 0 && existing.total_tasks == 0 {
+                                    // Try to read from archive as fallback
+                                    if let Ok(progress) =
+                                        task_parser::parse_archived_change(&fetched.id)
+                                    {
+                                        existing.completed_tasks = progress.completed;
+                                        existing.total_tasks = progress.total;
+                                    }
                                 }
                             }
+                            _ => {
+                                // For all other states: preserve existing progress (do nothing)
+                            }
                         }
-                        _ => {}
                     }
                 }
             }
@@ -1531,10 +1516,14 @@ mod tests {
             QueueStatus::MergeWait,
             "MergeWait status should not be modified by ProgressUpdated"
         );
-        // AND: Progress is NOT updated (MergeWait is in terminal-like state)
+        // AND: Progress IS updated (per update-progress-archive-resolve spec)
         assert_eq!(
-            app.changes[0].completed_tasks, 5,
-            "Progress should not be updated for MergeWait changes"
+            app.changes[0].completed_tasks, 8,
+            "Progress should be updated for all states including MergeWait"
+        );
+        assert_eq!(
+            app.changes[0].total_tasks, 10,
+            "Total tasks should be updated for all states including MergeWait"
         );
     }
 
@@ -1678,5 +1667,172 @@ mod tests {
         assert_eq!(app.changes[0].completed_tasks, 7);
         assert_eq!(app.changes[0].total_tasks, 10);
         assert_eq!(app.changes[0].queue_status, QueueStatus::Processing);
+    }
+
+    // === Tests for update-progress-archive-resolve ===
+
+    /// Test that ProgressUpdated with 0/0 preserves existing progress (all states)
+    #[test]
+    fn test_progress_updated_zero_preserves_existing_all_states() {
+        let states = vec![
+            QueueStatus::NotQueued,
+            QueueStatus::Queued,
+            QueueStatus::Processing,
+            QueueStatus::Completed,
+            QueueStatus::Archiving,
+            QueueStatus::Archived,
+            QueueStatus::Merged,
+            QueueStatus::MergeWait,
+            QueueStatus::Resolving,
+        ];
+
+        for state in states {
+            let changes = vec![create_approved_change("change-a", 5, 10)];
+            let mut app = AppState::new(changes);
+            app.changes[0].queue_status = state.clone();
+
+            // Send ProgressUpdated with 0/0 (retrieval failure)
+            app.handle_orchestrator_event(OrchestratorEvent::ProgressUpdated {
+                change_id: "change-a".to_string(),
+                completed: 0,
+                total: 0,
+            });
+
+            // Progress should be preserved
+            assert_eq!(
+                app.changes[0].completed_tasks, 5,
+                "State {:?}: completed_tasks should be preserved",
+                state
+            );
+            assert_eq!(
+                app.changes[0].total_tasks, 10,
+                "State {:?}: total_tasks should be preserved",
+                state
+            );
+        }
+    }
+
+    /// Test that ProgressUpdated with valid data updates all states
+    #[test]
+    fn test_progress_updated_valid_updates_all_states() {
+        let states = vec![
+            QueueStatus::NotQueued,
+            QueueStatus::Queued,
+            QueueStatus::Processing,
+            QueueStatus::Completed,
+            QueueStatus::Archiving,
+            QueueStatus::Archived,
+            QueueStatus::Merged,
+            QueueStatus::MergeWait,
+            QueueStatus::Resolving,
+        ];
+
+        for state in states {
+            let changes = vec![create_approved_change("change-a", 5, 10)];
+            let mut app = AppState::new(changes);
+            app.changes[0].queue_status = state.clone();
+
+            // Send ProgressUpdated with valid data
+            app.handle_orchestrator_event(OrchestratorEvent::ProgressUpdated {
+                change_id: "change-a".to_string(),
+                completed: 8,
+                total: 12,
+            });
+
+            // Progress should be updated
+            assert_eq!(
+                app.changes[0].completed_tasks, 8,
+                "State {:?}: completed_tasks should be updated",
+                state
+            );
+            assert_eq!(
+                app.changes[0].total_tasks, 12,
+                "State {:?}: total_tasks should be updated",
+                state
+            );
+        }
+    }
+
+    /// Test that update_changes with 0/0 preserves existing progress (all states)
+    #[test]
+    fn test_update_changes_zero_preserves_progress_all_states() {
+        let states = vec![
+            QueueStatus::NotQueued,
+            QueueStatus::Queued,
+            QueueStatus::Processing,
+            QueueStatus::Completed,
+            QueueStatus::Archiving,
+            QueueStatus::Archived,
+            QueueStatus::Merged,
+            QueueStatus::MergeWait,
+            QueueStatus::Resolving,
+        ];
+
+        for state in states {
+            let changes = vec![create_approved_change("change-a", 7, 10)];
+            let mut app = AppState::new(changes);
+            app.changes[0].queue_status = state.clone();
+
+            // Simulate refresh with 0/0 (retrieval failure)
+            let fetched = vec![Change {
+                id: "change-a".to_string(),
+                completed_tasks: 0,
+                total_tasks: 0,
+                last_modified: "now".to_string(),
+                is_approved: true,
+                dependencies: Vec::new(),
+            }];
+            app.update_changes(fetched);
+
+            // Progress should be preserved
+            assert_eq!(
+                app.changes[0].completed_tasks, 7,
+                "State {:?}: completed_tasks should be preserved on 0/0 refresh",
+                state
+            );
+            assert_eq!(
+                app.changes[0].total_tasks, 10,
+                "State {:?}: total_tasks should be preserved on 0/0 refresh",
+                state
+            );
+        }
+    }
+
+    /// Test that update_changes with valid data updates all states
+    #[test]
+    fn test_update_changes_valid_updates_all_states() {
+        let states = vec![
+            QueueStatus::NotQueued,
+            QueueStatus::Queued,
+            QueueStatus::Processing,
+            QueueStatus::Completed,
+            QueueStatus::Archiving,
+            QueueStatus::Archived,
+            QueueStatus::Merged,
+            QueueStatus::MergeWait,
+            QueueStatus::Resolving,
+        ];
+
+        for state in states {
+            let changes = vec![create_approved_change("change-a", 5, 10)];
+            let mut app = AppState::new(changes);
+            app.changes[0].queue_status = state.clone();
+
+            // Simulate refresh with valid data
+            let fetched = vec![create_approved_change("change-a", 9, 12)];
+            app.update_changes(fetched);
+
+            // Progress should be updated
+            assert_eq!(
+                app.changes[0].completed_tasks, 9,
+                "State {:?}: completed_tasks should be updated with valid data",
+                state
+            );
+            assert_eq!(
+                app.changes[0].total_tasks, 12,
+                "State {:?}: total_tasks should be updated with valid data",
+                state
+            );
+        }
     }
 }

@@ -195,15 +195,36 @@ impl WebState {
     /// Update state with new changes and broadcast to WebSocket clients.
     /// Only broadcasts if there are actual changes from the previous state.
     pub async fn update(&self, changes: &[Change]) {
-        let new_state = OrchestratorState::from_changes(changes);
+        let mut new_state = OrchestratorState::from_changes(changes);
+
+        // Preserve progress and queue_status from existing state
+        let old_changes = {
+            let old_state = self.state.read().await;
+            old_state.changes.clone()
+        };
+
+        for new_change in &mut new_state.changes {
+            if let Some(existing) = old_changes.iter().find(|c| c.id == new_change.id) {
+                // Preserve queue_status
+                new_change.queue_status = existing.queue_status.clone();
+
+                // Preserve existing progress if retrieval failed (new data is 0/0)
+                // This prevents resetting progress to 0 on retrieval failure
+                if new_change.total_tasks == 0
+                    && (existing.completed_tasks > 0 || existing.total_tasks > 0)
+                {
+                    new_change.completed_tasks = existing.completed_tasks;
+                    new_change.total_tasks = existing.total_tasks;
+                    new_change.progress_percent = existing.progress_percent;
+                    new_change.status = existing.status.clone();
+                }
+            }
+        }
 
         // Check if state has actually changed
-        let has_changes = {
-            let old_state = self.state.read().await;
-            !self
-                .compute_diff(&old_state.changes, &new_state.changes)
-                .is_empty()
-        };
+        let has_changes = !self
+            .compute_diff(&old_changes, &new_state.changes)
+            .is_empty();
 
         // Update internal state
         {
@@ -283,11 +304,17 @@ impl WebState {
                     total,
                 } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.completed_tasks = *completed;
-                        change.total_tasks = *total;
-                        change.progress_percent = progress_percent(*completed, *total);
-                        change.status = status_from_progress(*completed, *total).to_string();
-                        updated = true;
+                        // Update progress for all states when valid data is available.
+                        // Only update if total > 0 to avoid resetting progress on retrieval failure.
+                        // Progress retrieval failure (0/0) should preserve existing progress.
+                        if *total > 0 {
+                            change.completed_tasks = *completed;
+                            change.total_tasks = *total;
+                            change.progress_percent = progress_percent(*completed, *total);
+                            change.status = status_from_progress(*completed, *total).to_string();
+                            updated = true;
+                        }
+                        // If total == 0, preserve existing progress (do nothing)
                     }
                 }
 
@@ -338,11 +365,22 @@ impl WebState {
                     let mut new_change_statuses: Vec<ChangeStatus> =
                         changes.iter().map(ChangeStatus::from).collect();
 
-                    // Preserve queue_status from existing state where applicable
+                    // Preserve queue_status and progress from existing state where applicable
                     for new_change in &mut new_change_statuses {
                         if let Some(existing) = state.changes.iter().find(|c| c.id == new_change.id)
                         {
                             new_change.queue_status = existing.queue_status.clone();
+
+                            // Preserve existing progress if retrieval failed (new data is 0/0)
+                            // This prevents resetting progress to 0 on retrieval failure
+                            if new_change.total_tasks == 0
+                                && (existing.completed_tasks > 0 || existing.total_tasks > 0)
+                            {
+                                new_change.completed_tasks = existing.completed_tasks;
+                                new_change.total_tasks = existing.total_tasks;
+                                new_change.progress_percent = existing.progress_percent;
+                                new_change.status = existing.status.clone();
+                            }
                         }
                     }
 
@@ -851,5 +889,174 @@ mod tests {
         assert_eq!(update.changes.len(), 2);
         assert!(update.changes.iter().any(|change| change.id == "change-a"));
         assert!(update.changes.iter().any(|change| change.id == "change-b"));
+    }
+
+    // === Tests for update-progress-archive-resolve ===
+
+    #[tokio::test]
+    async fn test_progress_updated_zero_preserves_existing_progress() {
+        let changes = vec![create_test_change("change-a", 5, 10)];
+        let web_state = WebState::new(&changes);
+
+        // Send ProgressUpdated with 0/0 (retrieval failure)
+        web_state
+            .apply_execution_event(&ExecutionEvent::ProgressUpdated {
+                change_id: "change-a".to_string(),
+                completed: 0,
+                total: 0,
+            })
+            .await;
+
+        // Progress should be preserved
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].completed_tasks, 5,
+            "completed_tasks should be preserved on 0/0"
+        );
+        assert_eq!(
+            state.changes[0].total_tasks, 10,
+            "total_tasks should be preserved on 0/0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_progress_updated_valid_updates_progress() {
+        let changes = vec![create_test_change("change-a", 5, 10)];
+        let web_state = WebState::new(&changes);
+
+        // Send ProgressUpdated with valid data
+        web_state
+            .apply_execution_event(&ExecutionEvent::ProgressUpdated {
+                change_id: "change-a".to_string(),
+                completed: 8,
+                total: 12,
+            })
+            .await;
+
+        // Progress should be updated
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].completed_tasks, 8,
+            "completed_tasks should be updated with valid data"
+        );
+        assert_eq!(
+            state.changes[0].total_tasks, 12,
+            "total_tasks should be updated with valid data"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_method_preserves_progress_on_zero() {
+        let initial = vec![create_test_change("change-a", 7, 10)];
+        let web_state = WebState::new(&initial);
+
+        // Update with 0/0 (retrieval failure)
+        let updated = vec![Change {
+            id: "change-a".to_string(),
+            completed_tasks: 0,
+            total_tasks: 0,
+            last_modified: "now".to_string(),
+            is_approved: true,
+            dependencies: Vec::new(),
+        }];
+        web_state.update(&updated).await;
+
+        // Progress should be preserved
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].completed_tasks, 7,
+            "completed_tasks should be preserved on update with 0/0"
+        );
+        assert_eq!(
+            state.changes[0].total_tasks, 10,
+            "total_tasks should be preserved on update with 0/0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_method_updates_progress_with_valid_data() {
+        let initial = vec![create_test_change("change-a", 5, 10)];
+        let web_state = WebState::new(&initial);
+
+        // Update with valid data
+        let updated = vec![create_test_change("change-a", 9, 12)];
+        web_state.update(&updated).await;
+
+        // Progress should be updated
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].completed_tasks, 9,
+            "completed_tasks should be updated with valid data"
+        );
+        assert_eq!(
+            state.changes[0].total_tasks, 12,
+            "total_tasks should be updated with valid data"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_changes_refreshed_preserves_progress_on_zero() {
+        let initial = vec![create_test_change("change-a", 7, 10)];
+        let web_state = WebState::new(&initial);
+
+        // Set initial state via execution event
+        web_state
+            .apply_execution_event(&ExecutionEvent::ProcessingStarted("change-a".to_string()))
+            .await;
+
+        // Send ChangesRefreshed with 0/0 (retrieval failure)
+        use std::collections::HashSet;
+        web_state
+            .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+                changes: vec![Change {
+                    id: "change-a".to_string(),
+                    completed_tasks: 0,
+                    total_tasks: 0,
+                    last_modified: "now".to_string(),
+                    is_approved: true,
+                    dependencies: Vec::new(),
+                }],
+                committed_change_ids: HashSet::new(),
+                worktree_change_ids: HashSet::new(),
+            })
+            .await;
+
+        // Progress should be preserved
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].completed_tasks, 7,
+            "completed_tasks should be preserved on ChangesRefreshed with 0/0"
+        );
+        assert_eq!(
+            state.changes[0].total_tasks, 10,
+            "total_tasks should be preserved on ChangesRefreshed with 0/0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_changes_refreshed_updates_progress_with_valid_data() {
+        let initial = vec![create_test_change("change-a", 5, 10)];
+        let web_state = WebState::new(&initial);
+
+        // Send ChangesRefreshed with valid data
+        use std::collections::HashSet;
+        web_state
+            .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+                changes: vec![create_test_change("change-a", 9, 12)],
+                committed_change_ids: HashSet::new(),
+                worktree_change_ids: HashSet::new(),
+            })
+            .await;
+
+        // Progress should be updated
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].completed_tasks, 9,
+            "completed_tasks should be updated with valid data"
+        );
+        assert_eq!(
+            state.changes[0].total_tasks, 12,
+            "total_tasks should be updated with valid data"
+        );
     }
 }
