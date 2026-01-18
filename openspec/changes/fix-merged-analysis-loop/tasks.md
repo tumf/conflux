@@ -1,12 +1,13 @@
 ## 1. Implementation
-- [ ] 1.1 merged判定ルール（archive commit存在・changesディレクトリ消失）を整理する
-- [ ] 1.2 analysis前にmerged済みchangeを除外する処理を追加する
-- [ ] 1.3 除外時にログ/イベントを発行する
-- [ ] 1.4 すべて除外された場合に処理を終了する
+- [ ] 1.1 queuedのみをanalysis対象にするフィルタ条件を追加する
+- [ ] 1.2 queued外のchangeをanalysis対象から除外する
+- [ ] 1.3 実行中changeがなくqueuedも空のときに終了する判定を追加する
+- [ ] 1.4 queueが空のときはanalysisを実行しない
 
 ## 2. Tests
-- [ ] 2.1 merged済みchangeがanalysis対象から外れることを検証する
-- [ ] 2.2 全件merged時に並列実行が終了することを検証する
+- [ ] 2.1 queuedのみがanalysis対象になることを検証する
+- [ ] 2.2 queued外のchangeがanalysis対象から除外されることを検証する
+- [ ] 2.3 実行中・queuedが空のときに並列実行が終了することを検証する
 
 ## 3. Validation
 - [ ] 3.1 cargo fmt

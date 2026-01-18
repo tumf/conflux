@@ -1,13 +1,14 @@
 # Change: merged済みchangeの再解析ループ停止
 
 ## Why
-merged済みのchangeがanalysisにかけられ続け、全件完了後もオーケストレーションが停止しない問題を解消し、並列実行の完了判定を正しく行うため。
+queued対象のみをanalysisする前提にもかかわらず、merged済みchangeがanalysisに残り続け、実行中のchangeがなくなってもオーケストレーションが停止しない問題があるため。queuedのみを対象とすること、queuedと実行中が両方空なら終了することを明確化する。
 
 ## What Changes
-- mergedと判定できるchangeをanalysis対象から除外する。
-- analysis前に除外対象が空になった場合はオーケストレーションを終了する。
-- 除外理由がログ・イベントで明示されるようにする。
+- analysis対象はqueuedに限定する。
+- 実行中のchangeがなく、queuedも空の場合はオーケストレーションを終了する。
+- queueが空のときはanalysisを実行しない。
+- queued外のchange（merged済み、実行済み、削除済み）はanalysis対象から除外する。
 
 ## Impact
 - Affected specs: parallel-execution
-- Affected code: 並列実行ループ、workspace state判定、イベント送出
+- Affected code: 並列実行ループ、queue処理、終了判定
