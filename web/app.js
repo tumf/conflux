@@ -26,6 +26,9 @@ class WebMonitor {
             toastContainer: document.getElementById('toast-container'),
             ptrIndicator: document.getElementById('ptr-indicator'),
             ptrText: document.querySelector('.ptr-text'),
+            overallProgressFill: document.getElementById('overall-progress-fill'),
+            overallProgressTasks: document.getElementById('overall-progress-tasks'),
+            overallProgressPercent: document.getElementById('overall-progress-percent'),
         };
 
         this.touchState = {
@@ -445,6 +448,9 @@ class WebMonitor {
         this.elements.inProgressChanges.textContent = state.in_progress_changes;
         this.elements.pendingChanges.textContent = state.pending_changes;
 
+        // Update overall progress
+        this.updateOverallProgress(state.changes);
+
         // Render changes
         this.renderChanges(state.changes);
 
@@ -468,10 +474,35 @@ class WebMonitor {
         this.elements.inProgressChanges.textContent = stats.inProgress;
         this.elements.pendingChanges.textContent = stats.pending;
 
+        // Update overall progress
+        this.updateOverallProgress(changes);
+
         // Render change cards
         this.elements.changesList.innerHTML = changes.map(change =>
             this.renderChangeCard(change)
         ).join('');
+    }
+
+    updateOverallProgress(changes) {
+        if (!changes || changes.length === 0) {
+            this.elements.overallProgressFill.style.width = '0%';
+            this.elements.overallProgressTasks.textContent = '0 / 0 tasks';
+            this.elements.overallProgressPercent.textContent = '0%';
+            return;
+        }
+
+        // Calculate total tasks across all changes
+        const totalCompleted = changes.reduce((sum, c) => sum + c.completed_tasks, 0);
+        const totalTasks = changes.reduce((sum, c) => sum + c.total_tasks, 0);
+        const overallPercent = totalTasks > 0 ? (totalCompleted / totalTasks) * 100 : 0;
+
+        this.elements.overallProgressFill.style.width = `${overallPercent.toFixed(1)}%`;
+        this.elements.overallProgressTasks.textContent = `${totalCompleted} / ${totalTasks} tasks`;
+        this.elements.overallProgressPercent.textContent = `${overallPercent.toFixed(1)}%`;
+
+        // Update aria attributes
+        const progressBar = this.elements.overallProgressFill.parentElement;
+        progressBar.setAttribute('aria-valuenow', overallPercent.toFixed(1));
     }
 
     calculateStats(changes) {
@@ -486,6 +517,33 @@ class WebMonitor {
     renderChangeCard(change) {
         const progressPercent = change.progress_percent.toFixed(1);
         const isComplete = change.status === 'complete';
+
+        // Use queue_status if available, otherwise fall back to status
+        const displayStatus = change.queue_status || change.status.replace('_', ' ');
+        const statusClass = change.queue_status ? change.queue_status.replace(' ', '-') : change.status;
+
+        // Status icons mapping
+        const statusIcons = {
+            'not queued': '○',
+            'queued': '⏳',
+            'processing': '⚙️',
+            'completed': '✅',
+            'archiving': '📦',
+            'archived': '📥',
+            'merged': '🔀',
+            'merge wait': '⏸️',
+            'resolving': '🔧',
+            'error': '❌',
+            'pending': '○',
+            'in_progress': '⚙️',
+            'complete': '✅',
+        };
+        const statusIcon = statusIcons[displayStatus] || '•';
+
+        // Show iteration number if > 0
+        const iterationHtml = change.iteration_number && change.iteration_number > 0
+            ? `<span class="change-iteration">Iteration: ${change.iteration_number}</span>`
+            : '';
 
         const dependenciesHtml = change.dependencies && change.dependencies.length > 0
             ? `<div class="change-dependencies">
@@ -521,11 +579,12 @@ class WebMonitor {
             <article class="change-card" data-change-id="${this.escapeHtml(change.id)}" role="listitem" tabindex="0">
                 <div class="change-header">
                     <span class="change-id">${this.escapeHtml(change.id)}</span>
-                    <div class="change-badges">
-                        <span class="badge badge-status ${change.status}">${change.status.replace('_', ' ')}</span>
-                        <span class="badge ${change.is_approved ? 'badge-approved' : 'badge-unapproved'} badge-approval">
-                            ${change.is_approved ? 'Approved' : 'Pending Approval'}
+                    <div class="change-status-row">
+                        <span class="badge badge-status ${statusClass}">
+                            <span class="status-icon" aria-hidden="true">${statusIcon}</span>
+                            ${displayStatus}
                         </span>
+                        ${iterationHtml}
                     </div>
                 </div>
                 <div class="progress-container">
@@ -538,8 +597,13 @@ class WebMonitor {
                         <span>${progressPercent}%</span>
                     </div>
                 </div>
-                ${approvalButtonHtml}
                 <div class="change-details">
+                    <div class="approval-section">
+                        <span class="badge ${change.is_approved ? 'badge-approved' : 'badge-unapproved'} badge-approval">
+                            ${change.is_approved ? 'Approved' : 'Pending Approval'}
+                        </span>
+                        ${approvalButtonHtml}
+                    </div>
                     ${dependenciesHtml}
                 </div>
                 ${expandHintHtml}
