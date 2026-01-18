@@ -1,4 +1,4 @@
-## ADDED Requirements
+## MODIFIED Requirements
 ### Requirement: Enter Key Operation Guidance
 
 The TUI MUST display warning logs when the Enter key is ignored in Worktrees view, explaining the reason for rejection.
