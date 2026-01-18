@@ -10,6 +10,7 @@
 
 use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};
+use crate::history::OutputCollector;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::Change;
 use crate::process_manager::TerminationOutcome;
@@ -192,6 +193,9 @@ where
     let (mut child, mut output_rx, start_time) =
         agent.run_apply_streaming(&change.id, None).await?;
 
+    // Create output collector for history
+    let mut output_collector = OutputCollector::new();
+
     // Stream output
     loop {
         if cancel_check() {
@@ -213,8 +217,14 @@ where
         }
 
         match output_rx.try_recv() {
-            Ok(OutputLine::Stdout(s)) => output.on_stdout(&s),
-            Ok(OutputLine::Stderr(s)) => output.on_stderr(&s),
+            Ok(OutputLine::Stdout(s)) => {
+                output_collector.add_stdout(&s);
+                output.on_stdout(&s);
+            }
+            Ok(OutputLine::Stderr(s)) => {
+                output_collector.add_stderr(&s);
+                output.on_stderr(&s);
+            }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                 // No data available, check if process is done
                 tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -232,7 +242,13 @@ where
     })?;
 
     // Record the apply attempt for history context in subsequent retries
-    agent.record_apply_attempt(&change.id, &status, start_time);
+    agent.record_apply_attempt(
+        &change.id,
+        &status,
+        start_time,
+        output_collector.stdout_tail(),
+        output_collector.stderr_tail(),
+    );
 
     if !status.success() {
         let error_msg = format!(

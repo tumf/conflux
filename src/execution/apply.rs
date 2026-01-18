@@ -16,6 +16,7 @@
 use crate::agent::{AgentRunner, OutputLine};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::history::OutputCollector;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser::TaskProgress;
@@ -669,8 +670,16 @@ where
             .run_apply_streaming(change_id, Some(workspace_path))
             .await?;
 
+        // Create output collector for history
+        let mut output_collector = OutputCollector::new();
+
         // Stream output
         while let Some(line) = rx.recv().await {
+            // Collect output for history
+            match &line {
+                OutputLine::Stdout(s) => output_collector.add_stdout(s),
+                OutputLine::Stderr(s) => output_collector.add_stderr(s),
+            }
             event_handler.on_apply_output(change_id, &line);
             output_handler(line).await;
         }
@@ -687,7 +696,13 @@ where
         })?;
 
         // Record apply attempt for history
-        agent.record_apply_attempt(change_id, &status, start_time);
+        agent.record_apply_attempt(
+            change_id,
+            &status,
+            start_time,
+            output_collector.stdout_tail(),
+            output_collector.stderr_tail(),
+        );
 
         if !status.success() {
             let error_msg = format!("Apply command failed with exit code: {:?}", status.code());

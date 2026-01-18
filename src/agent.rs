@@ -212,7 +212,14 @@ impl AgentRunner {
 
     /// Record an apply attempt after streaming execution completes.
     /// Call this after `run_apply_streaming()` child process finishes.
-    pub fn record_apply_attempt(&mut self, change_id: &str, status: &ExitStatus, start: Instant) {
+    pub fn record_apply_attempt(
+        &mut self,
+        change_id: &str,
+        status: &ExitStatus,
+        start: Instant,
+        stdout_tail: Option<String>,
+        stderr_tail: Option<String>,
+    ) {
         let duration = start.elapsed();
         let attempt = ApplyAttempt {
             attempt: self.apply_history.count(change_id) + 1,
@@ -224,6 +231,8 @@ impl AgentRunner {
                 Some(format!("Exit code: {:?}", status.code()))
             },
             exit_code: status.code(),
+            stdout_tail,
+            stderr_tail,
         };
         self.apply_history.record(change_id, attempt);
     }
@@ -292,7 +301,7 @@ impl AgentRunner {
         let status = self.execute_shell_command(&command).await?;
         let duration = start.elapsed();
 
-        // Record the attempt
+        // Record the attempt (no output captured in non-streaming mode)
         let attempt = ApplyAttempt {
             attempt: self.apply_history.count(change_id) + 1,
             success: status.success(),
@@ -303,6 +312,8 @@ impl AgentRunner {
                 Some(format!("Exit code: {:?}", status.code()))
             },
             exit_code: status.code(),
+            stdout_tail: None,
+            stderr_tail: None,
         };
         self.apply_history.record(change_id, attempt);
 
@@ -317,6 +328,8 @@ impl AgentRunner {
         status: &ExitStatus,
         start: Instant,
         verification_result: Option<String>,
+        stdout_tail: Option<String>,
+        stderr_tail: Option<String>,
     ) {
         let duration = start.elapsed();
         let attempt = ArchiveAttempt {
@@ -335,6 +348,8 @@ impl AgentRunner {
             },
             verification_result,
             exit_code: status.code(),
+            stdout_tail,
+            stderr_tail,
         };
         self.archive_history.record(change_id, attempt);
     }

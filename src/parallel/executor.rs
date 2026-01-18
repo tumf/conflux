@@ -534,29 +534,33 @@ pub async fn execute_apply_in_workspace(
             .execute_streaming_with_retry(&command, Some(workspace_path))
             .await?;
 
+        // Create output collector for history
+        let mut output_collector = crate::history::OutputCollector::new();
+
         // Forward output to event channel
         use crate::ai_command_runner::OutputLine as AiOutputLine;
         let change_id_clone = change_id.to_string();
         let event_tx_clone = event_tx.clone();
-        let output_handle = tokio::spawn(async move {
-            while let Some(line) = output_rx.recv().await {
-                if let Some(ref tx) = event_tx_clone {
-                    let output_text = match line {
-                        AiOutputLine::Stdout(s) | AiOutputLine::Stderr(s) => s,
-                    };
-                    let _ = tx
-                        .send(ParallelEvent::ApplyOutput {
-                            change_id: change_id_clone.clone(),
-                            output: output_text,
-                            iteration: Some(iteration),
-                        })
-                        .await;
-                }
+        while let Some(line) = output_rx.recv().await {
+            // Collect output for history
+            match &line {
+                AiOutputLine::Stdout(s) => output_collector.add_stdout(s),
+                AiOutputLine::Stderr(s) => output_collector.add_stderr(s),
             }
-        });
 
-        // Wait for output streaming to complete
-        let _ = output_handle.await;
+            if let Some(ref tx) = event_tx_clone {
+                let output_text = match line {
+                    AiOutputLine::Stdout(s) | AiOutputLine::Stderr(s) => s,
+                };
+                let _ = tx
+                    .send(ParallelEvent::ApplyOutput {
+                        change_id: change_id_clone.clone(),
+                        output: output_text,
+                        iteration: Some(iteration),
+                    })
+                    .await;
+            }
+        }
 
         // Wait for process to finish
         let status = child.wait().await.map_err(|e| {
@@ -582,6 +586,8 @@ pub async fn execute_apply_in_workspace(
                     Some(format!("Exit code: {:?}", status.code()))
                 },
                 exit_code: status.code(),
+                stdout_tail: output_collector.stdout_tail(),
+                stderr_tail: output_collector.stderr_tail(),
             };
             history.record(change_id, attempt);
         }
@@ -997,29 +1003,33 @@ pub async fn execute_archive_in_workspace(
             .execute_streaming_with_retry(&command, Some(workspace_path))
             .await?;
 
+        // Create output collector for history
+        let mut output_collector = crate::history::OutputCollector::new();
+
         // Forward output to event channel
         use crate::ai_command_runner::OutputLine as AiOutputLine;
         let change_id_clone = change_id.to_string();
         let event_tx_clone = event_tx.clone();
-        let output_handle = tokio::spawn(async move {
-            while let Some(line) = output_rx.recv().await {
-                if let Some(ref tx) = event_tx_clone {
-                    let output_text = match line {
-                        AiOutputLine::Stdout(s) | AiOutputLine::Stderr(s) => s,
-                    };
-                    let _ = tx
-                        .send(ParallelEvent::ArchiveOutput {
-                            change_id: change_id_clone.clone(),
-                            output: output_text,
-                            iteration: None,
-                        })
-                        .await;
-                }
+        while let Some(line) = output_rx.recv().await {
+            // Collect output for history
+            match &line {
+                AiOutputLine::Stdout(s) => output_collector.add_stdout(s),
+                AiOutputLine::Stderr(s) => output_collector.add_stderr(s),
             }
-        });
 
-        // Wait for output streaming to complete
-        let _ = output_handle.await;
+            if let Some(ref tx) = event_tx_clone {
+                let output_text = match line {
+                    AiOutputLine::Stdout(s) | AiOutputLine::Stderr(s) => s,
+                };
+                let _ = tx
+                    .send(ParallelEvent::ArchiveOutput {
+                        change_id: change_id_clone.clone(),
+                        output: output_text,
+                        iteration: None,
+                    })
+                    .await;
+            }
+        }
 
         // Wait for process to complete
         let status = child.wait().await.map_err(|e| {
@@ -1107,6 +1117,8 @@ pub async fn execute_archive_in_workspace(
                 },
                 verification_result,
                 exit_code: status.code(),
+                stdout_tail: output_collector.stdout_tail(),
+                stderr_tail: output_collector.stderr_tail(),
             };
             history.record(change_id, attempt_record);
         }
