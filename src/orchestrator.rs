@@ -12,6 +12,7 @@ use crate::orchestration::{
 use crate::parallel_run_service::ParallelRunService;
 use crate::progress::ProgressDisplay;
 use crate::stall::{StallDetector, StallPhase};
+use crate::task_parser::TaskProgress;
 use crate::tui::log_deduplicator;
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{GitWorkspaceManager, VcsBackend, WorkspaceManager};
@@ -576,7 +577,8 @@ impl Orchestrator {
         iteration: u32,
     ) -> Result<SerialSnapshot> {
         let repo_root = std::env::current_dir()?;
-        let progress = check_task_progress(&repo_root, change_id).unwrap_or_default();
+        let progress =
+            check_task_progress(&repo_root, change_id).unwrap_or_else(|_| TaskProgress::default());
         let mut empty_commit = None;
 
         if matches!(self.vcs_backend, VcsBackend::Git | VcsBackend::Auto) {

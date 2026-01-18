@@ -248,7 +248,7 @@ async fn squash_wip_commits(
 /// Check task progress for a change in the given workspace.
 ///
 /// Reads and parses the tasks.md file to determine completion status.
-/// Returns None if the file doesn't exist (e.g., after archiving).
+/// Returns an error if the file doesn't exist.
 ///
 /// This function delegates to `crate::execution::apply::check_task_progress`
 /// for the actual implementation.
@@ -256,7 +256,7 @@ async fn squash_wip_commits(
 pub fn check_task_progress(
     workspace_path: &Path,
     change_id: &str,
-) -> Option<crate::task_parser::TaskProgress> {
+) -> Result<crate::task_parser::TaskProgress> {
     common_apply::check_task_progress(workspace_path, change_id)
 }
 
@@ -364,15 +364,7 @@ pub async fn execute_apply_in_workspace(
         }
 
         // Check current task progress using helper
-        let progress = match check_task_progress(workspace_path, change_id) {
-            Some(progress) => progress,
-            None => {
-                return Err(OrchestratorError::AgentCommand(format!(
-                    "Tasks file not found for change {} in workspace",
-                    change_id
-                )));
-            }
-        };
+        let progress = check_task_progress(workspace_path, change_id)?;
 
         // Send progress event only if we have valid progress data
         if progress.total > 0 {
@@ -524,15 +516,7 @@ pub async fn execute_apply_in_workspace(
         // Git worktrees already reflect working copy changes for task progress.
 
         // Check task progress after apply using helper
-        let new_progress = match check_task_progress(workspace_path, change_id) {
-            Some(progress) => progress,
-            None => {
-                return Err(OrchestratorError::AgentCommand(format!(
-                    "Tasks file not found for change {} in workspace after apply",
-                    change_id
-                )));
-            }
-        };
+        let new_progress = check_task_progress(workspace_path, change_id)?;
 
         // Send progress event after apply only if we have valid progress data
         if new_progress.total > 0 {

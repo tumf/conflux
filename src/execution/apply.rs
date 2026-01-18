@@ -20,6 +20,7 @@ use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser::TaskProgress;
 use crate::vcs::{VcsBackend, VcsResult, WorkspaceManager};
+use std::fs;
 use std::future::Future;
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
@@ -107,7 +108,7 @@ impl ApplyIterationResult {
 /// Check task progress for a change in the given workspace.
 ///
 /// Reads and parses the tasks.md file to determine completion status.
-/// Returns None if the file doesn't exist (e.g., after archiving).
+/// Returns an error if the file doesn't exist, with the exact path checked.
 ///
 /// # Arguments
 ///
@@ -116,28 +117,84 @@ impl ApplyIterationResult {
 ///
 /// # Returns
 ///
-/// * `Some(TaskProgress)` - Progress information if tasks.md exists
-/// * `None` - If tasks.md doesn't exist
-pub fn check_task_progress(workspace_path: &Path, change_id: &str) -> Option<TaskProgress> {
-    let tasks_path = workspace_path
-        .join("openspec/changes")
-        .join(change_id)
-        .join("tasks.md");
+/// * `Ok(TaskProgress)` - Progress information if tasks.md exists
+/// * `Err(OrchestratorError)` - If tasks.md doesn't exist
+pub fn check_task_progress(workspace_path: &Path, change_id: &str) -> Result<TaskProgress> {
+    let change_dir = workspace_path.join("openspec/changes").join(change_id);
+    let tasks_path = change_dir.join("tasks.md");
 
-    debug!("Checking tasks at: {:?}", tasks_path);
+    debug!(
+        change_id = change_id,
+        workspace_path = %workspace_path.display(),
+        tasks_path = %tasks_path.display(),
+        "Checking tasks path in workspace"
+    );
 
     if tasks_path.exists() {
-        let progress =
-            crate::task_parser::parse_file(&tasks_path, Some(change_id)).unwrap_or_default();
+        let progress = crate::task_parser::parse_file(&tasks_path, Some(change_id))?;
         debug!(
             "Tasks file found for {}: {}/{} complete",
             change_id, progress.completed, progress.total
         );
-        Some(progress)
-    } else {
-        debug!("Tasks file not found at {:?}", tasks_path);
-        None
+        return Ok(progress);
     }
+
+    let archive_root = if change_dir.is_dir() {
+        change_dir.join("archive")
+    } else {
+        workspace_path.join("openspec/changes/archive")
+    };
+    let archive_root_exists = archive_root.is_dir();
+    let latest_archive_dir = if archive_root_exists {
+        let mut latest: Option<String> = None;
+        for entry in fs::read_dir(&archive_root)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = match name.to_str() {
+                Some(value) => value,
+                None => continue,
+            };
+            if !name.ends_with(change_id) {
+                continue;
+            }
+            if latest
+                .as_ref()
+                .is_none_or(|current| name > current.as_str())
+            {
+                latest = Some(name.to_string());
+            }
+        }
+        latest
+    } else {
+        None
+    };
+
+    if let Some(latest_dir) = latest_archive_dir {
+        let archive_tasks_path = archive_root.join(latest_dir).join("tasks.md");
+        if archive_tasks_path.exists() {
+            let progress = crate::task_parser::parse_file(&archive_tasks_path, Some(change_id))?;
+            debug!(
+                "Tasks file found in archive for {}: {}/{} complete",
+                change_id, progress.completed, progress.total
+            );
+            return Ok(progress);
+        }
+    }
+
+    let change_dir_exists = change_dir.is_dir();
+    Err(OrchestratorError::AgentCommand(format!(
+        "Tasks file not found; change_id={}; workspace_path=\"{}\"; tasks_path=\"{}\"; change_dir_exists={}; archive_root=\"{}\"; archive_root_exists={}; exists=false",
+        change_id,
+        workspace_path.display(),
+        tasks_path.display(),
+        change_dir_exists,
+        archive_root.display(),
+        archive_root_exists
+    )))
 }
 
 /// Create a progress commit to save current work state.
@@ -534,7 +591,8 @@ where
 
             // Run on_error hook
             if let Some(hook_runner) = hooks {
-                let progress = check_task_progress(workspace_path, change_id).unwrap_or_default();
+                let progress = check_task_progress(workspace_path, change_id)
+                    .unwrap_or_else(|_| TaskProgress::default());
                 let error_ctx = hook_ctx
                     .build_hook_context(change_id, progress.completed, progress.total, iteration)
                     .with_error(&error_msg);
@@ -547,15 +605,7 @@ where
         }
 
         // Check current task progress
-        let progress = match check_task_progress(workspace_path, change_id) {
-            Some(progress) => progress,
-            None => {
-                return Err(OrchestratorError::AgentCommand(format!(
-                    "Tasks file not found for change {} in workspace",
-                    change_id
-                )));
-            }
-        };
+        let progress = check_task_progress(workspace_path, change_id)?;
 
         // Send progress event
         if progress.total > 0 {
@@ -642,15 +692,7 @@ where
         }
 
         // Check task progress after apply
-        let new_progress = match check_task_progress(workspace_path, change_id) {
-            Some(progress) => progress,
-            None => {
-                return Err(OrchestratorError::AgentCommand(format!(
-                    "Tasks file not found for change {} after apply",
-                    change_id
-                )));
-            }
-        };
+        let new_progress = check_task_progress(workspace_path, change_id)?;
 
         // Send progress event after apply
         if new_progress.total > 0 {
