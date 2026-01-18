@@ -213,7 +213,7 @@ where
             continue;
         }
 
-        let error_msg = build_archive_error_message(&change.id);
+        let error_msg = build_archive_error_message(&change.id, None);
         output.on_error(&error_msg);
         return Ok(ArchiveResult::Failed { error: error_msg });
     }
@@ -356,11 +356,19 @@ where
 
         // Wait for child process to complete
         let status = child.wait().await.map_err(|e| {
-            OrchestratorError::AgentCommand(format!("Failed to wait for process: {}", e))
+            OrchestratorError::AgentCommand(format!(
+                "Failed to wait for archive command for change '{}' (attempt {}): {}",
+                change.id, attempt, e
+            ))
         })?;
 
         if !status.success() {
-            let error_msg = format!("Archive command failed with exit code: {:?}", status.code());
+            let error_msg = format!(
+                "Archive command failed for change '{}' (attempt {}) with exit code: {:?}",
+                change.id,
+                attempt,
+                status.code()
+            );
 
             // Record the failed attempt
             agent.record_archive_attempt(&change.id, &status, start, Some(error_msg.clone()));
@@ -441,7 +449,7 @@ where
             continue;
         }
 
-        let error_msg = build_archive_error_message(&change.id);
+        let error_msg = build_archive_error_message(&change.id, None);
         output.on_error(&error_msg);
         return Ok(ArchiveResult::Failed { error: error_msg });
     }
