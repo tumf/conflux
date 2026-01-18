@@ -376,8 +376,14 @@ impl AppState {
                 }
                 self.add_log(entry);
             }
-            OrchestratorEvent::ResolveOutput { output, iteration } => {
-                let mut entry = LogEntry::info(output).with_operation("resolve");
+            OrchestratorEvent::ResolveOutput {
+                change_id,
+                output,
+                iteration,
+            } => {
+                let mut entry = LogEntry::info(output)
+                    .with_change_id(&change_id)
+                    .with_operation("resolve");
                 if let Some(iter) = iteration {
                     entry = entry.with_iteration(iter);
                 }
@@ -1353,6 +1359,7 @@ mod tests {
 
         // Send ResolveOutput event
         app.handle_orchestrator_event(OrchestratorEvent::ResolveOutput {
+            change_id: "change-d".to_string(),
             output: "Resolving conflicts...".to_string(),
             iteration: Some(1),
         });

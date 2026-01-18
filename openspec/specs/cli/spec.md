@@ -833,6 +833,26 @@ The TUI SHALL maintain a maximum limit on stored log entries to prevent unbounde
 - **THEN** the oldest log entry is removed
 - **AND** scroll offset is adjusted if necessary to prevent display issues
 
+### Requirement: Log Entry Headers
+
+The TUI SHALL display structured headers for analysis and resolve operation logs to improve traceability.
+
+#### Scenario: Analysis log header format
+- **WHEN** an analysis operation outputs a log message
+- **THEN** the log entry displays with header `[analysis:N]`
+- **AND** N represents the iteration number of the analysis operation
+
+#### Scenario: Resolve log header format
+- **WHEN** a resolve operation outputs a log message
+- **THEN** the log entry displays with header `[{change_id}:resolve:N]`
+- **AND** change_id identifies the change being resolved
+- **AND** N represents the iteration number of the resolve operation
+
+#### Scenario: Log headers use consistent color coding
+- **WHEN** log entries with headers are displayed
+- **THEN** headers use color coding based on change_id hash
+- **AND** headers are displayed in bold text for visibility
+
 ### Requirement: TUI Status Transition on Apply Completion
 
 The TUI SHALL transition change status from `Processing` to `Completed` when an apply operation succeeds and all tasks are complete.

@@ -299,6 +299,7 @@ pub enum ExecutionEvent {
     /// Resolve output (streaming)
     #[allow(dead_code)]
     ResolveOutput {
+        change_id: String,
         output: String,
         iteration: Option<u32>,
     },

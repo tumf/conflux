@@ -77,6 +77,7 @@ pub async fn resolve_conflicts_with_retry(
     config: &OrchestratorConfig,
     event_tx: &Option<mpsc::Sender<ParallelEvent>>,
     revisions: &[String],
+    change_ids: &[String],
     vcs_error: &str,
     max_retries: u32,
 ) -> Result<()> {
@@ -99,6 +100,9 @@ pub async fn resolve_conflicts_with_retry(
 
     // Create resolve context for tracking attempts
     let mut resolve_context = ResolveContext::new(max_retries);
+
+    // Create a combined change_id for logging (join multiple IDs if present)
+    let combined_change_id = change_ids.join("+");
 
     for attempt in 1..=max_retries {
         let start = Instant::now();
@@ -159,6 +163,7 @@ pub async fn resolve_conflicts_with_retry(
             send_event(
                 event_tx,
                 ParallelEvent::ResolveOutput {
+                    change_id: combined_change_id.clone(),
                     output: text.clone(),
                     iteration: Some(attempt),
                 },
@@ -338,6 +343,9 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
     // Create resolve context for tracking attempts
     let mut resolve_context = ResolveContext::new(max_retries);
 
+    // Create a combined change_id for logging (join multiple IDs if present)
+    let combined_change_id = change_ids.join("+");
+
     for attempt in 1..=max_retries {
         let start = Instant::now();
         info!(
@@ -415,6 +423,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             send_event(
                 event_tx,
                 ParallelEvent::ResolveOutput {
+                    change_id: combined_change_id.clone(),
                     output: text.clone(),
                     iteration: Some(attempt),
                 },
@@ -454,6 +463,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                     send_event(
                         event_tx,
                         ParallelEvent::ResolveOutput {
+                            change_id: combined_change_id.clone(),
                             output: reason.clone(),
                             iteration: Some(attempt),
                         },
@@ -507,6 +517,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                     send_event(
                         event_tx,
                         ParallelEvent::ResolveOutput {
+                            change_id: combined_change_id.clone(),
                             output: reason.clone(),
                             iteration: Some(attempt),
                         },
@@ -557,6 +568,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                     send_event(
                         event_tx,
                         ParallelEvent::ResolveOutput {
+                            change_id: combined_change_id.clone(),
                             output: reason.clone(),
                             iteration: Some(attempt),
                         },
@@ -592,6 +604,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                     send_event(
                         event_tx,
                         ParallelEvent::ResolveOutput {
+                            change_id: combined_change_id.clone(),
                             output: reason.clone(),
                             iteration: Some(attempt),
                         },
@@ -681,6 +694,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                     send_event(
                         event_tx,
                         ParallelEvent::ResolveOutput {
+                            change_id: combined_change_id.clone(),
                             output: reason.clone(),
                             iteration: Some(attempt),
                         },
@@ -704,6 +718,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                     send_event(
                         event_tx,
                         ParallelEvent::ResolveOutput {
+                            change_id: combined_change_id.clone(),
                             output: format!(
                                 "Removed approved-only change directories: {}",
                                 removed_changes.join(", ")
