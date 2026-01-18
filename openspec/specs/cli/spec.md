@@ -61,6 +61,7 @@ The acceptance loop SHALL run `acceptance_command` for the change, parse the out
 - The acceptance failure reason MUST be recorded in tasks.md together with the task update.
 - The apply loop MUST resume with the same iteration counter value (no reset) after acceptance failure.
 - If the output indicates CONTINUE, the orchestrator MUST retry acceptance up to `acceptance_max_continues` times.
+- If no acceptance marker is present, the orchestrator MUST treat the outcome as CONTINUE and retry according to `acceptance_max_continues`.
 - If the CONTINUE limit is exceeded, the orchestrator MUST treat the outcome as FAIL and return to the apply loop.
 
 #### Scenario: Acceptance output includes PASS with decoration
@@ -68,6 +69,12 @@ The acceptance loop SHALL run `acceptance_command` for the change, parse the out
 - **WHEN** acceptance output contains a decorated PASS marker such as `**ACCEPTANCE: PASS**`
 - **THEN** the orchestrator treats the outcome as PASS
 - **AND** tasks.md is not updated for acceptance failure
+
+#### Scenario: Acceptance output with no marker defaults to CONTINUE
+- **GIVEN** a change completes an apply iteration successfully
+- **WHEN** acceptance output includes no PASS/FAIL/CONTINUE marker
+- **THEN** the orchestrator treats the outcome as CONTINUE
+- **AND** the retry count is incremented
 
 ### Requirement: Default TUI Launch
 
