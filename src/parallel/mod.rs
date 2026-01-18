@@ -1433,6 +1433,54 @@ impl ParallelExecutor {
                             );
                             // Continue to archive commit below
                         }
+                        Ok(crate::orchestration::AcceptanceResult::Continue) => {
+                            let continue_count =
+                                agent.count_consecutive_acceptance_continues(change_id);
+                            let max_continues = self.config.get_acceptance_max_continues();
+
+                            if continue_count >= max_continues {
+                                warn!(
+                                    "Acceptance CONTINUE limit ({}) exceeded for {} on resume, treating as FAIL",
+                                    max_continues,
+                                    change_id
+                                );
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::Log(
+                                        LogEntry::warn(format!(
+                                            "Acceptance CONTINUE limit exceeded ({}), archive will not be committed. Change needs to return to apply loop.",
+                                            max_continues
+                                        ))
+                                        .with_change_id(change_id)
+                                        .with_operation("acceptance"),
+                                    ),
+                                )
+                                .await;
+                            } else {
+                                info!(
+                                    "Acceptance requires continuation for {} on resume (attempt {}/{}), returning to apply loop",
+                                    change_id,
+                                    continue_count,
+                                    max_continues
+                                );
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::Log(
+                                        LogEntry::info(format!(
+                                            "Acceptance requires continuation on resume (attempt {}/{}), archive will not be committed. Change needs to return to apply loop.",
+                                            continue_count,
+                                            max_continues
+                                        ))
+                                        .with_change_id(change_id)
+                                        .with_operation("acceptance"),
+                                    ),
+                                )
+                                .await;
+                            }
+
+                            changes_for_apply.push(change_id.clone());
+                            continue;
+                        }
                         Ok(crate::orchestration::AcceptanceResult::Fail { findings }) => {
                             warn!(
                                 "Acceptance failed for {} with {} findings on resume, will not commit archive",
