@@ -746,6 +746,7 @@ impl WorkspaceManager for GitWorkspaceManager {
     }
 
     async fn prepare_for_parallel(&self) -> VcsResult<Option<VcsWarning>> {
+        self.ensure_original_branch().await?;
         // Git requires a clean working directory - now only warns if not clean
         self.check_clean_working_directory().await
     }
