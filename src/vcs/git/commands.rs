@@ -5,7 +5,7 @@
 
 use crate::vcs::commands::{check_vcs_available, run_vcs_command, run_vcs_command_ignore_error};
 use crate::vcs::{VcsBackend, VcsError, VcsResult};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 use tracing::{debug, info};
@@ -308,6 +308,50 @@ pub async fn list_worktrees<P: AsRef<Path>>(
     }
 
     Ok(worktrees)
+}
+
+/// Check if a path is a git worktree (not the main repository).
+///
+/// A worktree is considered valid if:
+/// 1. The path is listed in `git worktree list --porcelain` output
+/// 2. The path is NOT the first worktree (main repository)
+///
+/// This is used to prevent parallel apply operations from running in the base repository,
+/// which would pollute the working tree with unintended changes.
+///
+/// # Arguments
+/// * `repo_root` - Repository root directory (main worktree)
+/// * `path` - Path to check if it's a worktree
+///
+/// # Returns
+/// * `Ok(true)` if the path is a valid worktree (not the main repository)
+/// * `Ok(false)` if the path is the main repository or not a worktree
+/// * `Err(VcsError)` if git command fails
+pub async fn is_worktree<P1: AsRef<Path>, P2: AsRef<Path>>(
+    repo_root: P1,
+    path: P2,
+) -> VcsResult<bool> {
+    let path = path.as_ref();
+    let worktrees = list_worktrees(repo_root).await?;
+
+    // Normalize the path for comparison
+    let normalized_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    for (worktree_path, _head, _branch, _is_detached, is_main) in worktrees {
+        let worktree_path_buf = PathBuf::from(&worktree_path);
+        let normalized_worktree = worktree_path_buf
+            .canonicalize()
+            .unwrap_or(worktree_path_buf);
+
+        if normalized_path == normalized_worktree {
+            // Found the path in worktree list
+            // Return true only if it's NOT the main worktree
+            return Ok(!is_main);
+        }
+    }
+
+    // Path not found in worktree list
+    Ok(false)
 }
 
 /// Check if the working directory is clean (no uncommitted changes).
@@ -1652,5 +1696,140 @@ mod tests {
 
         let err = result.unwrap_err();
         assert!(err.to_string().contains("Setup script failed"));
+    }
+
+    #[tokio::test]
+    async fn test_is_worktree_main_repo() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let _ = Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create initial commit
+        std::fs::write(temp_dir.path().join("file.txt"), "content").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Check that main repo is NOT a worktree
+        let result = is_worktree(temp_dir.path(), temp_dir.path()).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_is_worktree_valid_worktree() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let _ = Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create initial commit
+        std::fs::write(temp_dir.path().join("file.txt"), "content").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create a worktree
+        let worktree_path = temp_dir.path().join("worktree1");
+        let _ = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "-b",
+                "feature-branch",
+            ])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Check that worktree is detected as a worktree
+        let result = is_worktree(temp_dir.path(), &worktree_path).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_is_worktree_non_worktree_path() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let _ = Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create initial commit
+        std::fs::write(temp_dir.path().join("file.txt"), "content").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Check a random path that is not a worktree
+        let random_path = temp_dir.path().join("random");
+        let result = is_worktree(temp_dir.path(), &random_path).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
     }
 }

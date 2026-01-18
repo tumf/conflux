@@ -330,12 +330,53 @@ pub async fn execute_apply_in_workspace(
     parallel_ctx: Option<&ParallelHookContext>,
     cancel_token: Option<&CancellationToken>,
     ai_runner: &AiCommandRunner,
+    repo_root: &Path,
 ) -> Result<String> {
     const MAX_ITERATIONS: u32 = 50;
     let mut iteration = 0;
     let mut first_apply = true;
     let mut apply_succeeded = false; // Track if all iterations succeeded
     let mut stall_detector = StallDetector::new(config.get_stall_detection());
+
+    // Validate that workspace_path is a worktree, not the base repository
+    match git_commands::is_worktree(repo_root, workspace_path).await {
+        Ok(true) => {
+            info!(
+                "Workspace path validation passed: {} is a valid worktree",
+                workspace_path.display()
+            );
+        }
+        Ok(false) => {
+            let error_msg = format!(
+                "Parallel apply execution guard: workspace_path is NOT a worktree (executing in base repository is forbidden)\n\
+                 change_id: {}\n\
+                 workspace_path: {}\n\
+                 repo_root: {}\n\
+                 apply_command: {}",
+                change_id,
+                workspace_path.display(),
+                repo_root.display(),
+                apply_cmd_template
+            );
+            return Err(OrchestratorError::GitCommand(error_msg));
+        }
+        Err(e) => {
+            let error_msg = format!(
+                "Failed to validate worktree status for parallel apply\n\
+                 change_id: {}\n\
+                 workspace_path: {}\n\
+                 repo_root: {}\n\
+                 apply_command: {}\n\
+                 validation_error: {}",
+                change_id,
+                workspace_path.display(),
+                repo_root.display(),
+                apply_cmd_template,
+                e
+            );
+            return Err(OrchestratorError::GitCommand(error_msg));
+        }
+    }
 
     loop {
         iteration += 1;
