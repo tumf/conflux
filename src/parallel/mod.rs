@@ -81,6 +81,8 @@ pub struct ParallelExecutor {
     change_dependencies: HashMap<String, Vec<String>>,
     /// Changes waiting for merge resolution
     merge_deferred_changes: HashSet<String>,
+    /// Changes that previously had unresolved dependencies (for worktree recreation tracking)
+    previously_blocked_changes: HashSet<String>,
     /// Hook runner for executing hooks (optional)
     hooks: Option<Arc<HookRunner>>,
     /// Cancellation token for force stop cleanup
@@ -224,6 +226,7 @@ impl ParallelExecutor {
             failed_tracker: FailedChangeTracker::new(),
             change_dependencies: HashMap::new(),
             merge_deferred_changes: HashSet::new(),
+            previously_blocked_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at,
@@ -341,6 +344,34 @@ impl ParallelExecutor {
         None
     }
 
+    /// Check if a dependency is resolved (merged to base branch).
+    ///
+    /// A dependency is considered resolved if its archive commit is present in the base branch.
+    /// This indicates that the dependency's artifacts are available for dependent changes.
+    async fn is_dependency_resolved(&self, dep_id: &str) -> bool {
+        let original_branch = match self.workspace_manager.original_branch() {
+            Some(branch) => branch,
+            None => {
+                warn!("Original branch not initialized, assuming dependency not resolved");
+                return false;
+            }
+        };
+
+        // Check if the archive commit for this dependency exists in the base branch
+        match crate::execution::state::is_merged_to_base(dep_id, &self.repo_root, &original_branch)
+            .await
+        {
+            Ok(is_merged) => is_merged,
+            Err(e) => {
+                warn!(
+                    "Failed to check if dependency '{}' is merged to base: {}, assuming not resolved",
+                    dep_id, e
+                );
+                false
+            }
+        }
+    }
+
     /// Resolve VCS backend (convert Auto to concrete backend)
     fn resolve_backend(backend: VcsBackend, _repo_root: &Path) -> VcsBackend {
         match backend {
@@ -365,6 +396,19 @@ impl ParallelExecutor {
     }
 
     /// Execute groups in topological order
+    ///
+    /// # Deprecated
+    ///
+    /// This method is deprecated in favor of `execute_with_reanalysis()`, which provides
+    /// dynamic re-analysis after each group completes. The CLI and TUI now use the same
+    /// unified execution path via `execute_with_reanalysis()`.
+    ///
+    /// This method is kept for backward compatibility but may be removed in a future release.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use execute_with_reanalysis() for dynamic re-analysis"
+    )]
+    #[allow(dead_code)]
     pub async fn execute_groups(&mut self, groups: Vec<ParallelGroup>) -> Result<()> {
         if groups.is_empty() {
             send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
@@ -438,6 +482,7 @@ impl ParallelExecutor {
     ///
     /// This method analyzes the remaining changes after each group completes,
     /// allowing the LLM to reconsider dependencies based on the current state.
+    #[allow(dead_code)]
     pub async fn execute_with_reanalysis<F>(
         &mut self,
         mut changes: Vec<crate::openspec::Change>,
@@ -670,6 +715,363 @@ impl ParallelExecutor {
 
             changes_processed += group_size;
             group_counter += 1;
+        }
+
+        if self.has_merge_deferred() {
+            send_event(&self.event_tx, ParallelEvent::Stopped).await;
+        } else {
+            send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+        }
+        Ok(())
+    }
+
+    /// Execute changes with order-based re-analysis after each batch completes.
+    ///
+    /// This method uses the `order` field directly from analysis results,
+    /// selecting changes based on available execution slots and dependency constraints.
+    ///
+    /// # Order-based Execution Logic
+    ///
+    /// 1. Analyze remaining changes to get `order` and `dependencies`
+    /// 2. Calculate available execution slots (max_parallelism - active_count)
+    /// 3. Select changes from `order` that:
+    ///    - Have no unresolved dependencies (dependencies merged to base)
+    ///    - Fit within available slots
+    /// 4. Execute selected changes in parallel
+    /// 5. Repeat until all changes are processed
+    ///
+    /// # Dependency Constraints
+    ///
+    /// Changes with dependencies are blocked until their dependencies are merged to base.
+    /// When a dependency is resolved, the worktree is recreated (no resume) to ensure
+    /// the change executes with the dependency's artifacts available.
+    ///
+    /// # Arguments
+    ///
+    /// * `changes` - Initial list of changes to execute
+    /// * `analyzer` - Async function that returns AnalysisResult (order + dependencies)
+    pub async fn execute_with_order_based_reanalysis<F>(
+        &mut self,
+        mut changes: Vec<crate::openspec::Change>,
+        analyzer: F,
+    ) -> Result<()>
+    where
+        F: Fn(
+                &[crate::openspec::Change],
+                u32,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + '_>,
+            > + Send
+            + Sync,
+    {
+        if changes.is_empty() {
+            send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+            return Ok(());
+        }
+
+        info!(
+            "Starting order-based execution with re-analysis for {} changes",
+            changes.len()
+        );
+
+        // Prepare for parallel execution (clean check for git)
+        info!("Preparing for parallel execution...");
+        match self.workspace_manager.prepare_for_parallel().await {
+            Ok(Some(warning)) => {
+                warn!("{}", warning.message);
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Warning {
+                        title: warning.title,
+                        message: warning.message,
+                    },
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let error_msg = format!("Failed to prepare for parallel execution: {}", e);
+                error!("{}", error_msg);
+                send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
+                return Err(e.into());
+            }
+        }
+        info!("Preparation complete");
+
+        let mut iteration = 1u32;
+        let initial_total_changes = changes.len();
+        let mut changes_processed: usize = 0;
+
+        // Get max parallelism from config
+        let max_parallelism = self.workspace_manager.max_concurrent();
+
+        while !changes.is_empty() {
+            if self.is_cancelled() {
+                let remaining_changes: Vec<String> = changes.iter().map(|c| c.id.clone()).collect();
+                let cancel_msg = format!(
+                    "Cancelled parallel execution during order-based reanalysis ({} remaining changes: {})",
+                    remaining_changes.len(),
+                    remaining_changes.join(", ")
+                );
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::warn(&cancel_msg)),
+                )
+                .await;
+                return Err(OrchestratorError::AgentCommand(cancel_msg));
+            }
+
+            // Check dynamic queue for newly added changes (TUI mode)
+            if let Some(queue) = &self.dynamic_queue {
+                let mut queue_changed = false;
+                while let Some(dynamic_id) = queue.pop().await {
+                    // Check if change is already in the list
+                    if !changes.iter().any(|c| c.id == dynamic_id) {
+                        // Load change details from openspec by listing all changes and filtering
+                        match crate::openspec::list_changes_native() {
+                            Ok(all_changes) => {
+                                if let Some(new_change) =
+                                    all_changes.into_iter().find(|c| c.id == dynamic_id)
+                                {
+                                    info!("Dynamically adding change to execution: {}", dynamic_id);
+                                    send_event(
+                                        &self.event_tx,
+                                        ParallelEvent::Log(LogEntry::info(format!(
+                                            "Dynamically added to parallel execution: {}",
+                                            dynamic_id
+                                        ))),
+                                    )
+                                    .await;
+                                    changes.push(new_change);
+                                    queue_changed = true;
+                                } else {
+                                    warn!(
+                                        "Dynamically added change '{}' not found in openspec",
+                                        dynamic_id
+                                    );
+                                    send_event(
+                                        &self.event_tx,
+                                        ParallelEvent::Log(LogEntry::warn(format!(
+                                            "Dynamically added change '{}' not found in openspec",
+                                            dynamic_id
+                                        ))),
+                                    )
+                                    .await;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to load dynamically added change '{}': {}",
+                                    dynamic_id, e
+                                );
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::Log(LogEntry::warn(format!(
+                                        "Failed to load dynamically added change '{}': {}",
+                                        dynamic_id, e
+                                    ))),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+
+                // Update queue change timestamp if items were added
+                if queue_changed {
+                    let mut last_change = self.last_queue_change_at.lock().await;
+                    *last_change = Some(std::time::Instant::now());
+                }
+            }
+
+            // Filter out changes that depend on failed changes
+            let executable_changes: Vec<_> = changes
+                .iter()
+                .filter(|c| {
+                    if let Some(reason) = self.skip_reason_for_change(&c.id) {
+                        warn!("Excluding '{}' from analysis: {}", c.id, reason);
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .cloned()
+                .collect();
+
+            // Emit skip events for filtered changes
+            for change in &changes {
+                if let Some(reason) = self.skip_reason_for_change(&change.id) {
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::ChangeSkipped {
+                            change_id: change.id.clone(),
+                            reason,
+                        },
+                    )
+                    .await;
+                }
+            }
+
+            // Update changes to only include executable ones
+            changes = executable_changes;
+
+            if changes.is_empty() {
+                info!("All remaining changes are blocked by dependencies, stopping");
+                break;
+            }
+
+            // Check debounce (skip on first iteration to start immediately)
+            if iteration > 1 {
+                let slot_available = true; // Slot is available after previous completion
+                if !self.should_reanalyze(slot_available).await {
+                    // Debounce period still active, wait before re-analyzing
+                    let wait_duration = std::time::Duration::from_secs(1);
+                    info!("Debounce active, waiting {:?} before retry", wait_duration);
+                    tokio::time::sleep(wait_duration).await;
+                    continue; // Retry the loop after waiting
+                }
+            } else {
+                info!("First iteration, skipping debounce check");
+            }
+
+            // Analyze remaining changes to get order and dependencies
+            info!(
+                "Analyzing {} remaining changes for next batch (iteration {})",
+                changes.len(),
+                iteration
+            );
+            send_event(
+                &self.event_tx,
+                ParallelEvent::AnalysisStarted {
+                    remaining_changes: changes.len(),
+                },
+            )
+            .await;
+
+            let analysis_result = analyzer(&changes, iteration).await;
+
+            if analysis_result.order.is_empty() {
+                warn!("No order returned from analysis");
+                break;
+            }
+
+            // Update dependencies for skip tracking
+            self.failed_tracker
+                .set_dependencies(analysis_result.dependencies.clone());
+            self.change_dependencies = analysis_result.dependencies.clone();
+
+            // Calculate available slots
+            let active_count = self.workspace_manager.workspaces().len();
+            let available_slots = max_parallelism.saturating_sub(active_count);
+
+            info!(
+                "Available slots: {} (max: {}, active: {})",
+                available_slots, max_parallelism, active_count
+            );
+
+            if available_slots == 0 {
+                warn!("No available slots, waiting for workspaces to complete");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+
+            // Select changes from order based on available slots and dependency constraints
+            let mut selected_changes: Vec<String> = Vec::new();
+            let mut blocked_changes: HashSet<String> = HashSet::new();
+
+            for change_id in &analysis_result.order {
+                if selected_changes.len() >= available_slots {
+                    break;
+                }
+
+                // Check if change has unresolved dependencies
+                if let Some(deps) = analysis_result.dependencies.get(change_id) {
+                    let mut all_resolved = true;
+                    for dep_id in deps {
+                        // Check if dependency is merged to base
+                        if !self.is_dependency_resolved(dep_id).await {
+                            all_resolved = false;
+                            info!(
+                                "Change '{}' blocked: waiting for dependency '{}' to merge to base",
+                                change_id, dep_id
+                            );
+                            blocked_changes.insert(change_id.clone());
+                            break;
+                        }
+                    }
+
+                    if !all_resolved {
+                        continue;
+                    }
+
+                    // If dependency was previously blocking this change, mark for worktree recreation
+                    if self.previously_blocked_changes.contains(change_id) {
+                        info!(
+                            "Change '{}' dependency resolved, will recreate worktree",
+                            change_id
+                        );
+                        // Remove from previously_blocked to avoid repeated recreation
+                        self.previously_blocked_changes.remove(change_id);
+                        // Mark for no-resume (force new worktree)
+                        // This is handled in execute_group by checking previously_blocked_changes before it's removed
+                    }
+                }
+
+                selected_changes.push(change_id.clone());
+            }
+
+            // Track newly blocked changes
+            for change_id in &blocked_changes {
+                if !self.previously_blocked_changes.contains(change_id) {
+                    self.previously_blocked_changes.insert(change_id.clone());
+                    info!(
+                        "Change '{}' newly blocked by unresolved dependencies",
+                        change_id
+                    );
+                }
+            }
+
+            // Emit events for blocked changes
+            for change_id in &blocked_changes {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::info(format!(
+                        "Change '{}' waiting for dependencies to merge to base",
+                        change_id
+                    ))),
+                )
+                .await;
+            }
+
+            if selected_changes.is_empty() {
+                info!("No changes can be executed (all blocked by dependencies)");
+                // Wait before re-analyzing
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
+            }
+
+            // Create a pseudo-group for execution
+            let group = ParallelGroup {
+                id: iteration,
+                changes: selected_changes.clone(),
+                depends_on: Vec::new(),
+            };
+
+            let batch_size = group.changes.len();
+            info!(
+                "Executing batch {} with {} changes (from order): {:?}",
+                iteration, batch_size, group.changes
+            );
+
+            self.execute_group(&group, initial_total_changes, changes_processed)
+                .await?;
+
+            // Remove completed changes from the list
+            let completed_set: std::collections::HashSet<_> = group.changes.iter().collect();
+            changes.retain(|c| !completed_set.contains(&c.id));
+
+            changes_processed += batch_size;
+            iteration += 1;
         }
 
         if self.has_merge_deferred() {
@@ -2349,6 +2751,7 @@ mod tests {
             failed_tracker: FailedChangeTracker::new(),
             change_dependencies,
             merge_deferred_changes,
+            previously_blocked_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
@@ -2586,6 +2989,7 @@ mod tests {
             failed_tracker: FailedChangeTracker::new(),
             change_dependencies: HashMap::new(),
             merge_deferred_changes: HashSet::new(),
+            previously_blocked_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
@@ -2747,6 +3151,7 @@ mod tests {
             failed_tracker: FailedChangeTracker::new(),
             change_dependencies: HashMap::new(),
             merge_deferred_changes: HashSet::new(),
+            previously_blocked_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
@@ -2880,6 +3285,7 @@ mod tests {
             failed_tracker: FailedChangeTracker::new(),
             change_dependencies: HashMap::new(),
             merge_deferred_changes: HashSet::new(),
+            previously_blocked_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
@@ -3042,6 +3448,7 @@ mod tests {
             failed_tracker: FailedChangeTracker::new(),
             change_dependencies: HashMap::new(),
             merge_deferred_changes: HashSet::new(),
+            previously_blocked_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
@@ -3218,6 +3625,7 @@ mod tests {
             failed_tracker: FailedChangeTracker::new(),
             change_dependencies: HashMap::new(),
             merge_deferred_changes: HashSet::new(),
+            previously_blocked_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),
@@ -3400,6 +3808,7 @@ mod tests {
             failed_tracker: FailedChangeTracker::new(),
             change_dependencies: HashMap::new(),
             merge_deferred_changes: HashSet::new(),
+            previously_blocked_changes: HashSet::new(),
             hooks: None,
             cancel_token: None,
             last_queue_change_at: Arc::new(Mutex::new(None)),

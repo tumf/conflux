@@ -46,36 +46,40 @@ impl ParallelizationAnalyzer {
         Self { agent }
     }
 
-    /// Analyze changes and return parallel execution groups
+    /// Analyze changes and return the raw analysis result with order and dependencies.
     ///
-    /// Returns groups in topological order (dependencies first).
-    pub async fn analyze_groups(&self, changes: &[Change]) -> Result<Vec<ParallelGroup>> {
-        self.analyze_groups_with_callback(changes, |_| {}).await
+    /// This is the preferred method for order-based execution.
+    /// Returns the analysis result containing:
+    /// - `order`: Recommended execution sequence considering dependencies
+    /// - `dependencies`: Change-level dependency constraints
+    pub async fn analyze(&self, changes: &[Change]) -> Result<AnalysisResult> {
+        self.analyze_with_callback(changes, |_| {}).await
     }
 
-    /// Analyze changes and return parallel execution groups with output callback
-    ///
-    /// The callback is called for each line of output from the analysis command.
-    /// Returns groups in topological order (dependencies first).
-    pub async fn analyze_groups_with_callback<F>(
+    /// Analyze changes with output callback and return raw analysis result.
+    pub async fn analyze_with_callback<F>(
         &self,
         changes: &[Change],
         mut on_output: F,
-    ) -> Result<Vec<ParallelGroup>>
+    ) -> Result<AnalysisResult>
     where
         F: FnMut(String),
     {
         if changes.is_empty() {
-            return Ok(Vec::new());
+            return Ok(AnalysisResult {
+                order: Vec::new(),
+                dependencies: HashMap::new(),
+                groups: None,
+            });
         }
 
         // For single change, no parallelization needed
         if changes.len() == 1 {
-            return Ok(vec![ParallelGroup {
-                id: 1,
-                changes: vec![changes[0].id.clone()],
-                depends_on: Vec::new(),
-            }]);
+            return Ok(AnalysisResult {
+                order: vec![changes[0].id.clone()],
+                dependencies: HashMap::new(),
+                groups: None,
+            });
         }
 
         // Build prompt for LLM analysis
@@ -115,9 +119,7 @@ impl ParallelizationAnalyzer {
         debug!("LLM response: {}", response);
 
         // Parse JSON response with strict validation
-        // Even if exit code is 0, fail if JSON is invalid
         let result = self.parse_response(&response, changes).map_err(|e| {
-            // Provide context from output for debugging
             let preview = response.chars().take(200).collect::<String>();
             let change_ids: Vec<&str> = changes.iter().map(|c| c.id.as_str()).collect();
             OrchestratorError::Parse(format!(
@@ -129,7 +131,7 @@ impl ParallelizationAnalyzer {
             ))
         })?;
 
-        // Now check exit code after successful JSON parsing
+        // Check exit code after successful JSON parsing
         if !status.success() {
             let change_ids: Vec<&str> = changes.iter().map(|c| c.id.as_str()).collect();
             return Err(OrchestratorError::AgentCommand(format!(
@@ -139,11 +141,49 @@ impl ParallelizationAnalyzer {
             )));
         }
 
-        // Convert order-based result to group-based format for compatibility
+        info!("Analysis complete: {} changes in order", result.order.len());
+        Ok(result)
+    }
+
+    /// Analyze changes and return parallel execution groups
+    ///
+    /// Returns groups in topological order (dependencies first).
+    ///
+    /// # Deprecated
+    ///
+    /// This method converts order-based results to group-based format.
+    /// Prefer using `analyze()` for order-based execution.
+    pub async fn analyze_groups(&self, changes: &[Change]) -> Result<Vec<ParallelGroup>> {
+        self.analyze_groups_with_callback(changes, |_| {}).await
+    }
+
+    /// Analyze changes and return parallel execution groups with output callback
+    ///
+    /// The callback is called for each line of output from the analysis command.
+    /// Returns groups in topological order (dependencies first).
+    ///
+    /// # Deprecated
+    ///
+    /// This method converts order-based results to group-based format.
+    /// Prefer using `analyze_with_callback()` for order-based execution.
+    pub async fn analyze_groups_with_callback<F>(
+        &self,
+        changes: &[Change],
+        on_output: F,
+    ) -> Result<Vec<ParallelGroup>>
+    where
+        F: FnMut(String),
+    {
+        // Use the new analyze_with_callback and convert to groups
+        let result = self.analyze_with_callback(changes, on_output).await?;
+
+        if result.order.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Convert order-based result to group-based format for backward compatibility
         let groups = self.order_to_groups(&result);
-
         info!("Analysis complete: {} groups identified", groups.len());
-
         Ok(groups)
     }
 

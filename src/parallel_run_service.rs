@@ -120,6 +120,10 @@ impl ParallelRunService {
     ///
     /// The event_handler receives ParallelEvents as they occur during execution.
     /// Returns the execution result.
+    ///
+    /// This method now uses `execute_with_reanalysis` for dynamic re-analysis,
+    /// matching the TUI behavior and aligning with the spec requirement for
+    /// unified CLI/TUI execution paths.
     pub async fn run_parallel<F>(&self, changes: Vec<Change>, event_handler: F) -> Result<()>
     where
         F: Fn(ParallelEvent) + Send + Sync + 'static,
@@ -143,11 +147,10 @@ impl ParallelRunService {
             return Ok(());
         }
 
-        info!("Starting parallel execution for {} changes", changes.len());
-
-        // Group changes - try LLM analysis first, fall back to declarative dependencies
-        let groups = self.analyze_and_group(&changes).await;
-        info!("Created {} groups for parallel execution", groups.len());
+        info!(
+            "Starting parallel execution with re-analysis for {} changes",
+            changes.len()
+        );
 
         // Create event channel
         let (event_tx, mut event_rx) = mpsc::channel::<ParallelEvent>(100);
@@ -164,12 +167,32 @@ impl ParallelRunService {
             }
         });
 
-        // Create and run executor
-        let mut executor =
-            ParallelExecutor::new(self.repo_root.clone(), self.config.clone(), Some(event_tx));
+        // Create and run executor with re-analysis (same as TUI)
+        let mut executor = ParallelExecutor::new(
+            self.repo_root.clone(),
+            self.config.clone(),
+            Some(event_tx.clone()),
+        );
         executor.set_no_resume(self.no_resume);
 
-        let result = executor.execute_groups(groups).await;
+        // Clone config for the analyzer closure
+        let config = self.config.clone();
+        let repo_root = self.repo_root.clone();
+
+        // Use order-based execution (aligned with spec)
+        let result = executor
+            .execute_with_order_based_reanalysis(changes, move |remaining, iteration| {
+                let config = config.clone();
+                let repo_root = repo_root.clone();
+                let event_tx = event_tx.clone();
+                Box::pin(async move {
+                    let service = ParallelRunService::new(repo_root, config);
+                    service
+                        .analyze_order_with_sender(remaining, Some(&event_tx), Some(iteration))
+                        .await
+                })
+            })
+            .await;
 
         // Wait for event forwarding to complete
         let _ = forward_handle.await;
@@ -201,7 +224,63 @@ impl ParallelRunService {
             shared_queue_change,
             dynamic_queue,
         );
-        self.run_parallel_with_executor(executor, changes, event_tx)
+        // Use order-based execution (aligned with spec)
+        self.run_parallel_order_based_with_executor(executor, changes, event_tx)
+            .await
+    }
+
+    /// Run parallel execution with order-based analysis using a pre-configured executor.
+    ///
+    /// This is the preferred execution method that aligns with the parallel-execution spec.
+    /// Uses `order` directly to select changes based on available slots.
+    pub async fn run_parallel_order_based_with_executor(
+        &self,
+        mut executor: ParallelExecutor,
+        changes: Vec<Change>,
+        event_tx: mpsc::Sender<ParallelEvent>,
+    ) -> Result<()> {
+        let (changes, skipped) = self.filter_committed_changes(changes).await?;
+
+        if !skipped.is_empty() {
+            let message = format!(
+                "Skipping uncommitted changes in parallel mode: {}",
+                skipped.join(", ")
+            );
+            warn!("{}", message);
+            let _ = event_tx
+                .send(ParallelEvent::Warning {
+                    title: "Uncommitted changes skipped".to_string(),
+                    message,
+                })
+                .await;
+        }
+
+        if changes.is_empty() {
+            info!("No committed changes available for parallel execution");
+            return Ok(());
+        }
+
+        info!(
+            "Starting order-based parallel execution with re-analysis for {} changes",
+            changes.len()
+        );
+
+        let config = self.config.clone();
+        let repo_root = self.repo_root.clone();
+
+        // Use order-based execution
+        executor
+            .execute_with_order_based_reanalysis(changes, move |remaining, iteration| {
+                let config = config.clone();
+                let repo_root = repo_root.clone();
+                let event_tx = event_tx.clone();
+                Box::pin(async move {
+                    let service = ParallelRunService::new(repo_root, config);
+                    service
+                        .analyze_order_with_sender(remaining, Some(&event_tx), Some(iteration))
+                        .await
+                })
+            })
             .await
     }
 
@@ -210,6 +289,12 @@ impl ParallelRunService {
     /// This variant allows the caller to manage the executor instance,
     /// which is useful for calling executor methods like `mark_queue_changed()`
     /// during execution.
+    ///
+    /// # Deprecated
+    ///
+    /// This method uses group-based execution which converts order to groups.
+    /// Prefer using `run_parallel_order_based_with_executor()` for order-based execution.
+    #[allow(dead_code)]
     pub async fn run_parallel_with_executor(
         &self,
         mut executor: ParallelExecutor,
@@ -279,11 +364,60 @@ impl ParallelRunService {
             .await
     }
 
+    /// Analyze changes and return order-based result with optional event sender.
+    ///
+    /// If `use_llm_analysis` is enabled (default), uses LLM to analyze dependencies.
+    /// Otherwise, returns all changes in a single order (no dependency inference).
+    /// When a sender is provided, AnalysisOutput events are sent for streaming output.
+    async fn analyze_order_with_sender(
+        &self,
+        changes: &[Change],
+        event_tx: Option<&mpsc::Sender<ParallelEvent>>,
+        iteration: Option<u32>,
+    ) -> crate::analyzer::AnalysisResult {
+        // Check if LLM analysis is enabled (default: true)
+        if self.config.use_llm_analysis() {
+            info!("Using LLM analysis for parallelization (analyze_command)");
+            match self
+                .analyze_order_with_llm_streaming(changes, event_tx, iteration)
+                .await
+            {
+                Ok(result) => {
+                    info!(
+                        "LLM analysis successful: {} changes in order",
+                        result.order.len()
+                    );
+                    return result;
+                }
+                Err(e) => {
+                    error!("LLM analysis failed: {}", e);
+                    warn!(
+                        "Falling back to running all changes in parallel (no dependency analysis)"
+                    );
+                }
+            }
+        } else {
+            info!("LLM analysis disabled, running all changes in parallel");
+        }
+
+        // Fallback: all changes in order with no dependencies
+        crate::analyzer::AnalysisResult {
+            order: changes.iter().map(|c| c.id.clone()).collect(),
+            dependencies: HashMap::new(),
+            groups: None,
+        }
+    }
+
     /// Analyze changes and group them for parallel execution with optional event sender.
     ///
     /// If `use_llm_analysis` is enabled (default), uses LLM to analyze dependencies.
     /// Otherwise, runs all changes in parallel (no dependency inference).
     /// When a sender is provided, AnalysisOutput events are sent for streaming output.
+    ///
+    /// # Deprecated
+    ///
+    /// This method converts order-based results to group-based format.
+    /// Prefer using `analyze_order_with_sender()` for order-based execution.
     async fn analyze_and_group_with_sender(
         &self,
         changes: &[Change],
@@ -329,7 +463,37 @@ impl ParallelRunService {
         }]
     }
 
+    /// Analyze changes using LLM and return raw analysis result (order + dependencies)
+    async fn analyze_order_with_llm_streaming(
+        &self,
+        changes: &[Change],
+        event_tx: Option<&mpsc::Sender<ParallelEvent>>,
+        iteration: Option<u32>,
+    ) -> Result<crate::analyzer::AnalysisResult> {
+        let agent = AgentRunner::new(self.config.clone());
+        let analyzer = ParallelizationAnalyzer::new(agent);
+
+        if let Some(tx) = event_tx {
+            let tx = tx.clone();
+            analyzer
+                .analyze_with_callback(changes, move |output| {
+                    let _ = tx.try_send(ParallelEvent::AnalysisOutput {
+                        output: output.clone(),
+                        iteration,
+                    });
+                })
+                .await
+        } else {
+            analyzer.analyze(changes).await
+        }
+    }
+
     /// Analyze changes using LLM (analyze_command) with streaming output
+    ///
+    /// # Deprecated
+    ///
+    /// This method converts order-based results to group-based format.
+    /// Prefer using `analyze_order_with_llm_streaming()` for order-based execution.
     async fn analyze_with_llm_streaming(
         &self,
         changes: &[Change],
