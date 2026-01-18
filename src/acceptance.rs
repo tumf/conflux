@@ -10,13 +10,16 @@ pub enum AcceptanceResult {
     Pass,
     /// Acceptance failed with findings
     Fail { findings: Vec<String> },
+    /// Acceptance requires more investigation - continue later
+    Continue,
 }
 
-/// Parse acceptance output text and determine pass/fail status.
+/// Parse acceptance output text and determine pass/fail/continue status.
 ///
 /// Expected format:
 /// - PASS: `ACCEPTANCE: PASS`
 /// - FAIL: `ACCEPTANCE: FAIL` followed by `FINDINGS:` and items prefixed with `- `
+/// - CONTINUE: `ACCEPTANCE: CONTINUE`
 ///
 /// # Examples
 ///
@@ -35,35 +38,42 @@ pub enum AcceptanceResult {
 ///     }
 ///     _ => panic!("Expected Fail"),
 /// }
+///
+/// let continue_output = "ACCEPTANCE: CONTINUE\n";
+/// assert_eq!(parse_acceptance_output(continue_output), AcceptanceResult::Continue);
 /// ```
 pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
     let lines: Vec<&str> = output.lines().collect();
 
-    // Look for ACCEPTANCE: PASS or ACCEPTANCE: FAIL
+    // Look for ACCEPTANCE: PASS, ACCEPTANCE: FAIL, or ACCEPTANCE: CONTINUE
     let mut acceptance_status = None;
     for line in &lines {
         let trimmed = line.trim();
         if trimmed == "ACCEPTANCE: PASS" {
-            acceptance_status = Some(true);
+            acceptance_status = Some("pass");
             break;
         } else if trimmed == "ACCEPTANCE: FAIL" {
-            acceptance_status = Some(false);
+            acceptance_status = Some("fail");
+            break;
+        } else if trimmed == "ACCEPTANCE: CONTINUE" {
+            acceptance_status = Some("continue");
             break;
         }
     }
 
     match acceptance_status {
-        Some(true) => AcceptanceResult::Pass,
-        Some(false) => {
+        Some("pass") => AcceptanceResult::Pass,
+        Some("continue") => AcceptanceResult::Continue,
+        Some("fail") => {
             // Parse findings
             let findings = parse_findings(output);
             AcceptanceResult::Fail { findings }
         }
-        None => {
+        _ => {
             // Default to fail if no explicit status found
             AcceptanceResult::Fail {
                 findings: vec![
-                    "No explicit ACCEPTANCE: PASS or ACCEPTANCE: FAIL found in output".to_string(),
+                    "No explicit ACCEPTANCE: PASS, ACCEPTANCE: FAIL, or ACCEPTANCE: CONTINUE found in output".to_string(),
                 ],
             }
         }
@@ -185,5 +195,17 @@ Additional output here
             }
             _ => panic!("Expected Fail"),
         }
+    }
+
+    #[test]
+    fn test_parse_continue() {
+        let output = "ACCEPTANCE: CONTINUE\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_continue_with_extra_output() {
+        let output = "Some debug output\nACCEPTANCE: CONTINUE\nMore output\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
     }
 }
