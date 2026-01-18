@@ -421,20 +421,21 @@ impl AppState {
                     }
                 } else if fetched.total_tasks > 0 {
                     // Only update progress if we have valid data (total > 0)
-                    // and the change is NOT being processed (parallel mode uses workspace)
+                    // Note: Processing changes are now updated because auto-refresh enriches
+                    // progress from worktrees (see runner.rs auto-refresh task)
                     match existing.queue_status {
                         QueueStatus::Completed
                         | QueueStatus::Archiving
                         | QueueStatus::Archived
                         | QueueStatus::Merged
                         | QueueStatus::MergeWait
-                        | QueueStatus::Resolving
-                        | QueueStatus::Processing => {
-                            // Don't update progress after completion or during processing
-                            // - After completion: file may be moved
-                            // - During processing: parallel mode uses workspace, not main repo
+                        | QueueStatus::Resolving => {
+                            // Don't update progress after completion
+                            // - After completion: file may be moved/archived
                         }
                         _ => {
+                            // Update progress for all other states (including Processing)
+                            // For Processing: auto-refresh enriches from worktree tasks.md
                             existing.completed_tasks = fetched.completed_tasks;
                             existing.total_tasks = fetched.total_tasks;
                         }
@@ -1587,5 +1588,95 @@ mod tests {
         );
         // AND: ユーザー操作がない限りキューから外れた表示にならない
         // (MergeWait is not NotQueued, verified by above assertion)
+    }
+
+    // === Tests for update-tui-processing-progress ===
+
+    /// Test scenario: Processing中に進捗が更新される
+    #[test]
+    fn test_scenario_processing_progress_updates() {
+        // GIVEN: TUI が Processing 中の変更を表示している
+        let changes = vec![create_approved_change("change-a", 2, 10)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::Processing;
+
+        // AND: worktree の tasks.md から進捗が取得できる (simulated by fetched data)
+        // WHEN: 自動リフレッシュが実行される
+        let fetched = vec![create_approved_change("change-a", 5, 10)]; // Progress updated from 2/10 to 5/10
+        app.update_changes(fetched);
+
+        // THEN: TUI は completed/total の表示を更新する
+        assert_eq!(
+            app.changes[0].completed_tasks, 5,
+            "Completed tasks should be updated during Processing"
+        );
+        assert_eq!(
+            app.changes[0].total_tasks, 10,
+            "Total tasks should remain consistent"
+        );
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::Processing,
+            "Status should remain Processing"
+        );
+    }
+
+    /// Test scenario: Processing中に進捗取得が失敗した場合は保持する
+    #[test]
+    fn test_scenario_processing_progress_preserved_on_failure() {
+        // GIVEN: TUI が Processing 中の変更を表示している
+        let changes = vec![create_approved_change("change-a", 5, 10)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[0].completed_tasks = 5;
+        app.changes[0].total_tasks = 10;
+
+        // AND: tasks.md の読み取りに失敗する (simulated by 0/0 from auto-refresh)
+        // WHEN: 自動リフレッシュが実行される
+        let fetched = vec![Change {
+            id: "change-a".to_string(),
+            completed_tasks: 0,
+            total_tasks: 0, // Parse failed, no progress data
+            last_modified: "now".to_string(),
+            is_approved: true,
+            dependencies: Vec::new(),
+        }];
+        app.update_changes(fetched);
+
+        // THEN: TUI は直前の completed/total 表示を維持する
+        assert_eq!(
+            app.changes[0].completed_tasks, 5,
+            "Completed tasks should be preserved when parse fails"
+        );
+        assert_eq!(
+            app.changes[0].total_tasks, 10,
+            "Total tasks should be preserved when parse fails"
+        );
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::Processing,
+            "Status should remain Processing"
+        );
+    }
+
+    /// Test: ProgressUpdated event updates Processing changes
+    #[test]
+    fn test_progress_updated_event_updates_processing() {
+        // GIVEN: Processing中の変更
+        let changes = vec![create_approved_change("change-a", 2, 10)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::Processing;
+
+        // WHEN: ProgressUpdated イベントを受信
+        app.handle_orchestrator_event(OrchestratorEvent::ProgressUpdated {
+            change_id: "change-a".to_string(),
+            completed: 7,
+            total: 10,
+        });
+
+        // THEN: 進捗が更新される
+        assert_eq!(app.changes[0].completed_tasks, 7);
+        assert_eq!(app.changes[0].total_tasks, 10);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Processing);
     }
 }
