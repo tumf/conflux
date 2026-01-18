@@ -72,12 +72,9 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
             AcceptanceResult::Fail { findings }
         }
         _ => {
-            // Default to fail if no explicit status found
-            AcceptanceResult::Fail {
-                findings: vec![
-                    "No explicit ACCEPTANCE: PASS, ACCEPTANCE: FAIL, or ACCEPTANCE: CONTINUE found in output".to_string(),
-                ],
-            }
+            // Default to continue if no explicit status found
+            // This allows the acceptance loop to retry and investigate further
+            AcceptanceResult::Continue
         }
     }
 }
@@ -181,13 +178,22 @@ FINDINGS:
     #[test]
     fn test_parse_no_status() {
         let output = "Some random output\n";
-        match parse_acceptance_output(output) {
-            AcceptanceResult::Fail { findings } => {
-                assert_eq!(findings.len(), 1);
-                assert!(findings[0].contains("No explicit ACCEPTANCE"));
-            }
-            _ => panic!("Expected Fail"),
-        }
+        // When no explicit marker is present, default to CONTINUE
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_no_marker_defaults_to_continue() {
+        // Empty output defaults to CONTINUE
+        assert_eq!(parse_acceptance_output(""), AcceptanceResult::Continue);
+
+        // Output with no acceptance marker defaults to CONTINUE
+        let output = "Some debug output\nNo marker here\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+
+        // Output with findings but no marker defaults to CONTINUE
+        let output = "FINDINGS:\n- Issue 1\n- Issue 2\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
     }
 
     #[test]
