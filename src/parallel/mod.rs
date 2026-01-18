@@ -728,20 +728,22 @@ impl ParallelExecutor {
         Ok(())
     }
 
-    /// Execute changes with order-based re-analysis after each batch completes.
+    /// Execute changes with order-based re-analysis triggered by slot availability.
     ///
     /// This method uses the `order` field directly from analysis results,
     /// selecting changes based on available execution slots and dependency constraints.
     ///
-    /// # Order-based Execution Logic
+    /// # Order-based Execution Logic (Slot-Driven)
     ///
     /// 1. Analyze remaining changes to get `order` and `dependencies`
-    /// 2. Calculate available execution slots (max_parallelism - active_count)
-    /// 3. Select changes from `order` that:
+    /// 2. Launch changes from `order` that:
     ///    - Have no unresolved dependencies (dependencies merged to base)
-    ///    - Fit within available slots
-    /// 4. Execute selected changes in parallel
-    /// 5. Repeat until all changes are processed
+    ///    - Fit within available execution slots
+    /// 3. When any change completes (slot becomes available):
+    ///    - Check debounce condition (10s since last queue change)
+    ///    - Re-analyze if debounce passed or no queue changes
+    ///    - Launch next change(s) from updated `order`
+    /// 4. Repeat until all changes are processed
     ///
     /// # Dependency Constraints
     ///
@@ -928,7 +930,7 @@ impl ParallelExecutor {
                 let slot_available = true; // Slot is available after previous completion
                 if !self.should_reanalyze(slot_available).await {
                     // Debounce period still active, wait before re-analyzing
-                    let wait_duration = std::time::Duration::from_secs(1);
+                    let wait_duration = std::time::Duration::from_millis(500);
                     info!("Debounce active, waiting {:?} before retry", wait_duration);
                     tokio::time::sleep(wait_duration).await;
                     continue; // Retry the loop after waiting
@@ -980,14 +982,8 @@ impl ParallelExecutor {
             }
 
             // Select changes from order based on available slots and dependency constraints
-            // Limit batch size to enable frequent re-analysis during execution
-            let batch_size_limit = if available_slots > 2 {
-                // For larger slot counts, execute in smaller batches to allow frequent re-analysis
-                (available_slots / 2).max(1)
-            } else {
-                // For small slot counts, use all available slots
-                available_slots
-            };
+            // SLOT-DRIVEN: Launch one change at a time to enable frequent re-analysis
+            let batch_size_limit = 1;
             let mut selected_changes: Vec<String> = Vec::new();
             let mut blocked_changes: HashSet<String> = HashSet::new();
 
