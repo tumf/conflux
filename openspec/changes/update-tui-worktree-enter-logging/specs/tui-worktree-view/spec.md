@@ -1,20 +1,24 @@
-## MODIFIED Requirements
-### Requirement: WorktreeビューのEnter操作ガイダンス
-WorktreesビューでEnterキーが無視される場合、TUIはその理由をwarningログとして表示しなければならない（SHALL）。
+## NEW Requirements
+### Requirement: Enter Key Operation Guidance
 
-#### Scenario: Worktreesビュー以外でEnterが無視される場合の警告
-- **GIVEN** TUIがWorktreesビュー以外を表示している
-- **WHEN** ユーザーがEnterキーを押す
-- **THEN** TUIは"Enter ignored: not in Worktrees view"をwarningログに出力する
+The TUI MUST display warning logs when the Enter key is ignored in Worktrees view, explaining the reason for rejection.
 
-#### Scenario: Worktreeが未選択のためEnterが無視される場合の警告
-- **GIVEN** TUIがWorktreesビューを表示している
-- **AND** 選択中のworktreeが存在しない
-- **WHEN** ユーザーがEnterキーを押す
-- **THEN** TUIは"Enter ignored: no worktree selected"をwarningログに出力する
+#### Scenario: Warning When Enter Is Ignored Outside Worktrees View
 
-#### Scenario: worktree_command未設定でEnterが無視される場合の警告
-- **GIVEN** TUIがWorktreesビューを表示している
-- **AND** worktree_commandが設定されていない
-- **WHEN** ユーザーがEnterキーを押す
-- **THEN** TUIは"Enter ignored: worktree_command not configured"をwarningログに出力する
+- **GIVEN** the TUI is displaying a view other than Worktrees
+- **WHEN** the user presses the Enter key
+- **THEN** the TUI outputs "Enter ignored: not in Worktrees view" to the warning log
+
+#### Scenario: Warning When Enter Is Ignored Due to No Worktree Selection
+
+- **GIVEN** the TUI is displaying the Worktrees view
+- **AND** no worktree is currently selected
+- **WHEN** the user presses the Enter key
+- **THEN** the TUI outputs "Enter ignored: no worktree selected" to the warning log
+
+#### Scenario: Warning When Enter Is Ignored Due to Missing worktree_command Configuration
+
+- **GIVEN** the TUI is displaying the Worktrees view
+- **AND** worktree_command is not configured
+- **WHEN** the user presses the Enter key
+- **THEN** the TUI outputs "Enter ignored: worktree_command not configured" to the warning log
