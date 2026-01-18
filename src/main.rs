@@ -12,6 +12,7 @@ mod events;
 mod execution;
 mod history;
 mod hooks;
+mod merge_stall_monitor;
 mod openspec;
 mod orchestration;
 mod orchestrator;
