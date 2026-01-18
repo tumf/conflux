@@ -17,6 +17,11 @@ pub const DEFAULT_APPLY_COMMAND: &str = "opencode run '/openspec-apply {change_i
 /// Default archive command template (OpenCode)
 pub const DEFAULT_ARCHIVE_COMMAND: &str = "opencode run '/conflux:archive {change_id}'";
 
+/// Default acceptance command template (OpenCode)
+/// Supports `{change_id}` and `{prompt}` placeholders
+pub const DEFAULT_ACCEPTANCE_COMMAND: &str =
+    "opencode run '/conflux:acceptance {change_id} {prompt}'";
+
 /// Default resolve command template (OpenCode)
 /// Supports `{prompt}` placeholder for the resolve prompt
 pub const DEFAULT_RESOLVE_COMMAND: &str = "opencode run {prompt}";
@@ -36,6 +41,37 @@ All file paths should be relative to the repository root.
 
 /// Default prompt for archive command - empty by default
 pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
+
+/// Hardcoded acceptance prompt - always prepended to user's acceptance_prompt
+pub const ACCEPTANCE_SYSTEM_PROMPT: &str = r#"
+Review the implementation to verify it meets the specification requirements.
+Check the following:
+1. All tasks in tasks.md are completed (marked with [x])
+2. Implementation matches the specification
+3. Code quality and test coverage are adequate
+4. No obvious bugs or issues
+
+Output format:
+- If all checks pass: Output "ACCEPTANCE: PASS"
+- If checks fail: Output "ACCEPTANCE: FAIL" followed by "FINDINGS:" and list each issue on a new line prefixed with "- "
+
+Example of PASS:
+```
+ACCEPTANCE: PASS
+```
+
+Example of FAIL:
+```
+ACCEPTANCE: FAIL
+FINDINGS:
+- Task 1.3 is not completed
+- Missing unit tests for new feature
+- Code does not handle error case X
+```
+"#;
+
+/// Default prompt for acceptance command - appended after hardcoded prompt
+pub const DEFAULT_ACCEPTANCE_PROMPT: &str = "";
 
 /// Default maximum iterations for the orchestration loop
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;

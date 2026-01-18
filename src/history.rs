@@ -138,7 +138,8 @@ impl ApplyHistory {
             .unwrap_or(0)
     }
 
-    /// Clear history for a change (call on archive)
+    /// Clear history for a change (call on successful archive)
+    #[allow(dead_code)]
     pub fn clear(&mut self, change_id: &str) {
         self.attempts.remove(change_id);
     }
@@ -308,6 +309,122 @@ impl ArchiveHistory {
 }
 
 impl Default for ArchiveHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Summary of a single acceptance attempt
+#[derive(Debug, Clone)]
+pub struct AcceptanceAttempt {
+    /// Attempt number (1-based)
+    pub attempt: u32,
+    /// Whether the acceptance passed
+    pub passed: bool,
+    /// Duration of the attempt
+    pub duration: Duration,
+    /// Findings if failed (None if passed)
+    pub findings: Option<Vec<String>>,
+    /// Exit code if available
+    pub exit_code: Option<i32>,
+    /// Last N lines of stdout (tail summary)
+    pub stdout_tail: Option<String>,
+    /// Last N lines of stderr (tail summary)
+    pub stderr_tail: Option<String>,
+}
+
+/// Tracks acceptance attempts per change
+pub struct AcceptanceHistory {
+    /// Map of change_id to list of attempts
+    attempts: HashMap<String, Vec<AcceptanceAttempt>>,
+}
+
+impl AcceptanceHistory {
+    /// Create a new empty AcceptanceHistory
+    pub fn new() -> Self {
+        Self {
+            attempts: HashMap::new(),
+        }
+    }
+
+    /// Record a new attempt for a change
+    pub fn record(&mut self, change_id: &str, attempt: AcceptanceAttempt) {
+        self.attempts
+            .entry(change_id.to_string())
+            .or_default()
+            .push(attempt);
+    }
+
+    /// Get all attempts for a change
+    #[allow(dead_code)]
+    pub fn get(&self, change_id: &str) -> Option<&[AcceptanceAttempt]> {
+        self.attempts.get(change_id).map(|v| v.as_slice())
+    }
+
+    /// Get attempt count for a change
+    pub fn count(&self, change_id: &str) -> u32 {
+        self.attempts
+            .get(change_id)
+            .map(|v| v.len() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Clear history for a change (call on successful archive)
+    pub fn clear(&mut self, change_id: &str) {
+        self.attempts.remove(change_id);
+    }
+
+    /// Format history as context string for prompt injection.
+    /// Returns an empty string if there are no previous attempts.
+    pub fn format_context(&self, change_id: &str) -> String {
+        let Some(attempts) = self.attempts.get(change_id) else {
+            return String::new();
+        };
+
+        if attempts.is_empty() {
+            return String::new();
+        }
+
+        attempts
+            .iter()
+            .map(|a| {
+                let status = if a.passed { "passed" } else { "failed" };
+                let duration_secs = a.duration.as_secs();
+                let findings_line = match &a.findings {
+                    Some(f) if !f.is_empty() => {
+                        let findings_text = f
+                            .iter()
+                            .map(|finding| format!("  - {}", finding))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        format!("\nfindings:\n{}", findings_text)
+                    }
+                    _ => String::new(),
+                };
+                let exit_code_line = match a.exit_code {
+                    Some(code) => format!("\nexit_code: {}", code),
+                    None => String::new(),
+                };
+                let stdout_line = match &a.stdout_tail {
+                    Some(s) if !s.is_empty() => format!("\nstdout_tail:\n{}", s),
+                    _ => String::new(),
+                };
+                let stderr_line = match &a.stderr_tail {
+                    Some(s) if !s.is_empty() => format!("\nstderr_tail:\n{}", s),
+                    _ => String::new(),
+                };
+
+                format!(
+                    "<last_acceptance attempt=\"{}\">\nstatus: {}\nduration: {}s{}{}{}{}\n</last_acceptance>",
+                    a.attempt, status, duration_secs, findings_line, exit_code_line, stdout_line, stderr_line
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
+
+impl Default for AcceptanceHistory {
     fn default() -> Self {
         Self::new()
     }

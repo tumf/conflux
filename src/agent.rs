@@ -69,8 +69,12 @@ MANDATORY: Keep tasks.md updated throughout the apply process
 - If you split or refine a task during implementation, update tasks.md at the same time
 - Before finishing apply, verify that tasks.md accurately reflects all completed work
 - Never leave completed work unmarked in tasks.md - progress visibility is critical"#;
+use crate::config::defaults::ACCEPTANCE_SYSTEM_PROMPT;
 use crate::error::{OrchestratorError, Result};
-use crate::history::{ApplyAttempt, ApplyHistory, ArchiveAttempt, ArchiveHistory};
+use crate::history::{
+    AcceptanceAttempt, AcceptanceHistory, ApplyAttempt, ApplyHistory, ArchiveAttempt,
+    ArchiveHistory,
+};
 use crate::process_manager::ManagedChild;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -95,6 +99,8 @@ pub struct AgentRunner {
     apply_history: ApplyHistory,
     /// History of archive attempts per change for context injection
     archive_history: ArchiveHistory,
+    /// History of acceptance attempts per change for context injection
+    acceptance_history: AcceptanceHistory,
 }
 
 impl AgentRunner {
@@ -125,6 +131,7 @@ impl AgentRunner {
             command_queue: CommandQueue::new(queue_config),
             apply_history: ApplyHistory::new(),
             archive_history: ArchiveHistory::new(),
+            acceptance_history: AcceptanceHistory::new(),
         }
     }
 
@@ -169,6 +176,7 @@ impl AgentRunner {
             command_queue: CommandQueue::new_with_shared_state(queue_config, shared_state),
             apply_history: ApplyHistory::new(),
             archive_history: ArchiveHistory::new(),
+            acceptance_history: AcceptanceHistory::new(),
         }
     }
 
@@ -362,6 +370,61 @@ impl AgentRunner {
     /// Clear archive history for a change (call after successful archiving)
     pub fn clear_archive_history(&mut self, change_id: &str) {
         self.archive_history.clear(change_id);
+    }
+
+    /// Clear acceptance history for a change (call after successful archiving)
+    #[allow(dead_code)]
+    pub fn clear_acceptance_history(&mut self, change_id: &str) {
+        self.acceptance_history.clear(change_id);
+    }
+
+    /// Run acceptance command for the given change ID with output streaming.
+    /// Returns a child process handle, a receiver for output lines, and a start time.
+    /// The caller is responsible for recording the attempt after the child completes
+    /// by calling `record_acceptance_attempt()`.
+    ///
+    /// The prompt is constructed as: system_prompt + user_prompt + history_context
+    /// - system_prompt: ACCEPTANCE_SYSTEM_PROMPT constant (always included)
+    /// - user_prompt: from config.acceptance_prompt (user-customizable)
+    /// - history_context: previous acceptance attempts (if any)
+    pub async fn run_acceptance_streaming(
+        &self,
+        change_id: &str,
+        cwd: Option<&Path>,
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
+        let start = Instant::now();
+        let template = self.config.get_acceptance_command();
+        let user_prompt = self.config.get_acceptance_prompt();
+        let history_context = self.acceptance_history.format_context(change_id);
+
+        // Build full prompt: system_prompt + user_prompt + history_context
+        let full_prompt = build_acceptance_prompt(user_prompt, &history_context);
+
+        let command = OrchestratorConfig::expand_change_id(template, change_id);
+        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        info!(
+            module = module_path!(),
+            "Running acceptance command: {}", command
+        );
+        let (child, rx) = match cwd {
+            Some(dir) => {
+                self.execute_shell_command_streaming_in_dir(&command, dir)
+                    .await?
+            }
+            None => self.execute_shell_command_streaming(&command).await?,
+        };
+        Ok((child, rx, start))
+    }
+
+    /// Record an acceptance attempt after streaming execution completes.
+    /// Call this after `run_acceptance_streaming()` child process finishes.
+    pub fn record_acceptance_attempt(&mut self, change_id: &str, attempt: AcceptanceAttempt) {
+        self.acceptance_history.record(change_id, attempt);
+    }
+
+    /// Get the next acceptance attempt number for a change.
+    pub fn next_acceptance_attempt_number(&self, change_id: &str) -> u32 {
+        self.acceptance_history.count(change_id) + 1
     }
 
     /// Run archive command for the given change ID (blocking, no streaming)
@@ -1120,6 +1183,31 @@ pub fn build_apply_prompt(user_prompt: &str, history_context: &str) -> String {
 /// Format: user_prompt + history_context
 pub fn build_archive_prompt(user_prompt: &str, history_context: &str) -> String {
     let mut parts = Vec::new();
+
+    if !user_prompt.is_empty() {
+        parts.push(user_prompt.to_string());
+    }
+
+    if !history_context.is_empty() {
+        parts.push(history_context.to_string());
+    }
+
+    parts.join("\n\n")
+}
+
+/// Build acceptance prompt from user prompt and history context
+///
+/// The prompt is constructed as:
+/// 1. ACCEPTANCE_SYSTEM_PROMPT (always included)
+/// 2. user_prompt (if not empty)
+/// 3. history_context (if not empty)
+///
+/// Parts are joined with double newlines.
+pub fn build_acceptance_prompt(user_prompt: &str, history_context: &str) -> String {
+    let mut parts = Vec::new();
+
+    // System prompt is always included first
+    parts.push(ACCEPTANCE_SYSTEM_PROMPT.to_string());
 
     if !user_prompt.is_empty() {
         parts.push(user_prompt.to_string());
