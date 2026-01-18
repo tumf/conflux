@@ -6,8 +6,8 @@ use crate::execution::apply::{check_task_progress, create_progress_commit, is_pr
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::{
-    apply_change, archive_change, selection, ApplyContext, ApplyResult, ArchiveContext,
-    ArchiveResult, LogOutputHandler,
+    acceptance_test_streaming, apply_change, archive_change, selection, AcceptanceResult,
+    ApplyContext, ApplyResult, ArchiveContext, ArchiveResult, LogOutputHandler,
 };
 use crate::parallel_run_service::ParallelRunService;
 use crate::progress::ProgressDisplay;
@@ -407,6 +407,9 @@ impl Orchestrator {
                         self.changes_processed += 1;
                         let new_remaining = remaining_changes - 1;
 
+                        // Clear acceptance history after successful archive
+                        self.agent.clear_acceptance_history(&next.id);
+
                         // Run on_change_end hook (not included in shared archive_change)
                         let change_end_context = HookContext::new(
                             self.changes_processed,
@@ -514,6 +517,45 @@ impl Orchestrator {
                             let _ = self
                                 .squash_serial_wip_commits(&next.id, new_apply_count)
                                 .await;
+
+                            // Run acceptance test after apply completion
+                            info!("Tasks complete for {}, running acceptance test...", next.id);
+                            let output = LogOutputHandler::new();
+                            let cancel_check = || false; // No cancellation in CLI mode
+
+                            match acceptance_test_streaming(
+                                &next,
+                                &mut self.agent,
+                                &output,
+                                cancel_check,
+                            )
+                            .await
+                            {
+                                Ok(AcceptanceResult::Pass) => {
+                                    info!("Acceptance passed for {}, ready for archive", next.id);
+                                    // Change will be archived in next iteration
+                                }
+                                Ok(AcceptanceResult::Fail { findings }) => {
+                                    warn!(
+                                        "Acceptance failed for {} with {} findings, will retry apply",
+                                        next.id,
+                                        findings.len()
+                                    );
+                                    // Change will be selected again for apply in next iteration
+                                }
+                                Ok(AcceptanceResult::CommandFailed { error }) => {
+                                    error!("Acceptance command failed for {}: {}", next.id, error);
+                                    // Change will be selected again for apply in next iteration
+                                }
+                                Ok(AcceptanceResult::Cancelled) => {
+                                    info!("Acceptance cancelled for {}", next.id);
+                                    return Ok(());
+                                }
+                                Err(e) => {
+                                    error!("Acceptance error for {}: {}", next.id, e);
+                                    return Err(e);
+                                }
+                            }
                         }
 
                         if let Some(progress) = &mut self.progress {

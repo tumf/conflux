@@ -1284,6 +1284,195 @@ pub async fn execute_archive_in_workspace(
     Ok(revision)
 }
 
+/// Execute acceptance test in a workspace with streaming output
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_acceptance_in_workspace(
+    change_id: &str,
+    workspace_path: &Path,
+    agent: &mut AgentRunner,
+    event_tx: Option<mpsc::Sender<ParallelEvent>>,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<crate::orchestration::AcceptanceResult> {
+    use crate::acceptance::{parse_acceptance_output, AcceptanceResult as ParseResult};
+
+    if cancel_token.is_some_and(|token| token.is_cancelled()) {
+        return Ok(crate::orchestration::AcceptanceResult::Cancelled);
+    }
+
+    info!("Running acceptance test for {} in workspace", change_id);
+
+    // Send AcceptanceStarted event
+    if let Some(ref tx) = event_tx {
+        let _ = tx
+            .send(ParallelEvent::Log(
+                crate::events::LogEntry::info(format!("Running acceptance test: {}", change_id))
+                    .with_change_id(change_id)
+                    .with_operation("acceptance"),
+            ))
+            .await;
+    }
+
+    // Execute acceptance command with streaming (in workspace directory)
+    let (mut child, mut output_rx, start_time) = agent
+        .run_acceptance_streaming(change_id, Some(workspace_path))
+        .await?;
+
+    // Create output collector for history
+    let mut output_collector = crate::history::OutputCollector::new();
+    let mut full_stdout = String::new();
+
+    // Stream output until channel closes
+    while let Some(line) = output_rx.recv().await {
+        // Check for cancellation
+        if cancel_token.is_some_and(|token| token.is_cancelled()) {
+            warn!("Acceptance test cancelled for: {}", change_id);
+            let _ = child.terminate();
+            return Ok(crate::orchestration::AcceptanceResult::Cancelled);
+        }
+
+        match line {
+            OutputLine::Stdout(s) => {
+                output_collector.add_stdout(&s);
+                full_stdout.push_str(&s);
+                full_stdout.push('\n');
+
+                // Forward to event channel
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::Log(
+                            crate::events::LogEntry::info(&s)
+                                .with_change_id(change_id)
+                                .with_operation("acceptance"),
+                        ))
+                        .await;
+                }
+            }
+            OutputLine::Stderr(s) => {
+                output_collector.add_stderr(&s);
+
+                // Forward to event channel
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::Log(
+                            crate::events::LogEntry::warn(&s)
+                                .with_change_id(change_id)
+                                .with_operation("acceptance"),
+                        ))
+                        .await;
+                }
+            }
+        }
+    }
+
+    // Wait for child process to complete
+    let status = child.wait().await.map_err(|e| {
+        OrchestratorError::AgentCommand(format!(
+            "Failed to wait for acceptance command for change '{}' in workspace '{}': {}",
+            change_id,
+            workspace_path.display(),
+            e
+        ))
+    })?;
+
+    // Record attempt
+    let stdout_tail = output_collector.stdout_tail();
+    let stderr_tail = output_collector.stderr_tail();
+
+    // Parse acceptance output
+    let parse_result = parse_acceptance_output(&full_stdout);
+
+    // Check if command failed
+    if !status.success() {
+        let error_msg = format!(
+            "Acceptance command failed with exit code: {:?}",
+            status.code()
+        );
+        let attempt = crate::history::AcceptanceAttempt {
+            attempt: agent.next_acceptance_attempt_number(change_id),
+            passed: false,
+            duration: start_time.elapsed(),
+            findings: Some(vec![error_msg.clone()]),
+            exit_code: status.code(),
+            stdout_tail,
+            stderr_tail,
+        };
+        agent.record_acceptance_attempt(change_id, attempt);
+
+        if let Some(ref tx) = event_tx {
+            let _ = tx
+                .send(ParallelEvent::Log(
+                    crate::events::LogEntry::error(&error_msg)
+                        .with_change_id(change_id)
+                        .with_operation("acceptance"),
+                ))
+                .await;
+        }
+
+        return Ok(crate::orchestration::AcceptanceResult::CommandFailed { error: error_msg });
+    }
+
+    // Process parsed result
+    match parse_result {
+        ParseResult::Pass => {
+            info!("Acceptance passed for: {}", change_id);
+            let attempt = crate::history::AcceptanceAttempt {
+                attempt: agent.next_acceptance_attempt_number(change_id),
+                passed: true,
+                duration: start_time.elapsed(),
+                findings: None,
+                exit_code: status.code(),
+                stdout_tail,
+                stderr_tail: stderr_tail.clone(),
+            };
+            agent.record_acceptance_attempt(change_id, attempt);
+
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::Log(
+                        crate::events::LogEntry::info("Acceptance test passed")
+                            .with_change_id(change_id)
+                            .with_operation("acceptance"),
+                    ))
+                    .await;
+            }
+
+            Ok(crate::orchestration::AcceptanceResult::Pass)
+        }
+        ParseResult::Fail { findings } => {
+            info!(
+                "Acceptance failed for: {} with {} findings",
+                change_id,
+                findings.len()
+            );
+            let attempt = crate::history::AcceptanceAttempt {
+                attempt: agent.next_acceptance_attempt_number(change_id),
+                passed: false,
+                duration: start_time.elapsed(),
+                findings: Some(findings.clone()),
+                exit_code: status.code(),
+                stdout_tail,
+                stderr_tail,
+            };
+            agent.record_acceptance_attempt(change_id, attempt);
+
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::Log(
+                        crate::events::LogEntry::warn(format!(
+                            "Acceptance test failed with {} findings",
+                            findings.len()
+                        ))
+                        .with_change_id(change_id)
+                        .with_operation("acceptance"),
+                    ))
+                    .await;
+            }
+
+            Ok(crate::orchestration::AcceptanceResult::Fail { findings })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::task_parser::TaskProgress;
