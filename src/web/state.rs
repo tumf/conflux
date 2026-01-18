@@ -360,6 +360,7 @@ impl WebState {
                     changes,
                     committed_change_ids,
                     worktree_change_ids,
+                    worktree_paths: _,
                 } => {
                     // Update changes with new data
                     let mut new_change_statuses: Vec<ChangeStatus> =
@@ -1005,7 +1006,7 @@ mod tests {
             .await;
 
         // Send ChangesRefreshed with 0/0 (retrieval failure)
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
         web_state
             .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
                 changes: vec![Change {
@@ -1018,6 +1019,7 @@ mod tests {
                 }],
                 committed_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
+                worktree_paths: HashMap::new(),
             })
             .await;
 
@@ -1039,12 +1041,13 @@ mod tests {
         let web_state = WebState::new(&initial);
 
         // Send ChangesRefreshed with valid data
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
         web_state
             .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
                 changes: vec![create_test_change("change-a", 9, 12)],
                 committed_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
+                worktree_paths: HashMap::new(),
             })
             .await;
 

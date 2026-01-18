@@ -256,7 +256,24 @@ async fn run_tui_loop(
             }
         };
 
+    // Collect initial worktree paths for all changes
+    let mut initial_worktree_paths = std::collections::HashMap::new();
+    for change in &initial_changes {
+        match crate::vcs::git::get_worktree_path_for_change(&repo_root, &change.id).await {
+            Ok(Some(wt_path)) => {
+                initial_worktree_paths.insert(change.id.clone(), wt_path);
+            }
+            Ok(None) => {
+                // No worktree for this change
+            }
+            Err(e) => {
+                debug!("Failed to get worktree path for {}: {}", change.id, e);
+            }
+        }
+    }
+
     let mut app = AppState::new(initial_changes);
+    app.worktree_paths = initial_worktree_paths;
     let git_dir_exists = crate::cli::check_git_directory();
     let parallel_available = crate::cli::check_parallel_available();
     let mut parallel_mode = config.resolve_parallel_mode(false, git_dir_exists);
@@ -319,6 +336,9 @@ async fn run_tui_loop(
                                     }
                                 };
 
+                            // Collect worktree paths for all changes
+                            let mut worktree_paths = std::collections::HashMap::new();
+
                             // Enrich progress from worktrees (uncommitted tasks.md)
                             for change in &mut changes {
                                 match crate::vcs::git::get_worktree_path_for_change(
@@ -326,6 +346,8 @@ async fn run_tui_loop(
                                     &change.id
                                 ).await {
                                     Ok(Some(wt_path)) => {
+                                        // Store the worktree path for this change
+                                        worktree_paths.insert(change.id.clone(), wt_path.clone());
                                         // Try active change location first
                                         match crate::task_parser::parse_change_with_worktree_fallback(
                                             &change.id,
@@ -369,6 +391,7 @@ async fn run_tui_loop(
                                     changes,
                                     committed_change_ids,
                                     worktree_change_ids,
+                                    worktree_paths,
                                 })
                                 .await
                                 .is_err()
