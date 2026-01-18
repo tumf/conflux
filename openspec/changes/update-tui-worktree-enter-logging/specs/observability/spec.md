@@ -1,4 +1,4 @@
-## NEW Requirements
+## ADDED Requirements
 ### Requirement: REQ-OBS-005 TUI Input Rejection Logging
 
 The orchestrator MUST log warning messages when user input is ignored in the TUI to help users understand why their actions had no effect.
