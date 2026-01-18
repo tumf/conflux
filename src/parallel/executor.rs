@@ -11,8 +11,9 @@ use crate::vcs::git::commands as git_commands;
 use crate::vcs::VcsBackend;
 use std::path::Path;
 use std::process::Stdio as StdStdio;
+use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -331,6 +332,7 @@ pub async fn execute_apply_in_workspace(
     cancel_token: Option<&CancellationToken>,
     ai_runner: &AiCommandRunner,
     repo_root: &Path,
+    apply_history: &Arc<Mutex<crate::history::ApplyHistory>>,
 ) -> Result<String> {
     const MAX_ITERATIONS: u32 = 50;
     let mut iteration = 0;
@@ -498,9 +500,13 @@ pub async fn execute_apply_in_workspace(
             }
         }
 
-        // Build prompt with system instructions
+        // Build prompt with system instructions and history context
         let user_prompt = config.get_apply_prompt();
-        let full_prompt = build_apply_prompt(user_prompt, ""); // No history in parallel mode
+        let history_context = {
+            let history = apply_history.lock().await;
+            history.format_context(change_id)
+        };
+        let full_prompt = build_apply_prompt(user_prompt, &history_context);
 
         // Expand change_id and prompt in command
         let command = OrchestratorConfig::expand_change_id(apply_cmd_template, change_id);
@@ -508,6 +514,9 @@ pub async fn execute_apply_in_workspace(
 
         debug!("Workspace path: {:?}", workspace_path);
         debug!("Apply command: {}", command);
+
+        // Capture start time for history recording
+        let start = std::time::Instant::now();
 
         // Execute command via AiCommandRunner (with stagger and retry)
         // Execute in workspace directory (cwd parameter)
@@ -555,6 +564,23 @@ pub async fn execute_apply_in_workspace(
                 e
             ))
         })?;
+
+        // Record apply attempt in history
+        {
+            let mut history = apply_history.lock().await;
+            let attempt = crate::history::ApplyAttempt {
+                attempt: history.count(change_id) + 1,
+                success: status.success(),
+                duration: start.elapsed(),
+                error: if status.success() {
+                    None
+                } else {
+                    Some(format!("Exit code: {:?}", status.code()))
+                },
+                exit_code: status.code(),
+            };
+            history.record(change_id, attempt);
+        }
 
         if !status.success() {
             return Err(OrchestratorError::AgentCommand(format!(
@@ -803,6 +829,8 @@ pub async fn execute_archive_in_workspace(
     parallel_ctx: Option<&ParallelHookContext>,
     cancel_token: Option<&CancellationToken>,
     ai_runner: &AiCommandRunner,
+    archive_history: &Arc<Mutex<crate::history::ArchiveHistory>>,
+    apply_history: &Arc<Mutex<crate::history::ApplyHistory>>,
 ) -> Result<String> {
     if cancel_token.is_some_and(|token| token.is_cancelled()) {
         return Err(OrchestratorError::AgentCommand(format!(
@@ -902,9 +930,17 @@ pub async fn execute_archive_in_workspace(
         }
     }
 
+    // Build prompt with history context
+    let user_prompt = config.get_archive_prompt();
+    let history_context = {
+        let history = archive_history.lock().await;
+        history.format_context(change_id)
+    };
+    let full_prompt = crate::agent::build_archive_prompt(user_prompt, &history_context);
+
     // Expand change_id and prompt in archive command
     let command = OrchestratorConfig::expand_change_id(archive_cmd_template, change_id);
-    let command = OrchestratorConfig::expand_prompt(&command, config.get_archive_prompt());
+    let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
 
     debug!("Archive command in workspace: {}", command);
 
@@ -933,6 +969,7 @@ pub async fn execute_archive_in_workspace(
 
     loop {
         attempt += 1;
+        let start = std::time::Instant::now();
 
         // Execute command via AiCommandRunner (with stagger and retry)
         // Execute in workspace directory (cwd parameter)
@@ -1022,6 +1059,35 @@ pub async fn execute_archive_in_workspace(
         }
 
         let verification = verify_archive_completion(change_id, Some(workspace_path));
+
+        // Record archive attempt in history
+        {
+            let mut history = archive_history.lock().await;
+            let verification_result = if verification.is_success() {
+                None
+            } else {
+                Some(format!(
+                    "Change still exists at openspec/changes/{}",
+                    change_id
+                ))
+            };
+            let attempt_record = crate::history::ArchiveAttempt {
+                attempt: history.count(change_id) + 1,
+                success: status.success() && verification.is_success(),
+                duration: start.elapsed(),
+                error: if status.success() && verification.is_success() {
+                    None
+                } else if !status.success() {
+                    Some(format!("Exit code: {:?}", status.code()))
+                } else {
+                    Some("Archive command succeeded but verification failed".to_string())
+                },
+                verification_result,
+                exit_code: status.code(),
+            };
+            history.record(change_id, attempt_record);
+        }
+
         if verification.is_success() {
             break;
         }
@@ -1170,6 +1236,14 @@ pub async fn execute_archive_in_workspace(
                 return Err(e);
             }
         }
+    }
+
+    // Clear history after successful archive
+    {
+        let mut apply_hist = apply_history.lock().await;
+        apply_hist.clear(change_id);
+        let mut archive_hist = archive_history.lock().await;
+        archive_hist.clear(change_id);
     }
 
     Ok(revision)
