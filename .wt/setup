@@ -6,6 +6,15 @@ echo "Root worktree: $ROOT_WORKTREE_PATH"
 echo "Creating test marker file..."
 touch .setup-completed
 
+echo "Copying Serena cache into worktree..."
+if [ -d "${ROOT_WORKTREE_PATH}/.serena/cache" ]; then
+  mkdir -p .serena
+  rm -rf .serena/cache
+  cp -R "${ROOT_WORKTREE_PATH}/.serena/cache" .serena/cache
+else
+  echo "Serena cache not found at ${ROOT_WORKTREE_PATH}/.serena/cache; skipping copy" 1>&2
+fi
+
 hooks_dir="$(git rev-parse --git-dir 2>/dev/null)/hooks"
 if [ -n "$hooks_dir" ]; then
   case "$hooks_dir" in
