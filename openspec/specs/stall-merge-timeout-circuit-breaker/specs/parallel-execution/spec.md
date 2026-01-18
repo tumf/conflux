@@ -50,9 +50,10 @@ The system SHALL distinguish between successful completion, completion with erro
 **And** should display "Processing completed with errors" warning message
 **And** should NOT display "All changes processed successfully" message
 
-#### Scenario: merge 停滞による停止では成功完了を送信しない
-- **GIVEN** parallel 実行中である
-- **AND** merge 停滞が検出されてキャンセルが発火する
-- **WHEN** 実行ループが停止する
-- **THEN** `OrchestratorEvent::AllCompleted` は送信しない
-- **AND** 停止理由として merge 停滞がログに記録される
+#### Scenario: Stop due to merge stall does not send successful completion
+
+- **GIVEN** parallel execution is running
+- **AND** merge stall is detected and cancellation is triggered
+- **WHEN** the execution loop stops
+- **THEN** `OrchestratorEvent::AllCompleted` is NOT sent
+- **AND** the merge stall reason is logged as the stop reason

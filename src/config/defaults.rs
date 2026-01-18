@@ -138,6 +138,15 @@ pub const DEFAULT_ERROR_CIRCUIT_BREAKER_THRESHOLD: usize = 5;
 /// Default maximum number of acceptance CONTINUE retries before treating as FAIL
 pub const DEFAULT_ACCEPTANCE_MAX_CONTINUES: u32 = 2;
 
+/// Default enablement for merge stall detection
+pub const DEFAULT_MERGE_STALL_DETECTION_ENABLED: bool = true;
+
+/// Default threshold for merge stall detection (minutes)
+pub const DEFAULT_MERGE_STALL_THRESHOLD_MINUTES: u64 = 30;
+
+/// Default check interval for merge stall detection (seconds)
+pub const DEFAULT_MERGE_STALL_CHECK_INTERVAL_SECONDS: u64 = 60;
+
 /// Generates a project slug from the repository root path.
 /// Format: `{repo_basename}-{hash8}` where hash8 is the first 8 chars of the SHA256 hash
 /// of the absolute repository path.

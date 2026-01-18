@@ -48,6 +48,18 @@ fn default_error_circuit_breaker_threshold() -> usize {
     DEFAULT_ERROR_CIRCUIT_BREAKER_THRESHOLD
 }
 
+fn default_merge_stall_detection_enabled() -> bool {
+    defaults::DEFAULT_MERGE_STALL_DETECTION_ENABLED
+}
+
+fn default_merge_stall_threshold_minutes() -> u64 {
+    defaults::DEFAULT_MERGE_STALL_THRESHOLD_MINUTES
+}
+
+fn default_merge_stall_check_interval_seconds() -> u64 {
+    defaults::DEFAULT_MERGE_STALL_CHECK_INTERVAL_SECONDS
+}
+
 /// Logging configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoggingConfig {
@@ -109,6 +121,30 @@ impl Default for StallDetectionConfig {
     }
 }
 
+/// Merge stall detection configuration for monitoring merge progress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MergeStallDetectionConfig {
+    /// Enable merge stall detection based on merge commit inactivity.
+    #[serde(default = "default_merge_stall_detection_enabled")]
+    pub enabled: bool,
+    /// Threshold in minutes for merge inactivity before triggering stall.
+    #[serde(default = "default_merge_stall_threshold_minutes")]
+    pub threshold_minutes: u64,
+    /// Check interval in seconds for monitoring merge progress.
+    #[serde(default = "default_merge_stall_check_interval_seconds")]
+    pub check_interval_seconds: u64,
+}
+
+impl Default for MergeStallDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: defaults::DEFAULT_MERGE_STALL_DETECTION_ENABLED,
+            threshold_minutes: defaults::DEFAULT_MERGE_STALL_THRESHOLD_MINUTES,
+            check_interval_seconds: defaults::DEFAULT_MERGE_STALL_CHECK_INTERVAL_SECONDS,
+        }
+    }
+}
+
 /// Orchestrator configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OrchestratorConfig {
@@ -163,6 +199,10 @@ pub struct OrchestratorConfig {
     /// Error circuit breaker configuration (same error detection).
     #[serde(default)]
     pub error_circuit_breaker: Option<ErrorCircuitBreakerConfig>,
+
+    /// Merge stall detection configuration (merge commit inactivity).
+    #[serde(default)]
+    pub merge_stall_detection: Option<MergeStallDetectionConfig>,
 
     /// Delay between completion check retries in milliseconds.
     /// Default: 500ms
@@ -328,6 +368,11 @@ impl OrchestratorConfig {
     /// Get error circuit breaker configuration, returning defaults if not set.
     pub fn get_error_circuit_breaker(&self) -> ErrorCircuitBreakerConfig {
         self.error_circuit_breaker.clone().unwrap_or_default()
+    }
+
+    /// Get merge stall detection configuration, returning defaults if not set.
+    pub fn get_merge_stall_detection(&self) -> MergeStallDetectionConfig {
+        self.merge_stall_detection.clone().unwrap_or_default()
     }
 
     /// Get the maximum iterations limit.
@@ -1314,5 +1359,42 @@ mod tests {
         let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
         assert_eq!(config.acceptance_max_continues, Some(5));
         assert_eq!(config.get_acceptance_max_continues(), 5);
+    }
+
+    #[test]
+    fn test_merge_stall_detection_defaults() {
+        let config = OrchestratorConfig::default();
+        let merge_stall = config.get_merge_stall_detection();
+        assert!(merge_stall.enabled);
+        assert_eq!(merge_stall.threshold_minutes, 30);
+        assert_eq!(merge_stall.check_interval_seconds, 60);
+    }
+
+    #[test]
+    fn test_parse_merge_stall_detection_config() {
+        let jsonc = r#"{
+            "merge_stall_detection": {
+                "enabled": true,
+                "threshold_minutes": 30,
+                "check_interval_seconds": 60
+            }
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        let merge_stall = config.get_merge_stall_detection();
+        assert!(merge_stall.enabled);
+        assert_eq!(merge_stall.threshold_minutes, 30);
+        assert_eq!(merge_stall.check_interval_seconds, 60);
+    }
+
+    #[test]
+    fn test_parse_merge_stall_detection_disabled() {
+        let jsonc = r#"{
+            "merge_stall_detection": {
+                "enabled": false
+            }
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        let merge_stall = config.get_merge_stall_detection();
+        assert!(!merge_stall.enabled);
     }
 }

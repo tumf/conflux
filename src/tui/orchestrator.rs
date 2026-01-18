@@ -846,6 +846,9 @@ pub async fn run_orchestrator(
                     })
                     .await;
 
+                // Get the acceptance iteration number (attempt number that will be used)
+                let acceptance_iteration = agent.next_acceptance_attempt_number(&change_id);
+
                 // Create output handler that forwards to TUI events
                 let tx_clone = tx.clone();
                 let change_id_clone = change_id.clone();
@@ -859,7 +862,8 @@ pub async fn run_orchestrator(
                                     .send(OrchestratorEvent::Log(
                                         LogEntry::info(s)
                                             .with_change_id(&change_id)
-                                            .with_operation("acceptance"),
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
                                     ))
                                     .await;
                             }
@@ -868,7 +872,8 @@ pub async fn run_orchestrator(
                                     .send(OrchestratorEvent::Log(
                                         LogEntry::warn(s)
                                             .with_change_id(&change_id)
-                                            .with_operation("acceptance"),
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
                                     ))
                                     .await;
                             }
@@ -877,7 +882,8 @@ pub async fn run_orchestrator(
                                     .send(OrchestratorEvent::Log(
                                         LogEntry::info(s)
                                             .with_change_id(&change_id)
-                                            .with_operation("acceptance"),
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
                                     ))
                                     .await;
                             }
@@ -886,7 +892,8 @@ pub async fn run_orchestrator(
                                     .send(OrchestratorEvent::Log(
                                         LogEntry::warn(s)
                                             .with_change_id(&change_id)
-                                            .with_operation("acceptance"),
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
                                     ))
                                     .await;
                             }
@@ -895,7 +902,8 @@ pub async fn run_orchestrator(
                                     .send(OrchestratorEvent::Log(
                                         LogEntry::error(s)
                                             .with_change_id(&change_id)
-                                            .with_operation("acceptance"),
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
                                     ))
                                     .await;
                             }
@@ -904,7 +912,8 @@ pub async fn run_orchestrator(
                                     .send(OrchestratorEvent::Log(
                                         LogEntry::success(s)
                                             .with_change_id(&change_id)
-                                            .with_operation("acceptance"),
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
                                     ))
                                     .await;
                             }
