@@ -6,6 +6,77 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Default number of tail lines to capture from stdout/stderr
+const DEFAULT_TAIL_LINES: usize = 50;
+
+/// Collects stdout/stderr output and captures the last N lines as a summary.
+#[derive(Debug, Clone)]
+pub struct OutputCollector {
+    stdout_lines: Vec<String>,
+    stderr_lines: Vec<String>,
+    max_lines: usize,
+}
+
+impl OutputCollector {
+    /// Create a new OutputCollector with default tail line count.
+    pub fn new() -> Self {
+        Self::with_max_lines(DEFAULT_TAIL_LINES)
+    }
+
+    /// Create a new OutputCollector with a specified maximum tail line count.
+    pub fn with_max_lines(max_lines: usize) -> Self {
+        Self {
+            stdout_lines: Vec::new(),
+            stderr_lines: Vec::new(),
+            max_lines,
+        }
+    }
+
+    /// Add a stdout line to the collector.
+    pub fn add_stdout(&mut self, line: &str) {
+        self.stdout_lines.push(line.to_string());
+        // Keep only the last N lines to avoid unbounded memory growth
+        if self.stdout_lines.len() > self.max_lines {
+            self.stdout_lines.remove(0);
+        }
+    }
+
+    /// Add a stderr line to the collector.
+    pub fn add_stderr(&mut self, line: &str) {
+        self.stderr_lines.push(line.to_string());
+        // Keep only the last N lines to avoid unbounded memory growth
+        if self.stderr_lines.len() > self.max_lines {
+            self.stderr_lines.remove(0);
+        }
+    }
+
+    /// Get the stdout tail summary as a single string.
+    /// Returns None if no stdout was captured.
+    pub fn stdout_tail(&self) -> Option<String> {
+        if self.stdout_lines.is_empty() {
+            None
+        } else {
+            Some(self.stdout_lines.join("\n"))
+        }
+    }
+
+    /// Get the stderr tail summary as a single string.
+    /// Returns None if no stderr was captured.
+    pub fn stderr_tail(&self) -> Option<String> {
+        if self.stderr_lines.is_empty() {
+            None
+        } else {
+            Some(self.stderr_lines.join("\n"))
+        }
+    }
+}
+
+impl Default for OutputCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Summary of a single apply attempt
 #[derive(Debug, Clone)]
 pub struct ApplyAttempt {
@@ -19,6 +90,10 @@ pub struct ApplyAttempt {
     pub error: Option<String>,
     /// Exit code if available
     pub exit_code: Option<i32>,
+    /// Last N lines of stdout (tail summary)
+    pub stdout_tail: Option<String>,
+    /// Last N lines of stderr (tail summary)
+    pub stderr_tail: Option<String>,
 }
 
 /// Tracks apply attempts per change
@@ -92,10 +167,24 @@ impl ApplyHistory {
                     Some(code) => format!("\nexit_code: {}", code),
                     None => String::new(),
                 };
+                let stdout_line = match &a.stdout_tail {
+                    Some(s) if !s.is_empty() => format!("\nstdout_tail:\n{}", s),
+                    _ => String::new(),
+                };
+                let stderr_line = match &a.stderr_tail {
+                    Some(s) if !s.is_empty() => format!("\nstderr_tail:\n{}", s),
+                    _ => String::new(),
+                };
 
                 format!(
-                    "<last_apply attempt=\"{}\">\nstatus: {}\nduration: {}s{}{}\n</last_apply>",
-                    a.attempt, status, duration_secs, error_line, exit_code_line
+                    "<last_apply attempt=\"{}\">\nstatus: {}\nduration: {}s{}{}{}{}\n</last_apply>",
+                    a.attempt,
+                    status,
+                    duration_secs,
+                    error_line,
+                    exit_code_line,
+                    stdout_line,
+                    stderr_line
                 )
             })
             .collect::<Vec<_>>()
@@ -124,6 +213,10 @@ pub struct ArchiveAttempt {
     pub verification_result: Option<String>,
     /// Exit code if available
     pub exit_code: Option<i32>,
+    /// Last N lines of stdout (tail summary)
+    pub stdout_tail: Option<String>,
+    /// Last N lines of stderr (tail summary)
+    pub stderr_tail: Option<String>,
 }
 
 /// Tracks archive attempts per change
@@ -195,10 +288,18 @@ impl ArchiveHistory {
                     Some(code) => format!("\nexit_code: {}", code),
                     None => String::new(),
                 };
+                let stdout_line = match &a.stdout_tail {
+                    Some(s) if !s.is_empty() => format!("\nstdout_tail:\n{}", s),
+                    _ => String::new(),
+                };
+                let stderr_line = match &a.stderr_tail {
+                    Some(s) if !s.is_empty() => format!("\nstderr_tail:\n{}", s),
+                    _ => String::new(),
+                };
 
                 format!(
-                    "<last_archive attempt=\"{}\">\nstatus: {}\nduration: {}s{}{}{}\n</last_archive>",
-                    a.attempt, status, duration_secs, error_line, verification_line, exit_code_line
+                    "<last_archive attempt=\"{}\">\nstatus: {}\nduration: {}s{}{}{}{}{}\n</last_archive>",
+                    a.attempt, status, duration_secs, error_line, verification_line, exit_code_line, stdout_line, stderr_line
                 )
             })
             .collect::<Vec<_>>()
@@ -227,6 +328,10 @@ pub struct ResolveAttempt {
     pub continuation_reason: Option<String>,
     /// Exit code if available
     pub exit_code: Option<i32>,
+    /// Last N lines of stdout (tail summary)
+    pub stdout_tail: Option<String>,
+    /// Last N lines of stderr (tail summary)
+    pub stderr_tail: Option<String>,
 }
 
 /// Tracks resolve attempts within a single retry session
@@ -292,6 +397,18 @@ impl ResolveContext {
                 lines.push(format!("- Reason: {}", reason));
             }
             lines.push(format!("- Duration: {}s", duration_secs));
+            if let Some(stdout) = &attempt.stdout_tail {
+                if !stdout.is_empty() {
+                    lines.push("- Stdout tail:".to_string());
+                    lines.push(format!("  {}", stdout.replace('\n', "\n  ")));
+                }
+            }
+            if let Some(stderr) = &attempt.stderr_tail {
+                if !stderr.is_empty() {
+                    lines.push("- Stderr tail:".to_string());
+                    lines.push(format!("  {}", stderr.replace('\n', "\n  ")));
+                }
+            }
             lines.push(String::new());
         }
 
@@ -325,6 +442,8 @@ mod tests {
                 Some("Test error".to_string())
             },
             exit_code: if success { Some(0) } else { Some(1) },
+            stdout_tail: None,
+            stderr_tail: None,
         }
     }
 
@@ -417,6 +536,8 @@ mod tests {
                 duration: Duration::from_secs(45),
                 error: Some("Type error in auth.rs:42".to_string()),
                 exit_code: Some(1),
+                stdout_tail: None,
+                stderr_tail: None,
             },
         );
 
@@ -441,6 +562,8 @@ mod tests {
                 duration: Duration::from_secs(30),
                 error: None,
                 exit_code: Some(0),
+                stdout_tail: None,
+                stderr_tail: None,
             },
         );
 
@@ -462,6 +585,8 @@ mod tests {
                 duration: Duration::from_secs(30),
                 error: Some("Missing dependency".to_string()),
                 exit_code: Some(1),
+                stdout_tail: None,
+                stderr_tail: None,
             },
         );
         history.record(
@@ -472,6 +597,8 @@ mod tests {
                 duration: Duration::from_secs(45),
                 error: Some("Type error".to_string()),
                 exit_code: Some(1),
+                stdout_tail: None,
+                stderr_tail: None,
             },
         );
 
@@ -514,6 +641,8 @@ mod tests {
             },
             verification_result,
             exit_code: if success { Some(0) } else { Some(1) },
+            stdout_tail: None,
+            stderr_tail: None,
         }
     }
 
@@ -601,6 +730,8 @@ mod tests {
                     "Change still exists at openspec/changes/my-change".to_string(),
                 ),
                 exit_code: Some(0),
+                stdout_tail: None,
+                stderr_tail: None,
             },
         );
 
@@ -627,6 +758,8 @@ mod tests {
                 error: Some("Verification failed".to_string()),
                 verification_result: Some("Change not moved".to_string()),
                 exit_code: Some(0),
+                stdout_tail: None,
+                stderr_tail: None,
             },
         );
         history.record(
@@ -638,6 +771,8 @@ mod tests {
                 error: Some("Still not archived".to_string()),
                 verification_result: Some("Change still exists".to_string()),
                 exit_code: Some(0),
+                stdout_tail: None,
+                stderr_tail: None,
             },
         );
 
@@ -677,6 +812,8 @@ mod tests {
                 "Conflicts still present after resolution attempt: src/main.rs".to_string(),
             ),
             exit_code: Some(0),
+            stdout_tail: None,
+            stderr_tail: None,
         });
 
         assert_eq!(context.current_attempt(), 2);
@@ -696,6 +833,8 @@ mod tests {
                     .to_string(),
             ),
             exit_code: Some(0),
+            stdout_tail: None,
+            stderr_tail: None,
         });
 
         let formatted = context.format_continuation_context();
@@ -722,6 +861,8 @@ mod tests {
             duration: Duration::from_secs(30),
             continuation_reason: Some("Conflict markers remain".to_string()),
             exit_code: Some(0),
+            stdout_tail: None,
+            stderr_tail: None,
         });
 
         context.record(ResolveAttempt {
@@ -731,6 +872,8 @@ mod tests {
             duration: Duration::from_secs(40),
             continuation_reason: Some("MERGE_HEAD still exists".to_string()),
             exit_code: Some(0),
+            stdout_tail: None,
+            stderr_tail: None,
         });
 
         let formatted = context.format_continuation_context();
@@ -740,5 +883,55 @@ mod tests {
         assert!(formatted.contains("Previous attempt (2):"));
         assert!(formatted.contains("Conflict markers remain"));
         assert!(formatted.contains("MERGE_HEAD still exists"));
+    }
+
+    // OutputCollector tests
+    #[test]
+    fn test_output_collector_new() {
+        let collector = OutputCollector::new();
+        assert!(collector.stdout_tail().is_none());
+        assert!(collector.stderr_tail().is_none());
+    }
+
+    #[test]
+    fn test_output_collector_add_stdout() {
+        let mut collector = OutputCollector::new();
+        collector.add_stdout("line 1");
+        collector.add_stdout("line 2");
+
+        let stdout = collector.stdout_tail().unwrap();
+        assert_eq!(stdout, "line 1\nline 2");
+    }
+
+    #[test]
+    fn test_output_collector_add_stderr() {
+        let mut collector = OutputCollector::new();
+        collector.add_stderr("error 1");
+        collector.add_stderr("error 2");
+
+        let stderr = collector.stderr_tail().unwrap();
+        assert_eq!(stderr, "error 1\nerror 2");
+    }
+
+    #[test]
+    fn test_output_collector_max_lines() {
+        let mut collector = OutputCollector::with_max_lines(3);
+        collector.add_stdout("line 1");
+        collector.add_stdout("line 2");
+        collector.add_stdout("line 3");
+        collector.add_stdout("line 4");
+        collector.add_stdout("line 5");
+
+        let stdout = collector.stdout_tail().unwrap();
+        assert_eq!(stdout, "line 3\nline 4\nline 5");
+        assert!(!stdout.contains("line 1"));
+        assert!(!stdout.contains("line 2"));
+    }
+
+    #[test]
+    fn test_output_collector_default() {
+        let collector = OutputCollector::default();
+        assert!(collector.stdout_tail().is_none());
+        assert!(collector.stderr_tail().is_none());
     }
 }

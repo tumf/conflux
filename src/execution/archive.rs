@@ -27,6 +27,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::agent::{AgentRunner, OutputLine};
 use crate::error::{OrchestratorError, Result};
+use crate::history::OutputCollector;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::task_parser;
 use crate::vcs::git::commands as git_commands;
@@ -789,8 +790,16 @@ where
             .run_archive_streaming(change_id, Some(workspace_path))
             .await?;
 
+        // Create output collector for history
+        let mut output_collector = OutputCollector::new();
+
         // Stream output
         while let Some(line) = rx.recv().await {
+            // Collect output for history
+            match &line {
+                OutputLine::Stdout(s) => output_collector.add_stdout(s),
+                OutputLine::Stderr(s) => output_collector.add_stderr(s),
+            }
             event_handler.on_archive_output(change_id, &line);
             output_handler(line).await;
         }
@@ -839,7 +848,14 @@ where
         } else {
             Some(build_archive_error_message(change_id, Some(workspace_path)))
         };
-        agent.record_archive_attempt(change_id, &status, start_time, verification_msg.clone());
+        agent.record_archive_attempt(
+            change_id,
+            &status,
+            start_time,
+            verification_msg.clone(),
+            output_collector.stdout_tail(),
+            output_collector.stderr_tail(),
+        );
 
         if !status.success() {
             let error_msg = format!(

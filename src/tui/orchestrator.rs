@@ -5,6 +5,7 @@
 use crate::agent::AgentRunner;
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
+use crate::history::OutputCollector;
 use crate::openspec::Change;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -130,6 +131,9 @@ pub async fn archive_single_change(
         let (mut child, mut output_rx, start) =
             agent.run_archive_streaming(change_id, None).await?;
 
+        // Create output collector for history
+        let mut output_collector = OutputCollector::new();
+
         // Stream output to TUI log, with cancellation support
         loop {
             tokio::select! {
@@ -147,6 +151,7 @@ pub async fn archive_single_change(
                     match line {
                         Some(OutputLine::Stdout(s)) => {
                             tracing::debug!("Archive stdout: {}", s);
+                            output_collector.add_stdout(&s);
                             let _ = tx.send(OrchestratorEvent::Log(
                                 LogEntry::info(s)
                                     .with_change_id(change_id)
@@ -155,6 +160,7 @@ pub async fn archive_single_change(
                         }
                         Some(OutputLine::Stderr(s)) => {
                             tracing::debug!("Archive stderr: {}", s);
+                            output_collector.add_stderr(&s);
                             let _ = tx.send(OrchestratorEvent::Log(
                                 LogEntry::warn(s)
                                     .with_change_id(change_id)
@@ -182,7 +188,14 @@ pub async fn archive_single_change(
             let error_msg = format!("Archive failed with exit code: {:?}", status.code());
 
             // Record the failed attempt
-            agent.record_archive_attempt(change_id, &status, start, Some(error_msg.clone()));
+            agent.record_archive_attempt(
+                change_id,
+                &status,
+                start,
+                Some(error_msg.clone()),
+                output_collector.stdout_tail(),
+                output_collector.stderr_tail(),
+            );
 
             // Run on_error hook
             let error_context = HookContext::new(
@@ -208,7 +221,14 @@ pub async fn archive_single_change(
         let verification = verify_archive_completion(change_id, None);
         if verification.is_success() {
             // Record successful archive attempt
-            agent.record_archive_attempt(change_id, &status, start, None);
+            agent.record_archive_attempt(
+                change_id,
+                &status,
+                start,
+                None,
+                output_collector.stdout_tail(),
+                output_collector.stderr_tail(),
+            );
             let log_tx = tx.clone();
             let commit_result = ensure_archive_commit(
                 change_id,
@@ -295,7 +315,14 @@ pub async fn archive_single_change(
             }
             _ => "Archive verification failed".to_string(),
         };
-        agent.record_archive_attempt(change_id, &status, start, Some(verification_reason.clone()));
+        agent.record_archive_attempt(
+            change_id,
+            &status,
+            start,
+            Some(verification_reason.clone()),
+            output_collector.stdout_tail(),
+            output_collector.stderr_tail(),
+        );
 
         if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
             let _ = tx
@@ -705,6 +732,9 @@ pub async fn run_orchestrator(
         let (mut child, mut output_rx, start_time) =
             agent.run_apply_streaming(&change_id, None).await?;
 
+        // Create output collector for history
+        let mut output_collector = OutputCollector::new();
+
         // Stream output to TUI log, with cancellation support
         loop {
             tokio::select! {
@@ -723,6 +753,7 @@ pub async fn run_orchestrator(
                 line = output_rx.recv() => {
                     match line {
                         Some(OutputLine::Stdout(s)) => {
+                            output_collector.add_stdout(&s);
                             let _ = tx.send(OrchestratorEvent::Log(
                                 LogEntry::info(s)
                                     .with_change_id(&change_id)
@@ -731,6 +762,7 @@ pub async fn run_orchestrator(
                             )).await;
                         }
                         Some(OutputLine::Stderr(s)) => {
+                            output_collector.add_stderr(&s);
                             let _ = tx.send(OrchestratorEvent::Log(
                                 LogEntry::warn(s)
                                     .with_change_id(&change_id)
@@ -758,7 +790,13 @@ pub async fn run_orchestrator(
         })?;
 
         // Record the apply attempt for history context in subsequent retries
-        agent.record_apply_attempt(&change_id, &status, start_time);
+        agent.record_apply_attempt(
+            &change_id,
+            &status,
+            start_time,
+            output_collector.stdout_tail(),
+            output_collector.stderr_tail(),
+        );
 
         if status.success() {
             // Run post_apply hook
