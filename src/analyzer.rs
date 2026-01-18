@@ -7,8 +7,8 @@ use crate::agent::{AgentRunner, OutputLine};
 use crate::error::{OrchestratorError, Result};
 use crate::openspec::Change;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
-use tracing::{debug, info, warn};
+use std::collections::{HashMap, HashSet};
+use tracing::{debug, info};
 
 /// A group of changes that can be executed in parallel
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,11 +25,14 @@ pub struct ParallelGroup {
 /// Result of parallelization analysis
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisResult {
-    /// Parallel execution groups
-    pub groups: Vec<ParallelGroup>,
+    /// Execution order (recommended execution sequence considering dependencies)
+    pub order: Vec<String>,
     /// Dependencies between changes (change_id -> list of dependencies)
     #[serde(default)]
     pub dependencies: HashMap<String, Vec<String>>,
+    /// Legacy groups field (deprecated, for backward compatibility)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub groups: Option<Vec<ParallelGroup>>,
 }
 
 /// Analyzer for determining parallel execution groups
@@ -136,15 +139,12 @@ impl ParallelizationAnalyzer {
             )));
         }
 
-        // Validate dependency graph (no circular dependencies)
-        self.validate_dependency_graph(&result.groups)?;
+        // Convert order-based result to group-based format for compatibility
+        let groups = self.order_to_groups(&result);
 
-        // Return groups in topological order
-        let sorted = self.topological_sort(result.groups)?;
+        info!("Analysis complete: {} groups identified", groups.len());
 
-        info!("Analysis complete: {} groups identified", sorted.len());
-
-        Ok(sorted)
+        Ok(groups)
     }
 
     /// Extract the result from stream-json output format
@@ -186,7 +186,7 @@ impl ParallelizationAnalyzer {
     ///
     /// Formats selected changes (with `is_approved = true`) as a list with:
     /// - `[x]` marker to indicate selection status
-    /// - Directory path for each change (e.g., `openspec/changes/{id}/`)
+    /// - Full proposal file path for each change (e.g., `openspec/changes/{id}/proposal.md`)
     ///
     /// This makes it clear to the LLM which changes need analysis and where
     /// to find their proposal files.
@@ -194,38 +194,38 @@ impl ParallelizationAnalyzer {
         let change_list: String = changes
             .iter()
             .filter(|c| c.is_approved) // Only selected/approved changes
-            .map(|c| format!("[x] {} (openspec/changes/{}/)", c.id, c.id))
+            .map(|c| format!("[x] {} (openspec/changes/{}/proposal.md)", c.id, c.id))
             .collect::<Vec<_>>()
             .join("\n");
 
         format!(
             r#"You are planning the execution order for OpenSpec changes.
 
-Analyze these selected changes (marked with [x]).
-Read the proposal files in the specified directories to understand their dependencies:
+Analyze ONLY the changes marked with [x] below.
+Read the proposal files at the specified paths to understand their dependencies:
 
 {change_list}
 
 Your task:
 1. Read each change's proposal.md at the given path to understand what it does
 2. Identify dependencies between these changes
-3. Group changes that can run in parallel (no dependencies on each other)
-4. Order groups so dependencies are completed before dependents
+3. Determine the recommended execution order (considering dependencies)
+4. Return execution order and dependencies
 
 Return ONLY valid JSON in this exact format:
 {{
-  "groups": [
-    {{"id": 1, "changes": ["change-a", "change-b"], "depends_on": []}},
-    {{"id": 2, "changes": ["change-c"], "depends_on": [1]}}
-  ]
+  "order": ["change-a", "change-b", "change-c"],
+  "dependencies": {{
+    "change-c": ["change-a"]
+  }}
 }}
 
 Rules:
-- Every change ID must appear exactly once
-- Group IDs start at 1 and increment
-- depends_on lists group IDs (not change IDs) that must complete first
-- Groups with empty depends_on can start immediately
-- Changes with no dependencies on each other should be in the same group
+- `order`: Array of change IDs in recommended execution sequence (dependencies first)
+- `dependencies`: Object mapping change IDs to arrays of their dependency IDs
+- Every change ID must appear exactly once in `order`
+- Changes with no dependencies can be listed in any position (considering best parallelism)
+- Dependencies are constraints: a change CANNOT start until all its dependencies are merged to base
 - Return valid JSON only, no markdown, no explanation"#
         )
     }
@@ -246,6 +246,9 @@ Rules:
         // Validate all change IDs exist
         self.validate_change_ids(&result, changes)?;
 
+        // Validate dependency graph (no circular dependencies)
+        self.validate_dependency_graph(&result)?;
+
         Ok(result)
     }
 
@@ -253,29 +256,40 @@ Rules:
     ///
     /// Checks that:
     /// - JSON is parseable
-    /// - `groups` key exists
-    /// - `groups` is an array
+    /// - `order` key exists
+    /// - `order` is an array
+    /// - `dependencies` key exists (optional but should be present)
     fn validate_json_schema(&self, json_str: &str) -> Result<()> {
         // Parse as generic JSON value first
         let value: serde_json::Value = serde_json::from_str(json_str)
             .map_err(|e| OrchestratorError::Parse(format!("Invalid JSON syntax: {}", e)))?;
 
-        // Check for required `groups` key
+        // Check for required root object
         if !value.is_object() {
             return Err(OrchestratorError::Parse(
                 "JSON root must be an object".to_string(),
             ));
         }
 
-        let groups = value.get("groups").ok_or_else(|| {
-            OrchestratorError::Parse("Missing required key 'groups' in JSON".to_string())
+        // Check for required `order` key
+        let order = value.get("order").ok_or_else(|| {
+            OrchestratorError::Parse("Missing required key 'order' in JSON".to_string())
         })?;
 
-        // Check that groups is an array
-        if !groups.is_array() {
+        // Check that order is an array
+        if !order.is_array() {
             return Err(OrchestratorError::Parse(
-                "Key 'groups' must be an array".to_string(),
+                "Key 'order' must be an array".to_string(),
             ));
+        }
+
+        // Check for dependencies key (should be present)
+        if let Some(dependencies) = value.get("dependencies") {
+            if !dependencies.is_object() {
+                return Err(OrchestratorError::Parse(
+                    "Key 'dependencies' must be an object".to_string(),
+                ));
+            }
         }
 
         Ok(())
@@ -328,25 +342,24 @@ Rules:
         let valid_ids: HashSet<&str> = changes.iter().map(|c| c.id.as_str()).collect();
         let mut seen_ids: HashSet<&str> = HashSet::new();
 
-        for group in &result.groups {
-            for change_id in &group.changes {
-                // Check ID exists
-                if !valid_ids.contains(change_id.as_str()) {
-                    return Err(OrchestratorError::Parse(format!(
-                        "Unknown change ID in response: {}",
-                        change_id
-                    )));
-                }
-
-                // Check for duplicates
-                if seen_ids.contains(change_id.as_str()) {
-                    return Err(OrchestratorError::Parse(format!(
-                        "Duplicate change ID in response: {}",
-                        change_id
-                    )));
-                }
-                seen_ids.insert(change_id.as_str());
+        // Check all IDs in order
+        for change_id in &result.order {
+            // Check ID exists
+            if !valid_ids.contains(change_id.as_str()) {
+                return Err(OrchestratorError::Parse(format!(
+                    "Unknown change ID in order: {}",
+                    change_id
+                )));
             }
+
+            // Check for duplicates
+            if seen_ids.contains(change_id.as_str()) {
+                return Err(OrchestratorError::Parse(format!(
+                    "Duplicate change ID in order: {}",
+                    change_id
+                )));
+            }
+            seen_ids.insert(change_id.as_str());
         }
 
         // Check all changes are accounted for
@@ -362,49 +375,52 @@ Rules:
     }
 
     /// Validate dependency graph for circular dependencies
-    fn validate_dependency_graph(&self, groups: &[ParallelGroup]) -> Result<()> {
-        let group_ids: HashSet<u32> = groups.iter().map(|g| g.id).collect();
+    fn validate_dependency_graph(&self, result: &AnalysisResult) -> Result<()> {
+        // Check for self-dependencies
+        for (change_id, deps) in &result.dependencies {
+            if deps.contains(change_id) {
+                return Err(OrchestratorError::Parse(format!(
+                    "Self-dependency detected: change '{}' depends on itself",
+                    change_id
+                )));
+            }
 
-        // Check all depends_on references are valid
-        for group in groups {
-            for dep_id in &group.depends_on {
-                if !group_ids.contains(dep_id) {
+            // Check all dependencies exist in order
+            for dep_id in deps {
+                if !result.order.contains(dep_id) {
                     return Err(OrchestratorError::Parse(format!(
-                        "Invalid dependency reference: group {} depends on non-existent group {}",
-                        group.id, dep_id
-                    )));
-                }
-                if *dep_id == group.id {
-                    return Err(OrchestratorError::Parse(format!(
-                        "Self-dependency detected: group {} depends on itself",
-                        group.id
+                        "Invalid dependency reference: change '{}' depends on non-existent change '{}'",
+                        change_id, dep_id
                     )));
                 }
             }
         }
 
         // Check for circular dependencies using DFS
-        self.detect_cycles(groups)?;
+        self.detect_cycles_from_dependencies(&result.dependencies)?;
 
         Ok(())
     }
 
-    /// Detect cycles in the dependency graph using DFS
-    fn detect_cycles(&self, groups: &[ParallelGroup]) -> Result<()> {
-        let mut adjacency: HashMap<u32, Vec<u32>> = HashMap::new();
-        for group in groups {
-            adjacency.insert(group.id, group.depends_on.clone());
-        }
+    /// Detect cycles in dependency graph (change-level dependencies)
+    fn detect_cycles_from_dependencies(
+        &self,
+        dependencies: &HashMap<String, Vec<String>>,
+    ) -> Result<()> {
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut rec_stack: HashSet<String> = HashSet::new();
 
-        let mut visited: HashSet<u32> = HashSet::new();
-        let mut rec_stack: HashSet<u32> = HashSet::new();
-
-        for group in groups {
-            if !visited.contains(&group.id)
-                && self.has_cycle(group.id, &adjacency, &mut visited, &mut rec_stack)
+        for change_id in dependencies.keys() {
+            if !visited.contains(change_id)
+                && self.has_cycle_in_dependencies(
+                    change_id,
+                    dependencies,
+                    &mut visited,
+                    &mut rec_stack,
+                )
             {
                 return Err(OrchestratorError::Parse(
-                    "Circular dependency detected in parallelization groups".to_string(),
+                    "Circular dependency detected in change dependencies".to_string(),
                 ));
             }
         }
@@ -412,83 +428,118 @@ Rules:
         Ok(())
     }
 
-    /// DFS helper for cycle detection
-    fn has_cycle(
+    /// DFS helper for cycle detection in change-level dependencies
+    fn has_cycle_in_dependencies(
         &self,
-        node: u32,
-        adjacency: &HashMap<u32, Vec<u32>>,
-        visited: &mut HashSet<u32>,
-        rec_stack: &mut HashSet<u32>,
+        node: &str,
+        dependencies: &HashMap<String, Vec<String>>,
+        visited: &mut HashSet<String>,
+        rec_stack: &mut HashSet<String>,
     ) -> bool {
-        visited.insert(node);
-        rec_stack.insert(node);
+        visited.insert(node.to_string());
+        rec_stack.insert(node.to_string());
 
-        if let Some(deps) = adjacency.get(&node) {
-            for &dep in deps {
-                if !visited.contains(&dep) {
-                    if self.has_cycle(dep, adjacency, visited, rec_stack) {
+        if let Some(deps) = dependencies.get(node) {
+            for dep in deps {
+                if !visited.contains(dep) {
+                    if self.has_cycle_in_dependencies(dep, dependencies, visited, rec_stack) {
                         return true;
                     }
-                } else if rec_stack.contains(&dep) {
+                } else if rec_stack.contains(dep) {
                     return true;
                 }
             }
         }
 
-        rec_stack.remove(&node);
+        rec_stack.remove(node);
         false
     }
 
-    /// Sort groups in topological order (dependencies first)
-    fn topological_sort(&self, groups: Vec<ParallelGroup>) -> Result<Vec<ParallelGroup>> {
-        if groups.is_empty() {
-            return Ok(Vec::new());
-        }
+    /// Convert order-based analysis result to group-based format.
+    ///
+    /// Groups changes that have no dependencies on each other into parallel groups.
+    /// Changes are processed in the order specified by the `order` field, respecting
+    /// the constraints defined in the `dependencies` field.
+    fn order_to_groups(&self, result: &AnalysisResult) -> Vec<ParallelGroup> {
+        let mut groups: Vec<ParallelGroup> = Vec::new();
+        let mut processed: HashSet<String> = HashSet::new();
+        let mut group_id = 1u32;
 
-        // Build in-degree map
-        let mut in_degree: HashMap<u32, usize> = HashMap::new();
-        let mut group_map: HashMap<u32, ParallelGroup> = HashMap::new();
-        let mut dependents: HashMap<u32, Vec<u32>> = HashMap::new();
-
-        for group in groups {
-            in_degree.insert(group.id, group.depends_on.len());
-            for &dep_id in &group.depends_on {
-                dependents.entry(dep_id).or_default().push(group.id);
-            }
-            group_map.insert(group.id, group);
-        }
-
-        // Kahn's algorithm
-        let mut queue: VecDeque<u32> = in_degree
-            .iter()
-            .filter_map(|(&id, &deg)| if deg == 0 { Some(id) } else { None })
-            .collect();
-
-        let mut sorted: Vec<ParallelGroup> = Vec::new();
-
-        while let Some(id) = queue.pop_front() {
-            if let Some(group) = group_map.remove(&id) {
-                sorted.push(group);
+        // Process changes in order
+        for change_id in &result.order {
+            if processed.contains(change_id) {
+                continue;
             }
 
-            if let Some(deps) = dependents.get(&id) {
-                for &dep_id in deps {
-                    if let Some(deg) = in_degree.get_mut(&dep_id) {
-                        *deg = deg.saturating_sub(1);
-                        if *deg == 0 {
-                            queue.push_back(dep_id);
-                        }
-                    }
+            // Find all changes that can be executed in parallel with this one
+            let mut group_changes = vec![change_id.clone()];
+            processed.insert(change_id.clone());
+
+            // Check remaining unprocessed changes
+            for other_id in &result.order {
+                if processed.contains(other_id) {
+                    continue;
+                }
+
+                // Can run in parallel if:
+                // 1. No dependency between them
+                // 2. All dependencies are already processed
+                let can_parallel =
+                    !self.has_dependency_between(change_id, other_id, &result.dependencies)
+                        && self.dependencies_satisfied(other_id, &result.dependencies, &processed);
+
+                if can_parallel {
+                    group_changes.push(other_id.clone());
+                    processed.insert(other_id.clone());
                 }
             }
+
+            // Create a group for these parallel changes
+            groups.push(ParallelGroup {
+                id: group_id,
+                changes: group_changes,
+                depends_on: Vec::new(), // Dependencies are tracked at change level
+            });
+            group_id += 1;
         }
 
-        // If not all groups were processed, there's a cycle (shouldn't happen after validation)
-        if sorted.len() != in_degree.len() {
-            warn!("Topological sort incomplete - cycle may exist");
-        }
+        groups
+    }
 
-        Ok(sorted)
+    /// Check if there's a dependency relationship between two changes (in either direction)
+    fn has_dependency_between(
+        &self,
+        a: &str,
+        b: &str,
+        dependencies: &HashMap<String, Vec<String>>,
+    ) -> bool {
+        // Check if a depends on b
+        if let Some(a_deps) = dependencies.get(a) {
+            if a_deps.contains(&b.to_string()) {
+                return true;
+            }
+        }
+        // Check if b depends on a
+        if let Some(b_deps) = dependencies.get(b) {
+            if b_deps.contains(&a.to_string()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if all dependencies for a change are satisfied (already processed)
+    fn dependencies_satisfied(
+        &self,
+        change_id: &str,
+        dependencies: &HashMap<String, Vec<String>>,
+        processed: &HashSet<String>,
+    ) -> bool {
+        if let Some(deps) = dependencies.get(change_id) {
+            deps.iter().all(|dep| processed.contains(dep))
+        } else {
+            true // No dependencies
+        }
     }
 }
 
@@ -551,7 +602,7 @@ mod tests {
         let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
         let analyzer = ParallelizationAnalyzer::new(agent);
 
-        let json = r#"{"groups": [{"id": 1, "changes": ["a"], "depends_on": []}]}"#;
+        let json = r#"{"order": ["a"], "dependencies": {}}"#;
         let result = analyzer.extract_json(json);
         assert!(result.is_ok());
     }
@@ -564,7 +615,7 @@ mod tests {
         let response = r#"Here's the analysis:
 
 ```json
-{"groups": [{"id": 1, "changes": ["a"], "depends_on": []}]}
+{"order": ["a"], "dependencies": {}}
 ```
 
 That's all."#;
@@ -579,12 +630,9 @@ That's all."#;
 
         let changes = vec![create_test_change("a"), create_test_change("b")];
         let result = AnalysisResult {
-            groups: vec![ParallelGroup {
-                id: 1,
-                changes: vec!["a".to_string()], // Missing "b"
-                depends_on: Vec::new(),
-            }],
+            order: vec!["a".to_string()], // Missing "b"
             dependencies: HashMap::new(),
+            groups: None,
         };
 
         let validation = analyzer.validate_change_ids(&result, &changes);
@@ -598,19 +646,9 @@ That's all."#;
 
         let changes = vec![create_test_change("a"), create_test_change("b")];
         let result = AnalysisResult {
-            groups: vec![
-                ParallelGroup {
-                    id: 1,
-                    changes: vec!["a".to_string()],
-                    depends_on: Vec::new(),
-                },
-                ParallelGroup {
-                    id: 2,
-                    changes: vec!["a".to_string(), "b".to_string()], // Duplicate "a"
-                    depends_on: vec![1],
-                },
-            ],
+            order: vec!["a".to_string(), "a".to_string(), "b".to_string()], // Duplicate "a"
             dependencies: HashMap::new(),
+            groups: None,
         };
 
         let validation = analyzer.validate_change_ids(&result, &changes);
@@ -622,21 +660,16 @@ That's all."#;
         let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
         let analyzer = ParallelizationAnalyzer::new(agent);
 
-        let groups = vec![
-            ParallelGroup {
-                id: 1,
-                changes: vec!["a".to_string()],
-                depends_on: Vec::new(),
-            },
-            ParallelGroup {
-                id: 2,
-                changes: vec!["b".to_string()],
-                depends_on: vec![1],
-            },
-        ];
+        let mut deps = HashMap::new();
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        let result = AnalysisResult {
+            order: vec!["a".to_string(), "b".to_string()],
+            dependencies: deps,
+            groups: None,
+        };
 
-        let result = analyzer.validate_dependency_graph(&groups);
-        assert!(result.is_ok());
+        let validation = analyzer.validate_dependency_graph(&result);
+        assert!(validation.is_ok());
     }
 
     #[test]
@@ -644,14 +677,16 @@ That's all."#;
         let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
         let analyzer = ParallelizationAnalyzer::new(agent);
 
-        let groups = vec![ParallelGroup {
-            id: 1,
-            changes: vec!["a".to_string()],
-            depends_on: vec![1], // Self-reference
-        }];
+        let mut deps = HashMap::new();
+        deps.insert("a".to_string(), vec!["a".to_string()]); // Self-reference
+        let result = AnalysisResult {
+            order: vec!["a".to_string()],
+            dependencies: deps,
+            groups: None,
+        };
 
-        let result = analyzer.validate_dependency_graph(&groups);
-        assert!(result.is_err());
+        let validation = analyzer.validate_dependency_graph(&result);
+        assert!(validation.is_err());
     }
 
     #[test]
@@ -659,85 +694,17 @@ That's all."#;
         let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
         let analyzer = ParallelizationAnalyzer::new(agent);
 
-        let groups = vec![
-            ParallelGroup {
-                id: 1,
-                changes: vec!["a".to_string()],
-                depends_on: vec![2], // Cycle: 1 -> 2 -> 1
-            },
-            ParallelGroup {
-                id: 2,
-                changes: vec!["b".to_string()],
-                depends_on: vec![1],
-            },
-        ];
+        let mut deps = HashMap::new();
+        deps.insert("a".to_string(), vec!["b".to_string()]); // Cycle: a -> b -> a
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        let result = AnalysisResult {
+            order: vec!["a".to_string(), "b".to_string()],
+            dependencies: deps,
+            groups: None,
+        };
 
-        let result = analyzer.validate_dependency_graph(&groups);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_topological_sort_simple() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
-
-        let groups = vec![
-            ParallelGroup {
-                id: 2,
-                changes: vec!["b".to_string()],
-                depends_on: vec![1],
-            },
-            ParallelGroup {
-                id: 1,
-                changes: vec!["a".to_string()],
-                depends_on: Vec::new(),
-            },
-        ];
-
-        let sorted = analyzer.topological_sort(groups).unwrap();
-        assert_eq!(sorted.len(), 2);
-        assert_eq!(sorted[0].id, 1); // Group 1 should come first
-        assert_eq!(sorted[1].id, 2);
-    }
-
-    #[test]
-    fn test_topological_sort_complex() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
-
-        // Diamond dependency: 1 -> 2, 1 -> 3, 2 -> 4, 3 -> 4
-        let groups = vec![
-            ParallelGroup {
-                id: 4,
-                changes: vec!["d".to_string()],
-                depends_on: vec![2, 3],
-            },
-            ParallelGroup {
-                id: 3,
-                changes: vec!["c".to_string()],
-                depends_on: vec![1],
-            },
-            ParallelGroup {
-                id: 2,
-                changes: vec!["b".to_string()],
-                depends_on: vec![1],
-            },
-            ParallelGroup {
-                id: 1,
-                changes: vec!["a".to_string()],
-                depends_on: Vec::new(),
-            },
-        ];
-
-        let sorted = analyzer.topological_sort(groups).unwrap();
-        assert_eq!(sorted.len(), 4);
-        assert_eq!(sorted[0].id, 1); // Group 1 must be first
-        assert_eq!(sorted[3].id, 4); // Group 4 must be last
-
-        // Groups 2 and 3 can be in either order
-        let middle_ids: Vec<u32> = sorted[1..3].iter().map(|g| g.id).collect();
-        assert!(middle_ids.contains(&2));
-        assert!(middle_ids.contains(&3));
+        let validation = analyzer.validate_dependency_graph(&result);
+        assert!(validation.is_err());
     }
 
     #[test]
@@ -861,9 +828,9 @@ That's all."#;
 
         let prompt = analyzer.build_parallelization_prompt(&changes);
 
-        // Check that selected changes are marked with [x]
-        assert!(prompt.contains("[x] selected-a (openspec/changes/selected-a/)"));
-        assert!(prompt.contains("[x] selected-c (openspec/changes/selected-c/)"));
+        // Check that selected changes are marked with [x] and include proposal.md path
+        assert!(prompt.contains("[x] selected-a (openspec/changes/selected-a/proposal.md)"));
+        assert!(prompt.contains("[x] selected-c (openspec/changes/selected-c/proposal.md)"));
 
         // Check that unselected change is NOT included
         assert!(!prompt.contains("unselected-b"));
@@ -872,7 +839,7 @@ That's all."#;
         assert!(prompt.contains("marked with [x]"));
 
         // Check that instruction mentions reading proposal files
-        assert!(prompt.contains("Read the proposal files in the specified directories"));
+        assert!(prompt.contains("Read the proposal files at the specified paths"));
     }
 
     #[test]
@@ -901,9 +868,9 @@ That's all."#;
 
         let prompt = analyzer.build_parallelization_prompt(&changes);
 
-        // All should be included with [x] marker
-        assert!(prompt.contains("[x] change-1 (openspec/changes/change-1/)"));
-        assert!(prompt.contains("[x] change-2 (openspec/changes/change-2/)"));
+        // All should be included with [x] marker and proposal.md path
+        assert!(prompt.contains("[x] change-1 (openspec/changes/change-1/proposal.md)"));
+        assert!(prompt.contains("[x] change-2 (openspec/changes/change-2/proposal.md)"));
     }
 
     #[test]
@@ -926,6 +893,6 @@ That's all."#;
         assert!(!prompt.contains("change-1"));
 
         // But structure should still be there
-        assert!(prompt.contains("Analyze these selected changes"));
+        assert!(prompt.contains("Analyze ONLY the changes marked with [x]"));
     }
 }
