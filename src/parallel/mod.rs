@@ -658,6 +658,96 @@ impl ParallelExecutor {
                 break;
             }
 
+            // Filter out changes that are already merged or archived (queued-only filter)
+            // This prevents analysis of completed changes and allows the loop to exit
+            let original_branch = self.workspace_manager.original_branch().ok_or_else(|| {
+                OrchestratorError::GitCommand("Original branch not initialized".to_string())
+            })?;
+
+            let mut queued_changes = Vec::new();
+            let mut excluded_changes = Vec::new();
+
+            for change in changes {
+                // Check if workspace exists for this change
+                let workspace_state = match self
+                    .workspace_manager
+                    .find_existing_workspace(&change.id)
+                    .await
+                {
+                    Ok(Some(workspace_info)) => {
+                        // Workspace exists, detect its state
+                        match detect_workspace_state(
+                            &change.id,
+                            &workspace_info.path,
+                            &original_branch,
+                        )
+                        .await
+                        {
+                            Ok(state) => Some(state),
+                            Err(e) => {
+                                warn!("Failed to detect workspace state for '{}': {}, assuming queued", change.id, e);
+                                None
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // No workspace exists, this is a queued change
+                        None
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to find workspace for '{}': {}, assuming queued",
+                            change.id, e
+                        );
+                        None
+                    }
+                };
+
+                // Determine if change should be included in analysis
+                match workspace_state {
+                    Some(WorkspaceState::Merged) => {
+                        // Change is already merged, exclude from analysis
+                        info!("Excluding '{}' from analysis: already merged", change.id);
+                        excluded_changes.push((change, "already merged".to_string()));
+                    }
+                    Some(WorkspaceState::Archived) => {
+                        // Change is archived but not merged yet, exclude from analysis
+                        // (it will be handled by merge logic later)
+                        info!("Excluding '{}' from analysis: already archived", change.id);
+                        excluded_changes.push((change, "already archived".to_string()));
+                    }
+                    Some(WorkspaceState::Archiving)
+                    | Some(WorkspaceState::Applied)
+                    | Some(WorkspaceState::Applying { .. })
+                    | Some(WorkspaceState::Created)
+                    | None => {
+                        // Change is queued (not started, in progress, or needs work)
+                        queued_changes.push(change);
+                    }
+                }
+            }
+
+            // Emit skip events for excluded changes
+            for (change, reason) in excluded_changes {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::ChangeSkipped {
+                        change_id: change.id.clone(),
+                        reason: reason.clone(),
+                    },
+                )
+                .await;
+            }
+
+            // Update changes to only include queued ones
+            changes = queued_changes;
+
+            // Exit if no queued changes remain
+            if changes.is_empty() {
+                info!("No queued changes remaining, stopping parallel execution");
+                break;
+            }
+
             // Check debounce: a slot is available (after previous group completed)
             // Skip debounce check on first iteration to start immediately
             if group_counter > 1 {
@@ -925,6 +1015,96 @@ impl ParallelExecutor {
 
             if changes.is_empty() {
                 info!("All remaining changes are blocked by dependencies, stopping");
+                break;
+            }
+
+            // Filter out changes that are already merged or archived (queued-only filter)
+            // This prevents analysis of completed changes and allows the loop to exit
+            let original_branch = self.workspace_manager.original_branch().ok_or_else(|| {
+                OrchestratorError::GitCommand("Original branch not initialized".to_string())
+            })?;
+
+            let mut queued_changes = Vec::new();
+            let mut excluded_changes = Vec::new();
+
+            for change in changes {
+                // Check if workspace exists for this change
+                let workspace_state = match self
+                    .workspace_manager
+                    .find_existing_workspace(&change.id)
+                    .await
+                {
+                    Ok(Some(workspace_info)) => {
+                        // Workspace exists, detect its state
+                        match detect_workspace_state(
+                            &change.id,
+                            &workspace_info.path,
+                            &original_branch,
+                        )
+                        .await
+                        {
+                            Ok(state) => Some(state),
+                            Err(e) => {
+                                warn!("Failed to detect workspace state for '{}': {}, assuming queued", change.id, e);
+                                None
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // No workspace exists, this is a queued change
+                        None
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to find workspace for '{}': {}, assuming queued",
+                            change.id, e
+                        );
+                        None
+                    }
+                };
+
+                // Determine if change should be included in analysis
+                match workspace_state {
+                    Some(WorkspaceState::Merged) => {
+                        // Change is already merged, exclude from analysis
+                        info!("Excluding '{}' from analysis: already merged", change.id);
+                        excluded_changes.push((change, "already merged".to_string()));
+                    }
+                    Some(WorkspaceState::Archived) => {
+                        // Change is archived but not merged yet, exclude from analysis
+                        // (it will be handled by merge logic later)
+                        info!("Excluding '{}' from analysis: already archived", change.id);
+                        excluded_changes.push((change, "already archived".to_string()));
+                    }
+                    Some(WorkspaceState::Archiving)
+                    | Some(WorkspaceState::Applied)
+                    | Some(WorkspaceState::Applying { .. })
+                    | Some(WorkspaceState::Created)
+                    | None => {
+                        // Change is queued (not started, in progress, or needs work)
+                        queued_changes.push(change);
+                    }
+                }
+            }
+
+            // Emit skip events for excluded changes
+            for (change, reason) in excluded_changes {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::ChangeSkipped {
+                        change_id: change.id.clone(),
+                        reason: reason.clone(),
+                    },
+                )
+                .await;
+            }
+
+            // Update changes to only include queued ones
+            changes = queued_changes;
+
+            // Exit if no queued changes remain
+            if changes.is_empty() {
+                info!("No queued changes remaining, stopping parallel execution");
                 break;
             }
 
