@@ -982,8 +982,8 @@ impl ParallelExecutor {
             }
 
             // Select changes from order based on available slots and dependency constraints
-            // SLOT-DRIVEN: Launch one change at a time to enable frequent re-analysis
-            let batch_size_limit = 1;
+            // SLOT-DRIVEN: Launch up to available_slots changes to maximize parallelism
+            let batch_size_limit = available_slots;
             let mut selected_changes: Vec<String> = Vec::new();
             let mut blocked_changes: HashSet<String> = HashSet::new();
 
