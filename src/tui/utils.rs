@@ -132,7 +132,7 @@ pub fn clear_screen() -> Result<()> {
 
 /// Get version string for display
 pub fn get_version_string() -> String {
-    format!("v{}", env!("CARGO_PKG_VERSION"))
+    format!("v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER"))
 }
 
 #[cfg(test)]
@@ -181,5 +181,14 @@ mod tests {
     fn test_get_version_string() {
         let version = get_version_string();
         assert!(version.starts_with("v"));
+        // Should contain build number in parentheses
+        assert!(version.contains('('));
+        assert!(version.contains(')'));
+        // Build number should be 14 digits (YYYYMMDDHHmmss)
+        let parts: Vec<&str> = version.split('(').collect();
+        assert_eq!(parts.len(), 2);
+        let build = parts[1].trim_end_matches(')');
+        assert_eq!(build.len(), 14);
+        assert!(build.chars().all(|c| c.is_ascii_digit()));
     }
 }
