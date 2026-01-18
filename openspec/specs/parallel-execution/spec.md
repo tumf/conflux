@@ -113,6 +113,7 @@ These helpers SHALL be pure functions where possible, enabling unit testing.
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
 The acceptance loop SHALL parse stdout to determine pass/fail, and MUST NOT use exit code to determine acceptance verdict.
 The acceptance prompt MUST include a hardcoded acceptance prompt followed by configured `acceptance_prompt`.
+When resuming a workspace that has not completed archive, the orchestrator SHALL re-run acceptance before starting archive, even if tasks are already complete.
 
 #### Scenario: Parallel acceptance success proceeds to archive
 - **GIVEN** a change completes an apply iteration successfully in parallel mode
@@ -128,6 +129,18 @@ The acceptance prompt MUST include a hardcoded acceptance prompt followed by con
 - **GIVEN** a change completes an apply iteration successfully in parallel mode
 - **WHEN** the acceptance_command exits with non-zero status
 - **THEN** the orchestrator records the command failure and returns the change to the apply loop
+
+#### Scenario: Resume forces acceptance before archive
+- **GIVEN** a workspace is resumed after interruption
+- **AND** archive is not yet complete for the change
+- **WHEN** the orchestrator resumes processing
+- **THEN** acceptance_command is executed before any archive command
+
+**Implementation Notes:**
+- Acceptance results are not persisted across orchestrator sessions
+- When resuming in `Applied` or `Archiving` states, acceptance must re-run before archive
+- This ensures quality checks are not skipped even if acceptance completed before interruption
+- Acceptance history is cleared after successful archive to prevent history bloat
 
 ### Requirement: Parallel apply runs in worktree
 parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。
@@ -845,8 +858,7 @@ Parallel実行で `MergeWait` の change をユーザーが resolve した場合
 - **AND** TUI は該当 change のステータスを `Merged` に設定する
 
 ### Requirement: キュー変更デバウンスとスロット駆動の再分析
-
-並列実行中、システムはキュー変更（追加・削除）から10秒経過した後に再分析を行い、実行スロットが空いたタイミングで依存関係を考慮して次の変更を選定しなければならない（SHALL）。
+並列実行中、システムはキュー変更（追加・削除）を実行中でも監視し、変更から10秒経過した後に再分析を行い、実行スロットが空いたタイミングで依存関係を考慮して次の変更を選定しなければならない（SHALL）。
 
 加えて、システムは再分析時に実行スロットの空き数を算出し、依存関係分析の `order`（依存関係を満たした上での推奨実行順序）に従って空き数分の change を起動しなければならない（SHALL）。
 
@@ -854,12 +866,10 @@ Parallel実行で `MergeWait` の change をユーザーが resolve した場合
 
 依存制約が解決した change は、依存解決後の実行開始時点で worktree を新規作成し、既存の worktree がある場合も作り直さなければならない（MUST）。この挙動は依存 change に固有であり、resume が常に成立することを保証しない前提の例外とする。
 
-#### Scenario: `order` ベースの再分析が実装されている
-- **GIVEN** 並列実行で再分析が行われる
-- **AND** 依存関係分析結果が `order` と `dependencies` を返す
-- **WHEN** システムが次の起動候補を決定する
-- **THEN** `order` を group 変換せずに実行候補を選定する
-- **AND** 空きスロット数に応じて `order` から起動対象を選ぶ
+#### Scenario: 実行中のキュー変更でもデバウンス後に再分析が走る
+- **GIVEN** 並列実行中に change がキューへ追加または削除される
+- **WHEN** キュー変更から10秒が経過する
+- **THEN** システムは再分析を行い実行スロットに応じて次の change を選定する
 
 ### Requirement: AI エージェントクラッシュリカバリー
 
