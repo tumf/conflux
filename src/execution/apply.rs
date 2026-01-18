@@ -589,8 +589,10 @@ where
         // Check max iterations
         if iteration > max_iterations {
             let error_msg = format!(
-                "Max iterations ({}) reached for change {}",
-                max_iterations, change_id
+                "Max iterations ({}) reached for change '{}' in workspace '{}'",
+                max_iterations,
+                change_id,
+                workspace_path.display()
             );
 
             // Run on_error hook

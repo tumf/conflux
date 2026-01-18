@@ -225,14 +225,21 @@ where
 
     // Wait for child process to complete
     let status = child.wait().await.map_err(|e| {
-        OrchestratorError::AgentCommand(format!("Failed to wait for process: {}", e))
+        OrchestratorError::AgentCommand(format!(
+            "Failed to wait for apply command for change '{}': {}",
+            change.id, e
+        ))
     })?;
 
     // Record the apply attempt for history context in subsequent retries
     agent.record_apply_attempt(&change.id, &status, start_time);
 
     if !status.success() {
-        let error_msg = format!("Apply command failed with exit code: {:?}", status.code());
+        let error_msg = format!(
+            "Apply command failed for change '{}' with exit code: {:?}",
+            change.id,
+            status.code()
+        );
 
         // Run on_error hook
         let error_ctx = hook_ctx.clone().with_error(&error_msg);

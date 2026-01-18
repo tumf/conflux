@@ -160,7 +160,12 @@ pub async fn resolve_conflicts_with_retry(
 
         // Wait for process to complete
         let status = child.wait().await.map_err(|e| {
-            OrchestratorError::AgentCommand(format!("Resolve command failed: {}", e))
+            OrchestratorError::AgentCommand(format!(
+                "Resolve command failed in workspace '{}' (attempt {}): {}",
+                workspace_manager.repo_root().display(),
+                attempt,
+                e
+            ))
         })?;
         let status_success = status.success();
 
@@ -398,7 +403,12 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         }
 
         let status = child.wait().await.map_err(|e| {
-            OrchestratorError::AgentCommand(format!("Resolve command failed: {}", e))
+            OrchestratorError::AgentCommand(format!(
+                "Resolve command failed in workspace '{}' (attempt {}): {}",
+                workspace_manager.repo_root().display(),
+                attempt,
+                e
+            ))
         })?;
         let status_success = status.success();
         let duration = start.elapsed();

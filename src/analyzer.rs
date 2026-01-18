@@ -99,7 +99,12 @@ impl ParallelizationAnalyzer {
 
         // Wait for process to complete
         let status = child.wait().await.map_err(|e| {
-            OrchestratorError::AgentCommand(format!("Analysis process failed: {}", e))
+            let change_ids: Vec<&str> = changes.iter().map(|c| c.id.as_str()).collect();
+            OrchestratorError::AgentCommand(format!(
+                "Analysis process failed for changes [{}]: {}",
+                change_ids.join(", "),
+                e
+            ))
         })?;
 
         // Extract result from stream-json format if applicable
@@ -111,8 +116,10 @@ impl ParallelizationAnalyzer {
         let result = self.parse_response(&response, changes).map_err(|e| {
             // Provide context from output for debugging
             let preview = response.chars().take(200).collect::<String>();
+            let change_ids: Vec<&str> = changes.iter().map(|c| c.id.as_str()).collect();
             OrchestratorError::Parse(format!(
-                "Analysis returned invalid JSON (exit code: {:?}): {}. Response preview: {}",
+                "Analysis returned invalid JSON for changes [{}] (exit code: {:?}): {}. Response preview: {}",
+                change_ids.join(", "),
                 status.code(),
                 e,
                 preview
@@ -121,8 +128,10 @@ impl ParallelizationAnalyzer {
 
         // Now check exit code after successful JSON parsing
         if !status.success() {
+            let change_ids: Vec<&str> = changes.iter().map(|c| c.id.as_str()).collect();
             return Err(OrchestratorError::AgentCommand(format!(
-                "Analysis failed with exit code: {:?}",
+                "Analysis failed for changes [{}] with exit code: {:?}",
+                change_ids.join(", "),
                 status.code()
             )));
         }

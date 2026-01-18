@@ -263,20 +263,28 @@ Requirements:\n\
             }
 
             let status = child.wait().await.map_err(|e| {
-                OrchestratorError::AgentCommand(format!("Archive resolve command failed: {}", e))
+                OrchestratorError::AgentCommand(format!(
+                    "Archive resolve command failed for change '{}' in workspace '{}': {}",
+                    change_id,
+                    repo_root.display(),
+                    e
+                ))
             })?;
 
             if !status.success() {
                 return Err(OrchestratorError::AgentCommand(format!(
-                    "Archive resolve command failed with exit code: {:?}",
+                    "Archive resolve command failed for change '{}' in workspace '{}' with exit code: {:?}",
+                    change_id,
+                    repo_root.display(),
                     status.code()
                 )));
             }
 
             if !is_archive_commit_complete(change_id, Some(repo_root)).await? {
                 return Err(OrchestratorError::AgentCommand(format!(
-                    "Archive commit verification failed for {}",
-                    change_id
+                    "Archive commit verification failed for change '{}' in workspace '{}'",
+                    change_id,
+                    repo_root.display()
                 )));
             }
         }
@@ -525,13 +533,22 @@ pub fn get_task_progress(
 ///
 /// Creates a descriptive error message when archive verification fails,
 /// suitable for logging or sending to the user.
-pub fn build_archive_error_message(change_id: &str) -> String {
-    format!(
-        "Archive command succeeded but change '{}' was not actually archived. \
-         The change directory still exists in openspec/changes/. \
-         The archive command may not have executed 'openspec archive' correctly.",
-        change_id
-    )
+pub fn build_archive_error_message(change_id: &str, workspace_path: Option<&Path>) -> String {
+    match workspace_path {
+        Some(path) => format!(
+            "Archive command succeeded but change '{}' in workspace '{}' was not actually archived. \
+             The change directory still exists in openspec/changes/. \
+             The archive command may not have executed 'openspec archive' correctly.",
+            change_id,
+            path.display()
+        ),
+        None => format!(
+            "Archive command succeeded but change '{}' was not actually archived. \
+             The change directory still exists in openspec/changes/. \
+             The archive command may not have executed 'openspec archive' correctly.",
+            change_id
+        ),
+    }
 }
 
 /// Event handler for archive loop events.
@@ -794,7 +811,9 @@ where
             if let Err(e) = delete_change_directory(change_id, Some(workspace_path)) {
                 // Deletion failure is treated as archive failure
                 let error_msg = format!(
-                    "Archive command succeeded but failed to delete change directory: {}",
+                    "Archive command succeeded for change '{}' in workspace '{}' but failed to delete change directory: {}",
+                    change_id,
+                    workspace_path.display(),
                     e
                 );
                 error!("{}", error_msg);
@@ -818,12 +837,18 @@ where
         let verification_msg = if verification.is_success() {
             None
         } else {
-            Some(build_archive_error_message(change_id))
+            Some(build_archive_error_message(change_id, Some(workspace_path)))
         };
         agent.record_archive_attempt(change_id, &status, start_time, verification_msg.clone());
 
         if !status.success() {
-            let error_msg = format!("Archive command failed with exit code: {:?}", status.code());
+            let error_msg = format!(
+                "Archive command failed for change '{}' in workspace '{}' (attempt {}) with exit code: {:?}",
+                change_id,
+                workspace_path.display(),
+                attempt,
+                status.code()
+            );
 
             // Run on_error hook
             if let Some(hook_runner) = hooks {
@@ -849,7 +874,7 @@ where
         );
 
         if attempt >= max_attempts {
-            let error_msg = build_archive_error_message(change_id);
+            let error_msg = build_archive_error_message(change_id, Some(workspace_path));
 
             // Run on_error hook
             if let Some(hook_runner) = hooks {
@@ -1356,10 +1381,15 @@ fi\n";
 
     #[test]
     fn test_build_archive_error_message() {
-        let msg = build_archive_error_message("add-feature");
+        let msg = build_archive_error_message("add-feature", None);
         assert!(msg.contains("add-feature"));
         assert!(msg.contains("not actually archived"));
         assert!(msg.contains("openspec/changes"));
+
+        let msg_with_path = build_archive_error_message("add-feature", Some(Path::new("/tmp/ws")));
+        assert!(msg_with_path.contains("add-feature"));
+        assert!(msg_with_path.contains("in workspace '/tmp/ws'"));
+        assert!(msg_with_path.contains("not actually archived"));
     }
 
     // ===========================

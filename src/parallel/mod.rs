@@ -408,13 +408,17 @@ impl ParallelExecutor {
 
         for group in groups {
             if self.is_cancelled() {
-                let cancel_msg = "Cancelled parallel execution";
+                let cancel_msg = format!(
+                    "Cancelled parallel execution for group {} (changes: {})",
+                    group.id,
+                    group.changes.join(", ")
+                );
                 send_event(
                     &self.event_tx,
-                    ParallelEvent::Log(LogEntry::warn(cancel_msg)),
+                    ParallelEvent::Log(LogEntry::warn(&cancel_msg)),
                 )
                 .await;
-                return Err(OrchestratorError::AgentCommand(cancel_msg.to_string()));
+                return Err(OrchestratorError::AgentCommand(cancel_msg));
             }
             let group_size = group.changes.len();
             self.execute_group(&group, total_changes, changes_processed)
@@ -488,13 +492,18 @@ impl ParallelExecutor {
 
         while !changes.is_empty() {
             if self.is_cancelled() {
-                let cancel_msg = "Cancelled parallel execution during reanalysis";
+                let remaining_changes: Vec<String> = changes.iter().map(|c| c.id.clone()).collect();
+                let cancel_msg = format!(
+                    "Cancelled parallel execution during reanalysis ({} remaining changes: {})",
+                    remaining_changes.len(),
+                    remaining_changes.join(", ")
+                );
                 send_event(
                     &self.event_tx,
-                    ParallelEvent::Log(LogEntry::warn(cancel_msg)),
+                    ParallelEvent::Log(LogEntry::warn(&cancel_msg)),
                 )
                 .await;
-                return Err(OrchestratorError::AgentCommand(cancel_msg.to_string()));
+                return Err(OrchestratorError::AgentCommand(cancel_msg));
             }
 
             // Check dynamic queue for newly added changes (TUI mode)
@@ -679,13 +688,17 @@ impl ParallelExecutor {
         changes_processed: usize,
     ) -> Result<()> {
         if self.is_cancelled() {
-            let cancel_msg = "Cancelled parallel execution";
+            let cancel_msg = format!(
+                "Cancelled parallel execution for group {} (changes: {})",
+                group.id,
+                group.changes.join(", ")
+            );
             send_event(
                 &self.event_tx,
-                ParallelEvent::Log(LogEntry::warn(cancel_msg)),
+                ParallelEvent::Log(LogEntry::warn(&cancel_msg)),
             )
             .await;
-            return Err(OrchestratorError::AgentCommand(cancel_msg.to_string()));
+            return Err(OrchestratorError::AgentCommand(cancel_msg));
         }
         // First, check which changes should be skipped due to failed dependencies
         let mut changes_to_execute: Vec<String> = Vec::new();

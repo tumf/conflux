@@ -83,24 +83,13 @@ Log level criteria:
 
 ### Requirement: REQ-OBS-003 Unified Log Format
 
-The orchestrator MUST use a consistent log format.
+The orchestrator MUST ensure error messages include actionable context such as operation type, change ID, and workspace or working directory when available.
 
-Format rules:
-- Before command execution: `"Running {context}: {command}"` or `"Executing {command}"`
-- Include context information whenever possible (e.g., change ID, workspace path)
-
-#### Scenario: Unified Format Log Output
-
-- **GIVEN** multiple types of commands are executed
-- **WHEN** checking the logs
-- **THEN** all command logs are output in a unified format
-- **AND** context information (change ID, etc.) is included
-
-#### Scenario: Handling Long Command Lines
-
-- **GIVEN** executing a command with very long arguments
-- **WHEN** checking the logs
-- **THEN** the entire command line is recorded (not truncated)
+#### Scenario: Error message includes execution context
+- **GIVEN** an apply operation fails for change `alpha`
+- **WHEN** the orchestrator records the error
+- **THEN** the error message includes the operation type (`apply`) and change ID (`alpha`)
+- **AND** the message includes the workspace or working directory when available
 
 ### Requirement: REQ-OBS-004 Error Messages with Context
 

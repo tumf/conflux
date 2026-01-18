@@ -394,8 +394,10 @@ pub async fn execute_apply_in_workspace(
             // Run on_error hook if configured
             if let Some(hook_runner) = hooks {
                 let error_msg = format!(
-                    "Max iterations ({}) reached for change {}",
-                    MAX_ITERATIONS, change_id
+                    "Max iterations ({}) reached for change '{}' in workspace '{}'",
+                    MAX_ITERATIONS,
+                    change_id,
+                    workspace_path.display()
                 );
                 let error_ctx =
                     build_parallel_hook_context(change_id, 0, 0, iteration, parallel_ctx)
@@ -405,8 +407,10 @@ pub async fn execute_apply_in_workspace(
                 }
             }
             return Err(OrchestratorError::AgentCommand(format!(
-                "Max iterations ({}) reached for change {}",
-                MAX_ITERATIONS, change_id
+                "Max iterations ({}) reached for change '{}' in workspace '{}'",
+                MAX_ITERATIONS,
+                change_id,
+                workspace_path.display()
             )));
         }
 
@@ -584,7 +588,10 @@ pub async fn execute_apply_in_workspace(
 
         if !status.success() {
             return Err(OrchestratorError::AgentCommand(format!(
-                "Apply command failed with exit code: {:?}",
+                "Apply command failed for change '{}' in workspace '{}' (iteration {}) with exit code: {:?}",
+                change_id,
+                workspace_path.display(),
+                iteration,
                 status.code()
             )));
         }
@@ -847,14 +854,18 @@ pub async fn execute_archive_in_workspace(
         Ok(Some(progress)) => {
             if progress.total == 0 {
                 return Err(OrchestratorError::AgentCommand(format!(
-                    "Cannot archive {}: tasks.md exists but contains no tasks (0 tasks found)",
-                    change_id
+                    "Cannot archive '{}' in workspace '{}': tasks.md exists but contains no tasks (0 tasks found)",
+                    change_id,
+                    workspace_path.display()
                 )));
             }
             if progress.completed < progress.total {
                 return Err(OrchestratorError::AgentCommand(format!(
-                    "Cannot archive {}: tasks not complete ({}/{} tasks completed)",
-                    change_id, progress.completed, progress.total
+                    "Cannot archive '{}' in workspace '{}': tasks not complete ({}/{} tasks completed)",
+                    change_id,
+                    workspace_path.display(),
+                    progress.completed,
+                    progress.total
                 )));
             }
             info!(
@@ -865,8 +876,9 @@ pub async fn execute_archive_in_workspace(
         }
         Ok(None) => {
             return Err(OrchestratorError::AgentCommand(format!(
-                "Cannot archive {}: tasks.md not found in workspace at {}",
+                "Cannot archive '{}' in workspace '{}': tasks.md not found at {}",
                 change_id,
+                workspace_path.display(),
                 workspace_path
                     .join("openspec/changes")
                     .join(change_id)
@@ -876,8 +888,10 @@ pub async fn execute_archive_in_workspace(
         }
         Err(e) => {
             return Err(OrchestratorError::AgentCommand(format!(
-                "Cannot archive {}: failed to parse tasks.md: {}",
-                change_id, e
+                "Cannot archive '{}' in workspace '{}': failed to parse tasks.md: {}",
+                change_id,
+                workspace_path.display(),
+                e
             )));
         }
     };
@@ -1009,12 +1023,21 @@ pub async fn execute_archive_in_workspace(
 
         // Wait for process to complete
         let status = child.wait().await.map_err(|e| {
-            OrchestratorError::AgentCommand(format!("Archive command failed: {}", e))
+            OrchestratorError::AgentCommand(format!(
+                "Failed to wait for archive command for '{}' in workspace '{}' (attempt {}): {}",
+                change_id,
+                workspace_path.display(),
+                attempt,
+                e
+            ))
         })?;
 
         if !status.success() {
             return Err(OrchestratorError::AgentCommand(format!(
-                "Archive command failed with exit code: {:?}",
+                "Archive command failed for change '{}' in workspace '{}' (attempt {}) with exit code: {:?}",
+                change_id,
+                workspace_path.display(),
+                attempt,
                 status.code()
             )));
         }
@@ -1115,7 +1138,7 @@ pub async fn execute_archive_in_workspace(
         }
 
         return Err(OrchestratorError::AgentCommand(
-            build_archive_error_message(change_id),
+            build_archive_error_message(change_id, Some(workspace_path)),
         ));
     }
 
