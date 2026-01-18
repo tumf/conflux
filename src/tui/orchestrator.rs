@@ -173,8 +173,8 @@ pub async fn archive_single_change(
         // Wait for child process to complete
         let status = child.wait().await.map_err(|e| {
             crate::error::OrchestratorError::AgentCommand(format!(
-                "Failed to wait for process: {}",
-                e
+                "Failed to wait for archive command for change '{}': {}",
+                change_id, e
             ))
         })?;
 
@@ -314,7 +314,7 @@ pub async fn archive_single_change(
             continue;
         }
 
-        let error_msg = build_archive_error_message(change_id);
+        let error_msg = build_archive_error_message(change_id, None);
         let _ = tx
             .send(OrchestratorEvent::ProcessingError {
                 id: change_id.to_string(),
@@ -752,8 +752,8 @@ pub async fn run_orchestrator(
         // Wait for child process to complete
         let status = child.wait().await.map_err(|e| {
             crate::error::OrchestratorError::AgentCommand(format!(
-                "Failed to wait for process: {}",
-                e
+                "Failed to wait for apply command for change '{}' (iteration {}): {}",
+                change_id, apply_count, e
             ))
         })?;
 
@@ -1131,13 +1131,18 @@ pub async fn run_orchestrator_parallel(
         // Execute batch using ParallelRunService with channel and shared queue state
         let result = tokio::select! {
             _ = cancel_token.cancelled() => {
-                let cancel_msg = "Cancelled parallel execution";
+                let change_ids: Vec<String> = batch_changes.iter().map(|c| c.id.clone()).collect();
+                let cancel_msg = format!(
+                    "Cancelled parallel execution ({} changes in batch: {})",
+                    change_ids.len(),
+                    change_ids.join(", ")
+                );
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::warn(
-                        cancel_msg.to_string(),
+                        cancel_msg.clone(),
                     )))
                     .await;
-                Err(crate::error::OrchestratorError::AgentCommand(cancel_msg.to_string()))
+                Err(crate::error::OrchestratorError::AgentCommand(cancel_msg))
             }
             result = batch_service.run_parallel_with_channel_and_queue_state(
                 batch_changes.clone(),

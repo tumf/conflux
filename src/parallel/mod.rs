@@ -94,6 +94,10 @@ pub struct ParallelExecutor {
     /// Shared stagger state for resolve operations
     #[allow(dead_code)] // Reserved for future resolve integration
     shared_stagger_state: SharedStaggerState,
+    /// History of apply attempts per change for context injection
+    apply_history: Arc<Mutex<crate::history::ApplyHistory>>,
+    /// History of archive attempts per change for context injection
+    archive_history: Arc<Mutex<crate::history::ArchiveHistory>>,
 }
 
 pub async fn base_dirty_reason(repo_root: &Path) -> Result<Option<String>> {
@@ -226,6 +230,8 @@ impl ParallelExecutor {
             dynamic_queue: None,
             ai_runner,
             shared_stagger_state,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         }
     }
 
@@ -402,13 +408,17 @@ impl ParallelExecutor {
 
         for group in groups {
             if self.is_cancelled() {
-                let cancel_msg = "Cancelled parallel execution";
+                let cancel_msg = format!(
+                    "Cancelled parallel execution for group {} (changes: {})",
+                    group.id,
+                    group.changes.join(", ")
+                );
                 send_event(
                     &self.event_tx,
-                    ParallelEvent::Log(LogEntry::warn(cancel_msg)),
+                    ParallelEvent::Log(LogEntry::warn(&cancel_msg)),
                 )
                 .await;
-                return Err(OrchestratorError::AgentCommand(cancel_msg.to_string()));
+                return Err(OrchestratorError::AgentCommand(cancel_msg));
             }
             let group_size = group.changes.len();
             self.execute_group(&group, total_changes, changes_processed)
@@ -482,13 +492,18 @@ impl ParallelExecutor {
 
         while !changes.is_empty() {
             if self.is_cancelled() {
-                let cancel_msg = "Cancelled parallel execution during reanalysis";
+                let remaining_changes: Vec<String> = changes.iter().map(|c| c.id.clone()).collect();
+                let cancel_msg = format!(
+                    "Cancelled parallel execution during reanalysis ({} remaining changes: {})",
+                    remaining_changes.len(),
+                    remaining_changes.join(", ")
+                );
                 send_event(
                     &self.event_tx,
-                    ParallelEvent::Log(LogEntry::warn(cancel_msg)),
+                    ParallelEvent::Log(LogEntry::warn(&cancel_msg)),
                 )
                 .await;
-                return Err(OrchestratorError::AgentCommand(cancel_msg.to_string()));
+                return Err(OrchestratorError::AgentCommand(cancel_msg));
             }
 
             // Check dynamic queue for newly added changes (TUI mode)
@@ -673,13 +688,17 @@ impl ParallelExecutor {
         changes_processed: usize,
     ) -> Result<()> {
         if self.is_cancelled() {
-            let cancel_msg = "Cancelled parallel execution";
+            let cancel_msg = format!(
+                "Cancelled parallel execution for group {} (changes: {})",
+                group.id,
+                group.changes.join(", ")
+            );
             send_event(
                 &self.event_tx,
-                ParallelEvent::Log(LogEntry::warn(cancel_msg)),
+                ParallelEvent::Log(LogEntry::warn(&cancel_msg)),
             )
             .await;
-            return Err(OrchestratorError::AgentCommand(cancel_msg.to_string()));
+            return Err(OrchestratorError::AgentCommand(cancel_msg));
         }
         // First, check which changes should be skipped due to failed dependencies
         let mut changes_to_execute: Vec<String> = Vec::new();
@@ -1446,6 +1465,8 @@ impl ParallelExecutor {
             let cancel_token = self.cancel_token.clone();
             let ai_runner = self.ai_runner.clone();
             let repo_root = self.repo_root.clone();
+            let apply_history = self.apply_history.clone();
+            let archive_history = self.archive_history.clone();
 
             // Build parallel hook context
             let parallel_ctx = ParallelHookContext {
@@ -1477,6 +1498,7 @@ impl ParallelExecutor {
                     cancel_token.as_ref(),
                     &ai_runner,
                     &repo_root,
+                    &apply_history,
                 )
                 .await;
 
@@ -1510,6 +1532,8 @@ impl ParallelExecutor {
                             Some(&parallel_ctx),
                             cancel_token.as_ref(),
                             &ai_runner,
+                            &archive_history,
+                            &apply_history,
                         )
                         .await;
 
@@ -2331,6 +2355,8 @@ mod tests {
             dynamic_queue: None,
             ai_runner,
             shared_stagger_state,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         };
 
         assert_eq!(
@@ -2565,6 +2591,8 @@ mod tests {
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
             ai_runner,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
         };
 
@@ -2724,6 +2752,8 @@ mod tests {
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
             ai_runner,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
         };
 
@@ -2855,6 +2885,8 @@ mod tests {
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
             ai_runner,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
         };
 
@@ -3015,6 +3047,8 @@ mod tests {
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
             ai_runner,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
         };
 
@@ -3190,6 +3224,8 @@ mod tests {
             dynamic_queue: None,
             ai_runner,
             shared_stagger_state,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -3370,6 +3406,8 @@ mod tests {
             dynamic_queue: None,
             ai_runner,
             shared_stagger_state,
+            apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+            archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         };
 
         let revisions = vec![workspace_a.name];
