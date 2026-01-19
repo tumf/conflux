@@ -354,8 +354,25 @@ async fn run_tui_loop(
                                             Some(&wt_path)
                                         ) {
                                             Ok(progress) => {
-                                                change.completed_tasks = progress.completed;
-                                                change.total_tasks = progress.total;
+                                                if progress.total == 0 {
+                                                    // If progress is 0/0, try archived location
+                                                    match crate::task_parser::parse_archived_change_with_worktree_fallback(
+                                                        &change.id,
+                                                        Some(&wt_path)
+                                                    ) {
+                                                        Ok(archived_progress) if archived_progress.total > 0 => {
+                                                            change.completed_tasks = archived_progress.completed;
+                                                            change.total_tasks = archived_progress.total;
+                                                        }
+                                                        _ => {
+                                                            // Keep existing progress if archived progress is also 0/0 or unavailable
+                                                            debug!("Keeping existing progress for {} (active: 0/0, archived: unavailable)", change.id);
+                                                        }
+                                                    }
+                                                } else {
+                                                    change.completed_tasks = progress.completed;
+                                                    change.total_tasks = progress.total;
+                                                }
                                             }
                                             Err(_) => {
                                                 // If not found in active location, try archived location
