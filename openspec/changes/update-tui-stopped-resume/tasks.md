@@ -1,11 +1,11 @@
 ## 1. Implementation
-- [ ] 1.1 CLI仕様差分を作成する（Stopped時のqueue方針と再開条件の明文化）
+- [x] 1.1 CLI仕様差分を作成する（Stopped時のqueue方針と再開条件の明文化）
   - 検証: `openspec/changes/update-tui-stopped-resume/specs/cli/spec.md` を確認し `npx @fission-ai/openspec@latest validate update-tui-stopped-resume --strict` が通る
-- [ ] 1.2 Stopped遷移時の queue_status 更新を NotQueued へ統一し、実行マークは維持する
+- [x] 1.2 Stopped遷移時の queue_status 更新を NotQueued へ統一し、実行マークは維持する
   - 検証: `src/tui/state/events.rs` と `src/tui/runner.rs` の停止処理を確認
-- [ ] 1.3 F5 再開時に実行マーク付き change を queued に復元して実行開始する
+- [x] 1.3 F5 再開時に実行マーク付き change を queued に復元して実行開始する
   - 検証: `src/tui/state/modes.rs` の再開処理と `src/tui/runner.rs` の F5 ハンドリングを確認
-- [ ] 1.4 Stopped 表示とヘルプ文言を実行マーク/NotQueued 方針に合わせる
+- [x] 1.4 Stopped 表示とヘルプ文言を実行マーク/NotQueued 方針に合わせる
   - 検証: `src/tui/render.rs` の表示ロジックとフッター文言を確認
-- [ ] 1.5 停止/再開のユニットテストを更新する
+- [x] 1.5 停止/再開のユニットテストを更新する
   - 検証: `cargo test` を実行し該当テストが通る

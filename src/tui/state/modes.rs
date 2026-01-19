@@ -116,32 +116,41 @@ impl AppState {
         Some(TuiCommand::StartProcessing(selected))
     }
 
-    /// Resume processing queued changes from Stopped mode
+    /// Resume processing execution-marked changes from Stopped mode
+    /// Converts execution-marked (selected=true) changes to queued before starting
     pub fn resume_processing(&mut self) -> Option<TuiCommand> {
         if self.mode != AppMode::Stopped {
             return None;
         }
 
-        let queued: Vec<String> = self
+        // Find execution-marked changes (selected=true with NotQueued status)
+        let execution_marked: Vec<String> = self
             .changes
             .iter()
-            .filter(|c| matches!(c.queue_status, QueueStatus::Queued))
+            .filter(|c| c.selected && matches!(c.queue_status, QueueStatus::NotQueued))
             .map(|c| c.id.clone())
             .collect();
 
-        if queued.is_empty() {
-            self.warning_message = Some("No queued changes to resume".to_string());
+        if execution_marked.is_empty() {
+            self.warning_message = Some("No execution-marked changes to resume".to_string());
             return None;
+        }
+
+        // Convert execution-marked changes to queued
+        for change in &mut self.changes {
+            if change.selected && matches!(change.queue_status, QueueStatus::NotQueued) {
+                change.queue_status = QueueStatus::Queued;
+            }
         }
 
         self.reset_for_run();
         self.mode = AppMode::Running;
         self.add_log(LogEntry::info(format!(
             "Resuming processing {} change(s)...",
-            queued.len()
+            execution_marked.len()
         )));
 
-        Some(TuiCommand::StartProcessing(queued))
+        Some(TuiCommand::StartProcessing(execution_marked))
     }
 
     /// Retry error changes - resets error changes to queued and returns their IDs
@@ -249,7 +258,9 @@ mod tests {
         app.stop_mode = StopMode::ForceStopped;
         app.error_change_id = Some("stale".to_string());
         app.orchestration_elapsed = Some(std::time::Duration::from_secs(4));
-        app.changes[0].queue_status = QueueStatus::Queued;
+        // Set execution mark (selected=true) with NotQueued status (Stopped mode policy)
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].selected = true;
 
         let cmd = app.resume_processing();
 
@@ -259,6 +270,8 @@ mod tests {
         assert!(app.orchestration_started_at.is_some());
         assert!(app.orchestration_elapsed.is_none());
         assert!(app.error_change_id.is_none());
+        // Change should be converted to Queued
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
     }
 
     #[test]
@@ -268,7 +281,9 @@ mod tests {
 
         app.mode = AppMode::Stopped;
         app.parallel_mode = true;
-        app.changes[0].queue_status = QueueStatus::Queued;
+        // Set execution mark (selected=true) with NotQueued status (Stopped mode policy)
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].selected = true;
 
         let cmd = app.resume_processing();
 
@@ -279,6 +294,8 @@ mod tests {
         } else {
             panic!("Expected StartProcessing command");
         }
+        // Change should be converted to Queued
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
     }
 
     #[test]

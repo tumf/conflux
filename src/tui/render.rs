@@ -629,7 +629,7 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
             Color::Yellow,
         ),
         AppMode::Stopped => (
-            "Stopped. F5: resume, Space: toggle queue, Ctrl+C: quit",
+            "Stopped. F5: resume, Space: toggle execution mark, Ctrl+C: quit",
             Color::DarkGray,
         ),
         AppMode::Select => ("", Color::White),

@@ -665,13 +665,17 @@ async fn run_tui_loop(
                                     if let Some(cancel) = &orchestrator_cancel {
                                         cancel.cancel();
                                     }
-                                    // Reset any in-flight change back to Queued
+                                    // Reset queue_status to NotQueued while preserving execution mark
                                     for change in &mut app.changes {
                                         if matches!(
                                             change.queue_status,
-                                            QueueStatus::Processing | QueueStatus::Archiving
+                                            QueueStatus::Processing
+                                                | QueueStatus::Archiving
+                                                | QueueStatus::Queued
                                         ) {
-                                            change.queue_status = QueueStatus::Queued;
+                                            // Set to NotQueued but preserve selected (execution mark)
+                                            change.queue_status = QueueStatus::NotQueued;
+                                            // selected field is preserved as-is (execution mark)
                                         }
                                     }
                                     app.current_change = None;

@@ -512,28 +512,22 @@ impl AppState {
                 }
             }
             AppMode::Stopped => {
-                // Allow queue modifications in Stopped mode (same as Running)
-                match &change.queue_status {
-                    QueueStatus::NotQueued => {
-                        change.queue_status = QueueStatus::Queued;
-                        change.selected = true;
-                        // Clear NEW flag when user adds to queue
-                        if change.is_new {
-                            change.is_new = false;
-                            self.new_change_count = self.new_change_count.saturating_sub(1);
-                        }
-                        let id = change.id.clone();
-                        self.add_log(LogEntry::info(format!("Added to queue: {}", id)));
-                        Some(TuiCommand::AddToQueue(id))
+                // In Stopped mode: only toggle execution mark (selected), keep queue_status as NotQueued
+                // This implements the "execution mark only in Stopped mode" policy
+                if matches!(change.queue_status, QueueStatus::NotQueued) {
+                    // Toggle execution mark
+                    change.selected = !change.selected;
+                    // Clear NEW flag when user interacts with the change
+                    if change.is_new {
+                        change.is_new = false;
+                        self.new_change_count = self.new_change_count.saturating_sub(1);
                     }
-                    QueueStatus::Queued => {
-                        change.queue_status = QueueStatus::NotQueued;
-                        change.selected = false;
-                        let id = change.id.clone();
-                        self.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
-                        Some(TuiCommand::RemoveFromQueue(id))
-                    }
-                    _ => None,
+                    // Do NOT change queue_status - stays NotQueued
+                    // Do NOT send AddToQueue/RemoveFromQueue commands
+                    None
+                } else {
+                    // Cannot toggle for other statuses (Processing, Completed, etc.)
+                    None
                 }
             }
             AppMode::Stopping
@@ -1203,7 +1197,7 @@ mod tests {
 
     #[test]
     fn test_toggle_selection_clears_new_badge_in_stopped_mode() {
-        // Test that adding to queue in Stopped mode clears the NEW badge
+        // Test that toggling execution mark in Stopped mode clears the NEW badge
         let changes = vec![create_approved_change("new-change", 0, 1)];
         let mut app = AppState::new(changes);
 
@@ -1211,23 +1205,24 @@ mod tests {
         app.changes[0].is_new = true;
         app.new_change_count = 1;
 
-        // Start processing and then stop
+        // Start processing and then stop (this will set queue_status to NotQueued)
         app.start_processing();
-        app.mode = AppMode::Stopped;
-
-        // Remove from queue first
-        let _ = app.toggle_selection();
+        app.handle_orchestrator_event(OrchestratorEvent::Stopped);
+        assert_eq!(app.mode, AppMode::Stopped);
         assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
 
-        // Reset new state for the add-to-queue test
+        // Reset new state for the toggle test
         app.changes[0].is_new = true;
         app.new_change_count = 1;
+        app.changes[0].selected = false;
 
-        // Add to queue should clear NEW flag
+        // Toggle execution mark should clear NEW flag
         let cmd = app.toggle_selection();
-        assert!(matches!(cmd, Some(TuiCommand::AddToQueue(_))));
+        assert!(cmd.is_none()); // No command in Stopped mode
         assert!(!app.changes[0].is_new);
         assert_eq!(app.new_change_count, 0);
+        assert!(app.changes[0].selected); // Execution mark added
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued); // Status unchanged
     }
 
     #[test]

@@ -8,8 +8,6 @@ use std::time::Instant;
 use crate::openspec::Change;
 use crate::task_parser;
 
-#[cfg(test)]
-use super::super::events::TuiCommand;
 use super::super::events::{LogEntry, OrchestratorEvent};
 use super::super::types::{AppMode, QueueStatus, StopMode};
 use super::change::ChangeState;
@@ -313,17 +311,19 @@ impl AppState {
                 if let Some(started) = self.orchestration_started_at {
                     self.orchestration_elapsed = Some(started.elapsed());
                 }
-                // Reset any in-flight change back to Queued (same as force stop)
+                // Reset queue_status to NotQueued while preserving execution mark (selected)
                 for change in &mut self.changes {
                     if matches!(
                         change.queue_status,
-                        QueueStatus::Processing | QueueStatus::Archiving
+                        QueueStatus::Processing | QueueStatus::Archiving | QueueStatus::Queued
                     ) {
-                        // Record elapsed time before resetting status
+                        // Record elapsed time before resetting status (for processing/archiving)
                         if let Some(started) = change.started_at {
                             change.elapsed_time = Some(started.elapsed());
                         }
-                        change.queue_status = QueueStatus::Queued;
+                        // Set to NotQueued but preserve selected (execution mark)
+                        change.queue_status = QueueStatus::NotQueued;
+                        // selected field is preserved as-is (execution mark)
                     }
                 }
                 self.add_log(LogEntry::warn("Processing stopped"));
@@ -881,11 +881,11 @@ fn test_task_completion_in_stopped_mode_does_not_auto_queue() {
 
 #[test]
 fn test_explicit_queue_addition_in_stopped_mode_works() {
-    // Scenario: Explicit queue addition in Stopped mode works
+    // Scenario: Space in Stopped mode toggles execution mark only
     // WHEN TUI is in Stopped mode
-    // AND user presses Space on a not-queued change (even if tasks are 100% complete)
-    // THEN the change SHALL be added to the queue
-    // AND the change queue_status SHALL become Queued
+    // AND user presses Space on a not-marked change
+    // THEN the execution mark SHALL be added (selected=true)
+    // AND the queue_status SHALL remain NotQueued
 
     let changes = vec![create_approved_change("change-a", 5, 5)]; // 100% complete
     let mut app = AppState::new(changes);
@@ -894,17 +894,18 @@ fn test_explicit_queue_addition_in_stopped_mode_works() {
     app.start_processing();
     app.mode = AppMode::Stopped;
 
-    // Set to NotQueued (simulating user dequeued or it was never queued)
+    // Set to NotQueued with no execution mark (simulating stopped state)
     app.changes[0].queue_status = QueueStatus::NotQueued;
     app.changes[0].selected = false;
 
-    // User explicitly adds to queue via Space key
+    // User toggles execution mark via Space key
     let cmd = app.toggle_selection();
 
-    // Should return AddToQueue command
-    assert!(matches!(cmd, Some(TuiCommand::AddToQueue(_))));
-    // Queue status should become Queued
-    assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+    // Should return None (no command in Stopped mode)
+    assert!(cmd.is_none());
+    // Queue status should remain NotQueued
+    assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+    // Execution mark should be added
     assert!(app.changes[0].selected);
 }
 
@@ -1151,18 +1152,33 @@ fn test_stopped_event_cleans_up_processing_changes() {
     // Simulate processing state for multiple changes
     app.changes[0].queue_status = QueueStatus::Processing;
     app.changes[0].started_at = Some(Instant::now());
+    app.changes[0].selected = true; // Execution mark
     app.changes[1].queue_status = QueueStatus::Archiving;
     app.changes[1].started_at = Some(Instant::now());
+    app.changes[1].selected = true; // Execution mark
     app.changes[2].queue_status = QueueStatus::Queued;
+    app.changes[2].selected = true; // Execution mark
 
     // Handle Stopped event (graceful stop)
     app.handle_orchestrator_event(OrchestratorEvent::Stopped);
 
-    // Processing and Archiving should be reset to Queued
-    assert!(matches!(app.changes[0].queue_status, QueueStatus::Queued));
-    assert!(matches!(app.changes[1].queue_status, QueueStatus::Queued));
-    // Queued should remain Queued
-    assert!(matches!(app.changes[2].queue_status, QueueStatus::Queued));
+    // Processing, Archiving, and Queued should all be reset to NotQueued
+    assert!(matches!(
+        app.changes[0].queue_status,
+        QueueStatus::NotQueued
+    ));
+    assert!(matches!(
+        app.changes[1].queue_status,
+        QueueStatus::NotQueued
+    ));
+    assert!(matches!(
+        app.changes[2].queue_status,
+        QueueStatus::NotQueued
+    ));
+    // Execution marks (selected) should be preserved
+    assert!(app.changes[0].selected);
+    assert!(app.changes[1].selected);
+    assert!(app.changes[2].selected);
     // Mode should be Stopped
     assert_eq!(app.mode, AppMode::Stopped);
     // current_change should be cleared
