@@ -4,37 +4,13 @@
 Defines workspace cleanup behavior after parallel execution.
 ## Requirements
 ### Requirement: Workspace Cleanup Guard
+order-based再分析ループでは、MergeWaitのchangeに対応するworktreeをcleanupから除外し、`WorkspaceCleanupGuard`のDropで削除されないようにしなければならない（MUST）。
 
-`WorkspaceCleanupGuard`は、失敗したワークスペースを正しく保護し、正しい順序でクリーンアップを実行しなければならない（MUST）。
-
-ガードは以下を実装する：
-1. ワークスペース名とパスの両方を追跡する
-2. `preserve()`で指定されたワークスペースはDrop時にクリーンアップしない
-3. Drop時のクリーンアップでは、ワークツリー削除を先に実行し、その後ブランチを削除する
-
-#### Scenario: 失敗したワークスペースの保護
-
-- **GIVEN** ワークスペースAが作成され、トラッキングされている
-- **AND** ワークスペースAの処理が失敗した
-- **WHEN** `cleanup_guard.preserve("workspace-a")`が呼ばれる
-- **AND** ガードがDrop時にクリーンアップを試みる
-- **THEN** ワークスペースAはクリーンアップされない
-- **AND** 他の保護されていないワークスペースはクリーンアップされる
-
-#### Scenario: ワークツリー削除後のブランチ削除
-
-- **GIVEN** ワークスペースがトラッキングされている（名前とパスの両方）
-- **WHEN** ガードがDrop時にクリーンアップを実行する
-- **THEN** 最初に`git worktree remove <path> --force`が実行される
-- **AND** その後`git branch -D <branch_name>`が実行される
-- **AND** Gitエラー（ブランチが使用中）が発生しない
-
-#### Scenario: ワークスペースのトラッキング時にパスも保持
-
-- **GIVEN** 新しいワークスペースが作成された（名前: "ws-test", パス: "/tmp/ws-test"）
-- **WHEN** `cleanup_guard.track("ws-test", PathBuf::from("/tmp/ws-test"))`が呼ばれる
-- **THEN** ガードはワークスペース名とパスの両方を保持する
-- **AND** Drop時にパスを使用してワークツリーを削除できる
+#### Scenario: MergeWaitのworktreeはcleanupから除外される
+- **GIVEN** order-based再分析ループで変更Aが `MergeDeferred` になっている
+- **AND** 変更Aのworktreeが `WorkspaceCleanupGuard` にトラッキングされている
+- **WHEN** 正常系のcleanupまたはガードのDropが実行される
+- **THEN** 変更Aのworktreeは削除されない
 
 ### Requirement: Guard Integration with Parallel Executor
 
@@ -85,4 +61,3 @@ Defines workspace cleanup behavior after parallel execution.
 - **WHEN** ブランチ削除が失敗する
 - **THEN** `"Failed to delete git branch '<name>': <error>"`がdebugログに出力される
 - **AND** エラーは抑制される（パニックしない）
-
