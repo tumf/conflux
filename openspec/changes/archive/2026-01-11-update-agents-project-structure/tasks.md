@@ -8,7 +8,7 @@
   - `hooks.rs` - Lifecycle hook execution
   - `vcs/` - VCS backend trait abstraction (mod.rs, commands.rs, git/, jj/)
   - `history.rs` - Apply context history management
-  - `task_parser.rs` - Native task.md parser
+  - `task_parser.rs` - Native tasks.md parser
   - `parallel/` - Parallel execution (mod.rs, executor.rs, types.rs, events.rs, conflict.rs, cleanup.rs)
   - `parallel_run_service.rs` - Parallel execution service
   - `agent.rs` - AI agent command execution

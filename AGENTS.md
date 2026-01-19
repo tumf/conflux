@@ -108,7 +108,7 @@ src/
   history.rs            # Apply, archive, and resolve context history management
   hooks.rs              # Lifecycle hook execution
   parallel_run_service.rs # Parallel execution service
-  task_parser.rs        # Native task.md parser
+  task_parser.rs        # Native tasks.md parser
   templates.rs          # Configuration templates
 
   # Execution (shared logic between serial and parallel modes)
