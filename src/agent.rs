@@ -28,7 +28,7 @@ CRITICAL OPERATIONAL CONSTRAINTS:
 </system-reminder>
 
 Move tasks to Future Work ONLY if they meet ONE of these criteria:
-1. **Human work**: Requires human decision-making, judgment, or manual intervention (e.g., 'Ask user for design preference', 'Manual code review')
+1. **Human work**: Requires human decision-making, judgment, or manual intervention (e.g., 'Ask user for design preference', 'Manual code review', 'Manual TUI verification')
 2. **External system work**: Requires external system deployment, approval, or configuration changes outside this repository (e.g., 'Deploy to production', 'Configure external API', 'Update cloud infrastructure')
 3. **Long-wait verification**: Requires extended waiting periods for validation (e.g., 'Monitor performance for one week', 'Wait for stakeholder approval')
 
