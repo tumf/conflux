@@ -1,5 +1,4 @@
 ## 1. Implementation
-- [ ] 1.1 `src/tui/state/events.rs` の `ProcessingCompleted` と `ArchiveStarted` の進捗再取得処理を見直し、worktree上のアーカイブ済みtasks.mdを優先的に参照する（進捗が0/0のときは既存値を維持する）ことを確認する（該当ハンドラの分岐とタスク進捗更新を確認）。
-- [ ] 1.2 `src/tui/state/events.rs` の進捗更新ロジックに、アーカイブ移動直後（activeが消えた状態）でもworktreeのアーカイブ先から進捗を取得するフォールバックを追加する（`parse_archived_change_with_worktree_fallback` の呼び出しを確認）。
-- [ ] 1.3 `src/tui/state/events.rs` のテスト（アーカイブ途中のworktree移動を想定したケース）を追加/更新し、0/0にならず進捗が保持されることを確認する（該当テストの追加/更新を確認）。
-- [ ] 1.4 必要に応じて `cargo test` または該当テストを実行し、テストがパスすることを確認する（コマンドと結果を記録）。
+- [ ] 1.1 `src/tui/runner.rs` L356-358 の `Ok(progress) =>` ブランチを修正し、`progress.total == 0` の場合は `parse_archived_change_with_worktree_fallback` を試し、それでも 0/0 なら既存値を保持するようにする
+- [ ] 1.2 `cargo test` で既存テストがパスすることを確認する
+- [ ] 1.3 TUIでアーカイブ処理を実行し、ファイル移動直後の自動更新で進捗が0にならないことを手動確認する
