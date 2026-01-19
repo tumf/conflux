@@ -110,15 +110,15 @@ impl OrchestratorState {
 
         let completed = change_statuses
             .iter()
-            .filter(|c| c.status == "complete")
+            .filter(|c| c.queue_status.as_ref().is_some_and(|s| s == "completed"))
             .count();
         let in_progress = change_statuses
             .iter()
-            .filter(|c| c.status == "in_progress")
+            .filter(|c| c.queue_status.as_ref().is_some_and(|s| s == "processing"))
             .count();
         let pending = change_statuses
             .iter()
-            .filter(|c| c.status == "pending")
+            .filter(|c| c.queue_status.as_ref().is_some_and(|s| s == "queued"))
             .count();
 
         Self {
@@ -158,17 +158,27 @@ fn refresh_summary(state: &mut OrchestratorState) {
     state.completed_changes = state
         .changes
         .iter()
-        .filter(|change| change.status == "complete")
+        .filter(|change| {
+            change
+                .queue_status
+                .as_ref()
+                .is_some_and(|s| s == "completed")
+        })
         .count();
     state.in_progress_changes = state
         .changes
         .iter()
-        .filter(|change| change.status == "in_progress")
+        .filter(|change| {
+            change
+                .queue_status
+                .as_ref()
+                .is_some_and(|s| s == "processing")
+        })
         .count();
     state.pending_changes = state
         .changes
         .iter()
-        .filter(|change| change.status == "pending")
+        .filter(|change| change.queue_status.as_ref().is_some_and(|s| s == "queued"))
         .count();
     state.last_updated = chrono::Utc::now().to_rfc3339();
 }
@@ -753,9 +763,20 @@ mod tests {
             create_test_change("change-c", 4, 4),
         ];
 
-        let state = OrchestratorState::from_changes(&changes);
+        let mut state = OrchestratorState::from_changes(&changes);
 
+        // Initial state: no queue_status set, so all counts should be 0
         assert_eq!(state.total_changes, 3);
+        assert_eq!(state.pending_changes, 0);
+        assert_eq!(state.in_progress_changes, 0);
+        assert_eq!(state.completed_changes, 0);
+
+        // Set queue_status to test aggregation
+        state.changes[0].queue_status = Some("queued".to_string());
+        state.changes[1].queue_status = Some("processing".to_string());
+        state.changes[2].queue_status = Some("completed".to_string());
+        refresh_summary(&mut state);
+
         assert_eq!(state.pending_changes, 1);
         assert_eq!(state.in_progress_changes, 1);
         assert_eq!(state.completed_changes, 1);

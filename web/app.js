@@ -508,35 +508,33 @@ class WebMonitor {
     calculateStats(changes) {
         return {
             total: changes.length,
-            completed: changes.filter(c => c.status === 'complete').length,
-            inProgress: changes.filter(c => c.status === 'in_progress').length,
-            pending: changes.filter(c => c.status === 'pending').length,
+            completed: changes.filter(c => c.queue_status === 'completed').length,
+            inProgress: changes.filter(c => c.queue_status === 'processing').length,
+            pending: changes.filter(c => c.queue_status === 'queued').length,
         };
     }
 
     renderChangeCard(change) {
         const progressPercent = change.progress_percent.toFixed(1);
-        const isComplete = change.status === 'complete';
+        const isComplete = change.queue_status === 'completed';
 
-        // Use queue_status if available, otherwise fall back to status
-        const displayStatus = change.queue_status || change.status.replace('_', ' ');
-        const statusClass = change.queue_status ? change.queue_status.replace(' ', '-') : change.status;
+        // Use queue_status exclusively (no fallback to legacy status)
+        const displayStatus = change.queue_status || 'not queued';
+        const statusClass = displayStatus.replace(' ', '-');
 
-        // Status icons mapping
+        // Status icons mapping (TUI QueueStatus aligned)
         const statusIcons = {
             'not queued': '○',
             'queued': '⏳',
             'processing': '⚙️',
             'completed': '✅',
+            'accepting': '✓',
             'archiving': '📦',
             'archived': '📥',
             'merged': '🔀',
             'merge wait': '⏸️',
             'resolving': '🔧',
             'error': '❌',
-            'pending': '○',
-            'in_progress': '⚙️',
-            'complete': '✅',
         };
         const statusIcon = statusIcons[displayStatus] || '•';
 
