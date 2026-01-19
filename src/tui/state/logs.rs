@@ -33,9 +33,13 @@ impl AppState {
                 self.log_scroll_offset = self.log_scroll_offset.saturating_sub(1);
             }
         }
-        // Auto-scroll to bottom if enabled
+        // Auto-scroll to bottom if enabled, otherwise maintain relative position
         if self.log_auto_scroll {
             self.log_scroll_offset = 0;
+        } else {
+            // When auto-scroll is disabled, increment offset to maintain view position
+            // This compensates for the new log entry shifting the display
+            self.log_scroll_offset += 1;
         }
     }
 

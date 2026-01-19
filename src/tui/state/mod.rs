@@ -1525,6 +1525,79 @@ mod tests {
         assert_eq!(app.log_scroll_offset, 0);
     }
 
+    #[test]
+    fn test_scroll_logs_up_disables_auto_scroll() {
+        use crate::tui::events::LogEntry;
+
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Add some logs
+        for i in 0..20 {
+            app.add_log(LogEntry::info(format!("Log entry {}", i)));
+        }
+
+        // Initially auto-scroll is enabled
+        assert!(app.log_auto_scroll);
+        assert_eq!(app.log_scroll_offset, 0);
+
+        // Scroll up should disable auto-scroll
+        app.scroll_logs_up(5);
+
+        assert!(
+            !app.log_auto_scroll,
+            "Auto-scroll should be disabled after scrolling up"
+        );
+        assert_eq!(app.log_scroll_offset, 5);
+
+        // Adding a new log should increment scroll offset to maintain view position
+        app.add_log(LogEntry::info("New log entry"));
+
+        assert!(!app.log_auto_scroll, "Auto-scroll should remain disabled");
+        assert_eq!(
+            app.log_scroll_offset, 6,
+            "Scroll offset should increment to maintain view position when auto-scroll is disabled"
+        );
+
+        // Adding more logs should continue incrementing
+        app.add_log(LogEntry::info("Another log entry"));
+        assert_eq!(app.log_scroll_offset, 7);
+    }
+
+    #[test]
+    fn test_scroll_logs_down_to_bottom_enables_auto_scroll() {
+        use crate::tui::events::LogEntry;
+
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Add some logs
+        for i in 0..20 {
+            app.add_log(LogEntry::info(format!("Log entry {}", i)));
+        }
+
+        // Scroll up to disable auto-scroll
+        app.scroll_logs_up(10);
+        assert!(!app.log_auto_scroll);
+        assert_eq!(app.log_scroll_offset, 10);
+
+        // Scroll down but not to bottom
+        app.scroll_logs_down(5);
+        assert!(
+            !app.log_auto_scroll,
+            "Auto-scroll should remain disabled when not at bottom"
+        );
+        assert_eq!(app.log_scroll_offset, 5);
+
+        // Scroll down to bottom
+        app.scroll_logs_down(10); // More than offset, should clamp to 0
+        assert!(
+            app.log_auto_scroll,
+            "Auto-scroll should be enabled when at bottom"
+        );
+        assert_eq!(app.log_scroll_offset, 0);
+    }
+
     // === Tests for stop mode ===
 
     #[test]
