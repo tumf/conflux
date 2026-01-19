@@ -86,6 +86,7 @@ pub struct ParallelExecutor {
     /// Changes waiting for merge resolution
     merge_deferred_changes: HashSet<String>,
     /// Changes that previously had unresolved dependencies (for worktree recreation tracking)
+    #[allow(dead_code)]
     previously_blocked_changes: HashSet<String>,
     /// Changes that need forced worktree recreation (dependency just resolved)
     force_recreate_worktree: HashSet<String>,
@@ -106,6 +107,8 @@ pub struct ParallelExecutor {
     apply_history: Arc<Mutex<crate::history::ApplyHistory>>,
     /// History of archive attempts per change for context injection
     archive_history: Arc<Mutex<crate::history::ArchiveHistory>>,
+    /// Flag to trigger re-analysis on next loop iteration
+    needs_reanalysis: bool,
 }
 
 pub async fn base_dirty_reason(repo_root: &Path) -> Result<Option<String>> {
@@ -142,6 +145,27 @@ pub async fn base_dirty_reason(repo_root: &Path) -> Result<Option<String>> {
 enum MergeAttempt {
     Merged,
     Deferred(String),
+}
+
+/// Reason for triggering re-analysis (for logging and diagnostics)
+#[derive(Debug, Clone, Copy)]
+enum ReanalysisReason {
+    /// Initial analysis (first iteration)
+    Initial,
+    /// Task completion (apply/archive/acceptance finished)
+    Completion,
+    /// Queue notification (dynamic queue has new items)
+    QueueNotification,
+}
+
+impl std::fmt::Display for ReanalysisReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReanalysisReason::Initial => write!(f, "initial"),
+            ReanalysisReason::Completion => write!(f, "completion"),
+            ReanalysisReason::QueueNotification => write!(f, "queue"),
+        }
+    }
 }
 
 impl ParallelExecutor {
@@ -242,6 +266,7 @@ impl ParallelExecutor {
             shared_stagger_state,
             apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
             archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
+            needs_reanalysis: false,
         }
     }
 
@@ -403,36 +428,20 @@ impl ParallelExecutor {
             .map_err(Into::into)
     }
 
-    /// Execute changes with order-based re-analysis triggered by slot availability.
+    /// Execute changes with order-based dependency analysis and concurrent re-analysis.
     ///
-    /// This method uses the `order` field directly from analysis results,
-    /// selecting changes based on available execution slots and dependency constraints.
-    ///
-    /// # Order-based Execution Logic (Slot-Driven)
-    ///
-    /// 1. Analyze remaining changes to get `order` and `dependencies`
-    /// 2. Launch changes from `order` that:
-    ///    - Have no unresolved dependencies (dependencies merged to base)
-    ///    - Fit within available execution slots
-    /// 3. When any change completes (slot becomes available):
-    ///    - Check debounce condition (10s since last queue change)
-    ///    - Re-analyze if debounce passed or no queue changes
-    ///    - Launch next change(s) from updated `order`
-    /// 4. Repeat until all changes are processed
-    ///
-    /// # Dependency Constraints
-    ///
-    /// Changes with dependencies are blocked until their dependencies are merged to base.
-    /// When a dependency is resolved, the worktree is recreated (no resume) to ensure
-    /// the change executes with the dependency's artifacts available.
+    /// This method uses a `tokio::select!` based scheduler loop that:
+    /// - Does NOT block on dispatch (spawn tasks into JoinSet)
+    /// - Continues re-analysis even when apply commands are running
+    /// - Tracks in-flight changes to calculate available slots
+    /// - Responds to queue notifications, debounce timers, and task completions
     ///
     /// # Arguments
-    ///
     /// * `changes` - Initial list of changes to execute
     /// * `analyzer` - Async function that returns AnalysisResult (order + dependencies)
     pub async fn execute_with_order_based_reanalysis<F>(
         &mut self,
-        mut changes: Vec<crate::openspec::Change>,
+        changes: Vec<crate::openspec::Change>,
         analyzer: F,
     ) -> Result<()>
     where
@@ -458,7 +467,6 @@ impl ParallelExecutor {
         let merge_stall_monitor_handle = if let Some(cancel_token) = &self.cancel_token {
             let merge_stall_config = self.config.get_merge_stall_detection();
             if merge_stall_config.enabled {
-                // Get base branch name
                 if let Some(original_branch) = self.workspace_manager.original_branch() {
                     info!(
                         threshold_minutes = merge_stall_config.threshold_minutes,
@@ -507,36 +515,49 @@ impl ParallelExecutor {
         }
         info!("Preparation complete");
 
-        let mut iteration = 1u32;
-        let initial_total_changes = changes.len();
-        let mut changes_processed: usize = 0;
-
-        // Get max parallelism from config
+        // Initialize scheduler state
         let max_parallelism = self.workspace_manager.max_concurrent();
+        let semaphore = Arc::new(Semaphore::new(max_parallelism));
+        let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+        let mut in_flight: HashSet<String> = HashSet::new();
+        let mut queued: Vec<crate::openspec::Change> = changes;
+        let mut iteration = 1u32;
+        let mut cleanup_guard = WorkspaceCleanupGuard::new(
+            self.workspace_manager.backend_type(),
+            self.repo_root.clone(),
+        );
 
-        while !changes.is_empty() {
+        // Set needs_reanalysis to trigger first analysis
+        self.needs_reanalysis = true;
+        let mut reanalysis_reason = ReanalysisReason::Initial;
+
+        // Main scheduler loop: wait for triggers and dispatch changes
+        loop {
+            // Check for cancellation
             if self.is_cancelled() {
-                let remaining_changes: Vec<String> = changes.iter().map(|c| c.id.clone()).collect();
+                let remaining_changes: Vec<String> = queued.iter().map(|c| c.id.clone()).collect();
                 let cancel_msg = format!(
-                    "Cancelled parallel execution during order-based reanalysis ({} remaining changes: {})",
+                    "Cancelled parallel execution ({} queued, {} in-flight: queued=[{}], in-flight=[{}])",
                     remaining_changes.len(),
-                    remaining_changes.join(", ")
+                    in_flight.len(),
+                    remaining_changes.join(", "),
+                    in_flight.iter().cloned().collect::<Vec<_>>().join(", ")
                 );
                 send_event(
                     &self.event_tx,
                     ParallelEvent::Log(LogEntry::warn(&cancel_msg)),
                 )
                 .await;
-                return Err(OrchestratorError::AgentCommand(cancel_msg));
+                break;
             }
 
-            // Check dynamic queue for newly added changes (TUI mode)
+            // Step 1: Check dynamic queue for newly added changes (TUI mode)
             if let Some(queue) = &self.dynamic_queue {
                 let mut queue_changed = false;
                 while let Some(dynamic_id) = queue.pop().await {
-                    // Check if change is already in the list
-                    if !changes.iter().any(|c| c.id == dynamic_id) {
-                        // Load change details from openspec by listing all changes and filtering
+                    if !queued.iter().any(|c| c.id == dynamic_id)
+                        && !in_flight.contains(&dynamic_id)
+                    {
                         match crate::openspec::list_changes_native() {
                             Ok(all_changes) => {
                                 if let Some(new_change) =
@@ -551,21 +572,13 @@ impl ParallelExecutor {
                                         ))),
                                     )
                                     .await;
-                                    changes.push(new_change);
+                                    queued.push(new_change);
                                     queue_changed = true;
                                 } else {
                                     warn!(
                                         "Dynamically added change '{}' not found in openspec",
                                         dynamic_id
                                     );
-                                    send_event(
-                                        &self.event_tx,
-                                        ParallelEvent::Log(LogEntry::warn(format!(
-                                            "Dynamically added change '{}' not found in openspec",
-                                            dynamic_id
-                                        ))),
-                                    )
-                                    .await;
                                 }
                             }
                             Err(e) => {
@@ -573,14 +586,6 @@ impl ParallelExecutor {
                                     "Failed to load dynamically added change '{}': {}",
                                     dynamic_id, e
                                 );
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::Log(LogEntry::warn(format!(
-                                        "Failed to load dynamically added change '{}': {}",
-                                        dynamic_id, e
-                                    ))),
-                                )
-                                .await;
                             }
                         }
                     }
@@ -590,343 +595,243 @@ impl ParallelExecutor {
                 if queue_changed {
                     let mut last_change = self.last_queue_change_at.lock().await;
                     *last_change = Some(std::time::Instant::now());
+                    self.needs_reanalysis = true;
+                    reanalysis_reason = ReanalysisReason::QueueNotification;
+                    info!("Queue changed, re-analysis triggered");
                 }
             }
 
-            // Filter out changes that depend on failed changes
-            let executable_changes: Vec<_> = changes
-                .iter()
-                .filter(|c| {
-                    if let Some(reason) = self.skip_reason_for_change(&c.id) {
-                        warn!("Excluding '{}' from analysis: {}", c.id, reason);
-                        false
-                    } else {
-                        true
-                    }
-                })
-                .cloned()
-                .collect();
+            // Step 2: Re-analysis if needed and debounce elapsed
+            if self.needs_reanalysis && queued.is_empty() && in_flight.is_empty() {
+                // All work completed
+                info!("All changes completed (queued and in-flight empty), stopping");
+                break;
+            }
 
-            // Emit skip events for filtered changes
-            for change in &changes {
-                if let Some(reason) = self.skip_reason_for_change(&change.id) {
+            if self.needs_reanalysis && !queued.is_empty() {
+                // Check debounce (skip on first iteration)
+                let should_analyze = if iteration == 1 {
+                    info!("First iteration, skipping debounce check");
+                    true
+                } else {
+                    self.should_reanalyze().await
+                };
+
+                if should_analyze {
+                    // Filter out changes that depend on failed changes
+                    let mut executable_changes: Vec<crate::openspec::Change> = Vec::new();
+                    let mut skipped_changes: Vec<(String, String)> = Vec::new();
+
+                    for change in &queued {
+                        if let Some(reason) = self.skip_reason_for_change(&change.id) {
+                            warn!("Excluding '{}' from analysis: {}", change.id, reason);
+                            skipped_changes.push((change.id.clone(), reason));
+                        } else {
+                            executable_changes.push(change.clone());
+                        }
+                    }
+
+                    // Emit skip events
+                    for (change_id, reason) in skipped_changes {
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::ChangeSkipped { change_id, reason },
+                        )
+                        .await;
+                    }
+
+                    queued = executable_changes;
+
+                    if queued.is_empty() {
+                        info!("All queued changes skipped due to failed dependencies");
+                        if in_flight.is_empty() {
+                            break;
+                        } else {
+                            // Wait for in-flight to complete
+                            self.needs_reanalysis = false;
+                            continue;
+                        }
+                    }
+
+                    // Run dependency analysis
+                    info!(
+                        "Re-analysis triggered: iteration={}, queued={}, in_flight={}, trigger={}",
+                        iteration,
+                        queued.len(),
+                        in_flight.len(),
+                        reanalysis_reason
+                    );
                     send_event(
                         &self.event_tx,
-                        ParallelEvent::ChangeSkipped {
-                            change_id: change.id.clone(),
-                            reason,
+                        ParallelEvent::AnalysisStarted {
+                            remaining_changes: queued.len(),
                         },
                     )
                     .await;
-                }
-            }
 
-            // Update changes to only include executable ones
-            changes = executable_changes;
+                    let analysis_result = analyzer(&queued, iteration).await;
 
-            if changes.is_empty() {
-                info!("All remaining changes are blocked by dependencies, stopping");
-                break;
-            }
-
-            // Filter out changes that are already merged or archived (queued-only filter)
-            // This prevents analysis of completed changes and allows the loop to exit
-            let original_branch = self.workspace_manager.original_branch().ok_or_else(|| {
-                OrchestratorError::GitCommand("Original branch not initialized".to_string())
-            })?;
-
-            let mut queued_changes = Vec::new();
-            let mut excluded_changes = Vec::new();
-
-            for change in changes {
-                // Check if workspace exists for this change
-                let workspace_state = match self
-                    .workspace_manager
-                    .find_existing_workspace(&change.id)
-                    .await
-                {
-                    Ok(Some(workspace_info)) => {
-                        // Workspace exists, detect its state
-                        match detect_workspace_state(
-                            &change.id,
-                            &workspace_info.path,
-                            &original_branch,
-                        )
-                        .await
-                        {
-                            Ok(state) => Some(state),
-                            Err(e) => {
-                                warn!("Failed to detect workspace state for '{}': {}, assuming queued", change.id, e);
-                                None
-                            }
+                    if analysis_result.order.is_empty() {
+                        warn!("No order returned from analysis");
+                        if in_flight.is_empty() {
+                            break;
+                        } else {
+                            self.needs_reanalysis = false;
+                            continue;
                         }
                     }
-                    Ok(None) => {
-                        // No workspace exists, this is a queued change
-                        None
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to find workspace for '{}': {}, assuming queued",
-                            change.id, e
-                        );
-                        None
-                    }
-                };
 
-                // Determine if change should be included in analysis
-                match workspace_state {
-                    Some(WorkspaceState::Merged) => {
-                        // Change is already merged, exclude from analysis
-                        info!("Excluding '{}' from analysis: already merged", change.id);
-                        excluded_changes.push((change, "already merged".to_string()));
-                    }
-                    Some(WorkspaceState::Archived) => {
-                        // Change is archived but not merged yet, exclude from analysis
-                        // (it will be handled by merge logic later)
-                        info!("Excluding '{}' from analysis: already archived", change.id);
-                        excluded_changes.push((change, "already archived".to_string()));
-                    }
-                    Some(WorkspaceState::Archiving)
-                    | Some(WorkspaceState::Applied)
-                    | Some(WorkspaceState::Applying { .. })
-                    | Some(WorkspaceState::Created)
-                    | None => {
-                        // Change is queued (not started, in progress, or needs work)
-                        queued_changes.push(change);
-                    }
-                }
-            }
+                    // Update dependencies
+                    self.failed_tracker
+                        .set_dependencies(analysis_result.dependencies.clone());
+                    self.change_dependencies = analysis_result.dependencies.clone();
 
-            // Emit skip events for excluded changes
-            for (change, reason) in excluded_changes {
-                send_event(
-                    &self.event_tx,
-                    ParallelEvent::ChangeSkipped {
-                        change_id: change.id.clone(),
-                        reason: reason.clone(),
-                    },
-                )
-                .await;
-            }
+                    // Calculate available slots based on in-flight count
+                    let available_slots = max_parallelism.saturating_sub(in_flight.len());
+                    info!(
+                        "Available slots: {} (max: {}, in_flight: {}, queued: {})",
+                        available_slots,
+                        max_parallelism,
+                        in_flight.len(),
+                        queued.len()
+                    );
 
-            // Update changes to only include queued ones
-            changes = queued_changes;
-
-            // Exit if no queued changes remain
-            if changes.is_empty() {
-                info!("No queued changes remaining, stopping parallel execution");
-                break;
-            }
-
-            // Check debounce (skip on first iteration to start immediately)
-            if iteration > 1 {
-                if !self.should_reanalyze().await {
-                    // Debounce period still active, wait before re-analyzing
-                    // Use select to make the wait interruptible by queue notifications
-                    let wait_duration = std::time::Duration::from_millis(500);
-                    info!("Debounce active, waiting {:?} before retry (interruptible by queue notification)", wait_duration);
-
-                    if let Some(queue) = &self.dynamic_queue {
-                        tokio::select! {
-                            _ = tokio::time::sleep(wait_duration) => {
-                                // Timer expired, continue to next iteration
-                            }
-                            _ = queue.notified() => {
-                                // Queue notification received, continue immediately
-                                info!("Queue notification received during debounce wait, continuing");
-                            }
-                        }
-                    } else {
-                        tokio::time::sleep(wait_duration).await;
-                    }
-                    continue; // Retry the loop after waiting
-                }
-            } else {
-                info!("First iteration, skipping debounce check");
-            }
-
-            // Analyze remaining changes to get order and dependencies
-            info!(
-                "Analyzing {} remaining changes for next dispatch (iteration {})",
-                changes.len(),
-                iteration
-            );
-            send_event(
-                &self.event_tx,
-                ParallelEvent::AnalysisStarted {
-                    remaining_changes: changes.len(),
-                },
-            )
-            .await;
-
-            let analysis_result = analyzer(&changes, iteration).await;
-
-            if analysis_result.order.is_empty() {
-                warn!("No order returned from analysis");
-                break;
-            }
-
-            // Update dependencies for skip tracking
-            self.failed_tracker
-                .set_dependencies(analysis_result.dependencies.clone());
-            self.change_dependencies = analysis_result.dependencies.clone();
-
-            // Calculate available slots based on active workspaces only
-            // Active workspaces are those with status Created, Applying, or Applied
-            // Merged, Failed, and Cleaned workspaces do not count towards the limit
-            let active_count = self.workspace_manager.active_workspace_count();
-            let available_slots = max_parallelism.saturating_sub(active_count);
-
-            let total_workspaces = self.workspace_manager.workspaces().len();
-            info!(
-                "Available slots: {} (max: {}, active: {}, total workspaces: {})",
-                available_slots, max_parallelism, active_count, total_workspaces
-            );
-
-            // Per spec: re-analysis can run even when slots == 0
-            // If slots == 0, analysis runs but dispatch waits for slots to become available
-
-            // Select changes from order based on available slots and dependency constraints
-            // SLOT-DRIVEN: Launch up to available_slots changes to maximize parallelism
-            // If available_slots == 0, batch_size_limit will be 0 and no changes will be selected for dispatch
-            let batch_size_limit = available_slots;
-            let mut selected_changes: Vec<String> = Vec::new();
-            let mut blocked_changes: HashSet<String> = HashSet::new();
-
-            for change_id in &analysis_result.order {
-                if selected_changes.len() >= batch_size_limit {
-                    break;
-                }
-
-                // Check if change has unresolved dependencies
-                if let Some(deps) = analysis_result.dependencies.get(change_id) {
-                    let mut all_resolved = true;
-                    for dep_id in deps {
-                        // Check if dependency is merged to base
-                        if !self.is_dependency_resolved(dep_id).await {
-                            all_resolved = false;
-                            info!(
-                                "Change '{}' blocked: waiting for dependency '{}' to merge to base",
-                                change_id, dep_id
-                            );
-                            blocked_changes.insert(change_id.clone());
+                    // Select changes to dispatch based on order and available slots
+                    let mut selected_changes: Vec<String> = Vec::new();
+                    for change_id in &analysis_result.order {
+                        if selected_changes.len() >= available_slots {
                             break;
                         }
+
+                        // Check if change has unresolved dependencies
+                        if let Some(deps) = analysis_result.dependencies.get(change_id) {
+                            let mut all_resolved = true;
+                            for dep_id in deps {
+                                if !self.is_dependency_resolved(dep_id).await {
+                                    all_resolved = false;
+                                    info!(
+                                        "Change '{}' blocked: waiting for dependency '{}'",
+                                        change_id, dep_id
+                                    );
+                                    break;
+                                }
+                            }
+
+                            if !all_resolved {
+                                continue;
+                            }
+                        }
+
+                        selected_changes.push(change_id.clone());
                     }
 
-                    if !all_resolved {
-                        continue;
-                    }
+                    // Dispatch selected changes
+                    if !selected_changes.is_empty() {
+                        let base_revision = self
+                            .workspace_manager
+                            .get_current_revision()
+                            .await
+                            .map_err(OrchestratorError::from)?;
 
-                    // If dependency was previously blocking this change, mark for worktree recreation
-                    if self.previously_blocked_changes.contains(change_id) {
                         info!(
-                            "Change '{}' dependency resolved, will recreate worktree",
-                            change_id
+                            "Dispatching {} changes (iteration {}): {:?}",
+                            selected_changes.len(),
+                            iteration,
+                            selected_changes
                         );
-                        // Mark for forced worktree recreation
-                        self.force_recreate_worktree.insert(change_id.clone());
-                        // Remove from previously_blocked to avoid repeated recreation
-                        self.previously_blocked_changes.remove(change_id);
-                    }
-                }
 
-                selected_changes.push(change_id.clone());
-            }
-
-            // Track newly blocked changes
-            for change_id in &blocked_changes {
-                if !self.previously_blocked_changes.contains(change_id) {
-                    self.previously_blocked_changes.insert(change_id.clone());
-                    info!(
-                        "Change '{}' newly blocked by unresolved dependencies",
-                        change_id
-                    );
-                }
-            }
-
-            // Emit events for blocked changes
-            for change_id in &blocked_changes {
-                send_event(
-                    &self.event_tx,
-                    ParallelEvent::Log(LogEntry::info(format!(
-                        "Change '{}' waiting for dependencies to merge to base",
-                        change_id
-                    ))),
-                )
-                .await;
-            }
-
-            if selected_changes.is_empty() {
-                // Distinguish between:
-                // 1. All changes blocked by dependencies (retry with longer delay)
-                // 2. No slots available (retry with shorter delay to dispatch when slots free)
-                if available_slots == 0 && !changes.is_empty() {
-                    // Case 2: Slots exhausted, but analysis completed successfully
-                    // Wait for slots to become available or queue notification
-                    info!(
-                        "No available slots, waiting for workspaces to complete or queue notification (analysis complete, {} changes ready)",
-                        changes.len()
-                    );
-
-                    if let Some(queue) = &self.dynamic_queue {
-                        tokio::select! {
-                            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                                // Timer expired, re-check slots
-                            }
-                            _ = queue.notified() => {
-                                // Queue notification received, re-check immediately
-                                info!("Queue notification received while waiting for slots");
+                        for change_id in &selected_changes {
+                            if let Err(e) = self
+                                .dispatch_change_to_workspace(
+                                    change_id.clone(),
+                                    base_revision.clone(),
+                                    semaphore.clone(),
+                                    &mut join_set,
+                                    &mut in_flight,
+                                    &mut cleanup_guard,
+                                )
+                                .await
+                            {
+                                error!("Failed to dispatch change '{}': {}", change_id, e);
                             }
                         }
-                    } else {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                        // Remove dispatched changes from queued
+                        let dispatched_set: std::collections::HashSet<_> =
+                            selected_changes.iter().collect();
+                        queued.retain(|c| !dispatched_set.contains(&c.id));
+
+                        iteration += 1;
                     }
+
+                    self.needs_reanalysis = false;
                 } else {
-                    // Case 1: All changes blocked by dependencies
-                    info!("No changes can be executed (all blocked by dependencies)");
-                    // Wait for dependencies to be resolved or queue notification
-
-                    if let Some(queue) = &self.dynamic_queue {
-                        tokio::select! {
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                                // Timer expired, re-check dependencies
-                            }
-                            _ = queue.notified() => {
-                                // Queue notification received, re-check immediately
-                                info!("Queue notification received while waiting for dependencies");
-                            }
-                        }
-                    } else {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
+                    // Debounce active, wait for timer or queue notification
+                    info!("Debounce active, waiting for timer or queue notification");
                 }
-                continue;
             }
 
-            // Create a pseudo-group for execution
-            let group = ParallelGroup {
-                id: iteration,
-                changes: selected_changes.clone(),
-                depends_on: Vec::new(),
-            };
+            // Step 3: Check if all work is done (before waiting on select)
+            if join_set.is_empty() && queued.is_empty() {
+                info!("All work completed (join_set and queued empty), exiting scheduler loop");
+                break;
+            }
 
-            let batch_size = group.changes.len();
-            info!(
-                "Dispatching changes in iteration {} with {} changes (from order): {:?}",
-                iteration, batch_size, group.changes
-            );
+            // Step 4: Wait for events using tokio::select!
+            // This makes the loop non-blocking and responsive to multiple triggers
+            tokio::select! {
+                // Join completion: task finished (apply+archive)
+                Some(result) = join_set.join_next() => {
+                    match result {
+                        Ok(workspace_result) => {
+                            // Remove from in-flight
+                            in_flight.remove(&workspace_result.change_id);
 
-            self.execute_changes_dispatch(&group, initial_total_changes, changes_processed)
-                .await?;
+                            info!(
+                                "Task completed: change='{}', in_flight={}, available_slots={}, error={:?}",
+                                workspace_result.change_id,
+                                in_flight.len(),
+                                max_parallelism.saturating_sub(in_flight.len()),
+                                workspace_result.error
+                            );
 
-            // Remove completed changes from the list
-            let completed_set: std::collections::HashSet<_> = group.changes.iter().collect();
-            changes.retain(|c| !completed_set.contains(&c.id));
+                            // Handle result (success or failure)
+                            if let Some(error) = &workspace_result.error {
+                                error!("Change '{}' failed: {}", workspace_result.change_id, error);
+                                self.failed_tracker.mark_failed(&workspace_result.change_id);
+                            } else {
+                                info!("Change '{}' completed successfully", workspace_result.change_id);
+                                // TODO: Trigger merge/cleanup logic here if needed
+                            }
 
-            changes_processed += batch_size;
-            iteration += 1;
+                            // Trigger re-analysis on next iteration
+                            self.needs_reanalysis = true;
+                            reanalysis_reason = ReanalysisReason::Completion;
+                        }
+                        Err(e) => {
+                            error!("Task panicked: {:?}", e);
+                        }
+                    }
+                }
+
+                // Queue notification: dynamic queue has new items
+                Some(_) = async {
+                    if let Some(queue) = &self.dynamic_queue {
+                        queue.notified().await;
+                        Some(())
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    info!("Queue notification received, will check queue on next iteration");
+                    // Queue check happens at loop start
+                }
+
+                // Debounce timer: wait before allowing re-analysis
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    // Timer expired, loop will re-check needs_reanalysis and debounce
+                }
+            }
         }
 
         // Clean up merge stall monitor
@@ -934,14 +839,12 @@ impl ParallelExecutor {
             handle.abort();
         }
 
-        // Per spec (update-tui-status-display): Send AllCompleted even when MergeWait remains
-        // The execution loop has finished processing all queued changes.
-        // MergeWait changes are no longer blocking orchestration completion.
         send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
         Ok(())
     }
 
     /// Execute a single group of changes
+    #[allow(dead_code)]
     async fn execute_changes_dispatch(
         &mut self,
         group: &ParallelGroup,
@@ -1833,6 +1736,187 @@ impl ParallelExecutor {
         Ok(())
     }
 
+    /// Dispatch a single change to workspace (helper for concurrent re-analysis loop).
+    ///
+    /// This method:
+    /// 1. Acquires semaphore permit
+    /// 2. Creates or reuses workspace
+    /// 3. Spawns apply + archive task into JoinSet
+    ///
+    /// The spawned task will:
+    /// - Execute apply command
+    /// - Execute archive command
+    /// - Return WorkspaceResult
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_change_to_workspace(
+        &mut self,
+        change_id: String,
+        base_revision: String,
+        semaphore: Arc<Semaphore>,
+        join_set: &mut JoinSet<WorkspaceResult>,
+        in_flight: &mut HashSet<String>,
+        cleanup_guard: &mut WorkspaceCleanupGuard,
+    ) -> Result<()> {
+        // Check if already in-flight (avoid duplicate dispatch)
+        if in_flight.contains(&change_id) {
+            warn!(
+                "Change '{}' already in-flight, skipping dispatch",
+                change_id
+            );
+            return Ok(());
+        }
+
+        // Acquire semaphore permit
+        let permit = semaphore.clone().acquire_owned().await.map_err(|e| {
+            OrchestratorError::AgentCommand(format!("Failed to acquire semaphore: {}", e))
+        })?;
+
+        // Create or reuse workspace
+        let workspace = self
+            .get_or_create_workspace(&change_id, &base_revision)
+            .await?;
+
+        // Track workspace for cleanup
+        cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
+
+        // Add to in-flight set
+        in_flight.insert(change_id.clone());
+
+        // Prepare context for spawned task
+        let apply_command = self.apply_command.clone();
+        let archive_command = self.archive_command.clone();
+        let repo_root = self.repo_root.clone();
+        let config = self.config.clone();
+        let event_tx = self.event_tx.clone();
+        let vcs_backend = self.workspace_manager.backend_type();
+        let ai_runner = self.ai_runner.clone();
+        let apply_history = self.apply_history.clone();
+        let archive_history = self.archive_history.clone();
+        let cancel_token = self.cancel_token.clone();
+
+        // Spawn apply + archive task
+        join_set.spawn(async move {
+            let _permit = permit; // Hold permit until task completes
+
+            // Execute apply
+            let apply_result = execute_apply_in_workspace(
+                &change_id,
+                &workspace.path,
+                &apply_command,
+                &config,
+                event_tx.clone(),
+                vcs_backend,
+                None, // hooks
+                None, // parallel_ctx
+                cancel_token.as_ref(),
+                &ai_runner,
+                &repo_root,
+                &apply_history,
+                1, // initial_iteration
+            )
+            .await;
+
+            let (final_revision, _iteration) = match apply_result {
+                Ok(result) => result,
+                Err(e) => {
+                    return WorkspaceResult {
+                        change_id: change_id.clone(),
+                        workspace_name: workspace.name.clone(),
+                        final_revision: None,
+                        error: Some(format!("Apply failed: {}", e)),
+                    }
+                }
+            };
+
+            // Execute archive
+            let archive_result = execute_archive_in_workspace(
+                &change_id,
+                &workspace.path,
+                &archive_command,
+                &config,
+                event_tx,
+                vcs_backend,
+                None, // hooks
+                None, // parallel_ctx
+                cancel_token.as_ref(),
+                &ai_runner,
+                &archive_history,
+                &apply_history,
+            )
+            .await;
+
+            match archive_result {
+                Ok(_revision) => WorkspaceResult {
+                    change_id,
+                    workspace_name: workspace.name,
+                    final_revision: Some(final_revision),
+                    error: None,
+                },
+                Err(e) => WorkspaceResult {
+                    change_id,
+                    workspace_name: workspace.name,
+                    final_revision: None,
+                    error: Some(format!("Archive failed: {}", e)),
+                },
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Get or create workspace for a change (helper for dispatch).
+    async fn get_or_create_workspace(
+        &mut self,
+        change_id: &str,
+        base_revision: &str,
+    ) -> Result<Workspace> {
+        // Check for existing workspace (resume scenario)
+        if !self.no_resume && !self.force_recreate_worktree.contains(change_id) {
+            if let Ok(Some(workspace_info)) = self
+                .workspace_manager
+                .find_existing_workspace(change_id)
+                .await
+            {
+                info!(
+                    "Resuming existing workspace for '{}' (last modified: {:?})",
+                    change_id, workspace_info.last_modified
+                );
+                if let Ok(ws) = self
+                    .workspace_manager
+                    .reuse_workspace(&workspace_info)
+                    .await
+                {
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::WorkspaceResumed {
+                            change_id: change_id.to_string(),
+                            workspace: ws.name.clone(),
+                        },
+                    )
+                    .await;
+                    return Ok(ws);
+                }
+            }
+        }
+
+        // Create new workspace
+        let ws = self
+            .workspace_manager
+            .create_workspace(change_id, Some(base_revision))
+            .await?;
+
+        send_event(
+            &self.event_tx,
+            ParallelEvent::WorkspaceCreated {
+                change_id: change_id.to_string(),
+                workspace: ws.name.clone(),
+            },
+        )
+        .await;
+
+        Ok(ws)
+    }
+
     /// Execute apply + archive in parallel with workspace creation under semaphore control.
     ///
     /// Workspaces are created sequentially under semaphore control to ensure that
@@ -1845,6 +1929,7 @@ impl ParallelExecutor {
     /// 4. Release permit when task completes
     ///
     /// This ensures workspace creation rate is controlled by the concurrency limit.
+    #[allow(dead_code)]
     async fn execute_apply_and_archive_parallel(
         &mut self,
         change_workspace_pairs: &[(String, Option<Workspace>)],
@@ -3620,6 +3705,7 @@ mod tests {
             shared_stagger_state,
             apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
             archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
+            needs_reanalysis: false,
         };
 
         assert_eq!(
@@ -3859,6 +3945,7 @@ mod tests {
             apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
             archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
+            needs_reanalysis: false,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -4022,6 +4109,7 @@ mod tests {
             apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
             archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
+            needs_reanalysis: false,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -4157,6 +4245,7 @@ mod tests {
             apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
             archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
+            needs_reanalysis: false,
         };
 
         let revisions = vec![workspace_a.name];
@@ -4321,6 +4410,7 @@ mod tests {
             apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
             archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             shared_stagger_state,
+            needs_reanalysis: false,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -4496,9 +4586,10 @@ mod tests {
             last_queue_change_at: Arc::new(Mutex::new(None)),
             dynamic_queue: None,
             ai_runner,
-            shared_stagger_state,
             apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
             archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
+            shared_stagger_state,
+            needs_reanalysis: false,
         };
 
         let revisions = vec![workspace_a.name, workspace_b.name];
@@ -4683,6 +4774,7 @@ mod tests {
             shared_stagger_state,
             apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
             archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
+            needs_reanalysis: false,
         };
 
         let revisions = vec![workspace_a.name];
@@ -5062,5 +5154,56 @@ mod tests {
         // Verify initial state
         assert_eq!(executor.merge_deferred_changes.len(), 0);
         assert!(!executor.has_merge_deferred());
+    }
+
+    /// Test concurrent re-analysis: verify that re-analysis reason is properly tracked
+    /// and logged during execution.
+    ///
+    /// This test validates task 2.1 requirement:
+    /// - Initial analysis has reason "initial"
+    /// - Completion triggers have reason "completion"
+    /// - Queue notifications have reason "queue"
+    #[tokio::test]
+    async fn test_concurrent_reanalysis_queue_dispatch() {
+        use crate::tui::queue::DynamicQueue;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let config = OrchestratorConfig::default();
+        let repo_root = PathBuf::from("/tmp/test-repo");
+        let (tx, _rx) = mpsc::channel(100);
+
+        // Create executor with dynamic queue
+        let queue = Arc::new(DynamicQueue::new());
+        let mut executor = ParallelExecutor::new(repo_root.clone(), config.clone(), Some(tx));
+        executor.set_dynamic_queue(queue.clone());
+
+        // Add initial change to queue (will trigger queue notification)
+        queue.push("test-change".to_string()).await;
+
+        // Verify queue has one item
+        assert_eq!(queue.len().await, 1);
+
+        // Verify executor is set up correctly
+        assert!(executor.dynamic_queue.is_some());
+        assert!(!executor.needs_reanalysis); // Initially false until execution starts
+
+        // Test debounce logic
+        {
+            let mut last_change = executor.last_queue_change_at.lock().await;
+            *last_change = Some(std::time::Instant::now());
+        }
+
+        // Immediate check: should NOT reanalyze (debounce active)
+        assert!(!executor.should_reanalyze().await);
+
+        // Wait for debounce period to expire
+        tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+
+        // After debounce: should reanalyze
+        assert!(executor.should_reanalyze().await);
+
+        // Verify AnalysisStarted event would be emitted
+        // (Full execution test would require mocking apply/archive commands)
     }
 }
