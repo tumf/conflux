@@ -1185,7 +1185,7 @@ impl ParallelExecutor {
                                         .send(ParallelEvent::ArchiveOutput {
                                             change_id,
                                             output: text,
-                                            iteration: None,
+                                            iteration: 1,
                                         })
                                         .await;
                                 }
@@ -1446,7 +1446,7 @@ impl ParallelExecutor {
                                         .send(ParallelEvent::ArchiveOutput {
                                             change_id,
                                             output: text,
-                                            iteration: None,
+                                            iteration: 1,
                                         })
                                         .await;
                                 }
