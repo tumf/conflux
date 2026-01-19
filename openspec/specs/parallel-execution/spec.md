@@ -694,32 +694,20 @@ The system SHALL distinguish between successful completion, completion with erro
 
 ### Requirement: Loop termination reason must be tracked and distinguished
 
-The system SHALL track the reason for loop termination (cancellation, graceful stop, or normal completion) using local state flags.
+The system SHALL track the reason for loop termination (cancellation, graceful stop, normal completion, or merge_wait) using local state flags.
 
 The system SHALL use this information to conditionally send completion events and messages.
 
-加えて、`merge_wait` を終了理由として区別し、成功完了と誤解される完了イベント/メッセージを送信してはならない（SHALL NOT）。
+加えて、`merge_wait` が残っている場合でも実行可能な change の処理が完了したときは `OrchestratorEvent::AllCompleted` を送信し、オーケストレーションは完了状態に遷移しなければならない（MUST）。
 
-#### Scenario: Tracking stopped or cancelled state
-- **Given** the parallel orchestration loop is running
-- **When** the loop checks for cancellation or graceful stop
-- **And** either condition is true
-- **Then** a `stopped_or_cancelled` flag should be set to true
-- **And** the loop should break
-- **And** this flag should prevent sending completion events after the loop
+ただし、成功完了メッセージは `merge_wait` の有無を誤解させないように設計しなければならない（SHALL）。
 
-#### Scenario: Tracking error state during batch processing
-- **Given** the parallel orchestration loop is processing batches
-- **When** a batch execution returns an error
-- **Then** a `had_errors` flag should be set to true
-- **And** processing should continue with remaining batches
-- **And** this flag should affect the final completion message when all batches finish
-
-#### Scenario: マージ待ちが残る場合は成功完了として扱わない
+#### Scenario: マージ待ちが残る場合でも完了イベントを送信する
 - **GIVEN** 並列実行で少なくとも 1 件の change が `MergeWait` で残っている
-- **WHEN** 実行可能な queued change の処理が完了する
-- **THEN** システムは `AllCompleted` 相当の成功完了を通知しない
-- **AND** 停止/待機（merge 待ち）として扱われる
+- **AND** 実行可能な queued change の処理がすべて完了している
+- **WHEN** 並列実行ループが終了処理に入る
+- **THEN** システムは `OrchestratorEvent::AllCompleted` を送信する
+- **AND** オーケストレーションは完了状態に遷移する
 
 ### Requirement: Parallel Execution with Hooks
 

@@ -326,6 +326,7 @@ impl ParallelExecutor {
             .is_some_and(|token| token.is_cancelled())
     }
 
+    #[cfg(test)]
     fn has_merge_deferred(&self) -> bool {
         !self.merge_deferred_changes.is_empty()
     }
@@ -933,11 +934,10 @@ impl ParallelExecutor {
             handle.abort();
         }
 
-        // Per spec: Do not send completion events when any change is in MergeWait
-        // MergeWait is not a terminal state - the orchestration continues for other runnable changes
-        if !self.has_merge_deferred() {
-            send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
-        }
+        // Per spec (update-tui-status-display): Send AllCompleted even when MergeWait remains
+        // The execution loop has finished processing all queued changes.
+        // MergeWait changes are no longer blocking orchestration completion.
+        send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
         Ok(())
     }
 
@@ -5013,9 +5013,10 @@ mod tests {
         }
     }
 
-    /// Test that MergeWait state does not prevent completion events when no changes remain.
-    /// This test validates the spec requirement:
-    /// "The system SHALL NOT send completion events or success messages while any change remains in merge_wait."
+    /// Test that the has_merge_deferred helper correctly tracks MergeWait state.
+    /// Per spec (update-tui-status-display): The system SHALL send AllCompleted
+    /// even when MergeWait remains, but this helper tracks whether any changes
+    /// are in MergeWait state for other logic purposes.
     #[test]
     fn test_merge_wait_suppresses_completion_events() {
         let config = OrchestratorConfig::default();
