@@ -20,10 +20,9 @@ Defines TUI key binding hints display based on application mode.
 The TUI SHALL display dynamic key hints in running mode consistent with select mode.
 
 Changes panel title SHALL show only change-related keys.
-App-level control keys (Esc, q) SHALL be shown in Status panel title instead of Changes panel.
+App-level control keys (Esc, Ctrl+C) SHALL be shown in Status panel title instead of Changes panel.
 
 #### Scenario: Running mode shows appropriate keys
-
 - **GIVEN** the TUI is in running mode
 - **WHEN** changes exist
 - **THEN** the Changes panel key hints SHALL show selection keys based on current item state
@@ -31,7 +30,6 @@ App-level control keys (Esc, q) SHALL be shown in Status panel title instead of 
 - **AND** the Changes panel title SHALL NOT show "q: quit"
 
 #### Scenario: Running mode with empty list
-
 - **GIVEN** the TUI is in running mode
 - **WHEN** the changes list is empty
 - **THEN** the Changes panel key hints SHALL NOT show selection keys
@@ -140,4 +138,3 @@ resolve実行中は `M` による追加操作を受け付けてはならない�
 - **THEN** the row SHALL be grayed out
 - **AND** the row SHALL NOT display a checkbox
 - **AND** the row SHALL display the `UNCOMMITED` badge
-
