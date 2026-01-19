@@ -512,29 +512,29 @@ impl AppState {
                 }
             }
             AppMode::Stopped => {
-                // Allow queue modifications in Stopped mode (same as Running)
-                match &change.queue_status {
-                    QueueStatus::NotQueued => {
-                        change.queue_status = QueueStatus::Queued;
-                        change.selected = true;
-                        // Clear NEW flag when user adds to queue
-                        if change.is_new {
-                            change.is_new = false;
-                            self.new_change_count = self.new_change_count.saturating_sub(1);
-                        }
-                        let id = change.id.clone();
-                        self.add_log(LogEntry::info(format!("Added to queue: {}", id)));
-                        Some(TuiCommand::AddToQueue(id))
-                    }
-                    QueueStatus::Queued => {
-                        change.queue_status = QueueStatus::NotQueued;
-                        change.selected = false;
-                        let id = change.id.clone();
-                        self.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
-                        Some(TuiCommand::RemoveFromQueue(id))
-                    }
-                    _ => None,
+                // In Stopped mode, only toggle execution mark (selected), not queue_status
+                // Queue status remains NotQueued until F5 resume
+                if !matches!(change.queue_status, QueueStatus::NotQueued) {
+                    // Cannot modify non-NotQueued changes (completed, error, etc.)
+                    return None;
                 }
+
+                // Toggle execution mark only
+                change.selected = !change.selected;
+
+                // Clear NEW flag when user interacts with the change
+                if change.is_new {
+                    change.is_new = false;
+                    self.new_change_count = self.new_change_count.saturating_sub(1);
+                }
+
+                let id = change.id.clone();
+                if change.selected {
+                    self.add_log(LogEntry::info(format!("Marked for execution: {}", id)));
+                } else {
+                    self.add_log(LogEntry::info(format!("Unmarked: {}", id)));
+                }
+                None // No command needed, just state change
             }
             AppMode::Stopping
             | AppMode::Error
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn test_toggle_selection_clears_new_badge_in_stopped_mode() {
-        // Test that adding to queue in Stopped mode clears the NEW badge
+        // Test that toggling execution mark in Stopped mode clears the NEW badge
         let changes = vec![create_approved_change("new-change", 0, 1)];
         let mut app = AppState::new(changes);
 
@@ -1211,21 +1211,20 @@ mod tests {
         app.changes[0].is_new = true;
         app.new_change_count = 1;
 
-        // Start processing and then stop
-        app.start_processing();
+        // Enter Stopped mode (with NotQueued status)
         app.mode = AppMode::Stopped;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].selected = false;
 
-        // Remove from queue first
-        let _ = app.toggle_selection();
-        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
-
-        // Reset new state for the add-to-queue test
-        app.changes[0].is_new = true;
-        app.new_change_count = 1;
-
-        // Add to queue should clear NEW flag
+        // Toggle execution mark should clear NEW flag
         let cmd = app.toggle_selection();
-        assert!(matches!(cmd, Some(TuiCommand::AddToQueue(_))));
+        // In Stopped mode, no command is returned (just state change)
+        assert!(cmd.is_none());
+        // Queue status remains NotQueued
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+        // Execution mark should be set
+        assert!(app.changes[0].selected);
+        // NEW flag should be cleared
         assert!(!app.changes[0].is_new);
         assert_eq!(app.new_change_count, 0);
     }
