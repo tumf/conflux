@@ -665,21 +665,10 @@ async fn run_tui_loop(
                                     if let Some(cancel) = &orchestrator_cancel {
                                         cancel.cancel();
                                     }
-                                    // Reset queue_status to NotQueued while preserving execution mark
-                                    for change in &mut app.changes {
-                                        if matches!(
-                                            change.queue_status,
-                                            QueueStatus::Processing
-                                                | QueueStatus::Archiving
-                                                | QueueStatus::Queued
-                                        ) {
-                                            // Set to NotQueued but preserve selected (execution mark)
-                                            change.queue_status = QueueStatus::NotQueued;
-                                            // selected field is preserved as-is (execution mark)
-                                        }
-                                    }
+                                    // Use OrchestratorEvent::Stopped to properly reset queue status
+                                    // and preserve execution marks (same as graceful stop)
+                                    app.handle_orchestrator_event(OrchestratorEvent::Stopped);
                                     app.current_change = None;
-                                    app.mode = AppMode::Stopped;
                                     app.add_log(LogEntry::warn("Force stopped"));
                                 }
                                 _ => {}

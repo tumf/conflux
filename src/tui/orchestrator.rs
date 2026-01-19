@@ -160,6 +160,7 @@ pub async fn archive_single_change(
                                 LogEntry::info(s)
                                     .with_change_id(change_id)
                                     .with_operation("archive")
+                                    .with_iteration(attempt)
                             )).await;
                         }
                         Some(OutputLine::Stderr(s)) => {
@@ -169,6 +170,7 @@ pub async fn archive_single_change(
                                 LogEntry::warn(s)
                                     .with_change_id(change_id)
                                     .with_operation("archive")
+                                    .with_iteration(attempt)
                             )).await;
                         }
                         None => {

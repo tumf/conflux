@@ -512,23 +512,29 @@ impl AppState {
                 }
             }
             AppMode::Stopped => {
-                // In Stopped mode: only toggle execution mark (selected), keep queue_status as NotQueued
-                // This implements the "execution mark only in Stopped mode" policy
-                if matches!(change.queue_status, QueueStatus::NotQueued) {
-                    // Toggle execution mark
-                    change.selected = !change.selected;
-                    // Clear NEW flag when user interacts with the change
-                    if change.is_new {
-                        change.is_new = false;
-                        self.new_change_count = self.new_change_count.saturating_sub(1);
-                    }
-                    // Do NOT change queue_status - stays NotQueued
-                    // Do NOT send AddToQueue/RemoveFromQueue commands
-                    None
-                } else {
-                    // Cannot toggle for other statuses (Processing, Completed, etc.)
-                    None
+                // In Stopped mode, only toggle execution mark (selected), not queue_status
+                // Queue status remains NotQueued until F5 resume
+                if !matches!(change.queue_status, QueueStatus::NotQueued) {
+                    // Cannot modify non-NotQueued changes (completed, error, etc.)
+                    return None;
                 }
+
+                // Toggle execution mark only
+                change.selected = !change.selected;
+
+                // Clear NEW flag when user interacts with the change
+                if change.is_new {
+                    change.is_new = false;
+                    self.new_change_count = self.new_change_count.saturating_sub(1);
+                }
+
+                let id = change.id.clone();
+                if change.selected {
+                    self.add_log(LogEntry::info(format!("Marked for execution: {}", id)));
+                } else {
+                    self.add_log(LogEntry::info(format!("Unmarked: {}", id)));
+                }
+                None // No command needed, just state change
             }
             AppMode::Stopping
             | AppMode::Error
@@ -1205,24 +1211,22 @@ mod tests {
         app.changes[0].is_new = true;
         app.new_change_count = 1;
 
-        // Start processing and then stop (this will set queue_status to NotQueued)
-        app.start_processing();
-        app.handle_orchestrator_event(OrchestratorEvent::Stopped);
-        assert_eq!(app.mode, AppMode::Stopped);
-        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
-
-        // Reset new state for the toggle test
-        app.changes[0].is_new = true;
-        app.new_change_count = 1;
+        // Enter Stopped mode (with NotQueued status)
+        app.mode = AppMode::Stopped;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
         app.changes[0].selected = false;
 
         // Toggle execution mark should clear NEW flag
         let cmd = app.toggle_selection();
-        assert!(cmd.is_none()); // No command in Stopped mode
+        // In Stopped mode, no command is returned (just state change)
+        assert!(cmd.is_none());
+        // Queue status remains NotQueued
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+        // Execution mark should be set
+        assert!(app.changes[0].selected);
+        // NEW flag should be cleared
         assert!(!app.changes[0].is_new);
         assert_eq!(app.new_change_count, 0);
-        assert!(app.changes[0].selected); // Execution mark added
-        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued); // Status unchanged
     }
 
     #[test]

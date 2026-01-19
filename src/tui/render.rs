@@ -225,8 +225,9 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             // Checkbox display (Select mode):
             // [ ] - unapproved (cannot be selected)
             // [@] - approved but not selected (ready to select)
-            // [x] - selected/reserved (will become Queued when F5 is pressed)
+            // [x] - selected (will become Queued when F5 is pressed)
             // [x] (gray) - archived (processing complete, no longer actionable)
+            // Note: 'selected' field indicates selection for next run
             let is_archived = matches!(
                 change.queue_status,
                 QueueStatus::Archived | QueueStatus::Merged
@@ -388,12 +389,14 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
         .iter()
         .enumerate()
         .map(|(i, change)| {
-            // Checkbox display (Running mode - same symbols, different meaning):
+            // Checkbox display (Running/Stopped mode):
             // [ ] - unapproved (cannot be added to queue)
-            // [@] - approved but not in queue
-            // [x] - in queue or being processed
+            // [@] - approved but not in queue / not marked
+            // [x] - in queue OR marked for execution (Stopped mode)
             // [x] (gray) - archived (processing complete, no longer actionable)
-            // Note: In Running mode, queue_status shows actual state (Queued/Processing/etc.)
+            // Note: Display is driven by 'selected' field, which serves dual purpose:
+            //   - Running: shows queue membership (selected=true means Queued/Processing)
+            //   - Stopped: shows execution mark (selected=true, queue_status=NotQueued)
             let is_archived = matches!(
                 change.queue_status,
                 QueueStatus::Archived | QueueStatus::Merged
