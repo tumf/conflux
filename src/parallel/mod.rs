@@ -1694,6 +1694,9 @@ impl ParallelExecutor {
                     )
                     .await;
 
+                    // Get the acceptance iteration number for logging (count after recording)
+                    let acceptance_iteration = agent.next_acceptance_attempt_number(change_id);
+
                     // Handle acceptance result
                     match acceptance_result {
                         Ok(crate::orchestration::AcceptanceResult::Pass) => {
@@ -1722,7 +1725,8 @@ impl ParallelExecutor {
                                             max_continues
                                         ))
                                         .with_change_id(change_id)
-                                        .with_operation("acceptance"),
+                                        .with_operation("acceptance")
+                                        .with_iteration(acceptance_iteration),
                                     ),
                                 )
                                 .await;
@@ -1742,7 +1746,8 @@ impl ParallelExecutor {
                                             max_continues
                                         ))
                                         .with_change_id(change_id)
-                                        .with_operation("acceptance"),
+                                        .with_operation("acceptance")
+                                        .with_iteration(acceptance_iteration),
                                     ),
                                 )
                                 .await;
@@ -1765,7 +1770,8 @@ impl ParallelExecutor {
                                         findings.len()
                                     ))
                                     .with_change_id(change_id)
-                                    .with_operation("acceptance"),
+                                    .with_operation("acceptance")
+                                    .with_iteration(acceptance_iteration),
                                 ),
                             )
                             .await;
@@ -1786,7 +1792,8 @@ impl ParallelExecutor {
                                         error
                                     ))
                                     .with_change_id(change_id)
-                                    .with_operation("acceptance"),
+                                    .with_operation("acceptance")
+                                    .with_iteration(acceptance_iteration),
                                 ),
                             )
                             .await;
@@ -1805,7 +1812,8 @@ impl ParallelExecutor {
                                 ParallelEvent::Log(
                                     LogEntry::error(format!("Acceptance error on resume: {}", e))
                                         .with_change_id(change_id)
-                                        .with_operation("acceptance"),
+                                        .with_operation("acceptance")
+                                        .with_iteration(acceptance_iteration),
                                 ),
                             )
                             .await;
@@ -2440,6 +2448,9 @@ impl ParallelExecutor {
                     )
                     .await;
 
+                    // Get the acceptance iteration number for logging (count after recording)
+                    let acceptance_iteration = agent.next_acceptance_attempt_number(&change_id);
+
                     match acceptance_result {
                         Ok(crate::orchestration::AcceptanceResult::Pass) => {
                             info!("Acceptance passed for {}, proceeding to archive", change_id);
@@ -2463,7 +2474,8 @@ impl ParallelExecutor {
                                                 cycle_count
                                             ))
                                             .with_change_id(&change_id)
-                                            .with_operation("acceptance"),
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
                                         ))
                                         .await;
                                 }
@@ -2494,7 +2506,8 @@ impl ParallelExecutor {
                                                 cycle_count
                                             ))
                                             .with_change_id(&change_id)
-                                            .with_operation("acceptance"),
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
                                         ))
                                         .await;
                                 }
@@ -2532,7 +2545,8 @@ impl ParallelExecutor {
                                             cycle_count
                                         ))
                                         .with_change_id(&change_id)
-                                        .with_operation("acceptance"),
+                                        .with_operation("acceptance")
+                                        .with_iteration(acceptance_iteration),
                                     ))
                                     .await;
                             }
@@ -2566,7 +2580,8 @@ impl ParallelExecutor {
                                             cycle_count, error
                                         ))
                                         .with_change_id(&change_id)
-                                        .with_operation("acceptance"),
+                                        .with_operation("acceptance")
+                                        .with_iteration(acceptance_iteration),
                                     ))
                                     .await;
                             }
