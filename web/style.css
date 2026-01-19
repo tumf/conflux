@@ -409,18 +409,6 @@ main {
     color: var(--bg-primary);
 }
 
-.badge-status.pending {
-    background-color: var(--text-secondary);
-}
-
-.badge-status.in_progress {
-    background-color: var(--accent-blue);
-}
-
-.badge-status.complete {
-    background-color: var(--accent-green);
-}
-
 /* TUI-aligned queue status colors */
 .badge-status.not-queued {
     background-color: var(--text-secondary);
@@ -438,6 +426,11 @@ main {
     background-color: var(--accent-green);
 }
 
+.badge-status.accepting {
+    background-color: #90ee90; /* Light Green - matches TUI LightGreen */
+    color: var(--bg-primary);
+}
+
 .badge-status.archiving {
     background-color: #c77dff; /* Magenta */
 }
@@ -447,15 +440,15 @@ main {
 }
 
 .badge-status.merged {
-    background-color: #7209b7; /* Light Blue */
+    background-color: #87ceeb; /* Light Blue */
 }
 
 .badge-status.merge-wait {
-    background-color: #f72585; /* Light Magenta */
+    background-color: #dda0dd; /* Light Magenta */
 }
 
 .badge-status.resolving {
-    background-color: #06d6a0; /* Light Cyan */
+    background-color: #00ced1; /* Light Cyan */
 }
 
 .badge-status.error {
