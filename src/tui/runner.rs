@@ -386,12 +386,44 @@ async fn run_tui_loop(
                                 }
                             }
 
+                            // Check which worktrees are not ahead of base (for MergeWait auto-clear)
+                            let mut worktree_not_ahead_ids = std::collections::HashSet::new();
+
+                            // Get base branch (current branch in main repo)
+                            if let Ok(Some(base_branch)) = crate::vcs::git::commands::get_current_branch(&refresh_repo_root).await {
+                                // For each change with a worktree, check if worktree branch is ahead of base
+                                for (change_id, wt_path) in &worktree_paths {
+                                    // Get the branch name for this worktree
+                                    if let Ok(Some(worktree_branch)) = crate::vcs::git::commands::get_current_branch(wt_path).await {
+                                        // Count commits ahead
+                                        match crate::vcs::git::commands::count_commits_ahead(
+                                            &refresh_repo_root,
+                                            &base_branch,
+                                            &worktree_branch
+                                        ).await {
+                                            Ok(0) => {
+                                                // Worktree is not ahead (0 commits), mark for auto-clear
+                                                worktree_not_ahead_ids.insert(change_id.clone());
+                                            }
+                                            Ok(_) => {
+                                                // Worktree is ahead, keep MergeWait if present
+                                            }
+                                            Err(e) => {
+                                                debug!("Failed to count commits ahead for {}: {}", change_id, e);
+                                                // On error, don't auto-clear (safe default)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             if refresh_tx
                                 .send(OrchestratorEvent::ChangesRefreshed {
                                     changes,
                                     committed_change_ids,
                                     worktree_change_ids,
                                     worktree_paths,
+                                    worktree_not_ahead_ids,
                                 })
                                 .await
                                 .is_err()

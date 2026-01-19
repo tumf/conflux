@@ -396,6 +396,7 @@ impl WebState {
                     committed_change_ids,
                     worktree_change_ids,
                     worktree_paths: _,
+                    worktree_not_ahead_ids: _,
                 } => {
                     // Update changes with new data
                     let mut new_change_statuses: Vec<ChangeStatus> =
@@ -1056,6 +1057,7 @@ mod tests {
                 committed_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
+                worktree_not_ahead_ids: HashSet::new(),
             })
             .await;
 
@@ -1084,6 +1086,7 @@ mod tests {
                 committed_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
+                worktree_not_ahead_ids: HashSet::new(),
             })
             .await;
 
@@ -1208,6 +1211,7 @@ mod tests {
                 committed_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
+                worktree_not_ahead_ids: HashSet::new(),
             })
             .await;
 
@@ -1248,6 +1252,7 @@ mod tests {
                 committed_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
+                worktree_not_ahead_ids: HashSet::new(),
             })
             .await;
 

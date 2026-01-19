@@ -97,25 +97,30 @@ DynamicQueueは以下の操作をサポートすること：
 - **THEN** ログに削除操作が記録される
 
 ### Requirement: Event-Driven State Updates
-TUI は実行イベントを受信して内部状態を更新しなければならない（SHALL）。
-すべての状態で tasks.md から取得できる進捗を反映し続けなければならない（MUST）。
-進捗取得に失敗した場合でも completed を 0 に上書きしてはならない（MUST NOT）。取得失敗は 0 件完了とは別の状態として扱う。
-TUI は worktree を優先し、ベースツリーへフォールバックしながら進捗を取得しなければならない（MUST）。
-acceptance 実行が開始された場合、TUI は該当 change のステータスを `accepting` として表示しなければならない（SHALL）。
-acceptance 実行が完了した場合、TUI は既存のステータス遷移に戻さなければならない（SHALL）。
+TUI は 5 秒ごとの自動更新で `MergeWait` を評価し、以下のいずれかを満たす場合は `Queued` に戻さなければならない（MUST）。
 
-#### Scenario: acceptance 実行中のステータス更新
-- **GIVEN** TUI が change の状態を表示している
-- **AND** acceptance 実行が開始される
-- **WHEN** acceptance 開始イベントを受信する
-- **THEN** 該当 change のステータスは `accepting` として表示される
-- **AND** acceptance 完了イベントを受信した後は既存の遷移状態に戻る
+- 対応する worktree が存在しない
+- 対応する worktree が存在し、worktree ブランチが base に ahead していない
 
-#### Scenario: archiving/resolving/mergedでworktree進捗を優先する
-- **GIVEN** TUI が archiving/resolving/merged/archived 状態の変更を表示している
-- **AND** worktree側の tasks.md に最新進捗が存在する
-- **WHEN** 進捗更新イベントまたは自動リフレッシュが実行される
-- **THEN** TUI は worktree側の completed/total を表示する
+自動解除された change では `MergeWait` ではないため、`M` による merge resolve の操作ヒントや実行を行ってはならない（MUST NOT）。
+
+#### Scenario: worktree がない場合は MergeWait を解除する
+- **GIVEN** change が `MergeWait` である
+- **AND** 対応する worktree が存在しない
+- **WHEN** 5秒ポーリングの自動更新が実行される
+- **THEN** change のステータスは `Queued` に戻る
+
+#### Scenario: ahead なしの worktree は MergeWait を解除する
+- **GIVEN** change が `MergeWait` である
+- **AND** 対応する worktree が存在する
+- **AND** worktree ブランチが base に ahead していない
+- **WHEN** 5秒ポーリングの自動更新が実行される
+- **THEN** change のステータスは `Queued` に戻る
+
+#### Scenario: MergeWait が解除された change では M を使えない
+- **GIVEN** change が `MergeWait` から `Queued` に戻っている
+- **WHEN** TUI のキー表示が描画される
+- **THEN** `M` による merge resolve のヒントは表示されない
 
 ### Requirement: Log Entry Structure and Display
 TUIのログエントリーは、タイムスタンプ、メッセージ、色に加えて、オプションのコンテキスト情報（change ID、オペレーション、イテレーション番号）を含まなければならない（SHALL）。
