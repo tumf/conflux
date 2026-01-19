@@ -1098,4 +1098,173 @@ mod tests {
             "total_tasks should be updated with valid data"
         );
     }
+
+    #[tokio::test]
+    async fn test_archive_started_preserves_progress_when_zero() {
+        let initial = vec![create_test_change("change-a", 5, 10)];
+        let web_state = WebState::new(&initial);
+
+        // Set to archiving with ArchiveStarted
+        web_state
+            .apply_execution_event(&ExecutionEvent::ArchiveStarted("change-a".to_string()))
+            .await;
+
+        // Progress should be preserved
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].completed_tasks, 5,
+            "completed_tasks should be preserved during archiving"
+        );
+        assert_eq!(
+            state.changes[0].total_tasks, 10,
+            "total_tasks should be preserved during archiving"
+        );
+        assert_eq!(
+            state.changes[0].queue_status,
+            Some("archiving".to_string()),
+            "queue_status should be set to archiving"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_progress_updated_preserves_existing_during_archiving() {
+        let initial = vec![create_test_change("change-a", 7, 10)];
+        let web_state = WebState::new(&initial);
+
+        // Set to archiving
+        web_state
+            .apply_execution_event(&ExecutionEvent::ArchiveStarted("change-a".to_string()))
+            .await;
+
+        // Send ProgressUpdated with 0/0 (retrieval failure during archiving)
+        web_state
+            .apply_execution_event(&ExecutionEvent::ProgressUpdated {
+                change_id: "change-a".to_string(),
+                completed: 0,
+                total: 0,
+            })
+            .await;
+
+        // Progress should be preserved (not reset to 0/0)
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].completed_tasks, 7,
+            "completed_tasks should be preserved on 0/0 update during archiving"
+        );
+        assert_eq!(
+            state.changes[0].total_tasks, 10,
+            "total_tasks should be preserved on 0/0 update during archiving"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_progress_updated_preserves_existing_during_resolving() {
+        let initial = vec![create_test_change("change-a", 8, 10)];
+        let web_state = WebState::new(&initial);
+
+        // Set to resolving
+        web_state
+            .apply_execution_event(&ExecutionEvent::ResolveStarted {
+                change_id: "change-a".to_string(),
+            })
+            .await;
+
+        // Send ProgressUpdated with 0/0 (retrieval failure during resolving)
+        web_state
+            .apply_execution_event(&ExecutionEvent::ProgressUpdated {
+                change_id: "change-a".to_string(),
+                completed: 0,
+                total: 0,
+            })
+            .await;
+
+        // Progress should be preserved (not reset to 0/0)
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].completed_tasks, 8,
+            "completed_tasks should be preserved on 0/0 update during resolving"
+        );
+        assert_eq!(
+            state.changes[0].total_tasks, 10,
+            "total_tasks should be preserved on 0/0 update during resolving"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_changes_refreshed_preserves_progress_during_archiving() {
+        let initial = vec![create_test_change("change-a", 6, 10)];
+        let web_state = WebState::new(&initial);
+
+        // Set to archiving
+        web_state
+            .apply_execution_event(&ExecutionEvent::ArchiveStarted("change-a".to_string()))
+            .await;
+
+        // Send ChangesRefreshed with 0/0 (retrieval failure)
+        use std::collections::{HashMap, HashSet};
+        web_state
+            .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+                changes: vec![create_test_change("change-a", 0, 0)],
+                committed_change_ids: HashSet::new(),
+                worktree_change_ids: HashSet::new(),
+                worktree_paths: HashMap::new(),
+            })
+            .await;
+
+        // Progress should be preserved (not reset to 0/0)
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].completed_tasks, 6,
+            "completed_tasks should be preserved on ChangesRefreshed with 0/0 during archiving"
+        );
+        assert_eq!(
+            state.changes[0].total_tasks, 10,
+            "total_tasks should be preserved on ChangesRefreshed with 0/0 during archiving"
+        );
+        assert_eq!(
+            state.changes[0].queue_status,
+            Some("archiving".to_string()),
+            "queue_status should be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_changes_refreshed_preserves_progress_during_resolving() {
+        let initial = vec![create_test_change("change-a", 9, 10)];
+        let web_state = WebState::new(&initial);
+
+        // Set to resolving
+        web_state
+            .apply_execution_event(&ExecutionEvent::ResolveStarted {
+                change_id: "change-a".to_string(),
+            })
+            .await;
+
+        // Send ChangesRefreshed with 0/0 (retrieval failure)
+        use std::collections::{HashMap, HashSet};
+        web_state
+            .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+                changes: vec![create_test_change("change-a", 0, 0)],
+                committed_change_ids: HashSet::new(),
+                worktree_change_ids: HashSet::new(),
+                worktree_paths: HashMap::new(),
+            })
+            .await;
+
+        // Progress should be preserved (not reset to 0/0)
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].completed_tasks, 9,
+            "completed_tasks should be preserved on ChangesRefreshed with 0/0 during resolving"
+        );
+        assert_eq!(
+            state.changes[0].total_tasks, 10,
+            "total_tasks should be preserved on ChangesRefreshed with 0/0 during resolving"
+        );
+        assert_eq!(
+            state.changes[0].queue_status,
+            Some("resolving".to_string()),
+            "queue_status should be preserved"
+        );
+    }
 }

@@ -1212,13 +1212,16 @@ impl ParallelExecutor {
                 .set_dependencies(analysis_result.dependencies.clone());
             self.change_dependencies = analysis_result.dependencies.clone();
 
-            // Calculate available slots
-            let active_count = self.workspace_manager.workspaces().len();
+            // Calculate available slots based on active workspaces only
+            // Active workspaces are those with status Created, Applying, or Applied
+            // Merged, Failed, and Cleaned workspaces do not count towards the limit
+            let active_count = self.workspace_manager.active_workspace_count();
             let available_slots = max_parallelism.saturating_sub(active_count);
 
+            let total_workspaces = self.workspace_manager.workspaces().len();
             info!(
-                "Available slots: {} (max: {}, active: {})",
-                available_slots, max_parallelism, active_count
+                "Available slots: {} (max: {}, active: {}, total workspaces: {})",
+                available_slots, max_parallelism, active_count, total_workspaces
             );
 
             if available_slots == 0 {
@@ -1680,6 +1683,11 @@ impl ParallelExecutor {
 
                     // Step 1: Run acceptance test before archive commit
                     // NOTE: Acceptance results are NOT persisted, so we must re-run on every resume
+
+                    // Update status to Accepting
+                    self.workspace_manager
+                        .update_workspace_status(&workspace.name, WorkspaceStatus::Accepting);
+
                     let mut agent = AgentRunner::new(self.config.clone());
                     info!(
                         "Running acceptance test for {} before archive (resume)",
@@ -1824,6 +1832,10 @@ impl ParallelExecutor {
                     }
 
                     // Step 2: Commit archive (acceptance passed)
+                    // Update status to Archiving
+                    self.workspace_manager
+                        .update_workspace_status(&workspace.name, WorkspaceStatus::Archiving);
+
                     send_event(
                         &self.event_tx,
                         ParallelEvent::ArchiveStarted(change_id.clone()),
@@ -1972,6 +1984,14 @@ impl ParallelExecutor {
                     Ok(MergeAttempt::Merged) => {}
                     Ok(MergeAttempt::Deferred(reason)) => {
                         self.merge_deferred_changes.insert(result.change_id.clone());
+
+                        // Update workspace status to MergeWait so it's no longer counted as active
+                        // Per spec line 7: "merge_wait ... はアクティブとして扱ってはならない（MUST NOT）"
+                        self.workspace_manager.update_workspace_status(
+                            &result.workspace_name,
+                            WorkspaceStatus::MergeWait,
+                        );
+
                         send_event(
                             &self.event_tx,
                             ParallelEvent::MergeDeferred {
@@ -1980,6 +2000,16 @@ impl ParallelExecutor {
                             },
                         )
                         .await;
+
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::WorkspaceStatusUpdated {
+                                workspace_name: result.workspace_name.clone(),
+                                status: WorkspaceStatus::MergeWait,
+                            },
+                        )
+                        .await;
+
                         continue;
                     }
                     Err(e) => {
@@ -2220,6 +2250,10 @@ impl ParallelExecutor {
         let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
         let total_changes_in_group = change_workspace_pairs.len();
 
+        // Create a channel for workspace status updates from spawned tasks
+        let (status_tx, mut status_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, WorkspaceStatus)>();
+
         for (change_id, existing_workspace) in change_workspace_pairs {
             // Acquire semaphore BEFORE creating workspace to enforce concurrency limit
             let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -2342,6 +2376,7 @@ impl ParallelExecutor {
             let repo_root = self.repo_root.clone();
             let apply_history = self.apply_history.clone();
             let archive_history = self.archive_history.clone();
+            let status_tx_clone = status_tx.clone();
 
             // Build parallel hook context
             let parallel_ctx = ParallelHookContext {
@@ -2435,6 +2470,18 @@ impl ParallelExecutor {
                     // IMPORTANT: Acceptance results are NOT persisted to disk or git commits.
                     // This means acceptance will always run after apply completes, even on resume.
                     // This ensures quality gates are enforced regardless of interruptions.
+
+                    // Update status to Accepting
+                    let _ = status_tx_clone.send((workspace_name.clone(), WorkspaceStatus::Accepting));
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::WorkspaceStatusUpdated {
+                                workspace_name: workspace_name.clone(),
+                                status: WorkspaceStatus::Accepting,
+                            })
+                            .await;
+                    }
+
                     info!(
                         "Running acceptance test for {} after apply completion (cycle {})",
                         change_id, cycle_count
@@ -2615,7 +2662,15 @@ impl ParallelExecutor {
                 };
 
                 // Step 3: Execute archive after acceptance passes
+                // Update status to Archiving
+                let _ = status_tx_clone.send((workspace_name.clone(), WorkspaceStatus::Archiving));
                 if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::WorkspaceStatusUpdated {
+                            workspace_name: workspace_name.clone(),
+                            status: WorkspaceStatus::Archiving,
+                        })
+                        .await;
                     let _ = tx
                         .send(ParallelEvent::ArchiveStarted(change_id.clone()))
                         .await;
@@ -2677,11 +2732,21 @@ impl ParallelExecutor {
             });
         }
 
-        // Collect results
+        // Drop the sender so the channel closes when all tasks complete
+        drop(status_tx);
+
+        // Collect results and process status updates
         let mut results = Vec::new();
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(workspace_result) => {
+        loop {
+            tokio::select! {
+                // Process status updates from spawned tasks
+                Some((workspace_name, status)) = status_rx.recv() => {
+                    self.workspace_manager.update_workspace_status(&workspace_name, status);
+                }
+                // Process completed tasks
+                Some(result) = join_set.join_next() => {
+                    match result {
+                        Ok(workspace_result) => {
                     // Update workspace status
                     if workspace_result.error.is_some() {
                         self.workspace_manager.update_workspace_status(
@@ -2754,11 +2819,28 @@ impl ParallelExecutor {
                             Ok(MergeAttempt::Deferred(reason)) => {
                                 self.merge_deferred_changes
                                     .insert(workspace_result.change_id.clone());
+
+                                // Update workspace status to MergeWait so it's no longer counted as active
+                                // Per spec line 7: "merge_wait ... はアクティブとして扱ってはならない（MUST NOT）"
+                                self.workspace_manager.update_workspace_status(
+                                    &workspace_result.workspace_name,
+                                    WorkspaceStatus::MergeWait,
+                                );
+
                                 send_event(
                                     &self.event_tx,
                                     ParallelEvent::MergeDeferred {
                                         change_id: workspace_result.change_id.clone(),
                                         reason,
+                                    },
+                                )
+                                .await;
+
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::WorkspaceStatusUpdated {
+                                        workspace_name: workspace_result.workspace_name.clone(),
+                                        status: WorkspaceStatus::MergeWait,
                                     },
                                 )
                                 .await;
@@ -2773,11 +2855,15 @@ impl ParallelExecutor {
                             }
                         }
                     }
-                    results.push(workspace_result);
+                            results.push(workspace_result);
+                        }
+                        Err(e) => {
+                            warn!("Task join error: {}", e);
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!("Task join error: {}", e);
-                }
+                // All tasks completed and channel closed
+                else => break,
             }
         }
 
