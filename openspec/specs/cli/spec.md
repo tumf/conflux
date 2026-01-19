@@ -115,8 +115,7 @@ When launched without a subcommand, the interactive TUI SHALL be displayed.
 At TUI launch, the change selection mode SHALL be displayed, allowing users to select changes for processing.
 
 #### Scenario: Exit
-
-- **WHEN** user presses `q` key or `Ctrl+C`
+- **WHEN** user presses `Ctrl+C`
 - **THEN** TUI exits and the terminal is restored to its original state
 
 ### Requirement: Start Execution of Selected Changes
@@ -142,14 +141,12 @@ When F5 key is pressed in selection mode, processing of selected changes SHALL b
 TUI SHALL display a dashboard-style UI in running mode.
 
 #### Scenario: Display on processing completion
-
 - **WHEN** all queued changes have been processed
 - **THEN** the header status changes to "Completed"
 - **AND** "Done" is displayed in green on the left side of the status panel
-- **AND** TUI maintains display, allowing user to exit with `q` key
+- **AND** TUI maintains display, allowing user to exit with `Ctrl+C`
 
 #### Scenario: Queue modification after completion
-
 - **WHEN** AppMode is Completed
 - **AND** user presses Space key
 - **THEN** NotQueued changes can be changed to Queued
@@ -157,7 +154,6 @@ TUI SHALL display a dashboard-style UI in running mode.
 - **AND** Completed/Archived/Error changes cannot be modified
 
 #### Scenario: Re-run after completion
-
 - **WHEN** AppMode is Completed
 - **AND** changes are added to the queue
 - **AND** user presses F5 key

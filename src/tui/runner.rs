@@ -511,7 +511,7 @@ async fn run_tui_loop(
                     }
 
                     match (key.code, key.modifiers) {
-                        (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             app.should_quit = true;
                             break;
                         }
