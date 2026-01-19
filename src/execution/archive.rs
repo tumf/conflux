@@ -71,6 +71,37 @@ fn archive_entry_exists(change_id: &str, archive_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Find the path to an archived change directory.
+///
+/// This function searches for the archive directory entry matching the change_id,
+/// supporting both direct match (`{change_id}`) and date-prefixed format (`{date}-{change_id}`).
+///
+/// # Arguments
+///
+/// * `change_id` - The ID of the change to find
+/// * `archive_dir` - Path to the archive directory
+///
+/// # Returns
+///
+/// * `Some(PathBuf)` - Path to the archived change directory if found
+/// * `None` - Archive entry not found
+fn find_archive_entry_path(change_id: &str, archive_dir: &Path) -> Option<std::path::PathBuf> {
+    if !archive_dir.exists() {
+        return None;
+    }
+
+    std::fs::read_dir(archive_dir)
+        .ok()
+        .and_then(|entries| {
+            entries.filter_map(|e| e.ok()).find(|entry| {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                name_str == change_id || name_str.ends_with(&format!("-{}", change_id))
+            })
+        })
+        .map(|entry| entry.path())
+}
+
 /// Check if a change has already been archived in the given base path.
 ///
 /// This stricter check requires that the change directory is gone and
@@ -497,6 +528,12 @@ pub fn verify_task_completion(change_id: &str, base_path: Option<&Path>) -> Resu
 /// This is a convenience function that returns the full progress information
 /// rather than just a boolean completion status.
 ///
+/// This function implements a fallback strategy when the primary tasks.md file
+/// is not found in `openspec/changes/{change_id}/tasks.md`:
+/// 1. First checks the primary location
+/// 2. If not found, checks the archive directory for `openspec/changes/archive/{change_id}/tasks.md`
+///    or `openspec/changes/archive/{date}-{change_id}/tasks.md`
+///
 /// # Arguments
 ///
 /// * `change_id` - The ID of the change to check
@@ -506,12 +543,13 @@ pub fn verify_task_completion(change_id: &str, base_path: Option<&Path>) -> Resu
 /// # Returns
 ///
 /// * `Ok(Some(progress))` - Progress information with completed/total counts
-/// * `Ok(None)` - Tasks file doesn't exist
+/// * `Ok(None)` - Tasks file doesn't exist in either primary or archive location
 /// * `Err` - Failed to parse tasks file
 pub fn get_task_progress(
     change_id: &str,
     base_path: Option<&Path>,
 ) -> Result<Option<task_parser::TaskProgress>> {
+    // Try primary location: openspec/changes/{change_id}/tasks.md
     let tasks_path = match base_path {
         Some(base) => base
             .join("openspec/changes")
@@ -522,12 +560,31 @@ pub fn get_task_progress(
             .join("tasks.md"),
     };
 
-    if !tasks_path.exists() {
-        return Ok(None);
+    if tasks_path.exists() {
+        let progress = task_parser::parse_file(&tasks_path, Some(change_id))?;
+        return Ok(Some(progress));
     }
 
-    let progress = task_parser::parse_file(&tasks_path, Some(change_id))?;
-    Ok(Some(progress))
+    // Fallback: try archive location
+    let archive_dir = match base_path {
+        Some(base) => base.join("openspec/changes/archive"),
+        None => Path::new("openspec/changes/archive").to_path_buf(),
+    };
+
+    if let Some(archive_entry_path) = find_archive_entry_path(change_id, &archive_dir) {
+        let archive_tasks_path = archive_entry_path.join("tasks.md");
+        if archive_tasks_path.exists() {
+            debug!(
+                change_id = %change_id,
+                archive_tasks_path = %archive_tasks_path.display(),
+                "get_task_progress: using archive fallback"
+            );
+            let progress = task_parser::parse_file(&archive_tasks_path, Some(change_id))?;
+            return Ok(Some(progress));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Build an error message for failed archive verification.
@@ -1387,6 +1444,86 @@ fi\n";
         let base = temp_dir.path();
 
         let change_id = "nonexistent-change";
+        let progress = get_task_progress(change_id, Some(base)).unwrap();
+        assert!(progress.is_none());
+    }
+
+    #[test]
+    fn test_get_task_progress_archive_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        let change_id = "archived-change";
+        // Create archive directory with tasks.md
+        let archive_dir = base.join("openspec/changes/archive").join(change_id);
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let tasks_content = "# Tasks\n\n- [x] Task 1\n- [x] Task 2\n- [ ] Task 3\n";
+        fs::write(archive_dir.join("tasks.md"), tasks_content).unwrap();
+
+        // Primary location does not exist, should fall back to archive
+        let progress = get_task_progress(change_id, Some(base)).unwrap().unwrap();
+        assert_eq!(progress.completed, 2);
+        assert_eq!(progress.total, 3);
+    }
+
+    #[test]
+    fn test_get_task_progress_archive_fallback_date_prefixed() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        let change_id = "archived-change";
+        // Create date-prefixed archive directory with tasks.md
+        let archive_dir = base
+            .join("openspec/changes/archive")
+            .join("2024-01-15-archived-change");
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let tasks_content = "# Tasks\n\n- [x] Task 1\n- [x] Task 2\n- [x] Task 3\n";
+        fs::write(archive_dir.join("tasks.md"), tasks_content).unwrap();
+
+        // Primary location does not exist, should fall back to date-prefixed archive
+        let progress = get_task_progress(change_id, Some(base)).unwrap().unwrap();
+        assert_eq!(progress.completed, 3);
+        assert_eq!(progress.total, 3);
+    }
+
+    #[test]
+    fn test_get_task_progress_primary_takes_precedence() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        let change_id = "both-locations";
+
+        // Create primary location with tasks.md
+        let primary_dir = base.join("openspec/changes").join(change_id);
+        fs::create_dir_all(&primary_dir).unwrap();
+        let primary_tasks = "# Tasks\n\n- [x] Task 1\n- [ ] Task 2\n";
+        fs::write(primary_dir.join("tasks.md"), primary_tasks).unwrap();
+
+        // Create archive location with different tasks.md
+        let archive_dir = base.join("openspec/changes/archive").join(change_id);
+        fs::create_dir_all(&archive_dir).unwrap();
+        let archive_tasks = "# Tasks\n\n- [x] Task 1\n- [x] Task 2\n- [x] Task 3\n";
+        fs::write(archive_dir.join("tasks.md"), archive_tasks).unwrap();
+
+        // Should use primary location (1/2 tasks), not archive (3/3 tasks)
+        let progress = get_task_progress(change_id, Some(base)).unwrap().unwrap();
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.total, 2);
+    }
+
+    #[test]
+    fn test_get_task_progress_archive_without_tasks_md() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        let change_id = "archived-no-tasks";
+        // Create archive directory without tasks.md
+        let archive_dir = base.join("openspec/changes/archive").join(change_id);
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        // Should return None when archive exists but has no tasks.md
         let progress = get_task_progress(change_id, Some(base)).unwrap();
         assert!(progress.is_none());
     }
