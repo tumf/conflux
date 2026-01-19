@@ -326,6 +326,7 @@ impl ParallelExecutor {
             .is_some_and(|token| token.is_cancelled())
     }
 
+    #[cfg(test)]
     fn has_merge_deferred(&self) -> bool {
         !self.merge_deferred_changes.is_empty()
     }
@@ -933,11 +934,10 @@ impl ParallelExecutor {
             handle.abort();
         }
 
-        // Per spec: Do not send completion events when any change is in MergeWait
-        // MergeWait is not a terminal state - the orchestration continues for other runnable changes
-        if !self.has_merge_deferred() {
-            send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
-        }
+        // Per spec (update-tui-status-display): Send AllCompleted even when MergeWait remains
+        // The execution loop has finished processing all queued changes.
+        // MergeWait changes are no longer blocking orchestration completion.
+        send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
         Ok(())
     }
 
@@ -1686,30 +1686,60 @@ impl ParallelExecutor {
             .collect();
         let failed: Vec<&WorkspaceResult> = results.iter().filter(|r| r.error.is_some()).collect();
 
-        // Report failures and mark them in the tracker for dependent skipping
-        // Also preserve workspaces for failed changes (do not cleanup)
-        for result in &failed {
-            if result.error.is_some() {
-                error!(
-                    "Failed for {}, workspace preserved: {}",
-                    result.change_id, result.workspace_name
-                );
-                info!(
-                    "To resume: run with the same change_id, workspace will be automatically detected"
-                );
-                cleanup_guard.preserve(&result.workspace_name);
+        // Check if any result indicates cancellation (force stop)
+        // If so, preserve ALL workspaces (not just failed ones)
+        let has_cancellation = failed.iter().any(|r| {
+            r.error
+                .as_ref()
+                .is_some_and(|e| e.contains("cancel") || e.contains("Cancel"))
+        });
+
+        if has_cancellation {
+            // Force stop detected - preserve all tracked workspaces
+            info!("Cancellation detected, preserving all workspaces");
+            cleanup_guard.preserve_all();
+
+            // Emit WorkspacePreserved events for all tracked workspaces
+            for result in &results {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::WorkspacePreserved {
+                        change_id: result.change_id.clone(),
+                        workspace_name: result.workspace_name.clone(),
+                    },
+                )
+                .await;
             }
-            // Emit WorkspacePreserved event
-            send_event(
-                &self.event_tx,
-                ParallelEvent::WorkspacePreserved {
-                    change_id: result.change_id.clone(),
-                    workspace_name: result.workspace_name.clone(),
-                },
-            )
-            .await;
-            // Mark the failed change so dependent changes will be skipped
-            self.failed_tracker.mark_failed(&result.change_id);
+
+            // Mark failed changes for dependent skipping
+            for result in &failed {
+                self.failed_tracker.mark_failed(&result.change_id);
+            }
+        } else {
+            // Regular failure (not cancellation) - preserve only failed workspaces
+            for result in &failed {
+                if result.error.is_some() {
+                    error!(
+                        "Failed for {}, workspace preserved: {}",
+                        result.change_id, result.workspace_name
+                    );
+                    info!(
+                        "To resume: run with the same change_id, workspace will be automatically detected"
+                    );
+                    cleanup_guard.preserve(&result.workspace_name);
+                }
+                // Emit WorkspacePreserved event
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::WorkspacePreserved {
+                        change_id: result.change_id.clone(),
+                        workspace_name: result.workspace_name.clone(),
+                    },
+                )
+                .await;
+                // Mark the failed change so dependent changes will be skipped
+                self.failed_tracker.mark_failed(&result.change_id);
+            }
         }
 
         // If all failed, we don't have an error but continue to the next group
@@ -4983,9 +5013,10 @@ mod tests {
         }
     }
 
-    /// Test that MergeWait state does not prevent completion events when no changes remain.
-    /// This test validates the spec requirement:
-    /// "The system SHALL NOT send completion events or success messages while any change remains in merge_wait."
+    /// Test that the has_merge_deferred helper correctly tracks MergeWait state.
+    /// Per spec (update-tui-status-display): The system SHALL send AllCompleted
+    /// even when MergeWait remains, but this helper tracks whether any changes
+    /// are in MergeWait state for other logic purposes.
     #[test]
     fn test_merge_wait_suppresses_completion_events() {
         let config = OrchestratorConfig::default();

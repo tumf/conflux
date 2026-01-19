@@ -144,35 +144,49 @@ fn render_running_mode(frame: &mut Frame, app: &mut AppState, area: Rect) {
 
 /// Render header
 fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
-    let mode_text = match app.mode {
-        AppMode::Select => "Select Mode",
-        AppMode::Running => "Running",
-        AppMode::Stopping => "Stopping...",
-        AppMode::Stopped => "Stopped",
-        AppMode::Error => "Error",
-        AppMode::ConfirmWorktreeDelete => "Confirm Delete",
-        AppMode::QrPopup => "QR Code",
-    };
-
-    let mode_color = match app.mode {
-        AppMode::Select => Color::Cyan,
-        AppMode::Running => Color::Yellow,
-        AppMode::Stopping => Color::Yellow,
-        AppMode::Stopped => Color::DarkGray,
-        AppMode::Error => Color::Red,
-        AppMode::ConfirmWorktreeDelete => Color::Yellow,
-        AppMode::QrPopup => Color::Green,
+    // Per spec (update-tui-status-display):
+    // - Ready: when in Select mode
+    // - Running <count>: when changes are processing (count > 0)
+    // - No status: in Stopped and Error modes
+    let (mode_text, mode_color, show_status) = match app.mode {
+        AppMode::Select => ("Ready".to_string(), Color::Cyan, true),
+        AppMode::Running | AppMode::Stopping => {
+            // Count changes that are currently processing or archiving
+            let processing_count = app
+                .changes
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.queue_status,
+                        QueueStatus::Processing | QueueStatus::Archiving
+                    )
+                })
+                .count();
+            if processing_count > 0 {
+                (format!("Running {}", processing_count), Color::Yellow, true)
+            } else {
+                ("Ready".to_string(), Color::Cyan, true)
+            }
+        }
+        AppMode::Stopped | AppMode::Error => {
+            // Hide status in Stopped and Error modes per spec
+            (String::new(), Color::White, false)
+        }
+        AppMode::ConfirmWorktreeDelete => ("Confirm Delete".to_string(), Color::Yellow, true),
+        AppMode::QrPopup => ("QR Code".to_string(), Color::Green, true),
     };
 
     // Build header spans
-    let mut header_spans = vec![
-        Span::styled("Conflux", Style::default().fg(Color::White)),
-        Span::raw("  "),
-        Span::styled(
+    let mut header_spans = vec![Span::styled("Conflux", Style::default().fg(Color::White))];
+
+    // Add status label only when show_status is true
+    if show_status && !mode_text.is_empty() {
+        header_spans.push(Span::raw("  "));
+        header_spans.push(Span::styled(
             format!("[{}]", mode_text),
             Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
-        ),
-    ];
+        ));
+    }
 
     // Add parallel mode badge if enabled
     if app.parallel_mode {
@@ -567,140 +581,56 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
 /// Render status panel
 fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
-    // Check if all queued changes have completed
-    let all_completed = !app.logs.is_empty()
-        && app.mode == AppMode::Select
-        && app.changes.iter().any(|c| {
-            matches!(
-                c.queue_status,
-                QueueStatus::Completed | QueueStatus::Archived | QueueStatus::Merged
-            )
+    // Per spec (update-tui-status-display):
+    // Status line shows only progress bar + elapsed time
+    // Progress is calculated from selected (x) changes in all modes
+
+    // Calculate progress based on selected changes only
+    let (total_tasks, completed_tasks) = app
+        .changes
+        .iter()
+        .filter(|c| c.selected) // Only count selected (x) changes
+        .fold((0u32, 0u32), |(total, completed), c| {
+            (total + c.total_tasks, completed + c.completed_tasks)
         });
 
-    let (current_text, current_color) = match app.mode {
-        AppMode::Error => {
-            let error_id = app.error_change_id.as_deref().unwrap_or("unknown");
-            (format!("Error in: {}", error_id), Color::Red)
-        }
-        AppMode::Select if all_completed => ("Done".to_string(), Color::Green),
-        AppMode::Select => ("Ready".to_string(), Color::DarkGray),
-        AppMode::Stopped => ("Stopped".to_string(), Color::DarkGray),
-        AppMode::ConfirmWorktreeDelete => ("Confirm delete".to_string(), Color::Yellow),
-        AppMode::QrPopup => ("QR Code".to_string(), Color::Green),
-        AppMode::Running | AppMode::Stopping => {
-            // Count changes that are currently processing or archiving
-            let processing_count = app
-                .changes
-                .iter()
-                .filter(|c| {
-                    matches!(
-                        c.queue_status,
-                        QueueStatus::Processing | QueueStatus::Archiving
-                    )
-                })
-                .count();
-            if processing_count > 1 {
-                (format!("Running {}", processing_count), Color::Cyan)
-            } else if processing_count == 1 {
-                // Show the single change being processed
-                let current = app
-                    .changes
-                    .iter()
-                    .find(|c| {
-                        matches!(
-                            c.queue_status,
-                            QueueStatus::Processing | QueueStatus::Archiving
-                        )
-                    })
-                    .map(|c| c.id.as_str())
-                    .unwrap_or("unknown");
-                (format!("Status: {}", current), Color::White)
-            } else {
-                ("Waiting...".to_string(), Color::White)
-            }
-        }
-    };
+    let mut spans = vec![];
 
-    let (status_text, status_color) = match app.mode {
-        AppMode::Select if all_completed => (
-            "All processing completed. Press Ctrl+C to quit.",
-            Color::Green,
-        ),
-        AppMode::Running => ("Processing... Esc: stop", Color::Cyan),
-        AppMode::Stopping => (
-            "Stopping after current change... F5: continue, Esc: force stop",
-            Color::Yellow,
-        ),
-        AppMode::Stopped => (
-            "Stopped. F5: resume, Space: toggle execution mark, Ctrl+C: quit",
-            Color::DarkGray,
-        ),
-        AppMode::Select => ("", Color::White),
-        AppMode::Error => ("Press F5 to retry, or Ctrl+C to quit.", Color::Yellow),
-        AppMode::ConfirmWorktreeDelete => ("Y: delete worktree, N/Esc: cancel", Color::Yellow),
-        AppMode::QrPopup => ("Esc: close QR code", Color::Green),
-    };
-
-    // Calculate overall progress for all queued changes (including completed/archived)
-    let progress_info = if app.mode == AppMode::Running {
-        let (total_tasks, completed_tasks) = app
-            .changes
-            .iter()
-            .filter(|c| {
-                !matches!(
-                    c.queue_status,
-                    QueueStatus::NotQueued | QueueStatus::Error(_)
-                )
-            })
-            .fold((0u32, 0u32), |(total, completed), c| {
-                (total + c.total_tasks, completed + c.completed_tasks)
-            });
-
-        if total_tasks > 0 {
-            let percent = (completed_tasks as f32 / total_tasks as f32) * 100.0;
-            let bar_width = 20;
-            let filled = ((percent / 100.0) * bar_width as f32) as usize;
-            let empty = bar_width - filled;
-            Some((
-                format!(
-                    "[{}{}] {:>5.1}% ({}/{})",
-                    "█".repeat(filled),
-                    "░".repeat(empty),
-                    percent,
-                    completed_tasks,
-                    total_tasks
-                ),
-                Color::Cyan,
-            ))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let mut spans = vec![
-        Span::styled(current_text, Style::default().fg(current_color)),
-        Span::raw("  |  "),
-        Span::styled(status_text, Style::default().fg(status_color)),
-    ];
-
-    if let Some((progress_text, progress_color)) = progress_info {
-        spans.push(Span::raw("  |  "));
+    // Show progress bar if there are selected changes with tasks
+    if total_tasks > 0 {
+        let percent = (completed_tasks as f32 / total_tasks as f32) * 100.0;
+        let bar_width = 20;
+        let filled = ((percent / 100.0) * bar_width as f32) as usize;
+        let empty = bar_width - filled;
+        let progress_text = format!(
+            "[{}{}] {:>5.1}% ({}/{})",
+            "█".repeat(filled),
+            "░".repeat(empty),
+            percent,
+            completed_tasks,
+            total_tasks
+        );
         spans.push(Span::styled(
             progress_text,
-            Style::default().fg(progress_color),
+            Style::default().fg(Color::Cyan),
         ));
     }
 
+    // Show accumulated running time (elapsed)
+    // Per spec: accumulated running duration in Ready or Stopped mode
     if let Some(started) = app.orchestration_started_at {
         let elapsed = if matches!(app.mode, AppMode::Running | AppMode::Stopping) {
+            // Use current running time
             started.elapsed()
         } else {
+            // Use accumulated time from last run
             app.orchestration_elapsed
                 .unwrap_or_else(|| started.elapsed())
         };
-        spans.push(Span::raw("  |  "));
+
+        if !spans.is_empty() {
+            spans.push(Span::raw("  |  "));
+        }
         spans.push(Span::styled(
             format!("Elapsed {}", format_duration(elapsed)),
             Style::default().fg(Color::DarkGray),
