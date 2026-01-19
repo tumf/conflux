@@ -57,7 +57,10 @@ impl AppState {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
                     change.queue_status = QueueStatus::Completed;
                     // Reload final progress from tasks.md to preserve it
-                    if let Ok(progress) = task_parser::parse_change(&id) {
+                    let worktree_path = self.worktree_paths.get(&id).map(|p| p.as_path());
+                    if let Ok(progress) =
+                        task_parser::parse_progress_with_fallback(&id, worktree_path)
+                    {
                         change.completed_tasks = progress.completed;
                         change.total_tasks = progress.total;
                     }
@@ -95,9 +98,9 @@ impl AppState {
                     }
                     change.queue_status = QueueStatus::Archiving;
                     // Reload final progress from tasks.md to preserve it before archiving
-                    // Use worktree fallback to read from uncommitted changes
+                    // Use unified fallback helper to read from worktree → archive → base
                     let worktree_path = self.worktree_paths.get(&id).map(|p| p.as_path());
-                    match task_parser::parse_change_with_worktree_fallback(&id, worktree_path) {
+                    match task_parser::parse_progress_with_fallback(&id, worktree_path) {
                         Ok(progress) => {
                             // Only update if valid progress (not 0/0)
                             if progress.total > 0 {
@@ -121,12 +124,9 @@ impl AppState {
                         change.elapsed_time = Some(started.elapsed());
                     }
                     // Reload progress from archived tasks.md (with fallback guard)
-                    // Use worktree fallback to read from uncommitted archive
+                    // Use unified fallback helper to read from worktree → archive → base
                     let worktree_path = self.worktree_paths.get(&id).map(|p| p.as_path());
-                    match task_parser::parse_archived_change_with_worktree_fallback(
-                        &id,
-                        worktree_path,
-                    ) {
+                    match task_parser::parse_progress_with_fallback(&id, worktree_path) {
                         Ok(progress) => {
                             // Only update if valid progress (not 0/0)
                             if progress.total > 0 {
@@ -194,12 +194,9 @@ impl AppState {
                         change.elapsed_time = Some(started.elapsed());
                     }
                     // Reload progress from archived tasks.md (with fallback guard)
-                    // Use worktree fallback to read from uncommitted archive
+                    // Use unified fallback helper to read from worktree → archive → base
                     let worktree_path = self.worktree_paths.get(&change_id).map(|p| p.as_path());
-                    match task_parser::parse_archived_change_with_worktree_fallback(
-                        &change_id,
-                        worktree_path,
-                    ) {
+                    match task_parser::parse_progress_with_fallback(&change_id, worktree_path) {
                         Ok(progress) => {
                             // Only update if valid progress (not 0/0)
                             if progress.total > 0 {
@@ -231,12 +228,9 @@ impl AppState {
                         change.elapsed_time = Some(started.elapsed());
                     }
                     // Reload progress from archived tasks.md (with fallback guard)
-                    // Use worktree fallback to read from uncommitted archive
+                    // Use unified fallback helper to read from worktree → archive → base
                     let worktree_path = self.worktree_paths.get(&change_id).map(|p| p.as_path());
-                    match task_parser::parse_archived_change_with_worktree_fallback(
-                        &change_id,
-                        worktree_path,
-                    ) {
+                    match task_parser::parse_progress_with_fallback(&change_id, worktree_path) {
                         Ok(progress) => {
                             // Only update if valid progress (not 0/0)
                             if progress.total > 0 {
@@ -510,43 +504,15 @@ impl AppState {
                             self.worktree_paths.get(&fetched.id).map(|p| p.as_path());
 
                         match existing.queue_status {
-                            QueueStatus::Archiving | QueueStatus::Resolving => {
-                                // Try active location first, then archived location
-                                if let Ok(progress) =
-                                    task_parser::parse_change_with_worktree_fallback(
-                                        &fetched.id,
-                                        worktree_path,
-                                    )
-                                {
-                                    // Only update if valid progress (not 0/0)
-                                    if progress.total > 0 {
-                                        existing.completed_tasks = progress.completed;
-                                        existing.total_tasks = progress.total;
-                                    }
-                                    // If 0/0, preserve existing progress
-                                } else if let Ok(progress) =
-                                    task_parser::parse_archived_change_with_worktree_fallback(
-                                        &fetched.id,
-                                        worktree_path,
-                                    )
-                                {
-                                    // Only update if valid progress (not 0/0)
-                                    if progress.total > 0 {
-                                        existing.completed_tasks = progress.completed;
-                                        existing.total_tasks = progress.total;
-                                    }
-                                    // If 0/0, preserve existing progress
-                                }
-                                // If both fail or return 0/0, preserve existing progress
-                            }
-                            QueueStatus::Archived | QueueStatus::Merged => {
-                                // Try archived location with worktree fallback
-                                if let Ok(progress) =
-                                    task_parser::parse_archived_change_with_worktree_fallback(
-                                        &fetched.id,
-                                        worktree_path,
-                                    )
-                                {
+                            QueueStatus::Archiving
+                            | QueueStatus::Resolving
+                            | QueueStatus::Archived
+                            | QueueStatus::Merged => {
+                                // Use unified fallback helper: worktree → archive → base
+                                if let Ok(progress) = task_parser::parse_progress_with_fallback(
+                                    &fetched.id,
+                                    worktree_path,
+                                ) {
                                     // Only update if valid progress (not 0/0)
                                     if progress.total > 0 {
                                         existing.completed_tasks = progress.completed;

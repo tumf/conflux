@@ -548,45 +548,28 @@ impl WebState {
             .map_err(|e| format!("Failed to refresh changes from disk: {}", e))?;
 
         // Enrich progress from worktrees (uncommitted tasks.md)
+        // Use unified fallback helper: worktree → archive → base
         for change in &mut changes {
-            match crate::vcs::git::get_worktree_path_for_change(&repo_root, &change.id).await {
-                Ok(Some(wt_path)) => {
-                    // Try active change location first
-                    match crate::task_parser::parse_change_with_worktree_fallback(
-                        &change.id,
-                        Some(&wt_path),
-                    ) {
-                        Ok(progress) => {
-                            change.completed_tasks = progress.completed;
-                            change.total_tasks = progress.total;
-                        }
-                        Err(_) => {
-                            // If not found in active location, try archived location
-                            // This handles changes that have been archived but not yet merged
-                            match crate::task_parser::parse_archived_change_with_worktree_fallback(
-                                &change.id,
-                                Some(&wt_path),
-                            ) {
-                                Ok(progress) => {
-                                    change.completed_tasks = progress.completed;
-                                    change.total_tasks = progress.total;
-                                }
-                                Err(e) => {
-                                    tracing::debug!(
-                                        "Failed to read worktree progress for {}: {}",
-                                        change.id,
-                                        e
-                                    );
-                                }
-                            }
-                        }
+            let worktree_path =
+                match crate::vcs::git::get_worktree_path_for_change(&repo_root, &change.id).await {
+                    Ok(Some(wt_path)) => Some(wt_path),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::debug!("Failed to get worktree path for {}: {}", change.id, e);
+                        None
                     }
-                }
-                Ok(None) => {
-                    // No worktree exists, use progress from base tree
+                };
+
+            match crate::task_parser::parse_progress_with_fallback(
+                &change.id,
+                worktree_path.as_deref(),
+            ) {
+                Ok(progress) => {
+                    change.completed_tasks = progress.completed;
+                    change.total_tasks = progress.total;
                 }
                 Err(e) => {
-                    tracing::debug!("Failed to get worktree path for {}: {}", change.id, e);
+                    tracing::debug!("Failed to read progress for {}: {}", change.id, e);
                 }
             }
         }

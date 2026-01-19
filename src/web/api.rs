@@ -48,6 +48,36 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+/// Create a standardized Not Found error response.
+///
+/// This helper consolidates the Not Found response format used across all API endpoints.
+///
+/// # Arguments
+/// * `change_id` - The ID of the change that was not found
+///
+/// # Returns
+/// A tuple of (StatusCode::NOT_FOUND, Json<ErrorResponse>) ready to be returned from handlers.
+///
+/// # Example
+/// ```no_run
+/// use conflux::web::api::not_found_response;
+///
+/// async fn my_handler(id: String) -> Result<Json<Data>, (StatusCode, Json<ErrorResponse>)> {
+///     match get_data(&id) {
+///         Some(data) => Ok(Json(data)),
+///         None => Err(not_found_response(&id)),
+///     }
+/// }
+/// ```
+pub fn not_found_response(change_id: &str) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: format!("Change '{}' not found", change_id),
+        }),
+    )
+}
+
 /// Get a specific change by ID
 pub async fn get_change(
     State(state): State<Arc<WebState>>,
@@ -58,12 +88,7 @@ pub async fn get_change(
 
     match state.get_change(&id).await {
         Some(change) => Ok(Json(change)),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("Change '{}' not found", id),
-            }),
-        )),
+        None => Err(not_found_response(&id)),
     }
 }
 
@@ -84,12 +109,7 @@ pub async fn approve_change(
         Ok(change) => Ok(Json(change)),
         Err(e) => {
             if e.to_string().contains("not found") {
-                Err((
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: format!("Change '{}' not found", id),
-                    }),
-                ))
+                Err(not_found_response(&id))
             } else {
                 Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -119,12 +139,7 @@ pub async fn unapprove_change(
         Ok(change) => Ok(Json(change)),
         Err(e) => {
             if e.to_string().contains("not found") {
-                Err((
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: format!("Change '{}' not found", id),
-                    }),
-                ))
+                Err(not_found_response(&id))
             } else {
                 Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -246,5 +261,25 @@ mod tests {
         let (status, error) = result.unwrap_err();
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(error.error.contains("nonexistent"));
+    }
+
+    #[test]
+    fn test_not_found_response_helper() {
+        let (status, error) = not_found_response("test-change-id");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error.error, "Change 'test-change-id' not found");
+    }
+
+    #[test]
+    fn test_not_found_response_consistency() {
+        // Verify that the helper produces the same format as before
+        let change_id = "my-test-change";
+        let (status, error) = not_found_response(change_id);
+
+        // Check status code
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Check error message format (same as old inline format)
+        assert_eq!(error.error, format!("Change '{}' not found", change_id));
     }
 }

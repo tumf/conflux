@@ -348,48 +348,23 @@ async fn run_tui_loop(
                                     Ok(Some(wt_path)) => {
                                         // Store the worktree path for this change
                                         worktree_paths.insert(change.id.clone(), wt_path.clone());
-                                        // Try active change location first
-                                        match crate::task_parser::parse_change_with_worktree_fallback(
+                                        // Use unified fallback helper: worktree → archive → base
+                                        match crate::task_parser::parse_progress_with_fallback(
                                             &change.id,
                                             Some(&wt_path)
                                         ) {
                                             Ok(progress) => {
-                                                if progress.total == 0 {
-                                                    // If progress is 0/0, try archived location
-                                                    match crate::task_parser::parse_archived_change_with_worktree_fallback(
-                                                        &change.id,
-                                                        Some(&wt_path)
-                                                    ) {
-                                                        Ok(archived_progress) if archived_progress.total > 0 => {
-                                                            change.completed_tasks = archived_progress.completed;
-                                                            change.total_tasks = archived_progress.total;
-                                                        }
-                                                        _ => {
-                                                            // Keep existing progress if archived progress is also 0/0 or unavailable
-                                                            debug!("Keeping existing progress for {} (active: 0/0, archived: unavailable)", change.id);
-                                                        }
-                                                    }
-                                                } else {
+                                                if progress.total > 0 {
                                                     change.completed_tasks = progress.completed;
                                                     change.total_tasks = progress.total;
+                                                } else {
+                                                    // Keep existing progress if 0/0
+                                                    debug!("Keeping existing progress for {} (parsed: 0/0)", change.id);
                                                 }
                                             }
-                                            Err(_) => {
-                                                // If not found in active location, try archived location
-                                                // This handles changes that have been archived but not yet merged
-                                                match crate::task_parser::parse_archived_change_with_worktree_fallback(
-                                                    &change.id,
-                                                    Some(&wt_path)
-                                                ) {
-                                                    Ok(progress) => {
-                                                        change.completed_tasks = progress.completed;
-                                                        change.total_tasks = progress.total;
-                                                    }
-                                                    Err(e) => {
-                                                        debug!("Failed to read worktree progress for {}: {}", change.id, e);
-                                                        // Keep existing progress (from base tree)
-                                                    }
-                                                }
+                                            Err(e) => {
+                                                debug!("Failed to read progress for {}: {}", change.id, e);
+                                                // Keep existing progress (from base tree)
                                             }
                                         }
                                     }

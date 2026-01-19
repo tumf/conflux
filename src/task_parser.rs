@@ -129,6 +129,15 @@ pub fn parse_change(change_id: &str) -> Result<TaskProgress> {
 ///
 /// This function is designed for TUI auto-refresh to read the latest progress
 /// from worktrees where AI agents update tasks.md before committing.
+///
+/// # Deprecated
+/// Use [`parse_progress_with_fallback`] instead, which provides comprehensive
+/// fallback order: worktree → archive → base.
+#[deprecated(
+    since = "0.3.0",
+    note = "Use parse_progress_with_fallback for comprehensive fallback order"
+)]
+#[allow(dead_code)]
 pub fn parse_change_with_worktree_fallback(
     change_id: &str,
     worktree_path: Option<&Path>,
@@ -194,6 +203,15 @@ fn find_archive_directory(change_id: &str, base_path: Option<&Path>) -> Option<s
 /// `openspec/changes/archive/{date}-{change_id}/tasks.md` (date-prefixed format).
 /// This is used to retrieve final progress for archived changes when
 /// the change is no longer in the active changes directory.
+///
+/// # Deprecated
+/// Use [`parse_progress_with_fallback`] instead, which provides comprehensive
+/// fallback order: worktree → archive → base.
+#[deprecated(
+    since = "0.3.0",
+    note = "Use parse_progress_with_fallback for comprehensive fallback order"
+)]
+#[allow(dead_code)]
 pub fn parse_archived_change(change_id: &str) -> Result<TaskProgress> {
     let archive_path = find_archive_directory(change_id, None).ok_or_else(|| {
         OrchestratorError::ConfigLoad(format!(
@@ -226,6 +244,16 @@ pub fn parse_archived_change(change_id: &str) -> Result<TaskProgress> {
 ///
 /// This function is designed for Archived/Merged changes in TUI auto-refresh to read
 /// the latest progress from worktrees where the archive may not yet be committed.
+///
+/// # Deprecated
+/// Use [`parse_progress_with_fallback`] instead, which provides comprehensive
+/// fallback order: worktree → archive → base.
+#[deprecated(
+    since = "0.3.0",
+    note = "Use parse_progress_with_fallback for comprehensive fallback order"
+)]
+#[allow(dead_code)]
+#[allow(deprecated)]
 pub fn parse_archived_change_with_worktree_fallback(
     change_id: &str,
     worktree_path: Option<&Path>,
@@ -261,6 +289,100 @@ pub fn parse_archived_change_with_worktree_fallback(
 
     // Fallback to base tree archive (supports date-prefixed directories)
     parse_archived_change(change_id)
+}
+
+/// Parse task progress with comprehensive fallback order: worktree → archive → base.
+///
+/// This is the unified progress retrieval helper used by both TUI and Web components.
+///
+/// Resolution order:
+/// 1. Try worktree active location: worktree_path/openspec/changes/{change_id}/tasks.md
+/// 2. Try worktree archive location: worktree_path/openspec/changes/archive/{change_id}/tasks.md (or date-prefixed)
+/// 3. Try base tree archive location: openspec/changes/archive/{change_id}/tasks.md (or date-prefixed)
+/// 4. Try base tree active location: openspec/changes/{change_id}/tasks.md
+///
+/// # Arguments
+/// * `change_id` - The ID of the change to retrieve progress for
+/// * `worktree_path` - Optional path to the worktree (for uncommitted changes)
+///
+/// # Returns
+/// Task progress with completed and total counts, or an error if not found in any location.
+///
+/// # Example
+/// ```no_run
+/// use std::path::Path;
+/// use conflux::task_parser;
+///
+/// // Without worktree (base tree only)
+/// let progress = task_parser::parse_progress_with_fallback("my-change", None)?;
+///
+/// // With worktree (prioritizes worktree)
+/// let wt_path = Path::new("/path/to/worktree");
+/// let progress = task_parser::parse_progress_with_fallback("my-change", Some(wt_path))?;
+/// # Ok::<(), conflux::error::OrchestratorError>(())
+/// ```
+pub fn parse_progress_with_fallback(
+    change_id: &str,
+    worktree_path: Option<&Path>,
+) -> Result<TaskProgress> {
+    // 1. Try worktree active location first (most recent uncommitted changes)
+    if let Some(wt_path) = worktree_path {
+        let wt_active = wt_path
+            .join("openspec/changes")
+            .join(change_id)
+            .join("tasks.md");
+
+        if wt_active.exists() {
+            debug!(
+                "Reading progress from worktree active location: {:?}",
+                wt_active
+            );
+            return parse_file(&wt_active, Some(change_id));
+        }
+
+        // 2. Try worktree archive location (archived but not yet committed)
+        if let Some(archive_path) = find_archive_directory(change_id, Some(wt_path)) {
+            let wt_archive_tasks = archive_path.join("tasks.md");
+            if wt_archive_tasks.exists() {
+                debug!(
+                    "Reading progress from worktree archive location: {:?}",
+                    wt_archive_tasks
+                );
+                return parse_file(&wt_archive_tasks, Some(change_id));
+            }
+        }
+    }
+
+    // 3. Try base tree archive location (committed archive)
+    if let Some(archive_path) = find_archive_directory(change_id, None) {
+        let base_archive_tasks = archive_path.join("tasks.md");
+        if base_archive_tasks.exists() {
+            debug!(
+                "Reading progress from base tree archive location: {:?}",
+                base_archive_tasks
+            );
+            return parse_file(&base_archive_tasks, Some(change_id));
+        }
+    }
+
+    // 4. Fallback to base tree active location (committed active change)
+    let base_active = Path::new("openspec/changes")
+        .join(change_id)
+        .join("tasks.md");
+
+    if base_active.exists() {
+        debug!(
+            "Reading progress from base tree active location: {:?}",
+            base_active
+        );
+        return parse_file(&base_active, Some(change_id));
+    }
+
+    // Not found in any location
+    Err(OrchestratorError::ConfigLoad(format!(
+        "Tasks file not found for change '{}' in any location (worktree, archive, or base tree)",
+        change_id
+    )))
 }
 
 #[cfg(test)]
@@ -508,7 +630,7 @@ mod tests {
         std::fs::write(change_dir.join("tasks.md"), tasks_content).unwrap();
 
         // Parse with worktree
-        let result = parse_change_with_worktree_fallback("test-change", Some(worktree_path));
+        let result = parse_progress_with_fallback("test-change", Some(worktree_path));
         assert!(result.is_ok());
         let progress = result.unwrap();
         assert_eq!(progress.completed, 2);
@@ -545,7 +667,7 @@ mod tests {
         std::fs::write(change_dir.join("tasks.md"), tasks_content).unwrap();
 
         // Parse with non-existent worktree (should fallback to base)
-        let result = parse_change_with_worktree_fallback("test-change", None);
+        let result = parse_progress_with_fallback("test-change", None);
         assert!(result.is_ok());
         let progress = result.unwrap();
         assert_eq!(progress.completed, 1);
@@ -575,8 +697,7 @@ mod tests {
         std::fs::write(archive_dir.join("tasks.md"), tasks_content).unwrap();
 
         // Parse with worktree
-        let result =
-            parse_archived_change_with_worktree_fallback("test-archived", Some(worktree_path));
+        let result = parse_progress_with_fallback("test-archived", Some(worktree_path));
         assert!(result.is_ok());
         let progress = result.unwrap();
         assert_eq!(progress.completed, 3);
@@ -599,8 +720,7 @@ mod tests {
         std::fs::write(change_dir.join("tasks.md"), tasks_content).unwrap();
 
         // Parse with worktree (should find in active location since not in archive yet)
-        let result =
-            parse_archived_change_with_worktree_fallback("test-prearchive", Some(worktree_path));
+        let result = parse_progress_with_fallback("test-prearchive", Some(worktree_path));
         assert!(result.is_ok());
         let progress = result.unwrap();
         assert_eq!(progress.completed, 2);
@@ -634,7 +754,7 @@ mod tests {
         std::fs::write(archive_dir.join("tasks.md"), tasks_content).unwrap();
 
         // Parse with non-existent worktree (should fallback to base)
-        let result = parse_archived_change_with_worktree_fallback("test-base-archive", None);
+        let result = parse_progress_with_fallback("test-base-archive", None);
         assert!(result.is_ok());
         let progress = result.unwrap();
         assert_eq!(progress.completed, 1);
@@ -677,8 +797,7 @@ mod tests {
         .unwrap();
 
         // Parse with worktree (should prefer worktree over base)
-        let result =
-            parse_archived_change_with_worktree_fallback("test-priority", Some(&worktree_path));
+        let result = parse_progress_with_fallback("test-priority", Some(&worktree_path));
         assert!(result.is_ok());
         let progress = result.unwrap();
         assert_eq!(progress.completed, 2);
@@ -719,7 +838,7 @@ mod tests {
         std::fs::write(archive_dir.join("tasks.md"), tasks_content).unwrap();
 
         // Parse should find the date-prefixed directory
-        let result = parse_archived_change("test-change");
+        let result = parse_progress_with_fallback("test-change", None);
         assert!(result.is_ok());
         let progress = result.unwrap();
         assert_eq!(progress.completed, 2);
@@ -757,7 +876,7 @@ mod tests {
         std::fs::write(date_archive.join("tasks.md"), "- [ ] Date task").unwrap();
 
         // Parse should prefer exact match over date-prefixed
-        let result = parse_archived_change("test-exact");
+        let result = parse_progress_with_fallback("test-exact", None);
         assert!(result.is_ok());
         let progress = result.unwrap();
         assert_eq!(progress.completed, 1);
@@ -795,7 +914,7 @@ mod tests {
         .unwrap();
 
         // Parse without worktree (should find date-prefixed archive)
-        let result = parse_archived_change_with_worktree_fallback("test-date", None);
+        let result = parse_progress_with_fallback("test-date", None);
         assert!(result.is_ok());
         let progress = result.unwrap();
         assert_eq!(progress.completed, 3);
@@ -851,5 +970,245 @@ mod tests {
         let result = find_archive_directory("my-feature", Some(base_path));
         assert!(result.is_some());
         assert_eq!(result.unwrap(), date_archive);
+    }
+
+    // ====================
+    // Unified fallback helper tests
+    // ====================
+
+    #[test]
+    fn test_parse_progress_with_fallback_worktree_active() {
+        use std::env;
+        use tempfile::TempDir;
+
+        // Acquire lock to prevent concurrent directory changes
+        let _lock = DIR_TEST_MUTEX
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path();
+
+        // Change to temp directory
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(base_path).unwrap();
+
+        // Create worktree active location
+        let worktree_path = base_path.join("worktree");
+        let wt_active = worktree_path.join("openspec/changes/test-fallback");
+        std::fs::create_dir_all(&wt_active).unwrap();
+        std::fs::write(
+            wt_active.join("tasks.md"),
+            "- [x] Task 1\n- [x] Task 2\n- [ ] Task 3",
+        )
+        .unwrap();
+
+        // Parse should find worktree active location first
+        let result = parse_progress_with_fallback("test-fallback", Some(&worktree_path));
+        assert!(result.is_ok());
+        let progress = result.unwrap();
+        assert_eq!(progress.completed, 2);
+        assert_eq!(progress.total, 3);
+
+        // Restore directory
+        env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[test]
+    fn test_parse_progress_with_fallback_worktree_archive() {
+        use std::env;
+        use tempfile::TempDir;
+
+        // Acquire lock to prevent concurrent directory changes
+        let _lock = DIR_TEST_MUTEX
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path();
+
+        // Change to temp directory
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(base_path).unwrap();
+
+        // Create worktree archive location (no active location)
+        let worktree_path = base_path.join("worktree");
+        let wt_archive = worktree_path.join("openspec/changes/archive/test-wt-archive");
+        std::fs::create_dir_all(&wt_archive).unwrap();
+        std::fs::write(
+            wt_archive.join("tasks.md"),
+            "- [x] Task 1\n- [x] Task 2\n- [x] Task 3\n- [ ] Task 4",
+        )
+        .unwrap();
+
+        // Parse should find worktree archive location
+        let result = parse_progress_with_fallback("test-wt-archive", Some(&worktree_path));
+        assert!(result.is_ok());
+        let progress = result.unwrap();
+        assert_eq!(progress.completed, 3);
+        assert_eq!(progress.total, 4);
+
+        // Restore directory
+        env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[test]
+    fn test_parse_progress_with_fallback_base_archive() {
+        use std::env;
+        use tempfile::TempDir;
+
+        // Acquire lock to prevent concurrent directory changes
+        let _lock = DIR_TEST_MUTEX
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path();
+
+        // Change to temp directory
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(base_path).unwrap();
+
+        // Create base tree archive location (no worktree)
+        let base_archive = base_path.join("openspec/changes/archive/test-base-archive");
+        std::fs::create_dir_all(&base_archive).unwrap();
+        std::fs::write(base_archive.join("tasks.md"), "- [x] Task 1\n- [x] Task 2").unwrap();
+
+        // Parse should find base tree archive location
+        let result = parse_progress_with_fallback("test-base-archive", None);
+        assert!(result.is_ok());
+        let progress = result.unwrap();
+        assert_eq!(progress.completed, 2);
+        assert_eq!(progress.total, 2);
+
+        // Restore directory
+        env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[test]
+    fn test_parse_progress_with_fallback_base_active() {
+        use std::env;
+        use tempfile::TempDir;
+
+        // Acquire lock to prevent concurrent directory changes
+        let _lock = DIR_TEST_MUTEX
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path();
+
+        // Change to temp directory
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(base_path).unwrap();
+
+        // Create base tree active location (no archive, no worktree)
+        let base_active = base_path.join("openspec/changes/test-base-active");
+        std::fs::create_dir_all(&base_active).unwrap();
+        std::fs::write(base_active.join("tasks.md"), "- [ ] Task 1").unwrap();
+
+        // Parse should find base tree active location
+        let result = parse_progress_with_fallback("test-base-active", None);
+        assert!(result.is_ok());
+        let progress = result.unwrap();
+        assert_eq!(progress.completed, 0);
+        assert_eq!(progress.total, 1);
+
+        // Restore directory
+        env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[test]
+    fn test_parse_progress_with_fallback_priority_order() {
+        use std::env;
+        use tempfile::TempDir;
+
+        // Acquire lock to prevent concurrent directory changes
+        let _lock = DIR_TEST_MUTEX
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path();
+
+        // Change to temp directory
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(base_path).unwrap();
+
+        // Create all locations with different progress values
+        let worktree_path = base_path.join("worktree");
+
+        // Worktree active (highest priority)
+        let wt_active = worktree_path.join("openspec/changes/test-priority");
+        std::fs::create_dir_all(&wt_active).unwrap();
+        std::fs::write(
+            wt_active.join("tasks.md"),
+            "- [x] WT Active 1\n- [x] WT Active 2\n- [x] WT Active 3",
+        )
+        .unwrap();
+
+        // Worktree archive
+        let wt_archive = worktree_path.join("openspec/changes/archive/test-priority");
+        std::fs::create_dir_all(&wt_archive).unwrap();
+        std::fs::write(
+            wt_archive.join("tasks.md"),
+            "- [x] WT Archive 1\n- [x] WT Archive 2",
+        )
+        .unwrap();
+
+        // Base archive
+        let base_archive = base_path.join("openspec/changes/archive/test-priority");
+        std::fs::create_dir_all(&base_archive).unwrap();
+        std::fs::write(base_archive.join("tasks.md"), "- [x] Base Archive 1").unwrap();
+
+        // Base active (lowest priority)
+        let base_active = base_path.join("openspec/changes/test-priority");
+        std::fs::create_dir_all(&base_active).unwrap();
+        std::fs::write(base_active.join("tasks.md"), "- [ ] Base Active 1").unwrap();
+
+        // Parse should find worktree active location (highest priority)
+        let result = parse_progress_with_fallback("test-priority", Some(&worktree_path));
+        assert!(result.is_ok());
+        let progress = result.unwrap();
+        assert_eq!(progress.completed, 3); // From worktree active
+        assert_eq!(progress.total, 3);
+
+        // Restore directory
+        env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[test]
+    fn test_parse_progress_with_fallback_not_found() {
+        use std::env;
+        use tempfile::TempDir;
+
+        // Acquire lock to prevent concurrent directory changes
+        let _lock = DIR_TEST_MUTEX
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path();
+
+        // Change to temp directory
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(base_path).unwrap();
+
+        // Don't create any locations
+        let result = parse_progress_with_fallback("nonexistent", None);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not found for change 'nonexistent'"));
+
+        // Restore directory
+        env::set_current_dir(original_dir).unwrap();
     }
 }
