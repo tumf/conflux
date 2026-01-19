@@ -125,12 +125,46 @@ pub enum WorkspaceStatus {
     Applying,
     /// Apply completed successfully with resulting revision
     Applied(String),
+    /// Running acceptance tests
+    Accepting,
+    /// Currently being archived
+    Archiving,
+    /// Currently resolving conflicts
+    Resolving,
+    /// Waiting for merge resolution
+    MergeWait,
     /// Apply failed with error message
     Failed(String),
     /// Workspace merged into main
     Merged,
     /// Workspace cleaned up
     Cleaned,
+}
+
+impl WorkspaceStatus {
+    /// Check if this workspace status represents an active workspace.
+    ///
+    /// Active workspaces are those currently being worked on (apply/archive/acceptance/resolve).
+    /// Inactive workspaces are those that are done, merged, cleaned up, or errored.
+    ///
+    /// This is used for calculating available execution slots in parallel mode.
+    /// Per spec line 7: "apply / acceptance / archive / resolve が進行中の change"
+    pub fn is_active(&self) -> bool {
+        match self {
+            // Active: workspace is being worked on
+            WorkspaceStatus::Created => true,
+            WorkspaceStatus::Applying => true,
+            WorkspaceStatus::Applied(_) => true,
+            WorkspaceStatus::Accepting => true,
+            WorkspaceStatus::Archiving => true,
+            WorkspaceStatus::Resolving => true,
+            // Inactive: waiting or completed states (per spec: merged / merge_wait / error / not queued)
+            WorkspaceStatus::MergeWait => false,
+            WorkspaceStatus::Failed(_) => false,
+            WorkspaceStatus::Merged => false,
+            WorkspaceStatus::Cleaned => false,
+        }
+    }
 }
 
 /// Generic workspace information
@@ -212,6 +246,17 @@ pub trait WorkspaceManager: Send + Sync {
 
     /// Get the list of active workspaces
     fn workspaces(&self) -> Vec<Workspace>;
+
+    /// Get the count of active workspaces (those currently being worked on).
+    ///
+    /// Active workspaces are those with status Created, Applying, or Applied.
+    /// This is used to calculate available execution slots in parallel mode.
+    fn active_workspace_count(&self) -> usize {
+        self.workspaces()
+            .iter()
+            .filter(|w| w.status.is_active())
+            .count()
+    }
 
     /// List change IDs that currently have worktrees.
     async fn list_worktree_change_ids(&self) -> VcsResult<HashSet<String>>;
@@ -443,6 +488,23 @@ mod tests {
     fn test_workspace_status_failed_includes_message() {
         let status = WorkspaceStatus::Failed("LLM timeout".to_string());
         assert!(matches!(status, WorkspaceStatus::Failed(ref msg) if msg == "LLM timeout"));
+    }
+
+    #[test]
+    fn test_workspace_status_is_active() {
+        // Active statuses - per spec: apply / acceptance / archive / resolve in progress
+        assert!(WorkspaceStatus::Created.is_active());
+        assert!(WorkspaceStatus::Applying.is_active());
+        assert!(WorkspaceStatus::Applied("abc123".to_string()).is_active());
+        assert!(WorkspaceStatus::Accepting.is_active());
+        assert!(WorkspaceStatus::Archiving.is_active());
+        assert!(WorkspaceStatus::Resolving.is_active());
+
+        // Inactive statuses - per spec: merged / merge_wait / error / not queued
+        assert!(!WorkspaceStatus::MergeWait.is_active());
+        assert!(!WorkspaceStatus::Failed("error".to_string()).is_active());
+        assert!(!WorkspaceStatus::Merged.is_active());
+        assert!(!WorkspaceStatus::Cleaned.is_active());
     }
 
     // === Tests for VcsError types ===

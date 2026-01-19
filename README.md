@@ -729,6 +729,10 @@ The actual bound address is logged when the server starts.
 | `/api/state` | GET | Full orchestrator state |
 | `/api/changes` | GET | List all changes with progress |
 | `/api/changes/{id}` | GET | Details for a specific change |
+| `/api/changes/{id}/approve` | POST | Approve a change |
+| `/api/changes/{id}/unapprove` | POST | Unapprove a change |
+
+For complete API specifications, see the [OpenAPI documentation](docs/web-api.openapi.yaml).
 
 **WebSocket:**
 
