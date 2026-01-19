@@ -754,13 +754,17 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
         })
         .collect();
 
-    // Build title with scroll position indicator
+    // Build title with scroll position indicator and auto-scroll status
+    let auto_scroll_indicator = if app.log_auto_scroll { "▼" } else { "⏸" };
     let title = if total_logs > visible_height {
         let visible_start = start_index + 1;
         let visible_end = end_index;
-        format!(" Logs [{}-{}/{}] ", visible_start, visible_end, total_logs)
+        format!(
+            " Logs [{}-{}/{}] {} ",
+            visible_start, visible_end, total_logs, auto_scroll_indicator
+        )
     } else {
-        " Logs ".to_string()
+        format!(" Logs {} ", auto_scroll_indicator)
     };
 
     let logs = Paragraph::new(log_items).block(
