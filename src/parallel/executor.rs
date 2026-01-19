@@ -1028,7 +1028,7 @@ pub async fn execute_archive_in_workspace(
                     .send(ParallelEvent::ArchiveOutput {
                         change_id: change_id_clone.clone(),
                         output: output_text,
-                        iteration: Some(attempt),
+                        iteration: attempt,
                     })
                     .await;
             }
@@ -1174,6 +1174,7 @@ pub async fn execute_archive_in_workspace(
     let resolve_agent = AgentRunner::new(config.clone());
     let change_id_owned = change_id.to_string();
     let event_tx_clone = event_tx.clone();
+    let final_attempt = attempt;
     ensure_archive_commit(
         change_id,
         workspace_path,
@@ -1182,6 +1183,7 @@ pub async fn execute_archive_in_workspace(
         move |line| {
             let event_tx = event_tx_clone.clone();
             let change_id = change_id_owned.clone();
+            let iteration = final_attempt;
             async move {
                 let text = match line {
                     OutputLine::Stdout(text) | OutputLine::Stderr(text) => text,
@@ -1191,7 +1193,7 @@ pub async fn execute_archive_in_workspace(
                         .send(ParallelEvent::ArchiveOutput {
                             change_id,
                             output: text,
-                            iteration: Some(1),
+                            iteration,
                         })
                         .await;
                 }

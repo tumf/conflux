@@ -188,7 +188,7 @@ impl ParallelRunService {
                 Box::pin(async move {
                     let service = ParallelRunService::new(repo_root, config);
                     service
-                        .analyze_order_with_sender(remaining, Some(&event_tx), Some(iteration))
+                        .analyze_order_with_sender(remaining, Some(&event_tx), iteration)
                         .await
                 })
             })
@@ -277,7 +277,7 @@ impl ParallelRunService {
                 Box::pin(async move {
                     let service = ParallelRunService::new(repo_root, config);
                     service
-                        .analyze_order_with_sender(remaining, Some(&event_tx), Some(iteration))
+                        .analyze_order_with_sender(remaining, Some(&event_tx), iteration)
                         .await
                 })
             })
@@ -297,8 +297,7 @@ impl ParallelRunService {
     /// If `use_llm_analysis` is enabled (default), uses LLM to analyze dependencies.
     /// Otherwise, runs all changes in parallel (no dependency inference).
     async fn analyze_and_group(&self, changes: &[Change]) -> Vec<ParallelGroup> {
-        self.analyze_and_group_with_sender(changes, None, None)
-            .await
+        self.analyze_and_group_with_sender(changes, None, 1).await
     }
 
     /// Analyze changes and return order-based result with optional event sender.
@@ -310,7 +309,7 @@ impl ParallelRunService {
         &self,
         changes: &[Change],
         event_tx: Option<&mpsc::Sender<ParallelEvent>>,
-        iteration: Option<u32>,
+        iteration: u32,
     ) -> crate::analyzer::AnalysisResult {
         // Check if LLM analysis is enabled (default: true)
         if self.config.use_llm_analysis() {
@@ -359,7 +358,7 @@ impl ParallelRunService {
         &self,
         changes: &[Change],
         event_tx: Option<&mpsc::Sender<ParallelEvent>>,
-        iteration: Option<u32>,
+        iteration: u32,
     ) -> Vec<ParallelGroup> {
         // Check if LLM analysis is enabled (default: true)
         if self.config.use_llm_analysis() {
@@ -405,7 +404,7 @@ impl ParallelRunService {
         &self,
         changes: &[Change],
         event_tx: Option<&mpsc::Sender<ParallelEvent>>,
-        iteration: Option<u32>,
+        iteration: u32,
     ) -> Result<crate::analyzer::AnalysisResult> {
         let agent = AgentRunner::new(self.config.clone());
         let analyzer = ParallelizationAnalyzer::new(agent);
@@ -435,7 +434,7 @@ impl ParallelRunService {
         &self,
         changes: &[Change],
         event_tx: Option<&mpsc::Sender<ParallelEvent>>,
-        iteration: Option<u32>,
+        iteration: u32,
     ) -> Result<Vec<ParallelGroup>> {
         let agent = AgentRunner::new(self.config.clone());
         let analyzer = ParallelizationAnalyzer::new(agent);

@@ -1185,7 +1185,7 @@ impl ParallelExecutor {
                                         .send(ParallelEvent::ArchiveOutput {
                                             change_id,
                                             output: text,
-                                            iteration: None,
+                                            iteration: 1,
                                         })
                                         .await;
                                 }
@@ -1202,6 +1202,8 @@ impl ParallelExecutor {
                             },
                         )
                         .await;
+                        // Preserve all workspaces on error to allow resume/debugging
+                        cleanup_guard.preserve_all();
                         return Err(err);
                     }
 
@@ -1444,7 +1446,7 @@ impl ParallelExecutor {
                                         .send(ParallelEvent::ArchiveOutput {
                                             change_id,
                                             output: text,
-                                            iteration: None,
+                                            iteration: 1,
                                         })
                                         .await;
                                 }
@@ -1461,6 +1463,8 @@ impl ParallelExecutor {
                             },
                         )
                         .await;
+                        // Preserve all workspaces on error to allow resume/debugging
+                        cleanup_guard.preserve_all();
                         return Err(err);
                     }
 
@@ -1602,6 +1606,8 @@ impl ParallelExecutor {
                         error!("{}", error_msg);
                         send_event(&self.event_tx, ParallelEvent::Error { message: error_msg })
                             .await;
+                        // Preserve all workspaces on error to allow resume/debugging
+                        cleanup_guard.preserve_all();
                         return Err(e);
                     }
                 }
@@ -1665,6 +1671,8 @@ impl ParallelExecutor {
                     let error_msg = format!("Failed to execute applies: {}", e);
                     error!("{}", error_msg);
                     send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
+                    // Preserve all workspaces on error to allow resume/debugging
+                    cleanup_guard.preserve_all();
                     return Err(e);
                 }
             };
@@ -2425,7 +2433,8 @@ impl ParallelExecutor {
                                     "Failed to merge {} (workspace: {}): {}",
                                     workspace_result.change_id, workspace_result.workspace_name, e
                                 );
-                                // Merge failure is critical - return error immediately
+                                // Merge failure is critical - preserve all workspaces and return error
+                                cleanup_guard.preserve_all();
                                 return Err(e);
                             }
                         }

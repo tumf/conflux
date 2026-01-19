@@ -383,20 +383,19 @@ impl AppState {
                 output,
                 iteration,
             } => {
-                let mut entry = LogEntry::info(output)
-                    .with_change_id(change_id)
-                    .with_operation("archive");
-                if let Some(iter) = iteration {
-                    entry = entry.with_iteration(iter);
-                }
-                self.add_log(entry);
+                self.add_log(
+                    LogEntry::info(output)
+                        .with_change_id(change_id)
+                        .with_operation("archive")
+                        .with_iteration(iteration),
+                );
             }
             OrchestratorEvent::AnalysisOutput { output, iteration } => {
-                let mut entry = LogEntry::info(output).with_operation("analysis");
-                if let Some(iter) = iteration {
-                    entry = entry.with_iteration(iter);
-                }
-                self.add_log(entry);
+                self.add_log(
+                    LogEntry::info(output)
+                        .with_operation("analysis")
+                        .with_iteration(iteration),
+                );
             }
             OrchestratorEvent::ResolveOutput {
                 change_id,
@@ -1414,7 +1413,7 @@ fn test_archive_output_event_logged() {
     app.handle_orchestrator_event(OrchestratorEvent::ArchiveOutput {
         change_id: "change-b".to_string(),
         output: "Archive output line".to_string(),
-        iteration: Some(2),
+        iteration: 2,
     });
 
     // Log should be added
@@ -1436,7 +1435,7 @@ fn test_analysis_output_event_logged() {
     // Send AnalysisOutput event
     app.handle_orchestrator_event(OrchestratorEvent::AnalysisOutput {
         output: "Analyzing dependencies...".to_string(),
-        iteration: Some(1),
+        iteration: 1,
     });
 
     // Log should be added

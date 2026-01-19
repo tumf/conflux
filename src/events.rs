@@ -193,7 +193,7 @@ pub enum ExecutionEvent {
     ArchiveOutput {
         change_id: String,
         output: String,
-        iteration: Option<u32>,
+        iteration: u32,
     },
 
     // Acceptance events
@@ -298,10 +298,7 @@ pub enum ExecutionEvent {
     AnalysisStarted { remaining_changes: usize },
     /// Analysis output (streaming)
     #[allow(dead_code)]
-    AnalysisOutput {
-        output: String,
-        iteration: Option<u32>,
-    },
+    AnalysisOutput { output: String, iteration: u32 },
     /// Analysis completed
     #[allow(dead_code)]
     AnalysisCompleted { groups_found: usize },

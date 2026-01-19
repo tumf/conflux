@@ -335,10 +335,8 @@ impl WebState {
                     ..
                 } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        if let Some(iter) = iteration {
-                            change.iteration_number = Some(*iter);
-                            updated = true;
-                        }
+                        change.iteration_number = Some(*iteration);
+                        updated = true;
                     }
                 }
 
