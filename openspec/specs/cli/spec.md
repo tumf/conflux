@@ -982,49 +982,47 @@ TUIはEsc二度押しによる強制停止時、現在のエージェントプ�
 
 ### Requirement: TUI Stopped Mode
 
-The TUI SHALL provide a Stopped mode where users can review progress and manage the queue before resuming. Task completion in Stopped mode SHALL NOT automatically add changes to the queue.
+The TUI SHALL provide a Stopped mode that manages change state by holding queued status only during execution. When transitioning to Stopped, queue_status SHALL be reset to NotQueued while preserving execution marks ([x]). Space operations in Stopped mode SHALL only add/remove execution marks while maintaining queue_status as NotQueued. When resuming with F5, execution-marked changes SHALL be restored to queued and processing SHALL resume. Task progress updates in Stopped mode SHALL NOT trigger queuing.
 
 #### Scenario: Stopped mode display
 
 - **WHEN** TUI is in Stopped mode
 - **THEN** header status displays "Stopped" in gray color
 - **AND** the change list remains visible with current statuses
-- **AND** completed changes show "[completed]" or "[archived]"
-- **AND** remaining queued changes show "queued"
+- **AND** execution-marked changes show "[x]" while their queue_status remains not queued
 
 #### Scenario: Queue management in Stopped mode
 
 - **WHEN** TUI is in Stopped mode
-- **AND** user presses Space on a queued change
-- **THEN** the change is removed from queue (becomes not queued)
+- **AND** user presses Space on an execution-marked change
+- **THEN** the execution mark is removed and queue_status remains not queued
 
 #### Scenario: Queue addition in Stopped mode
 
 - **WHEN** TUI is in Stopped mode
-- **AND** user presses Space on a not-queued change
-- **THEN** the change is added to the queue
+- **AND** user presses Space on a not-marked change
+- **THEN** the execution mark is added and queue_status remains not queued
 
 #### Scenario: Task completion in Stopped mode does not auto-queue
 
 - **WHEN** TUI is in Stopped mode
 - **AND** a change's tasks are updated (e.g., all tasks marked complete)
-- **THEN** the change queue_status SHALL remain unchanged
+- **THEN** the change queue_status SHALL remain not queued
 - **AND** the change SHALL NOT be automatically added to the queue
-- **AND** the change SHALL only be queued when user explicitly presses Space key
 
 #### Scenario: Resume processing from Stopped mode
 
 - **WHEN** TUI is in Stopped mode
-- **AND** one or more changes are queued
+- **AND** one or more changes are execution-marked
 - **AND** user presses F5
 - **THEN** the TUI transitions to Running mode
-- **AND** processing resumes with the queued changes
+- **AND** processing resumes after converting execution-marked changes to queued
 - **AND** log displays "Resuming processing..."
 
 #### Scenario: Resume with empty queue shows warning
 
 - **WHEN** TUI is in Stopped mode
-- **AND** no changes are queued
+- **AND** no changes are execution-marked
 - **AND** user presses F5
 - **THEN** a warning message is displayed
 - **AND** the TUI remains in Stopped mode
@@ -1041,15 +1039,15 @@ The TUI help text SHALL include stop key binding information.
 
 ### Requirement: Interrupted Change Handling
 
-Changes interrupted by force stop SHALL be handled gracefully.
+Changes interrupted by stop SHALL be handled according to the policy of holding queued status only during execution. When force-stopped, queue_status SHALL be reset to NotQueued while preserving execution marks. On resume, execution-marked changes SHALL be restored to queued and can be re-processed.
 
-#### Scenario: Force-stopped change returns to queued
+#### Scenario: Force-stopped change returns to not queued
 
 - **WHEN** a change is being processed
 - **AND** user force stops with second Esc press
-- **THEN** the change status becomes "queued" (not error)
+- **THEN** the change status becomes not queued (not error)
+- **AND** the execution mark remains set
 - **AND** the change can be re-processed on resume
-- **AND** no error message is displayed for the interruption
 
 #### Scenario: Partial progress preserved
 
