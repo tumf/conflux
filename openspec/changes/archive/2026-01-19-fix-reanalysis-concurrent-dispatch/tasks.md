@@ -25,3 +25,23 @@
 
 ## Acceptance Failure Follow-up
 - [x] Address acceptance findings: No acceptance failures found. All tests pass (878 unit tests + 25 e2e tests + 3 process cleanup tests + 3 ralph compatibility tests + 4 spec delta tests = 913 tests passed).
+
+
+## Acceptance Failure Follow-up
+- [x] Address acceptance findings:
+  1) Task 1.2 requires "workspace 作成/再利用と apply+acceptance+archive の spawn をここに集約する" but `dispatch_change_to_workspace` (src/parallel/mod.rs:1751-1865) only executes apply + archive, completely omitting the acceptance step
+  2) Design document (design.md:21) explicitly states "in-flight の定義は apply / acceptance / archive / resolve とする" but the new concurrent dispatch flow does not include acceptance
+  3) Implementation summary (implementation-summary.md:199) documents `spawn(apply + acceptance + archive)` but actual implementation at src/parallel/mod.rs:1798-1862 only calls `execute_apply_in_workspace` and `execute_archive_in_workspace`, skipping acceptance entirely
+  4) The old flow (`execute_apply_and_archive_parallel` at src/parallel/mod.rs:2187-2194) correctly runs acceptance between apply and archive, but this method is no longer called in production code
+  5) The new flow is invoked via CLI (src/orchestrator.rs or parallel_run_service.rs) → ParallelRunService.run_parallel → execute_with_order_based_reanalysis → dispatch_change_to_workspace, proving the incomplete flow is actively used
+  6) This is a critical functional regression: changes are being archived without validation, violating the established workflow where acceptance must gate archive operations
+  7) All 913 tests pass despite this regression, indicating insufficient test coverage for the acceptance step in the new flow
+
+**Fix Applied**: Modified `dispatch_change_to_workspace` (src/parallel/mod.rs:1738-2137) to include the full apply+acceptance+archive flow:
+- Added AgentRunner creation for acceptance testing
+- Implemented apply+acceptance retry loop (max 10 cycles) with cumulative iteration tracking
+- Handle all AcceptanceResult variants: Pass, Continue, Fail, CommandFailed, Cancelled
+- Update tasks.md on acceptance failure via `update_tasks_on_acceptance_failure`
+- Send workspace status updates (Accepting, Archiving) and events (ApplyCompleted, AcceptanceStarted, ChangeArchived, etc.)
+- Clear acceptance history after successful archive
+- Acceptance now properly gates archive operations, restoring the expected workflow
