@@ -99,8 +99,12 @@ impl AppState {
                     let worktree_path = self.worktree_paths.get(&id).map(|p| p.as_path());
                     match task_parser::parse_change_with_worktree_fallback(&id, worktree_path) {
                         Ok(progress) => {
-                            change.completed_tasks = progress.completed;
-                            change.total_tasks = progress.total;
+                            // Only update if valid progress (not 0/0)
+                            if progress.total > 0 {
+                                change.completed_tasks = progress.completed;
+                                change.total_tasks = progress.total;
+                            }
+                            // If 0/0, preserve existing progress
                         }
                         Err(_) => {
                             // Preserve existing progress if parsing fails
@@ -124,8 +128,12 @@ impl AppState {
                         worktree_path,
                     ) {
                         Ok(progress) => {
-                            change.completed_tasks = progress.completed;
-                            change.total_tasks = progress.total;
+                            // Only update if valid progress (not 0/0)
+                            if progress.total > 0 {
+                                change.completed_tasks = progress.completed;
+                                change.total_tasks = progress.total;
+                            }
+                            // If 0/0, preserve existing progress
                         }
                         Err(_) => {
                             // Preserve existing progress if parsing fails
@@ -193,8 +201,12 @@ impl AppState {
                         worktree_path,
                     ) {
                         Ok(progress) => {
-                            change.completed_tasks = progress.completed;
-                            change.total_tasks = progress.total;
+                            // Only update if valid progress (not 0/0)
+                            if progress.total > 0 {
+                                change.completed_tasks = progress.completed;
+                                change.total_tasks = progress.total;
+                            }
+                            // If 0/0, preserve existing progress
                         }
                         Err(_) => {
                             // Preserve existing progress if parsing fails
@@ -226,8 +238,12 @@ impl AppState {
                         worktree_path,
                     ) {
                         Ok(progress) => {
-                            change.completed_tasks = progress.completed;
-                            change.total_tasks = progress.total;
+                            // Only update if valid progress (not 0/0)
+                            if progress.total > 0 {
+                                change.completed_tasks = progress.completed;
+                                change.total_tasks = progress.total;
+                            }
+                            // If 0/0, preserve existing progress
                         }
                         Err(_) => {
                             // Preserve existing progress if parsing fails
@@ -497,18 +513,26 @@ impl AppState {
                                         worktree_path,
                                     )
                                 {
-                                    existing.completed_tasks = progress.completed;
-                                    existing.total_tasks = progress.total;
+                                    // Only update if valid progress (not 0/0)
+                                    if progress.total > 0 {
+                                        existing.completed_tasks = progress.completed;
+                                        existing.total_tasks = progress.total;
+                                    }
+                                    // If 0/0, preserve existing progress
                                 } else if let Ok(progress) =
                                     task_parser::parse_archived_change_with_worktree_fallback(
                                         &fetched.id,
                                         worktree_path,
                                     )
                                 {
-                                    existing.completed_tasks = progress.completed;
-                                    existing.total_tasks = progress.total;
+                                    // Only update if valid progress (not 0/0)
+                                    if progress.total > 0 {
+                                        existing.completed_tasks = progress.completed;
+                                        existing.total_tasks = progress.total;
+                                    }
+                                    // If 0/0, preserve existing progress
                                 }
-                                // If both fail, preserve existing progress
+                                // If both fail or return 0/0, preserve existing progress
                             }
                             QueueStatus::Archived | QueueStatus::Merged => {
                                 // Try archived location with worktree fallback
@@ -518,10 +542,14 @@ impl AppState {
                                         worktree_path,
                                     )
                                 {
-                                    existing.completed_tasks = progress.completed;
-                                    existing.total_tasks = progress.total;
+                                    // Only update if valid progress (not 0/0)
+                                    if progress.total > 0 {
+                                        existing.completed_tasks = progress.completed;
+                                        existing.total_tasks = progress.total;
+                                    }
+                                    // If 0/0, preserve existing progress
                                 }
-                                // If fails, preserve existing progress
+                                // If fails or returns 0/0, preserve existing progress
                             }
                             _ => {
                                 // For all other states: preserve existing progress (do nothing)
@@ -2034,5 +2062,193 @@ mod tests {
         assert_eq!(app.changes[0].completed_tasks, 5);
         assert_eq!(app.changes[0].total_tasks, 7);
         assert_eq!(app.changes[0].queue_status, QueueStatus::Archiving);
+    }
+
+    #[test]
+    fn test_archive_started_preserves_progress_when_worktree_returns_zero() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let worktree_path = temp_dir.path();
+
+        // Create worktree structure with empty tasks.md (returns 0/0)
+        let change_dir = worktree_path.join("openspec/changes/test-change");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("tasks.md"), "# Tasks\n\nNo checkboxes here").unwrap();
+
+        let changes = vec![create_approved_change("test-change", 3, 5)];
+        let mut app = AppState::new(changes);
+        app.worktree_paths
+            .insert("test-change".to_string(), worktree_path.to_path_buf());
+
+        // Trigger ArchiveStarted event
+        app.handle_orchestrator_event(OrchestratorEvent::ArchiveStarted("test-change".to_string()));
+
+        // Progress should be preserved (not reset to 0/0 from worktree)
+        assert_eq!(app.changes[0].completed_tasks, 3);
+        assert_eq!(app.changes[0].total_tasks, 5);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archiving);
+    }
+
+    #[test]
+    fn test_change_archived_preserves_progress_when_worktree_returns_zero() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let worktree_path = temp_dir.path();
+
+        // Create worktree archive structure with empty tasks.md (returns 0/0)
+        let archive_dir = worktree_path.join("openspec/changes/archive/test-archived");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(archive_dir.join("tasks.md"), "# No tasks here").unwrap();
+
+        let changes = vec![create_approved_change("test-archived", 4, 6)];
+        let mut app = AppState::new(changes);
+        app.changes[0].started_at = Some(Instant::now());
+        app.worktree_paths
+            .insert("test-archived".to_string(), worktree_path.to_path_buf());
+
+        // Trigger ChangeArchived event
+        app.handle_orchestrator_event(OrchestratorEvent::ChangeArchived(
+            "test-archived".to_string(),
+        ));
+
+        // Progress should be preserved (not reset to 0/0 from worktree)
+        assert_eq!(app.changes[0].completed_tasks, 4);
+        assert_eq!(app.changes[0].total_tasks, 6);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archived);
+    }
+
+    #[test]
+    fn test_resolve_completed_preserves_progress_when_worktree_returns_zero() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let worktree_path = temp_dir.path();
+
+        // Create worktree archive structure with empty tasks.md (returns 0/0)
+        let archive_dir = worktree_path.join("openspec/changes/archive/test-resolved");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(archive_dir.join("tasks.md"), "").unwrap();
+
+        let changes = vec![create_approved_change("test-resolved", 2, 4)];
+        let mut app = AppState::new(changes);
+        app.changes[0].started_at = Some(Instant::now());
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.worktree_paths
+            .insert("test-resolved".to_string(), worktree_path.to_path_buf());
+
+        // Trigger ResolveCompleted event
+        app.handle_orchestrator_event(OrchestratorEvent::ResolveCompleted {
+            change_id: "test-resolved".to_string(),
+            worktree_change_ids: None,
+        });
+
+        // Progress should be preserved (not reset to 0/0 from worktree)
+        assert_eq!(app.changes[0].completed_tasks, 2);
+        assert_eq!(app.changes[0].total_tasks, 4);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Merged);
+    }
+
+    #[test]
+    fn test_merge_completed_preserves_progress_when_worktree_returns_zero() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let worktree_path = temp_dir.path();
+
+        // Create worktree archive structure with empty tasks.md (returns 0/0)
+        let archive_dir = worktree_path.join("openspec/changes/archive/test-merged");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(archive_dir.join("tasks.md"), "").unwrap();
+
+        let changes = vec![create_approved_change("test-merged", 1, 3)];
+        let mut app = AppState::new(changes);
+        app.changes[0].started_at = Some(Instant::now());
+        app.worktree_paths
+            .insert("test-merged".to_string(), worktree_path.to_path_buf());
+
+        // Trigger MergeCompleted event
+        app.handle_orchestrator_event(OrchestratorEvent::MergeCompleted {
+            change_id: "test-merged".to_string(),
+            revision: "abc123".to_string(),
+        });
+
+        // Progress should be preserved (not reset to 0/0 from worktree)
+        assert_eq!(app.changes[0].completed_tasks, 1);
+        assert_eq!(app.changes[0].total_tasks, 3);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Merged);
+    }
+
+    #[test]
+    fn test_update_changes_preserves_progress_when_worktree_returns_zero_archiving() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let worktree_path = temp_dir.path();
+
+        // Create worktree structure with empty tasks.md (returns 0/0)
+        let change_dir = worktree_path.join("openspec/changes/test-change");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("tasks.md"), "").unwrap();
+
+        let changes = vec![create_approved_change("test-change", 3, 5)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::Archiving;
+        app.worktree_paths
+            .insert("test-change".to_string(), worktree_path.to_path_buf());
+
+        // Trigger ChangesRefreshed with 0/0 progress
+        let fetched = vec![Change {
+            id: "test-change".to_string(),
+            completed_tasks: 0,
+            total_tasks: 0,
+            last_modified: "2024-01-01".to_string(),
+            is_approved: true,
+            dependencies: vec![],
+        }];
+
+        app.update_changes(fetched);
+
+        // Progress should be preserved (worktree fallback tried, returned 0/0, should not overwrite)
+        assert_eq!(app.changes[0].completed_tasks, 3);
+        assert_eq!(app.changes[0].total_tasks, 5);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archiving);
+    }
+
+    #[test]
+    fn test_update_changes_preserves_progress_when_worktree_returns_zero_resolving() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let worktree_path = temp_dir.path();
+
+        // Create worktree archive structure with empty tasks.md (returns 0/0)
+        let archive_dir = worktree_path.join("openspec/changes/archive/test-change");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(archive_dir.join("tasks.md"), "").unwrap();
+
+        let changes = vec![create_approved_change("test-change", 4, 6)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.worktree_paths
+            .insert("test-change".to_string(), worktree_path.to_path_buf());
+
+        // Trigger ChangesRefreshed with 0/0 progress
+        let fetched = vec![Change {
+            id: "test-change".to_string(),
+            completed_tasks: 0,
+            total_tasks: 0,
+            last_modified: "2024-01-01".to_string(),
+            is_approved: true,
+            dependencies: vec![],
+        }];
+
+        app.update_changes(fetched);
+
+        // Progress should be preserved (worktree fallback tried, returned 0/0, should not overwrite)
+        assert_eq!(app.changes[0].completed_tasks, 4);
+        assert_eq!(app.changes[0].total_tasks, 6);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Resolving);
     }
 }

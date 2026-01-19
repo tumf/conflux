@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## ADDED Requirements
 ### Requirement: すべての状態でtasks進捗を保持する
 Web state_updateは、tasks.mdの読み取りに失敗した場合にcompleted_tasks/total_tasksを0/0で上書きしてはならない（MUST NOT）。archive/resolving中でも直前の進捗が維持されなければならない（MUST）。
 
