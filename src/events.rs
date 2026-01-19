@@ -357,6 +357,8 @@ pub enum ExecutionEvent {
         worktree_change_ids: std::collections::HashSet<String>,
         /// Map of change_id to worktree path for active worktrees
         worktree_paths: std::collections::HashMap<String, std::path::PathBuf>,
+        /// Set of change_ids whose worktrees are NOT ahead of base (for auto-clearing MergeWait)
+        worktree_not_ahead_ids: std::collections::HashSet<String>,
     },
     /// Worktrees list refreshed (for worktree view)
     WorktreesRefreshed {
