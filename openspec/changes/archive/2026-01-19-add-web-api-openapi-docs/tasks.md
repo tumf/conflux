@@ -1,0 +1,6 @@
+- [x] 1.1 `docs/web-api.openapi.yaml` を新規追加し、`/api/health` と `/api/state` の OpenAPI 定義を記述する。完了条件: YAML に paths 定義と response schema があり、ファイルが `docs/` に存在する。
+- [x] 1.2 `/api/changes` と `/api/changes/{id}` の定義を追加し、ChangeStatus と OrchestratorState の schema を整理する。完了条件: YAML に該当 paths があり、`components/schemas` に再利用されている。
+- [x] 1.3 `/api/changes/{id}/approve` と `/api/changes/{id}/unapprove` の定義を追加する。完了条件: POST の response/body が `ChangeStatus` を返すことが明記されている。
+- [x] 1.4 WebSocket `/ws` の仕様を OpenAPI 拡張 (`x-websocket`) で補足し、初期メッセージと更新メッセージの schema を記述する。完了条件: YAML に拡張フィールドが追加され、`StateUpdate`/`InitialState` の schema がある。
+- [x] 1.5 追加した OpenAPI YAML を `docs/` で参照できるよう README または関連ドキュメントへのリンク方針を決める。完了条件: 参照先ファイルと追記箇所が特定されている。
+- [x] 1.6 `npx @fission-ai/openspec@latest validate add-web-api-openapi-docs --strict` を実行し、指摘があれば修正する。完了条件: validate が成功する。
