@@ -70,43 +70,15 @@ impl AppState {
                             self.worktree_paths.get(&fetched.id).map(|p| p.as_path());
 
                         match existing.queue_status {
-                            QueueStatus::Archiving | QueueStatus::Resolving => {
-                                // Try active location first, then archived location
-                                if let Ok(progress) =
-                                    task_parser::parse_change_with_worktree_fallback(
-                                        &fetched.id,
-                                        worktree_path,
-                                    )
-                                {
-                                    // Only update if valid progress (not 0/0)
-                                    if progress.total > 0 {
-                                        existing.completed_tasks = progress.completed;
-                                        existing.total_tasks = progress.total;
-                                    }
-                                    // If 0/0, preserve existing progress
-                                } else if let Ok(progress) =
-                                    task_parser::parse_archived_change_with_worktree_fallback(
-                                        &fetched.id,
-                                        worktree_path,
-                                    )
-                                {
-                                    // Only update if valid progress (not 0/0)
-                                    if progress.total > 0 {
-                                        existing.completed_tasks = progress.completed;
-                                        existing.total_tasks = progress.total;
-                                    }
-                                    // If 0/0, preserve existing progress
-                                }
-                                // If both fail or return 0/0, preserve existing progress
-                            }
-                            QueueStatus::Archived | QueueStatus::Merged => {
-                                // Try archived location with worktree fallback
-                                if let Ok(progress) =
-                                    task_parser::parse_archived_change_with_worktree_fallback(
-                                        &fetched.id,
-                                        worktree_path,
-                                    )
-                                {
+                            QueueStatus::Archiving
+                            | QueueStatus::Resolving
+                            | QueueStatus::Archived
+                            | QueueStatus::Merged => {
+                                // Use comprehensive fallback: worktree active -> worktree archive -> base active -> base archive
+                                if let Ok(progress) = task_parser::parse_progress_with_fallback(
+                                    &fetched.id,
+                                    worktree_path,
+                                ) {
                                     // Only update if valid progress (not 0/0)
                                     if progress.total > 0 {
                                         existing.completed_tasks = progress.completed;
