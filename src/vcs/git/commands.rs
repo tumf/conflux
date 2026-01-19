@@ -389,11 +389,12 @@ pub async fn check_merge_conflicts<P: AsRef<Path>>(
     let merge_base = merge_base.trim();
 
     // Use git merge-tree to simulate the merge (available in Git 2.38+)
-    // Format: git merge-tree --write-tree <base> <branch1> <branch2>
+    // Format: git merge-tree --write-tree --merge-base <base> <branch1> <branch2>
     let output = Command::new("git")
         .args([
             "merge-tree",
             "--write-tree",
+            "--merge-base",
             merge_base,
             head_commit,
             branch_commit,
@@ -403,25 +404,36 @@ pub async fn check_merge_conflicts<P: AsRef<Path>>(
         .await
         .map_err(|e| VcsError::git_command(e.to_string()))?;
 
-    let _stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let exit_code = output.status.code().unwrap_or(-1);
 
-    // Check for conflicts in stderr
-    // git merge-tree outputs conflict markers and messages to stderr
-    if stderr.contains("CONFLICT") {
+    // Check for conflicts:
+    // - Exit code 1 indicates conflicts
+    // - Conflict messages appear in stderr
+    // - Stdout contains the tree OID (or conflict markers in older Git versions)
+    if exit_code == 1 || stderr.contains("CONFLICT") {
         // Extract conflict files from stderr
         let conflict_files = parse_conflict_files(&stderr);
         debug!(
-            "Detected {} conflicts in worktree at {}",
+            "Detected {} conflicts in worktree at {} (exit_code: {}, stderr: {})",
             conflict_files.len(),
-            cwd.display()
+            cwd.display(),
+            exit_code,
+            stderr.trim()
         );
         Ok(Some(conflict_files))
     } else if !output.status.success() {
-        // merge-tree failed for another reason
+        // merge-tree failed for another reason (not conflict-related)
+        debug!(
+            "Merge tree command failed: exit_code={}, stdout={}, stderr={}",
+            exit_code,
+            stdout.trim(),
+            stderr.trim()
+        );
         Err(VcsError::git_command(format!(
-            "Merge tree simulation failed: {}",
-            stderr
+            "Merge tree simulation failed (exit {}): {}",
+            exit_code, stderr
         )))
     } else {
         // No conflicts - merge would succeed cleanly

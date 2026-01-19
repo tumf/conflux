@@ -2,17 +2,17 @@
 
 use crate::vcs::VcsBackend;
 use std::path::PathBuf;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// RAII guard for workspace cleanup on partial failures.
 ///
-/// This guard tracks created workspaces and ensures they are cleaned up
-/// on drop if not explicitly committed. This prevents workspace leaks
-/// when errors occur during workspace creation or apply phases.
+/// This guard tracks created workspaces and preserves them by default.
+/// Workspaces are only cleaned up when explicitly requested via commit().
+/// This ensures workspaces are retained for debugging, resume, or manual
+/// investigation after errors or cancellation.
 ///
-/// Note: Failed workspaces can be marked for preservation, which will
-/// prevent their cleanup on drop to allow for manual investigation or
-/// resume functionality.
+/// Note: The guard preserves all workspaces by default. Use commit() after
+/// successful merge to enable cleanup for successfully processed workspaces.
 pub(crate) struct WorkspaceCleanupGuard {
     /// Workspace names and paths to clean up
     workspaces: std::collections::HashMap<String, PathBuf>,
@@ -22,19 +22,22 @@ pub(crate) struct WorkspaceCleanupGuard {
     vcs_backend: VcsBackend,
     /// Repository root for cleanup commands
     repo_root: PathBuf,
-    /// Whether cleanup has been committed (skipped)
-    committed: bool,
+    /// Whether cleanup is allowed on drop (default: false, preserves workspaces)
+    cleanup_allowed: bool,
 }
 
 impl WorkspaceCleanupGuard {
     /// Create a new cleanup guard
+    ///
+    /// By default, workspaces are preserved (not cleaned up on drop).
+    /// Call commit() to enable cleanup for successfully processed workspaces.
     pub fn new(vcs_backend: VcsBackend, repo_root: PathBuf) -> Self {
         Self {
             workspaces: std::collections::HashMap::new(),
             preserved_workspaces: std::collections::HashSet::new(),
             vcs_backend,
             repo_root,
-            committed: false,
+            cleanup_allowed: false,
         }
     }
 
@@ -62,18 +65,20 @@ impl WorkspaceCleanupGuard {
         }
     }
 
-    /// Commit the guard, preventing cleanup on drop
+    /// Commit the guard, enabling cleanup on drop for non-preserved workspaces
     ///
-    /// Call this when all workspaces have been successfully processed
-    /// and cleanup will be handled through the normal path.
+    /// Call this after successful merge completion to enable cleanup.
+    /// Preserved workspaces will still be excluded from cleanup.
+    #[allow(dead_code)] // Public API for optional cleanup enablement
     pub fn commit(mut self) {
-        self.committed = true;
+        self.cleanup_allowed = true;
     }
 }
 
 impl Drop for WorkspaceCleanupGuard {
     fn drop(&mut self) {
-        if self.committed || self.workspaces.is_empty() {
+        // Only cleanup if explicitly allowed (via commit after successful merge)
+        if !self.cleanup_allowed || self.workspaces.is_empty() {
             return;
         }
 
@@ -88,8 +93,8 @@ impl Drop for WorkspaceCleanupGuard {
             return;
         }
 
-        warn!(
-            "Cleaning up {} workspace(s) due to early error ({} preserved)",
+        debug!(
+            "Cleaning up {} workspace(s) after successful merge ({} preserved)",
             workspaces_to_clean.len(),
             self.preserved_workspaces.len()
         );
@@ -182,8 +187,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
 
-        // Guard should start with no workspaces and not committed
-        assert!(!guard.committed);
+        // Guard should start with no workspaces and cleanup not allowed (preserves by default)
+        assert!(!guard.cleanup_allowed);
         assert!(guard.workspaces.is_empty());
     }
 
@@ -201,16 +206,16 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_guard_commit_prevents_cleanup() {
+    fn test_cleanup_guard_commit_enables_cleanup() {
         let temp_dir = TempDir::new().unwrap();
         let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
 
         guard.track("ws-change-a-1234".to_string(), PathBuf::from("/tmp/ws-a"));
-        assert!(!guard.committed);
+        assert!(!guard.cleanup_allowed);
 
-        // Commit the guard
+        // Commit the guard to enable cleanup
         guard.commit();
-        // After commit(), guard is consumed and cleanup is prevented
+        // After commit(), guard is consumed and cleanup is enabled on drop
     }
 
     #[test]
@@ -240,13 +245,13 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_guard_drop_with_committed_guard_does_nothing() {
+    fn test_cleanup_guard_drop_without_commit_preserves_workspaces() {
         let temp_dir = TempDir::new().unwrap();
         let mut guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
         guard.track("ws-test-1234".to_string(), PathBuf::from("/tmp/ws-test"));
 
-        // Commit and then drop - should not attempt cleanup
-        guard.commit();
+        // Drop without commit - workspaces are preserved by default
+        drop(guard);
     }
 
     // === Tests for RAII cleanup semantics (workspace-cleanup spec 4.1) ===
@@ -261,10 +266,10 @@ mod tests {
             let mut guard =
                 WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
             guard.track("ws-test-1234".to_string(), PathBuf::from("/tmp/ws-test"));
-            // Not committed - will attempt cleanup on drop
+            // Not committed - workspaces are preserved on drop (default behavior)
         } // guard drops here
 
-        // If we reach here, drop completed successfully
+        // If we reach here, drop completed successfully (no cleanup attempted)
     }
 
     #[test]
@@ -278,9 +283,9 @@ mod tests {
             PathBuf::from("/tmp/ws-success"),
         );
 
-        // On success, commit to prevent cleanup
+        // On successful merge, commit to enable cleanup
         guard.commit();
-        // Guard is consumed, no cleanup will occur
+        // Guard is consumed, cleanup will occur on drop for non-preserved workspaces
     }
 
     // === Tests for VCS backend cleanup paths ===
