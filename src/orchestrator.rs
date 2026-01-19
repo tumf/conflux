@@ -988,12 +988,6 @@ impl Orchestrator {
                     let _ = tx.send(event.clone());
                 }
                 match event {
-                    ParallelEvent::GroupStarted { group_id, changes } => {
-                        info!("Starting group {} with {} changes", group_id, changes.len());
-                    }
-                    ParallelEvent::GroupCompleted { group_id } => {
-                        info!("Group {} completed", group_id);
-                    }
                     ParallelEvent::ApplyCompleted { change_id, .. } => {
                         info!("Apply completed for {}", change_id);
                     }

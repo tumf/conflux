@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 /// This service encapsulates the shared logic between CLI and TUI
 /// parallel execution modes, including:
 /// - Git availability checking
-/// - Dependency-based grouping
+/// - Dependency-based analysis
 /// - ParallelExecutor coordination
 pub struct ParallelRunService {
     /// Configuration for the orchestrator
@@ -59,7 +59,7 @@ impl ParallelRunService {
     /// Create a configured ParallelExecutor instance with optional shared queue change state.
     ///
     /// This allows external callers to share queue change timestamps across multiple executors,
-    /// enabling debounce logic to work across batch boundaries.
+    /// enabling debounce logic to work across re-analysis iterations.
     pub fn create_executor_with_queue_state(
         &self,
         event_tx: Option<mpsc::Sender<ParallelEvent>>,
@@ -205,11 +205,11 @@ impl ParallelRunService {
     /// This variant is useful when integrating with existing channel-based
     /// event systems (e.g., TUI).
     ///
-    /// Uses dynamic re-analysis: after each group completes, the remaining changes
-    /// are re-analyzed to determine the next group.
+    /// Uses dynamic re-analysis: after each dispatch iteration completes, the remaining changes
+    /// are re-analyzed to determine the next dispatch.
     ///
     /// The `shared_queue_change` parameter allows tracking queue changes across multiple
-    /// batch executions for proper debouncing behavior.
+    /// re-analysis iterations for proper debouncing behavior.
     pub async fn run_parallel_with_channel_and_queue_state(
         &self,
         changes: Vec<Change>,
@@ -278,69 +278,6 @@ impl ParallelRunService {
                     let service = ParallelRunService::new(repo_root, config);
                     service
                         .analyze_order_with_sender(remaining, Some(&event_tx), Some(iteration))
-                        .await
-                })
-            })
-            .await
-    }
-
-    /// Run parallel execution with a pre-configured executor.
-    ///
-    /// This variant allows the caller to manage the executor instance,
-    /// which is useful for calling executor methods like `mark_queue_changed()`
-    /// during execution.
-    ///
-    /// # Deprecated
-    ///
-    /// This method uses group-based execution which converts order to groups.
-    /// Prefer using `run_parallel_order_based_with_executor()` for order-based execution.
-    #[allow(dead_code)]
-    pub async fn run_parallel_with_executor(
-        &self,
-        mut executor: ParallelExecutor,
-        changes: Vec<Change>,
-        event_tx: mpsc::Sender<ParallelEvent>,
-    ) -> Result<()> {
-        let (changes, skipped) = self.filter_committed_changes(changes).await?;
-
-        if !skipped.is_empty() {
-            let message = format!(
-                "Skipping uncommitted changes in parallel mode: {}",
-                skipped.join(", ")
-            );
-            warn!("{}", message);
-            let _ = event_tx
-                .send(ParallelEvent::Warning {
-                    title: "Uncommitted changes skipped".to_string(),
-                    message,
-                })
-                .await;
-        }
-
-        if changes.is_empty() {
-            info!("No committed changes available for parallel execution");
-            return Ok(());
-        }
-
-        info!(
-            "Starting parallel execution with re-analysis for {} changes",
-            changes.len()
-        );
-
-        // Clone config for the analyzer closure
-        let config = self.config.clone();
-        let repo_root = self.repo_root.clone();
-
-        // Use execute_with_reanalysis to re-analyze after each group
-        executor
-            .execute_with_reanalysis(changes, move |remaining, iteration| {
-                let config = config.clone();
-                let repo_root = repo_root.clone();
-                let event_tx = event_tx.clone();
-                Box::pin(async move {
-                    let service = ParallelRunService::new(repo_root, config);
-                    service
-                        .analyze_and_group_with_sender(remaining, Some(&event_tx), Some(iteration))
                         .await
                 })
             })

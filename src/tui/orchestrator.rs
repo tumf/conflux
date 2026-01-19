@@ -480,7 +480,7 @@ pub async fn run_orchestrator(
     tx: mpsc::Sender<OrchestratorEvent>,
     cancel_token: CancellationToken,
     dynamic_queue: DynamicQueue,
-    graceful_stop_flag: Arc<AtomicBool>,
+    _graceful_stop_flag: Arc<AtomicBool>,
 ) -> Result<()> {
     use crate::agent::OutputLine;
     use crate::hooks::{HookContext, HookRunner, HookType};
@@ -524,7 +524,7 @@ pub async fn run_orchestrator(
         }
 
         // Check for graceful stop flag (stop after current change completes)
-        if graceful_stop_flag.load(Ordering::SeqCst) {
+        if _graceful_stop_flag.load(Ordering::SeqCst) {
             let _ = tx
                 .send(OrchestratorEvent::Log(LogEntry::info(
                     "Graceful stop: stopping after current change".to_string(),
@@ -1175,8 +1175,8 @@ pub async fn run_orchestrator(
 /// Run the orchestrator in parallel mode using git worktrees
 /// This function executes all changes in parallel using ParallelRunService
 ///
-/// Supports dynamic queue: after each batch completes, checks for newly queued changes
-/// and processes them in subsequent batches.
+/// Supports dynamic queue: continuously processes changes as slots become available,
+/// without waiting for batch boundaries.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_orchestrator_parallel(
     change_ids: Vec<String>,
@@ -1184,7 +1184,7 @@ pub async fn run_orchestrator_parallel(
     tx: mpsc::Sender<OrchestratorEvent>,
     cancel_token: CancellationToken,
     dynamic_queue: DynamicQueue,
-    graceful_stop_flag: Arc<AtomicBool>,
+    _graceful_stop_flag: Arc<AtomicBool>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
     use crate::openspec::list_changes_native;
@@ -1205,7 +1205,7 @@ pub async fn run_orchestrator_parallel(
     // Create ParallelRunService
     let service = ParallelRunService::new(repo_root.clone(), config.clone());
 
-    // Create shared queue change timestamp for debouncing across batches
+    // Create shared queue change timestamp for debouncing
     let shared_queue_change = Arc::new(tokio::sync::Mutex::new(None::<std::time::Instant>));
 
     // Check Git availability
@@ -1220,14 +1220,80 @@ pub async fn run_orchestrator_parallel(
         ));
     }
 
-    // Track processed change IDs to avoid re-processing
-    let mut processed_ids: HashSet<String> = HashSet::new();
-    // Track pending change IDs (initial + dynamically added)
+    // Collect initial pending changes
     let mut pending_ids: HashSet<String> = change_ids.into_iter().collect();
 
-    // Track loop termination reason for correct completion message
+    // Track execution termination reason for correct completion message
     let mut stopped_or_cancelled = false;
     let mut had_errors = false;
+
+    // Check for dynamically added changes before starting execution
+    while let Some(dynamic_id) = dynamic_queue.pop().await {
+        if !pending_ids.contains(&dynamic_id) {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                    "Dynamically added to parallel queue: {}",
+                    dynamic_id
+                ))))
+                .await;
+            pending_ids.insert(dynamic_id);
+        }
+    }
+
+    // Handle removed changes
+    let removed_ids = dynamic_queue.drain_removed().await;
+    for id in removed_ids {
+        if pending_ids.remove(&id) {
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                    "Removed from pending queue: {}",
+                    id
+                ))))
+                .await;
+        }
+    }
+
+    // Exit early if no changes to process
+    if pending_ids.is_empty() {
+        let _ = tx
+            .send(OrchestratorEvent::Log(LogEntry::info(
+                "No changes to process".to_string(),
+            )))
+            .await;
+        let _ = tx.send(OrchestratorEvent::AllCompleted).await;
+        return Ok(());
+    }
+
+    let _ = tx
+        .send(OrchestratorEvent::Log(LogEntry::info(format!(
+            "Processing {} change(s) with slot-driven continuous dispatch...",
+            pending_ids.len()
+        ))))
+        .await;
+
+    // Load all pending changes
+    let all_changes = list_changes_native()?;
+    let changes_to_process: Vec<_> = all_changes
+        .into_iter()
+        .filter(|c| pending_ids.contains(&c.id))
+        .collect();
+
+    if changes_to_process.is_empty() {
+        let _ = tx
+            .send(OrchestratorEvent::Log(LogEntry::warn(
+                "No valid changes found (may be already archived)".to_string(),
+            )))
+            .await;
+        let _ = tx.send(OrchestratorEvent::AllCompleted).await;
+        return Ok(());
+    }
+
+    let _ = tx
+        .send(OrchestratorEvent::Log(LogEntry::info(format!(
+            "Analyzing {} changes for parallelization...",
+            changes_to_process.len()
+        ))))
+        .await;
 
     // Create WebState event forwarding channel and task
     #[cfg(feature = "web-monitoring")]
@@ -1250,235 +1316,118 @@ pub async fn run_orchestrator_parallel(
         (None, None)
     };
 
+    // Create event channel for forwarding to TUI
+    let (parallel_tx, mut parallel_rx) = mpsc::channel::<ParallelEvent>(100);
+
+    // Spawn event forwarding task
+    let forward_tx = tx.clone();
+    let forward_cancel = cancel_token.clone();
+    let merge_deferred_stop = Arc::new(AtomicBool::new(false));
+    let forward_merge_stop = merge_deferred_stop.clone();
     #[cfg(feature = "web-monitoring")]
-    let web_event_sender = web_event_tx.clone();
-
-    // Main loop: process batches until no more pending changes
-    loop {
-        // Check for cancellation
-        if cancel_token.is_cancelled() {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::warn(
-                    "Parallel execution cancelled".to_string(),
-                )))
-                .await;
-            stopped_or_cancelled = true;
-            break;
-        }
-
-        // Check for graceful stop
-        if graceful_stop_flag.load(Ordering::SeqCst) {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::info(
-                    "Graceful stop: stopping parallel execution".to_string(),
-                )))
-                .await;
-            let _ = tx.send(OrchestratorEvent::Stopped).await;
-            stopped_or_cancelled = true;
-            break;
-        }
-
-        // Check dynamic queue for newly added changes
-        let mut queue_changed = false;
-        while let Some(dynamic_id) = dynamic_queue.pop().await {
-            if !processed_ids.contains(&dynamic_id) && !pending_ids.contains(&dynamic_id) {
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                        "Dynamically added to parallel queue: {}",
-                        dynamic_id
-                    ))))
-                    .await;
-                pending_ids.insert(dynamic_id);
-                queue_changed = true;
-            }
-        }
-
-        let removed_ids = dynamic_queue.drain_removed().await;
-        if !removed_ids.is_empty() {
-            for id in removed_ids {
-                if pending_ids.remove(&id) {
-                    let _ = tx
-                        .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                            "Removed from pending queue: {}",
-                            id
-                        ))))
-                        .await;
-                    queue_changed = true;
+    let forward_web_tx = web_event_tx.clone();
+    let forward_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = forward_cancel.cancelled() => {
+                    break;
                 }
-            }
-        }
-
-        // Mark queue change timestamp for debouncing
-        if queue_changed {
-            let mut last_change = shared_queue_change.lock().await;
-            *last_change = Some(std::time::Instant::now());
-        }
-
-        // Get changes to process in this batch (pending - processed)
-        let batch_ids: Vec<String> = pending_ids.difference(&processed_ids).cloned().collect();
-
-        if batch_ids.is_empty() {
-            // No more changes to process
-            break;
-        }
-
-        let _ = tx
-            .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                "Processing batch of {} change(s)...",
-                batch_ids.len()
-            ))))
-            .await;
-
-        // Load changes with dependencies and filter to batch
-        let all_changes = list_changes_native()?;
-        let batch_set: HashSet<_> = batch_ids.iter().collect();
-        let batch_changes: Vec<_> = all_changes
-            .into_iter()
-            .filter(|c| batch_set.contains(&c.id))
-            .collect();
-
-        if batch_changes.is_empty() {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::warn(
-                    "No valid changes found in batch (may be already archived)".to_string(),
-                )))
-                .await;
-            // Mark batch_ids as processed to avoid infinite loop
-            for id in batch_ids {
-                processed_ids.insert(id);
-            }
-            continue;
-        }
-
-        let _ = tx
-            .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                "Analyzing {} changes for parallelization...",
-                batch_changes.len()
-            ))))
-            .await;
-
-        // Create event channel for forwarding to TUI
-        let (parallel_tx, mut parallel_rx) = mpsc::channel::<ParallelEvent>(100);
-
-        // Spawn event forwarding task
-        let forward_tx = tx.clone();
-        let forward_cancel = cancel_token.clone();
-        let merge_deferred_stop = Arc::new(AtomicBool::new(false));
-        let forward_merge_stop = merge_deferred_stop.clone();
-        #[cfg(feature = "web-monitoring")]
-        let forward_web_tx = web_event_sender.clone();
-        let forward_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = forward_cancel.cancelled() => {
-                        break;
-                    }
-                    event = parallel_rx.recv() => {
-                        match event {
-                            Some(ParallelEvent::AllCompleted) => {
-                                // AllCompleted signals batch completion
-                                #[cfg(feature = "web-monitoring")]
-                                if let Some(tx) = &forward_web_tx {
-                                    let _ = tx.send(ParallelEvent::AllCompleted);
-                                }
-                                break;
+                event = parallel_rx.recv() => {
+                    match event {
+                        Some(ParallelEvent::AllCompleted) => {
+                            // AllCompleted signals execution completion
+                            #[cfg(feature = "web-monitoring")]
+                            if let Some(tx) = &forward_web_tx {
+                                let _ = tx.send(ParallelEvent::AllCompleted);
                             }
-                            Some(ParallelEvent::Stopped) => {
-                                forward_merge_stop.store(true, Ordering::SeqCst);
-                                let _ = forward_tx.send(ParallelEvent::Stopped).await;
-                                #[cfg(feature = "web-monitoring")]
-                                if let Some(tx) = &forward_web_tx {
-                                    let _ = tx.send(ParallelEvent::Stopped);
-                                }
-                                break;
+                            break;
+                        }
+                        Some(ParallelEvent::Stopped) => {
+                            forward_merge_stop.store(true, Ordering::SeqCst);
+                            let _ = forward_tx.send(ParallelEvent::Stopped).await;
+                            #[cfg(feature = "web-monitoring")]
+                            if let Some(tx) = &forward_web_tx {
+                                let _ = tx.send(ParallelEvent::Stopped);
                             }
-                            Some(parallel_event) => {
-                                // Forward to TUI
-                                let _ = forward_tx.send(parallel_event.clone()).await;
-                                // Forward to WebState
-                                #[cfg(feature = "web-monitoring")]
-                                if let Some(tx) = &forward_web_tx {
-                                    let _ = tx.send(parallel_event);
-                                }
+                            break;
+                        }
+                        Some(parallel_event) => {
+                            // Forward to TUI
+                            let _ = forward_tx.send(parallel_event.clone()).await;
+                            // Forward to WebState
+                            #[cfg(feature = "web-monitoring")]
+                            if let Some(tx) = &forward_web_tx {
+                                let _ = tx.send(parallel_event);
                             }
-                            None => {
-                                break;
-                            }
+                        }
+                        None => {
+                            break;
                         }
                     }
                 }
             }
-        });
-
-        // Create a new service for this batch (to get fresh repo state)
-        let batch_service = ParallelRunService::new(repo_root.clone(), config.clone());
-
-        // Execute batch using ParallelRunService with channel and shared queue state
-        let result = tokio::select! {
-            _ = cancel_token.cancelled() => {
-                let change_ids: Vec<String> = batch_changes.iter().map(|c| c.id.clone()).collect();
-                let cancel_msg = format!(
-                    "Cancelled parallel execution ({} changes in batch: {})",
-                    change_ids.len(),
-                    change_ids.join(", ")
-                );
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::warn(
-                        cancel_msg.clone(),
-                    )))
-                    .await;
-                Err(crate::error::OrchestratorError::AgentCommand(cancel_msg))
-            }
-            result = batch_service.run_parallel_with_channel_and_queue_state(
-                batch_changes.clone(),
-                parallel_tx,
-                Some(cancel_token.clone()),
-                Some(shared_queue_change.clone()),
-                Some(Arc::new(dynamic_queue.clone())),
-            ) => {
-                result
-            }
-        };
-
-        // Wait for forward task to complete
-        let _ = forward_handle.await;
-        if merge_deferred_stop.load(Ordering::SeqCst) {
-            stopped_or_cancelled = true;
         }
+    });
 
-        // Mark batch changes as processed
-        for change in &batch_changes {
-            processed_ids.insert(change.id.clone());
+    // Execute all changes using slot-driven continuous dispatch
+    let result = tokio::select! {
+        _ = cancel_token.cancelled() => {
+            let change_ids: Vec<String> = changes_to_process.iter().map(|c| c.id.clone()).collect();
+            let cancel_msg = format!(
+                "Cancelled parallel execution ({} changes: {})",
+                change_ids.len(),
+                change_ids.join(", ")
+            );
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::warn(
+                    cancel_msg.clone(),
+                )))
+                .await;
+            Err(crate::error::OrchestratorError::AgentCommand(cancel_msg))
         }
+        result = service.run_parallel_with_channel_and_queue_state(
+            changes_to_process.clone(),
+            parallel_tx,
+            Some(cancel_token.clone()),
+            Some(shared_queue_change.clone()),
+            Some(Arc::new(dynamic_queue.clone())),
+        ) => {
+            result
+        }
+    };
 
-        match result {
-            Ok(_) => {
-                if merge_deferred_stop.load(Ordering::SeqCst) {
-                    let _ = tx
-                        .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                            "Batch stopped with deferred merges ({} changes processed)",
-                            batch_changes.len()
-                        ))))
-                        .await;
-                } else {
-                    let _ = tx
-                        .send(OrchestratorEvent::Log(LogEntry::success(format!(
-                            "Batch completed ({} changes processed)",
-                            batch_changes.len()
-                        ))))
-                        .await;
-                }
-            }
-            Err(e) => {
-                had_errors = true;
+    // Wait for forward task to complete
+    let _ = forward_handle.await;
+    if merge_deferred_stop.load(Ordering::SeqCst) {
+        stopped_or_cancelled = true;
+    }
+
+    match result {
+        Ok(_) => {
+            if merge_deferred_stop.load(Ordering::SeqCst) {
                 let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::error(format!(
-                        "Batch execution failed: {}",
-                        e
+                    .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                        "Execution stopped with deferred merges ({} changes processed)",
+                        changes_to_process.len()
                     ))))
                     .await;
-                // Continue to check for more changes even if this batch failed
+            } else {
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::success(format!(
+                        "Execution completed ({} changes processed)",
+                        changes_to_process.len()
+                    ))))
+                    .await;
             }
+        }
+        Err(e) => {
+            had_errors = true;
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::error(format!(
+                    "Execution failed: {}",
+                    e
+                ))))
+                .await;
         }
     }
 
