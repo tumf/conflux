@@ -44,14 +44,19 @@ pub fn build_archive_prompt(user_prompt: &str, history_context: &str) -> String 
 /// Build acceptance prompt from user prompt and history context
 ///
 /// The prompt is constructed as:
-/// 1. ACCEPTANCE_SYSTEM_PROMPT (always included)
+/// 1. ACCEPTANCE_SYSTEM_PROMPT with {change_id} expanded (always included)
 /// 2. user_prompt (if not empty)
 /// 3. history_context (if not empty)
-pub fn build_acceptance_prompt(user_prompt: &str, history_context: &str) -> String {
+pub fn build_acceptance_prompt(
+    change_id: &str,
+    user_prompt: &str,
+    history_context: &str,
+) -> String {
     let mut parts = Vec::new();
 
-    // System prompt is always included first
-    parts.push(ACCEPTANCE_SYSTEM_PROMPT.to_string());
+    // System prompt is always included first, with change_id expanded
+    let system_prompt = ACCEPTANCE_SYSTEM_PROMPT.replace("{change_id}", change_id);
+    parts.push(system_prompt);
 
     if !user_prompt.is_empty() {
         parts.push(user_prompt.to_string());
