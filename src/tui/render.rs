@@ -1567,4 +1567,47 @@ mod tests {
             "Buffer should not contain headers for plain log messages"
         );
     }
+
+    #[test]
+    fn test_log_header_acceptance_with_iteration() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+
+        // Add acceptance log with change_id and iteration
+        let entry = LogEntry::info("Running acceptance test")
+            .with_change_id("my-change")
+            .with_operation("acceptance")
+            .with_iteration(3);
+        app.add_log(entry);
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        // Should display [my-change:acceptance:3] header
+        assert!(
+            content.contains("[my-change:acceptance:3]"),
+            "Buffer should contain '[my-change:acceptance:3]' header, but got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_log_header_acceptance_without_iteration() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+
+        // Add acceptance log with change_id but no iteration
+        let entry = LogEntry::info("Acceptance test starting")
+            .with_change_id("my-change")
+            .with_operation("acceptance");
+        app.add_log(entry);
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        // Should display [my-change:acceptance] header
+        assert!(
+            content.contains("[my-change:acceptance]"),
+            "Buffer should contain '[my-change:acceptance]' header, but got:\n{}",
+            content
+        );
+    }
 }

@@ -1304,6 +1304,9 @@ pub async fn execute_acceptance_in_workspace(
 
     info!("Running acceptance test for {} in workspace", change_id);
 
+    // Get the acceptance iteration number (attempt number that will be used)
+    let acceptance_iteration = agent.next_acceptance_attempt_number(change_id);
+
     // Send AcceptanceStarted event
     if let Some(ref tx) = event_tx {
         let _ = tx
@@ -1315,7 +1318,8 @@ pub async fn execute_acceptance_in_workspace(
             .send(ParallelEvent::Log(
                 crate::events::LogEntry::info(format!("Running acceptance test: {}", change_id))
                     .with_change_id(change_id)
-                    .with_operation("acceptance"),
+                    .with_operation("acceptance")
+                    .with_iteration(acceptance_iteration),
             ))
             .await;
     }
@@ -1350,7 +1354,8 @@ pub async fn execute_acceptance_in_workspace(
                         .send(ParallelEvent::Log(
                             crate::events::LogEntry::info(&s)
                                 .with_change_id(change_id)
-                                .with_operation("acceptance"),
+                                .with_operation("acceptance")
+                                .with_iteration(acceptance_iteration),
                         ))
                         .await;
                 }
@@ -1364,7 +1369,8 @@ pub async fn execute_acceptance_in_workspace(
                         .send(ParallelEvent::Log(
                             crate::events::LogEntry::warn(&s)
                                 .with_change_id(change_id)
-                                .with_operation("acceptance"),
+                                .with_operation("acceptance")
+                                .with_iteration(acceptance_iteration),
                         ))
                         .await;
                 }
@@ -1411,7 +1417,8 @@ pub async fn execute_acceptance_in_workspace(
                 .send(ParallelEvent::Log(
                     crate::events::LogEntry::error(&error_msg)
                         .with_change_id(change_id)
-                        .with_operation("acceptance"),
+                        .with_operation("acceptance")
+                        .with_iteration(acceptance_iteration),
                 ))
                 .await;
             let _ = tx
@@ -1444,7 +1451,8 @@ pub async fn execute_acceptance_in_workspace(
                     .send(ParallelEvent::Log(
                         crate::events::LogEntry::info("Acceptance test passed")
                             .with_change_id(change_id)
-                            .with_operation("acceptance"),
+                            .with_operation("acceptance")
+                            .with_iteration(acceptance_iteration),
                     ))
                     .await;
                 let _ = tx
@@ -1474,7 +1482,8 @@ pub async fn execute_acceptance_in_workspace(
                     .send(ParallelEvent::Log(
                         crate::events::LogEntry::info("Acceptance test requires continuation")
                             .with_change_id(change_id)
-                            .with_operation("acceptance"),
+                            .with_operation("acceptance")
+                            .with_iteration(acceptance_iteration),
                     ))
                     .await;
                 let _ = tx
@@ -1511,7 +1520,8 @@ pub async fn execute_acceptance_in_workspace(
                             findings.len()
                         ))
                         .with_change_id(change_id)
-                        .with_operation("acceptance"),
+                        .with_operation("acceptance")
+                        .with_iteration(acceptance_iteration),
                     ))
                     .await;
                 let _ = tx

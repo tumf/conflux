@@ -204,6 +204,13 @@ pub enum ExecutionEvent {
     /// Acceptance failed for a change
     #[allow(dead_code)]
     AcceptanceFailed { change_id: String, error: String },
+    /// Acceptance output (streaming)
+    #[allow(dead_code)]
+    AcceptanceOutput {
+        change_id: String,
+        output: String,
+        iteration: Option<u32>,
+    },
 
     // Progress events
     /// Progress updated for a change (task completion tracking)
