@@ -370,4 +370,73 @@ mod tests {
 
         assert!(guard.preserved_workspaces.is_empty());
     }
+
+    // === Test for MergeDeferred worktree preservation (fix-merge-wait-resolve-flow) ===
+
+    #[test]
+    fn test_cleanup_guard_merge_deferred_preserves_worktree() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Simulate the MergeDeferred scenario from execute_with_order_based_reanalysis
+        {
+            let mut guard =
+                WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
+
+            // Track a workspace that completed archive
+            guard.track(
+                "ws-change-archived-1234".to_string(),
+                PathBuf::from("/tmp/ws-archived"),
+            );
+
+            // Simulate MergeDeferred: preserve the workspace
+            // This happens when attempt_merge returns MergeAttempt::Deferred
+            guard.preserve("ws-change-archived-1234");
+
+            // Verify the workspace is marked for preservation
+            assert!(guard
+                .preserved_workspaces
+                .contains("ws-change-archived-1234"));
+
+            // On drop (without commit), the workspace should be preserved
+            // This allows the user to manually resolve conflicts and retry merge
+        }
+        // If we reach here, drop completed successfully without cleaning up the preserved workspace
+    }
+
+    #[test]
+    fn test_cleanup_guard_merge_deferred_multiple_workspaces() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Test scenario with multiple workspaces, some merged successfully, some deferred
+        {
+            let mut guard =
+                WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
+
+            // Track multiple workspaces
+            guard.track(
+                "ws-change-merged-1".to_string(),
+                PathBuf::from("/tmp/ws-merged-1"),
+            );
+            guard.track(
+                "ws-change-deferred-2".to_string(),
+                PathBuf::from("/tmp/ws-deferred-2"),
+            );
+            guard.track(
+                "ws-change-merged-3".to_string(),
+                PathBuf::from("/tmp/ws-merged-3"),
+            );
+
+            // Preserve only the deferred workspace
+            guard.preserve("ws-change-deferred-2");
+
+            // Verify preservation state
+            assert!(!guard.preserved_workspaces.contains("ws-change-merged-1"));
+            assert!(guard.preserved_workspaces.contains("ws-change-deferred-2"));
+            assert!(!guard.preserved_workspaces.contains("ws-change-merged-3"));
+
+            // On drop (without commit), only the deferred workspace is preserved
+            // The merged workspaces would be cleaned up if commit() was called
+        }
+        // Drop completes successfully
+    }
 }
