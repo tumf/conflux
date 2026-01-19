@@ -801,7 +801,108 @@ impl ParallelExecutor {
                                 self.failed_tracker.mark_failed(&workspace_result.change_id);
                             } else {
                                 info!("Change '{}' completed successfully", workspace_result.change_id);
-                                // TODO: Trigger merge/cleanup logic here if needed
+
+                                // Attempt merge if archive completed successfully
+                                if workspace_result.final_revision.is_some() {
+                                    let revisions = vec![workspace_result.workspace_name.clone()];
+                                    let change_ids = vec![workspace_result.change_id.clone()];
+
+                                    // Find workspace path for archive verification
+                                    let workspace_path = self
+                                        .workspace_manager
+                                        .workspaces()
+                                        .iter()
+                                        .find(|workspace| workspace.name == workspace_result.workspace_name)
+                                        .map(|workspace| workspace.path.clone());
+
+                                    if let Some(path) = workspace_path {
+                                        let archive_paths = vec![path];
+
+                                        info!(
+                                            "Merging archived {} (workspace: {})",
+                                            workspace_result.change_id, workspace_result.workspace_name
+                                        );
+
+                                        match self.attempt_merge(&revisions, &change_ids, &archive_paths).await {
+                                            Ok(MergeAttempt::Merged) => {
+                                                // Merge succeeded, cleanup workspace
+                                                send_event(
+                                                    &self.event_tx,
+                                                    ParallelEvent::CleanupStarted {
+                                                        workspace: workspace_result.workspace_name.clone(),
+                                                    },
+                                                )
+                                                .await;
+
+                                                if let Err(err) = self
+                                                    .workspace_manager
+                                                    .cleanup_workspace(&workspace_result.workspace_name)
+                                                    .await
+                                                {
+                                                    warn!(
+                                                        "Failed to cleanup worktree '{}' after merge: {}",
+                                                        workspace_result.workspace_name, err
+                                                    );
+                                                } else {
+                                                    send_event(
+                                                        &self.event_tx,
+                                                        ParallelEvent::CleanupCompleted {
+                                                            workspace: workspace_result.workspace_name.clone(),
+                                                        },
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                            Ok(MergeAttempt::Deferred(reason)) => {
+                                                // Merge deferred, preserve workspace and transition to MergeWait
+                                                self.merge_deferred_changes.insert(workspace_result.change_id.clone());
+
+                                                // Update workspace status to MergeWait so it's no longer counted as active
+                                                self.workspace_manager.update_workspace_status(
+                                                    &workspace_result.workspace_name,
+                                                    WorkspaceStatus::MergeWait,
+                                                );
+
+                                                // Preserve this workspace from cleanup
+                                                cleanup_guard.preserve(&workspace_result.workspace_name);
+
+                                                send_event(
+                                                    &self.event_tx,
+                                                    ParallelEvent::MergeDeferred {
+                                                        change_id: workspace_result.change_id.clone(),
+                                                        reason,
+                                                    },
+                                                )
+                                                .await;
+
+                                                send_event(
+                                                    &self.event_tx,
+                                                    ParallelEvent::WorkspaceStatusUpdated {
+                                                        workspace_name: workspace_result.workspace_name.clone(),
+                                                        status: WorkspaceStatus::MergeWait,
+                                                    },
+                                                )
+                                                .await;
+                                            }
+                                            Err(e) => {
+                                                let error_msg = format!(
+                                                    "Failed to merge archived {} (workspace: {}): {}",
+                                                    workspace_result.change_id, workspace_result.workspace_name, e
+                                                );
+                                                error!("{}", error_msg);
+                                                send_event(&self.event_tx, ParallelEvent::Error { message: error_msg })
+                                                    .await;
+                                                // Preserve workspace on merge error to allow debugging
+                                                cleanup_guard.preserve(&workspace_result.workspace_name);
+                                            }
+                                        }
+                                    } else {
+                                        warn!(
+                                            "Workspace '{}' not found after archive completion, skipping merge",
+                                            workspace_result.workspace_name
+                                        );
+                                    }
+                                }
                             }
 
                             // Trigger re-analysis on next iteration
@@ -838,6 +939,10 @@ impl ParallelExecutor {
         if let Some(handle) = merge_stall_monitor_handle {
             handle.abort();
         }
+
+        // Commit the cleanup guard to finalize workspace cleanup
+        // Preserved workspaces (MergeWait) will not be cleaned up on drop
+        cleanup_guard.commit();
 
         send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
         Ok(())
