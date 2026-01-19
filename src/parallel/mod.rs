@@ -1274,11 +1274,24 @@ impl ParallelExecutor {
                             changes_for_apply.push(change_id.clone());
                             continue;
                         }
-                        Ok(crate::orchestration::AcceptanceResult::CommandFailed { error }) => {
+                        Ok(crate::orchestration::AcceptanceResult::CommandFailed {
+                            error,
+                            findings,
+                        }) => {
                             error!(
                                 "Acceptance command failed for {} on resume: {}",
                                 change_id, error
                             );
+                            if let Err(e) =
+                                crate::orchestration::update_tasks_on_acceptance_failure(
+                                    change_id,
+                                    &findings,
+                                    Some(&workspace.path),
+                                )
+                                .await
+                            {
+                                warn!("Failed to update tasks.md for {}: {}", change_id, e);
+                            }
                             send_event(
                                 &self.event_tx,
                                 ParallelEvent::Log(
@@ -2003,19 +2016,21 @@ impl ParallelExecutor {
                         // Continue loop - retry apply with updated tasks
                         continue;
                     }
-                    Ok(crate::orchestration::AcceptanceResult::CommandFailed { error }) => {
+                    Ok(crate::orchestration::AcceptanceResult::CommandFailed {
+                        error,
+                        findings,
+                    }) => {
                         error!(
                             "Acceptance command failed for {} (cycle {}): {}",
                             change_id, cycle_count, error
                         );
                         // Update tasks.md with command failure
-                        if let Err(e) =
-                            crate::orchestration::update_tasks_on_acceptance_failure(
-                                &change_id,
-                                std::slice::from_ref(&error),
-                                Some(&workspace.path),
-                            )
-                            .await
+                        if let Err(e) = crate::orchestration::update_tasks_on_acceptance_failure(
+                            &change_id,
+                            &findings,
+                            Some(&workspace.path),
+                        )
+                        .await
                         {
                             warn!(
                                 "Failed to update tasks.md for {}: {}",
@@ -2570,7 +2585,10 @@ impl ParallelExecutor {
                             // Continue loop - retry apply with updated tasks
                             continue;
                         }
-                        Ok(crate::orchestration::AcceptanceResult::CommandFailed { error }) => {
+                        Ok(crate::orchestration::AcceptanceResult::CommandFailed {
+                            error,
+                            findings,
+                        }) => {
                             error!(
                                 "Acceptance command failed for {} (cycle {}): {}",
                                 change_id, cycle_count, error
@@ -2579,7 +2597,7 @@ impl ParallelExecutor {
                             if let Err(e) =
                                 crate::orchestration::update_tasks_on_acceptance_failure(
                                     &change_id,
-                                    std::slice::from_ref(&error),
+                                    &findings,
                                     Some(&workspace_path),
                                 )
                                 .await
@@ -2603,12 +2621,13 @@ impl ParallelExecutor {
                                     .await;
                             }
                             // Command failed - this is a critical error, don't retry
-                            return WorkspaceResult {
-                                change_id,
-                                workspace_name,
-                                final_revision: None,
-                                error: Some(format!("Acceptance command failed: {}", error)),
-                            };
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: Some(format!("Acceptance command failed: {}", error)),
+                        };
+
                         }
                         Ok(crate::orchestration::AcceptanceResult::Cancelled) => {
                             info!("Acceptance cancelled for {}", change_id);
@@ -2717,115 +2736,117 @@ impl ParallelExecutor {
                 Some(result) = join_set.join_next() => {
                     match result {
                         Ok(workspace_result) => {
-                    // Update workspace status
-                    if workspace_result.error.is_some() {
-                        self.workspace_manager.update_workspace_status(
-                            &workspace_result.workspace_name,
-                            WorkspaceStatus::Failed(
-                                workspace_result.error.clone().unwrap_or_default(),
-                            ),
-                        );
-                    } else if let Some(ref rev) = workspace_result.final_revision {
-                        self.workspace_manager.update_workspace_status(
-                            &workspace_result.workspace_name,
-                            WorkspaceStatus::Applied(rev.clone()),
-                        );
-
-                        // Individual merge: merge immediately after archive completes
-                        let revisions = vec![workspace_result.workspace_name.clone()];
-                        let change_ids = vec![workspace_result.change_id.clone()];
-
-                        info!(
-                            "Merging {} (workspace: {})",
-                            workspace_result.change_id, workspace_result.workspace_name
-                        );
-                        let archive_paths = vec![self
-                            .workspace_manager
-                            .workspaces()
-                            .iter()
-                            .find(|workspace| workspace.name == workspace_result.workspace_name)
-                            .map(|workspace| workspace.path.clone())
-                            .ok_or_else(|| {
-                                OrchestratorError::GitCommand(format!(
-                                    "Workspace not found for archive verification: {}",
-                                    workspace_result.workspace_name
-                                ))
-                            })?];
-                        let merge_result = self
-                            .attempt_merge(&revisions, &change_ids, &archive_paths)
-                            .await;
-                        match merge_result {
-                            Ok(MergeAttempt::Merged) => {
-                                info!(
-                                    "Successfully merged {} (workspace: {})",
-                                    workspace_result.change_id, workspace_result.workspace_name
-                                );
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::CleanupStarted {
-                                        workspace: workspace_result.workspace_name.clone(),
-                                    },
-                                )
-                                .await;
-                                if let Err(err) = self
-                                    .workspace_manager
-                                    .cleanup_workspace(&workspace_result.workspace_name)
-                                    .await
-                                {
-                                    warn!(
-                                        "Failed to cleanup worktree '{}' after merge: {}",
-                                        workspace_result.workspace_name, err
-                                    );
-                                } else {
-                                    send_event(
-                                        &self.event_tx,
-                                        ParallelEvent::CleanupCompleted {
-                                            workspace: workspace_result.workspace_name.clone(),
-                                        },
-                                    )
-                                    .await;
-                                }
-                            }
-                            Ok(MergeAttempt::Deferred(reason)) => {
-                                self.merge_deferred_changes
-                                    .insert(workspace_result.change_id.clone());
-
-                                // Update workspace status to MergeWait so it's no longer counted as active
-                                // Per spec line 7: "merge_wait ... はアクティブとして扱ってはならない（MUST NOT）"
+                            // Update workspace status
+                            if workspace_result.error.is_some() {
                                 self.workspace_manager.update_workspace_status(
                                     &workspace_result.workspace_name,
-                                    WorkspaceStatus::MergeWait,
+                                    WorkspaceStatus::Failed(
+                                        workspace_result.error.clone().unwrap_or_default(),
+                                    ),
+                                );
+                            } else if let Some(ref rev) = workspace_result.final_revision {
+                                self.workspace_manager.update_workspace_status(
+                                    &workspace_result.workspace_name,
+                                    WorkspaceStatus::Applied(rev.clone()),
                                 );
 
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::MergeDeferred {
-                                        change_id: workspace_result.change_id.clone(),
-                                        reason,
-                                    },
-                                )
-                                .await;
+                                // Individual merge: merge immediately after archive completes
+                                let revisions = vec![workspace_result.workspace_name.clone()];
+                                let change_ids = vec![workspace_result.change_id.clone()];
 
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::WorkspaceStatusUpdated {
-                                        workspace_name: workspace_result.workspace_name.clone(),
-                                        status: WorkspaceStatus::MergeWait,
-                                    },
-                                )
-                                .await;
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to merge {} (workspace: {}): {}",
-                                    workspace_result.change_id, workspace_result.workspace_name, e
+                                info!(
+                                    "Merging {} (workspace: {})",
+                                    workspace_result.change_id, workspace_result.workspace_name
                                 );
-                                // Merge failure is critical - preserve all workspaces and return error
-                                cleanup_guard.preserve_all();
-                                return Err(e);
+                                let archive_paths = vec![self
+                                    .workspace_manager
+                                    .workspaces()
+                                    .iter()
+                                    .find(|workspace| workspace.name == workspace_result.workspace_name)
+                                    .map(|workspace| workspace.path.clone())
+                                    .ok_or_else(|| {
+                                        OrchestratorError::GitCommand(format!(
+                                            "Workspace not found for archive verification: {}",
+                                            workspace_result.workspace_name
+                                        ))
+                                    })?];
+                                let merge_result = self
+                                    .attempt_merge(&revisions, &change_ids, &archive_paths)
+                                    .await;
+                                match merge_result {
+                                    Ok(MergeAttempt::Merged) => {
+                                        info!(
+                                            "Successfully merged {} (workspace: {})",
+                                            workspace_result.change_id, workspace_result.workspace_name
+                                        );
+                                        send_event(
+                                            &self.event_tx,
+                                            ParallelEvent::CleanupStarted {
+                                                workspace: workspace_result.workspace_name.clone(),
+                                            },
+                                        )
+                                        .await;
+                                        if let Err(err) = self
+                                            .workspace_manager
+                                            .cleanup_workspace(&workspace_result.workspace_name)
+                                            .await
+                                        {
+                                            warn!(
+                                                "Failed to cleanup worktree '{}' after merge: {}",
+                                                workspace_result.workspace_name, err
+                                            );
+                                        } else {
+                                            send_event(
+                                                &self.event_tx,
+                                                ParallelEvent::CleanupCompleted {
+                                                    workspace: workspace_result.workspace_name.clone(),
+                                                },
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    Ok(MergeAttempt::Deferred(reason)) => {
+                                        self.merge_deferred_changes
+                                            .insert(workspace_result.change_id.clone());
+
+                                        // Update workspace status to MergeWait so it's no longer counted as active
+                                        // Per spec line 7: "merge_wait ... はアクティブとして扱ってはならない（MUST NOT）"
+                                        self.workspace_manager.update_workspace_status(
+                                            &workspace_result.workspace_name,
+                                            WorkspaceStatus::MergeWait,
+                                        );
+
+                                        send_event(
+                                            &self.event_tx,
+                                            ParallelEvent::MergeDeferred {
+                                                change_id: workspace_result.change_id.clone(),
+                                                reason,
+                                            },
+                                        )
+                                        .await;
+
+                                        send_event(
+                                            &self.event_tx,
+                                            ParallelEvent::WorkspaceStatusUpdated {
+                                                workspace_name: workspace_result.workspace_name.clone(),
+                                                status: WorkspaceStatus::MergeWait,
+                                            },
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "Failed to merge {} (workspace: {}): {}",
+                                            workspace_result.change_id,
+                                            workspace_result.workspace_name,
+                                            e
+                                        );
+                                        // Merge failure is critical - preserve all workspaces and return error
+                                        cleanup_guard.preserve_all();
+                                        return Err(e);
+                                    }
+                                }
                             }
-                        }
-                    }
                             results.push(workspace_result);
 
                             // Check dynamic queue for new changes when a task completes (slot available)
@@ -3157,7 +3178,10 @@ impl ParallelExecutor {
                                                                         }
                                                                         continue;
                                                                     }
-                                                                    Ok(crate::orchestration::AcceptanceResult::CommandFailed { error }) => {
+                                                                    Ok(crate::orchestration::AcceptanceResult::CommandFailed {
+                                                                        error,
+                                                                        findings,
+                                                                    }) => {
                                                                         error!(
                                                                             "Acceptance command failed for {} (cycle {}): {}",
                                                                             change_id, cycle_count, error
@@ -3165,7 +3189,7 @@ impl ParallelExecutor {
                                                                         if let Err(e) =
                                                                             crate::orchestration::update_tasks_on_acceptance_failure(
                                                                                 &change_id,
-                                                                                std::slice::from_ref(&error),
+                                                                                &findings,
                                                                                 Some(&workspace_path),
                                                                             )
                                                                             .await
@@ -3188,9 +3212,10 @@ impl ParallelExecutor {
                                                                                 ))
                                                                                 .await;
                                                                         }
+                                                                        // Command failed - this is a critical error, don't retry
                                                                         return WorkspaceResult {
                                                                             change_id,
-                                                                            workspace_name,
+                                                                            workspace_name: workspace.name,
                                                                             final_revision: None,
                                                                             error: Some(format!("Acceptance command failed: {}", error)),
                                                                         };

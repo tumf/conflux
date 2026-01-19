@@ -573,13 +573,11 @@ impl Orchestrator {
                                     }
                                     // Change will be selected again for apply in next iteration
                                 }
-                                Ok(AcceptanceResult::CommandFailed { error }) => {
+                                Ok(AcceptanceResult::CommandFailed { error, findings }) => {
                                     error!("Acceptance command failed for {}: {}", next.id, error);
                                     // Update tasks.md with command failure
                                     if let Err(e) = update_tasks_on_acceptance_failure(
-                                        &next.id,
-                                        std::slice::from_ref(&error),
-                                        None,
+                                        &next.id, &findings, None,
                                     )
                                     .await
                                     {

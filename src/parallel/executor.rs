@@ -6,6 +6,7 @@ use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
+use crate::orchestration::build_acceptance_tail_findings;
 use crate::stall::{StallDetector, StallPhase};
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::VcsBackend;
@@ -1396,6 +1397,7 @@ pub async fn execute_acceptance_in_workspace(
 
     // Parse acceptance output
     let parse_result = parse_acceptance_output(&full_stdout);
+    let tail_findings = build_acceptance_tail_findings(stdout_tail.clone(), stderr_tail.clone());
 
     // Check if command failed
     if !status.success() {
@@ -1407,7 +1409,7 @@ pub async fn execute_acceptance_in_workspace(
             attempt: agent.next_acceptance_attempt_number(change_id),
             passed: false,
             duration: start_time.elapsed(),
-            findings: Some(vec![error_msg.clone()]),
+            findings: Some(tail_findings.clone()),
             exit_code: status.code(),
             stdout_tail,
             stderr_tail,
@@ -1430,7 +1432,10 @@ pub async fn execute_acceptance_in_workspace(
                 .await;
         }
 
-        return Ok(crate::orchestration::AcceptanceResult::CommandFailed { error: error_msg });
+        return Ok(crate::orchestration::AcceptanceResult::CommandFailed {
+            error: error_msg,
+            findings: tail_findings,
+        });
     }
 
     // Process parsed result
@@ -1497,17 +1502,18 @@ pub async fn execute_acceptance_in_workspace(
 
             Ok(crate::orchestration::AcceptanceResult::Continue)
         }
-        ParseResult::Fail { findings } => {
+        ParseResult::Fail { .. } => {
+            let findings_for_tasks = tail_findings.clone();
             info!(
                 "Acceptance failed for: {} with {} findings",
                 change_id,
-                findings.len()
+                findings_for_tasks.len()
             );
             let attempt = crate::history::AcceptanceAttempt {
                 attempt: agent.next_acceptance_attempt_number(change_id),
                 passed: false,
                 duration: start_time.elapsed(),
-                findings: Some(findings.clone()),
+                findings: Some(findings_for_tasks.clone()),
                 exit_code: status.code(),
                 stdout_tail,
                 stderr_tail,
@@ -1519,7 +1525,7 @@ pub async fn execute_acceptance_in_workspace(
                     .send(ParallelEvent::Log(
                         crate::events::LogEntry::warn(format!(
                             "Acceptance test failed with {} findings",
-                            findings.len()
+                            findings_for_tasks.len()
                         ))
                         .with_change_id(change_id)
                         .with_operation("acceptance")
@@ -1533,7 +1539,9 @@ pub async fn execute_acceptance_in_workspace(
                     .await;
             }
 
-            Ok(crate::orchestration::AcceptanceResult::Fail { findings })
+            Ok(crate::orchestration::AcceptanceResult::Fail {
+                findings: findings_for_tasks,
+            })
         }
     }
 }

@@ -13,6 +13,29 @@ use tracing::{info, warn};
 
 use super::output::OutputHandler;
 
+const ACCEPTANCE_OUTPUT_FALLBACK: &str = "No acceptance output captured";
+
+pub fn build_acceptance_tail_findings(
+    stdout_tail: Option<String>,
+    stderr_tail: Option<String>,
+) -> Vec<String> {
+    let stdout = stdout_tail.filter(|text| !text.trim().is_empty());
+    let stderr = stderr_tail.filter(|text| !text.trim().is_empty());
+    let selected = stdout
+        .or(stderr)
+        .unwrap_or_else(|| ACCEPTANCE_OUTPUT_FALLBACK.to_string());
+    let lines = selected
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        vec![ACCEPTANCE_OUTPUT_FALLBACK.to_string()]
+    } else {
+        lines
+    }
+}
+
 /// Result of an acceptance operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptanceResult {
@@ -23,7 +46,10 @@ pub enum AcceptanceResult {
     /// Acceptance requires more investigation - retry acceptance.
     Continue,
     /// Acceptance command execution failed (non-zero exit).
-    CommandFailed { error: String },
+    CommandFailed {
+        error: String,
+        findings: Vec<String>,
+    },
     /// Acceptance was cancelled (e.g., by user or timeout).
     Cancelled,
 }
@@ -46,7 +72,7 @@ impl AcceptanceResult {
 /// # Returns
 /// * `Ok(AcceptanceResult::Pass)` - Acceptance passed
 /// * `Ok(AcceptanceResult::Fail { findings })` - Acceptance failed with findings
-/// * `Ok(AcceptanceResult::CommandFailed { error })` - Command execution failed
+/// * `Ok(AcceptanceResult::CommandFailed { error, findings })` - Command execution failed
 /// * `Ok(AcceptanceResult::Cancelled)` - Operation was cancelled
 /// * `Err(e)` - An error occurred
 pub async fn acceptance_test_streaming<O, F>(
@@ -110,6 +136,7 @@ where
 
     // Parse acceptance output
     let parse_result = parse_acceptance_output(&full_stdout);
+    let tail_findings = build_acceptance_tail_findings(stdout_tail.clone(), stderr_tail.clone());
 
     // Check if command failed
     if !status.success() {
@@ -121,14 +148,17 @@ where
             attempt: agent.next_acceptance_attempt_number(&change.id),
             passed: false,
             duration: start_time.elapsed(),
-            findings: Some(vec![error_msg.clone()]),
+            findings: Some(tail_findings.clone()),
             exit_code: status.code(),
             stdout_tail,
             stderr_tail,
         };
         agent.record_acceptance_attempt(&change.id, attempt);
         output.on_error(&error_msg);
-        return Ok(AcceptanceResult::CommandFailed { error: error_msg });
+        return Ok(AcceptanceResult::CommandFailed {
+            error: error_msg,
+            findings: tail_findings,
+        });
     }
 
     // Process parsed result
@@ -163,17 +193,18 @@ where
             output.on_info("Acceptance test requires continuation");
             Ok(AcceptanceResult::Continue)
         }
-        ParseResult::Fail { findings } => {
+        ParseResult::Fail { .. } => {
+            let findings_for_tasks = tail_findings.clone();
             info!(
                 "Acceptance failed for: {} with {} findings",
                 change.id,
-                findings.len()
+                findings_for_tasks.len()
             );
             let attempt = AcceptanceAttempt {
                 attempt: agent.next_acceptance_attempt_number(&change.id),
                 passed: false,
                 duration: start_time.elapsed(),
-                findings: Some(findings.clone()),
+                findings: Some(findings_for_tasks.clone()),
                 exit_code: status.code(),
                 stdout_tail,
                 stderr_tail,
@@ -181,12 +212,14 @@ where
             agent.record_acceptance_attempt(&change.id, attempt);
             output.on_warn(&format!(
                 "Acceptance test failed with {} findings",
-                findings.len()
+                findings_for_tasks.len()
             ));
-            for finding in &findings {
+            for finding in &findings_for_tasks {
                 output.on_warn(&format!("  - {}", finding));
             }
-            Ok(AcceptanceResult::Fail { findings })
+            Ok(AcceptanceResult::Fail {
+                findings: findings_for_tasks,
+            })
         }
     }
 }
@@ -270,6 +303,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_build_acceptance_tail_findings_prefers_stdout() {
+        let findings = build_acceptance_tail_findings(
+            Some("stdout line 1\nstdout line 2".to_string()),
+            Some("stderr line".to_string()),
+        );
+
+        assert_eq!(findings, vec!["stdout line 1", "stdout line 2"]);
+    }
+
+    #[test]
+    fn test_build_acceptance_tail_findings_falls_back_to_stderr() {
+        let findings =
+            build_acceptance_tail_findings(Some("  ".to_string()), Some("stderr".to_string()));
+
+        assert_eq!(findings, vec!["stderr"]);
+    }
+
+    #[test]
+    fn test_build_acceptance_tail_findings_fallback_message() {
+        let findings = build_acceptance_tail_findings(None, Some("\n\n".to_string()));
+
+        assert_eq!(findings, vec!["No acceptance output captured"]);
+    }
+
+    #[test]
     fn test_acceptance_result_is_pass() {
         assert!(AcceptanceResult::Pass.is_pass());
         assert!(!AcceptanceResult::Fail {
@@ -277,7 +335,8 @@ mod tests {
         }
         .is_pass());
         assert!(!AcceptanceResult::CommandFailed {
-            error: "test".to_string()
+            error: "test".to_string(),
+            findings: vec!["failure".to_string()],
         }
         .is_pass());
         assert!(!AcceptanceResult::Cancelled.is_pass());

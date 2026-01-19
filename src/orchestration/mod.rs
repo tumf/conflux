@@ -26,7 +26,8 @@ pub mod state;
 // Some exports are unused until TUI integration is complete.
 #[allow(unused_imports)]
 pub use acceptance::{
-    acceptance_test_streaming, update_tasks_on_acceptance_failure, AcceptanceResult,
+    acceptance_test_streaming, build_acceptance_tail_findings, update_tasks_on_acceptance_failure,
+    AcceptanceResult,
 };
 #[allow(unused_imports)]
 pub use apply::{apply_change, apply_change_streaming, ApplyContext, ApplyResult};

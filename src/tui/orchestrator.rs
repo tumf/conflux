@@ -1008,7 +1008,7 @@ pub async fn run_orchestrator(
                         }
                         // Change will be selected again for apply in next iteration
                     }
-                    Ok(AcceptanceResult::CommandFailed { error }) => {
+                    Ok(AcceptanceResult::CommandFailed { error, findings }) => {
                         let _ = tx
                             .send(OrchestratorEvent::Log(LogEntry::error(format!(
                                 "Acceptance command failed for {}: {}",
@@ -1024,12 +1024,8 @@ pub async fn run_orchestrator(
                             .await;
 
                         // Update tasks.md with command failure
-                        if let Err(e) = update_tasks_on_acceptance_failure(
-                            &change_id,
-                            std::slice::from_ref(&error),
-                            None,
-                        )
-                        .await
+                        if let Err(e) =
+                            update_tasks_on_acceptance_failure(&change_id, &findings, None).await
                         {
                             let _ = tx
                                 .send(OrchestratorEvent::Log(LogEntry::warn(format!(
