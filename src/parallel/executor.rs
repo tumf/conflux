@@ -885,7 +885,7 @@ pub async fn execute_archive_in_workspace(
         }
         Ok(None) => {
             return Err(OrchestratorError::AgentCommand(format!(
-                "Cannot archive '{}' in workspace '{}': tasks.md not found at {}",
+                "Cannot archive '{}' in workspace '{}': tasks.md not found at {} or in archive directory",
                 change_id,
                 workspace_path.display(),
                 workspace_path
