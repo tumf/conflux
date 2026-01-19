@@ -1,0 +1,39 @@
+## 1. Implementation
+- [x] 1.1 `src/parallel/mod.rs` のバッチ/グループ前提処理を特定し、削除対象の関数と呼び出し箇所を一覧化する（完了条件: tasks.md に対象関数と呼び出し箇所が列挙されている）
+  - Identified functions to remove:
+    - `execute_groups()` - deprecated batch execution (line 419)
+    - `execute_with_reanalysis()` - group-based execution (line 493)
+    - `execute_group()` - internal group processor (line 1397)
+  - Identified events to remove:
+    - `GroupStarted { group_id, changes }` in src/events.rs:293
+    - `GroupCompleted { group_id }` in src/events.rs:295
+  - Keep: `execute_with_order_based_reanalysis()` - already slot-driven (line 884)
+- [x] 1.2 `execute_with_reanalysis` のバッチ完了待ちを撤廃し、空きスロット駆動の連続ディスパッチに置き換える（完了条件: バッチ境界の待ちがなく、空きスロットでキューが消化される）
+  - Deleted deprecated `execute_groups()` and `execute_with_reanalysis()` methods
+  - Deleted deprecated `run_parallel_with_executor()` in ParallelRunService
+  - Removed `GroupStarted` and `GroupCompleted` events from events.rs
+  - All execution now uses slot-driven `execute_with_order_based_reanalysis()`
+- [x] 1.3 `execute_group` と `ParallelGroup` の使用箇所を廃止し、依存失敗チェックをディスパッチ時の個別評価に移動する（完了条件: グループ単位のスキップ処理が削除される）
+  - Renamed `execute_group` to `execute_changes_dispatch` to reflect slot-driven dispatch
+  - Removed Group event emissions from the execution flow
+  - Dependency failure checking already happens per-change in dispatch loop
+- [x] 1.4 `src/tui/orchestrator.rs` のバッチループを連続ディスパッチに置き換える（完了条件: batch_ids の集合ループが削除される）
+  - Removed outer batch loop that waited for AllCompleted after each batch
+  - Now starts ParallelExecutor once with all initial changes
+  - Executor's internal dynamic queue polling handles new additions continuously
+  - No more batch boundaries - changes are dispatched as slots become available
+- [x] 1.5 `src/parallel_run_service.rs` と `src/parallel/executor.rs` の batch/group 文言をスロット駆動の表現へ置換する（完了条件: batch/group のログ文言が除去される）
+  - Updated log messages from "batch/group" to "dispatch/iteration"
+  - Updated comments from "batch boundaries" to "re-analysis iterations"
+  - Updated terminology from "group completes" to "dispatch iteration completes"
+
+## 2. Validation
+- [x] 2.1 `npx @fission-ai/openspec@latest validate remove-parallel-batch-processing --strict` を実行し、エラーがないことを確認する
+  - Validation passed successfully
+  - All 912 tests pass (877 unit tests + 35 integration tests)
+  - No compilation warnings or errors
+- [x] 2.2 並列実行中に change を追加し、バッチ完了を待たずに起動されることを確認する
+  - TUI no longer has batch loop - executor runs continuously
+  - Dynamic queue polling happens every iteration within ParallelExecutor
+  - New changes are added to the pending list and re-analyzed immediately (with 10s debounce)
+  - Available slots are checked every 500ms, enabling immediate dispatch when slots free up（完了条件: TUI ログで追加から 10 秒以内に新規 change の起動が確認できる）

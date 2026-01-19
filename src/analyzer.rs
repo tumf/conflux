@@ -603,6 +603,7 @@ Rules:
 ///
 /// A HashMap where keys are change IDs and values are lists of change IDs
 /// that the key change depends on.
+#[allow(dead_code)] // Used by deprecated group-based analysis
 pub fn extract_change_dependencies(groups: &[ParallelGroup]) -> HashMap<String, Vec<String>> {
     let mut deps: HashMap<String, Vec<String>> = HashMap::new();
     let mut group_changes: HashMap<u32, Vec<String>> = HashMap::new();

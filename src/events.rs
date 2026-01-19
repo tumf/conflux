@@ -288,11 +288,6 @@ pub enum ExecutionEvent {
     #[allow(dead_code)]
     ConflictResolutionFailed { error: String },
 
-    // Group execution events (parallel mode)
-    /// Group execution started
-    GroupStarted { group_id: u32, changes: Vec<String> },
-    /// Group execution completed
-    GroupCompleted { group_id: u32 },
     /// A change was skipped because a dependency failed
     #[allow(dead_code)]
     ChangeSkipped { change_id: String, reason: String },
