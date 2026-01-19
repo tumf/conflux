@@ -408,22 +408,56 @@ pub async fn check_merge_conflicts<P: AsRef<Path>>(
     let stderr = String::from_utf8_lossy(&output.stderr);
     let exit_code = output.status.code().unwrap_or(-1);
 
-    // Check for conflicts:
-    // - Exit code 1 indicates conflicts
-    // - Conflict messages appear in stderr
-    // - Stdout contains the tree OID (or conflict markers in older Git versions)
-    if exit_code == 1 || stderr.contains("CONFLICT") {
-        // Extract conflict files from stderr
-        let conflict_files = parse_conflict_files(&stderr);
+    // According to git merge-tree documentation:
+    // - Exit code 1 indicates conflicts (this is the primary indicator)
+    // - Stdout format for conflicts:
+    //   Line 1: <OID of toplevel tree>
+    //   Lines 2+: <Conflicted file info> (mode, object, stage, filename)
+    //   Last section: <Informational messages> (CONFLICT notices)
+    // - Exit code 0 means clean merge (no conflicts)
+    // - Other exit codes indicate command failure
+
+    if exit_code == 1 {
+        // Conflicts detected - parse stdout for conflicted file info
+        // Stdout format: tree OID on line 1, then conflicted file info, then messages
+        let conflict_files = parse_conflict_files_from_stdout(&stdout);
+
+        // If stdout parsing didn't find files, fall back to stderr parsing
+        let conflict_files = if conflict_files.is_empty() {
+            parse_conflict_files_from_stderr(&stderr)
+        } else {
+            conflict_files
+        };
+
         debug!(
-            "Detected {} conflicts in worktree at {} (exit_code: {}, stderr: {})",
+            "Detected {} conflicts in worktree at {} (exit_code: {}, files: {:?})",
             conflict_files.len(),
             cwd.display(),
             exit_code,
-            stderr.trim()
+            conflict_files
         );
-        Ok(Some(conflict_files))
-    } else if !output.status.success() {
+
+        // Even if we can't parse specific files, exit code 1 means conflicts exist
+        // Return a generic indicator if no files were parsed
+        if conflict_files.is_empty() {
+            debug!(
+                "Exit code 1 but no conflict files parsed. stdout: {}, stderr: {}",
+                stdout.trim(),
+                stderr.trim()
+            );
+            Ok(Some(vec!["<unknown>".to_string()]))
+        } else {
+            Ok(Some(conflict_files))
+        }
+    } else if exit_code == 0 {
+        // No conflicts - merge would succeed cleanly
+        debug!(
+            "No conflicts detected for {} in {}",
+            branch_name,
+            cwd.display()
+        );
+        Ok(None)
+    } else {
         // merge-tree failed for another reason (not conflict-related)
         debug!(
             "Merge tree command failed: exit_code={}, stdout={}, stderr={}",
@@ -435,14 +469,6 @@ pub async fn check_merge_conflicts<P: AsRef<Path>>(
             "Merge tree simulation failed (exit {}): {}",
             exit_code, stderr
         )))
-    } else {
-        // No conflicts - merge would succeed cleanly
-        debug!(
-            "No conflicts detected for {} in {}",
-            branch_name,
-            cwd.display()
-        );
-        Ok(None)
     }
 }
 
@@ -472,10 +498,64 @@ pub async fn count_commits_ahead<P: AsRef<Path>>(
     Ok(count)
 }
 
-/// Parse conflict files from git merge output.
+/// Parse conflict files from git merge-tree stdout.
+///
+/// Parses the "Conflicted file info" section from stdout.
+/// Format: `<mode> <object> <stage> <filename>`
+///
+/// According to git documentation, stdout for conflicted merge contains:
+/// - Line 1: Tree OID
+/// - Lines 2+: Conflicted file info (until empty line or informational messages)
+/// - Last section: Informational messages (CONFLICT notices)
+fn parse_conflict_files_from_stdout(stdout: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut lines = stdout.lines();
+
+    // Skip first line (tree OID)
+    if lines.next().is_none() {
+        return files;
+    }
+
+    // Parse conflicted file info section
+    // Format: <mode> <object> <stage> <filename>
+    // Example: 100644 abc123... 2 src/main.rs
+    for line in lines {
+        let line = line.trim();
+
+        // Empty line or start of informational messages section
+        if line.is_empty() {
+            break;
+        }
+
+        // Check if line matches conflicted file info format
+        // Format: <mode> <object> <stage> <filename>
+        let parts: Vec<&str> = line.splitn(4, ' ').collect();
+        if parts.len() == 4 {
+            // parts[0] = mode (e.g., "100644")
+            // parts[1] = object (e.g., "abc123...")
+            // parts[2] = stage (e.g., "1", "2", "3")
+            // parts[3] = filename
+
+            // Validate stage is a number (1, 2, or 3 for conflicts)
+            if let Ok(stage) = parts[2].parse::<u8>() {
+                if (1..=3).contains(&stage) {
+                    let filename = parts[3].trim();
+                    // Avoid duplicates
+                    if !files.contains(&filename.to_string()) {
+                        files.push(filename.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    files
+}
+
+/// Parse conflict files from git merge-tree stderr (fallback).
 ///
 /// Extracts file paths from lines like "CONFLICT (content): Merge conflict in src/main.rs"
-fn parse_conflict_files(stderr: &str) -> Vec<String> {
+fn parse_conflict_files_from_stderr(stderr: &str) -> Vec<String> {
     let mut files = Vec::new();
 
     for line in stderr.lines() {
@@ -557,7 +637,7 @@ pub async fn merge_branch<P: AsRef<Path>>(cwd: P, branch_name: &str) -> VcsResul
 
             Err(VcsError::git_command(format!(
                 "Merge conflict detected. Merge aborted. Files: {}",
-                parse_conflict_files(&stderr).join(", ")
+                parse_conflict_files_from_stderr(&stderr).join(", ")
             )))
         } else {
             // Other error
