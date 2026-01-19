@@ -940,9 +940,10 @@ impl ParallelExecutor {
             handle.abort();
         }
 
-        // Commit the cleanup guard to finalize workspace cleanup
-        // Preserved workspaces (MergeWait) will not be cleaned up on drop
-        cleanup_guard.commit();
+        // Drop cleanup guard without calling commit()
+        // Workspaces are preserved by default for resume/debugging
+        // Cleanup is only performed explicitly after successful merge via cleanup_workspace()
+        drop(cleanup_guard);
 
         send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
         Ok(())
@@ -1841,9 +1842,10 @@ impl ParallelExecutor {
             .await;
         }
 
-        // Commit the cleanup guard since normal cleanup succeeded
-        // This prevents double-cleanup on drop
-        cleanup_guard.commit();
+        // Drop cleanup guard without calling commit()
+        // Workspaces are preserved by default for resume/debugging
+        // Cleanup was already performed explicitly above via cleanup_workspace()
+        drop(cleanup_guard);
 
         // Clear force_recreate_worktree flags for changes in this group
         // (they've now been recreated or failed)

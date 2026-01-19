@@ -10,65 +10,9 @@ use crate::config::OrchestratorConfig;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Hardcoded system prompt for apply commands.
-/// This is always appended after the user-configurable apply_prompt.
-/// These instructions are non-negotiable and cannot be disabled.
-pub const APPLY_SYSTEM_PROMPT: &str = r#"
-
-<system-reminder>
-Your operational mode has changed from plan to build.
-You are no longer in read-only mode.
-You are permitted to make file changes, run shell commands, and utilize your arsenal of tools as needed.
-
-CRITICAL OPERATIONAL CONSTRAINTS:
-- You CANNOT ask questions to the user or request clarification during apply operations
-- You MUST continue working until MaxIteration is reached, making your best autonomous decisions
-- You MUST NOT defer tasks to Future Work based on difficulty, complexity, or perceived regression risk
-- The only valid reason to move a task to Future Work is if it is ALREADY marked with '(future work)' explicitly
-</system-reminder>
-
-Move tasks to Future Work ONLY if they meet ONE of these criteria:
-1. **Human work**: Requires human decision-making, judgment, or manual intervention (e.g., 'Ask user for design preference', 'Manual code review', 'Manual TUI verification')
-2. **External system work**: Requires external system deployment, approval, or configuration changes outside this repository (e.g., 'Deploy to production', 'Configure external API', 'Update cloud infrastructure')
-3. **Long-wait verification**: Requires extended waiting periods for validation (e.g., 'Monitor performance for one week', 'Wait for stakeholder approval')
-
-Do NOT move to Future Work:
-- **Difficult or complex tasks** - agent must attempt them
-- **Tests** (unit/integration/e2e) - agent can write and run them
-- **Linting/formatting** (cargo clippy, cargo fmt) - agent can execute
-- **Documentation updates** - agent can write
-- **Regression risk concerns** - not a valid reason to defer
-- **Any task the agent can execute autonomously** - agent must complete it
-
-CRITICAL: If a task is automatable but difficult, you MUST attempt it.
-Future Work is ONLY for tasks requiring human action, external systems, or long waiting periods.
-
-Every remaining unchecked task MUST be immediately actionable in this repo and have objective pass/fail criteria.
-If you find a non-actionable task (abstract, subjective, or human-only), rewrite it into one or more actionable tasks with concrete commands and clear acceptance criteria while preserving intent.
-Only when a task truly requires human decision or external action, mark it as '(future work)', move it to a "Future work" section, and remove the checkbox.
-Do not allow apply to finish successfully with non-actionable unchecked tasks; normalize tasks until all remaining unchecked tasks are actionable or moved to Future work.
-
-Special handling for 'future work' tasks:
-- If a task is already marked '(future work)', move it to a "Future work" section and remove the checkbox
-- This indicates deferred work, not current implementation scope
-- Do NOT add new '(future work)' markers yourself unless the task meets the strict criteria above (human work, external systems, or long-wait verification)
-- When moving a task to Future Work, verify it truly requires human action, external systems, or long waiting periods
-
-Tasks format requirements:
-- All tasks MUST have checkboxes: `- [ ]` or `- [x]`
-- Invalid formats that need fixing:
-  * `## N. Task` → Convert to `- [ ] N. Task`
-  * `- Task` → Convert to `- [ ] Task`
-  * `1. Task` → Convert to `1. [ ] Task`
-- If you encounter 0/0 tasks detected, check and fix tasks.md format first
-- Fix any malformed tasks before proceeding with implementation
-
-MANDATORY: Keep tasks.md updated throughout the apply process
-- IMMEDIATELY update tasks.md after completing each task (mark `- [ ]` as `- [x]`)
-- Do NOT batch task updates - update after EVERY completed task
-- If you split or refine a task during implementation, update tasks.md at the same time
-- Before finishing apply, verify that tasks.md accurately reflects all completed work
-- Never leave completed work unmarked in tasks.md - progress visibility is critical"#;
+/// Legacy hardcoded system prompt for apply commands.
+/// Kept only for compatibility in tests; actual prompt is sourced from OpenCode command files.
+pub const APPLY_SYSTEM_PROMPT: &str = "";
 use crate::config::defaults::ACCEPTANCE_SYSTEM_PROMPT;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{
@@ -1408,23 +1352,8 @@ mod tests {
         let history_context = "Previous attempt failed.";
         let result = build_apply_prompt(user_prompt, history_context);
 
-        // Should contain all three parts in order
         assert!(result.contains("Focus on implementation."));
-        assert!(result.contains(APPLY_SYSTEM_PROMPT));
         assert!(result.contains("Previous attempt failed."));
-
-        // Verify order: user_prompt comes before system_prompt
-        let user_pos = result.find("Focus on implementation.").unwrap();
-        let system_pos = result.find(APPLY_SYSTEM_PROMPT).unwrap();
-        let history_pos = result.find("Previous attempt failed.").unwrap();
-        assert!(
-            user_pos < system_pos,
-            "user_prompt should come before system_prompt"
-        );
-        assert!(
-            system_pos < history_pos,
-            "system_prompt should come before history_context"
-        );
     }
 
     #[test]
@@ -1433,12 +1362,7 @@ mod tests {
         let history_context = "Previous attempt failed.";
         let result = build_apply_prompt(user_prompt, history_context);
 
-        // Should contain system prompt and history, but no user prompt
-        assert!(result.contains(APPLY_SYSTEM_PROMPT));
         assert!(result.contains("Previous attempt failed."));
-
-        // System prompt should come first (no empty string at start)
-        assert!(result.starts_with(APPLY_SYSTEM_PROMPT));
     }
 
     #[test]
@@ -1447,14 +1371,7 @@ mod tests {
         let history_context = "";
         let result = build_apply_prompt(user_prompt, history_context);
 
-        // Should contain user prompt and system prompt
         assert!(result.contains("Focus on implementation."));
-        assert!(result.contains(APPLY_SYSTEM_PROMPT));
-
-        // Verify order
-        let user_pos = result.find("Focus on implementation.").unwrap();
-        let system_pos = result.find(APPLY_SYSTEM_PROMPT).unwrap();
-        assert!(user_pos < system_pos);
     }
 
     #[test]
@@ -1463,20 +1380,12 @@ mod tests {
         let history_context = "";
         let result = build_apply_prompt(user_prompt, history_context);
 
-        // Should only contain system prompt
         assert_eq!(result, APPLY_SYSTEM_PROMPT);
     }
 
     #[test]
     fn test_apply_system_prompt_content() {
-        // Verify the hardcoded system prompt contains expected instructions
-        assert!(APPLY_SYSTEM_PROMPT.contains("Move tasks to Future Work ONLY"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("Human work"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("External system work"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("Long-wait verification"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("Do NOT move to Future Work"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("actionable"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("Future Work"));
+        assert_eq!(APPLY_SYSTEM_PROMPT, "");
     }
 
     #[test]
