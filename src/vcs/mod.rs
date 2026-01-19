@@ -125,6 +125,14 @@ pub enum WorkspaceStatus {
     Applying,
     /// Apply completed successfully with resulting revision
     Applied(String),
+    /// Running acceptance tests
+    Accepting,
+    /// Currently being archived
+    Archiving,
+    /// Currently resolving conflicts
+    Resolving,
+    /// Waiting for merge resolution
+    MergeWait,
     /// Apply failed with error message
     Failed(String),
     /// Workspace merged into main
@@ -140,13 +148,18 @@ impl WorkspaceStatus {
     /// Inactive workspaces are those that are done, merged, cleaned up, or errored.
     ///
     /// This is used for calculating available execution slots in parallel mode.
+    /// Per spec line 7: "apply / acceptance / archive / resolve が進行中の change"
     pub fn is_active(&self) -> bool {
         match self {
             // Active: workspace is being worked on
             WorkspaceStatus::Created => true,
             WorkspaceStatus::Applying => true,
             WorkspaceStatus::Applied(_) => true,
-            // Inactive: workspace is done or errored
+            WorkspaceStatus::Accepting => true,
+            WorkspaceStatus::Archiving => true,
+            WorkspaceStatus::Resolving => true,
+            // Inactive: waiting or completed states (per spec: merged / merge_wait / error / not queued)
+            WorkspaceStatus::MergeWait => false,
             WorkspaceStatus::Failed(_) => false,
             WorkspaceStatus::Merged => false,
             WorkspaceStatus::Cleaned => false,
@@ -479,12 +492,16 @@ mod tests {
 
     #[test]
     fn test_workspace_status_is_active() {
-        // Active statuses
+        // Active statuses - per spec: apply / acceptance / archive / resolve in progress
         assert!(WorkspaceStatus::Created.is_active());
         assert!(WorkspaceStatus::Applying.is_active());
         assert!(WorkspaceStatus::Applied("abc123".to_string()).is_active());
+        assert!(WorkspaceStatus::Accepting.is_active());
+        assert!(WorkspaceStatus::Archiving.is_active());
+        assert!(WorkspaceStatus::Resolving.is_active());
 
-        // Inactive statuses
+        // Inactive statuses - per spec: merged / merge_wait / error / not queued
+        assert!(!WorkspaceStatus::MergeWait.is_active());
         assert!(!WorkspaceStatus::Failed("error".to_string()).is_active());
         assert!(!WorkspaceStatus::Merged.is_active());
         assert!(!WorkspaceStatus::Cleaned.is_active());

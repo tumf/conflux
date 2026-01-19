@@ -220,6 +220,13 @@ pub enum ExecutionEvent {
         change_id: String,
         workspace: String,
     },
+    /// Workspace status updated
+    WorkspaceStatusUpdated {
+        #[allow(dead_code)]
+        workspace_name: String,
+        #[allow(dead_code)]
+        status: crate::vcs::WorkspaceStatus,
+    },
     /// An existing workspace was found and is being reused
     #[allow(dead_code)]
     WorkspaceResumed {
