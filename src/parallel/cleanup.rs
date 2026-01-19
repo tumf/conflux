@@ -52,6 +52,16 @@ impl WorkspaceCleanupGuard {
         self.preserved_workspaces.insert(workspace_name.to_string());
     }
 
+    /// Mark all tracked workspaces for preservation.
+    ///
+    /// Call this when cancellation or errors occur and all workspaces
+    /// should be preserved for debugging or resume functionality.
+    pub fn preserve_all(&mut self) {
+        for workspace_name in self.workspaces.keys() {
+            self.preserved_workspaces.insert(workspace_name.clone());
+        }
+    }
+
     /// Commit the guard, preventing cleanup on drop
     ///
     /// Call this when all workspaces have been successfully processed
