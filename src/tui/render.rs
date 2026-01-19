@@ -465,7 +465,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 QueueStatus::Processing => {
                     format!("{} [{:>3.0}%]", spinner_char, change.progress_percent())
                 }
-                QueueStatus::Archiving | QueueStatus::Resolving => {
+                QueueStatus::Archiving | QueueStatus::Resolving | QueueStatus::Accepting => {
                     format!("{} [{}]", spinner_char, change.queue_status.display())
                 }
                 QueueStatus::Completed

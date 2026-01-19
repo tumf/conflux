@@ -299,8 +299,8 @@ impl AgentRunner {
         let user_prompt = self.config.get_acceptance_prompt();
         let history_context = self.acceptance_history.format_context(change_id);
 
-        // Build full prompt: system_prompt + user_prompt + history_context
-        let full_prompt = build_acceptance_prompt(user_prompt, &history_context);
+        // Build full prompt: system_prompt (with change_id) + user_prompt + history_context
+        let full_prompt = build_acceptance_prompt(change_id, user_prompt, &history_context);
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);

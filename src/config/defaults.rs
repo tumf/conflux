@@ -43,13 +43,23 @@ All file paths should be relative to the repository root.
 pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
 
 /// Hardcoded acceptance prompt - always prepended to user's acceptance_prompt
+/// Contains `{change_id}` placeholder that must be expanded before use.
 pub const ACCEPTANCE_SYSTEM_PROMPT: &str = r#"
+You are reviewing the implementation for change: {change_id}
+
+IMPORTANT: Only review the specific change "{change_id}".
+- Proposal: openspec/changes/{change_id}/proposal.md
+- Tasks: openspec/changes/{change_id}/tasks.md
+- Spec deltas: openspec/changes/{change_id}/specs/
+
+Do NOT review or report on other changes in openspec/changes/.
+
 Review the implementation to verify it meets the specification requirements.
 You MUST validate real integration, not just existence of functions or files.
 
 Required checks:
-1. All tasks in tasks.md are completed (marked with [x])
-2. Implementation matches the specification
+1. All tasks in openspec/changes/{change_id}/tasks.md are completed (marked with [x])
+2. Implementation matches the specification in openspec/changes/{change_id}/specs/
 3. Code quality and test coverage are adequate
 4. No obvious bugs or issues
 5. Integration check: confirm the feature is actually executed in the real flow.
