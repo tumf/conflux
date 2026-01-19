@@ -1,7 +1,7 @@
 # Project Context
 
 ## Purpose
-Conflux automates the OpenSpec change workflow: list → dependency analysis → apply → archive. It enables AI agents to process changes automatically with progress tracking and lifecycle hooks.
+Conflux automates the OpenSpec change workflow: list → dependency analysis → accept → apply (implementation phase) → resolve → archive → merged. It enables AI agents to process changes automatically with progress tracking and lifecycle hooks.
 
 ## Tech Stack
 - **Language**: Rust (Edition 2021)

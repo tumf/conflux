@@ -10,58 +10,15 @@ use crate::config::OrchestratorConfig;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Hardcoded system prompt for apply commands.
-/// This is always appended after the user-configurable apply_prompt.
-/// These instructions are non-negotiable and cannot be disabled.
-pub const APPLY_SYSTEM_PROMPT: &str = r#"
-
-<system-reminder>
-Your operational mode has changed from plan to build.
-You are no longer in read-only mode.
-You are permitted to make file changes, run shell commands, and utilize your arsenal of tools as needed.
-
-CRITICAL OPERATIONAL CONSTRAINTS:
-- You CANNOT ask questions to the user or request clarification during apply operations
-- You MUST continue working until MaxIteration is reached, making your best autonomous decisions
-- You MUST NOT defer tasks to Future Work based on difficulty, complexity, or perceived regression risk
-- The only valid reason to move a task to Future Work is if it is ALREADY marked with '(future work)' explicitly
-</system-reminder>
-
-Remove tasks only if they meet one of these criteria:
-- Out-of-scope: belongs to a different change/proposal
-- Requires human decision or external action (e.g., 'Ask user...', 'Deploy to production', 'Get API key')
-- Requires long waiting periods (e.g., 'Check after one week', 'Wait for approval')
-- Explicitly marked as 'future work' (deferred for later implementation)
-
-Do NOT remove:
-- Tests (unit/integration) - agent can write and run them
-- Linting/formatting (cargo clippy, cargo fmt) - agent can execute
-- Documentation updates - agent can write
-- Any task the agent can execute autonomously
-
-IMPORTANT: Do NOT move tasks to Future Work simply because they are difficult, require testing, or have regression risk.
-If you can execute the task autonomously (write code, run tests, execute commands), you MUST complete it.
-
-Every remaining unchecked task MUST be immediately actionable in this repo and have objective pass/fail criteria.
-If you find a non-actionable task (abstract, subjective, or human-only), rewrite it into one or more actionable tasks with concrete commands and clear acceptance criteria while preserving intent.
-Only when a task truly requires human decision or external action, mark it as '(future work)', move it to a "Future work" section, and remove the checkbox.
-Do not allow apply to finish successfully with non-actionable unchecked tasks; normalize tasks until all remaining unchecked tasks are actionable or moved to Future work.
-
-Special handling for 'future work' tasks:
-- If a task is already marked '(future work)', move it to a "Future work" section and remove the checkbox
-- This indicates deferred work, not current implementation scope
-- Do NOT add new '(future work)' markers yourself - only move tasks that already have this marker
-
-Tasks format requirements:
-- All tasks MUST have checkboxes: `- [ ]` or `- [x]`
-- Invalid formats that need fixing:
-  * `## N. Task` → Convert to `- [ ] N. Task`
-  * `- Task` → Convert to `- [ ] Task`
-  * `1. Task` → Convert to `1. [ ] Task`
-- If you encounter 0/0 tasks detected, check and fix tasks.md format first
-- Fix any malformed tasks before proceeding with implementation"#;
+/// Legacy hardcoded system prompt for apply commands.
+/// Kept only for compatibility in tests; actual prompt is sourced from OpenCode command files.
+pub const APPLY_SYSTEM_PROMPT: &str = "";
+use crate::config::defaults::ACCEPTANCE_SYSTEM_PROMPT;
 use crate::error::{OrchestratorError, Result};
-use crate::history::{ApplyAttempt, ApplyHistory, ArchiveAttempt, ArchiveHistory};
+use crate::history::{
+    AcceptanceAttempt, AcceptanceHistory, ApplyAttempt, ApplyHistory, ArchiveAttempt,
+    ArchiveHistory,
+};
 use crate::process_manager::ManagedChild;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -86,6 +43,8 @@ pub struct AgentRunner {
     apply_history: ApplyHistory,
     /// History of archive attempts per change for context injection
     archive_history: ArchiveHistory,
+    /// History of acceptance attempts per change for context injection
+    acceptance_history: AcceptanceHistory,
 }
 
 impl AgentRunner {
@@ -116,6 +75,7 @@ impl AgentRunner {
             command_queue: CommandQueue::new(queue_config),
             apply_history: ApplyHistory::new(),
             archive_history: ArchiveHistory::new(),
+            acceptance_history: AcceptanceHistory::new(),
         }
     }
 
@@ -160,6 +120,7 @@ impl AgentRunner {
             command_queue: CommandQueue::new_with_shared_state(queue_config, shared_state),
             apply_history: ApplyHistory::new(),
             archive_history: ArchiveHistory::new(),
+            acceptance_history: AcceptanceHistory::new(),
         }
     }
 
@@ -175,6 +136,7 @@ impl AgentRunner {
     pub async fn run_apply_streaming(
         &self,
         change_id: &str,
+        cwd: Option<&Path>,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
         let start = Instant::now();
         let template = self.config.get_apply_command();
@@ -190,13 +152,26 @@ impl AgentRunner {
             module = module_path!(),
             "Running apply command: {}", command
         );
-        let (child, rx) = self.execute_shell_command_streaming(&command).await?;
+        let (child, rx) = match cwd {
+            Some(dir) => {
+                self.execute_shell_command_streaming_in_dir(&command, dir)
+                    .await?
+            }
+            None => self.execute_shell_command_streaming(&command).await?,
+        };
         Ok((child, rx, start))
     }
 
     /// Record an apply attempt after streaming execution completes.
     /// Call this after `run_apply_streaming()` child process finishes.
-    pub fn record_apply_attempt(&mut self, change_id: &str, status: &ExitStatus, start: Instant) {
+    pub fn record_apply_attempt(
+        &mut self,
+        change_id: &str,
+        status: &ExitStatus,
+        start: Instant,
+        stdout_tail: Option<String>,
+        stderr_tail: Option<String>,
+    ) {
         let duration = start.elapsed();
         let attempt = ApplyAttempt {
             attempt: self.apply_history.count(change_id) + 1,
@@ -208,6 +183,8 @@ impl AgentRunner {
                 Some(format!("Exit code: {:?}", status.code()))
             },
             exit_code: status.code(),
+            stdout_tail,
+            stderr_tail,
         };
         self.apply_history.record(change_id, attempt);
     }
@@ -223,6 +200,7 @@ impl AgentRunner {
     pub async fn run_archive_streaming(
         &self,
         change_id: &str,
+        cwd: Option<&Path>,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
         let start = Instant::now();
         let template = self.config.get_archive_command();
@@ -238,7 +216,13 @@ impl AgentRunner {
             module = module_path!(),
             "Running archive command: {}", command
         );
-        let (child, rx) = self.execute_shell_command_streaming(&command).await?;
+        let (child, rx) = match cwd {
+            Some(dir) => {
+                self.execute_shell_command_streaming_in_dir(&command, dir)
+                    .await?
+            }
+            None => self.execute_shell_command_streaming(&command).await?,
+        };
         Ok((child, rx, start))
     }
 
@@ -269,7 +253,7 @@ impl AgentRunner {
         let status = self.execute_shell_command(&command).await?;
         let duration = start.elapsed();
 
-        // Record the attempt
+        // Record the attempt (no output captured in non-streaming mode)
         let attempt = ApplyAttempt {
             attempt: self.apply_history.count(change_id) + 1,
             success: status.success(),
@@ -280,6 +264,8 @@ impl AgentRunner {
                 Some(format!("Exit code: {:?}", status.code()))
             },
             exit_code: status.code(),
+            stdout_tail: None,
+            stderr_tail: None,
         };
         self.apply_history.record(change_id, attempt);
 
@@ -294,6 +280,8 @@ impl AgentRunner {
         status: &ExitStatus,
         start: Instant,
         verification_result: Option<String>,
+        stdout_tail: Option<String>,
+        stderr_tail: Option<String>,
     ) {
         let duration = start.elapsed();
         let attempt = ArchiveAttempt {
@@ -312,6 +300,8 @@ impl AgentRunner {
             },
             verification_result,
             exit_code: status.code(),
+            stdout_tail,
+            stderr_tail,
         };
         self.archive_history.record(change_id, attempt);
     }
@@ -324,6 +314,67 @@ impl AgentRunner {
     /// Clear archive history for a change (call after successful archiving)
     pub fn clear_archive_history(&mut self, change_id: &str) {
         self.archive_history.clear(change_id);
+    }
+
+    /// Clear acceptance history for a change (call after successful archiving)
+    #[allow(dead_code)]
+    pub fn clear_acceptance_history(&mut self, change_id: &str) {
+        self.acceptance_history.clear(change_id);
+    }
+
+    /// Run acceptance command for the given change ID with output streaming.
+    /// Returns a child process handle, a receiver for output lines, and a start time.
+    /// The caller is responsible for recording the attempt after the child completes
+    /// by calling `record_acceptance_attempt()`.
+    ///
+    /// The prompt is constructed as: system_prompt + user_prompt + history_context
+    /// - system_prompt: ACCEPTANCE_SYSTEM_PROMPT constant (always included)
+    /// - user_prompt: from config.acceptance_prompt (user-customizable)
+    /// - history_context: previous acceptance attempts (if any)
+    pub async fn run_acceptance_streaming(
+        &self,
+        change_id: &str,
+        cwd: Option<&Path>,
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
+        let start = Instant::now();
+        let template = self.config.get_acceptance_command();
+        let user_prompt = self.config.get_acceptance_prompt();
+        let history_context = self.acceptance_history.format_context(change_id);
+
+        // Build full prompt: system_prompt + user_prompt + history_context
+        let full_prompt = build_acceptance_prompt(user_prompt, &history_context);
+
+        let command = OrchestratorConfig::expand_change_id(template, change_id);
+        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        info!(
+            module = module_path!(),
+            "Running acceptance command: {}", command
+        );
+        let (child, rx) = match cwd {
+            Some(dir) => {
+                self.execute_shell_command_streaming_in_dir(&command, dir)
+                    .await?
+            }
+            None => self.execute_shell_command_streaming(&command).await?,
+        };
+        Ok((child, rx, start))
+    }
+
+    /// Record an acceptance attempt after streaming execution completes.
+    /// Call this after `run_acceptance_streaming()` child process finishes.
+    pub fn record_acceptance_attempt(&mut self, change_id: &str, attempt: AcceptanceAttempt) {
+        self.acceptance_history.record(change_id, attempt);
+    }
+
+    /// Get the next acceptance attempt number for a change.
+    pub fn next_acceptance_attempt_number(&self, change_id: &str) -> u32 {
+        self.acceptance_history.count(change_id) + 1
+    }
+
+    /// Get the count of consecutive CONTINUE attempts for a change.
+    pub fn count_consecutive_acceptance_continues(&self, change_id: &str) -> u32 {
+        self.acceptance_history
+            .count_consecutive_continues(change_id)
     }
 
     /// Run archive command for the given change ID (blocking, no streaming)
@@ -1094,6 +1145,31 @@ pub fn build_archive_prompt(user_prompt: &str, history_context: &str) -> String 
     parts.join("\n\n")
 }
 
+/// Build acceptance prompt from user prompt and history context
+///
+/// The prompt is constructed as:
+/// 1. ACCEPTANCE_SYSTEM_PROMPT (always included)
+/// 2. user_prompt (if not empty)
+/// 3. history_context (if not empty)
+///
+/// Parts are joined with double newlines.
+pub fn build_acceptance_prompt(user_prompt: &str, history_context: &str) -> String {
+    let mut parts = Vec::new();
+
+    // System prompt is always included first
+    parts.push(ACCEPTANCE_SYSTEM_PROMPT.to_string());
+
+    if !user_prompt.is_empty() {
+        parts.push(user_prompt.to_string());
+    }
+
+    if !history_context.is_empty() {
+        parts.push(history_context.to_string());
+    }
+
+    parts.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1172,7 +1248,10 @@ mod tests {
             ..Default::default()
         };
         let runner = AgentRunner::new(config);
-        let (mut child, mut rx, _start) = runner.run_apply_streaming("test-change").await.unwrap();
+        let (mut child, mut rx, _start) = runner
+            .run_apply_streaming("test-change", None)
+            .await
+            .unwrap();
 
         let mut lines = Vec::new();
         while let Some(line) = rx.recv().await {
@@ -1217,22 +1296,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_archive_with_empty_default_prompt() {
-        // Test that archive uses default prompt (with path context)
+        // Test that archive uses default prompt (which is empty)
         let config = OrchestratorConfig {
             archive_command: Some("echo 'Archive {change_id}:{prompt}:end'".to_string()),
             ..Default::default()
         };
         let runner = AgentRunner::new(config);
-        // Default archive_prompt should include path context
+        // Default archive_prompt should be empty
         assert_eq!(
             runner.config().get_archive_prompt(),
             crate::config::DEFAULT_ARCHIVE_PROMPT
         );
-        // Verify default includes path context
-        assert!(runner
-            .config()
-            .get_archive_prompt()
-            .contains("repository root"));
+        // Verify default is empty
+        assert_eq!(runner.config().get_archive_prompt(), "");
         let status = runner.run_archive("test-change").await.unwrap();
         assert!(status.success());
     }
@@ -1246,7 +1322,8 @@ mod tests {
             ..Default::default()
         };
         let runner = AgentRunner::new(config);
-        let (mut child, mut rx, _start) = runner.run_apply_streaming("my-change").await.unwrap();
+        let (mut child, mut rx, _start) =
+            runner.run_apply_streaming("my-change", None).await.unwrap();
 
         let mut lines = Vec::new();
         while let Some(line) = rx.recv().await {
@@ -1275,23 +1352,8 @@ mod tests {
         let history_context = "Previous attempt failed.";
         let result = build_apply_prompt(user_prompt, history_context);
 
-        // Should contain all three parts in order
         assert!(result.contains("Focus on implementation."));
-        assert!(result.contains(APPLY_SYSTEM_PROMPT));
         assert!(result.contains("Previous attempt failed."));
-
-        // Verify order: user_prompt comes before system_prompt
-        let user_pos = result.find("Focus on implementation.").unwrap();
-        let system_pos = result.find(APPLY_SYSTEM_PROMPT).unwrap();
-        let history_pos = result.find("Previous attempt failed.").unwrap();
-        assert!(
-            user_pos < system_pos,
-            "user_prompt should come before system_prompt"
-        );
-        assert!(
-            system_pos < history_pos,
-            "system_prompt should come before history_context"
-        );
     }
 
     #[test]
@@ -1300,12 +1362,7 @@ mod tests {
         let history_context = "Previous attempt failed.";
         let result = build_apply_prompt(user_prompt, history_context);
 
-        // Should contain system prompt and history, but no user prompt
-        assert!(result.contains(APPLY_SYSTEM_PROMPT));
         assert!(result.contains("Previous attempt failed."));
-
-        // System prompt should come first (no empty string at start)
-        assert!(result.starts_with(APPLY_SYSTEM_PROMPT));
     }
 
     #[test]
@@ -1314,14 +1371,7 @@ mod tests {
         let history_context = "";
         let result = build_apply_prompt(user_prompt, history_context);
 
-        // Should contain user prompt and system prompt
         assert!(result.contains("Focus on implementation."));
-        assert!(result.contains(APPLY_SYSTEM_PROMPT));
-
-        // Verify order
-        let user_pos = result.find("Focus on implementation.").unwrap();
-        let system_pos = result.find(APPLY_SYSTEM_PROMPT).unwrap();
-        assert!(user_pos < system_pos);
     }
 
     #[test]
@@ -1330,19 +1380,12 @@ mod tests {
         let history_context = "";
         let result = build_apply_prompt(user_prompt, history_context);
 
-        // Should only contain system prompt
         assert_eq!(result, APPLY_SYSTEM_PROMPT);
     }
 
     #[test]
     fn test_apply_system_prompt_content() {
-        // Verify the hardcoded system prompt contains expected instructions
-        assert!(APPLY_SYSTEM_PROMPT.contains("Out-of-scope"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("human decision"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("Do NOT remove"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("actionable"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("concrete commands"));
-        assert!(APPLY_SYSTEM_PROMPT.contains("Future work"));
+        assert_eq!(APPLY_SYSTEM_PROMPT, "");
     }
 
     #[test]
