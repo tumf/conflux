@@ -1,0 +1,11 @@
+## 1. Implementation
+- [x] 1.1 Create CLI spec diff (formalize queue policy and resume conditions for Stopped mode)
+  - Verification: Check `openspec/changes/update-tui-stopped-resume/specs/cli/spec.md` and confirm `npx @fission-ai/openspec@latest validate update-tui-stopped-resume --strict` passes
+- [x] 1.2 Unify queue_status update to NotQueued on Stopped transition, preserve execution marks
+  - Verification: Check stop handling in `src/tui/state/events.rs` and `src/tui/runner.rs`
+- [x] 1.3 Restore execution-marked changes to queued and start execution on F5 resume
+  - Verification: Check resume handling in `src/tui/state/modes.rs` and F5 handling in `src/tui/runner.rs`
+- [x] 1.4 Update Stopped display and help text to match execution-mark/NotQueued policy
+  - Verification: Check display logic and footer text in `src/tui/render.rs`
+- [x] 1.5 Update stop/resume unit tests
+  - Verification: Run `cargo test` and confirm relevant tests pass

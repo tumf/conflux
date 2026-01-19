@@ -2302,7 +2302,11 @@ impl ParallelExecutor {
         let (status_tx, mut status_rx) =
             tokio::sync::mpsc::unbounded_channel::<(String, WorkspaceStatus)>();
 
+        // Track changes we've already spawned tasks for (to avoid duplicates from dynamic queue)
+        let mut spawned_changes: HashSet<String> = HashSet::new();
+
         for (change_id, existing_workspace) in change_workspace_pairs {
+            spawned_changes.insert(change_id.clone());
             // Acquire semaphore BEFORE creating workspace to enforce concurrency limit
             let permit = semaphore.clone().acquire_owned().await.unwrap();
 
@@ -2780,8 +2784,8 @@ impl ParallelExecutor {
             });
         }
 
-        // Drop the sender so the channel closes when all tasks complete
-        drop(status_tx);
+        // Note: We keep status_tx alive for dynamic queue task spawning
+        // It will be dropped at the end of the function automatically
 
         // Collect results and process status updates
         let mut results = Vec::new();
@@ -2904,6 +2908,477 @@ impl ParallelExecutor {
                         }
                     }
                             results.push(workspace_result);
+
+                            // Check dynamic queue for new changes when a task completes (slot available)
+                            // Per spec: システムはキュー変更を実行中でも監視し、実行スロットが空いたタイミングで次の変更を選定
+                            if let Some(queue) = &self.dynamic_queue {
+                                // Try to acquire a semaphore permit to check if a slot is available
+                                // Use try_acquire to avoid blocking
+                                if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+                                    // Pop from queue (non-blocking)
+                                    if let Some(dynamic_id) = queue.pop().await {
+                                        // Check if we've already spawned this change
+                                        if !spawned_changes.contains(&dynamic_id) {
+                                            // Load change details from openspec
+                                            match crate::openspec::list_changes_native() {
+                                                Ok(all_changes) => {
+                                                    if let Some(new_change) = all_changes.into_iter().find(|c| c.id == dynamic_id) {
+                                                        info!("Dynamically spawning task for change '{}' in active batch (slot became available)", dynamic_id);
+                                                        send_event(
+                                                            &self.event_tx,
+                                                            ParallelEvent::Log(LogEntry::info(format!(
+                                                                "Slot available: dynamically starting '{}' during batch execution",
+                                                                dynamic_id
+                                                            ))),
+                                                        )
+                                                        .await;
+
+                                                        // Update queue change timestamp for debounce tracking
+                                                        {
+                                                            let mut last_change = self.last_queue_change_at.lock().await;
+                                                            *last_change = Some(std::time::Instant::now());
+                                                        }
+
+                                                        // Mark as spawned
+                                                        spawned_changes.insert(new_change.id.clone());
+
+                                                        // Create workspace for the new change
+                                                        // Note: This follows the same pattern as the initial spawn loop above
+                                                        let change_id = &new_change.id;
+
+                                                        // Check for existing workspace (resume scenario)
+                                                        let workspace_opt = if self.no_resume || self.force_recreate_worktree.contains(change_id) {
+                                                            None
+                                                        } else {
+                                                            match self.workspace_manager.find_existing_workspace(change_id).await {
+                                                                Ok(Some(workspace_info)) => {
+                                                                    info!("Resuming existing workspace for '{}' (dynamically added)", change_id);
+                                                                    match self.workspace_manager.reuse_workspace(&workspace_info).await {
+                                                                        Ok(ws) => {
+                                                                            send_event(
+                                                                                &self.event_tx,
+                                                                                ParallelEvent::WorkspaceResumed {
+                                                                                    change_id: change_id.clone(),
+                                                                                    workspace: ws.name.clone(),
+                                                                                },
+                                                                            ).await;
+                                                                            Some(ws)
+                                                                        }
+                                                                        Err(e) => {
+                                                                            warn!("Failed to reuse workspace for '{}': {}, creating new", change_id, e);
+                                                                            None
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Ok(None) => None,
+                                                                Err(e) => {
+                                                                    warn!("Failed to find existing workspace for '{}': {}, creating new", change_id, e);
+                                                                    None
+                                                                }
+                                                            }
+                                                        };
+
+                                                        let workspace = match workspace_opt {
+                                                            Some(ws) => ws,
+                                                            None => {
+                                                                match self.workspace_manager.create_workspace(change_id, Some(base_revision)).await {
+                                                                    Ok(ws) => {
+                                                                        send_event(
+                                                                            &self.event_tx,
+                                                                            ParallelEvent::WorkspaceCreated {
+                                                                                change_id: change_id.clone(),
+                                                                                workspace: ws.name.clone(),
+                                                                            },
+                                                                        ).await;
+                                                                        ws
+                                                                    }
+                                                                    Err(e) => {
+                                                                        let error_msg = format!("Failed to create workspace for dynamically added change: {}", e);
+                                                                        error!("{} for {}", error_msg, change_id);
+                                                                        send_event(
+                                                                            &self.event_tx,
+                                                                            ParallelEvent::Error {
+                                                                                message: format!("[{}] {}", change_id, error_msg),
+                                                                            },
+                                                                        ).await;
+                                                                        // Drop permit and continue (don't fail entire batch)
+                                                                        drop(permit);
+                                                                        continue;
+                                                                    }
+                                                                }
+                                                            }
+                                                        };
+
+                                                        // Track workspace in cleanup guard
+                                                        cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
+
+                                                        // Send ProcessingStarted event
+                                                        send_event(
+                                                            &self.event_tx,
+                                                            ParallelEvent::ProcessingStarted(change_id.clone()),
+                                                        ).await;
+
+                                                        // Clone all necessary data for the spawned task
+                                                        let change_id = workspace.change_id.clone();
+                                                        let workspace_path = workspace.path.clone();
+                                                        let workspace_name = workspace.name.clone();
+                                                        let apply_cmd = self.apply_command.clone();
+                                                        let archive_cmd = self.archive_command.clone();
+                                                        let config = self.config.clone();
+                                                        let event_tx = self.event_tx.clone();
+                                                        let vcs_backend = self.workspace_manager.backend_type();
+                                                        let hooks = self.hooks.clone();
+                                                        let cancel_token = self.cancel_token.clone();
+                                                        let ai_runner = self.ai_runner.clone();
+                                                        let repo_root = self.repo_root.clone();
+                                                        let apply_history = self.apply_history.clone();
+                                                        let archive_history = self.archive_history.clone();
+                                                        let status_tx_clone = status_tx.clone();
+
+                                                        // Build parallel hook context
+                                                        let parallel_ctx = ParallelHookContext {
+                                                            workspace_path: workspace_path.to_string_lossy().to_string(),
+                                                            group_index,
+                                                            total_changes_in_group: total_changes_in_group + spawned_changes.len() - total_changes_in_group,
+                                                            total_changes,
+                                                            changes_processed,
+                                                        };
+
+                                                        // Update status
+                                                        self.workspace_manager.update_workspace_status(&workspace_name, WorkspaceStatus::Applying);
+
+                                                        // Spawn task (same logic as initial spawn loop)
+                                                        join_set.spawn(async move {
+                                                            let _permit = permit;
+
+                                                            let mut agent = AgentRunner::new(config.clone());
+
+                                                            const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
+                                                            let mut cycle_count = 0u32;
+                                                            let mut cumulative_iteration = 0u32;
+
+                                                            let _apply_revision = loop {
+                                                                cycle_count += 1;
+                                                                if cycle_count > MAX_APPLY_ACCEPTANCE_CYCLES {
+                                                                    error!(
+                                                                        "Max apply+acceptance cycles ({}) reached for {}",
+                                                                        MAX_APPLY_ACCEPTANCE_CYCLES, change_id
+                                                                    );
+                                                                    return WorkspaceResult {
+                                                                        change_id,
+                                                                        workspace_name,
+                                                                        final_revision: None,
+                                                                        error: Some(format!(
+                                                                            "Max apply+acceptance cycles ({}) reached",
+                                                                            MAX_APPLY_ACCEPTANCE_CYCLES
+                                                                        )),
+                                                                    };
+                                                                }
+
+                                                                let apply_result = execute_apply_in_workspace(
+                                                                    &change_id,
+                                                                    &workspace_path,
+                                                                    &apply_cmd,
+                                                                    &config,
+                                                                    event_tx.clone(),
+                                                                    vcs_backend,
+                                                                    hooks.as_ref().map(|h| h.as_ref()),
+                                                                    Some(&parallel_ctx),
+                                                                    cancel_token.as_ref(),
+                                                                    &ai_runner,
+                                                                    &repo_root,
+                                                                    &apply_history,
+                                                                    cumulative_iteration,
+                                                                )
+                                                                .await;
+
+                                                                let (revision, final_iteration) = match apply_result {
+                                                                    Ok((rev, iter)) => (rev, iter),
+                                                                    Err(e) => {
+                                                                        return WorkspaceResult {
+                                                                            change_id,
+                                                                            workspace_name,
+                                                                            final_revision: None,
+                                                                            error: Some(format!("Apply failed: {}", e)),
+                                                                        };
+                                                                    }
+                                                                };
+
+                                                                cumulative_iteration = final_iteration;
+
+                                                                if let Some(ref tx) = event_tx {
+                                                                    let _ = tx
+                                                                        .send(ParallelEvent::ApplyCompleted {
+                                                                            change_id: change_id.clone(),
+                                                                            revision: revision.clone(),
+                                                                        })
+                                                                        .await;
+                                                                }
+
+                                                                let _ = status_tx_clone.send((workspace_name.clone(), WorkspaceStatus::Accepting));
+                                                                if let Some(ref tx) = event_tx {
+                                                                    let _ = tx
+                                                                        .send(ParallelEvent::WorkspaceStatusUpdated {
+                                                                            workspace_name: workspace_name.clone(),
+                                                                            status: WorkspaceStatus::Accepting,
+                                                                        })
+                                                                        .await;
+                                                                }
+
+                                                                info!(
+                                                                    "Running acceptance test for {} after apply completion (cycle {})",
+                                                                    change_id, cycle_count
+                                                                );
+                                                                let acceptance_result = execute_acceptance_in_workspace(
+                                                                    &change_id,
+                                                                    &workspace_path,
+                                                                    &mut agent,
+                                                                    event_tx.clone(),
+                                                                    cancel_token.as_ref(),
+                                                                )
+                                                                .await;
+
+                                                                let acceptance_iteration = agent.next_acceptance_attempt_number(&change_id);
+
+                                                                match acceptance_result {
+                                                                    Ok(crate::orchestration::AcceptanceResult::Pass) => {
+                                                                        info!("Acceptance passed for {}, proceeding to archive", change_id);
+                                                                        break revision;
+                                                                    }
+                                                                    Ok(crate::orchestration::AcceptanceResult::Continue) => {
+                                                                        let continue_count = agent.count_consecutive_acceptance_continues(&change_id);
+                                                                        let max_continues = config.get_acceptance_max_continues();
+
+                                                                        if continue_count >= max_continues {
+                                                                            warn!(
+                                                                                "Acceptance CONTINUE limit ({}) exceeded for {} (cycle {}), treating as FAIL",
+                                                                                max_continues, change_id, cycle_count
+                                                                            );
+                                                                            if let Some(ref tx) = event_tx {
+                                                                                let _ = tx
+                                                                                    .send(ParallelEvent::Log(
+                                                                                        LogEntry::warn(format!(
+                                                                                            "Acceptance CONTINUE limit exceeded (cycle {}), change will not be archived",
+                                                                                            cycle_count
+                                                                                        ))
+                                                                                        .with_change_id(&change_id)
+                                                                                        .with_operation("acceptance")
+                                                                                        .with_iteration(acceptance_iteration),
+                                                                                    ))
+                                                                                    .await;
+                                                                            }
+                                                                            return WorkspaceResult {
+                                                                                change_id,
+                                                                                workspace_name,
+                                                                                final_revision: None,
+                                                                                error: Some(format!(
+                                                                                    "Acceptance CONTINUE limit ({}) exceeded",
+                                                                                    max_continues
+                                                                                )),
+                                                                            };
+                                                                        } else {
+                                                                            info!(
+                                                                                "Acceptance requires continuation for {} (attempt {}/{}, cycle {}), retrying acceptance",
+                                                                                change_id,
+                                                                                continue_count,
+                                                                                max_continues,
+                                                                                cycle_count
+                                                                            );
+                                                                            if let Some(ref tx) = event_tx {
+                                                                                let _ = tx
+                                                                                    .send(ParallelEvent::Log(
+                                                                                        LogEntry::info(format!(
+                                                                                            "Acceptance requires continuation (attempt {}/{}, cycle {}), retrying",
+                                                                                            continue_count,
+                                                                                            max_continues,
+                                                                                            cycle_count
+                                                                                        ))
+                                                                                        .with_change_id(&change_id)
+                                                                                        .with_operation("acceptance")
+                                                                                        .with_iteration(acceptance_iteration),
+                                                                                    ))
+                                                                                    .await;
+                                                                            }
+                                                                            continue;
+                                                                        }
+                                                                    }
+                                                                    Ok(crate::orchestration::AcceptanceResult::Fail { findings }) => {
+                                                                        warn!(
+                                                                            "Acceptance failed for {} with {} findings (cycle {}), returning to apply loop",
+                                                                            change_id,
+                                                                            findings.len(),
+                                                                            cycle_count
+                                                                        );
+                                                                        if let Err(e) =
+                                                                            crate::orchestration::update_tasks_on_acceptance_failure(
+                                                                                &change_id,
+                                                                                &findings,
+                                                                                Some(&workspace_path),
+                                                                            )
+                                                                            .await
+                                                                        {
+                                                                            warn!(
+                                                                                "Failed to update tasks.md for {}: {}",
+                                                                                change_id, e
+                                                                            );
+                                                                        }
+                                                                        if let Some(ref tx) = event_tx {
+                                                                            let _ = tx
+                                                                                .send(ParallelEvent::Log(
+                                                                                    LogEntry::warn(format!(
+                                                                                        "Acceptance failed with {} findings, returning to apply loop (cycle {})",
+                                                                                        findings.len(),
+                                                                                        cycle_count
+                                                                                    ))
+                                                                                    .with_change_id(&change_id)
+                                                                                    .with_operation("acceptance")
+                                                                                    .with_iteration(acceptance_iteration),
+                                                                                ))
+                                                                                .await;
+                                                                        }
+                                                                        continue;
+                                                                    }
+                                                                    Ok(crate::orchestration::AcceptanceResult::CommandFailed { error }) => {
+                                                                        error!(
+                                                                            "Acceptance command failed for {} (cycle {}): {}",
+                                                                            change_id, cycle_count, error
+                                                                        );
+                                                                        if let Err(e) =
+                                                                            crate::orchestration::update_tasks_on_acceptance_failure(
+                                                                                &change_id,
+                                                                                std::slice::from_ref(&error),
+                                                                                Some(&workspace_path),
+                                                                            )
+                                                                            .await
+                                                                        {
+                                                                            warn!(
+                                                                                "Failed to update tasks.md for {}: {}",
+                                                                                change_id, e
+                                                                            );
+                                                                        }
+                                                                        if let Some(ref tx) = event_tx {
+                                                                            let _ = tx
+                                                                                .send(ParallelEvent::Log(
+                                                                                    LogEntry::error(format!(
+                                                                                        "Acceptance command failed (cycle {}): {}",
+                                                                                        cycle_count, error
+                                                                                    ))
+                                                                                    .with_change_id(&change_id)
+                                                                                    .with_operation("acceptance")
+                                                                                    .with_iteration(acceptance_iteration),
+                                                                                ))
+                                                                                .await;
+                                                                        }
+                                                                        return WorkspaceResult {
+                                                                            change_id,
+                                                                            workspace_name,
+                                                                            final_revision: None,
+                                                                            error: Some(format!("Acceptance command failed: {}", error)),
+                                                                        };
+                                                                    }
+                                                                    Ok(crate::orchestration::AcceptanceResult::Cancelled) => {
+                                                                        info!("Acceptance cancelled for {}", change_id);
+                                                                        return WorkspaceResult {
+                                                                            change_id,
+                                                                            workspace_name,
+                                                                            final_revision: None,
+                                                                            error: Some("Acceptance cancelled".to_string()),
+                                                                        };
+                                                                    }
+                                                                    Err(e) => {
+                                                                        error!("Acceptance error for {}: {}", change_id, e);
+                                                                        return WorkspaceResult {
+                                                                            change_id,
+                                                                            workspace_name,
+                                                                            final_revision: None,
+                                                                            error: Some(format!("Acceptance error: {}", e)),
+                                                                        };
+                                                                    }
+                                                                }
+                                                            };
+
+                                                            let _ = status_tx_clone.send((workspace_name.clone(), WorkspaceStatus::Archiving));
+                                                            if let Some(ref tx) = event_tx {
+                                                                let _ = tx
+                                                                    .send(ParallelEvent::WorkspaceStatusUpdated {
+                                                                        workspace_name: workspace_name.clone(),
+                                                                        status: WorkspaceStatus::Archiving,
+                                                                    })
+                                                                    .await;
+                                                                let _ = tx
+                                                                    .send(ParallelEvent::ArchiveStarted(change_id.clone()))
+                                                                    .await;
+                                                            }
+
+                                                            let archive_result = execute_archive_in_workspace(
+                                                                &change_id,
+                                                                &workspace_path,
+                                                                &archive_cmd,
+                                                                &config,
+                                                                event_tx.clone(),
+                                                                vcs_backend,
+                                                                hooks.as_ref().map(|h| h.as_ref()),
+                                                                Some(&parallel_ctx),
+                                                                cancel_token.as_ref(),
+                                                                &ai_runner,
+                                                                &archive_history,
+                                                                &apply_history,
+                                                            )
+                                                            .await;
+
+                                                            match archive_result {
+                                                                Ok(archive_revision) => {
+                                                                    agent.clear_acceptance_history(&change_id);
+
+                                                                    if let Some(ref tx) = event_tx {
+                                                                        let _ = tx
+                                                                            .send(ParallelEvent::ChangeArchived(change_id.clone()))
+                                                                            .await;
+                                                                    }
+                                                                    WorkspaceResult {
+                                                                        change_id,
+                                                                        workspace_name,
+                                                                        final_revision: Some(archive_revision),
+                                                                        error: None,
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    warn!("Archive failed for {}: {}", change_id, e);
+                                                                    if let Some(ref tx) = event_tx {
+                                                                        let _ = tx
+                                                                            .send(ParallelEvent::ArchiveFailed {
+                                                                                change_id: change_id.clone(),
+                                                                                error: e.to_string(),
+                                                                            })
+                                                                            .await;
+                                                                    }
+                                                                    WorkspaceResult {
+                                                                        change_id,
+                                                                        workspace_name,
+                                                                        final_revision: None,
+                                                                        error: Some(format!("Archive failed: {}", e)),
+                                                                    }
+                                                                }
+                                                            }
+                                                        });
+                                                    } else {
+                                                        warn!("Dynamically added change '{}' not found in openspec", dynamic_id);
+                                                        drop(permit);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to load dynamically added change '{}': {}", dynamic_id, e);
+                                                    drop(permit);
+                                                }
+                                            }
+                                        } else {
+                                            drop(permit);
+                                        }
+                                    } else {
+                                        drop(permit);
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             warn!("Task join error: {}", e);
