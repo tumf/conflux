@@ -923,14 +923,14 @@ Parallel実行で `MergeWait` の change をユーザーが resolve した場合
 
 依存制約が解決した change は、依存解決後の実行開始時点で worktree を新規作成し、既存の worktree がある場合も作り直さなければならない（MUST）。この挙動は依存 change に固有であり、resume が常に成立することを保証しない前提の例外とする。
 
-#### Scenario: 空きスロット数に応じて同時起動する
+#### Scenario: 実行中の空きスロットでキュー追加が起動する
 - **GIVEN** `max_concurrent_workspaces` が 3 に設定されている
-- **AND** 依存関係が解決済みの change が 3 件以上ある
 - **AND** 進行中（apply / acceptance / archive / resolve）の change が 2 件である
-- **WHEN** 再分析が実行される
-- **THEN** システムは空きスロット数に応じて最大 1 件まで同時に起動する
-- **AND** merged / merge_wait / error / not queued の change はアクティブとして数えない
-- **AND** 依存関係が未解決の change は起動しない
+- **AND** 実行中にキューへ新しい change が追加される
+- **AND** 追加された change の依存関係はすべて解決済みである
+- **WHEN** 実行スロットが空いたタイミングを迎える
+- **THEN** システムはバッチ完了を待たずに新しい change を起動する
+- **AND** 起動は `order` に従い空きスロット数を超えない
 
 ### Requirement: AI エージェントクラッシュリカバリー
 
