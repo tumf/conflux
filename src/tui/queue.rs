@@ -5,17 +5,23 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 /// Dynamic queue for runtime change additions
 ///
 /// This struct provides a thread-safe queue for dynamically adding changes
 /// during orchestrator execution. TUI pushes change IDs when the user adds
 /// them via Space key, and the orchestrator pops them for processing.
+///
+/// The queue uses a `Notify` to wake up the re-analysis loop immediately
+/// when new items are added, enabling event-driven re-analysis without
+/// relying on completion events or polling.
 #[derive(Clone)]
 pub struct DynamicQueue {
     inner: Arc<Mutex<VecDeque<String>>>,
     removed: Arc<Mutex<HashSet<String>>>,
+    /// Notification for queue changes (used to wake up re-analysis loop)
+    notify: Arc<Notify>,
 }
 
 impl DynamicQueue {
@@ -24,10 +30,11 @@ impl DynamicQueue {
         Self {
             inner: Arc::new(Mutex::new(VecDeque::new())),
             removed: Arc::new(Mutex::new(HashSet::new())),
+            notify: Arc::new(Notify::new()),
         }
     }
 
-    /// Push a change ID to the queue
+    /// Push a change ID to the queue and notify waiting listeners
     /// Returns false if the ID is already in the queue
     pub async fn push(&self, id: String) -> bool {
         {
@@ -39,6 +46,10 @@ impl DynamicQueue {
             return false;
         }
         queue.push_back(id);
+        drop(queue); // Release lock before notifying
+
+        // Notify waiting re-analysis loop
+        self.notify.notify_one();
         true
     }
 
@@ -92,6 +103,12 @@ impl DynamicQueue {
     pub async fn len(&self) -> usize {
         let queue = self.inner.lock().await;
         queue.len()
+    }
+
+    /// Get a future that completes when the queue is notified
+    /// This is used by the re-analysis loop to wake up when new items are added
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
     }
 }
 

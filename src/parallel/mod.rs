@@ -280,19 +280,19 @@ impl ParallelExecutor {
         self.dynamic_queue = Some(dynamic_queue);
     }
 
-    /// Check if re-analysis should proceed based on debounce logic.
+    /// Check if debounce period has elapsed for queue changes.
     ///
     /// Returns `true` if:
-    /// - A slot is available (a change just completed), AND
-    /// - Either no recent queue changes OR 10 seconds have passed since the last queue change
+    /// - No recent queue changes, OR
+    /// - 10 seconds have passed since the last queue change
     ///
     /// This prevents immediate re-analysis when the queue changes, giving time for
     /// multiple changes to be queued before triggering expensive re-analysis.
-    pub async fn should_reanalyze(&self, slot_available: bool) -> bool {
-        if !slot_available {
-            return false;
-        }
-
+    ///
+    /// Note: This is now separated from slot availability check. Re-analysis can
+    /// proceed even when available_slots == 0, and the next dispatch will happen
+    /// when slots become available.
+    pub async fn should_reanalyze(&self) -> bool {
         let last_change = self.last_queue_change_at.lock().await;
         match *last_change {
             None => {
@@ -778,11 +778,9 @@ impl ParallelExecutor {
                 break;
             }
 
-            // Check debounce: a slot is available (after previous group completed)
-            // Skip debounce check on first iteration to start immediately
+            // Check debounce (skip on first iteration to start immediately)
             if group_counter > 1 {
-                let slot_available = true; // Slot is available after previous completion
-                if !self.should_reanalyze(slot_available).await {
+                if !self.should_reanalyze().await {
                     // Debounce period still active, wait before re-analyzing
                     let wait_duration = std::time::Duration::from_secs(1);
                     info!("Debounce active, waiting {:?} before retry", wait_duration);
@@ -1174,12 +1172,25 @@ impl ParallelExecutor {
 
             // Check debounce (skip on first iteration to start immediately)
             if iteration > 1 {
-                let slot_available = true; // Slot is available after previous completion
-                if !self.should_reanalyze(slot_available).await {
+                if !self.should_reanalyze().await {
                     // Debounce period still active, wait before re-analyzing
+                    // Use select to make the wait interruptible by queue notifications
                     let wait_duration = std::time::Duration::from_millis(500);
-                    info!("Debounce active, waiting {:?} before retry", wait_duration);
-                    tokio::time::sleep(wait_duration).await;
+                    info!("Debounce active, waiting {:?} before retry (interruptible by queue notification)", wait_duration);
+
+                    if let Some(queue) = &self.dynamic_queue {
+                        tokio::select! {
+                            _ = tokio::time::sleep(wait_duration) => {
+                                // Timer expired, continue to next iteration
+                            }
+                            _ = queue.notified() => {
+                                // Queue notification received, continue immediately
+                                info!("Queue notification received during debounce wait, continuing");
+                            }
+                        }
+                    } else {
+                        tokio::time::sleep(wait_duration).await;
+                    }
                     continue; // Retry the loop after waiting
                 }
             } else {
@@ -1225,9 +1236,25 @@ impl ParallelExecutor {
             );
 
             if available_slots == 0 {
-                // Poll more frequently to enable slot-driven re-analysis
-                warn!("No available slots, waiting for workspaces to complete");
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                // No slots available, but re-analysis can still run
+                // Wait for slots to become available or queue notification
+                warn!(
+                    "No available slots, waiting for workspaces to complete or queue notification"
+                );
+
+                if let Some(queue) = &self.dynamic_queue {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                            // Timer expired, re-check slots
+                        }
+                        _ = queue.notified() => {
+                            // Queue notification received, re-check immediately
+                            info!("Queue notification received while waiting for slots");
+                        }
+                    }
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
                 continue;
             }
 
@@ -1303,8 +1330,21 @@ impl ParallelExecutor {
 
             if selected_changes.is_empty() {
                 info!("No changes can be executed (all blocked by dependencies)");
-                // Poll more frequently to detect when dependencies are resolved
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                // Wait for dependencies to be resolved or queue notification
+
+                if let Some(queue) = &self.dynamic_queue {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                            // Timer expired, re-check dependencies
+                        }
+                        _ = queue.notified() => {
+                            // Queue notification received, re-check immediately
+                            info!("Queue notification received while waiting for dependencies");
+                        }
+                    }
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
                 continue;
             }
 
@@ -4654,7 +4694,7 @@ mod tests {
         let executor = ParallelExecutor::new(repo_root, config, Some(tx));
 
         // First check: no queue changes, should reanalyze
-        assert!(executor.should_reanalyze(true).await);
+        assert!(executor.should_reanalyze().await);
 
         // Simulate a queue change
         {
@@ -4663,13 +4703,54 @@ mod tests {
         }
 
         // Immediate check: should NOT reanalyze (debounce active)
-        assert!(!executor.should_reanalyze(true).await);
+        assert!(!executor.should_reanalyze().await);
 
         // Wait for debounce period to expire (10 seconds + margin)
         tokio::time::sleep(Duration::from_secs(11)).await;
 
         // After debounce: should reanalyze
-        assert!(executor.should_reanalyze(true).await);
+        assert!(executor.should_reanalyze().await);
+    }
+
+    #[tokio::test]
+    async fn test_queue_notification_triggers_reanalysis() {
+        use crate::tui::queue::DynamicQueue;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Create a dynamic queue
+        let queue = Arc::new(DynamicQueue::new());
+
+        // Spawn a task that waits for notification
+        let queue_clone = queue.clone();
+        let handle = tokio::spawn(async move {
+            let notified = queue_clone.notified();
+
+            // Wait for notification with timeout
+            tokio::select! {
+                _ = notified => {
+                    // Notification received
+                    Ok(())
+                }
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                    // Timeout - notification not received
+                    Err("Timeout waiting for notification")
+                }
+            }
+        });
+
+        // Give the task time to start waiting
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Push to queue (should trigger notification)
+        queue.push("test-change".to_string()).await;
+
+        // Verify the notification was received
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "Queue notification should have been received"
+        );
     }
 
     #[tokio::test]
