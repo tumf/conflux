@@ -619,20 +619,21 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
     };
 
     let (status_text, status_color) = match app.mode {
-        AppMode::Select if all_completed => {
-            ("All processing completed. Press 'q' to quit.", Color::Green)
-        }
+        AppMode::Select if all_completed => (
+            "All processing completed. Press Ctrl+C to quit.",
+            Color::Green,
+        ),
         AppMode::Running => ("Processing... Esc: stop", Color::Cyan),
         AppMode::Stopping => (
             "Stopping after current change... F5: continue, Esc: force stop",
             Color::Yellow,
         ),
         AppMode::Stopped => (
-            "Stopped. F5: resume, Space: toggle queue, q: quit",
+            "Stopped. F5: resume, Space: toggle queue, Ctrl+C: quit",
             Color::DarkGray,
         ),
         AppMode::Select => ("", Color::White),
-        AppMode::Error => ("Press F5 to retry, or 'q' to quit.", Color::Yellow),
+        AppMode::Error => ("Press F5 to retry, or Ctrl+C to quit.", Color::Yellow),
         AppMode::ConfirmWorktreeDelete => ("Y: delete worktree, N/Esc: cancel", Color::Yellow),
         AppMode::QrPopup => ("Esc: close QR code", Color::Green),
     };
@@ -707,11 +708,11 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
 
     // Build title with app control keys based on mode
     let title = match app.mode {
-        AppMode::Running => " Status (Esc: stop, q: quit) ".to_string(),
-        AppMode::Stopping => " Status (F5: continue, Esc: force stop, q: quit) ".to_string(),
-        AppMode::Stopped => " Status (F5: resume, q: quit) ".to_string(),
-        AppMode::ConfirmWorktreeDelete => " Status (Y/N: confirm, q: quit) ".to_string(),
-        _ => " Status (q: quit) ".to_string(),
+        AppMode::Running => " Status (Esc: stop, Ctrl+C: quit) ".to_string(),
+        AppMode::Stopping => " Status (F5: continue, Esc: force stop, Ctrl+C: quit) ".to_string(),
+        AppMode::Stopped => " Status (F5: resume, Ctrl+C: quit) ".to_string(),
+        AppMode::ConfirmWorktreeDelete => " Status (Y/N: confirm, Ctrl+C: quit) ".to_string(),
+        _ => " Status (Ctrl+C: quit) ".to_string(),
     };
 
     let status = Paragraph::new(content).block(
@@ -1052,7 +1053,7 @@ fn render_footer_worktree(frame: &mut Frame, app: &AppState, area: Rect) {
     // Note: We'll check this in the actual implementation
     key_hints.push(("Enter", "shell"));
 
-    key_hints.push(("q", "quit"));
+    key_hints.push(("Ctrl+C", "quit"));
 
     let hints_text = key_hints
         .iter()
