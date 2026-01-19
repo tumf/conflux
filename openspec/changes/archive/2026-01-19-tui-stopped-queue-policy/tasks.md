@@ -13,3 +13,11 @@
 
 ## Acceptance Failure Follow-up
 - [x] Address acceptance findings: No findings - all tests pass and spec validation succeeds
+
+
+## Acceptance Failure Follow-up
+- [x] Address acceptance findings:
+  1) Fixed: Force stop now uses `OrchestratorEvent::Stopped` to set `queue_status = NotQueued` (src/tui/runner.rs:670)
+  2) Fixed: Force stop now uses the same event handler as graceful stop to preserve execution marks
+  3) Integration: Both graceful and force stop now use the same `OrchestratorEvent::Stopped` handler
+  4) Validation: All 908 tests pass, code quality checks pass, spec validation succeeds
