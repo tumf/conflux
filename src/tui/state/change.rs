@@ -35,6 +35,8 @@ pub struct ChangeState {
     pub started_at: Option<Instant>,
     /// Elapsed time when processing finished (for display after completion)
     pub elapsed_time: Option<Duration>,
+    /// Current iteration number (for apply/archive/acceptance operations)
+    pub iteration_number: Option<u32>,
 }
 
 impl ChangeState {
@@ -53,6 +55,7 @@ impl ChangeState {
             has_worktree: false,
             started_at: None,
             elapsed_time: None,
+            iteration_number: None,
         }
     }
 
@@ -99,6 +102,7 @@ mod tests {
             has_worktree: false,
             started_at: None,
             elapsed_time: None,
+            iteration_number: None,
         };
 
         assert_eq!(change.progress_percent(), 50.0);
@@ -144,6 +148,7 @@ mod tests {
             has_worktree: false,
             started_at: None,
             elapsed_time: None,
+            iteration_number: None,
         };
 
         assert_eq!(change.progress_percent(), 0.0);
@@ -166,6 +171,7 @@ mod tests {
             has_worktree: false,
             started_at: None,
             elapsed_time: None,
+            iteration_number: None,
         };
 
         assert!(change.is_complete());
