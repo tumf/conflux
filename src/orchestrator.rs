@@ -6,7 +6,7 @@ use crate::execution::apply::{check_task_progress, create_progress_commit, is_pr
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::{
-    acceptance_test_streaming, apply_change, archive_change, selection,
+    acceptance_test_streaming, apply_change_streaming, archive_change_streaming, selection,
     update_tasks_on_acceptance_failure, AcceptanceResult, ApplyContext, ApplyResult,
     ArchiveContext, ArchiveResult, LogOutputHandler,
 };
@@ -79,6 +79,10 @@ pub struct Orchestrator {
     /// Web monitoring state (for broadcasting updates to WebSocket clients)
     #[cfg(feature = "web-monitoring")]
     web_state: Option<Arc<WebState>>,
+    /// Current execution mode for web monitoring app_mode
+    /// "select" | "running" | "stopped" | "stopping" | "error"
+    #[cfg(feature = "web-monitoring")]
+    execution_mode: String,
 }
 
 impl Orchestrator {
@@ -128,6 +132,8 @@ impl Orchestrator {
             no_resume,
             #[cfg(feature = "web-monitoring")]
             web_state: None,
+            #[cfg(feature = "web-monitoring")]
+            execution_mode: "select".to_string(),
         })
     }
 
@@ -141,7 +147,9 @@ impl Orchestrator {
     #[cfg(feature = "web-monitoring")]
     async fn broadcast_state_update(&self, changes: &[Change]) {
         if let Some(ref web_state) = self.web_state {
-            web_state.update(changes).await;
+            web_state
+                .update_with_mode(changes, &self.execution_mode)
+                .await;
         }
     }
 
@@ -185,13 +193,24 @@ impl Orchestrator {
             no_resume: false,
             #[cfg(feature = "web-monitoring")]
             web_state: None,
+            #[cfg(feature = "web-monitoring")]
+            execution_mode: "select".to_string(),
         })
     }
 
     /// Run the orchestration loop with cancellation support
-    pub async fn run(&mut self, _cancel_token: tokio_util::sync::CancellationToken) -> Result<()> {
+    pub async fn run(
+        &mut self,
+        cancel_token: tokio_util::sync::CancellationToken,
+        graceful_stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<()> {
         info!("Starting orchestration loop");
-        // TODO: Integrate cancel_token with apply/archive operations for graceful shutdown
+
+        // Set execution mode to running (for web monitoring)
+        #[cfg(feature = "web-monitoring")]
+        {
+            self.execution_mode = "running".to_string();
+        }
 
         // Capture initial snapshot of change IDs at run start.
         // Only changes present at this point will be processed during the run.
@@ -205,7 +224,9 @@ impl Orchestrator {
 
         // Handle parallel execution mode
         if self.parallel {
-            return self.run_parallel(&initial_changes).await;
+            return self
+                .run_parallel(&initial_changes, cancel_token, graceful_stop_flag)
+                .await;
         }
 
         if initial_changes.is_empty() {
@@ -286,7 +307,75 @@ impl Orchestrator {
 
         let finish_status;
 
+        // Track previous graceful stop state to detect transitions (false -> true)
+        let mut previous_graceful_stop = false;
+
         loop {
+            // Check for graceful stop flag (stop after current change completes)
+            if let Some(ref graceful_flag) = graceful_stop_flag {
+                let current_graceful_stop = graceful_flag.load(std::sync::atomic::Ordering::SeqCst);
+
+                // Detect transition from false to true (entering stopping state)
+                if current_graceful_stop && !previous_graceful_stop {
+                    info!("Graceful stop requested, entering stopping state");
+                    #[cfg(feature = "web-monitoring")]
+                    {
+                        self.execution_mode = "stopping".to_string();
+                        // Broadcast mode change to web monitoring
+                        let current_changes = openspec::list_changes_native().unwrap_or_default();
+                        self.broadcast_state_update(&current_changes).await;
+                    }
+                }
+
+                // Detect transition from true to false (cancel stop - resume running)
+                if !current_graceful_stop && previous_graceful_stop {
+                    info!("Graceful stop cancelled, resuming running state");
+                    #[cfg(feature = "web-monitoring")]
+                    {
+                        self.execution_mode = "running".to_string();
+                        // Broadcast mode change to web monitoring
+                        let current_changes = openspec::list_changes_native().unwrap_or_default();
+                        self.broadcast_state_update(&current_changes).await;
+                    }
+                }
+
+                previous_graceful_stop = current_graceful_stop;
+
+                // If stop is still requested, exit loop
+                if current_graceful_stop {
+                    info!("Graceful stop: stopping after current change");
+                    #[cfg(feature = "web-monitoring")]
+                    {
+                        self.execution_mode = "stopped".to_string();
+                        // Broadcast mode change to web monitoring
+                        let current_changes = openspec::list_changes_native().unwrap_or_default();
+                        self.broadcast_state_update(&current_changes).await;
+                    }
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_all();
+                    }
+                    finish_status = "graceful_stop";
+                    break;
+                }
+            }
+
+            // Check for cancellation request (force stop or signal)
+            if cancel_token.is_cancelled() {
+                info!("Cancellation requested, stopping orchestration");
+                #[cfg(feature = "web-monitoring")]
+                {
+                    self.execution_mode = "stopped".to_string();
+                    // Broadcast mode change to web monitoring
+                    let current_changes = openspec::list_changes_native().unwrap_or_default();
+                    self.broadcast_state_update(&current_changes).await;
+                }
+                if let Some(progress) = &mut self.progress {
+                    progress.complete_all();
+                }
+                finish_status = "cancelled";
+                break;
+            }
+
             // Increment iteration counter
             self.iteration += 1;
 
@@ -392,12 +481,16 @@ impl Orchestrator {
 
                 let stall_config = self.config.get_stall_detection();
 
-                match archive_change(
+                // Create cancel check closure that checks the cancel token
+                let cancel_check = || cancel_token.is_cancelled();
+
+                match archive_change_streaming(
                     &next,
                     &mut self.agent,
                     &self.hooks,
                     &archive_ctx,
                     &output,
+                    cancel_check,
                     None,
                     &stall_config,
                 )
@@ -444,6 +537,14 @@ impl Orchestrator {
                         if let Some(progress) = &mut self.progress {
                             progress.error(&format!("Archive failed: {}", next.id));
                         }
+                        #[cfg(feature = "web-monitoring")]
+                        {
+                            self.execution_mode = "error".to_string();
+                            // Broadcast mode change to web monitoring
+                            let current_changes =
+                                openspec::list_changes_native().unwrap_or_default();
+                            self.broadcast_state_update(&current_changes).await;
+                        }
                         return Err(OrchestratorError::AgentCommand(error));
                     }
                     Ok(ArchiveResult::Cancelled) => {
@@ -454,6 +555,14 @@ impl Orchestrator {
                         error!("Archive error for {}: {}", next.id, e);
                         if let Some(progress) = &mut self.progress {
                             progress.error(&format!("Archive failed: {}", next.id));
+                        }
+                        #[cfg(feature = "web-monitoring")]
+                        {
+                            self.execution_mode = "error".to_string();
+                            // Broadcast mode change to web monitoring
+                            let current_changes =
+                                openspec::list_changes_native().unwrap_or_default();
+                            self.broadcast_state_update(&current_changes).await;
                         }
                         return Err(e);
                     }
@@ -474,7 +583,19 @@ impl Orchestrator {
                 );
                 let output = LogOutputHandler::new();
 
-                match apply_change(&next, &mut self.agent, &self.hooks, &apply_ctx, &output).await {
+                // Create cancel check closure that checks the cancel token
+                let cancel_check = || cancel_token.is_cancelled();
+
+                match apply_change_streaming(
+                    &next,
+                    &mut self.agent,
+                    &self.hooks,
+                    &apply_ctx,
+                    &output,
+                    cancel_check,
+                )
+                .await
+                {
                     Ok(ApplyResult::Success) => {
                         let snapshot = match self
                             .snapshot_serial_iteration(&next.id, new_apply_count)
@@ -623,6 +744,14 @@ impl Orchestrator {
                         if let Some(progress) = &mut self.progress {
                             progress.error(&format!("Apply failed: {}", next.id));
                         }
+                        #[cfg(feature = "web-monitoring")]
+                        {
+                            self.execution_mode = "error".to_string();
+                            // Broadcast mode change to web monitoring
+                            let current_changes =
+                                openspec::list_changes_native().unwrap_or_default();
+                            self.broadcast_state_update(&current_changes).await;
+                        }
                         return Err(OrchestratorError::AgentCommand(error));
                     }
                     Ok(ApplyResult::Cancelled) => {
@@ -633,6 +762,14 @@ impl Orchestrator {
                         error!("Apply error for {}: {}", next.id, e);
                         if let Some(progress) = &mut self.progress {
                             progress.error(&format!("Apply failed: {}", next.id));
+                        }
+                        #[cfg(feature = "web-monitoring")]
+                        {
+                            self.execution_mode = "error".to_string();
+                            // Broadcast mode change to web monitoring
+                            let current_changes =
+                                openspec::list_changes_native().unwrap_or_default();
+                            self.broadcast_state_update(&current_changes).await;
                         }
                         return Err(e);
                     }
@@ -646,6 +783,15 @@ impl Orchestrator {
         self.hooks
             .run_hook(HookType::OnFinish, &finish_context)
             .await?;
+
+        // Set execution mode to stopped (for web monitoring)
+        #[cfg(feature = "web-monitoring")]
+        {
+            self.execution_mode = "stopped".to_string();
+            // Broadcast mode change to web monitoring
+            let current_changes = openspec::list_changes_native().unwrap_or_default();
+            self.broadcast_state_update(&current_changes).await;
+        }
 
         info!("Orchestration completed");
         Ok(())
@@ -924,7 +1070,12 @@ impl Orchestrator {
     }
 
     /// Run parallel execution mode
-    async fn run_parallel(&mut self, changes: &[Change]) -> Result<()> {
+    async fn run_parallel(
+        &mut self,
+        changes: &[Change],
+        cancel_token: tokio_util::sync::CancellationToken,
+        graceful_stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<()> {
         info!("Running parallel execution mode");
 
         // Filter to approved changes only
@@ -976,9 +1127,26 @@ impl Orchestrator {
         #[cfg(feature = "web-monitoring")]
         let web_event_sender = web_event_tx.clone();
 
+        // Monitor graceful_stop_flag and trigger cancellation if set
+        // This allows Web control Stop to work in parallel mode
+        if let Some(ref stop_flag) = graceful_stop_flag {
+            let monitor_token = cancel_token.clone();
+            let monitor_flag = stop_flag.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    if monitor_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        info!("Graceful stop requested in parallel mode, cancelling execution");
+                        monitor_token.cancel();
+                        break;
+                    }
+                }
+            });
+        }
+
         // Run with a simple logging event handler for CLI mode
         let result = service
-            .run_parallel(approved, move |event| {
+            .run_parallel(approved, Some(cancel_token), move |event| {
                 // Log events for CLI mode (no TUI)
                 use crate::parallel::ParallelEvent;
                 #[cfg(feature = "web-monitoring")]

@@ -146,6 +146,24 @@ pub async fn start_server(
             "/api/changes/{id}/unapprove",
             axum::routing::post(api::unapprove_change),
         )
+        // Control API routes
+        .route(
+            "/api/control/start",
+            axum::routing::post(api::control_start),
+        )
+        .route("/api/control/stop", axum::routing::post(api::control_stop))
+        .route(
+            "/api/control/cancel-stop",
+            axum::routing::post(api::control_cancel_stop),
+        )
+        .route(
+            "/api/control/force-stop",
+            axum::routing::post(api::control_force_stop),
+        )
+        .route(
+            "/api/control/retry",
+            axum::routing::post(api::control_retry),
+        )
         // WebSocket route
         .route("/ws", get(websocket::ws_handler))
         .layer(cors)
@@ -227,6 +245,24 @@ pub async fn spawn_server_with_url(
         .route(
             "/api/changes/{id}/unapprove",
             axum::routing::post(api::unapprove_change),
+        )
+        // Control API routes
+        .route(
+            "/api/control/start",
+            axum::routing::post(api::control_start),
+        )
+        .route("/api/control/stop", axum::routing::post(api::control_stop))
+        .route(
+            "/api/control/cancel-stop",
+            axum::routing::post(api::control_cancel_stop),
+        )
+        .route(
+            "/api/control/force-stop",
+            axum::routing::post(api::control_force_stop),
+        )
+        .route(
+            "/api/control/retry",
+            axum::routing::post(api::control_retry),
         )
         // WebSocket route
         .route("/ws", get(websocket::ws_handler))

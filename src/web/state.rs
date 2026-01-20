@@ -6,7 +6,22 @@ use crate::events::{ExecutionEvent, LogEntry};
 use crate::openspec::Change;
 use crate::tui::types::WorktreeInfo;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+
+/// Control commands that can be sent from Web UI to orchestrator
+#[derive(Debug, Clone)]
+pub enum ControlCommand {
+    /// Start or resume processing
+    Start,
+    /// Stop processing (graceful shutdown)
+    Stop,
+    /// Cancel a pending stop request
+    CancelStop,
+    /// Force stop immediately
+    ForceStop,
+    /// Retry error changes
+    Retry,
+}
 
 /// State update message sent to WebSocket clients
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +212,9 @@ pub struct WebState {
     state: RwLock<OrchestratorState>,
     /// Broadcast channel for state updates
     tx: broadcast::Sender<StateUpdate>,
+    /// Control command channel (optional, only used when web control is enabled)
+    /// Uses Mutex for interior mutability to allow setting after Arc creation
+    control_tx: Mutex<Option<mpsc::UnboundedSender<ControlCommand>>>,
 }
 
 impl WebState {
@@ -208,6 +226,32 @@ impl WebState {
         Self {
             state: RwLock::new(state),
             tx,
+            control_tx: Mutex::new(None),
+        }
+    }
+
+    /// Set the control command channel for web-based execution control
+    pub async fn set_control_channel(&self, control_tx: mpsc::UnboundedSender<ControlCommand>) {
+        *self.control_tx.lock().await = Some(control_tx);
+    }
+
+    /// Send a control command (returns error if control channel not set)
+    pub fn send_control_command(
+        &self,
+        command: ControlCommand,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Use try_lock to avoid blocking in sync context
+        let control_tx_guard = self
+            .control_tx
+            .try_lock()
+            .map_err(|_| "Control channel lock contention")?;
+
+        if let Some(tx) = control_tx_guard.as_ref() {
+            tx.send(command)
+                .map_err(|e| format!("Failed to send control command: {}", e))?;
+            Ok(())
+        } else {
+            Err("Control channel not initialized".into())
         }
     }
 
@@ -221,11 +265,14 @@ impl WebState {
     pub async fn update(&self, changes: &[Change]) {
         let mut new_state = OrchestratorState::from_changes(changes);
 
-        // Preserve progress and queue_status from existing state
-        let old_changes = {
+        // Preserve progress, queue_status, and app_mode from existing state
+        let (old_changes, old_app_mode) = {
             let old_state = self.state.read().await;
-            old_state.changes.clone()
+            (old_state.changes.clone(), old_state.app_mode.clone())
         };
+
+        // Preserve app_mode to prevent overwriting runtime state during refresh
+        new_state.app_mode = old_app_mode.clone();
 
         for new_change in &mut new_state.changes {
             if let Some(existing) = old_changes.iter().find(|c| c.id == new_change.id) {
@@ -261,7 +308,59 @@ impl WebState {
 
         // Only broadcast if there were changes
         if has_changes {
-            self.broadcast_snapshot(new_state.changes);
+            self.broadcast_snapshot(new_state.changes).await;
+        }
+    }
+
+    /// Update the state with new changes and explicit app_mode (for Run mode)
+    pub async fn update_with_mode(&self, changes: &[Change], app_mode: &str) {
+        let mut new_state = OrchestratorState::from_changes(changes);
+
+        // Override app_mode from orchestrator execution state
+        new_state.app_mode = app_mode.to_string();
+
+        // Preserve progress and queue_status from existing state
+        let (old_changes, old_app_mode) = {
+            let old_state = self.state.read().await;
+            (old_state.changes.clone(), old_state.app_mode.clone())
+        };
+
+        for new_change in &mut new_state.changes {
+            if let Some(existing) = old_changes.iter().find(|c| c.id == new_change.id) {
+                // Preserve queue_status
+                new_change.queue_status = existing.queue_status.clone();
+
+                // Preserve iteration_number
+                new_change.iteration_number = existing.iteration_number;
+
+                // Preserve existing progress if retrieval failed (new data is 0/0)
+                // This prevents resetting progress to 0 on retrieval failure
+                if new_change.total_tasks == 0
+                    && (existing.completed_tasks > 0 || existing.total_tasks > 0)
+                {
+                    new_change.completed_tasks = existing.completed_tasks;
+                    new_change.total_tasks = existing.total_tasks;
+                    new_change.progress_percent = existing.progress_percent;
+                    new_change.status = existing.status.clone();
+                }
+            }
+        }
+
+        // Check if state has actually changed (changes OR app_mode)
+        let has_changes = !self
+            .compute_diff(&old_changes, &new_state.changes)
+            .is_empty();
+        let app_mode_changed = new_state.app_mode != old_app_mode;
+
+        // Update internal state
+        {
+            let mut state = self.state.write().await;
+            *state = new_state.clone();
+        }
+
+        // Broadcast if there were changes OR if app_mode changed
+        if has_changes || app_mode_changed {
+            self.broadcast_snapshot(new_state.changes).await;
         }
     }
 
@@ -307,6 +406,8 @@ impl WebState {
                         change.queue_status = Some(format!("error: {}", error));
                         updated = true;
                     }
+                    state.app_mode = "error".to_string();
+                    mode_broadcast = Some("error".to_string());
                 }
 
                 // Apply output with iteration tracking
@@ -454,6 +555,10 @@ impl WebState {
                 }
 
                 // Completion events
+                ExecutionEvent::Stopping => {
+                    state.app_mode = "stopping".to_string();
+                    mode_broadcast = Some("stopping".to_string());
+                }
                 ExecutionEvent::Stopped => {
                     state.app_mode = "stopped".to_string();
                     mode_broadcast = Some("stopped".to_string());
@@ -461,6 +566,11 @@ impl WebState {
                 ExecutionEvent::AllCompleted => {
                     state.app_mode = "select".to_string();
                     mode_broadcast = Some("select".to_string());
+                }
+                ExecutionEvent::Error { message } => {
+                    state.app_mode = "error".to_string();
+                    mode_broadcast = Some("error".to_string());
+                    log_broadcast = Some(vec![LogEntry::error(message.clone())]);
                 }
 
                 _ => {}
@@ -493,14 +603,20 @@ impl WebState {
         }
     }
 
-    fn broadcast_snapshot(&self, changes: Vec<ChangeStatus>) {
+    async fn broadcast_snapshot(&self, changes: Vec<ChangeStatus>) {
+        // Read current app_mode from state
+        let current_app_mode = {
+            let state = self.state.read().await;
+            state.app_mode.clone()
+        };
+
         let update = StateUpdate {
             msg_type: "state_update".to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
             changes,
             logs: None,
             worktrees: None,
-            app_mode: None,
+            app_mode: Some(current_app_mode),
         };
 
         let _ = self.tx.send(update);
@@ -545,6 +661,7 @@ impl WebState {
 
     /// Refresh state from disk by re-reading changes using native parser.
     /// This ensures the web state reflects the latest task progress from worktree.
+    /// Preserves the existing app_mode to avoid overwriting runtime execution state.
     pub async fn refresh_from_disk(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::openspec;
 
@@ -582,8 +699,14 @@ impl WebState {
             }
         }
 
-        // Update state with refreshed changes
-        self.update(&changes).await;
+        // Preserve existing app_mode (don't overwrite runtime state with "select" default)
+        let current_app_mode = {
+            let state = self.state.read().await;
+            state.app_mode.clone()
+        };
+
+        // Update state with refreshed changes, preserving app_mode
+        self.update_with_mode(&changes, &current_app_mode).await;
 
         Ok(())
     }
@@ -643,7 +766,7 @@ impl WebState {
         };
 
         // Broadcast the update
-        self.broadcast_snapshot(changes_snapshot);
+        self.broadcast_snapshot(changes_snapshot).await;
 
         Ok(updated_change)
     }
@@ -687,7 +810,7 @@ impl WebState {
         };
 
         // Broadcast the update
-        self.broadcast_snapshot(changes_snapshot);
+        self.broadcast_snapshot(changes_snapshot).await;
 
         Ok(updated_change)
     }

@@ -530,6 +530,7 @@ impl ParallelExecutor {
         // Set needs_reanalysis to trigger first analysis
         self.needs_reanalysis = true;
         let mut reanalysis_reason = ReanalysisReason::Initial;
+        let mut cancelled = false;
 
         // Main scheduler loop: wait for triggers and dispatch changes
         loop {
@@ -548,6 +549,7 @@ impl ParallelExecutor {
                     ParallelEvent::Log(LogEntry::warn(&cancel_msg)),
                 )
                 .await;
+                cancelled = true;
                 break;
             }
 
@@ -961,7 +963,12 @@ impl ParallelExecutor {
         // Cleanup is only performed explicitly after successful merge via cleanup_workspace()
         drop(cleanup_guard);
 
-        send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+        // Send appropriate completion event based on how we exited
+        if cancelled {
+            send_event(&self.event_tx, ParallelEvent::Stopped).await;
+        } else {
+            send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+        }
         Ok(())
     }
 

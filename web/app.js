@@ -29,7 +29,14 @@ class WebMonitor {
             overallProgressFill: document.getElementById('overall-progress-fill'),
             overallProgressTasks: document.getElementById('overall-progress-tasks'),
             overallProgressPercent: document.getElementById('overall-progress-percent'),
+            btnRun: document.getElementById('btn-run'),
+            btnStop: document.getElementById('btn-stop'),
+            btnCancelStop: document.getElementById('btn-cancel-stop'),
+            btnForceStop: document.getElementById('btn-force-stop'),
+            btnRetry: document.getElementById('btn-retry'),
         };
+
+        this.appMode = 'select'; // Current app mode: select, running, stopping, stopped, error
 
         this.touchState = {
             startX: 0,
@@ -50,8 +57,72 @@ class WebMonitor {
         this.setupMediaQueryListener();
         this.setupTouchHandlers();
         this.setupPullToRefresh();
+        this.setupControlButtons();
         this.fetchState();
         this.connect();
+    }
+
+    setupControlButtons() {
+        this.elements.btnRun.addEventListener('click', () => this.handleControlCommand('start'));
+        this.elements.btnStop.addEventListener('click', () => this.handleControlCommand('stop'));
+        this.elements.btnCancelStop.addEventListener('click', () => this.handleControlCommand('cancel-stop'));
+        this.elements.btnForceStop.addEventListener('click', () => this.handleControlCommand('force-stop'));
+        this.elements.btnRetry.addEventListener('click', () => this.handleControlCommand('retry'));
+    }
+
+    async handleControlCommand(command) {
+        try {
+            const response = await fetch(`/api/control/${command}`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+            });
+
+            const data = await response.json();
+
+            if (response.ok) {
+                this.showToast(data.message, 'success');
+            } else {
+                this.showToast(data.error || 'Operation failed', 'error');
+            }
+        } catch (error) {
+            console.error(`Control command ${command} failed:`, error);
+            this.showToast(`Failed to ${command}: ${error.message}`, 'error');
+        }
+    }
+
+    updateControlButtons(appMode) {
+        this.appMode = appMode || 'select';
+
+        // Disable all buttons by default
+        this.elements.btnRun.disabled = true;
+        this.elements.btnStop.disabled = true;
+        this.elements.btnCancelStop.disabled = true;
+        this.elements.btnForceStop.disabled = true;
+        this.elements.btnRetry.disabled = true;
+
+        // Enable buttons based on app mode
+        switch (this.appMode) {
+            case 'select':
+                this.elements.btnRun.disabled = false;
+                this.elements.btnRun.querySelector('.btn-text').textContent = 'Run';
+                break;
+            case 'running':
+                this.elements.btnStop.disabled = false;
+                break;
+            case 'stopping':
+                this.elements.btnCancelStop.disabled = false;
+                this.elements.btnForceStop.disabled = false;
+                break;
+            case 'stopped':
+                this.elements.btnRun.disabled = false;
+                this.elements.btnRun.querySelector('.btn-text').textContent = 'Resume';
+                break;
+            case 'error':
+                this.elements.btnRetry.disabled = false;
+                break;
+        }
     }
 
     setupMediaQueryListener() {
@@ -432,6 +503,22 @@ class WebMonitor {
             case 'state_update':
                 this.renderChanges(data.changes);
                 this.updateTimestamp(data.timestamp);
+
+                // Update app mode if provided
+                if (data.app_mode) {
+                    this.updateControlButtons(data.app_mode);
+                }
+
+                // Show logs if provided
+                if (data.logs && data.logs.length > 0) {
+                    data.logs.forEach(log => {
+                        if (log.level === 'error') {
+                            this.showToast(log.message, 'error');
+                        } else if (log.level === 'warning') {
+                            this.showToast(log.message, 'warning');
+                        }
+                    });
+                }
                 break;
             default:
                 console.log('Unknown message type:', data.type);
@@ -456,6 +543,11 @@ class WebMonitor {
 
         // Update timestamp
         this.updateTimestamp(state.last_updated);
+
+        // Update control buttons based on app mode
+        if (state.app_mode) {
+            this.updateControlButtons(state.app_mode);
+        }
     }
 
     renderChanges(changes) {
