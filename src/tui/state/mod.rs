@@ -9,6 +9,7 @@ mod logs;
 mod modes;
 
 use crate::openspec::Change;
+use crate::vcs::GitWorkspaceManager;
 use ratatui::widgets::ListState;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -269,19 +270,36 @@ impl AppState {
             return None;
         }
 
-        // Cannot delete if any change is being processed
-        // (We check if any change is processing to be safe, since we don't track worktree paths per change yet)
-        let is_any_processing = self.changes.iter().any(|c| {
-            matches!(
-                c.queue_status,
-                QueueStatus::Processing | QueueStatus::Archiving
-            )
-        });
+        // Extract change_id from worktree branch name
+        let change_id_opt = if !worktree.branch.is_empty() && !worktree.is_detached {
+            GitWorkspaceManager::extract_change_id_from_worktree_name(&worktree.branch)
+        } else {
+            None
+        };
 
-        if is_any_processing {
-            self.warning_message =
-                Some("Cannot delete worktree: changes are being processed".to_string());
-            return None;
+        // Check if the worktree is related to a change that is queued or processing
+        if let Some(change_id) = change_id_opt {
+            if let Some(change) = self.changes.iter().find(|c| c.id == change_id) {
+                // Block deletion if change is in active processing states
+                let is_active = matches!(
+                    change.queue_status,
+                    QueueStatus::Queued
+                        | QueueStatus::Processing
+                        | QueueStatus::Archiving
+                        | QueueStatus::Resolving
+                        | QueueStatus::Accepting
+                        | QueueStatus::MergeWait
+                );
+
+                if is_active {
+                    self.warning_message = Some(format!(
+                        "Cannot delete worktree: change '{}' is {}",
+                        change_id,
+                        change.queue_status.display()
+                    ));
+                    return None;
+                }
+            }
         }
 
         // Get the worktree path as string
@@ -1982,10 +2000,11 @@ mod tests {
         let changes = vec![create_test_change("a", 0, 1)];
         let mut app = AppState::new(changes);
 
+        // Worktree branch name matches change ID "a"
         app.worktrees = vec![WorktreeInfo {
             path: PathBuf::from("/path/to/worktree"),
             head: "abc123".to_string(),
-            branch: "feature".to_string(),
+            branch: "a".to_string(), // Branch name matches change ID
             is_detached: false,
             is_main: false,
             merge_conflict: None,
@@ -1993,7 +2012,7 @@ mod tests {
             is_merging: false,
         }];
 
-        // Simulate processing state
+        // Simulate processing state for change "a"
         app.start_processing();
         app.changes[0].queue_status = QueueStatus::Processing;
 
@@ -2001,11 +2020,10 @@ mod tests {
         let cmd = app.request_worktree_delete_from_list();
         assert!(cmd.is_none());
         assert!(app.warning_message.is_some());
-        assert!(app
-            .warning_message
-            .as_ref()
-            .unwrap()
-            .contains("Cannot delete worktree"));
+        let warning = app.warning_message.as_ref().unwrap();
+        assert!(warning.contains("Cannot delete worktree"));
+        assert!(warning.contains("change 'a'"));
+        assert!(warning.contains("processing"));
     }
 
     #[test]
@@ -2104,6 +2122,164 @@ mod tests {
         // Cancel action
         app.cancel_worktree_action();
         assert!(app.pending_worktree_action.is_none());
+    }
+
+    // === Tests for allow-worktree-delete-while-running ===
+
+    #[test]
+    fn test_request_worktree_delete_unrelated_worktree_allowed() {
+        use crate::tui::types::WorktreeInfo;
+        use std::path::PathBuf;
+
+        // Change "a" is processing, but worktree is for change "b" which doesn't exist in changes list
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.worktrees = vec![WorktreeInfo {
+            path: PathBuf::from("/path/to/worktree-b"),
+            head: "abc123".to_string(),
+            branch: "b".to_string(), // Change ID not in changes list
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: false,
+            is_merging: false,
+        }];
+
+        // Simulate processing state for change "a"
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Processing;
+        app.warning_message = None; // Clear any warning from start_processing
+
+        // Should allow deletion of worktree for change not in list
+        let cmd = app.request_worktree_delete_from_list();
+        assert!(cmd.is_none()); // No command yet, just sets pending action
+        assert!(app.pending_worktree_action.is_some());
+        assert!(app.warning_message.is_none());
+    }
+
+    #[test]
+    fn test_request_worktree_delete_not_queued_change_allowed() {
+        use crate::tui::types::WorktreeInfo;
+        use std::path::PathBuf;
+
+        // Change "a" exists but is NotQueued
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.worktrees = vec![WorktreeInfo {
+            path: PathBuf::from("/path/to/worktree-a"),
+            head: "abc123".to_string(),
+            branch: "a".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: false,
+            is_merging: false,
+        }];
+
+        // Change "a" is NotQueued
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+
+        // Should allow deletion
+        let cmd = app.request_worktree_delete_from_list();
+        assert!(cmd.is_none()); // No command yet, just sets pending action
+        assert!(app.pending_worktree_action.is_some());
+        assert!(app.warning_message.is_none());
+    }
+
+    #[test]
+    fn test_request_worktree_delete_queued_change_blocked() {
+        use crate::tui::types::WorktreeInfo;
+        use std::path::PathBuf;
+
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.worktrees = vec![WorktreeInfo {
+            path: PathBuf::from("/path/to/worktree-a"),
+            head: "abc123".to_string(),
+            branch: "a".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: false,
+            is_merging: false,
+        }];
+
+        // Start processing to set change to Queued
+        app.start_processing();
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+
+        // Should block deletion
+        let cmd = app.request_worktree_delete_from_list();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        let warning = app.warning_message.as_ref().unwrap();
+        assert!(warning.contains("Cannot delete worktree"));
+        assert!(warning.contains("change 'a'"));
+        assert!(warning.contains("queued"));
+    }
+
+    #[test]
+    fn test_request_worktree_delete_archived_change_allowed() {
+        use crate::tui::types::WorktreeInfo;
+        use std::path::PathBuf;
+
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.worktrees = vec![WorktreeInfo {
+            path: PathBuf::from("/path/to/worktree-a"),
+            head: "abc123".to_string(),
+            branch: "a".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: false,
+            is_merging: false,
+        }];
+
+        // Set change to Archived status
+        app.changes[0].queue_status = QueueStatus::Archived;
+
+        // Should allow deletion (Archived is not an active state)
+        let cmd = app.request_worktree_delete_from_list();
+        assert!(cmd.is_none()); // No command yet, just sets pending action
+        assert!(app.pending_worktree_action.is_some());
+        assert!(app.warning_message.is_none());
+    }
+
+    #[test]
+    fn test_request_worktree_delete_no_branch_allowed() {
+        use crate::tui::types::WorktreeInfo;
+        use std::path::PathBuf;
+
+        // Change "a" is processing
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Worktree has no branch (detached HEAD)
+        app.worktrees = vec![WorktreeInfo {
+            path: PathBuf::from("/path/to/worktree"),
+            head: "abc123".to_string(),
+            branch: "".to_string(),
+            is_detached: true,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: false,
+            is_merging: false,
+        }];
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Processing;
+        app.warning_message = None; // Clear any warning from start_processing
+
+        // Should allow deletion (cannot extract change_id from detached HEAD)
+        let cmd = app.request_worktree_delete_from_list();
+        assert!(cmd.is_none()); // No command yet, just sets pending action
+        assert!(app.pending_worktree_action.is_some());
+        assert!(app.warning_message.is_none());
     }
 
     // === Tests for update-tui-disable-merge-during-resolve ===
