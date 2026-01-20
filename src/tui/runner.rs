@@ -1231,7 +1231,7 @@ async fn run_tui_loop(
                         }
                     }
                 }
-                TuiCommand::DeleteWorktreeByPath(path) => {
+                TuiCommand::DeleteWorktreeByPath(path, branch_name) => {
                     match crate::vcs::git::commands::worktree_remove(
                         &repo_root,
                         path.to_string_lossy().as_ref(),
@@ -1243,6 +1243,30 @@ async fn run_tui_loop(
                                 "Deleted worktree: {}",
                                 path.display()
                             )));
+
+                            // Delete the associated branch if it exists
+                            if let Some(branch) = branch_name {
+                                match crate::vcs::git::commands::branch_delete(&repo_root, &branch)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        app.add_log(LogEntry::success(format!(
+                                            "Deleted branch: {}",
+                                            branch
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to delete branch '{}': {} (continuing)",
+                                            branch, e
+                                        );
+                                        app.add_log(LogEntry::warn(format!(
+                                            "Failed to delete branch '{}': {}",
+                                            branch, e
+                                        )));
+                                    }
+                                }
+                            }
 
                             // Refresh worktree list with conflict check
                             match load_worktrees_with_conflict_check(&repo_root).await {

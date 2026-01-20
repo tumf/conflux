@@ -61,6 +61,8 @@ pub struct AppState {
     pub worktree_list_state: ListState,
     /// Pending worktree action confirmation (path, action)
     pub pending_worktree_action: Option<(String, WorktreeAction)>,
+    /// Branch name associated with pending worktree action (for deletion)
+    pub pending_worktree_branch: Option<String>,
     /// ID of the currently processing change
     pub current_change: Option<String>,
     /// ID of the change that caused the error (for display in Error mode)
@@ -156,6 +158,7 @@ impl AppState {
             worktree_cursor_index: 0,
             worktree_list_state: ListState::default(),
             pending_worktree_action: None,
+            pending_worktree_branch: None,
             current_change: None,
             error_change_id: None,
             logs,
@@ -332,8 +335,16 @@ impl AppState {
         // Get the worktree path as string
         let path_str = worktree.path.display().to_string();
 
+        // Get the branch name (if not detached and branch exists)
+        let branch_name = if !worktree.is_detached && !worktree.branch.is_empty() {
+            Some(worktree.branch.clone())
+        } else {
+            None
+        };
+
         // Store pending action for confirmation
         self.pending_worktree_action = Some((path_str, WorktreeAction::Delete));
+        self.pending_worktree_branch = branch_name;
         self.previous_mode = Some(self.mode.clone());
         self.mode = AppMode::ConfirmWorktreeDelete;
 
@@ -343,6 +354,9 @@ impl AppState {
     /// Confirm and execute pending worktree action
     pub fn confirm_worktree_action_delete(&mut self) -> Option<TuiCommand> {
         if let Some((path, WorktreeAction::Delete)) = self.pending_worktree_action.take() {
+            // Get the branch name that was stored when the delete was requested
+            let branch_name = self.pending_worktree_branch.take();
+
             // Restore previous mode
             if let Some(mode) = self.previous_mode.take() {
                 self.mode = mode;
@@ -350,7 +364,7 @@ impl AppState {
                 self.mode = AppMode::Select;
             }
 
-            Some(TuiCommand::DeleteWorktreeByPath(path.into()))
+            Some(TuiCommand::DeleteWorktreeByPath(path.into(), branch_name))
         } else {
             None
         }
@@ -359,6 +373,7 @@ impl AppState {
     /// Cancel pending worktree action
     pub fn cancel_worktree_action(&mut self) {
         self.pending_worktree_action = None;
+        self.pending_worktree_branch = None;
 
         // Restore previous mode
         if let Some(mode) = self.previous_mode.take() {
@@ -2126,8 +2141,9 @@ mod tests {
         // Confirm deletion
         let cmd = app.confirm_worktree_action_delete();
         assert!(cmd.is_some());
-        if let Some(TuiCommand::DeleteWorktreeByPath(path)) = &cmd {
+        if let Some(TuiCommand::DeleteWorktreeByPath(path, branch_name)) = &cmd {
             assert_eq!(path, &worktree_path);
+            assert_eq!(branch_name, &None); // No branch name set in this test
         } else {
             panic!("Expected DeleteWorktreeByPath command");
         }

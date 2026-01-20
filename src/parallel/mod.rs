@@ -535,181 +535,196 @@ impl ParallelExecutor {
             }
 
             if self.needs_reanalysis && !queued.is_empty() {
-                // Check debounce (skip on first iteration)
-                let should_analyze = if iteration == 1 {
-                    info!("First iteration, skipping debounce check");
-                    true
-                } else {
-                    self.should_reanalyze().await
-                };
+                // Gate re-analysis by available execution slots
+                let available_slots = max_parallelism.saturating_sub(in_flight.len());
 
-                if should_analyze {
-                    // Filter out changes that depend on failed changes
-                    let mut executable_changes: Vec<crate::openspec::Change> = Vec::new();
-                    let mut skipped_changes: Vec<(String, String)> = Vec::new();
-
-                    for change in &queued {
-                        if let Some(reason) = self.skip_reason_for_change(&change.id) {
-                            warn!("Excluding '{}' from analysis: {}", change.id, reason);
-                            skipped_changes.push((change.id.clone(), reason));
-                        } else {
-                            executable_changes.push(change.clone());
-                        }
-                    }
-
-                    // Emit skip events
-                    for (change_id, reason) in skipped_changes {
-                        send_event(
-                            &self.event_tx,
-                            ParallelEvent::ChangeSkipped { change_id, reason },
-                        )
-                        .await;
-                    }
-
-                    queued = executable_changes;
-
-                    if queued.is_empty() {
-                        info!("All queued changes skipped due to failed dependencies");
-                        if in_flight.is_empty() {
-                            break;
-                        } else {
-                            // Wait for in-flight to complete
-                            self.needs_reanalysis = false;
-                            continue;
-                        }
-                    }
-
-                    // Run dependency analysis
+                if available_slots == 0 {
+                    // No available slots, defer re-analysis until slots become available
                     info!(
+                        "Re-analysis deferred: no available slots (max: {}, in_flight: {}, queued: {})",
+                        max_parallelism,
+                        in_flight.len(),
+                        queued.len()
+                    );
+                    // Keep needs_reanalysis=true so re-analysis will run when slots free up
+                    // Continue to wait for in-flight completions
+                } else {
+                    // Check debounce (skip on first iteration)
+                    let should_analyze = if iteration == 1 {
+                        info!("First iteration, skipping debounce check");
+                        true
+                    } else {
+                        self.should_reanalyze().await
+                    };
+
+                    if should_analyze {
+                        // Filter out changes that depend on failed changes
+                        let mut executable_changes: Vec<crate::openspec::Change> = Vec::new();
+                        let mut skipped_changes: Vec<(String, String)> = Vec::new();
+
+                        for change in &queued {
+                            if let Some(reason) = self.skip_reason_for_change(&change.id) {
+                                warn!("Excluding '{}' from analysis: {}", change.id, reason);
+                                skipped_changes.push((change.id.clone(), reason));
+                            } else {
+                                executable_changes.push(change.clone());
+                            }
+                        }
+
+                        // Emit skip events
+                        for (change_id, reason) in skipped_changes {
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::ChangeSkipped { change_id, reason },
+                            )
+                            .await;
+                        }
+
+                        queued = executable_changes;
+
+                        if queued.is_empty() {
+                            info!("All queued changes skipped due to failed dependencies");
+                            if in_flight.is_empty() {
+                                break;
+                            } else {
+                                // Wait for in-flight to complete
+                                self.needs_reanalysis = false;
+                                continue;
+                            }
+                        }
+
+                        // Run dependency analysis
+                        info!(
                         "Re-analysis triggered: iteration={}, queued={}, in_flight={}, trigger={}",
                         iteration,
                         queued.len(),
                         in_flight.len(),
                         reanalysis_reason
                     );
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::AnalysisStarted {
-                            remaining_changes: queued.len(),
-                        },
-                    )
-                    .await;
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::AnalysisStarted {
+                                remaining_changes: queued.len(),
+                            },
+                        )
+                        .await;
 
-                    let analysis_result = analyzer(&queued, iteration).await;
+                        let analysis_result = analyzer(&queued, iteration).await;
 
-                    if analysis_result.order.is_empty() {
-                        warn!("No order returned from analysis");
-                        if in_flight.is_empty() {
-                            break;
-                        } else {
-                            self.needs_reanalysis = false;
-                            continue;
-                        }
-                    }
-
-                    // Update dependencies
-                    self.failed_tracker
-                        .set_dependencies(analysis_result.dependencies.clone());
-                    self.change_dependencies = analysis_result.dependencies.clone();
-
-                    // Calculate available slots based on in-flight count
-                    let available_slots = max_parallelism.saturating_sub(in_flight.len());
-                    info!(
-                        "Available slots: {} (max: {}, in_flight: {}, queued: {})",
-                        available_slots,
-                        max_parallelism,
-                        in_flight.len(),
-                        queued.len()
-                    );
-
-                    // Select changes to dispatch based on order and available slots
-                    let mut selected_changes: Vec<String> = Vec::new();
-                    for change_id in &analysis_result.order {
-                        if selected_changes.len() >= available_slots {
-                            break;
-                        }
-
-                        // Check if change has unresolved dependencies
-                        if let Some(deps) = analysis_result.dependencies.get(change_id) {
-                            let mut all_resolved = true;
-                            for dep_id in deps {
-                                if !self.is_dependency_resolved(dep_id).await {
-                                    all_resolved = false;
-                                    info!(
-                                        "Change '{}' blocked: waiting for dependency '{}'",
-                                        change_id, dep_id
-                                    );
-                                    break;
-                                }
-                            }
-
-                            if !all_resolved {
+                        if analysis_result.order.is_empty() {
+                            warn!("No order returned from analysis");
+                            if in_flight.is_empty() {
+                                break;
+                            } else {
+                                self.needs_reanalysis = false;
                                 continue;
                             }
                         }
 
-                        selected_changes.push(change_id.clone());
-                    }
+                        // Update dependencies
+                        self.failed_tracker
+                            .set_dependencies(analysis_result.dependencies.clone());
+                        self.change_dependencies = analysis_result.dependencies.clone();
 
-                    // Dispatch selected changes
-                    if !selected_changes.is_empty() {
-                        let base_revision = self
-                            .workspace_manager
-                            .get_current_revision()
-                            .await
-                            .map_err(OrchestratorError::from)?;
-
+                        // Recalculate available slots (may have changed during analysis if tasks completed)
+                        let available_slots = max_parallelism.saturating_sub(in_flight.len());
                         info!(
-                            "Dispatching {} changes (iteration {}): {:?}",
-                            selected_changes.len(),
-                            iteration,
-                            selected_changes
+                            "Available slots after analysis: {} (max: {}, in_flight: {}, queued: {})",
+                            available_slots,
+                            max_parallelism,
+                            in_flight.len(),
+                            queued.len()
                         );
 
-                        for change_id in &selected_changes {
-                            if let Err(e) = self
-                                .dispatch_change_to_workspace(
-                                    change_id.clone(),
-                                    base_revision.clone(),
-                                    semaphore.clone(),
-                                    &mut join_set,
-                                    &mut in_flight,
-                                    &mut cleanup_guard,
-                                )
-                                .await
-                            {
-                                let message =
-                                    format!("Failed to dispatch change '{}': {}", change_id, e);
-                                self.failed_tracker.mark_failed(change_id);
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::ProcessingError {
-                                        id: change_id.clone(),
-                                        error: message.clone(),
-                                    },
-                                )
-                                .await;
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::Log(LogEntry::error(message.clone())),
-                                )
-                                .await;
-                                error!("{}", message);
+                        // Select changes to dispatch based on order and available slots
+                        let mut selected_changes: Vec<String> = Vec::new();
+                        for change_id in &analysis_result.order {
+                            if selected_changes.len() >= available_slots {
+                                break;
                             }
+
+                            // Check if change has unresolved dependencies
+                            if let Some(deps) = analysis_result.dependencies.get(change_id) {
+                                let mut all_resolved = true;
+                                for dep_id in deps {
+                                    if !self.is_dependency_resolved(dep_id).await {
+                                        all_resolved = false;
+                                        info!(
+                                            "Change '{}' blocked: waiting for dependency '{}'",
+                                            change_id, dep_id
+                                        );
+                                        break;
+                                    }
+                                }
+
+                                if !all_resolved {
+                                    continue;
+                                }
+                            }
+
+                            selected_changes.push(change_id.clone());
                         }
 
-                        // Remove dispatched changes from queued
-                        let dispatched_set: std::collections::HashSet<_> =
-                            selected_changes.iter().collect();
-                        queued.retain(|c| !dispatched_set.contains(&c.id));
+                        // Dispatch selected changes
+                        if !selected_changes.is_empty() {
+                            let base_revision = self
+                                .workspace_manager
+                                .get_current_revision()
+                                .await
+                                .map_err(OrchestratorError::from)?;
 
-                        iteration += 1;
+                            info!(
+                                "Dispatching {} changes (iteration {}): {:?}",
+                                selected_changes.len(),
+                                iteration,
+                                selected_changes
+                            );
+
+                            for change_id in &selected_changes {
+                                if let Err(e) = self
+                                    .dispatch_change_to_workspace(
+                                        change_id.clone(),
+                                        base_revision.clone(),
+                                        semaphore.clone(),
+                                        &mut join_set,
+                                        &mut in_flight,
+                                        &mut cleanup_guard,
+                                    )
+                                    .await
+                                {
+                                    let message =
+                                        format!("Failed to dispatch change '{}': {}", change_id, e);
+                                    self.failed_tracker.mark_failed(change_id);
+                                    send_event(
+                                        &self.event_tx,
+                                        ParallelEvent::ProcessingError {
+                                            id: change_id.clone(),
+                                            error: message.clone(),
+                                        },
+                                    )
+                                    .await;
+                                    send_event(
+                                        &self.event_tx,
+                                        ParallelEvent::Log(LogEntry::error(message.clone())),
+                                    )
+                                    .await;
+                                    error!("{}", message);
+                                }
+                            }
+
+                            // Remove dispatched changes from queued
+                            let dispatched_set: std::collections::HashSet<_> =
+                                selected_changes.iter().collect();
+                            queued.retain(|c| !dispatched_set.contains(&c.id));
+
+                            iteration += 1;
+                        }
+
+                        self.needs_reanalysis = false;
+                    } else {
+                        // Debounce active, wait for timer or queue notification
+                        info!("Debounce active, waiting for timer or queue notification");
                     }
-
-                    self.needs_reanalysis = false;
-                } else {
-                    // Debounce active, wait for timer or queue notification
-                    info!("Debounce active, waiting for timer or queue notification");
                 }
             }
 

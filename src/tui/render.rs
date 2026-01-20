@@ -125,7 +125,7 @@ fn render_running_mode(frame: &mut Frame, app: &mut AppState, area: Rect) {
         Constraint::Length(3),  // Header
         Constraint::Min(5),     // Changes list
         Constraint::Length(3),  // Status
-        Constraint::Length(10), // Logs
+        Constraint::Length(20), // Logs (2x height for better visibility)
     ])
     .split(area);
 
