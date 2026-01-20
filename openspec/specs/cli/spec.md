@@ -372,31 +372,27 @@ The running mode footer SHALL display a progress bar for overall processing prog
 
 ### Requirement: Processing Item Spinner Animation
 
-The TUI SHALL display an animated spinner next to items with `Processing` or `Accepting` status in running mode.
+TUI は実行中の表示を processing ではなくフェーズ別の語彙で示さなければならない（SHALL）。apply の実行中は `applying`、acceptance 実行中は `accepting`、archive 実行中は `archiving`、resolve 実行中は `resolving` を表示すること。
 
-#### Scenario: Spinner display for processing items
-- **WHEN** TUI is in running mode
-- **AND** an item has `QueueStatus::Processing`
-- **THEN** an animated spinner character is displayed before the progress percentage
-- **AND** the spinner cycles through Braille dot characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏)
-- **AND** the display format is "⠋ [XX%]" where ⠋ is the current spinner character
+#### Scenario: Applying 状態の表示
+- **GIVEN** TUI が running mode で change を処理している
+- **WHEN** apply が実行中である
+- **THEN** change のステータス表示は `applying` となる
 
-#### Scenario: Spinner display for accepting items
-- **WHEN** TUI is in running mode
-- **AND** an item has `QueueStatus::Accepting`
-- **THEN** an animated spinner character is displayed before the progress percentage
-- **AND** the spinner cycles through Braille dot characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏)
-- **AND** the display format is "⠋ [accepting]" where ⠋ is the current spinner character
+#### Scenario: Accepting 状態の表示
+- **GIVEN** TUI が running mode で change を処理している
+- **WHEN** acceptance が実行中である
+- **THEN** change のステータス表示は `accepting` となる
 
-#### Scenario: Spinner animation timing
-- **WHEN** TUI is rendering in running mode
-- **THEN** the spinner character advances to the next frame approximately every 100ms
-- **AND** the spinner cycles continuously until processing completes
+#### Scenario: Archiving 状態の表示
+- **GIVEN** TUI が running mode で change を処理している
+- **WHEN** archive が実行中である
+- **THEN** change のステータス表示は `archiving` となる
 
-#### Scenario: Spinner not shown for non-processing items
-- **WHEN** TUI is in running mode
-- **AND** an item has status other than `Processing` or `Accepting` (Queued, Completed, Error)
-- **THEN** no spinner is displayed for that item
+#### Scenario: Resolving 状態の表示
+- **GIVEN** TUI が running mode で change を処理している
+- **WHEN** resolve が実行中である
+- **THEN** change のステータス表示は `resolving` となる
 
 ### Requirement: Completion Detection Retry Settings
 
@@ -529,36 +525,19 @@ The TUI header SHALL display the application version with UTC build number in bo
 
 ### Requirement: Terminal Status Task Count Display
 
-TUI running mode SHALL display terminal states with status-only text and task counts in a separate column, avoiding redundant display.
+TUI は反復回数がある状態の表示を `status:iteration` 形式にしなければならない（SHALL）。
 
-#### Scenario: Archived state display format
-- **WHEN** a change is in `archived` status in running mode
-- **THEN** the status text SHALL be displayed as `[archived]` (without task count)
-- **AND** the status is displayed in blue color
-- **AND** task counts SHALL be displayed in a separate column as `X/Y`
+#### Scenario: Applying の iteration 表示
+- **GIVEN** change が apply 実行中である
+- **AND** apply の iteration 番号が 1 である
+- **WHEN** TUI が change 行を表示する
+- **THEN** ステータス表示は `applying:1` となる
 
-#### Scenario: Error state display format
-- **WHEN** a change is in `error` status in running mode
-- **THEN** the status text SHALL be displayed as `[error]` (without task count)
-- **AND** the status is displayed in red color
-- **AND** task counts SHALL be displayed in a separate column as `X/Y`
-
-#### Scenario: Processing state keeps progress percentage with task count
-- **WHEN** a change is in `processing` status in running mode
-- **THEN** the status text SHALL continue to display progress percentage as `⠋ [ XX%]`
-- **AND** task counts SHALL be displayed in a separate column as `X/Y`
-
-#### Scenario: Terminal states skip completed and archive immediately
-- **WHEN** a change reaches completion criteria for apply and acceptance
-- **THEN** the queue status transitions directly to `archiving` without using `completed`
-- **AND** no execution path leaves the change in a `completed` state (completed is never observable or durable)
-- **AND** the change SHALL proceed to `archiving` immediately without pausing in any intermediate state or waiting for manual action
-- **AND** completed MUST NOT be emitted as a queue status at any point
-- **AND** completion always results in archiving without manual intervention
-- **AND** no hook or retry flow can keep a change in completed state
-- **AND** there is no configuration option that re-enables completed state
-- **AND** failure to archive is handled as an error, not as a completed state
-- **AND** the running mode status text SHALL not display `[completed]`
+#### Scenario: Archiving の iteration 表示
+- **GIVEN** change が archive 実行中である
+- **AND** archive の iteration 番号が 2 である
+- **WHEN** TUI が change 行を表示する
+- **THEN** ステータス表示は `archiving:2` となる
 
 ### Requirement: TUI Archive Priority Processing
 
