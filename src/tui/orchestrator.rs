@@ -1280,17 +1280,21 @@ pub async fn run_orchestrator_parallel(
     let mut stopped_or_cancelled = false;
     let mut had_errors = false;
 
-    // Fetch changes to process using native implementation
-    let changes_to_process: Vec<Change> = list_changes_native()?
-        .into_iter()
+    // Fetch all changes for UI refresh
+    let all_changes = list_changes_native()?;
+
+    // Filter to get only changes to process
+    let changes_to_process: Vec<Change> = all_changes
+        .iter()
         .filter(|c| change_ids.contains(&c.id))
+        .cloned()
         .collect();
 
     // Send initial ChangesRefreshed event with empty worktree data
     // (Worktree data will be populated during parallel execution)
     let _ = tx
         .send(OrchestratorEvent::ChangesRefreshed {
-            changes: changes_to_process.clone(),
+            changes: all_changes,
             committed_change_ids: HashSet::new(),
             worktree_change_ids: HashSet::new(),
             worktree_paths: HashMap::new(),

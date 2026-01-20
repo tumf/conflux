@@ -1339,7 +1339,7 @@ mod tests {
             config.get_acceptance_max_continues(),
             DEFAULT_ACCEPTANCE_MAX_CONTINUES
         );
-        assert_eq!(config.get_acceptance_max_continues(), 2);
+        assert_eq!(config.get_acceptance_max_continues(), 10);
     }
 
     #[test]

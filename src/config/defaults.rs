@@ -187,7 +187,7 @@ pub const DEFAULT_ERROR_CIRCUIT_BREAKER_ENABLED: bool = true;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_THRESHOLD: usize = 5;
 
 /// Default maximum number of acceptance CONTINUE retries before treating as FAIL
-pub const DEFAULT_ACCEPTANCE_MAX_CONTINUES: u32 = 2;
+pub const DEFAULT_ACCEPTANCE_MAX_CONTINUES: u32 = 10;
 
 /// Default enablement for merge stall detection
 pub const DEFAULT_MERGE_STALL_DETECTION_ENABLED: bool = true;
