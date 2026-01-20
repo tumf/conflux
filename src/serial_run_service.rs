@@ -13,17 +13,15 @@
 //! The actual orchestration loop remains in the orchestrators for now,
 //! as they have mode-specific concerns (WIP commits for CLI, DynamicQueue for TUI).
 
-// Allow dead code for infrastructure that will be used in future refactoring iterations
-#![allow(dead_code)]
-
 use crate::agent::AgentRunner;
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::{
-    acceptance_test_streaming, apply_change, archive_change, update_tasks_on_acceptance_failure,
-    AcceptanceResult, ApplyContext, ApplyResult, ArchiveContext, ArchiveResult, OutputHandler,
+    acceptance_test_streaming, apply_change_streaming, archive_change,
+    update_tasks_on_acceptance_failure, AcceptanceResult, ApplyContext, ApplyResult,
+    ArchiveContext, ArchiveResult, OutputHandler,
 };
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser::TaskProgress;
@@ -80,21 +78,25 @@ impl SerialRunService {
     }
 
     /// Get the repository root path
+    #[allow(dead_code)] // Reserved for future TUI integration
     pub fn repo_root(&self) -> &PathBuf {
         &self.repo_root
     }
 
     /// Get the current iteration number
+    #[allow(dead_code)] // Reserved for future TUI integration
     pub fn iteration(&self) -> u32 {
         self.iteration
     }
 
     /// Get the number of changes processed
+    #[allow(dead_code)] // Reserved for future TUI integration
     pub fn changes_processed(&self) -> usize {
         self.changes_processed
     }
 
     /// Get the current change ID being processed
+    #[allow(dead_code)] // Reserved for future TUI integration
     pub fn current_change_id(&self) -> Option<&String> {
         self.current_change_id.as_ref()
     }
@@ -247,7 +249,7 @@ impl SerialRunService {
                 total_changes,
                 remaining_changes,
                 apply_count,
-                cancel_check,
+                &cancel_check,
             )
             .await
         }
@@ -324,7 +326,7 @@ impl SerialRunService {
 
     /// Internal method to apply a change
     #[allow(clippy::too_many_arguments)]
-    async fn apply_change_internal<O: OutputHandler>(
+    async fn apply_change_internal<O: OutputHandler, F>(
         &mut self,
         change: &Change,
         agent: &mut AgentRunner,
@@ -333,8 +335,11 @@ impl SerialRunService {
         total_changes: usize,
         remaining_changes: usize,
         apply_count: u32,
-        cancel_check: impl Fn() -> bool,
-    ) -> Result<ChangeProcessResult> {
+        cancel_check: &F,
+    ) -> Result<ChangeProcessResult>
+    where
+        F: Fn() -> bool,
+    {
         info!("Applying change: {}", change.id);
 
         // Increment apply count
@@ -348,7 +353,7 @@ impl SerialRunService {
             new_apply_count,
         );
 
-        match apply_change(change, agent, hooks, &apply_ctx, output).await {
+        match apply_change_streaming(change, agent, hooks, &apply_ctx, output, cancel_check).await {
             Ok(ApplyResult::Success) => {
                 // Re-fetch change to get updated task counts after apply
                 let updated_changes = openspec::list_changes_native().unwrap_or_default();
@@ -363,8 +368,10 @@ impl SerialRunService {
                     );
 
                     // Run acceptance test
-                    match acceptance_test_streaming(&updated_change, agent, output, cancel_check)
-                        .await
+                    match acceptance_test_streaming(&updated_change, agent, output, || {
+                        cancel_check()
+                    })
+                    .await
                     {
                         Ok(AcceptanceResult::Pass) => {
                             info!("Acceptance passed for {}, ready for archive", change.id);
@@ -448,12 +455,14 @@ impl SerialRunService {
     }
 
     /// Run on_start hook
+    #[allow(dead_code)] // Reserved for future TUI integration
     pub async fn run_start_hook(&self, hooks: &HookRunner, total_changes: usize) -> Result<()> {
         let start_context = HookContext::new(0, total_changes, total_changes, false);
         hooks.run_hook(HookType::OnStart, &start_context).await
     }
 
     /// Run on_finish hook
+    #[allow(dead_code)] // Reserved for future TUI integration
     pub async fn run_finish_hook(
         &self,
         hooks: &HookRunner,
@@ -466,6 +475,7 @@ impl SerialRunService {
     }
 
     /// Check if max iterations limit is reached
+    #[allow(dead_code)] // Reserved for future TUI integration
     pub fn check_iteration_limit(&self, max_iterations: u32) -> IterationLimitStatus {
         if max_iterations == 0 {
             return IterationLimitStatus::NoLimit;
@@ -516,6 +526,7 @@ impl SerialRunService {
 
 /// Result of processing a single change
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Some variants may not be used yet depending on mode
 pub enum ChangeProcessResult {
     /// Change was successfully archived
     Archived,
@@ -543,6 +554,7 @@ pub enum ChangeProcessResult {
 
 /// Status of iteration limit check
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Reserved for future use
 pub enum IterationLimitStatus {
     /// No iteration limit configured
     NoLimit,
