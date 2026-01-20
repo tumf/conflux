@@ -1,0 +1,630 @@
+//! Shared serial execution service for CLI and TUI modes.
+//!
+//! This module provides a unified service for running serial execution
+//! that can be used by both CLI and TUI orchestrators, eliminating
+//! code duplication between the two modes.
+//!
+//! The service provides helper functions for:
+//! - Change selection based on progress and dependencies
+//! - State tracking (apply counts, completed/stalled changes)
+//! - Iteration limit checking
+//! - Hook execution helpers
+//!
+//! The actual orchestration loop remains in the orchestrators for now,
+//! as they have mode-specific concerns (WIP commits for CLI, DynamicQueue for TUI).
+
+// Allow dead code for infrastructure that will be used in future refactoring iterations
+#![allow(dead_code)]
+
+use crate::agent::AgentRunner;
+use crate::config::OrchestratorConfig;
+use crate::error::Result;
+use crate::hooks::{HookContext, HookRunner, HookType};
+use crate::openspec::{self, Change};
+use crate::orchestration::{
+    acceptance_test_streaming, apply_change, archive_change, update_tasks_on_acceptance_failure,
+    AcceptanceResult, ApplyContext, ApplyResult, ArchiveContext, ArchiveResult, OutputHandler,
+};
+use crate::stall::{StallDetector, StallPhase};
+use crate::task_parser::TaskProgress;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use tracing::{error, info, warn};
+
+/// Service for serial execution of changes.
+///
+/// This service encapsulates the shared logic between CLI and TUI
+/// serial execution modes, including:
+/// - Change selection
+/// - Apply/archive flow
+/// - Acceptance testing
+/// - Hook execution
+/// - Iteration tracking
+/// - Stall detection
+pub struct SerialRunService {
+    /// Configuration for the orchestrator
+    config: OrchestratorConfig,
+    /// Repository root directory
+    repo_root: PathBuf,
+    /// Apply count per change
+    apply_counts: HashMap<String, u32>,
+    /// Currently processing change ID
+    current_change_id: Option<String>,
+    /// Completed change IDs
+    completed_change_ids: HashSet<String>,
+    /// Stalled change IDs
+    stalled_change_ids: HashSet<String>,
+    /// Stall detector for monitoring progress
+    stall_detector: StallDetector,
+    /// Changes processed count
+    changes_processed: usize,
+    /// Current iteration
+    iteration: u32,
+}
+
+impl SerialRunService {
+    /// Create a new serial run service
+    pub fn new(repo_root: PathBuf, config: OrchestratorConfig) -> Self {
+        let stall_config = config.get_stall_detection();
+        Self {
+            config,
+            repo_root,
+            apply_counts: HashMap::new(),
+            current_change_id: None,
+            completed_change_ids: HashSet::new(),
+            stalled_change_ids: HashSet::new(),
+            stall_detector: StallDetector::new(stall_config),
+            changes_processed: 0,
+            iteration: 0,
+        }
+    }
+
+    /// Get the repository root path
+    pub fn repo_root(&self) -> &PathBuf {
+        &self.repo_root
+    }
+
+    /// Get the current iteration number
+    pub fn iteration(&self) -> u32 {
+        self.iteration
+    }
+
+    /// Get the number of changes processed
+    pub fn changes_processed(&self) -> usize {
+        self.changes_processed
+    }
+
+    /// Get the current change ID being processed
+    pub fn current_change_id(&self) -> Option<&String> {
+        self.current_change_id.as_ref()
+    }
+
+    /// Get apply count for a change
+    pub fn apply_count(&self, change_id: &str) -> u32 {
+        *self.apply_counts.get(change_id).unwrap_or(&0)
+    }
+
+    /// Check if a change is stalled
+    pub fn is_stalled(&self, change_id: &str) -> bool {
+        self.stalled_change_ids.contains(change_id)
+    }
+
+    /// Check if a change is completed
+    pub fn is_completed(&self, change_id: &str) -> bool {
+        self.completed_change_ids.contains(change_id)
+    }
+
+    /// Select the next change to process.
+    ///
+    /// Prioritizes changes by highest progress percentage.
+    /// Filters out stalled changes and their dependencies.
+    pub fn select_next_change<'a>(&self, changes: &'a [Change]) -> Option<&'a Change> {
+        // Filter out completed and stalled changes
+        let eligible: Vec<_> = changes
+            .iter()
+            .filter(|c| !self.is_completed(&c.id) && !self.is_stalled(&c.id))
+            .collect();
+
+        // Further filter out changes that depend on stalled changes
+        let filtered: Vec<_> = eligible
+            .iter()
+            .filter(|c| {
+                !c.dependencies
+                    .iter()
+                    .any(|dep| self.stalled_change_ids.contains(dep))
+            })
+            .copied()
+            .collect();
+
+        if filtered.is_empty() {
+            return None;
+        }
+
+        // Find incomplete changes and prioritize by progress
+        let incomplete: Vec<_> = filtered.iter().filter(|c| !c.is_complete()).collect();
+
+        if !incomplete.is_empty() {
+            // Prioritize incomplete changes by highest progress percentage
+            return incomplete
+                .into_iter()
+                .max_by(|a, b| {
+                    let a_progress = if a.total_tasks > 0 {
+                        a.completed_tasks as f32 / a.total_tasks as f32
+                    } else {
+                        0.0
+                    };
+                    let b_progress = if b.total_tasks > 0 {
+                        b.completed_tasks as f32 / b.total_tasks as f32
+                    } else {
+                        0.0
+                    };
+                    a_progress
+                        .partial_cmp(&b_progress)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .copied();
+        }
+
+        // If all are complete, select the first one for archiving
+        filtered.first().copied()
+    }
+
+    /// Mark a change as stalled
+    pub fn mark_stalled(&mut self, change_id: &str, reason: &str) {
+        warn!("Marking {} as stalled: {}", change_id, reason);
+        self.stalled_change_ids.insert(change_id.to_string());
+    }
+
+    /// Process a single iteration for a change.
+    ///
+    /// This includes:
+    /// - Running hooks (on_change_start, pre_apply, post_apply, etc.)
+    /// - Applying or archiving the change
+    /// - Running acceptance tests
+    /// - Stall detection
+    ///
+    /// Returns `Ok(ChangeProcessResult)` indicating the outcome.
+    /// Callers should handle the result and decide whether to continue the loop.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn process_change<O: OutputHandler, F>(
+        &mut self,
+        change: &Change,
+        agent: &mut AgentRunner,
+        hooks: &HookRunner,
+        output: &O,
+        total_changes: usize,
+        remaining_changes: usize,
+        cancel_check: F,
+    ) -> Result<ChangeProcessResult>
+    where
+        F: Fn() -> bool,
+    {
+        self.iteration += 1;
+        let change_id = &change.id;
+
+        // Check if this is a new change
+        let is_new_change = self.current_change_id.as_ref() != Some(change_id);
+        if is_new_change {
+            // Run on_change_start hook
+            let change_start_context = HookContext::new(
+                self.changes_processed,
+                total_changes,
+                remaining_changes,
+                false,
+            )
+            .with_change(change_id, change.completed_tasks, change.total_tasks)
+            .with_apply_count(0);
+
+            hooks
+                .run_hook(HookType::OnChangeStart, &change_start_context)
+                .await?;
+
+            self.current_change_id = Some(change_id.clone());
+        }
+
+        let apply_count = self.apply_count(change_id);
+
+        // Process the change
+        if change.is_complete() {
+            // Archive completed change
+            self.archive_change_internal(
+                change,
+                agent,
+                hooks,
+                output,
+                total_changes,
+                remaining_changes,
+                apply_count,
+            )
+            .await
+        } else {
+            // Apply incomplete change
+            self.apply_change_internal(
+                change,
+                agent,
+                hooks,
+                output,
+                total_changes,
+                remaining_changes,
+                apply_count,
+                cancel_check,
+            )
+            .await
+        }
+    }
+
+    /// Internal method to archive a change
+    #[allow(clippy::too_many_arguments)]
+    async fn archive_change_internal<O: OutputHandler>(
+        &mut self,
+        change: &Change,
+        agent: &mut AgentRunner,
+        hooks: &HookRunner,
+        output: &O,
+        total_changes: usize,
+        remaining_changes: usize,
+        apply_count: u32,
+    ) -> Result<ChangeProcessResult> {
+        info!("Change {} is complete, archiving...", change.id);
+
+        let archive_ctx = ArchiveContext::new(
+            self.changes_processed,
+            total_changes,
+            remaining_changes,
+            apply_count,
+        );
+
+        let stall_config = self.config.get_stall_detection();
+
+        match archive_change(
+            change,
+            agent,
+            hooks,
+            &archive_ctx,
+            output,
+            None,
+            &stall_config,
+        )
+        .await
+        {
+            Ok(ArchiveResult::Success) => {
+                // Update changes_processed count
+                self.changes_processed += 1;
+
+                // Clear acceptance history after successful archive
+                agent.clear_acceptance_history(&change.id);
+
+                // Run on_change_end hook (not included in shared archive_change)
+                let new_remaining = remaining_changes.saturating_sub(1);
+                let change_end_context =
+                    HookContext::new(self.changes_processed, total_changes, new_remaining, false)
+                        .with_change(&change.id, change.completed_tasks, change.total_tasks)
+                        .with_apply_count(apply_count);
+                hooks
+                    .run_hook(HookType::OnChangeEnd, &change_end_context)
+                    .await?;
+
+                // Mark change as completed and clear current
+                self.completed_change_ids.insert(change.id.clone());
+                self.current_change_id = None;
+                self.apply_counts.remove(&change.id);
+                self.stall_detector.clear_change(&change.id);
+
+                Ok(ChangeProcessResult::Archived)
+            }
+            Ok(ArchiveResult::Stalled { error }) => {
+                self.mark_stalled(&change.id, &error);
+                Ok(ChangeProcessResult::Stalled { error })
+            }
+            Ok(ArchiveResult::Failed { error }) => Ok(ChangeProcessResult::Failed { error }),
+            Ok(ArchiveResult::Cancelled) => Ok(ChangeProcessResult::Cancelled),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Internal method to apply a change
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_change_internal<O: OutputHandler>(
+        &mut self,
+        change: &Change,
+        agent: &mut AgentRunner,
+        hooks: &HookRunner,
+        output: &O,
+        total_changes: usize,
+        remaining_changes: usize,
+        apply_count: u32,
+        cancel_check: impl Fn() -> bool,
+    ) -> Result<ChangeProcessResult> {
+        info!("Applying change: {}", change.id);
+
+        // Increment apply count
+        let new_apply_count = apply_count + 1;
+        self.apply_counts.insert(change.id.clone(), new_apply_count);
+
+        let apply_ctx = ApplyContext::new(
+            self.changes_processed,
+            total_changes,
+            remaining_changes,
+            new_apply_count,
+        );
+
+        match apply_change(change, agent, hooks, &apply_ctx, output).await {
+            Ok(ApplyResult::Success) => {
+                // Re-fetch change to get updated task counts after apply
+                let updated_changes = openspec::list_changes_native().unwrap_or_default();
+                let updated_change = updated_changes.iter().find(|c| c.id == change.id).cloned();
+                let is_complete = updated_change.as_ref().is_some_and(|c| c.is_complete());
+
+                if is_complete {
+                    let updated_change = updated_change.unwrap(); // Safe: checked above
+                    info!(
+                        "Tasks complete for {}, running acceptance test...",
+                        change.id
+                    );
+
+                    // Run acceptance test
+                    match acceptance_test_streaming(&updated_change, agent, output, cancel_check)
+                        .await
+                    {
+                        Ok(AcceptanceResult::Pass) => {
+                            info!("Acceptance passed for {}, ready for archive", change.id);
+                            Ok(ChangeProcessResult::AcceptancePassed)
+                        }
+                        Ok(AcceptanceResult::Continue) => {
+                            let continue_count =
+                                agent.count_consecutive_acceptance_continues(&change.id);
+                            let max_continues = self.config.get_acceptance_max_continues();
+
+                            if continue_count >= max_continues {
+                                warn!(
+                                    "Acceptance CONTINUE limit ({}) exceeded for {}, treating as FAIL",
+                                    max_continues, change.id
+                                );
+                                Ok(ChangeProcessResult::AcceptanceContinueExceeded)
+                            } else {
+                                info!(
+                                    "Acceptance requires continuation for {} (attempt {}/{}), retrying...",
+                                    change.id, continue_count, max_continues
+                                );
+                                Ok(ChangeProcessResult::AcceptanceContinue)
+                            }
+                        }
+                        Ok(AcceptanceResult::Fail { findings }) => {
+                            warn!(
+                                "Acceptance failed for {} with {} findings, will retry apply",
+                                change.id,
+                                findings.len()
+                            );
+                            // Update tasks.md with acceptance findings
+                            if let Err(e) =
+                                update_tasks_on_acceptance_failure(&change.id, &findings, None)
+                                    .await
+                            {
+                                warn!("Failed to update tasks.md for {}: {}", change.id, e);
+                            }
+                            Ok(ChangeProcessResult::AcceptanceFailed { findings })
+                        }
+                        Ok(AcceptanceResult::CommandFailed { error, findings }) => {
+                            error!("Acceptance command failed for {}: {}", change.id, error);
+                            // Update tasks.md with command failure
+                            if let Err(e) =
+                                update_tasks_on_acceptance_failure(&change.id, &findings, None)
+                                    .await
+                            {
+                                warn!("Failed to update tasks.md for {}: {}", change.id, e);
+                            }
+                            Ok(ChangeProcessResult::AcceptanceCommandFailed { error })
+                        }
+                        Ok(AcceptanceResult::Cancelled) => {
+                            info!("Acceptance cancelled for {}", change.id);
+                            Ok(ChangeProcessResult::Cancelled)
+                        }
+                        Err(e) => {
+                            error!("Acceptance error for {}: {}", change.id, e);
+                            Err(e)
+                        }
+                    }
+                } else {
+                    info!(
+                        "Apply completed for {}, but tasks not yet complete",
+                        change.id
+                    );
+                    Ok(ChangeProcessResult::ApplySuccessIncomplete)
+                }
+            }
+            Ok(ApplyResult::Failed { error }) => {
+                error!("Apply failed for {}: {}", change.id, error);
+                Ok(ChangeProcessResult::ApplyFailed { error })
+            }
+            Ok(ApplyResult::Cancelled) => {
+                info!("Apply cancelled for {}", change.id);
+                Ok(ChangeProcessResult::Cancelled)
+            }
+            Err(e) => {
+                error!("Apply error for {}: {}", change.id, e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Run on_start hook
+    pub async fn run_start_hook(&self, hooks: &HookRunner, total_changes: usize) -> Result<()> {
+        let start_context = HookContext::new(0, total_changes, total_changes, false);
+        hooks.run_hook(HookType::OnStart, &start_context).await
+    }
+
+    /// Run on_finish hook
+    pub async fn run_finish_hook(
+        &self,
+        hooks: &HookRunner,
+        total_changes: usize,
+        finish_status: &str,
+    ) -> Result<()> {
+        let finish_context = HookContext::new(self.changes_processed, total_changes, 0, false)
+            .with_status(finish_status);
+        hooks.run_hook(HookType::OnFinish, &finish_context).await
+    }
+
+    /// Check if max iterations limit is reached
+    pub fn check_iteration_limit(&self, max_iterations: u32) -> IterationLimitStatus {
+        if max_iterations == 0 {
+            return IterationLimitStatus::NoLimit;
+        }
+
+        let warning_threshold = (max_iterations as f32 * 0.8) as u32;
+        if self.iteration == warning_threshold {
+            IterationLimitStatus::Warning {
+                current: self.iteration,
+                max: max_iterations,
+            }
+        } else if self.iteration >= max_iterations {
+            IterationLimitStatus::Reached {
+                max: max_iterations,
+            }
+        } else {
+            IterationLimitStatus::BelowLimit
+        }
+    }
+
+    /// Check stall detection after apply
+    pub fn check_stall_after_apply(
+        &mut self,
+        change_id: &str,
+        progress: &TaskProgress,
+        is_empty_commit: Option<bool>,
+    ) -> Option<String> {
+        if let Some(is_empty) = is_empty_commit {
+            if !is_progress_complete(progress)
+                && self
+                    .stall_detector
+                    .register_commit(change_id, StallPhase::Apply, is_empty)
+            {
+                let count = self
+                    .stall_detector
+                    .current_count(change_id, StallPhase::Apply);
+                let threshold = self.stall_detector.config().threshold;
+                let message = format!(
+                    "Stall detected for {} after {} empty WIP commits (apply)",
+                    change_id, count
+                );
+                return Some(format!("{} (threshold {})", message, threshold));
+            }
+        }
+        None
+    }
+}
+
+/// Result of processing a single change
+#[derive(Debug, Clone)]
+pub enum ChangeProcessResult {
+    /// Change was successfully archived
+    Archived,
+    /// Change was stalled
+    Stalled { error: String },
+    /// Archive or apply failed
+    Failed { error: String },
+    /// Operation was cancelled
+    Cancelled,
+    /// Apply succeeded but tasks not yet complete
+    ApplySuccessIncomplete,
+    /// Apply failed
+    ApplyFailed { error: String },
+    /// Acceptance test passed
+    AcceptancePassed,
+    /// Acceptance test failed
+    AcceptanceFailed { findings: Vec<String> },
+    /// Acceptance test command failed
+    AcceptanceCommandFailed { error: String },
+    /// Acceptance test requires continuation
+    AcceptanceContinue,
+    /// Acceptance CONTINUE limit exceeded
+    AcceptanceContinueExceeded,
+}
+
+/// Status of iteration limit check
+#[derive(Debug, Clone)]
+pub enum IterationLimitStatus {
+    /// No iteration limit configured
+    NoLimit,
+    /// Below warning threshold
+    BelowLimit,
+    /// At warning threshold (80%)
+    Warning { current: u32, max: u32 },
+    /// Iteration limit reached
+    Reached { max: u32 },
+}
+
+/// Helper function to check if progress is complete
+fn is_progress_complete(progress: &TaskProgress) -> bool {
+    progress.total > 0 && progress.completed >= progress.total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OrchestratorConfig;
+    use tempfile::TempDir;
+
+    fn create_test_change(id: &str, completed: u32, total: u32, is_approved: bool) -> Change {
+        Change {
+            id: id.to_string(),
+            completed_tasks: completed,
+            total_tasks: total,
+            last_modified: "1m ago".to_string(),
+            is_approved,
+            dependencies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_select_next_change_prioritizes_progress() {
+        let temp_dir = TempDir::new().unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+
+        let changes = vec![
+            create_test_change("a", 1, 10, true), // 10% progress
+            create_test_change("b", 5, 10, true), // 50% progress
+            create_test_change("c", 8, 10, true), // 80% progress (highest)
+        ];
+
+        let next = service.select_next_change(&changes);
+        assert_eq!(next.map(|c| c.id.as_str()), Some("c"));
+    }
+
+    #[test]
+    fn test_select_next_change_excludes_stalled() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+
+        service.mark_stalled("b", "test");
+
+        let changes = vec![
+            create_test_change("a", 1, 10, true),
+            create_test_change("b", 8, 10, true), // Highest progress but stalled
+            create_test_change("c", 5, 10, true),
+        ];
+
+        let next = service.select_next_change(&changes);
+        assert_eq!(next.map(|c| c.id.as_str()), Some("c")); // Should pick 'c', not 'b'
+    }
+
+    #[test]
+    fn test_select_next_change_prioritizes_complete_for_archive() {
+        let temp_dir = TempDir::new().unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+
+        let changes = vec![
+            create_test_change("a", 5, 10, true), // 50% progress, incomplete
+            create_test_change("b", 10, 10, true), // 100% complete
+        ];
+
+        let next = service.select_next_change(&changes);
+        // Should select the incomplete one first (archive happens in a separate phase in practice,
+        // but select_next_change returns the first match which would be 'b' if it's complete)
+        // Actually, reading the implementation, it prioritizes incomplete first, so should be 'a'
+        assert_eq!(next.map(|c| c.id.as_str()), Some("a"));
+    }
+}

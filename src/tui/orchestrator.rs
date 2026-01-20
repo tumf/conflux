@@ -11,6 +11,7 @@ use crate::orchestration::acceptance::{
     acceptance_test_streaming, update_tasks_on_acceptance_failure, AcceptanceResult,
 };
 use crate::orchestration::output::{ChannelOutputHandler, OutputMessage};
+use crate::serial_run_service::SerialRunService;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -520,7 +521,11 @@ pub async fn run_orchestrator(
     let hooks = HookRunner::new(config.get_hooks());
     let max_iterations = config.get_max_iterations();
     let acceptance_max_continues = config.get_acceptance_max_continues();
-    let mut agent = AgentRunner::new(config);
+    let mut agent = AgentRunner::new(config.clone());
+
+    // Create serial run service for shared state and helpers
+    let repo_root = std::env::current_dir()?;
+    let serial_service = SerialRunService::new(repo_root, config);
 
     let mut total_changes = change_ids.len();
     let mut iteration: u32 = 0;
@@ -681,26 +686,15 @@ pub async fn run_orchestrator(
         // Fetch current state to find best candidate using native implementation
         let changes = openspec::list_changes_native()?;
 
-        // Find the next incomplete change from our pending set
-        // Prioritize by highest progress percentage
-        let next_change = changes
+        // Filter to changes in pending set and not complete
+        let eligible_changes: Vec<_> = changes
             .iter()
             .filter(|c| pending_changes.contains(&c.id) && !c.is_complete())
-            .max_by(|a, b| {
-                let a_progress = if a.total_tasks > 0 {
-                    a.completed_tasks as f32 / a.total_tasks as f32
-                } else {
-                    0.0
-                };
-                let b_progress = if b.total_tasks > 0 {
-                    b.completed_tasks as f32 / b.total_tasks as f32
-                } else {
-                    0.0
-                };
-                a_progress
-                    .partial_cmp(&b_progress)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            .cloned()
+            .collect();
+
+        // Use serial service for change selection
+        let next_change = serial_service.select_next_change(&eligible_changes);
 
         let Some(change) = next_change else {
             // No incomplete changes found - might all be complete now

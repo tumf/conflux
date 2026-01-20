@@ -20,6 +20,7 @@ mod parallel;
 mod parallel_run_service;
 mod process_manager;
 mod progress;
+mod serial_run_service;
 mod spec_delta;
 #[cfg(test)]
 mod spec_test_annotations;

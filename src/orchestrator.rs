@@ -8,12 +8,12 @@ use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::state::OrchestratorState;
 use crate::orchestration::{
-    acceptance_test_streaming, apply_change, archive_change, selection,
-    update_tasks_on_acceptance_failure, AcceptanceResult, ApplyContext, ApplyResult,
-    ArchiveContext, ArchiveResult, LogOutputHandler,
+    acceptance_test_streaming, apply_change, archive_change, update_tasks_on_acceptance_failure,
+    AcceptanceResult, ApplyContext, ApplyResult, ArchiveContext, ArchiveResult, LogOutputHandler,
 };
 use crate::parallel_run_service::ParallelRunService;
 use crate::progress::ProgressDisplay;
+use crate::serial_run_service::SerialRunService;
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser::TaskProgress;
 use crate::tui::log_deduplicator;
@@ -306,6 +306,10 @@ impl Orchestrator {
 
         let total_changes = filtered_initial.len();
 
+        // Create serial run service for shared state and helpers
+        let repo_root = std::env::current_dir()?;
+        let mut serial_service = SerialRunService::new(repo_root, self.config.clone());
+
         // Run on_start hook
         let start_context = HookContext::new(0, total_changes, total_changes, false);
         self.hooks
@@ -376,12 +380,16 @@ impl Orchestrator {
                 break;
             }
 
-            // Select next change to process
-            let next = self.select_next_change(&eligible_changes).await?;
+            // Select next change to process using serial service
+            let next = serial_service
+                .select_next_change(&eligible_changes)
+                .ok_or_else(|| {
+                    OrchestratorError::AgentCommand("No eligible change found".to_string())
+                })?;
             info!("Selected change: {}", next.id);
 
             if let Some(progress) = &mut self.progress {
-                progress.update_change(&next);
+                progress.update_change(next);
             }
 
             // Check if this is a new change (for on_change_start hook)
@@ -427,7 +435,7 @@ impl Orchestrator {
                 let stall_config = self.config.get_stall_detection();
 
                 match archive_change(
-                    &next,
+                    next,
                     &mut self.agent,
                     &self.hooks,
                     &archive_ctx,
@@ -476,6 +484,7 @@ impl Orchestrator {
                     Ok(ArchiveResult::Stalled { error }) => {
                         warn!("Archive stalled for {}: {}", next.id, error);
                         self.mark_change_stalled(&next.id, &error);
+                        serial_service.mark_stalled(&next.id, &error);
                         continue;
                     }
                     Ok(ArchiveResult::Failed { error }) => {
@@ -520,7 +529,7 @@ impl Orchestrator {
                 );
                 let output = LogOutputHandler::new();
 
-                match apply_change(&next, &mut self.agent, &self.hooks, &apply_ctx, &output).await {
+                match apply_change(next, &mut self.agent, &self.hooks, &apply_ctx, &output).await {
                     Ok(ApplyResult::Success) => {
                         // Update shared state: apply completed
                         self.shared_state.write().await.apply_execution_event(
@@ -564,6 +573,7 @@ impl Orchestrator {
                                 );
                                 warn!("{} (threshold {})", message, threshold);
                                 self.mark_change_stalled(&next.id, &message);
+                                serial_service.mark_stalled(&next.id, &message);
                                 continue;
                             }
                         }
@@ -579,7 +589,7 @@ impl Orchestrator {
                             let cancel_check = || false; // No cancellation in CLI mode
 
                             match acceptance_test_streaming(
-                                &next,
+                                next,
                                 &mut self.agent,
                                 &output,
                                 cancel_check,
@@ -670,6 +680,7 @@ impl Orchestrator {
                             );
                             warn!("{}", message);
                             self.mark_change_stalled(&next.id, &message);
+                            serial_service.mark_stalled(&next.id, &message);
                             continue;
                         }
 
@@ -806,13 +817,6 @@ impl Orchestrator {
     /// Select the next change to process.
     ///
     /// Uses the shared selection module which provides:
-    /// 1. Complete changes first (ready for archive)
-    /// 2. LLM-based selection (via agent)
-    /// 3. Fallback to highest progress
-    async fn select_next_change(&self, changes: &[Change]) -> Result<Change> {
-        selection::select_next_change(changes, Some(&self.agent)).await
-    }
-
     /// Filter changes to only include those present in the initial snapshot.
     /// Returns an empty vector if no snapshot was captured.
     fn filter_to_snapshot(&self, changes: &[Change]) -> Vec<Change> {
