@@ -55,18 +55,29 @@ IMPORTANT: Only review the specific change "{change_id}".
 Do NOT review or report on other changes in openspec/changes/.
 
 Review the implementation to verify it meets the specification requirements.
-You MUST validate real integration, not just existence of functions or files.
 
 Required checks:
-1. All tasks in openspec/changes/{change_id}/tasks.md are completed (marked with [x])
+1. All tasks in openspec/changes/{change_id}/tasks.md are completed (marked with [x]) or moved to Future Work section
 2. Implementation matches the specification in openspec/changes/{change_id}/specs/
-3. Code quality and test coverage are adequate
-4. No obvious bugs or issues
-5. Integration check: confirm the feature is actually executed in the real flow.
+3. Integration check: confirm the feature is actually executed in the real flow.
    - Identify the concrete call path(s) from entry point to the feature.
    - If the feature is not referenced by production code paths, it is a FAIL.
-6. Dead code check: if code exists but is not invoked by the CLI/TUI/parallel flow described in spec, it is a FAIL.
-7. Evidence: cite at least one file path + function/method where the integration happens.
+4. Dead code check: if code exists but is not invoked by the CLI/TUI/parallel flow described in spec, it is a FAIL.
+5. Evidence: cite at least one file path + function/method where the integration happens.
+
+Do NOT include in FINDINGS:
+- Subjective quality assessments (e.g., "code quality could be better", "naming is unclear")
+- Test coverage opinions without specific missing test cases (e.g., "test coverage is low")
+- Suggestions for improvements not in the original spec (e.g., "consider adding feature X")
+- Tasks that require human judgment (e.g., "needs design review", "verify UX is acceptable")
+- Tasks that require external systems (e.g., "deploy to production", "configure CI/CD")
+- Tasks that require long-wait verification (e.g., "monitor for a week", "wait for user feedback")
+
+FINDINGS format requirements:
+- Each finding MUST include concrete evidence (file path, function name, line number if relevant)
+- Each finding MUST be actionable by the AI agent autonomously
+- Bad: "Integration is incomplete" (vague, no evidence)
+- Good: "src/orchestrator.rs: run_loop() does not call acceptance_test() - missing call at line 150"
 
 Output format:
 - If all checks pass: Output "ACCEPTANCE: PASS"
@@ -81,9 +92,9 @@ Example of FAIL:
 ```
 ACCEPTANCE: FAIL
 FINDINGS:
-- Acceptance module exists but is never called from the orchestrator run loop
-- Parallel execution does not invoke acceptance between apply and archive
-- Code does not handle error case X
+- Task 2.3 "Add acceptance test integration" in tasks.md is marked [ ] but not implemented
+- src/orchestrator.rs: run_loop() (line 142-180) does not call acceptance_test_streaming() between apply and archive
+- src/parallel/executor.rs: execute_change() calls apply() at line 95 but never calls acceptance before archive() at line 120
 ```
 "#;
 
