@@ -16,9 +16,12 @@ use crate::tui::types::QueueStatus;
 impl AppState {
     /// Update changes from a refresh
     ///
-    /// IMPORTANT: This method only updates task progress (completed_tasks, total_tasks).
-    /// It does NOT modify queue_status. In Stopped mode, task completion does not
-    /// trigger auto-queue. Changes are only queued through explicit user action (Space key).
+    /// Updates task progress (completed_tasks, total_tasks) from fetched changes and
+    /// enriches change metadata from shared orchestration state when available (apply counts,
+    /// pending/archived tracking).
+    ///
+    /// IMPORTANT: This method does NOT modify queue_status. In Stopped mode, task completion
+    /// does not trigger auto-queue. Changes are only queued through explicit user action (Space key).
     pub fn update_changes(&mut self, fetched_changes: Vec<Change>) {
         // Detect new changes
         let new_ids: Vec<String> = fetched_changes
@@ -107,6 +110,21 @@ impl AppState {
 
         self.new_change_count = self.changes.iter().filter(|c| c.is_new).count();
         self.last_refresh = Instant::now();
+
+        // Enrich change metadata from shared orchestration state if available
+        // This provides apply counts (iteration_number) for display
+        if let Some(shared_state) = &self.shared_orchestrator_state {
+            // Attempt to read shared state, but don't block if lock is held
+            if let Ok(guard) = shared_state.try_read() {
+                for change in &mut self.changes {
+                    // Set iteration_number from apply_count if available
+                    let apply_count = guard.apply_count(&change.id);
+                    if apply_count > 0 {
+                        change.iteration_number = Some(apply_count);
+                    }
+                }
+            }
+        }
 
         // Remove changes that no longer exist (have been archived externally)
         let current_ids: HashSet<String> = fetched_changes.iter().map(|c| c.id.clone()).collect();

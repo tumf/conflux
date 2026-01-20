@@ -2,6 +2,17 @@
 //!
 //! This module contains AppState and ChangeState implementations,
 //! organized into submodules by responsibility.
+//!
+//! ## Shared State Integration
+//!
+//! The TUI can reference the shared orchestration state from `crate::orchestration::state::OrchestratorState`
+//! for unified state tracking across TUI and Web interfaces. The shared state provides:
+//! - Pending/archived change tracking
+//! - Apply count tracking per change
+//! - Current change being processed
+//! - Iteration counters
+//!
+//! Both TUI and Web states are updated via `ExecutionEvent` messages, ensuring consistency.
 
 mod change;
 mod events;
@@ -100,6 +111,10 @@ pub struct AppState {
     pub is_resolving: bool,
     /// Map of change_id to worktree path for active worktrees (for progress fallback)
     pub worktree_paths: HashMap<String, PathBuf>,
+    /// Reference to shared orchestration state (for unified state tracking)
+    /// TUI can query this for pending/archived status, apply counts, etc.
+    pub shared_orchestrator_state:
+        Option<std::sync::Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>>,
 }
 
 impl AppState {
@@ -168,7 +183,19 @@ impl AppState {
             web_url: None,
             is_resolving: false,
             worktree_paths: HashMap::new(),
+            shared_orchestrator_state: None,
         }
+    }
+
+    /// Set reference to shared orchestration state for unified tracking.
+    /// This allows TUI to query core orchestration state (pending/archived, apply counts, etc.)
+    pub fn set_shared_state(
+        &mut self,
+        shared_state: std::sync::Arc<
+            tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>,
+        >,
+    ) {
+        self.shared_orchestrator_state = Some(shared_state);
     }
 
     /// Show QR popup (only when web_url is set)

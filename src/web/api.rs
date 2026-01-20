@@ -156,7 +156,7 @@ pub async fn unapprove_change(
 mod tests {
     use super::*;
     use crate::openspec::Change;
-    use crate::web::state::OrchestratorState;
+    use crate::web::state::OrchestratorStateSnapshot;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -189,7 +189,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let state: OrchestratorState = serde_json::from_slice(&body).unwrap();
+        let state: OrchestratorStateSnapshot = serde_json::from_slice(&body).unwrap();
         // After refresh_from_disk, state may include real changes from the repository
         // Just verify that the response is valid JSON with the correct structure
         assert!(state.total_changes > 0);
