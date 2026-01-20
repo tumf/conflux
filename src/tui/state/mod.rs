@@ -2,6 +2,17 @@
 //!
 //! This module contains AppState and ChangeState implementations,
 //! organized into submodules by responsibility.
+//!
+//! ## Shared State Integration
+//!
+//! The TUI can reference the shared orchestration state from `crate::orchestration::state::OrchestratorState`
+//! for unified state tracking across TUI and Web interfaces. The shared state provides:
+//! - Pending/archived change tracking
+//! - Apply count tracking per change
+//! - Current change being processed
+//! - Iteration counters
+//!
+//! Both TUI and Web states are updated via `ExecutionEvent` messages, ensuring consistency.
 
 mod change;
 mod events;
@@ -284,7 +295,7 @@ impl AppState {
                 let is_active = matches!(
                     change.queue_status,
                     QueueStatus::Queued
-                        | QueueStatus::Processing
+                        | QueueStatus::Applying
                         | QueueStatus::Archiving
                         | QueueStatus::Resolving
                         | QueueStatus::Accepting
@@ -646,7 +657,7 @@ impl AppState {
         // Block approval toggle for processing changes
         if matches!(
             change.queue_status,
-            QueueStatus::Processing | QueueStatus::Resolving
+            QueueStatus::Applying | QueueStatus::Resolving
         ) {
             self.warning_message = Some("Cannot change approval for processing change".to_string());
             debug!("toggle_approval: blocked by Processing/Resolving status");
@@ -720,7 +731,7 @@ impl AppState {
         let change = &self.changes[self.cursor_index];
         if matches!(
             change.queue_status,
-            QueueStatus::Processing | QueueStatus::Archiving | QueueStatus::Resolving
+            QueueStatus::Applying | QueueStatus::Archiving | QueueStatus::Resolving
         ) {
             self.warning_popup = Some(WarningPopup {
                 title: "Worktree delete blocked".to_string(),
@@ -944,14 +955,14 @@ mod tests {
         let changes = vec![create_approved_change("a", 0, 1)];
         let mut app = AppState::new(changes);
 
-        // Start processing and set the change to Processing status
+        // Start processing and set the change to Applying status
         app.start_processing();
-        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[0].queue_status = QueueStatus::Applying;
 
         // Toggle should do nothing
         let cmd = app.toggle_selection();
         assert!(cmd.is_none());
-        assert_eq!(app.changes[0].queue_status, QueueStatus::Processing);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Applying);
     }
 
     #[test]
@@ -1124,8 +1135,8 @@ mod tests {
         app.start_processing();
         assert_eq!(app.mode, AppMode::Running);
 
-        // Simulate: a is processing, b is archiving
-        app.changes[0].queue_status = QueueStatus::Processing;
+        // Simulate: a is applying, b is archiving
+        app.changes[0].queue_status = QueueStatus::Applying;
         app.changes[1].queue_status = QueueStatus::Archiving;
 
         // Calculate progress (includes Archiving changes)
@@ -1437,7 +1448,7 @@ mod tests {
     fn test_request_worktree_delete_blocks_processing_change() {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
-        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[0].queue_status = QueueStatus::Applying;
 
         app.request_worktree_delete();
 
@@ -1498,7 +1509,7 @@ mod tests {
         let mut app = AppState::new(changes);
 
         app.start_processing();
-        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[0].queue_status = QueueStatus::Applying;
 
         let cmd = app.toggle_approval();
         assert!(cmd.is_none());
@@ -2026,18 +2037,18 @@ mod tests {
             is_merging: false,
         }];
 
-        // Simulate processing state for change "a"
+        // Simulate applying state for change "a"
         app.start_processing();
-        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[0].queue_status = QueueStatus::Applying;
 
-        // Cannot delete worktree for processing change
+        // Cannot delete worktree for applying change
         let cmd = app.request_worktree_delete_from_list();
         assert!(cmd.is_none());
         assert!(app.warning_message.is_some());
         let warning = app.warning_message.as_ref().unwrap();
         assert!(warning.contains("Cannot delete worktree"));
         assert!(warning.contains("change 'a'"));
-        assert!(warning.contains("processing"));
+        assert!(warning.contains("applying"));
     }
 
     #[test]
@@ -2160,9 +2171,9 @@ mod tests {
             is_merging: false,
         }];
 
-        // Simulate processing state for change "a"
+        // Simulate applying state for change "a"
         app.start_processing();
-        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[0].queue_status = QueueStatus::Applying;
         app.warning_message = None; // Clear any warning from start_processing
 
         // Should allow deletion of worktree for change not in list
@@ -2286,7 +2297,7 @@ mod tests {
         }];
 
         app.start_processing();
-        app.changes[0].queue_status = QueueStatus::Processing;
+        app.changes[0].queue_status = QueueStatus::Applying;
         app.warning_message = None; // Clear any warning from start_processing
 
         // Should allow deletion (cannot extract change_id from detached HEAD)

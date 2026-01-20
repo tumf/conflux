@@ -80,9 +80,9 @@ impl From<&Change> for ChangeStatus {
     }
 }
 
-/// Full orchestrator state for REST API
+/// Full orchestrator state snapshot for REST API
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrchestratorState {
+pub struct OrchestratorStateSnapshot {
     /// List of all changes
     pub changes: Vec<ChangeStatus>,
     /// Total number of changes
@@ -103,8 +103,8 @@ pub struct OrchestratorState {
     pub app_mode: String,
 }
 
-impl OrchestratorState {
-    /// Create a new state from a list of changes
+impl OrchestratorStateSnapshot {
+    /// Create a new state snapshot from a list of changes
     pub fn from_changes(changes: &[Change]) -> Self {
         let change_statuses: Vec<ChangeStatus> = changes.iter().map(ChangeStatus::from).collect();
 
@@ -120,7 +120,7 @@ impl OrchestratorState {
             .iter()
             .filter(|c| {
                 c.queue_status.as_ref().is_some_and(|s| {
-                    s == "processing" || s == "accepting" || s == "archiving" || s == "resolving"
+                    s == "applying" || s == "accepting" || s == "archiving" || s == "resolving"
                 })
             })
             .count();
@@ -161,7 +161,7 @@ fn status_from_progress(completed: u32, total: u32) -> &'static str {
     }
 }
 
-fn refresh_summary(state: &mut OrchestratorState) {
+fn refresh_summary(state: &mut OrchestratorStateSnapshot) {
     state.total_changes = state.changes.len();
     state.completed_changes = state
         .changes
@@ -177,10 +177,9 @@ fn refresh_summary(state: &mut OrchestratorState) {
         .changes
         .iter()
         .filter(|change| {
-            change
-                .queue_status
-                .as_ref()
-                .is_some_and(|s| s == "processing")
+            change.queue_status.as_ref().is_some_and(|s| {
+                s == "applying" || s == "accepting" || s == "archiving" || s == "resolving"
+            })
         })
         .count();
     state.pending_changes = state
@@ -193,8 +192,8 @@ fn refresh_summary(state: &mut OrchestratorState) {
 
 /// Shared web state with broadcast channel for updates
 pub struct WebState {
-    /// Current orchestrator state (thread-safe)
-    state: RwLock<OrchestratorState>,
+    /// Current orchestrator state snapshot (thread-safe)
+    state: RwLock<OrchestratorStateSnapshot>,
     /// Broadcast channel for state updates
     tx: broadcast::Sender<StateUpdate>,
 }
@@ -203,7 +202,7 @@ impl WebState {
     /// Create a new WebState with initial changes
     pub fn new(initial_changes: &[Change]) -> Self {
         let (tx, _) = broadcast::channel(100);
-        let state = OrchestratorState::from_changes(initial_changes);
+        let state = OrchestratorStateSnapshot::from_changes(initial_changes);
 
         Self {
             state: RwLock::new(state),
@@ -211,15 +210,15 @@ impl WebState {
         }
     }
 
-    /// Get a read lock on the current state
-    pub async fn get_state(&self) -> OrchestratorState {
+    /// Get a read lock on the current state snapshot
+    pub async fn get_state(&self) -> OrchestratorStateSnapshot {
         self.state.read().await.clone()
     }
 
     /// Update state with new changes and broadcast to WebSocket clients.
     /// Only broadcasts if there are actual changes from the previous state.
     pub async fn update(&self, changes: &[Change]) {
-        let mut new_state = OrchestratorState::from_changes(changes);
+        let mut new_state = OrchestratorStateSnapshot::from_changes(changes);
 
         // Preserve progress and queue_status from existing state
         let old_changes = {
@@ -281,7 +280,7 @@ impl WebState {
                 ExecutionEvent::ProcessingStarted(change_id) => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
                         change.status = "in_progress".to_string();
-                        change.queue_status = Some("processing".to_string());
+                        change.queue_status = Some("applying".to_string());
                         change.progress_percent =
                             progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
@@ -301,10 +300,10 @@ impl WebState {
                         updated = true;
                     }
                 }
-                ExecutionEvent::ProcessingError { id, error } => {
+                ExecutionEvent::ProcessingError { id, error: _ } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *id) {
                         change.status = "error".to_string();
-                        change.queue_status = Some(format!("error: {}", error));
+                        change.queue_status = Some("error".to_string());
                         updated = true;
                     }
                 }
@@ -320,6 +319,20 @@ impl WebState {
                             change.iteration_number = Some(*iter);
                             updated = true;
                         }
+                    }
+                }
+
+                // Acceptance events
+                ExecutionEvent::AcceptanceStarted { change_id } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.queue_status = Some("accepting".to_string());
+                        updated = true;
+                    }
+                }
+                ExecutionEvent::AcceptanceCompleted { change_id } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.queue_status = Some("archiving".to_string());
+                        updated = true;
                     }
                 }
 
@@ -388,9 +401,12 @@ impl WebState {
                         updated = true;
                     }
                 }
-                ExecutionEvent::ResolveFailed { change_id, error } => {
+                ExecutionEvent::ResolveFailed {
+                    change_id,
+                    error: _,
+                } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.queue_status = Some(format!("error: {}", error));
+                        change.queue_status = Some("error".to_string());
                         updated = true;
                     }
                 }
@@ -745,14 +761,14 @@ mod tests {
     }
 
     #[test]
-    fn test_orchestrator_state_from_changes() {
+    fn test_orchestrator_state_snapshot_from_changes() {
         let changes = vec![
             create_test_change("change-a", 0, 3),
             create_test_change("change-b", 2, 5),
             create_test_change("change-c", 4, 4),
         ];
 
-        let mut state = OrchestratorState::from_changes(&changes);
+        let mut state = OrchestratorStateSnapshot::from_changes(&changes);
 
         // Initial state: no queue_status set, so all counts should be 0
         assert_eq!(state.total_changes, 3);
@@ -762,7 +778,7 @@ mod tests {
 
         // Set queue_status to test aggregation
         state.changes[0].queue_status = Some("queued".to_string());
-        state.changes[1].queue_status = Some("processing".to_string());
+        state.changes[1].queue_status = Some("applying".to_string());
         state.changes[2].queue_status = Some("archived".to_string());
         refresh_summary(&mut state);
 
@@ -814,6 +830,37 @@ mod tests {
 
         let state = web_state.get_state().await;
         assert_eq!(state.changes[0].status, "in_progress");
+        assert_eq!(state.changes[0].queue_status, Some("applying".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_apply_execution_event_acceptance_started() {
+        let changes = vec![create_test_change("change-a", 5, 10)];
+        let web_state = WebState::new(&changes);
+
+        web_state
+            .apply_execution_event(&ExecutionEvent::AcceptanceStarted {
+                change_id: "change-a".to_string(),
+            })
+            .await;
+
+        let state = web_state.get_state().await;
+        assert_eq!(state.changes[0].queue_status, Some("accepting".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_apply_execution_event_acceptance_completed() {
+        let changes = vec![create_test_change("change-a", 10, 10)];
+        let web_state = WebState::new(&changes);
+
+        web_state
+            .apply_execution_event(&ExecutionEvent::AcceptanceCompleted {
+                change_id: "change-a".to_string(),
+            })
+            .await;
+
+        let state = web_state.get_state().await;
+        assert_eq!(state.changes[0].queue_status, Some("archiving".to_string()));
     }
 
     #[tokio::test]

@@ -208,6 +208,65 @@ impl OrchestratorState {
             self.current_change_id = None;
         }
     }
+
+    /// Apply an ExecutionEvent to update the shared state.
+    ///
+    /// This is the single source of truth for state mutations driven by execution events.
+    /// Both TUI and Web states should derive their views from this shared state.
+    pub fn apply_execution_event(&mut self, event: &crate::events::ExecutionEvent) {
+        use crate::events::ExecutionEvent;
+
+        match event {
+            // Processing lifecycle
+            ExecutionEvent::ProcessingStarted(change_id) => {
+                self.set_current_change(Some(change_id.clone()));
+            }
+            ExecutionEvent::ProcessingCompleted(change_id) => {
+                // Keep current_change_id set until archived
+                let _ = change_id;
+            }
+            ExecutionEvent::ProcessingError { id, error: _ } => {
+                self.remove_from_pending(id);
+            }
+
+            // Apply events
+            ExecutionEvent::ApplyStarted { change_id } => {
+                self.set_current_change(Some(change_id.clone()));
+            }
+            ExecutionEvent::ApplyCompleted { change_id, .. } => {
+                self.increment_apply_count(change_id);
+            }
+            ExecutionEvent::ApplyFailed { change_id, .. } => {
+                self.remove_from_pending(change_id);
+            }
+
+            // Archive events
+            ExecutionEvent::ChangeArchived(change_id) => {
+                self.mark_archived(change_id);
+            }
+
+            // Dynamic queue support
+            ExecutionEvent::ChangesRefreshed { changes, .. } => {
+                // Refresh the initial snapshot if new changes appeared
+                for change in changes {
+                    if !self.initial_change_ids.contains(&change.id)
+                        && !self.archived_changes.contains(&change.id)
+                    {
+                        self.add_dynamic_change(change.id.clone());
+                    }
+                }
+            }
+
+            // Other events don't affect shared state directly
+            _ => {}
+        }
+    }
+}
+
+impl Default for OrchestratorState {
+    fn default() -> Self {
+        Self::new(Vec::new(), 0)
+    }
 }
 
 #[cfg(test)]
