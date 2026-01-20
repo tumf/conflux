@@ -151,19 +151,14 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
     let (mode_text, mode_color, show_status) = match app.mode {
         AppMode::Select => ("Ready".to_string(), Color::Cyan, true),
         AppMode::Running | AppMode::Stopping => {
-            // Count changes that are currently processing or archiving
-            let processing_count = app
+            // Count changes that are currently active (queued, processing, accepting, archiving, resolving)
+            let active_count = app
                 .changes
                 .iter()
-                .filter(|c| {
-                    matches!(
-                        c.queue_status,
-                        QueueStatus::Processing | QueueStatus::Archiving
-                    )
-                })
+                .filter(|c| c.queue_status.is_active())
                 .count();
-            if processing_count > 0 {
-                (format!("Running {}", processing_count), Color::Yellow, true)
+            if active_count > 0 {
+                (format!("Running {}", active_count), Color::Yellow, true)
             } else {
                 ("Ready".to_string(), Color::Cyan, true)
             }
