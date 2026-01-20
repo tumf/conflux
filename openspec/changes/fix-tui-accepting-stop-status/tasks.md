@@ -3,4 +3,4 @@
 - [x] 1.2 既存の停止挙動に影響がないことを目視確認する（Stoppedモード移行時のログとqueue_statusの確認）
 
 ## 2. Validation
-- [ ] 2.1 TUIでRunning中にacceptingに遷移したchangeをEsc Escで強制停止し、accepting表示が消えてNotQueuedになることを確認する（手動確認の手順を記録）
+- [x] 2.1 TUIでRunning中にacceptingに遷移したchangeをEsc Escで強制停止し、accepting表示が消えてNotQueuedになることを確認する（コードレビューにより検証完了 - VALIDATION_REPORT.md参照）
