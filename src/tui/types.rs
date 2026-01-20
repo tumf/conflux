@@ -54,8 +54,8 @@ pub enum QueueStatus {
     NotQueued,
     /// Waiting in the execution queue
     Queued,
-    /// Currently being processed
-    Processing,
+    /// Currently being applied
+    Applying,
     /// Running acceptance tests
     Accepting,
     /// Currently being archived
@@ -78,7 +78,7 @@ impl QueueStatus {
         match self {
             QueueStatus::NotQueued => "not queued",
             QueueStatus::Queued => "queued",
-            QueueStatus::Processing => "processing",
+            QueueStatus::Applying => "applying",
             QueueStatus::Accepting => "accepting",
             QueueStatus::Archiving => "archiving",
             QueueStatus::Archived => "archived",
@@ -94,7 +94,7 @@ impl QueueStatus {
         match self {
             QueueStatus::NotQueued => Color::DarkGray,
             QueueStatus::Queued => Color::Yellow,
-            QueueStatus::Processing => Color::Cyan,
+            QueueStatus::Applying => Color::Cyan,
             QueueStatus::Accepting => Color::LightGreen,
             QueueStatus::Archiving => Color::Magenta,
             QueueStatus::Archived => Color::Blue,
@@ -110,13 +110,13 @@ impl QueueStatus {
     /// Active states are those where work is currently being performed.
     /// This is used for counting "Running N" in the TUI header.
     ///
-    /// Active: Queued, Processing, Accepting, Archiving, Resolving
+    /// Active: Queued, Applying, Accepting, Archiving, Resolving
     /// Inactive: NotQueued, MergeWait, Archived, Merged, Error
     pub fn is_active(&self) -> bool {
         matches!(
             self,
             QueueStatus::Queued
-                | QueueStatus::Processing
+                | QueueStatus::Applying
                 | QueueStatus::Accepting
                 | QueueStatus::Archiving
                 | QueueStatus::Resolving
@@ -222,7 +222,7 @@ mod tests {
     fn test_queue_status_display() {
         assert_eq!(QueueStatus::NotQueued.display(), "not queued");
         assert_eq!(QueueStatus::Queued.display(), "queued");
-        assert_eq!(QueueStatus::Processing.display(), "processing");
+        assert_eq!(QueueStatus::Applying.display(), "applying");
         assert_eq!(QueueStatus::Accepting.display(), "accepting");
         assert_eq!(QueueStatus::Archiving.display(), "archiving");
         assert_eq!(QueueStatus::Archived.display(), "archived");
@@ -236,7 +236,7 @@ mod tests {
     fn test_queue_status_color() {
         assert_eq!(QueueStatus::NotQueued.color(), Color::DarkGray);
         assert_eq!(QueueStatus::Queued.color(), Color::Yellow);
-        assert_eq!(QueueStatus::Processing.color(), Color::Cyan);
+        assert_eq!(QueueStatus::Applying.color(), Color::Cyan);
         assert_eq!(QueueStatus::Accepting.color(), Color::LightGreen);
         assert_eq!(QueueStatus::Archiving.color(), Color::Magenta);
         assert_eq!(QueueStatus::Archived.color(), Color::Blue);
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn test_queue_status_is_active() {
         assert!(QueueStatus::Queued.is_active());
-        assert!(QueueStatus::Processing.is_active());
+        assert!(QueueStatus::Applying.is_active());
         assert!(QueueStatus::Accepting.is_active());
         assert!(QueueStatus::Archiving.is_active());
         assert!(QueueStatus::Resolving.is_active());

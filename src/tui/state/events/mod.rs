@@ -122,6 +122,11 @@ impl AppState {
                 output,
                 iteration,
             } => self.handle_archive_output(change_id, output, iteration),
+            OrchestratorEvent::AcceptanceOutput {
+                change_id,
+                output,
+                iteration,
+            } => self.handle_acceptance_output(change_id, output, iteration),
             OrchestratorEvent::AnalysisOutput { output, iteration } => {
                 self.handle_analysis_output(output, iteration)
             }

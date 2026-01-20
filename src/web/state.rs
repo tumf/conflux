@@ -120,7 +120,7 @@ impl OrchestratorState {
             .iter()
             .filter(|c| {
                 c.queue_status.as_ref().is_some_and(|s| {
-                    s == "processing" || s == "accepting" || s == "archiving" || s == "resolving"
+                    s == "applying" || s == "accepting" || s == "archiving" || s == "resolving"
                 })
             })
             .count();
@@ -177,10 +177,9 @@ fn refresh_summary(state: &mut OrchestratorState) {
         .changes
         .iter()
         .filter(|change| {
-            change
-                .queue_status
-                .as_ref()
-                .is_some_and(|s| s == "processing")
+            change.queue_status.as_ref().is_some_and(|s| {
+                s == "applying" || s == "accepting" || s == "archiving" || s == "resolving"
+            })
         })
         .count();
     state.pending_changes = state
@@ -281,7 +280,7 @@ impl WebState {
                 ExecutionEvent::ProcessingStarted(change_id) => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
                         change.status = "in_progress".to_string();
-                        change.queue_status = Some("processing".to_string());
+                        change.queue_status = Some("applying".to_string());
                         change.progress_percent =
                             progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
@@ -301,10 +300,10 @@ impl WebState {
                         updated = true;
                     }
                 }
-                ExecutionEvent::ProcessingError { id, error } => {
+                ExecutionEvent::ProcessingError { id, error: _ } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *id) {
                         change.status = "error".to_string();
-                        change.queue_status = Some(format!("error: {}", error));
+                        change.queue_status = Some("error".to_string());
                         updated = true;
                     }
                 }
@@ -320,6 +319,20 @@ impl WebState {
                             change.iteration_number = Some(*iter);
                             updated = true;
                         }
+                    }
+                }
+
+                // Acceptance events
+                ExecutionEvent::AcceptanceStarted { change_id } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.queue_status = Some("accepting".to_string());
+                        updated = true;
+                    }
+                }
+                ExecutionEvent::AcceptanceCompleted { change_id } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.queue_status = Some("archiving".to_string());
+                        updated = true;
                     }
                 }
 
@@ -388,9 +401,12 @@ impl WebState {
                         updated = true;
                     }
                 }
-                ExecutionEvent::ResolveFailed { change_id, error } => {
+                ExecutionEvent::ResolveFailed {
+                    change_id,
+                    error: _,
+                } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.queue_status = Some(format!("error: {}", error));
+                        change.queue_status = Some("error".to_string());
                         updated = true;
                     }
                 }
@@ -762,7 +778,7 @@ mod tests {
 
         // Set queue_status to test aggregation
         state.changes[0].queue_status = Some("queued".to_string());
-        state.changes[1].queue_status = Some("processing".to_string());
+        state.changes[1].queue_status = Some("applying".to_string());
         state.changes[2].queue_status = Some("archived".to_string());
         refresh_summary(&mut state);
 
@@ -814,6 +830,37 @@ mod tests {
 
         let state = web_state.get_state().await;
         assert_eq!(state.changes[0].status, "in_progress");
+        assert_eq!(state.changes[0].queue_status, Some("applying".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_apply_execution_event_acceptance_started() {
+        let changes = vec![create_test_change("change-a", 5, 10)];
+        let web_state = WebState::new(&changes);
+
+        web_state
+            .apply_execution_event(&ExecutionEvent::AcceptanceStarted {
+                change_id: "change-a".to_string(),
+            })
+            .await;
+
+        let state = web_state.get_state().await;
+        assert_eq!(state.changes[0].queue_status, Some("accepting".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_apply_execution_event_acceptance_completed() {
+        let changes = vec![create_test_change("change-a", 10, 10)];
+        let web_state = WebState::new(&changes);
+
+        web_state
+            .apply_execution_event(&ExecutionEvent::AcceptanceCompleted {
+                change_id: "change-a".to_string(),
+            })
+            .await;
+
+        let state = web_state.get_state().await;
+        assert_eq!(state.changes[0].queue_status, Some("archiving".to_string()));
     }
 
     #[tokio::test]

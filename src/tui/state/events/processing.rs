@@ -14,7 +14,7 @@ impl AppState {
     pub(super) fn handle_processing_started(&mut self, id: String) {
         self.current_change = Some(id.clone());
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-            change.queue_status = QueueStatus::Processing;
+            change.queue_status = QueueStatus::Applying;
             change.started_at = Some(Instant::now());
             change.elapsed_time = None;
         }
@@ -87,7 +87,7 @@ impl AppState {
         for change in &mut self.changes {
             if matches!(
                 change.queue_status,
-                QueueStatus::Processing
+                QueueStatus::Applying
                     | QueueStatus::Accepting
                     | QueueStatus::Archiving
                     | QueueStatus::Queued

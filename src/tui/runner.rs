@@ -744,6 +744,8 @@ async fn run_tui_loop(
                                                 orch_cancel,
                                                 orch_dynamic_queue,
                                                 orch_graceful_stop,
+                                                #[cfg(feature = "web-monitoring")]
+                                                orch_web_state,
                                             )
                                             .await
                                         };

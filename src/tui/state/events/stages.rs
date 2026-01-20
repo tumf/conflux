@@ -19,7 +19,7 @@ impl AppState {
             if change.started_at.is_none() {
                 change.started_at = Some(Instant::now());
             }
-            change.queue_status = QueueStatus::Processing;
+            change.queue_status = QueueStatus::Applying;
             change.elapsed_time = None;
         }
         self.add_log(LogEntry::info(format!("Apply started: {}", change_id)));

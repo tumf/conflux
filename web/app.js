@@ -506,17 +506,21 @@ class WebMonitor {
     }
 
     calculateStats(changes) {
+        // Per new vocabulary: applying/accepting/archiving/resolving are in-progress states
+        const inProgressStates = ['applying', 'accepting', 'archiving', 'resolving'];
+        const completedStates = ['archived', 'merged'];
+
         return {
             total: changes.length,
-            completed: changes.filter(c => c.queue_status === 'completed').length,
-            inProgress: changes.filter(c => c.queue_status === 'processing').length,
+            completed: changes.filter(c => completedStates.includes(c.queue_status)).length,
+            inProgress: changes.filter(c => inProgressStates.includes(c.queue_status)).length,
             pending: changes.filter(c => c.queue_status === 'queued').length,
         };
     }
 
     renderChangeCard(change) {
         const progressPercent = change.progress_percent.toFixed(1);
-        const isComplete = change.queue_status === 'completed';
+        const isComplete = ['archived', 'merged'].includes(change.queue_status);
 
         // Use queue_status exclusively (no fallback to legacy status)
         const displayStatus = change.queue_status || 'not queued';
@@ -526,8 +530,7 @@ class WebMonitor {
         const statusIcons = {
             'not queued': '○',
             'queued': '⏳',
-            'processing': '⚙️',
-            'completed': '✅',
+            'applying': '⚙️',
             'accepting': '✓',
             'archiving': '📦',
             'archived': '📥',
@@ -538,10 +541,11 @@ class WebMonitor {
         };
         const statusIcon = statusIcons[displayStatus] || '•';
 
-        // Show iteration number if > 0
-        const iterationHtml = change.iteration_number && change.iteration_number > 0
-            ? `<span class="change-iteration">Iteration: ${change.iteration_number}</span>`
-            : '';
+        // Status display uses new vocabulary
+        // If iteration number is available, show status:iteration format
+        const statusDisplay = change.iteration_number
+            ? `${displayStatus}:${change.iteration_number}`
+            : displayStatus;
 
         const dependenciesHtml = change.dependencies && change.dependencies.length > 0
             ? `<div class="change-dependencies">
@@ -580,9 +584,8 @@ class WebMonitor {
                     <div class="change-status-row">
                         <span class="badge badge-status ${statusClass}">
                             <span class="status-icon" aria-hidden="true">${statusIcon}</span>
-                            ${displayStatus}
+                            ${statusDisplay}
                         </span>
-                        ${iterationHtml}
                     </div>
                 </div>
                 <div class="progress-container">
