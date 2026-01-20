@@ -65,7 +65,9 @@ impl AcceptanceResult {
 ///
 /// # Arguments
 /// * `change` - The change to test
-/// * `agent` - The agent runner for executing commands
+/// * `agent` - The agent runner for history tracking
+/// * `ai_runner` - The AI command runner for command execution
+/// * `config` - Orchestrator configuration
 /// * `output` - Output handler for streaming command output
 /// * `cancel_check` - Function to check if operation should be cancelled
 ///
@@ -78,6 +80,8 @@ impl AcceptanceResult {
 pub async fn acceptance_test_streaming<O, F>(
     change: &Change,
     agent: &mut AgentRunner,
+    _ai_runner: &crate::ai_command_runner::AiCommandRunner,
+    _config: &crate::config::OrchestratorConfig,
     output: &O,
     cancel_check: F,
 ) -> Result<AcceptanceResult>

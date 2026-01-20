@@ -78,6 +78,7 @@ impl ApplyContext {
 /// # Arguments
 /// * `change` - The change to apply
 /// * `agent` - The agent runner for executing commands
+/// * `ai_runner` - The AI command runner for shared stagger state
 /// * `hooks` - The hook runner for executing hooks
 /// * `context` - Context information for hooks
 /// * `output` - Output handler for streaming command output
@@ -90,6 +91,7 @@ impl ApplyContext {
 pub async fn apply_change<O: OutputHandler>(
     change: &Change,
     agent: &mut AgentRunner,
+    ai_runner: &crate::ai_command_runner::AiCommandRunner,
     hooks: &HookRunner,
     context: &ApplyContext,
     output: &O,
@@ -114,8 +116,8 @@ pub async fn apply_change<O: OutputHandler>(
 
     output.on_info(&format!("Applying: {}", change.id));
 
-    // Execute apply command
-    let status = agent.run_apply(&change.id).await?;
+    // Execute apply command via AiCommandRunner (with shared stagger state)
+    let status = agent.run_apply_with_runner(&change.id, ai_runner).await?;
 
     if !status.success() {
         let error_msg = format!("Apply command failed with exit code: {:?}", status.code());
@@ -151,6 +153,7 @@ pub async fn apply_change<O: OutputHandler>(
 /// * `hooks` - The hook runner for executing hooks
 /// * `context` - Context information for hooks
 /// * `output` - Output handler for streaming command output
+/// * `ai_runner` - AI command runner for coordinated stagger and retry
 /// * `cancel_check` - Function to check if operation should be cancelled
 ///
 /// # Returns
@@ -161,6 +164,7 @@ pub async fn apply_change_streaming<O, F>(
     hooks: &HookRunner,
     context: &ApplyContext,
     output: &O,
+    ai_runner: &crate::ai_command_runner::AiCommandRunner,
     cancel_check: F,
 ) -> Result<ApplyResult>
 where
@@ -189,9 +193,10 @@ where
 
     output.on_info(&format!("Applying: {}", change.id));
 
-    // Execute apply command with streaming
-    let (mut child, mut output_rx, start_time) =
-        agent.run_apply_streaming(&change.id, None).await?;
+    // Execute apply command with streaming via AiCommandRunner
+    let (mut child, mut output_rx, start_time) = agent
+        .run_apply_streaming_with_runner(&change.id, ai_runner, None)
+        .await?;
 
     // Create output collector for history
     let mut output_collector = OutputCollector::new();

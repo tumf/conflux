@@ -31,6 +31,7 @@ use super::output_bridge::ParallelOutputHandler;
 /// * `agent` - Agent runner (should be configured to run in workspace_path)
 /// * `hooks` - Hook runner
 /// * `context` - Apply context (progress tracking)
+/// * `ai_runner` - AI command runner for coordinated stagger and retry
 /// * `event_tx` - Optional ParallelEvent channel
 /// * `cancel_token` - Optional cancellation token
 ///
@@ -50,6 +51,7 @@ pub async fn apply_change_in_workspace(
     agent: &mut AgentRunner,
     hooks: &HookRunner,
     context: &ApplyContext,
+    ai_runner: &crate::ai_command_runner::AiCommandRunner,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<ApplyResult> {
@@ -66,6 +68,7 @@ pub async fn apply_change_in_workspace(
         hooks,
         context,
         &output,
+        ai_runner,
         cancel_check,
     )
     .await
@@ -154,11 +157,23 @@ mod tests {
         let hooks = HookRunner::empty();
         let context = ApplyContext::new(0, 1, 1, 1);
         let (tx, _rx) = mpsc::channel(10);
+        let ai_runner = crate::ai_command_runner::AiCommandRunner::new_with_shared_state(
+            config.clone(),
+            Default::default(),
+        );
 
         // This will fail because we don't have a real apply command configured,
         // but it demonstrates the integration pattern
-        let result =
-            apply_change_in_workspace(&change, &mut agent, &hooks, &context, Some(tx), None).await;
+        let result = apply_change_in_workspace(
+            &change,
+            &mut agent,
+            &hooks,
+            &context,
+            &ai_runner,
+            Some(tx),
+            None,
+        )
+        .await;
 
         // We expect an error since no apply command is configured
         assert!(result.is_err());

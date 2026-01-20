@@ -297,6 +297,32 @@ async fn run_tui_loop(
     app.apply_worktree_status(&worktree_change_ids);
     app.max_concurrent = config.get_max_concurrent_workspaces();
     app.web_url = web_url;
+
+    // Create shared stagger state for all AI commands (worktree, apply, archive, acceptance)
+    use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
+    use crate::command_queue::CommandQueueConfig;
+    use crate::config::defaults::*;
+    let shared_stagger_state: SharedStaggerState = Arc::new(tokio::sync::Mutex::new(None));
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: config
+            .command_queue_stagger_delay_ms
+            .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+        max_retries: config
+            .command_queue_max_retries
+            .unwrap_or(DEFAULT_MAX_RETRIES),
+        retry_delay_ms: config
+            .command_queue_retry_delay_ms
+            .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+        retry_error_patterns: config
+            .command_queue_retry_patterns
+            .clone()
+            .unwrap_or_else(default_retry_patterns),
+        retry_if_duration_under_secs: config
+            .command_queue_retry_if_duration_under_secs
+            .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+    };
+    let ai_runner = AiCommandRunner::new(queue_config.clone(), shared_stagger_state.clone());
+
     let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(100);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<TuiCommand>(100);
 
@@ -796,7 +822,7 @@ async fn run_tui_loop(
                                                 orch_cancel,
                                                 orch_dynamic_queue,
                                                 orch_graceful_stop,
-                                                orch_shared_state,
+                                                orch_shared_state.clone(),
                                                 #[cfg(feature = "web-monitoring")]
                                                 orch_web_state,
                                             )
@@ -894,19 +920,46 @@ async fn run_tui_loop(
 
                             info!(
                                 module = module_path!(),
-                                "Running worktree command: sh -c {}", command
+                                "Running worktree command via AiCommandRunner: sh -c {}", command
                             );
-                            let status = std::process::Command::new("sh")
-                                .arg("-c")
-                                .arg(&command)
-                                .current_dir(&worktree_path_str)
-                                .status();
+
+                            // Execute via AiCommandRunner (with stagger and retry)
+                            let worktree_path_for_exec = Path::new(&worktree_path_str);
+                            let exec_result = ai_runner
+                                .execute_streaming_with_retry(
+                                    &command,
+                                    Some(worktree_path_for_exec),
+                                )
+                                .await;
+
+                            let status_result = match exec_result {
+                                Ok((mut child, mut rx)) => {
+                                    // Forward output to stdout/stderr in real-time
+                                    use crate::ai_command_runner::OutputLine;
+                                    while let Some(line) = rx.recv().await {
+                                        match line {
+                                            OutputLine::Stdout(s) => {
+                                                println!("{}", s);
+                                            }
+                                            OutputLine::Stderr(s) => {
+                                                eprintln!("{}", s);
+                                            }
+                                        }
+                                    }
+                                    // Wait for child to complete
+                                    child.wait().await
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to execute worktree command: {}", e);
+                                    Err(std::io::Error::other(e.to_string()))
+                                }
+                            };
 
                             enable_raw_mode()?;
                             execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                             terminal.clear()?;
 
-                            match status {
+                            match status_result {
                                 Ok(exit_status) if exit_status.success() => {
                                     app.add_log(LogEntry::success(
                                         "Worktree command completed successfully",
@@ -1060,19 +1113,42 @@ async fn run_tui_loop(
 
                             info!(
                                 module = module_path!(),
-                                "Running worktree command: sh -c {}", command
+                                "Running worktree command via AiCommandRunner: sh -c {}", command
                             );
-                            let status = std::process::Command::new("sh")
-                                .arg("-c")
-                                .arg(&command)
-                                .current_dir(&worktree_path)
-                                .status();
+
+                            // Execute via AiCommandRunner (with stagger and retry)
+                            let exec_result = ai_runner
+                                .execute_streaming_with_retry(&command, Some(&worktree_path))
+                                .await;
+
+                            let status_result = match exec_result {
+                                Ok((mut child, mut rx)) => {
+                                    // Forward output to stdout/stderr in real-time
+                                    use crate::ai_command_runner::OutputLine;
+                                    while let Some(line) = rx.recv().await {
+                                        match line {
+                                            OutputLine::Stdout(s) => {
+                                                println!("{}", s);
+                                            }
+                                            OutputLine::Stderr(s) => {
+                                                eprintln!("{}", s);
+                                            }
+                                        }
+                                    }
+                                    // Wait for child to complete
+                                    child.wait().await
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to execute worktree command: {}", e);
+                                    Err(std::io::Error::other(e.to_string()))
+                                }
+                            };
 
                             enable_raw_mode()?;
                             execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                             terminal.clear()?;
 
-                            match status {
+                            match status_result {
                                 Ok(exit_status) if exit_status.success() => {
                                     app.add_log(LogEntry::success(
                                         "Worktree command completed successfully",

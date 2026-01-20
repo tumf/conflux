@@ -3,7 +3,7 @@
 //! Uses LLM-based analysis to determine which changes can be executed
 //! in parallel and what dependencies exist between them.
 
-use crate::agent::{AgentRunner, OutputLine};
+use crate::ai_command_runner::OutputLine as AiOutputLine;
 use crate::error::{OrchestratorError, Result};
 use crate::openspec::Change;
 use serde::{Deserialize, Serialize};
@@ -37,13 +37,17 @@ pub struct AnalysisResult {
 
 /// Analyzer for determining parallel execution groups
 pub struct ParallelizationAnalyzer {
-    agent: AgentRunner,
+    ai_runner: crate::ai_command_runner::AiCommandRunner,
+    config: crate::config::OrchestratorConfig,
 }
 
 impl ParallelizationAnalyzer {
-    /// Create a new analyzer with the given agent runner
-    pub fn new(agent: AgentRunner) -> Self {
-        Self { agent }
+    /// Create a new analyzer with the given AI command runner and configuration
+    pub fn new(
+        ai_runner: crate::ai_command_runner::AiCommandRunner,
+        config: crate::config::OrchestratorConfig,
+    ) -> Self {
+        Self { ai_runner, config }
     }
 
     /// Analyze changes and return the raw analysis result with order and dependencies.
@@ -90,14 +94,19 @@ impl ParallelizationAnalyzer {
         }
         debug!("Analysis prompt: {}", prompt);
 
-        // Call LLM for analysis with streaming output
-        let (mut child, mut rx) = self.agent.analyze_dependencies_streaming(&prompt).await?;
+        // Call LLM for analysis with streaming output via AiCommandRunner
+        let template = self.config.get_analyze_command();
+        let command = crate::config::OrchestratorConfig::expand_prompt(template, &prompt);
+        let (mut child, mut rx) = self
+            .ai_runner
+            .execute_streaming_with_retry(&command, None)
+            .await?;
 
         // Collect output while streaming to callback
         let mut full_output = String::new();
         while let Some(line) = rx.recv().await {
             let text = match &line {
-                OutputLine::Stdout(s) | OutputLine::Stderr(s) => s.clone(),
+                AiOutputLine::Stdout(s) | AiOutputLine::Stderr(s) => s.clone(),
             };
             full_output.push_str(&text);
             full_output.push('\n');
@@ -632,6 +641,11 @@ pub fn extract_change_dependencies(groups: &[ParallelGroup]) -> HashMap<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
+    use crate::command_queue::CommandQueueConfig;
+    use crate::config::defaults::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     fn create_test_change(id: &str) -> Change {
         Change {
@@ -644,10 +658,34 @@ mod tests {
         }
     }
 
+    fn create_test_analyzer() -> ParallelizationAnalyzer {
+        let config = crate::config::OrchestratorConfig::default();
+        let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: config
+                .command_queue_stagger_delay_ms
+                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+            max_retries: config
+                .command_queue_max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_delay_ms: config
+                .command_queue_retry_delay_ms
+                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+            retry_error_patterns: config
+                .command_queue_retry_patterns
+                .clone()
+                .unwrap_or_else(default_retry_patterns),
+            retry_if_duration_under_secs: config
+                .command_queue_retry_if_duration_under_secs
+                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+        };
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+        ParallelizationAnalyzer::new(ai_runner, config)
+    }
+
     #[test]
     fn test_extract_json_pure() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = create_test_analyzer();
 
         let json = r#"{"order": ["a"], "dependencies": {}}"#;
         let result = analyzer.extract_json(json);
@@ -656,8 +694,7 @@ mod tests {
 
     #[test]
     fn test_extract_json_markdown() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = create_test_analyzer();
 
         let response = r#"Here's the analysis:
 
@@ -672,8 +709,7 @@ That's all."#;
 
     #[test]
     fn test_validate_change_ids_missing() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = create_test_analyzer();
 
         let changes = vec![create_test_change("a"), create_test_change("b")];
         let result = AnalysisResult {
@@ -688,8 +724,7 @@ That's all."#;
 
     #[test]
     fn test_validate_change_ids_duplicate() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = create_test_analyzer();
 
         let changes = vec![create_test_change("a"), create_test_change("b")];
         let result = AnalysisResult {
@@ -704,8 +739,7 @@ That's all."#;
 
     #[test]
     fn test_validate_dependency_graph_valid() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = create_test_analyzer();
 
         let mut deps = HashMap::new();
         deps.insert("b".to_string(), vec!["a".to_string()]);
@@ -721,8 +755,7 @@ That's all."#;
 
     #[test]
     fn test_validate_dependency_graph_self_reference() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = create_test_analyzer();
 
         let mut deps = HashMap::new();
         deps.insert("a".to_string(), vec!["a".to_string()]); // Self-reference
@@ -738,8 +771,7 @@ That's all."#;
 
     #[test]
     fn test_validate_dependency_graph_cycle() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = create_test_analyzer();
 
         let mut deps = HashMap::new();
         deps.insert("a".to_string(), vec!["b".to_string()]); // Cycle: a -> b -> a
@@ -843,8 +875,7 @@ That's all."#;
 
     #[test]
     fn test_build_prompt_with_selected_markers() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = create_test_analyzer();
 
         let changes = vec![
             Change {
@@ -891,8 +922,7 @@ That's all."#;
 
     #[test]
     fn test_build_prompt_all_selected() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = create_test_analyzer();
 
         let changes = vec![
             Change {
@@ -922,8 +952,7 @@ That's all."#;
 
     #[test]
     fn test_build_prompt_none_selected() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = create_test_analyzer();
 
         let changes = vec![Change {
             id: "change-1".to_string(),
@@ -945,8 +974,7 @@ That's all."#;
 
     #[test]
     fn test_prompt_clarifies_dependency_vs_order() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = create_test_analyzer();
 
         let changes = vec![create_test_change("a")];
         let prompt = analyzer.build_parallelization_prompt(&changes);
@@ -964,8 +992,7 @@ That's all."#;
 
     #[test]
     fn test_validate_dependency_strict_criteria() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = create_test_analyzer();
 
         // Valid case: b requires a's API
         let mut deps_valid = HashMap::new();
@@ -996,8 +1023,7 @@ That's all."#;
 
     #[test]
     fn test_order_can_differ_from_dependency_graph() {
-        let agent = AgentRunner::new(crate::config::OrchestratorConfig::default());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = create_test_analyzer();
 
         // Case: a and b are independent, but order suggests b before a (by priority)
         let result = AnalysisResult {

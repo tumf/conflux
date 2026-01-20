@@ -173,12 +173,14 @@ TBD - created by archiving change add-command-execution-queue. Update Purpose af
 - `resolve_command` - 競合解消・マージ完了
 - `analyze_command` - 依存関係分析
 - `worktree_command` - ワークツリー上の提案作成
+- `acceptance_command` - 受け入れテスト
 
 **実装要件**:
 - すべてのAI駆動コマンドは共通ランナー層（`AiCommandRunner`）を経由しなければならない (MUST)
 - 時間差起動の状態（`last_execution`）はプロセス全体で共有されなければならない (MUST)
 - 並列実行モードの apply/archive も共通ランナー層を経由しなければならない (MUST)
 - resolve 実行時に `AgentRunner` を都度作成してはならない (MUST NOT)
+- parallel 実行の acceptance は共通の `last_execution` を参照して遅延を適用しなければならない (MUST)
 
 #### Scenario: apply_command での時間差起動とリトライ
 
@@ -222,6 +224,15 @@ TBD - created by archiving change add-command-execution-queue. Update Purpose af
 - **WHEN** apply/archive コマンドが起動される
 - **THEN** CommandQueue の stagger と retry が適用される
 - **AND** streaming 出力のリトライ通知が既存の出力経路に送信される
+
+#### Scenario: parallel acceptance が共通スタッガーを参照する
+
+- **GIVEN** 並列実行モードで複数の change が acceptance を開始する
+- **AND** 遅延時間が2秒に設定されている
+- **WHEN** worktree A で acceptance コマンドが起動される
+- **AND** 0.5秒後に worktree B で acceptance コマンドが起動されようとする
+- **THEN** worktree B の acceptance は1.5秒待機してから実行される
+- **AND** 両方の acceptance が共通の `last_execution` 状態を参照している
 
 ### Requirement: Streaming 対応リトライ
 
@@ -281,4 +292,3 @@ Streaming リトライの動作は以下の通りとする：
 - **AND** stdout が期待スキーマに準拠した JSON である
 - **WHEN** 出力検証が実行される
 - **THEN** 検証が成功し、パース済みの `AnalysisResult` が返される
-

@@ -3,6 +3,9 @@
 //! Contains the run_orchestrator function and archive operations.
 
 use crate::agent::AgentRunner;
+use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
+use crate::command_queue::CommandQueueConfig;
+use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::history::OutputCollector;
@@ -15,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::events::{LogEntry, OrchestratorEvent};
@@ -75,6 +78,7 @@ pub async fn archive_single_change(
     change_id: &str,
     change: &Change,
     agent: &mut AgentRunner,
+    ai_runner: &crate::ai_command_runner::AiCommandRunner,
     hooks: &crate::hooks::HookRunner,
     tx: &mpsc::Sender<OrchestratorEvent>,
     cancel_token: &CancellationToken,
@@ -146,9 +150,10 @@ pub async fn archive_single_change(
     loop {
         attempt += 1;
 
-        // Run archive command with streaming output
-        let (mut child, mut output_rx, start) =
-            agent.run_archive_streaming(change_id, None).await?;
+        // Run archive command via AiCommandRunner with streaming output (shared stagger state)
+        let (mut child, mut output_rx, start) = agent
+            .run_archive_streaming_with_runner(change_id, ai_runner, None)
+            .await?;
 
         // Create output collector for history
         let mut output_collector = OutputCollector::new();
@@ -258,6 +263,7 @@ pub async fn archive_single_change(
                 change_id,
                 Path::new("."),
                 &*agent,
+                ai_runner,
                 crate::vcs::VcsBackend::Auto,
                 move |line| {
                     let log_tx = log_tx.clone();
@@ -399,6 +405,7 @@ pub async fn archive_single_change(
 pub async fn archive_all_complete_changes(
     pending_ids: &HashSet<String>,
     agent: &mut AgentRunner,
+    ai_runner: &crate::ai_command_runner::AiCommandRunner,
     hooks: &crate::hooks::HookRunner,
     tx: &mpsc::Sender<OrchestratorEvent>,
     cancel_token: &CancellationToken,
@@ -466,6 +473,7 @@ pub async fn archive_all_complete_changes(
             &change.id,
             &change,
             agent,
+            ai_runner,
             hooks,
             tx,
             cancel_token,
@@ -533,6 +541,28 @@ pub async fn run_orchestrator(
     let max_iterations = config.get_max_iterations();
     // Note: acceptance_max_continues is now handled by SerialRunService
     let mut agent = AgentRunner::new(config.clone());
+
+    // Create AiCommandRunner for serial mode execution
+    let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: config
+            .command_queue_stagger_delay_ms
+            .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+        max_retries: config
+            .command_queue_max_retries
+            .unwrap_or(DEFAULT_MAX_RETRIES),
+        retry_delay_ms: config
+            .command_queue_retry_delay_ms
+            .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+        retry_error_patterns: config
+            .command_queue_retry_patterns
+            .clone()
+            .unwrap_or_else(default_retry_patterns),
+        retry_if_duration_under_secs: config
+            .command_queue_retry_if_duration_under_secs
+            .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+    };
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
 
     // Create serial run service for shared state and helpers
     let repo_root = std::env::current_dir()?;
@@ -796,6 +826,7 @@ pub async fn run_orchestrator(
             .process_change(
                 &change,
                 &mut agent,
+                &ai_runner,
                 &hooks,
                 &output,
                 total_changes,

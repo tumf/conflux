@@ -83,6 +83,7 @@ impl ArchiveContext {
 /// # Arguments
 /// * `change` - The change to archive
 /// * `agent` - The agent runner for executing commands
+/// * `ai_runner` - The AI command runner for shared stagger state
 /// * `hooks` - The hook runner for executing hooks
 /// * `context` - Context information for hooks
 /// * `output` - Output handler for logging
@@ -91,9 +92,11 @@ impl ArchiveContext {
 ///
 /// # Returns
 /// Same as `archive_change_streaming`
+#[allow(clippy::too_many_arguments)] // Infrastructure function, parameters needed for refactoring
 pub async fn archive_change<O>(
     change: &Change,
     agent: &mut AgentRunner,
+    ai_runner: &crate::ai_command_runner::AiCommandRunner,
     hooks: &HookRunner,
     context: &ArchiveContext,
     output: &O,
@@ -149,8 +152,8 @@ where
     loop {
         attempt += 1;
 
-        // Execute archive command
-        let status = agent.run_archive(&change.id).await?;
+        // Execute archive command via AiCommandRunner (with shared stagger state)
+        let status = agent.run_archive_with_runner(&change.id, ai_runner).await?;
 
         if !status.success() {
             let error_msg = format!("Archive command failed with exit code: {:?}", status.code());
@@ -606,7 +609,7 @@ mv "$base_dir/openspec/changes/$1" "$base_dir/openspec/changes/archive/$1"
             ..Default::default()
         };
 
-        let mut agent = AgentRunner::new(config);
+        let mut agent = AgentRunner::new(config.clone());
         let hooks = HookRunner::empty();
         let output = NullOutputHandler::new();
         let context = ArchiveContext::new(0, 1, 1, 0);
@@ -619,10 +622,38 @@ mv "$base_dir/openspec/changes/$1" "$base_dir/openspec/changes/archive/$1"
             dependencies: Vec::new(),
         };
 
+        // Create AiCommandRunner for test
+        use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
+        use crate::command_queue::CommandQueueConfig;
+        use crate::config::defaults::*;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: config
+                .command_queue_stagger_delay_ms
+                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+            max_retries: config
+                .command_queue_max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_delay_ms: config
+                .command_queue_retry_delay_ms
+                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+            retry_error_patterns: config
+                .command_queue_retry_patterns
+                .clone()
+                .unwrap_or_else(default_retry_patterns),
+            retry_if_duration_under_secs: config
+                .command_queue_retry_if_duration_under_secs
+                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+        };
+        let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+
         let stall_config = OrchestratorConfig::default().get_stall_detection();
         let result = archive_change(
             &change,
             &mut agent,
+            &ai_runner,
             &hooks,
             &context,
             &output,
