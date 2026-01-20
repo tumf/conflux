@@ -89,6 +89,17 @@ impl AppState {
         )));
     }
 
+    /// Handle ChangeSkipped event
+    pub(super) fn handle_change_skipped(&mut self, change_id: String, reason: String) {
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            change.queue_status = QueueStatus::Error(reason.clone());
+            if let Some(started) = change.started_at {
+                change.elapsed_time = Some(started.elapsed());
+            }
+        }
+        self.add_log(LogEntry::warn(format!("Skipped {}: {}", change_id, reason)));
+    }
+
     /// Handle BranchMergeFailed event
     pub(super) fn handle_branch_merge_failed(&mut self, branch_name: String, error: String) {
         self.warning_popup = Some(WarningPopup {

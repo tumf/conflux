@@ -563,8 +563,15 @@ async fn run_tui_loop(
                         }
                         (KeyCode::Char('@'), _) => {
                             // Toggle approval status
+                            debug!(
+                                "@ key pressed: mode={:?}, view_mode={:?}, cursor_index={}, changes_len={}",
+                                app.mode, app.view_mode, app.cursor_index, app.changes.len()
+                            );
                             if let Some(cmd) = app.toggle_approval() {
+                                debug!("toggle_approval returned: {:?}", cmd);
                                 let _ = cmd_tx.send(cmd).await;
+                            } else {
+                                debug!("toggle_approval returned None");
                             }
                         }
                         (KeyCode::Char('e'), _) => {

@@ -60,6 +60,7 @@ The acceptance loop SHALL run `acceptance_command` for the change, parse the out
 - Task updates MUST either add a new follow-up task or uncheck a previously completed task that must be revisited.
 - The acceptance failure reason MUST be recorded in tasks.md together with the task update.
 - The acceptance failure reason MUST be captured from the acceptance output tail rather than parsed findings.
+- The acceptance failure reason MUST be recorded as a line-by-line bullet list without numbering.
 - The apply loop MUST resume with the same iteration counter value (no reset) after acceptance failure.
 - If the output indicates CONTINUE, the orchestrator MUST retry acceptance up to `acceptance_max_continues` times.
 - If no acceptance marker is present, the orchestrator MUST treat the outcome as CONTINUE and retry according to `acceptance_max_continues`.
@@ -74,6 +75,7 @@ The acceptance loop SHALL run `acceptance_command` for the change, parse the out
 - **AND** acceptance output indicates FAIL
 - **WHEN** the orchestrator updates tasks.md before returning to the apply loop
 - **THEN** the acceptance failure reason is recorded using the acceptance output tail
+- **AND** the failure reason is recorded as a line-by-line bullet list without numbering
 - **AND** findings extraction output is not required
 
 ### Requirement: Default TUI Launch
@@ -129,8 +131,8 @@ TUI SHALL display a dashboard-style UI in running mode.
 
 #### Scenario: Running mode header shows processing count
 - **GIVEN** the TUI is in running mode
-- **WHEN** one or more changes are processing or archiving
-- **THEN** the header shows "Running <count>" where <count> is the number of active operations
+- **WHEN** one or more changes are in active state (Queued, Processing, Accepting, Archiving, or Resolving)
+- **THEN** the header shows "Running <count>" where <count> is the number of active changes
 
 #### Scenario: Status line uses selected change progress
 - **GIVEN** the TUI is in any mode

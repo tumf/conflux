@@ -624,11 +624,24 @@ impl AppState {
     /// Only available in Select mode. Returns a TuiCommand::ToggleApproval
     /// to be processed by the main loop.
     pub fn toggle_approval(&mut self) -> Option<TuiCommand> {
+        use tracing::debug;
+
         if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
+            debug!(
+                "toggle_approval: early return - changes.is_empty={}, cursor_index={}, changes.len={}",
+                self.changes.is_empty(),
+                self.cursor_index,
+                self.changes.len()
+            );
             return None;
         }
 
         let change = &self.changes[self.cursor_index];
+
+        debug!(
+            "toggle_approval: change_id={}, queue_status={:?}, is_approved={}, mode={:?}",
+            change.id, change.queue_status, change.is_approved, self.mode
+        );
 
         // Block approval toggle for processing changes
         if matches!(
@@ -636,6 +649,7 @@ impl AppState {
             QueueStatus::Applying | QueueStatus::Resolving
         ) {
             self.warning_message = Some("Cannot change approval for processing change".to_string());
+            debug!("toggle_approval: blocked by Processing/Resolving status");
             return None;
         }
 
