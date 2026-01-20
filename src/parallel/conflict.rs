@@ -72,6 +72,7 @@ fn cleanup_approved_only_changes(repo_root: &Path, change_ids: &[String]) -> Res
 }
 
 /// Attempt to resolve conflicts with retries using the configured resolve command.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_conflicts_with_retry(
     workspace_manager: &dyn WorkspaceManager,
     config: &OrchestratorConfig,
@@ -80,6 +81,7 @@ pub async fn resolve_conflicts_with_retry(
     change_ids: &[String],
     vcs_error: &str,
     max_retries: u32,
+    shared_stagger_state: crate::ai_command_runner::SharedStaggerState,
 ) -> Result<()> {
     send_event(event_tx, ParallelEvent::ConflictResolutionStarted).await;
 
@@ -144,8 +146,9 @@ pub async fn resolve_conflicts_with_retry(
             resolve_prompt = format!("{}\n\n{}", resolve_prompt, continuation_context);
         }
 
-        // Use AgentRunner for streaming resolve command execution
-        let agent = AgentRunner::new(config.clone());
+        // Use AgentRunner for streaming resolve command execution with shared stagger state
+        let agent =
+            AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state.clone());
         let (mut child, mut rx) = agent
             .run_resolve_streaming_in_dir(&resolve_prompt, workspace_manager.repo_root())
             .await?;
@@ -261,7 +264,7 @@ pub async fn resolve_conflicts_with_retry(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ResolveMergesWithRetryArgs<'a> {
     pub workspace_manager: &'a dyn WorkspaceManager,
     pub config: &'a OrchestratorConfig,
@@ -271,6 +274,7 @@ pub struct ResolveMergesWithRetryArgs<'a> {
     pub target_branch: &'a str,
     pub base_revision: &'a str,
     pub max_retries: u32,
+    pub shared_stagger_state: crate::ai_command_runner::SharedStaggerState,
 }
 
 /// Attempt to resolve merges with retries using the configured resolve command.
@@ -284,6 +288,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         target_branch,
         base_revision,
         max_retries,
+        shared_stagger_state,
     } = args;
 
     send_event(event_tx, ParallelEvent::ConflictResolutionStarted).await;
@@ -410,7 +415,8 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             resolve_prompt = format!("{}\n\n{}", resolve_prompt, continuation_context);
         }
 
-        let agent = AgentRunner::new(config.clone());
+        let agent =
+            AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state.clone());
         let (mut child, mut rx) = agent
             .run_resolve_streaming_in_dir(&resolve_prompt, workspace_manager.repo_root())
             .await?;

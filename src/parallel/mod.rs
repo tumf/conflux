@@ -1246,7 +1246,10 @@ impl ParallelExecutor {
                     self.workspace_manager
                         .update_workspace_status(&workspace.name, WorkspaceStatus::Accepting);
 
-                    let mut agent = AgentRunner::new(self.config.clone());
+                    let mut agent = AgentRunner::new_with_shared_state(
+                        self.config.clone(),
+                        self.shared_stagger_state.clone(),
+                    );
                     info!(
                         "Running acceptance test for {} before archive (resume)",
                         change_id
@@ -1885,13 +1888,14 @@ impl ParallelExecutor {
         let apply_history = self.apply_history.clone();
         let archive_history = self.archive_history.clone();
         let cancel_token = self.cancel_token.clone();
+        let shared_stagger_state = self.shared_stagger_state.clone();
 
         // Spawn apply + acceptance + archive task
         join_set.spawn(async move {
             let _permit = permit; // Hold permit until task completes
 
             // Create agent for acceptance testing
-            let mut agent = AgentRunner::new(config.clone());
+            let mut agent = AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state);
 
             // Track apply+acceptance cycles to prevent infinite loops
             const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
@@ -2387,6 +2391,7 @@ impl ParallelExecutor {
             let apply_history = self.apply_history.clone();
             let archive_history = self.archive_history.clone();
             let status_tx_clone = status_tx.clone();
+            let shared_stagger_state = self.shared_stagger_state.clone();
 
             // Build parallel hook context
             let parallel_ctx = ParallelHookContext {
@@ -2406,7 +2411,7 @@ impl ParallelExecutor {
                 let _permit = permit;
 
                 // Create agent for this workspace
-                let mut agent = AgentRunner::new(config.clone());
+                let mut agent = AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state);
 
                 // Track apply+acceptance cycles to prevent infinite loops
                 const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
@@ -2999,6 +3004,7 @@ impl ParallelExecutor {
                                                         let apply_history = self.apply_history.clone();
                                                         let archive_history = self.archive_history.clone();
                                                         let status_tx_clone = status_tx.clone();
+                                                        let shared_stagger_state = self.shared_stagger_state.clone();
 
                                                         // Build parallel hook context
                                                         let parallel_ctx = ParallelHookContext {
@@ -3016,7 +3022,7 @@ impl ParallelExecutor {
                                                         join_set.spawn(async move {
                                                             let _permit = permit;
 
-                                                            let mut agent = AgentRunner::new(config.clone());
+                                                            let mut agent = AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state);
 
                                                             const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
                                                             let mut cycle_count = 0u32;
@@ -3488,8 +3494,10 @@ impl ParallelExecutor {
     /// Merge revisions and resolve any conflicts
     async fn merge_and_resolve(&self, revisions: &[String], change_ids: &[String]) -> Result<()> {
         let change_ids_vec = change_ids.to_vec();
+        let shared_stagger_state = self.shared_stagger_state.clone();
         self.merge_and_resolve_with(revisions, change_ids, |revisions, details| {
             let change_ids_clone = change_ids_vec.clone();
+            let shared_stagger_state_clone = shared_stagger_state.clone();
             async move {
                 conflict::resolve_conflicts_with_retry(
                     self.workspace_manager.as_ref(),
@@ -3499,6 +3507,7 @@ impl ParallelExecutor {
                     &change_ids_clone,
                     &details,
                     self.max_conflict_retries,
+                    shared_stagger_state_clone,
                 )
                 .await
             }
@@ -3552,6 +3561,7 @@ impl ParallelExecutor {
                 target_branch: target_branch.as_str(),
                 base_revision: base_revision.as_str(),
                 max_retries: max_attempts,
+                shared_stagger_state: self.shared_stagger_state.clone(),
             })
             .await?;
 
