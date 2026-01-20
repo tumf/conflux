@@ -1226,6 +1226,18 @@ pub async fn run_orchestrator_parallel(
     // Fetch all changes for UI refresh
     let all_changes = list_changes_native()?;
 
+    let committed_change_ids: HashSet<String> =
+        match crate::vcs::git::commands::list_changes_in_head(&repo_root).await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Failed to load committed change snapshot for parallel start"
+                );
+                all_changes.iter().map(|change| change.id.clone()).collect()
+            }
+        };
+
     // Filter to get only changes to process
     let changes_to_process: Vec<Change> = all_changes
         .iter()
@@ -1238,7 +1250,7 @@ pub async fn run_orchestrator_parallel(
     let _ = tx
         .send(OrchestratorEvent::ChangesRefreshed {
             changes: all_changes,
-            committed_change_ids: HashSet::new(),
+            committed_change_ids,
             worktree_change_ids: HashSet::new(),
             worktree_paths: HashMap::new(),
             worktree_not_ahead_ids: HashSet::new(),
