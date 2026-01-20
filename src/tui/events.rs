@@ -37,7 +37,8 @@ pub enum TuiCommand {
     #[allow(dead_code)]
     DeleteWorktree(String),
     /// Delete a worktree by path (from worktree view)
-    DeleteWorktreeByPath(PathBuf),
+    /// The optional String is the branch name to delete after worktree removal
+    DeleteWorktreeByPath(PathBuf, Option<String>),
     /// Resolve a deferred merge for a change
     ResolveMerge(String),
     /// Merge a worktree branch into the base branch

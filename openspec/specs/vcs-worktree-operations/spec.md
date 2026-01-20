@@ -79,3 +79,23 @@ WorktreeInfo struct SHALL represent git worktree metadata.
 - **WHEN** 新しい worktree が作成される（TUIの「+」を含む）
 - **THEN** worktree作成は失敗として扱われる
 - **AND** 失敗理由がログに記録される
+
+### Requirement: Worktree delete removes branch
+
+When deleting a worktree from the Worktrees view, the system MUST also delete the associated local branch.
+
+If the branch does not exist or deletion fails, the worktree deletion MUST still be treated as successful, and the branch deletion failure MUST be logged as a warning.
+
+#### Scenario: Branch is deleted when worktree is deleted
+- **GIVEN** A worktree deletion is executed from the Worktrees view
+- **AND** The target worktree has an associated local branch
+- **WHEN** The worktree deletion process completes
+- **THEN** The local branch is also deleted
+- **AND** Success logs for both worktree and branch deletion are recorded
+
+#### Scenario: Worktree deletion succeeds even if branch deletion fails
+- **GIVEN** A worktree deletion is executed from the Worktrees view
+- **AND** The target branch has already been deleted
+- **WHEN** The worktree deletion process completes
+- **THEN** The worktree deletion is treated as successful
+- **AND** A warning log for the branch deletion failure is recorded

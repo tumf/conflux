@@ -112,6 +112,7 @@ The HTTP server SHALL provide detailed information for a specific change.
 - **AND** response body contains error message with change ID
 
 ### Requirement: WebSocket - Real-time Updates
+
 The HTTP server SHALL broadcast state updates to the dashboard via WebSocket for both serial and parallel execution (`--parallel`) modes.
 The HTTP server SHALL ensure that TUI and Web UI states remain consistent by broadcasting real-time state updates that occur in the TUI via WebSocket.
 This broadcast MUST be based on a unified state model that includes not only change list progress but also TUI-visible states (queue status, logs, worktrees, running operations, etc.).
@@ -132,6 +133,12 @@ For dashboard compatibility, the `changes` field in `state_update` messages MUST
 - **WHEN** state_update が送信される
 - **THEN** completed_tasks/total_tasks は直前の値を維持する
 - **AND** 取得失敗を 0 件完了として扱わない
+
+#### Scenario: Web state uses unified model
+- **GIVEN** WebState が state_update を生成する
+- **WHEN** 変更状態のスナップショットを作成する
+- **THEN** the snapshot derives from the shared orchestration state
+- **AND** Web-specific DTO naming does not conflict with shared state types
 
 ### Requirement: Static File Serving - Dashboard
 The HTTP server SHALL serve a web-based dashboard interface for visualizing orchestration state.
@@ -160,31 +167,19 @@ The HTTP server SHALL serve a web-based dashboard interface for visualizing orch
 
 ### Requirement: Dashboard UI - Change List Display
 
-Webダッシュボードは、TUIのQueueStatusと完全に一致するステータス語彙と集計ルールでchange一覧を表示しなければならない（SHALL）。
+Webダッシュボードは、TUIの表示語彙と一致するステータス語彙でchange一覧を表示しなければならない（SHALL）。processing/completed 表記は使用せず、`not queued, queued, applying, accepting, archiving, resolving, completed, archived, merged, merge wait, error` を使用すること。反復回数がある場合は `status:iteration` 形式で表示すること。
 
 #### Scenario: QueueStatusに一致するステータス表示
 - **GIVEN** Web UI が change 一覧を表示している
 - **WHEN** change の queue_status が更新される
-- **THEN** Web UI は TUI の QueueStatus 表記（not queued, queued, processing, accepting, archiving, archived, merged, merge wait, resolving, error）で表示する
-- **AND** `completed` は表示しない
-- **AND** archiving 遷移が発生するため completed の中間表示は存在しない
+- **THEN** Web UI は `not queued, queued, applying, accepting, archiving, resolving, completed, archived, merged, merge wait, error` の語彙で表示する
+- **AND** processing/completed の表記は表示しない
 
-#### Scenario: QueueStatus基準の集計表示
-- **GIVEN** Web UI が全体進捗と統計を表示している
-- **WHEN** change の queue_status が更新される
-- **THEN** Web UI の集計は QueueStatus 基準で計算される
-- **AND** `completed` は集計対象から除外される
-- **AND** completed を中間状態として数えるケースは存在しない
-- **AND** いかなる場合も completed を集計値として表示しない
-- **AND** completed の単語を UI 上の統計ラベルとして表示しない
-- **AND** completed を UI 上で観測できる状態は存在しない
-- **AND** completed が state_update に現れないことを前提に表示を行う
-
-#### Scenario: Acceptingの表示
-- **GIVEN** change がQueueStatus::Acceptingである
+#### Scenario: Applying の iteration 表示
+- **GIVEN** change の queue_status が applying である
+- **AND** iteration_number が 1 である
 - **WHEN** Web UI が change 行を表示する
-- **THEN** ステータスは "accepting" と表示される
-- **AND** 専用のバッジ色とアイコンが適用される
+- **THEN** ステータス表示は `applying:1` となる
 
 ### Requirement: Dashboard UI - Real-time Updates
 The web dashboard SHALL automatically update when orchestrator state changes.
@@ -225,18 +220,14 @@ The web dashboard SHALL fall back to polling when WebSocket updates are unavaila
 - **AND** the displayed progress reflects current `/api/state` content
 
 ### Requirement: Dashboard UI - Task Status Visualization
-The web dashboard SHALL show detailed task status for each change.
 
-#### Scenario: Expand change details
-- **WHEN** user clicks on a change in the list
-- **THEN** UI expands to show all tasks for that change
-- **AND** each task displays checkbox status (completed or pending)
-- **AND** task descriptions are rendered from tasks.md
+反復回数がある状態は `status:iteration` 形式で表示しなければならない（SHALL）。
 
-#### Scenario: Visual progress indication
-- **WHEN** change is displayed
-- **THEN** UI shows progress bar with percentage (completed_tasks / total_tasks)
-- **AND** progress bar uses color coding (green for complete, yellow for in-progress)
+#### Scenario: Applying の iteration 表示
+- **GIVEN** change の queue_status が applying である
+- **AND** iteration_number が 1 である
+- **WHEN** Web UI が change 行を表示する
+- **THEN** ステータス表示は `applying:1` となる
 
 ### Requirement: Error Handling and Logging
 The HTTP server SHALL handle errors gracefully and log all HTTP requests.

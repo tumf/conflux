@@ -132,7 +132,11 @@ pub fn clear_screen() -> Result<()> {
 
 /// Get version string for display
 pub fn get_version_string() -> String {
-    format!("v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER"))
+    format!(
+        "cflx v{} ({})",
+        env!("CARGO_PKG_VERSION"),
+        env!("BUILD_NUMBER")
+    )
 }
 
 #[cfg(test)]

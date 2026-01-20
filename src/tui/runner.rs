@@ -272,8 +272,17 @@ async fn run_tui_loop(
         }
     }
 
+    // Create shared orchestration state for unified tracking across TUI and Web
+    let change_ids: Vec<String> = initial_changes.iter().map(|c| c.id.clone()).collect();
+    let max_iterations = config.get_max_iterations();
+    let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(
+        crate::orchestration::state::OrchestratorState::new(change_ids, max_iterations),
+    ));
+
     let mut app = AppState::new(initial_changes);
     app.worktree_paths = initial_worktree_paths;
+    // Inject shared state reference into TUI for unified tracking
+    app.set_shared_state(shared_state.clone());
     let git_dir_exists = crate::cli::check_git_directory();
     let parallel_available = crate::cli::check_parallel_available();
     let mut parallel_mode = config.resolve_parallel_mode(false, git_dir_exists);
@@ -290,6 +299,12 @@ async fn run_tui_loop(
     app.web_url = web_url;
     let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(100);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<TuiCommand>(100);
+
+    // Inject shared state into WebState if web monitoring is enabled
+    #[cfg(feature = "web-monitoring")]
+    if let Some(ref ws) = web_state {
+        ws.set_shared_state(shared_state.clone()).await;
+    }
 
     // Dynamic queue for runtime change additions
     let dynamic_queue = DynamicQueue::new();
@@ -611,8 +626,15 @@ async fn run_tui_loop(
                         }
                         (KeyCode::Char('@'), _) => {
                             // Toggle approval status
+                            debug!(
+                                "@ key pressed: mode={:?}, view_mode={:?}, cursor_index={}, changes_len={}",
+                                app.mode, app.view_mode, app.cursor_index, app.changes.len()
+                            );
                             if let Some(cmd) = app.toggle_approval() {
+                                debug!("toggle_approval returned: {:?}", cmd);
                                 let _ = cmd_tx.send(cmd).await;
+                            } else {
+                                debug!("toggle_approval returned None");
                             }
                         }
                         (KeyCode::Char('e'), _) => {
@@ -759,6 +781,7 @@ async fn run_tui_loop(
                                     let orch_cancel = CancellationToken::new();
                                     let orch_dynamic_queue = dynamic_queue.clone();
                                     let orch_graceful_stop = graceful_stop_flag.clone();
+                                    let orch_shared_state = shared_state.clone();
                                     orchestrator_cancel = Some(orch_cancel.clone());
                                     let use_parallel = app.parallel_mode;
                                     #[cfg(feature = "web-monitoring")]
@@ -773,6 +796,7 @@ async fn run_tui_loop(
                                                 orch_cancel,
                                                 orch_dynamic_queue,
                                                 orch_graceful_stop,
+                                                orch_shared_state,
                                                 #[cfg(feature = "web-monitoring")]
                                                 orch_web_state,
                                             )
@@ -785,6 +809,9 @@ async fn run_tui_loop(
                                                 orch_cancel,
                                                 orch_dynamic_queue,
                                                 orch_graceful_stop,
+                                                orch_shared_state,
+                                                #[cfg(feature = "web-monitoring")]
+                                                orch_web_state,
                                             )
                                             .await
                                         };
@@ -1151,12 +1178,14 @@ async fn run_tui_loop(
                             let orch_cancel = CancellationToken::new();
                             let orch_dynamic_queue = dynamic_queue.clone();
                             let orch_graceful_stop = graceful_stop_flag.clone();
+                            let orch_shared_state = shared_state.clone();
                             orchestrator_cancel = Some(orch_cancel.clone());
                             let use_parallel = app.parallel_mode;
                             #[cfg(feature = "web-monitoring")]
                             let orch_web_state = web_state.clone();
 
                             orchestrator_handle = Some(tokio::spawn(async move {
+                                #[cfg(feature = "web-monitoring")]
                                 let result = if use_parallel {
                                     run_orchestrator_parallel(
                                         selected_ids,
@@ -1165,7 +1194,7 @@ async fn run_tui_loop(
                                         orch_cancel,
                                         orch_dynamic_queue,
                                         orch_graceful_stop,
-                                        #[cfg(feature = "web-monitoring")]
+                                        orch_shared_state,
                                         orch_web_state,
                                     )
                                     .await
@@ -1177,6 +1206,32 @@ async fn run_tui_loop(
                                         orch_cancel,
                                         orch_dynamic_queue,
                                         orch_graceful_stop,
+                                        orch_shared_state,
+                                        orch_web_state,
+                                    )
+                                    .await
+                                };
+                                #[cfg(not(feature = "web-monitoring"))]
+                                let result = if use_parallel {
+                                    run_orchestrator_parallel(
+                                        selected_ids,
+                                        orch_config,
+                                        orch_tx.clone(),
+                                        orch_cancel,
+                                        orch_dynamic_queue,
+                                        orch_graceful_stop,
+                                        orch_shared_state,
+                                    )
+                                    .await
+                                } else {
+                                    run_orchestrator(
+                                        selected_ids,
+                                        orch_config,
+                                        orch_tx.clone(),
+                                        orch_cancel,
+                                        orch_dynamic_queue,
+                                        orch_graceful_stop,
+                                        orch_shared_state,
                                     )
                                     .await
                                 };
@@ -1326,7 +1381,7 @@ async fn run_tui_loop(
                         }
                     }
                 }
-                TuiCommand::DeleteWorktreeByPath(path) => {
+                TuiCommand::DeleteWorktreeByPath(path, branch_name) => {
                     match crate::vcs::git::commands::worktree_remove(
                         &repo_root,
                         path.to_string_lossy().as_ref(),
@@ -1338,6 +1393,30 @@ async fn run_tui_loop(
                                 "Deleted worktree: {}",
                                 path.display()
                             )));
+
+                            // Delete the associated branch if it exists
+                            if let Some(branch) = branch_name {
+                                match crate::vcs::git::commands::branch_delete(&repo_root, &branch)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        app.add_log(LogEntry::success(format!(
+                                            "Deleted branch: {}",
+                                            branch
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to delete branch '{}': {} (continuing)",
+                                            branch, e
+                                        );
+                                        app.add_log(LogEntry::warn(format!(
+                                            "Failed to delete branch '{}': {}",
+                                            branch, e
+                                        )));
+                                    }
+                                }
+                            }
 
                             // Refresh worktree list with conflict check
                             match load_worktrees_with_conflict_check(&repo_root).await {
@@ -1471,12 +1550,14 @@ async fn run_tui_loop(
                                 let orch_cancel = CancellationToken::new();
                                 let orch_dynamic_queue = dynamic_queue.clone();
                                 let orch_graceful_stop = graceful_stop_flag.clone();
+                                let orch_shared_state = shared_state.clone();
                                 orchestrator_cancel = Some(orch_cancel.clone());
                                 let use_parallel = app.parallel_mode;
                                 #[cfg(feature = "web-monitoring")]
                                 let orch_web_state = web_state.clone();
 
                                 orchestrator_handle = Some(tokio::spawn(async move {
+                                    #[cfg(feature = "web-monitoring")]
                                     let result = if use_parallel {
                                         run_orchestrator_parallel(
                                             selected_ids,
@@ -1485,7 +1566,7 @@ async fn run_tui_loop(
                                             orch_cancel,
                                             orch_dynamic_queue,
                                             orch_graceful_stop,
-                                            #[cfg(feature = "web-monitoring")]
+                                            orch_shared_state,
                                             orch_web_state,
                                         )
                                         .await
@@ -1497,6 +1578,32 @@ async fn run_tui_loop(
                                             orch_cancel,
                                             orch_dynamic_queue,
                                             orch_graceful_stop,
+                                            orch_shared_state,
+                                            orch_web_state,
+                                        )
+                                        .await
+                                    };
+                                    #[cfg(not(feature = "web-monitoring"))]
+                                    let result = if use_parallel {
+                                        run_orchestrator_parallel(
+                                            selected_ids,
+                                            orch_config,
+                                            orch_tx.clone(),
+                                            orch_cancel,
+                                            orch_dynamic_queue,
+                                            orch_graceful_stop,
+                                            orch_shared_state,
+                                        )
+                                        .await
+                                    } else {
+                                        run_orchestrator(
+                                            selected_ids,
+                                            orch_config,
+                                            orch_tx.clone(),
+                                            orch_cancel,
+                                            orch_dynamic_queue,
+                                            orch_graceful_stop,
+                                            orch_shared_state,
                                         )
                                         .await
                                     };

@@ -55,35 +55,76 @@ IMPORTANT: Only review the specific change "{change_id}".
 Do NOT review or report on other changes in openspec/changes/.
 
 Review the implementation to verify it meets the specification requirements.
-You MUST validate real integration, not just existence of functions or files.
 
 Required checks:
-1. All tasks in openspec/changes/{change_id}/tasks.md are completed (marked with [x])
+1. All tasks in openspec/changes/{change_id}/tasks.md are completed (marked with [x]) or moved to Future Work section
 2. Implementation matches the specification in openspec/changes/{change_id}/specs/
-3. Code quality and test coverage are adequate
-4. No obvious bugs or issues
-5. Integration check: confirm the feature is actually executed in the real flow.
+3. Integration check: confirm the feature is actually executed in the real flow.
    - Identify the concrete call path(s) from entry point to the feature.
    - If the feature is not referenced by production code paths, it is a FAIL.
-6. Dead code check: if code exists but is not invoked by the CLI/TUI/parallel flow described in spec, it is a FAIL.
-7. Evidence: cite at least one file path + function/method where the integration happens.
+4. Dead code check: if code exists but is not invoked by the CLI/TUI/parallel flow described in spec, it is a FAIL.
+5. Regression check: verify that existing features unrelated to this change are not broken.
+   - If the change modifies shared code (e.g., common functions, traits, structs), check that other callers still work.
+   - If existing tests fail due to the change, it is a FAIL.
+   - If existing functionality is removed or altered without being part of the spec, it is a FAIL.
+6. Evidence: cite at least one file path + function/method where the integration happens.
+
+Do NOT include in FINDINGS:
+- Subjective quality assessments (e.g., "code quality could be better", "naming is unclear")
+- Test coverage opinions without specific missing test cases (e.g., "test coverage is low")
+- Suggestions for improvements not in the original spec (e.g., "consider adding feature X")
+- Tasks that require human judgment (e.g., "needs design review", "verify UX is acceptable")
+- Tasks that require external systems (e.g., "deploy to production", "configure CI/CD")
+- Tasks that require long-wait verification (e.g., "monitor for a week", "wait for user feedback")
+
+FINDINGS format requirements:
+- Each finding MUST include concrete evidence (file path, function name, line number if relevant)
+- Each finding MUST be actionable by the AI agent autonomously
+- Bad: "Integration is incomplete" (vague, no evidence)
+- Good: "src/orchestrator.rs: run_loop() does not call acceptance_test() - missing call at line 150"
+
+Verification strategy:
+- Use "ACCEPTANCE: CONTINUE" to perform thorough, multi-pass verification
+- Do NOT output PASS or FAIL until you have verified ALL aspects of the implementation
+- First pass: verify task completion and basic code existence
+- Second pass: trace integration paths from entry points to features
+- Third pass: check for regressions and state management completeness
+- Only after completing all verification passes, output PASS or FAIL
 
 Output format:
-- If all checks pass: Output "ACCEPTANCE: PASS"
-- If checks fail: Output "ACCEPTANCE: FAIL" followed by "FINDINGS:" and list each issue on a new line prefixed with "- "
+- If verification is incomplete and more investigation needed: Output "ACCEPTANCE: CONTINUE"
+- If all checks pass after thorough verification: Output "ACCEPTANCE: PASS"
+- If checks fail: Output "ACCEPTANCE: FAIL" followed by "FINDINGS:" and list ALL issues found (not just the first one)
+
+IMPORTANT: When outputting FAIL, list ALL issues discovered across all verification passes.
+Do not stop at the first issue - continue checking and report everything in one FAIL response.
+
+Example of CONTINUE (investigation in progress):
+```
+ACCEPTANCE: CONTINUE
+Verified so far:
+- Tasks 1.1-1.3: completed
+- Integration path for feature A: confirmed
+Still need to verify:
+- Integration path for feature B
+- State transitions for error handling
+- Regression check for shared modules
+```
 
 Example of PASS:
 ```
 ACCEPTANCE: PASS
 ```
 
-Example of FAIL:
+Example of FAIL (with ALL issues):
 ```
 ACCEPTANCE: FAIL
 FINDINGS:
-- Acceptance module exists but is never called from the orchestrator run loop
-- Parallel execution does not invoke acceptance between apply and archive
-- Code does not handle error case X
+- Task 2.3 "Add acceptance test integration" in tasks.md is marked [ ] but not implemented
+- src/orchestrator.rs: run_loop() (line 142-180) does not call acceptance_test_streaming() between apply and archive
+- src/parallel/executor.rs: execute_change() calls apply() at line 95 but never calls acceptance before archive() at line 120
+- src/web/state.rs: broadcast_snapshot() does not include app_mode field, violating state broadcast requirement
+- src/main.rs: ControlCommand::Stop handler does not update app_mode to "stopping" before orchestrator processes it
 ```
 "#;
 
@@ -146,7 +187,7 @@ pub const DEFAULT_ERROR_CIRCUIT_BREAKER_ENABLED: bool = true;
 pub const DEFAULT_ERROR_CIRCUIT_BREAKER_THRESHOLD: usize = 5;
 
 /// Default maximum number of acceptance CONTINUE retries before treating as FAIL
-pub const DEFAULT_ACCEPTANCE_MAX_CONTINUES: u32 = 2;
+pub const DEFAULT_ACCEPTANCE_MAX_CONTINUES: u32 = 10;
 
 /// Default enablement for merge stall detection
 pub const DEFAULT_MERGE_STALL_DETECTION_ENABLED: bool = true;

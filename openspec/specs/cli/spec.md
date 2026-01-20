@@ -60,6 +60,7 @@ The acceptance loop SHALL run `acceptance_command` for the change, parse the out
 - Task updates MUST either add a new follow-up task or uncheck a previously completed task that must be revisited.
 - The acceptance failure reason MUST be recorded in tasks.md together with the task update.
 - The acceptance failure reason MUST be captured from the acceptance output tail rather than parsed findings.
+- The acceptance failure reason MUST be recorded as a line-by-line bullet list without numbering.
 - The apply loop MUST resume with the same iteration counter value (no reset) after acceptance failure.
 - If the output indicates CONTINUE, the orchestrator MUST retry acceptance up to `acceptance_max_continues` times.
 - If no acceptance marker is present, the orchestrator MUST treat the outcome as CONTINUE and retry according to `acceptance_max_continues`.
@@ -74,6 +75,7 @@ The acceptance loop SHALL run `acceptance_command` for the change, parse the out
 - **AND** acceptance output indicates FAIL
 - **WHEN** the orchestrator updates tasks.md before returning to the apply loop
 - **THEN** the acceptance failure reason is recorded using the acceptance output tail
+- **AND** the failure reason is recorded as a line-by-line bullet list without numbering
 - **AND** findings extraction output is not required
 
 ### Requirement: Default TUI Launch
@@ -129,8 +131,8 @@ TUI SHALL display a dashboard-style UI in running mode.
 
 #### Scenario: Running mode header shows processing count
 - **GIVEN** the TUI is in running mode
-- **WHEN** one or more changes are processing or archiving
-- **THEN** the header shows "Running <count>" where <count> is the number of active operations
+- **WHEN** one or more changes are in active state (Queued, Processing, Accepting, Archiving, or Resolving)
+- **THEN** the header shows "Running <count>" where <count> is the number of active changes
 
 #### Scenario: Status line uses selected change progress
 - **GIVEN** the TUI is in any mode
@@ -372,31 +374,18 @@ The running mode footer SHALL display a progress bar for overall processing prog
 
 ### Requirement: Processing Item Spinner Animation
 
-The TUI SHALL display an animated spinner next to items with `Processing` or `Accepting` status in running mode.
+TUI は実行中の表示を processing ではなくフェーズ別の語彙で示さなければならない（SHALL）。apply の実行中は `applying`、acceptance 実行中は `accepting`、archive 実行中は `archiving`、resolve 実行中は `resolving` を表示すること。反復回数がある場合は `status:iteration` 形式で表示すること。
 
-#### Scenario: Spinner display for processing items
-- **WHEN** TUI is in running mode
-- **AND** an item has `QueueStatus::Processing`
-- **THEN** an animated spinner character is displayed before the progress percentage
-- **AND** the spinner cycles through Braille dot characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏)
-- **AND** the display format is "⠋ [XX%]" where ⠋ is the current spinner character
+#### Scenario: Applying 状態の表示
+- **GIVEN** TUI が running mode で change を処理している
+- **WHEN** apply が実行中である
+- **THEN** change のステータス表示は `applying` となる
 
-#### Scenario: Spinner display for accepting items
-- **WHEN** TUI is in running mode
-- **AND** an item has `QueueStatus::Accepting`
-- **THEN** an animated spinner character is displayed before the progress percentage
-- **AND** the spinner cycles through Braille dot characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏)
-- **AND** the display format is "⠋ [accepting]" where ⠋ is the current spinner character
-
-#### Scenario: Spinner animation timing
-- **WHEN** TUI is rendering in running mode
-- **THEN** the spinner character advances to the next frame approximately every 100ms
-- **AND** the spinner cycles continuously until processing completes
-
-#### Scenario: Spinner not shown for non-processing items
-- **WHEN** TUI is in running mode
-- **AND** an item has status other than `Processing` or `Accepting` (Queued, Completed, Error)
-- **THEN** no spinner is displayed for that item
+#### Scenario: Resolving の iteration 表示
+- **GIVEN** change の queue_status が resolving である
+- **AND** iteration_number が 2 である
+- **WHEN** TUI が change 行を表示する
+- **THEN** ステータス表示は `resolving:2` となる
 
 ### Requirement: Completion Detection Retry Settings
 
@@ -529,36 +518,19 @@ The TUI header SHALL display the application version with UTC build number in bo
 
 ### Requirement: Terminal Status Task Count Display
 
-TUI running mode SHALL display terminal states with status-only text and task counts in a separate column, avoiding redundant display.
+TUI は反復回数がある状態の表示を `status:iteration` 形式にしなければならない（SHALL）。
 
-#### Scenario: Archived state display format
-- **WHEN** a change is in `archived` status in running mode
-- **THEN** the status text SHALL be displayed as `[archived]` (without task count)
-- **AND** the status is displayed in blue color
-- **AND** task counts SHALL be displayed in a separate column as `X/Y`
+#### Scenario: Applying の iteration 表示
+- **GIVEN** change が apply 実行中である
+- **AND** apply の iteration 番号が 1 である
+- **WHEN** TUI が change 行を表示する
+- **THEN** ステータス表示は `applying:1` となる
 
-#### Scenario: Error state display format
-- **WHEN** a change is in `error` status in running mode
-- **THEN** the status text SHALL be displayed as `[error]` (without task count)
-- **AND** the status is displayed in red color
-- **AND** task counts SHALL be displayed in a separate column as `X/Y`
-
-#### Scenario: Processing state keeps progress percentage with task count
-- **WHEN** a change is in `processing` status in running mode
-- **THEN** the status text SHALL continue to display progress percentage as `⠋ [ XX%]`
-- **AND** task counts SHALL be displayed in a separate column as `X/Y`
-
-#### Scenario: Terminal states skip completed and archive immediately
-- **WHEN** a change reaches completion criteria for apply and acceptance
-- **THEN** the queue status transitions directly to `archiving` without using `completed`
-- **AND** no execution path leaves the change in a `completed` state (completed is never observable or durable)
-- **AND** the change SHALL proceed to `archiving` immediately without pausing in any intermediate state or waiting for manual action
-- **AND** completed MUST NOT be emitted as a queue status at any point
-- **AND** completion always results in archiving without manual intervention
-- **AND** no hook or retry flow can keep a change in completed state
-- **AND** there is no configuration option that re-enables completed state
-- **AND** failure to archive is handled as an error, not as a completed state
-- **AND** the running mode status text SHALL not display `[completed]`
+#### Scenario: Archiving の iteration 表示
+- **GIVEN** change が archive 実行中である
+- **AND** archive の iteration 番号が 2 である
+- **WHEN** TUI が change 行を表示する
+- **THEN** ステータス表示は `archiving:2` となる
 
 ### Requirement: TUI Archive Priority Processing
 
@@ -1034,21 +1006,13 @@ The TUI help text SHALL include stop key binding information.
 - **AND** help text shows "Waiting for current process..."
 
 ### Requirement: Interrupted Change Handling
+Changes interrupted by stop SHALL be handled according to the policy of holding queued status only during execution. When force-stopped, queue_status SHALL be reset to NotQueued while preserving execution marks. On resume, execution-marked changes SHALL be restored to queued and can be re-processed. Accepting status SHALL be treated as an in-flight execution state and MUST be reset to NotQueued when the user force-stops.
 
-Changes interrupted by stop SHALL be handled according to the policy of holding queued status only during execution. When force-stopped, queue_status SHALL be reset to NotQueued while preserving execution marks. On resume, execution-marked changes SHALL be restored to queued and can be re-processed.
-
-#### Scenario: Force-stopped change returns to not queued
-- **WHEN** a change is being processed
-- **AND** user force stops with second Esc press
-- **THEN** the change status becomes not queued (not error)
+#### Scenario: Force-stopped accepting change returns to not queued
+- **GIVEN** a change is in Accepting status
+- **WHEN** the user force stops with second Esc press
+- **THEN** the change status becomes not queued
 - **AND** the execution mark remains set
-- **AND** the change can be re-processed on resume
-
-#### Scenario: Partial progress preserved
-- **WHEN** a change had some tasks completed before force stop
-- **THEN** the completed tasks remain completed
-- **AND** the tasks.md file reflects actual progress
-- **AND** resuming continues from the partial state
 
 ### Requirement: Parallel Execution Mode Flag
 
@@ -1288,10 +1252,19 @@ TUIは選択中changeに紐づくworktreeを削除する操作を提供し、削
 
 ### Requirement: 実行中changeのworktree削除を禁止する
 TUIはProcessing/Running中のchangeに対してworktree削除を許可してはならない（MUST NOT）。
+ただし、削除対象worktreeがChanges一覧に存在しない、またはNotQueuedのchangeに紐づく場合は、実行中であっても削除を許可しなければならない（MUST）。
 
-#### Scenario: Processing中に削除を試みる
-- **GIVEN** 選択中changeがProcessing/Running中である
-- **WHEN** SelectモードでDキーを押す
+#### Scenario: 実行中の未関連worktreeを削除できる
+- **GIVEN** TUIがRunning中である
+- **AND** 選択中worktreeがChanges一覧に存在しない、またはNotQueuedのchangeに紐づく
+- **WHEN** WorktreesビューでDキーを押して削除を確認する
+- **THEN** worktree削除が実行される
+- **AND** 削除後にworktree一覧が更新される
+
+#### Scenario: 実行中のqueued/processing系worktreeは削除できない
+- **GIVEN** TUIがRunning中である
+- **AND** 選択中worktreeがQueued/Processing/Archiving/Resolving/Accepting/MergeWaitのchangeに紐づく
+- **WHEN** WorktreesビューでDキーを押す
 - **THEN** 削除は行われず、禁止メッセージが表示される
 
 ### Requirement: Serial Apply Iteration WIP Commits

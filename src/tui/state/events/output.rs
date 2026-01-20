@@ -14,6 +14,11 @@ impl AppState {
         output: String,
         iteration: Option<u32>,
     ) {
+        // Update iteration number in change state
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            change.iteration_number = iteration;
+        }
+
         self.add_log(
             LogEntry::info(output)
                 .with_change_id(change_id)
@@ -29,11 +34,36 @@ impl AppState {
         output: String,
         iteration: u32,
     ) {
+        // Update iteration number in change state
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            change.iteration_number = Some(iteration);
+        }
+
         self.add_log(
             LogEntry::info(output)
                 .with_change_id(change_id)
                 .with_operation("archive")
                 .with_iteration(iteration),
+        );
+    }
+
+    /// Handle AcceptanceOutput event
+    pub(super) fn handle_acceptance_output(
+        &mut self,
+        change_id: String,
+        output: String,
+        iteration: Option<u32>,
+    ) {
+        // Update iteration number in change state
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            change.iteration_number = iteration;
+        }
+
+        self.add_log(
+            LogEntry::info(output)
+                .with_change_id(change_id)
+                .with_operation("acceptance")
+                .with_iteration(iteration.unwrap_or(1)),
         );
     }
 
@@ -53,12 +83,16 @@ impl AppState {
         output: String,
         iteration: Option<u32>,
     ) {
-        let mut entry = LogEntry::info(output)
-            .with_change_id(&change_id)
-            .with_operation("resolve");
-        if let Some(iter) = iteration {
-            entry = entry.with_iteration(iter);
+        // Update iteration number in change state
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            change.iteration_number = iteration;
         }
-        self.add_log(entry);
+
+        self.add_log(
+            LogEntry::info(output)
+                .with_change_id(&change_id)
+                .with_operation("resolve")
+                .with_iteration(iteration.unwrap_or(1)),
+        );
     }
 }

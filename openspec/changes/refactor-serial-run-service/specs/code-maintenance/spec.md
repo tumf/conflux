@@ -1,0 +1,9 @@
+## MODIFIED Requirements
+### Requirement: Unified Orchestration Module
+The codebase SHALL have a unified orchestration module that contains shared logic between CLI and TUI modes, including a SerialRunService that owns the shared serial execution flow.
+
+#### Scenario: Serial run is routed through a shared service
+- **WHEN** the orchestrator runs in CLI serial mode
+- **AND** when the orchestrator runs in TUI serial mode
+- **THEN** both modes SHALL invoke SerialRunService for the shared serial execution flow
+- **AND** mode-specific output and UI updates are handled by injected adapters

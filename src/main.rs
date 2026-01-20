@@ -20,6 +20,7 @@ mod parallel;
 mod parallel_run_service;
 mod process_manager;
 mod progress;
+mod serial_run_service;
 mod spec_delta;
 #[cfg(test)]
 mod spec_test_annotations;
@@ -378,7 +379,7 @@ async fn main() -> Result<()> {
 
                 #[cfg(feature = "web-monitoring")]
                 if let Some(ref web_state) = web_state_arc {
-                    orchestrator.set_web_state(web_state.clone());
+                    orchestrator.set_web_state(web_state.clone()).await;
                 }
 
                 // Create a fresh cancel token for this run iteration
