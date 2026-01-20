@@ -1140,7 +1140,8 @@ pub async fn execute_archive_in_workspace(
                             change_id, attempt, max_attempts
                         ))
                         .with_change_id(change_id)
-                        .with_operation("archive"),
+                        .with_operation("archive")
+                        .with_iteration(attempt),
                     ))
                     .await;
             }
