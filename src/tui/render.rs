@@ -755,16 +755,20 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
         .collect();
 
     // Build title with scroll position indicator and auto-scroll status
+    // Debug: show offset value to verify it's incrementing
     let auto_scroll_indicator = if app.log_auto_scroll { "▼" } else { "⏸" };
     let title = if total_logs > visible_height {
         let visible_start = start_index + 1;
         let visible_end = end_index;
         format!(
-            " Logs [{}-{}/{}] {} ",
-            visible_start, visible_end, total_logs, auto_scroll_indicator
+            " Logs [{}-{}/{}] off={} {} ",
+            visible_start, visible_end, total_logs, app.log_scroll_offset, auto_scroll_indicator
         )
     } else {
-        format!(" Logs {} ", auto_scroll_indicator)
+        format!(
+            " Logs off={} {} ",
+            app.log_scroll_offset, auto_scroll_indicator
+        )
     };
 
     let logs = Paragraph::new(log_items).block(
