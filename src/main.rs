@@ -20,6 +20,7 @@ mod parallel;
 mod parallel_run_service;
 mod process_manager;
 mod progress;
+mod serial_run_service;
 mod spec_delta;
 #[cfg(test)]
 mod spec_test_annotations;
@@ -37,7 +38,7 @@ use config::OrchestratorConfig;
 use error::Result;
 use orchestrator::Orchestrator;
 use std::path::Path;
-use tracing::{info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::prelude::*;
 
 /// Initialize file-based logging for TUI mode
@@ -210,49 +211,280 @@ async fn main() -> Result<()> {
                 }
             }
 
-            info!("Starting orchestrator");
-            let mut orchestrator = Orchestrator::new(
-                args.change,
-                args.config,
-                args.max_iterations,
-                use_parallel,
-                args.max_concurrent,
-                args.dry_run,
-                vcs_override,
-                args.no_resume,
-            )?;
+            // Run mode control state for web control integration
+            // Run mode now supports retry and resume via outer loop.
+            use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+            use std::sync::Arc;
 
-            // Set web state for broadcasting updates
+            // Control state: 0 = Stopped, 1 = Running, 2 = Stopping
+            let run_state = Arc::new(AtomicU8::new(1)); // Start in Running state
+            let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+            let force_stop_flag = Arc::new(AtomicBool::new(false));
+            let restart_requested = Arc::new(AtomicBool::new(false));
+
+            // Set web state for broadcasting updates and wire control channel
             #[cfg(feature = "web-monitoring")]
-            if let Some(web_state) = web_state_arc {
-                orchestrator.set_web_state(web_state);
+            if let Some(web_state) = &web_state_arc {
+                // Create unbounded channel for web control commands
+                let (control_tx, mut control_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<web::state::ControlCommand>();
+
+                // Set the control channel in WebState
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        web_state.set_control_channel(control_tx).await;
+                    })
+                });
+
+                // Spawn bridge task to handle control commands
+                let bridge_run_state = run_state.clone();
+                let bridge_graceful_stop = graceful_stop_flag.clone();
+                let bridge_force_stop = force_stop_flag.clone();
+                let bridge_restart = restart_requested.clone();
+                let bridge_web_state = web_state.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if let Some(control_cmd) = control_rx.recv().await {
+                            use crate::events::ExecutionEvent;
+                            use web::state::ControlCommand;
+                            match control_cmd {
+                                ControlCommand::Start => {
+                                    let current_state = bridge_run_state.load(Ordering::SeqCst);
+                                    if current_state == 2 {
+                                        // Stopping -> Running (acts like CancelStop)
+                                        info!("Web control: Start requested, canceling stop and resuming");
+                                        bridge_graceful_stop.store(false, Ordering::SeqCst);
+                                        bridge_run_state.store(1, Ordering::SeqCst);
+                                    } else if current_state == 1 {
+                                        info!("Web control: Start requested but already running");
+                                    } else {
+                                        // State 0 (Stopped) - request restart in outer loop
+                                        info!("Web control: Start requested after stop, will restart orchestrator");
+                                        bridge_restart.store(true, Ordering::SeqCst);
+                                        bridge_run_state.store(1, Ordering::SeqCst);
+                                    }
+                                }
+                                ControlCommand::Stop => {
+                                    info!("Web control: Graceful stop requested");
+                                    bridge_graceful_stop.store(true, Ordering::SeqCst);
+                                    bridge_run_state.store(2, Ordering::SeqCst);
+                                    // Immediately broadcast stopping mode to web UI
+                                    bridge_web_state
+                                        .apply_execution_event(&ExecutionEvent::Stopping)
+                                        .await;
+                                }
+                                ControlCommand::CancelStop => {
+                                    let current_state = bridge_run_state.load(Ordering::SeqCst);
+                                    if current_state == 2 {
+                                        // Stopping -> Running
+                                        info!("Web control: Cancel stop requested");
+                                        bridge_graceful_stop.store(false, Ordering::SeqCst);
+                                        bridge_run_state.store(1, Ordering::SeqCst);
+                                        // Broadcast running mode immediately
+                                        bridge_web_state
+                                            .apply_execution_event(
+                                                &ExecutionEvent::ProcessingStarted("".to_string()),
+                                            )
+                                            .await;
+                                    } else {
+                                        warn!("Web control: Cancel stop requested but not in stopping state");
+                                    }
+                                }
+                                ControlCommand::ForceStop => {
+                                    info!("Web control: Force stop requested");
+                                    bridge_force_stop.store(true, Ordering::SeqCst);
+                                    bridge_graceful_stop.store(true, Ordering::SeqCst);
+                                    bridge_run_state.store(0, Ordering::SeqCst);
+                                    // Broadcast stopped mode immediately
+                                    bridge_web_state
+                                        .apply_execution_event(&ExecutionEvent::Stopped)
+                                        .await;
+                                }
+                                ControlCommand::Retry => {
+                                    let current_state = bridge_run_state.load(Ordering::SeqCst);
+                                    if current_state == 2 {
+                                        // Stopping -> Running (resume)
+                                        info!("Web control: Retry requested, canceling stop and resuming");
+                                        bridge_graceful_stop.store(false, Ordering::SeqCst);
+                                        bridge_run_state.store(1, Ordering::SeqCst);
+                                    } else if current_state == 1 {
+                                        info!("Web control: Retry requested during execution, will restart after completion");
+                                        bridge_restart.store(true, Ordering::SeqCst);
+                                    } else {
+                                        // State 0 (Stopped) - request restart
+                                        info!("Web control: Retry requested after stop, will restart orchestrator");
+                                        bridge_restart.store(true, Ordering::SeqCst);
+                                        bridge_run_state.store(1, Ordering::SeqCst);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
             }
 
-            // Setup signal handling for graceful shutdown
-            let cancel_token = tokio_util::sync::CancellationToken::new();
-            let cancel_for_signal = cancel_token.clone();
+            // Signal handler flags (shared across all iterations)
+            let signal_stop = Arc::new(AtomicBool::new(false));
 
-            // Spawn signal handler task
+            // Spawn signal handler tasks
             #[cfg(unix)]
             {
-                let cancel_for_sigterm = cancel_for_signal.clone();
+                let signal_stop_sigterm = signal_stop.clone();
                 tokio::spawn(async move {
                     let mut sigterm =
                         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                             .expect("Failed to install SIGTERM handler");
                     sigterm.recv().await;
                     info!("Received SIGTERM, shutting down gracefully...");
-                    cancel_for_sigterm.cancel();
+                    signal_stop_sigterm.store(true, Ordering::SeqCst);
                 });
             }
 
-            tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                info!("Received SIGINT (Ctrl+C), shutting down gracefully...");
-                cancel_for_signal.cancel();
-            });
+            {
+                let signal_stop_sigint = signal_stop.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    info!("Received SIGINT (Ctrl+C), shutting down gracefully...");
+                    signal_stop_sigint.store(true, Ordering::SeqCst);
+                });
+            }
 
-            orchestrator.run(cancel_token).await?;
+            // Clone args for use in restart loop
+            let change_ids = args.change.clone();
+            let config_path = args.config.clone();
+            let max_iterations = args.max_iterations;
+            let max_concurrent = args.max_concurrent;
+            let dry_run = args.dry_run;
+            let no_resume = args.no_resume;
+
+            // Outer loop for retry/restart support in Run mode
+            loop {
+                // Check for signal stop before starting new iteration
+                if signal_stop.load(Ordering::SeqCst) {
+                    info!("Signal stop detected, exiting");
+                    break;
+                }
+
+                info!("Starting orchestrator");
+                let mut orchestrator = Orchestrator::new(
+                    change_ids.clone(),
+                    config_path.clone(),
+                    max_iterations,
+                    use_parallel,
+                    max_concurrent,
+                    dry_run,
+                    vcs_override,
+                    no_resume,
+                )?;
+
+                #[cfg(feature = "web-monitoring")]
+                if let Some(ref web_state) = web_state_arc {
+                    orchestrator.set_web_state(web_state.clone()).await;
+                }
+
+                // Create a fresh cancel token for this run iteration
+                let cancel_token = tokio_util::sync::CancellationToken::new();
+
+                // Monitor stop flags and trigger cancellation for this iteration
+                // Note: graceful_stop is NOT monitored here - it's checked directly in orchestrator loop
+                // This allows CancelStop to clear the flag before orchestrator sees it
+                let monitor_token = cancel_token.clone();
+                let monitor_force = force_stop_flag.clone();
+                let monitor_signal = signal_stop.clone();
+                let monitor_handle = tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        if monitor_signal.load(Ordering::SeqCst)
+                            || monitor_force.load(Ordering::SeqCst)
+                        {
+                            if monitor_force.load(Ordering::SeqCst) {
+                                info!("Force stop detected, cancelling orchestrator");
+                            } else {
+                                info!("Signal received, cancelling orchestrator");
+                            }
+                            monitor_token.cancel();
+                            break;
+                        }
+                    }
+                });
+
+                let result = orchestrator
+                    .run(cancel_token, Some(graceful_stop_flag.clone()))
+                    .await;
+
+                // Cancel monitor task
+                monitor_handle.abort();
+
+                // After orchestrator completes, update state
+                run_state.store(0, Ordering::SeqCst); // Stopped
+
+                // Handle result - wait for restart requests in both error and stopped states
+                match result {
+                    Err(e) => {
+                        error!("Orchestrator error: {}", e);
+
+                        // Wait for retry request in error state
+                        // Keep checking restart_requested flag until user requests retry or signals stop
+                        loop {
+                            // Check if restart was requested
+                            if restart_requested.load(Ordering::SeqCst) {
+                                info!("Retry requested after error, will restart orchestrator");
+                                break;
+                            }
+
+                            // Check if force stop or signal was received (exit on those)
+                            if force_stop_flag.load(Ordering::SeqCst)
+                                || signal_stop.load(Ordering::SeqCst)
+                            {
+                                info!("Stop requested in error state, exiting");
+                                return Err(e);
+                            }
+
+                            // Wait a bit before checking again (100ms polling interval)
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        }
+
+                        info!("Continuing after error due to retry request");
+                    }
+                    Ok(()) => {
+                        // Successful completion or graceful stop
+                        info!("Orchestrator completed successfully");
+
+                        // Wait for restart request in stopped state (to support resume from stop)
+                        loop {
+                            // Check if restart was requested
+                            if restart_requested.load(Ordering::SeqCst) {
+                                info!("Restart requested after stop, will restart orchestrator");
+                                break;
+                            }
+
+                            // Check if force stop or signal was received (exit on those)
+                            if force_stop_flag.load(Ordering::SeqCst)
+                                || signal_stop.load(Ordering::SeqCst)
+                            {
+                                info!("Stop signal received, exiting");
+                                break; // Exit outer loop below
+                            }
+
+                            // Wait a bit before checking again (100ms polling interval)
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+
+                // Check if restart was requested (Start/Retry from web UI or post-error/stop retry)
+                if restart_requested.swap(false, Ordering::SeqCst) {
+                    info!("Restarting orchestrator due to web control request");
+                    run_state.store(1, Ordering::SeqCst); // Back to Running
+                                                          // Reset stop flags for new run
+                    graceful_stop_flag.store(false, Ordering::SeqCst);
+                    force_stop_flag.store(false, Ordering::SeqCst);
+                    continue; // Restart loop
+                }
+
+                // No restart requested, exit loop
+                break;
+            }
         }
 
         // Init subcommand: generate configuration file

@@ -2,6 +2,12 @@
 //!
 //! Provides unified change selection that both modes can use,
 //! with optional LLM-based dependency analysis.
+//!
+//! Note: This module's functions are currently unused as selection logic
+//! has been migrated to SerialRunService. Keeping for reference and potential
+//! future use in parallel mode.
+
+#![allow(dead_code)]
 
 use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};

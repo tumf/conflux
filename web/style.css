@@ -258,6 +258,82 @@ header h1 {
     margin-top: var(--space-xs);
 }
 
+/* Control Bar - Mobile (stacked buttons) */
+.control-bar {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    margin-bottom: var(--space-md);
+    padding: var(--space-md);
+    background-color: var(--bg-secondary);
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+}
+
+.control-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-sm);
+    min-height: var(--touch-target);
+    padding: var(--space-sm) var(--space-md);
+    font-size: 0.875rem;
+    font-weight: 600;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-family: inherit;
+}
+
+.control-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.control-btn:not(:disabled):hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+}
+
+.control-btn:not(:disabled):active {
+    transform: translateY(0);
+}
+
+.control-btn-primary {
+    background-color: var(--accent-blue);
+    color: var(--bg-primary);
+}
+
+.control-btn-warning {
+    background-color: var(--accent-yellow);
+    color: var(--bg-primary);
+}
+
+.control-btn-info {
+    background-color: var(--accent-blue);
+    color: var(--bg-primary);
+}
+
+.control-btn-danger {
+    background-color: var(--accent-red);
+    color: var(--text-primary);
+}
+
+.control-btn-success {
+    background-color: var(--accent-green);
+    color: var(--bg-primary);
+}
+
+.btn-icon {
+    font-size: 1.125rem;
+    line-height: 1;
+}
+
+.btn-text {
+    line-height: 1;
+}
+
 /* Main Content */
 main {
     flex: 1;
@@ -663,6 +739,18 @@ footer {
 
     .stat-label {
         font-size: 0.75rem;
+    }
+
+    .control-bar {
+        flex-direction: row;
+        flex-wrap: wrap;
+        gap: var(--space-md);
+        padding: var(--space-lg);
+    }
+
+    .control-btn {
+        flex: 1;
+        min-width: 120px;
     }
 
     .change-card {

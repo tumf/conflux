@@ -80,8 +80,8 @@ impl AcceptanceResult {
 pub async fn acceptance_test_streaming<O, F>(
     change: &Change,
     agent: &mut AgentRunner,
-    ai_runner: &crate::ai_command_runner::AiCommandRunner,
-    config: &crate::config::OrchestratorConfig,
+    _ai_runner: &crate::ai_command_runner::AiCommandRunner,
+    _config: &crate::config::OrchestratorConfig,
     output: &O,
     cancel_check: F,
 ) -> Result<AcceptanceResult>
@@ -89,32 +89,19 @@ where
     O: OutputHandler,
     F: Fn() -> bool,
 {
-    use crate::ai_command_runner::OutputLine as AiOutputLine;
+    use crate::agent::OutputLine;
 
     info!("Running acceptance test for: {}", change.id);
     output.on_info(&format!("Acceptance test: {}", change.id));
 
-    // Get the acceptance iteration number (attempt number that will be used)
-    let _acceptance_iteration = agent.next_acceptance_attempt_number(&change.id);
+    // Capture current commit hash for diff tracking
+    let commit_hash = crate::vcs::git::commands::get_current_commit(".")
+        .await
+        .ok(); // Allow to fail silently (non-git repos)
 
-    // Build prompt with system instructions and history context
-    let user_prompt = config.get_acceptance_prompt();
-    let history_context = agent.format_acceptance_history(&change.id);
-    let full_prompt =
-        crate::agent::build_acceptance_prompt(&change.id, user_prompt, &history_context);
-
-    // Expand change_id and prompt in command
-    let template = config.get_acceptance_command();
-    let command = crate::config::OrchestratorConfig::expand_change_id(template, &change.id);
-    let command = crate::config::OrchestratorConfig::expand_prompt(&command, &full_prompt);
-
-    // Capture start time for history recording
-    let start_time = std::time::Instant::now();
-
-    // Execute command via AiCommandRunner (with stagger and retry)
-    let (mut child, mut output_rx) = ai_runner
-        .execute_streaming_with_retry(&command, None)
-        .await?;
+    // Execute acceptance command with streaming
+    let (mut child, mut output_rx, start_time) =
+        agent.run_acceptance_streaming(&change.id, None).await?;
 
     // Create output collector for history and parsing
     let mut output_collector = OutputCollector::new();
@@ -131,13 +118,13 @@ where
         }
 
         match line {
-            AiOutputLine::Stdout(s) => {
+            OutputLine::Stdout(s) => {
                 output_collector.add_stdout(&s);
                 full_stdout.push_str(&s);
                 full_stdout.push('\n');
                 output.on_stdout(&s);
             }
-            AiOutputLine::Stderr(s) => {
+            OutputLine::Stderr(s) => {
                 output_collector.add_stderr(&s);
                 output.on_stderr(&s);
             }
@@ -174,6 +161,7 @@ where
             exit_code: status.code(),
             stdout_tail,
             stderr_tail,
+            commit_hash: commit_hash.clone(),
         };
         agent.record_acceptance_attempt(&change.id, attempt);
         output.on_error(&error_msg);
@@ -195,6 +183,7 @@ where
                 exit_code: status.code(),
                 stdout_tail,
                 stderr_tail: stderr_tail.clone(),
+                commit_hash: commit_hash.clone(),
             };
             agent.record_acceptance_attempt(&change.id, attempt);
             output.on_success("Acceptance test passed");
@@ -210,6 +199,7 @@ where
                 exit_code: status.code(),
                 stdout_tail,
                 stderr_tail,
+                commit_hash: commit_hash.clone(),
             };
             agent.record_acceptance_attempt(&change.id, attempt);
             output.on_info("Acceptance test requires continuation");
@@ -230,6 +220,7 @@ where
                 exit_code: status.code(),
                 stdout_tail,
                 stderr_tail,
+                commit_hash: commit_hash.clone(),
             };
             agent.record_acceptance_attempt(&change.id, attempt);
             output.on_warn(&format!(

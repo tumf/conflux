@@ -1,6 +1,6 @@
 //! REST API handlers for web monitoring.
 
-use super::state::{ChangeStatus, WebState};
+use super::state::{ChangeStatus, ControlCommand, WebState};
 use axum::{
     extract::{Path, State},
     http::{header, StatusCode},
@@ -152,11 +152,242 @@ pub async fn unapprove_change(
     }
 }
 
+/// Success response for control operations
+#[derive(Debug, Serialize)]
+pub struct ControlResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+/// Start or resume processing
+///
+/// # Endpoint
+/// POST /api/control/start
+///
+/// # Returns
+/// - 200 OK if start/resume is successful
+/// - 409 Conflict if already running or stopping
+/// - 500 Internal Server Error if control channel not available
+pub async fn control_start(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<ControlResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Check current mode
+    let current_mode = {
+        let s = state.get_state().await;
+        s.app_mode.clone()
+    };
+
+    // Validate state transition
+    if current_mode == "running" || current_mode == "stopping" {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("Cannot start: already {}", current_mode),
+            }),
+        ));
+    }
+
+    // Send control command
+    match state.send_control_command(ControlCommand::Start) {
+        Ok(()) => Ok(Json(ControlResponse {
+            success: true,
+            message: "Processing started".to_string(),
+        })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to start processing: {}", e),
+            }),
+        )),
+    }
+}
+
+/// Stop processing (graceful shutdown)
+///
+/// # Endpoint
+/// POST /api/control/stop
+///
+/// # Returns
+/// - 200 OK if stop is initiated
+/// - 409 Conflict if not running
+/// - 500 Internal Server Error if control channel not available
+pub async fn control_stop(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<ControlResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Check current mode
+    let current_mode = {
+        let s = state.get_state().await;
+        s.app_mode.clone()
+    };
+
+    // Validate state transition
+    if current_mode != "running" {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("Cannot stop: not running (current mode: {})", current_mode),
+            }),
+        ));
+    }
+
+    // Send control command
+    match state.send_control_command(ControlCommand::Stop) {
+        Ok(()) => Ok(Json(ControlResponse {
+            success: true,
+            message: "Stopping after current change completes...".to_string(),
+        })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to stop processing: {}", e),
+            }),
+        )),
+    }
+}
+
+/// Cancel a pending stop request
+///
+/// # Endpoint
+/// POST /api/control/cancel-stop
+///
+/// # Returns
+/// - 200 OK if stop is canceled
+/// - 409 Conflict if not in stopping mode
+/// - 500 Internal Server Error if control channel not available
+pub async fn control_cancel_stop(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<ControlResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Check current mode
+    let current_mode = {
+        let s = state.get_state().await;
+        s.app_mode.clone()
+    };
+
+    // Validate state transition
+    if current_mode != "stopping" {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!(
+                    "Cannot cancel stop: not stopping (current mode: {})",
+                    current_mode
+                ),
+            }),
+        ));
+    }
+
+    // Send control command
+    match state.send_control_command(ControlCommand::CancelStop) {
+        Ok(()) => Ok(Json(ControlResponse {
+            success: true,
+            message: "Stop canceled, continuing...".to_string(),
+        })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to cancel stop: {}", e),
+            }),
+        )),
+    }
+}
+
+/// Force stop immediately
+///
+/// # Endpoint
+/// POST /api/control/force-stop
+///
+/// # Returns
+/// - 200 OK if force stop is initiated
+/// - 409 Conflict if not running or stopping
+/// - 500 Internal Server Error if control channel not available
+pub async fn control_force_stop(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<ControlResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Check current mode
+    let current_mode = {
+        let s = state.get_state().await;
+        s.app_mode.clone()
+    };
+
+    // Validate state transition
+    if current_mode != "running" && current_mode != "stopping" {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!(
+                    "Cannot force stop: not running or stopping (current mode: {})",
+                    current_mode
+                ),
+            }),
+        ));
+    }
+
+    // Send control command
+    match state.send_control_command(ControlCommand::ForceStop) {
+        Ok(()) => Ok(Json(ControlResponse {
+            success: true,
+            message: "Force stopping...".to_string(),
+        })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to force stop: {}", e),
+            }),
+        )),
+    }
+}
+
+/// Retry error changes
+///
+/// # Endpoint
+/// POST /api/control/retry
+///
+/// # Returns
+/// - 200 OK if retry is initiated
+/// - 409 Conflict if not in error mode
+/// - 500 Internal Server Error if control channel not available
+pub async fn control_retry(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<ControlResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Check current mode
+    let current_mode = {
+        let s = state.get_state().await;
+        s.app_mode.clone()
+    };
+
+    // Validate state transition
+    if current_mode != "error" {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!(
+                    "Cannot retry: not in error mode (current mode: {})",
+                    current_mode
+                ),
+            }),
+        ));
+    }
+
+    // Send control command
+    match state.send_control_command(ControlCommand::Retry) {
+        Ok(()) => Ok(Json(ControlResponse {
+            success: true,
+            message: "Retrying error changes...".to_string(),
+        })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to retry: {}", e),
+            }),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::openspec::Change;
-    use crate::web::state::OrchestratorState;
+    use crate::web::state::OrchestratorStateSnapshot;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -189,7 +420,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let state: OrchestratorState = serde_json::from_slice(&body).unwrap();
+        let state: OrchestratorStateSnapshot = serde_json::from_slice(&body).unwrap();
         // After refresh_from_disk, state may include real changes from the repository
         // Just verify that the response is valid JSON with the correct structure
         assert!(state.total_changes > 0);

@@ -6,8 +6,6 @@
 //! Note: These types are infrastructure for future CLI/TUI integration.
 //! They will be used as the refactoring continues.
 
-#![allow(dead_code)]
-
 use tracing::{error, info, warn};
 
 /// Trait for handling output during orchestration operations.
@@ -78,10 +76,12 @@ impl OutputHandler for LogOutputHandler {
 ///
 /// Discards all output. Useful for testing or when output is not needed.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // Reserved for testing
 pub struct NullOutputHandler;
 
 impl NullOutputHandler {
     /// Create a new null output handler.
+    #[allow(dead_code)] // Reserved for testing
     pub fn new() -> Self {
         Self
     }

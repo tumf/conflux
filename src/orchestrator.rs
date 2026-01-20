@@ -5,17 +5,16 @@ use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::error_history::{CircuitBreakerConfig, ErrorHistory};
-use crate::execution::apply::{check_task_progress, create_progress_commit, is_progress_complete};
+use crate::events::ExecutionEvent;
+use crate::execution::apply::{check_task_progress, create_progress_commit};
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
-use crate::orchestration::{
-    acceptance_test_streaming, apply_change, archive_change, selection,
-    update_tasks_on_acceptance_failure, AcceptanceResult, ApplyContext, ApplyResult,
-    ArchiveContext, ArchiveResult, LogOutputHandler,
-};
+use crate::orchestration::state::OrchestratorState;
+use crate::orchestration::LogOutputHandler;
 use crate::parallel_run_service::ParallelRunService;
 use crate::progress::ProgressDisplay;
-use crate::stall::{StallDetector, StallPhase};
+use crate::serial_run_service::SerialRunService;
+use crate::stall::StallDetector;
 use crate::task_parser::TaskProgress;
 use crate::tui::log_deduplicator;
 use crate::vcs::git::commands as git_commands;
@@ -80,9 +79,16 @@ pub struct Orchestrator {
     vcs_backend: VcsBackend,
     /// Disable automatic workspace resume (always create new workspaces)
     no_resume: bool,
+    /// Shared orchestration state (single source of truth for state tracking)
+    /// Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
+    shared_state: std::sync::Arc<tokio::sync::RwLock<OrchestratorState>>,
     /// Web monitoring state (for broadcasting updates to WebSocket clients)
     #[cfg(feature = "web-monitoring")]
     web_state: Option<Arc<WebState>>,
+    /// Current execution mode for web monitoring app_mode
+    /// "select" | "running" | "stopped" | "stopping" | "error"
+    #[cfg(feature = "web-monitoring")]
+    execution_mode: String,
 }
 
 impl Orchestrator {
@@ -130,6 +136,13 @@ impl Orchestrator {
         };
         let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
 
+        // Initialize shared state (will be populated when run() is called with actual changes)
+        // Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            Vec::new(),
+            max_iterations,
+        )));
+
         Ok(Self {
             agent,
             ai_runner,
@@ -153,14 +166,20 @@ impl Orchestrator {
             dry_run,
             vcs_backend,
             no_resume,
+            shared_state,
             #[cfg(feature = "web-monitoring")]
             web_state: None,
+            #[cfg(feature = "web-monitoring")]
+            execution_mode: "select".to_string(),
         })
     }
 
-    /// Set web monitoring state for broadcasting updates to WebSocket clients
+    /// Set web monitoring state for broadcasting updates to WebSocket clients.
+    /// Also injects the shared orchestration state reference into WebState for unified tracking.
     #[cfg(feature = "web-monitoring")]
-    pub fn set_web_state(&mut self, web_state: Arc<WebState>) {
+    pub async fn set_web_state(&mut self, web_state: Arc<WebState>) {
+        // Inject shared state reference into WebState
+        web_state.set_shared_state(self.shared_state.clone()).await;
         self.web_state = Some(web_state);
     }
 
@@ -168,7 +187,9 @@ impl Orchestrator {
     #[cfg(feature = "web-monitoring")]
     async fn broadcast_state_update(&self, changes: &[Change]) {
         if let Some(ref web_state) = self.web_state {
-            web_state.update(changes).await;
+            web_state
+                .update_with_mode(changes, &self.execution_mode)
+                .await;
         }
     }
 
@@ -210,6 +231,13 @@ impl Orchestrator {
         };
         let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
 
+        // Initialize shared state (for testing, will use empty change list)
+        // Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            Vec::new(),
+            max_iterations,
+        )));
+
         Ok(Self {
             agent,
             ai_runner,
@@ -233,15 +261,27 @@ impl Orchestrator {
             dry_run: false,
             vcs_backend: VcsBackend::Auto,
             no_resume: false,
+            shared_state,
             #[cfg(feature = "web-monitoring")]
             web_state: None,
+            #[cfg(feature = "web-monitoring")]
+            execution_mode: "select".to_string(),
         })
     }
 
     /// Run the orchestration loop with cancellation support
-    pub async fn run(&mut self, _cancel_token: tokio_util::sync::CancellationToken) -> Result<()> {
+    pub async fn run(
+        &mut self,
+        cancel_token: tokio_util::sync::CancellationToken,
+        graceful_stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<()> {
         info!("Starting orchestration loop");
-        // TODO: Integrate cancel_token with apply/archive operations for graceful shutdown
+
+        // Set execution mode to running (for web monitoring)
+        #[cfg(feature = "web-monitoring")]
+        {
+            self.execution_mode = "running".to_string();
+        }
 
         // Capture initial snapshot of change IDs at run start.
         // Only changes present at this point will be processed during the run.
@@ -255,7 +295,9 @@ impl Orchestrator {
 
         // Handle parallel execution mode
         if self.parallel {
-            return self.run_parallel(&initial_changes).await;
+            return self
+                .run_parallel(&initial_changes, cancel_token, graceful_stop_flag)
+                .await;
         }
 
         if initial_changes.is_empty() {
@@ -323,10 +365,18 @@ impl Orchestrator {
         );
         self.initial_change_ids = Some(snapshot_ids.clone());
 
+        // Initialize shared orchestration state with filtered changes
+        let change_ids: Vec<String> = filtered_initial.iter().map(|c| c.id.clone()).collect();
+        *self.shared_state.write().await = OrchestratorState::new(change_ids, self.max_iterations);
+
         // Initialize progress display
         self.progress = Some(ProgressDisplay::new(filtered_initial.len()));
 
         let total_changes = filtered_initial.len();
+
+        // Create serial run service for shared state and helpers
+        let repo_root = std::env::current_dir()?;
+        let mut serial_service = SerialRunService::new(repo_root, self.config.clone());
 
         // Run on_start hook
         let start_context = HookContext::new(0, total_changes, total_changes, false);
@@ -336,7 +386,75 @@ impl Orchestrator {
 
         let finish_status;
 
+        // Track previous graceful stop state to detect transitions (false -> true)
+        let mut previous_graceful_stop = false;
+
         loop {
+            // Check for graceful stop flag (stop after current change completes)
+            if let Some(ref graceful_flag) = graceful_stop_flag {
+                let current_graceful_stop = graceful_flag.load(std::sync::atomic::Ordering::SeqCst);
+
+                // Detect transition from false to true (entering stopping state)
+                if current_graceful_stop && !previous_graceful_stop {
+                    info!("Graceful stop requested, entering stopping state");
+                    #[cfg(feature = "web-monitoring")]
+                    {
+                        self.execution_mode = "stopping".to_string();
+                        // Broadcast mode change to web monitoring
+                        let current_changes = openspec::list_changes_native().unwrap_or_default();
+                        self.broadcast_state_update(&current_changes).await;
+                    }
+                }
+
+                // Detect transition from true to false (cancel stop - resume running)
+                if !current_graceful_stop && previous_graceful_stop {
+                    info!("Graceful stop cancelled, resuming running state");
+                    #[cfg(feature = "web-monitoring")]
+                    {
+                        self.execution_mode = "running".to_string();
+                        // Broadcast mode change to web monitoring
+                        let current_changes = openspec::list_changes_native().unwrap_or_default();
+                        self.broadcast_state_update(&current_changes).await;
+                    }
+                }
+
+                previous_graceful_stop = current_graceful_stop;
+
+                // If stop is still requested, exit loop
+                if current_graceful_stop {
+                    info!("Graceful stop: stopping after current change");
+                    #[cfg(feature = "web-monitoring")]
+                    {
+                        self.execution_mode = "stopped".to_string();
+                        // Broadcast mode change to web monitoring
+                        let current_changes = openspec::list_changes_native().unwrap_or_default();
+                        self.broadcast_state_update(&current_changes).await;
+                    }
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_all();
+                    }
+                    finish_status = "graceful_stop";
+                    break;
+                }
+            }
+
+            // Check for cancellation request (force stop or signal)
+            if cancel_token.is_cancelled() {
+                info!("Cancellation requested, stopping orchestration");
+                #[cfg(feature = "web-monitoring")]
+                {
+                    self.execution_mode = "stopped".to_string();
+                    // Broadcast mode change to web monitoring
+                    let current_changes = openspec::list_changes_native().unwrap_or_default();
+                    self.broadcast_state_update(&current_changes).await;
+                }
+                if let Some(progress) = &mut self.progress {
+                    progress.complete_all();
+                }
+                finish_status = "cancelled";
+                break;
+            }
+
             // Increment iteration counter
             self.iteration += 1;
 
@@ -398,305 +516,259 @@ impl Orchestrator {
                 break;
             }
 
-            // Select next change to process
-            let next = self.select_next_change(&eligible_changes).await?;
+            // Select next change to process using serial service
+            let next = serial_service
+                .select_next_change(&eligible_changes)
+                .ok_or_else(|| {
+                    OrchestratorError::AgentCommand("No eligible change found".to_string())
+                })?;
             info!("Selected change: {}", next.id);
 
             if let Some(progress) = &mut self.progress {
-                progress.update_change(&next);
+                progress.update_change(next);
             }
 
-            // Check if this is a new change (for on_change_start hook)
+            // Check if this is a new change (for state tracking)
             let is_new_change = self.current_change_id.as_ref() != Some(&next.id);
             if is_new_change {
-                // Run on_change_start hook
-                let change_start_context = HookContext::new(
-                    self.changes_processed,
-                    total_changes,
-                    remaining_changes,
-                    false,
-                )
-                .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                .with_apply_count(0);
-                self.hooks
-                    .run_hook(HookType::OnChangeStart, &change_start_context)
-                    .await?;
+                // Update shared state: processing started
+                self.shared_state
+                    .write()
+                    .await
+                    .apply_execution_event(&ExecutionEvent::ProcessingStarted(next.id.clone()));
+
+                // Note: OnChangeStart hook is called by process_change() internally
                 self.current_change_id = Some(next.id.clone());
             }
 
-            // Get current apply count for this change
-            let apply_count = *self.apply_counts.get(&next.id).unwrap_or(&0);
+            // Process the change through SerialRunService
+            let output = LogOutputHandler::new();
+            let cancel_check = || false; // No cancellation in CLI mode
 
-            // Process the change
-            if next.is_complete() {
-                // Archive completed change using shared function
-                info!("Change {} is complete, archiving...", next.id);
-
-                let archive_ctx = ArchiveContext::new(
-                    self.changes_processed,
-                    total_changes,
-                    remaining_changes,
-                    apply_count,
-                );
-                let output = LogOutputHandler::new();
-
-                let stall_config = self.config.get_stall_detection();
-
-                match archive_change(
-                    &next,
+            let result = serial_service
+                .process_change(
+                    next,
                     &mut self.agent,
                     &self.ai_runner,
                     &self.hooks,
-                    &archive_ctx,
                     &output,
-                    None,
-                    &stall_config,
+                    total_changes,
+                    remaining_changes,
+                    cancel_check,
                 )
-                .await
-                {
-                    Ok(ArchiveResult::Success) => {
-                        // Update changes_processed count
-                        self.changes_processed += 1;
-                        let new_remaining = remaining_changes - 1;
+                .await?;
 
-                        // Clear acceptance history after successful archive
-                        self.agent.clear_acceptance_history(&next.id);
+            // Handle mode-specific concerns based on result
+            use crate::serial_run_service::ChangeProcessResult;
+            match result {
+                ChangeProcessResult::Archived => {
+                    // Update changes_processed count
+                    self.changes_processed += 1;
 
-                        // Run on_change_end hook (not included in shared archive_change)
-                        let change_end_context = HookContext::new(
-                            self.changes_processed,
-                            total_changes,
-                            new_remaining,
-                            false,
-                        )
-                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                        .with_apply_count(apply_count);
-                        self.hooks
-                            .run_hook(HookType::OnChangeEnd, &change_end_context)
-                            .await?;
+                    // Update shared state: mark change as archived
+                    self.shared_state
+                        .write()
+                        .await
+                        .apply_execution_event(&ExecutionEvent::ChangeArchived(next.id.clone()));
 
-                        // Mark change as completed and clear current
-                        self.completed_change_ids.insert(next.id.clone());
-                        self.current_change_id = None;
-                        self.apply_counts.remove(&next.id);
-                        self.stall_detector.clear_change(&next.id);
+                    // Mark change as completed and clear current (already done in service)
+                    self.completed_change_ids.insert(next.id.clone());
+                    self.current_change_id = None;
+                    self.apply_counts.remove(&next.id);
+                    self.stall_detector.clear_change(&next.id);
 
-                        if let Some(progress) = &mut self.progress {
-                            progress.archive_change(&next.id);
-                        }
-                    }
-                    Ok(ArchiveResult::Stalled { error }) => {
-                        warn!("Archive stalled for {}: {}", next.id, error);
-                        self.mark_change_stalled(&next.id, &error);
-                        continue;
-                    }
-                    Ok(ArchiveResult::Failed { error }) => {
-                        error!("Archive failed for {}: {}", next.id, error);
-                        if let Some(progress) = &mut self.progress {
-                            progress.error(&format!("Archive failed: {}", next.id));
-                        }
-                        return Err(OrchestratorError::AgentCommand(error));
-                    }
-                    Ok(ArchiveResult::Cancelled) => {
-                        info!("Archive cancelled for {}", next.id);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        error!("Archive error for {}: {}", next.id, e);
-                        if let Some(progress) = &mut self.progress {
-                            progress.error(&format!("Archive failed: {}", next.id));
-                        }
-                        return Err(e);
+                    if let Some(progress) = &mut self.progress {
+                        progress.archive_change(&next.id);
                     }
                 }
-            } else {
-                // Apply change using shared function
-                info!("Applying change: {}", next.id);
-
-                // Increment apply count
-                let new_apply_count = apply_count + 1;
-                self.apply_counts.insert(next.id.clone(), new_apply_count);
-
-                let apply_ctx = ApplyContext::new(
-                    self.changes_processed,
-                    total_changes,
-                    remaining_changes,
-                    new_apply_count,
-                );
-                let output = LogOutputHandler::new();
-
-                match apply_change(
-                    &next,
-                    &mut self.agent,
-                    &self.ai_runner,
-                    &self.hooks,
-                    &apply_ctx,
-                    &output,
-                )
-                .await
-                {
-                    Ok(ApplyResult::Success) => {
-                        let snapshot = match self
-                            .snapshot_serial_iteration(&next.id, new_apply_count)
-                            .await
-                        {
-                            Ok(snapshot) => snapshot,
-                            Err(e) => {
-                                warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
-                                SerialSnapshot {
-                                    progress: crate::task_parser::TaskProgress::default(),
-                                    empty_commit: None,
-                                }
-                            }
-                        };
-
-                        let progress_snapshot = snapshot.progress;
-
-                        if let Some(is_empty) = snapshot.empty_commit {
-                            if !is_progress_complete(&progress_snapshot)
-                                && self.stall_detector.register_commit(
-                                    &next.id,
-                                    StallPhase::Apply,
-                                    is_empty,
-                                )
-                            {
-                                let count = self
-                                    .stall_detector
-                                    .current_count(&next.id, StallPhase::Apply);
-                                let threshold = self.stall_detector.config().threshold;
-                                let message = format!(
-                                    "Stall detected for {} after {} empty WIP commits (apply)",
-                                    next.id, count
-                                );
-                                warn!("{} (threshold {})", message, threshold);
-                                self.mark_change_stalled(&next.id, &message);
-                                continue;
-                            }
-                        }
-
-                        if is_progress_complete(&progress_snapshot) {
-                            let _ = self
-                                .squash_serial_wip_commits(&next.id, new_apply_count)
-                                .await;
-
-                            // Run acceptance test after apply completion
-                            info!("Tasks complete for {}, running acceptance test...", next.id);
-                            let output = LogOutputHandler::new();
-                            let cancel_check = || false; // No cancellation in CLI mode
-
-                            match acceptance_test_streaming(
-                                &next,
-                                &mut self.agent,
-                                &self.ai_runner,
-                                &self.config,
-                                &output,
-                                cancel_check,
-                            )
-                            .await
-                            {
-                                Ok(AcceptanceResult::Pass) => {
-                                    info!("Acceptance passed for {}, ready for archive", next.id);
-                                    // Change will be archived in next iteration
-                                }
-                                Ok(AcceptanceResult::Continue) => {
-                                    let continue_count =
-                                        self.agent.count_consecutive_acceptance_continues(&next.id);
-                                    let max_continues = self.config.get_acceptance_max_continues();
-
-                                    if continue_count >= max_continues {
-                                        warn!(
-                                            "Acceptance CONTINUE limit ({}) exceeded for {}, treating as FAIL",
-                                            max_continues, next.id
-                                        );
-                                        // Exceeded limit - treat as FAIL and return to apply loop
-                                    } else {
-                                        info!(
-                                            "Acceptance requires continuation for {} (attempt {}/{}), retrying...",
-                                            next.id,
-                                            continue_count,
-                                            max_continues
-                                        );
-                                        // Will retry acceptance in next iteration
-                                    }
-                                }
-                                Ok(AcceptanceResult::Fail { findings }) => {
-                                    warn!(
-                                        "Acceptance failed for {} with {} findings, will retry apply",
-                                        next.id,
-                                        findings.len()
-                                    );
-                                    // Update tasks.md with acceptance findings
-                                    if let Err(e) = update_tasks_on_acceptance_failure(
-                                        &next.id, &findings, None,
-                                    )
-                                    .await
-                                    {
-                                        warn!("Failed to update tasks.md for {}: {}", next.id, e);
-                                    }
-                                    // Change will be selected again for apply in next iteration
-                                }
-                                Ok(AcceptanceResult::CommandFailed { error, findings }) => {
-                                    error!("Acceptance command failed for {}: {}", next.id, error);
-                                    // Update tasks.md with command failure
-                                    if let Err(e) = update_tasks_on_acceptance_failure(
-                                        &next.id, &findings, None,
-                                    )
-                                    .await
-                                    {
-                                        warn!("Failed to update tasks.md for {}: {}", next.id, e);
-                                    }
-                                    // Change will be selected again for apply in next iteration
-                                }
-                                Ok(AcceptanceResult::Cancelled) => {
-                                    info!("Acceptance cancelled for {}", next.id);
-                                    return Ok(());
-                                }
-                                Err(e) => {
-                                    error!("Acceptance error for {}: {}", next.id, e);
-                                    return Err(e);
-                                }
-                            }
-                        }
-
-                        if let Some(progress) = &mut self.progress {
-                            progress.complete_change(&next.id);
-                        }
+                ChangeProcessResult::Stalled { error } => {
+                    warn!("Change stalled: {} - {}", next.id, error);
+                    self.mark_change_stalled(&next.id, &error);
+                    continue;
+                }
+                ChangeProcessResult::Failed { error } => {
+                    error!("Change failed: {} - {}", next.id, error);
+                    if let Some(progress) = &mut self.progress {
+                        progress.error(&format!("Failed: {}", next.id));
                     }
-                    Ok(ApplyResult::Failed { error }) => {
-                        if let Err(e) = self
-                            .snapshot_serial_iteration(&next.id, new_apply_count)
-                            .await
-                        {
+                    #[cfg(feature = "web-monitoring")]
+                    {
+                        self.execution_mode = "error".to_string();
+                        // Broadcast mode change to web monitoring
+                        let current_changes = openspec::list_changes_native().unwrap_or_default();
+                        self.broadcast_state_update(&current_changes).await;
+                    }
+                    return Err(OrchestratorError::AgentCommand(error));
+                }
+                ChangeProcessResult::Cancelled => {
+                    info!("Processing cancelled for {}", next.id);
+                    return Ok(());
+                }
+                ChangeProcessResult::ApplySuccessIncomplete => {
+                    // Update shared state: apply completed
+                    self.shared_state.write().await.apply_execution_event(
+                        &ExecutionEvent::ApplyCompleted {
+                            change_id: next.id.clone(),
+                            revision: "serial".to_string(),
+                        },
+                    );
+
+                    // CLI-specific: Create WIP snapshot
+                    let apply_count = serial_service.apply_count(&next.id);
+                    let snapshot = match self.snapshot_serial_iteration(&next.id, apply_count).await
+                    {
+                        Ok(snapshot) => snapshot,
+                        Err(e) => {
                             warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
+                            SerialSnapshot {
+                                progress: crate::task_parser::TaskProgress::default(),
+                                empty_commit: None,
+                            }
                         }
+                    };
 
-                        // Record error and check circuit breaker
-                        if self.record_error_and_check_circuit_breaker(&next.id, &error) {
-                            let message = format!(
-                                "Circuit breaker opened for '{}' due to repeated errors",
-                                next.id
-                            );
-                            warn!("{}", message);
-                            self.mark_change_stalled(&next.id, &message);
-                            continue;
-                        }
+                    // CLI-specific: Check for stall on empty commits
+                    if let Some(stall_reason) = serial_service.check_stall_after_apply(
+                        &next.id,
+                        &snapshot.progress,
+                        snapshot.empty_commit,
+                    ) {
+                        warn!("{}", stall_reason);
+                        self.mark_change_stalled(&next.id, &stall_reason);
+                        continue;
+                    }
 
-                        error!("Apply failed for {}: {}", next.id, error);
-                        if let Some(progress) = &mut self.progress {
-                            progress.error(&format!("Apply failed: {}", next.id));
-                        }
-                        return Err(OrchestratorError::AgentCommand(error));
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_change(&next.id);
                     }
-                    Ok(ApplyResult::Cancelled) => {
-                        info!("Apply cancelled for {}", next.id);
-                        return Ok(());
+                }
+                ChangeProcessResult::ApplyFailed { error } => {
+                    // Update shared state: apply started (for tracking)
+                    self.shared_state.write().await.apply_execution_event(
+                        &ExecutionEvent::ApplyStarted {
+                            change_id: next.id.clone(),
+                        },
+                    );
+
+                    // CLI-specific: Create WIP snapshot even on failure
+                    let apply_count = serial_service.apply_count(&next.id);
+                    if let Err(e) = self.snapshot_serial_iteration(&next.id, apply_count).await {
+                        warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
                     }
-                    Err(e) => {
-                        error!("Apply error for {}: {}", next.id, e);
-                        if let Some(progress) = &mut self.progress {
-                            progress.error(&format!("Apply failed: {}", next.id));
-                        }
-                        return Err(e);
+
+                    // CLI-specific: Check circuit breaker
+                    if self.record_error_and_check_circuit_breaker(&next.id, &error) {
+                        let message = format!(
+                            "Circuit breaker opened for '{}' due to repeated errors",
+                            next.id
+                        );
+                        warn!("{}", message);
+                        self.mark_change_stalled(&next.id, &message);
+                        serial_service.mark_stalled(&next.id, &message);
+                        continue;
+                    }
+
+                    error!("Apply failed for {}: {}", next.id, error);
+                    if let Some(progress) = &mut self.progress {
+                        progress.error(&format!("Apply failed: {}", next.id));
+                    }
+                    #[cfg(feature = "web-monitoring")]
+                    {
+                        self.execution_mode = "error".to_string();
+                        // Broadcast mode change to web monitoring
+                        let current_changes = openspec::list_changes_native().unwrap_or_default();
+                        self.broadcast_state_update(&current_changes).await;
+                    }
+                    return Err(OrchestratorError::AgentCommand(error));
+                }
+                ChangeProcessResult::AcceptancePassed => {
+                    // Update shared state
+                    self.shared_state.write().await.apply_execution_event(
+                        &ExecutionEvent::ApplyCompleted {
+                            change_id: next.id.clone(),
+                            revision: "serial".to_string(),
+                        },
+                    );
+
+                    // CLI-specific: Squash WIP commits after acceptance pass
+                    let apply_count = serial_service.apply_count(&next.id);
+                    let _ = self.squash_serial_wip_commits(&next.id, apply_count).await;
+
+                    info!("Acceptance passed for {}, ready for archive", next.id);
+
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_change(&next.id);
+                    }
+                }
+                ChangeProcessResult::AcceptanceContinue => {
+                    // Update shared state
+                    self.shared_state.write().await.apply_execution_event(
+                        &ExecutionEvent::ApplyCompleted {
+                            change_id: next.id.clone(),
+                            revision: "serial".to_string(),
+                        },
+                    );
+
+                    info!(
+                        "Acceptance requires continuation for {}, retrying...",
+                        next.id
+                    );
+
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_change(&next.id);
+                    }
+                }
+                ChangeProcessResult::AcceptanceContinueExceeded => {
+                    // Update shared state
+                    self.shared_state.write().await.apply_execution_event(
+                        &ExecutionEvent::ApplyCompleted {
+                            change_id: next.id.clone(),
+                            revision: "serial".to_string(),
+                        },
+                    );
+
+                    warn!(
+                        "Acceptance CONTINUE limit exceeded for {}, treating as FAIL",
+                        next.id
+                    );
+
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_change(&next.id);
+                    }
+                }
+                ChangeProcessResult::AcceptanceFailed { findings: _ } => {
+                    // Update shared state
+                    self.shared_state.write().await.apply_execution_event(
+                        &ExecutionEvent::ApplyCompleted {
+                            change_id: next.id.clone(),
+                            revision: "serial".to_string(),
+                        },
+                    );
+
+                    // Findings already logged and tasks.md updated by SerialRunService
+                    info!("Acceptance failed for {}, will retry apply", next.id);
+
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_change(&next.id);
+                    }
+                }
+                ChangeProcessResult::AcceptanceCommandFailed { error: _ } => {
+                    // Update shared state
+                    self.shared_state.write().await.apply_execution_event(
+                        &ExecutionEvent::ApplyCompleted {
+                            change_id: next.id.clone(),
+                            revision: "serial".to_string(),
+                        },
+                    );
+
+                    // Error already logged and tasks.md updated by SerialRunService
+                    info!(
+                        "Acceptance command failed for {}, will retry apply",
+                        next.id
+                    );
+
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_change(&next.id);
                     }
                 }
             }
@@ -708,6 +780,15 @@ impl Orchestrator {
         self.hooks
             .run_hook(HookType::OnFinish, &finish_context)
             .await?;
+
+        // Set execution mode to stopped (for web monitoring)
+        #[cfg(feature = "web-monitoring")]
+        {
+            self.execution_mode = "stopped".to_string();
+            // Broadcast mode change to web monitoring
+            let current_changes = openspec::list_changes_native().unwrap_or_default();
+            self.broadcast_state_update(&current_changes).await;
+        }
 
         info!("Orchestration completed");
         Ok(())
@@ -809,16 +890,6 @@ impl Orchestrator {
         }
 
         Ok(())
-    }
-
-    /// Select the next change to process.
-    ///
-    /// Uses the shared selection module which provides:
-    /// 1. Complete changes first (ready for archive)
-    /// 2. LLM-based selection (via agent)
-    /// 3. Fallback to highest progress
-    async fn select_next_change(&self, changes: &[Change]) -> Result<Change> {
-        selection::select_next_change(changes, Some(&self.agent), Some(&self.ai_runner)).await
     }
 
     /// Filter changes to only include those present in the initial snapshot.
@@ -986,7 +1057,12 @@ impl Orchestrator {
     }
 
     /// Run parallel execution mode
-    async fn run_parallel(&mut self, changes: &[Change]) -> Result<()> {
+    async fn run_parallel(
+        &mut self,
+        changes: &[Change],
+        cancel_token: tokio_util::sync::CancellationToken,
+        graceful_stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<()> {
         info!("Running parallel execution mode");
 
         // Filter to approved changes only
@@ -1038,9 +1114,26 @@ impl Orchestrator {
         #[cfg(feature = "web-monitoring")]
         let web_event_sender = web_event_tx.clone();
 
+        // Monitor graceful_stop_flag and trigger cancellation if set
+        // This allows Web control Stop to work in parallel mode
+        if let Some(ref stop_flag) = graceful_stop_flag {
+            let monitor_token = cancel_token.clone();
+            let monitor_flag = stop_flag.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    if monitor_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        info!("Graceful stop requested in parallel mode, cancelling execution");
+                        monitor_token.cancel();
+                        break;
+                    }
+                }
+            });
+        }
+
         // Run with a simple logging event handler for CLI mode
         let result = service
-            .run_parallel(approved, move |event| {
+            .run_parallel(approved, Some(cancel_token), move |event| {
                 // Log events for CLI mode (no TUI)
                 use crate::parallel::ParallelEvent;
                 #[cfg(feature = "web-monitoring")]

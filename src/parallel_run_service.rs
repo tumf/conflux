@@ -190,7 +190,12 @@ impl ParallelRunService {
     /// This method now uses `execute_with_reanalysis` for dynamic re-analysis,
     /// matching the TUI behavior and aligning with the spec requirement for
     /// unified CLI/TUI execution paths.
-    pub async fn run_parallel<F>(&self, changes: Vec<Change>, event_handler: F) -> Result<()>
+    pub async fn run_parallel<F>(
+        &self,
+        changes: Vec<Change>,
+        cancel_token: Option<CancellationToken>,
+        event_handler: F,
+    ) -> Result<()>
     where
         F: Fn(ParallelEvent) + Send + Sync + 'static,
     {
@@ -243,6 +248,11 @@ impl ParallelRunService {
             Some(self.shared_stagger_state.clone()),
         );
         executor.set_no_resume(self.no_resume);
+
+        // Set cancel token if provided
+        if let Some(token) = cancel_token {
+            executor.set_cancel_token(token);
+        }
 
         // Clone config and shared stagger state for the analyzer closure
         let config = self.config.clone();

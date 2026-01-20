@@ -66,17 +66,19 @@ The acceptance loop SHALL run `acceptance_command` for the change, parse the out
 - If no acceptance marker is present, the orchestrator MUST treat the outcome as CONTINUE and retry according to `acceptance_max_continues`.
 - If the CONTINUE limit is exceeded, the orchestrator MUST treat the outcome as FAIL and return to the apply loop.
 - The acceptance loop MUST carry forward its iteration counter when returning to the apply loop after acceptance failure.
-- The TUI log panel MUST display acceptance log headers as `[{change_id}:acceptance:<iteration>]` when an iteration number is available.
-- The TUI log panel MUST display acceptance log headers as `[{change_id}:acceptance]` when no iteration number is available.
 - The acceptance loop iteration counter MUST increment on each acceptance attempt, and MUST NOT reset when the apply loop is re-entered due to acceptance failure.
+- The second and later acceptance attempts MUST focus on the updated file list since the previous acceptance attempt and the previously reported findings, rather than performing a full re-check.
+- The acceptance prompt for second and later attempts MUST include the updated file list (file paths only) since the previous acceptance attempt.
+- The acceptance prompt for second and later attempts MUST include the previous acceptance findings and instruct the agent to verify whether those findings are resolved.
+- The acceptance prompt for second and later attempts MUST instruct the agent to read relevant files as needed; it MUST NOT include diff content.
 
-#### Scenario: Acceptance failure records tail output in tasks
+#### Scenario: Acceptance retry narrows to updated files and prior findings
 - **GIVEN** a change completes an apply iteration successfully
-- **AND** acceptance output indicates FAIL
-- **WHEN** the orchestrator updates tasks.md before returning to the apply loop
-- **THEN** the acceptance failure reason is recorded using the acceptance output tail
-- **AND** the failure reason is recorded as a line-by-line bullet list without numbering
-- **AND** findings extraction output is not required
+- **AND** acceptance output indicates CONTINUE
+- **WHEN** the orchestrator runs a subsequent acceptance attempt for the same change
+- **THEN** the acceptance prompt includes only the updated file list since the previous acceptance attempt (no diff content)
+- **AND** the acceptance prompt includes the prior acceptance findings for verification
+- **AND** the acceptance prompt instructs the agent to read files as needed to confirm fixes
 
 ### Requirement: Default TUI Launch
 
@@ -1486,3 +1488,21 @@ CLI SHALL provide a subcommand to detect conflicts between spec delta files acro
 #### Scenario: JSON出力の指定
 - **WHEN** user runs the new conflict detection command with a JSON output flag
 - **THEN** the command outputs a machine-readable JSON payload
+
+### Requirement: Web Execution Control Availability
+Web UIからの実行制御は、`--web` でHTTPサーバーが起動している場合にのみ有効でなければならない（SHALL）。TUIとRunモードのいずれでも同じ制御経路を提供しなければならない（MUST）。RunモードではTUIと同等のリトライ/停止挙動を提供しなければならない（SHALL）。
+
+#### Scenario: TUIモードでのWeb制御
+- **GIVEN** `cflx tui --web` で起動している
+- **WHEN** Web UI が制御APIへ開始/停止要求を送る
+- **THEN** TUIの実行状態が同等に変化する
+
+#### Scenario: RunモードでのWeb制御
+- **GIVEN** `cflx run --web` で起動している
+- **WHEN** Web UI が制御APIへ開始/停止要求を送る
+- **THEN** オーケストレーターの実行状態が同等に変化する
+
+#### Scenario: Runモードでのリトライ制御
+- **GIVEN** `cflx run --web` で実行中にエラーが発生している
+- **WHEN** Web UI が制御APIへ retry 要求を送る
+- **THEN** オーケストレーターは同一のエラー change を再実行する

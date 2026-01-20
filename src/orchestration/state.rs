@@ -1,12 +1,61 @@
-//! Shared state management for CLI and TUI modes.
+//! Shared state management for orchestration operations.
 //!
-//! Provides a unified state structure that both modes can use
-//! to track orchestration progress.
+//! Provides a unified state structure that tracks orchestration progress
+//! across different execution modes (serial CLI, TUI, parallel).
 //!
-//! Note: This module is infrastructure for future CLI/TUI integration.
-//! It will be used as the refactoring continues.
-
-#![allow(dead_code)]
+//! ## Integration Status
+//!
+//! - **Serial Orchestrator** (`src/orchestrator.rs`): Fully integrated. The orchestrator
+//!   maintains a `shared_state: Arc<RwLock<OrchestratorState>>` instance and updates it
+//!   via `apply_execution_event` when processing changes (ProcessingStarted, ApplyStarted,
+//!   ApplyCompleted, ChangeArchived). The shared state is wrapped in Arc<RwLock<>> to enable
+//!   sharing with TUI and Web monitoring.
+//!
+//! - **TUI** (`src/tui/state/mod.rs`): Integrated via optional reference. TUI AppState has
+//!   a `shared_orchestrator_state` field that can be set via `set_shared_state()`. TUI can
+//!   query this for pending/archived status, apply counts, and current change tracking while
+//!   maintaining its own UI-specific state for rendering and interaction.
+//!
+//! - **Web** (`src/web/state.rs`): Integrated via optional reference. WebState has a
+//!   `shared_orchestrator_state` field set via `set_shared_state()` (called automatically
+//!   by `Orchestrator::set_web_state()`). When generating `OrchestratorStateSnapshot` via
+//!   `from_changes_with_shared_state()`, WebState queries shared state to enrich change
+//!   metadata with apply counts, pending/archived status, and iteration numbers.
+//!
+//! ## Usage
+//!
+//! The shared state provides a single source of truth for tracking:
+//! - Pending, completed, and archived changes
+//! - Apply counts per change
+//! - Current change being processed
+//! - Iteration counters and limits
+//!
+//! ### Integration Pattern
+//!
+//! 1. **Orchestrator creates and owns shared state:**
+//!    ```rust
+//!    let shared_state = Arc::new(RwLock::new(OrchestratorState::new(changes, max_iters)));
+//!    ```
+//!
+//! 2. **Orchestrator updates state via events:**
+//!    ```rust
+//!    shared_state.write().await.apply_execution_event(&event);
+//!    ```
+//!
+//! 3. **TUI/Web receive shared state reference:**
+//!    ```rust
+//!    app_state.set_shared_state(shared_state.clone());
+//!    web_state.set_shared_state(shared_state.clone()).await;
+//!    ```
+//!
+//! 4. **TUI/Web query shared state when needed:**
+//!    ```rust
+//!    if let Some(shared) = &app_state.shared_orchestrator_state {
+//!        let guard = shared.read().await;
+//!        let apply_count = guard.apply_count(change_id);
+//!        let is_pending = guard.is_pending(change_id);
+//!    }
+//!    ```
 
 use std::collections::{HashMap, HashSet};
 
@@ -47,6 +96,7 @@ pub struct OrchestratorState {
     current_change_id: Option<String>,
 }
 
+#[allow(dead_code)] // Public API for future use by TUI/Web states
 impl OrchestratorState {
     /// Create a new orchestrator state with the given initial changes.
     pub fn new(change_ids: Vec<String>, max_iterations: u32) -> Self {
@@ -207,6 +257,75 @@ impl OrchestratorState {
         if self.current_change_id.as_deref() == Some(change_id) {
             self.current_change_id = None;
         }
+    }
+
+    /// Apply an ExecutionEvent to update the shared state.
+    ///
+    /// This is the single source of truth for state mutations driven by execution events.
+    ///
+    /// ## Current Usage
+    ///
+    /// - **Serial Orchestrator**: Calls this method in `src/orchestrator.rs` to track:
+    ///   - `ProcessingStarted` - When a change begins processing
+    ///   - `ApplyStarted` - When apply operation starts
+    ///   - `ApplyCompleted` - When apply operation completes (increments apply count)
+    ///   - `ChangeArchived` - When a change is successfully archived
+    ///
+    /// - **TUI/Web**: Currently maintain their own ExecutionEvent-driven state independently.
+    ///   Future refactoring can make them query this shared state for unified tracking.
+    pub fn apply_execution_event(&mut self, event: &crate::events::ExecutionEvent) {
+        use crate::events::ExecutionEvent;
+
+        match event {
+            // Processing lifecycle
+            ExecutionEvent::ProcessingStarted(change_id) => {
+                self.set_current_change(Some(change_id.clone()));
+            }
+            ExecutionEvent::ProcessingCompleted(change_id) => {
+                // Keep current_change_id set until archived
+                let _ = change_id;
+            }
+            ExecutionEvent::ProcessingError { id, error: _ } => {
+                self.remove_from_pending(id);
+            }
+
+            // Apply events
+            ExecutionEvent::ApplyStarted { change_id } => {
+                self.set_current_change(Some(change_id.clone()));
+            }
+            ExecutionEvent::ApplyCompleted { change_id, .. } => {
+                self.increment_apply_count(change_id);
+            }
+            ExecutionEvent::ApplyFailed { change_id, .. } => {
+                self.remove_from_pending(change_id);
+            }
+
+            // Archive events
+            ExecutionEvent::ChangeArchived(change_id) => {
+                self.mark_archived(change_id);
+            }
+
+            // Dynamic queue support
+            ExecutionEvent::ChangesRefreshed { changes, .. } => {
+                // Refresh the initial snapshot if new changes appeared
+                for change in changes {
+                    if !self.initial_change_ids.contains(&change.id)
+                        && !self.archived_changes.contains(&change.id)
+                    {
+                        self.add_dynamic_change(change.id.clone());
+                    }
+                }
+            }
+
+            // Other events don't affect shared state directly
+            _ => {}
+        }
+    }
+}
+
+impl Default for OrchestratorState {
+    fn default() -> Self {
+        Self::new(Vec::new(), 0)
     }
 }
 

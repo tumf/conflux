@@ -336,6 +336,8 @@ pub enum ExecutionEvent {
     Warning { title: String, message: String },
     /// Log message
     Log(LogEntry),
+    /// Processing stopping (graceful stop initiated)
+    Stopping,
     /// Processing stopped (graceful stop completed)
     Stopped,
     /// All processing completed
