@@ -63,7 +63,11 @@ Required checks:
    - Identify the concrete call path(s) from entry point to the feature.
    - If the feature is not referenced by production code paths, it is a FAIL.
 4. Dead code check: if code exists but is not invoked by the CLI/TUI/parallel flow described in spec, it is a FAIL.
-5. Evidence: cite at least one file path + function/method where the integration happens.
+5. Regression check: verify that existing features unrelated to this change are not broken.
+   - If the change modifies shared code (e.g., common functions, traits, structs), check that other callers still work.
+   - If existing tests fail due to the change, it is a FAIL.
+   - If existing functionality is removed or altered without being part of the spec, it is a FAIL.
+6. Evidence: cite at least one file path + function/method where the integration happens.
 
 Do NOT include in FINDINGS:
 - Subjective quality assessments (e.g., "code quality could be better", "naming is unclear")
