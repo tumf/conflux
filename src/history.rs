@@ -331,6 +331,8 @@ pub struct AcceptanceAttempt {
     pub stdout_tail: Option<String>,
     /// Last N lines of stderr (tail summary)
     pub stderr_tail: Option<String>,
+    /// Commit hash at the time of this acceptance check (for diff calculation)
+    pub commit_hash: Option<String>,
 }
 
 /// Tracks acceptance attempts per change
@@ -392,6 +394,24 @@ impl AcceptanceHistory {
                     .unwrap_or(false)
             })
             .count() as u32
+    }
+
+    /// Get the last commit hash from the most recent acceptance attempt.
+    /// Returns None if there are no previous attempts or the last attempt has no commit hash.
+    pub fn last_commit_hash(&self, change_id: &str) -> Option<String> {
+        self.attempts
+            .get(change_id)
+            .and_then(|v| v.last())
+            .and_then(|a| a.commit_hash.clone())
+    }
+
+    /// Get the last findings from the most recent acceptance attempt.
+    /// Returns None if there are no previous attempts or the last attempt has no findings.
+    pub fn last_findings(&self, change_id: &str) -> Option<Vec<String>> {
+        self.attempts
+            .get(change_id)
+            .and_then(|v| v.last())
+            .and_then(|a| a.findings.clone())
     }
 
     /// Format history as context string for prompt injection.
@@ -1070,5 +1090,143 @@ mod tests {
         let collector = OutputCollector::default();
         assert!(collector.stdout_tail().is_none());
         assert!(collector.stderr_tail().is_none());
+    }
+
+    // AcceptanceHistory tests
+    #[test]
+    fn test_acceptance_history_last_commit_hash() {
+        let mut history = AcceptanceHistory::new();
+
+        // No history - should return None
+        assert!(history.last_commit_hash("change-a").is_none());
+
+        // Add attempt with commit hash
+        history.record(
+            "change-a",
+            AcceptanceAttempt {
+                attempt: 1,
+                passed: false,
+                duration: Duration::from_secs(30),
+                findings: Some(vec!["Issue 1".to_string()]),
+                exit_code: Some(1),
+                stdout_tail: None,
+                stderr_tail: None,
+                commit_hash: Some("abc123".to_string()),
+            },
+        );
+
+        // Should return the commit hash
+        assert_eq!(
+            history.last_commit_hash("change-a"),
+            Some("abc123".to_string())
+        );
+
+        // Add another attempt with different commit hash
+        history.record(
+            "change-a",
+            AcceptanceAttempt {
+                attempt: 2,
+                passed: true,
+                duration: Duration::from_secs(45),
+                findings: None,
+                exit_code: Some(0),
+                stdout_tail: None,
+                stderr_tail: None,
+                commit_hash: Some("def456".to_string()),
+            },
+        );
+
+        // Should return the last commit hash
+        assert_eq!(
+            history.last_commit_hash("change-a"),
+            Some("def456".to_string())
+        );
+    }
+
+    #[test]
+    fn test_acceptance_history_last_commit_hash_none() {
+        let mut history = AcceptanceHistory::new();
+
+        // Add attempt without commit hash
+        history.record(
+            "change-a",
+            AcceptanceAttempt {
+                attempt: 1,
+                passed: false,
+                duration: Duration::from_secs(30),
+                findings: Some(vec!["Issue 1".to_string()]),
+                exit_code: Some(1),
+                stdout_tail: None,
+                stderr_tail: None,
+                commit_hash: None,
+            },
+        );
+
+        // Should return None
+        assert!(history.last_commit_hash("change-a").is_none());
+    }
+
+    #[test]
+    fn test_acceptance_history_last_findings() {
+        let mut history = AcceptanceHistory::new();
+
+        // No history - should return None
+        assert!(history.last_findings("change-a").is_none());
+
+        // Add attempt with findings
+        let findings1 = vec!["Issue 1".to_string(), "Issue 2".to_string()];
+        history.record(
+            "change-a",
+            AcceptanceAttempt {
+                attempt: 1,
+                passed: false,
+                duration: Duration::from_secs(30),
+                findings: Some(findings1.clone()),
+                exit_code: Some(1),
+                stdout_tail: None,
+                stderr_tail: None,
+                commit_hash: Some("abc123".to_string()),
+            },
+        );
+
+        // Should return the findings
+        assert_eq!(history.last_findings("change-a"), Some(findings1));
+
+        // Add another attempt with different findings
+        let findings2 = vec!["Fixed issue 1".to_string()];
+        history.record(
+            "change-a",
+            AcceptanceAttempt {
+                attempt: 2,
+                passed: false,
+                duration: Duration::from_secs(45),
+                findings: Some(findings2.clone()),
+                exit_code: Some(1),
+                stdout_tail: None,
+                stderr_tail: None,
+                commit_hash: Some("def456".to_string()),
+            },
+        );
+
+        // Should return the last findings
+        assert_eq!(history.last_findings("change-a"), Some(findings2));
+
+        // Add passed attempt with no findings
+        history.record(
+            "change-a",
+            AcceptanceAttempt {
+                attempt: 3,
+                passed: true,
+                duration: Duration::from_secs(50),
+                findings: None,
+                exit_code: Some(0),
+                stdout_tail: None,
+                stderr_tail: None,
+                commit_hash: Some("ghi789".to_string()),
+            },
+        );
+
+        // Should return None (last attempt has no findings)
+        assert!(history.last_findings("change-a").is_none());
     }
 }

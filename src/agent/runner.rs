@@ -285,8 +285,9 @@ impl AgentRunner {
     /// The caller is responsible for recording the attempt after the child completes
     /// by calling `record_acceptance_attempt()`.
     ///
-    /// The prompt is constructed as: system_prompt + user_prompt + history_context
+    /// The prompt is constructed as: system_prompt + diff_context + user_prompt + history_context
     /// - system_prompt: ACCEPTANCE_SYSTEM_PROMPT constant (always included)
+    /// - diff_context: changed files and previous findings (2nd+ attempts only)
     /// - user_prompt: from config.acceptance_prompt (user-customizable)
     /// - history_context: previous acceptance attempts (if any)
     pub async fn run_acceptance_streaming(
@@ -299,8 +300,15 @@ impl AgentRunner {
         let user_prompt = self.config.get_acceptance_prompt();
         let history_context = self.acceptance_history.format_context(change_id);
 
-        // Build full prompt: system_prompt (with change_id) + user_prompt + history_context
-        let full_prompt = build_acceptance_prompt(change_id, user_prompt, &history_context);
+        // Build diff context for 2nd+ attempts
+        let diff_context = self.build_acceptance_diff_context(change_id, cwd).await?;
+
+        // Build full prompt: system_prompt (with change_id) + diff_context + user_prompt + history_context
+        let mut full_prompt = build_acceptance_prompt(change_id, user_prompt, &history_context);
+        if !diff_context.is_empty() {
+            // Insert diff_context after system_prompt, before user_prompt
+            full_prompt = format!("{}\n\n{}", full_prompt, diff_context);
+        }
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
@@ -316,6 +324,60 @@ impl AgentRunner {
             None => self.execute_shell_command_streaming(&command).await?,
         };
         Ok((child, rx, start))
+    }
+
+    /// Build acceptance diff context for 2nd+ attempts.
+    /// Returns empty string for 1st attempt, or formatted diff context for 2nd+ attempts.
+    async fn build_acceptance_diff_context(
+        &self,
+        change_id: &str,
+        cwd: Option<&Path>,
+    ) -> Result<String> {
+        use super::prompt::build_acceptance_diff_context;
+
+        // Only build diff context for 2nd+ attempts
+        if self.acceptance_history.count(change_id) == 0 {
+            return Ok(String::new());
+        }
+
+        // Get repository path
+        let repo_path = cwd.unwrap_or_else(|| Path::new("."));
+
+        // Get last commit hash from previous acceptance
+        let last_commit = self.acceptance_history.last_commit_hash(change_id);
+
+        // Get current commit hash
+        let current_commit = crate::vcs::git::commands::get_current_commit(repo_path)
+            .await
+            .map_err(|e| {
+                OrchestratorError::GitCommand(format!("Failed to get current commit hash: {}", e))
+            })?;
+
+        // Get changed files between last acceptance and now
+        let changed_files = if let Some(ref last) = last_commit {
+            crate::vcs::git::commands::get_changed_files(repo_path, Some(last), &current_commit)
+                .await
+                .map_err(|e| {
+                    OrchestratorError::GitCommand(format!("Failed to get changed files: {}", e))
+                })?
+        } else {
+            // First attempt had no commit hash recorded, fall back to empty list
+            Vec::new()
+        };
+
+        // Get previous findings
+        let previous_findings = self.acceptance_history.last_findings(change_id);
+
+        // Build diff context only if there are changed files or previous findings
+        if changed_files.is_empty() && previous_findings.is_none() {
+            return Ok(String::new());
+        }
+
+        let findings_slice = previous_findings.as_deref();
+        Ok(build_acceptance_diff_context(
+            &changed_files,
+            findings_slice,
+        ))
     }
 
     /// Record an acceptance attempt after streaming execution completes.
