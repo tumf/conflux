@@ -61,6 +61,7 @@ fn apply_pending_removals(
 
 /// Archive a single completed change
 /// Returns Ok(ArchiveResult) indicating success, failure, or cancellation
+#[allow(clippy::too_many_arguments)]
 pub async fn archive_single_change(
     change_id: &str,
     change: &Change,
@@ -69,6 +70,7 @@ pub async fn archive_single_change(
     tx: &mpsc::Sender<OrchestratorEvent>,
     cancel_token: &CancellationToken,
     context: &ArchiveContext,
+    #[cfg(feature = "web-monitoring")] web_state: &Option<Arc<crate::web::WebState>>,
 ) -> Result<ArchiveResult> {
     use crate::agent::OutputLine;
     use crate::hooks::{HookContext, HookType};
@@ -116,9 +118,12 @@ pub async fn archive_single_change(
     }
 
     // Archive the change - send ArchiveStarted event
-    let _ = tx
-        .send(OrchestratorEvent::ArchiveStarted(change_id.to_string()))
-        .await;
+    let archive_started_event = OrchestratorEvent::ArchiveStarted(change_id.to_string());
+    let _ = tx.send(archive_started_event.clone()).await;
+    #[cfg(feature = "web-monitoring")]
+    if let Some(ws) = web_state {
+        ws.apply_execution_event(&archive_started_event).await;
+    }
 
     use crate::execution::archive::{
         build_archive_error_message, ensure_archive_commit, verify_archive_completion,
@@ -215,12 +220,15 @@ pub async fn archive_single_change(
             .with_error(&error_msg);
             let _ = hooks.run_hook(HookType::OnError, &error_context).await;
 
-            let _ = tx
-                .send(OrchestratorEvent::ProcessingError {
-                    id: change_id.to_string(),
-                    error: error_msg.clone(),
-                })
-                .await;
+            let processing_error_event = OrchestratorEvent::ProcessingError {
+                id: change_id.to_string(),
+                error: error_msg.clone(),
+            };
+            let _ = tx.send(processing_error_event.clone()).await;
+            #[cfg(feature = "web-monitoring")]
+            if let Some(ws) = web_state {
+                ws.apply_execution_event(&processing_error_event).await;
+            }
             return Ok(ArchiveResult::Failed);
         }
 
@@ -274,12 +282,15 @@ pub async fn archive_single_change(
                 .with_error(&error_msg);
                 let _ = hooks.run_hook(HookType::OnError, &error_context).await;
 
-                let _ = tx
-                    .send(OrchestratorEvent::ProcessingError {
-                        id: change_id.to_string(),
-                        error: error_msg,
-                    })
-                    .await;
+                let processing_error_event = OrchestratorEvent::ProcessingError {
+                    id: change_id.to_string(),
+                    error: error_msg,
+                };
+                let _ = tx.send(processing_error_event.clone()).await;
+                #[cfg(feature = "web-monitoring")]
+                if let Some(ws) = web_state {
+                    ws.apply_execution_event(&processing_error_event).await;
+                }
                 return Ok(ArchiveResult::Failed);
             }
 
@@ -308,9 +319,12 @@ pub async fn archive_single_change(
                     .await;
             }
 
-            let _ = tx
-                .send(OrchestratorEvent::ChangeArchived(change_id.to_string()))
-                .await;
+            let change_archived_event = OrchestratorEvent::ChangeArchived(change_id.to_string());
+            let _ = tx.send(change_archived_event.clone()).await;
+            #[cfg(feature = "web-monitoring")]
+            if let Some(ws) = web_state {
+                ws.apply_execution_event(&change_archived_event).await;
+            }
             return Ok(ArchiveResult::Success);
         }
 
@@ -348,12 +362,15 @@ pub async fn archive_single_change(
         }
 
         let error_msg = build_archive_error_message(change_id, None);
-        let _ = tx
-            .send(OrchestratorEvent::ProcessingError {
-                id: change_id.to_string(),
-                error: error_msg,
-            })
-            .await;
+        let processing_error_event = OrchestratorEvent::ProcessingError {
+            id: change_id.to_string(),
+            error: error_msg,
+        };
+        let _ = tx.send(processing_error_event.clone()).await;
+        #[cfg(feature = "web-monitoring")]
+        if let Some(ws) = web_state {
+            ws.apply_execution_event(&processing_error_event).await;
+        }
         return Ok(ArchiveResult::Failed);
     }
 }
@@ -371,6 +388,7 @@ pub async fn archive_all_complete_changes(
     total_changes: usize,
     changes_processed: &mut usize,
     apply_counts: &HashMap<String, u32>,
+    #[cfg(feature = "web-monitoring")] web_state: &Option<Arc<crate::web::WebState>>,
 ) -> Result<usize> {
     use crate::openspec;
 
@@ -433,6 +451,8 @@ pub async fn archive_all_complete_changes(
             tx,
             cancel_token,
             &context,
+            #[cfg(feature = "web-monitoring")]
+            web_state,
         )
         .await?;
 
@@ -481,6 +501,7 @@ pub async fn run_orchestrator(
     cancel_token: CancellationToken,
     dynamic_queue: DynamicQueue,
     _graceful_stop_flag: Arc<AtomicBool>,
+    #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
     use crate::agent::OutputLine;
     use crate::hooks::{HookContext, HookRunner, HookType};
@@ -610,6 +631,8 @@ pub async fn run_orchestrator(
             total_changes,
             &mut changes_processed,
             &apply_counts,
+            #[cfg(feature = "web-monitoring")]
+            &web_state,
         )
         .await?;
 
@@ -679,9 +702,12 @@ pub async fn run_orchestrator(
         iteration += 1;
 
         // Notify processing started
-        let _ = tx
-            .send(OrchestratorEvent::ProcessingStarted(change_id.clone()))
-            .await;
+        let processing_started_event = OrchestratorEvent::ProcessingStarted(change_id.clone());
+        let _ = tx.send(processing_started_event.clone()).await;
+        #[cfg(feature = "web-monitoring")]
+        if let Some(ws) = &web_state {
+            ws.apply_execution_event(&processing_started_event).await;
+        }
 
         let remaining_changes = pending_changes.len();
 
@@ -697,12 +723,15 @@ pub async fn run_orchestrator(
                 .run_hook(HookType::OnChangeStart, &change_start_context)
                 .await
             {
-                let _ = tx
-                    .send(OrchestratorEvent::ProcessingError {
-                        id: change_id.clone(),
-                        error: format!("on_change_start hook failed: {}", e),
-                    })
-                    .await;
+                let processing_error_event = OrchestratorEvent::ProcessingError {
+                    id: change_id.clone(),
+                    error: format!("on_change_start hook failed: {}", e),
+                };
+                let _ = tx.send(processing_error_event.clone()).await;
+                #[cfg(feature = "web-monitoring")]
+                if let Some(ws) = &web_state {
+                    ws.apply_execution_event(&processing_error_event).await;
+                }
                 break;
             }
             current_change_id = Some(change_id.clone());
@@ -718,12 +747,15 @@ pub async fn run_orchestrator(
                 .with_change(&change_id, change.completed_tasks, change.total_tasks)
                 .with_apply_count(apply_count);
         if let Err(e) = hooks.run_hook(HookType::PreApply, &pre_apply_context).await {
-            let _ = tx
-                .send(OrchestratorEvent::ProcessingError {
-                    id: change_id.clone(),
-                    error: format!("pre_apply hook failed: {}", e),
-                })
-                .await;
+            let processing_error_event = OrchestratorEvent::ProcessingError {
+                id: change_id.clone(),
+                error: format!("pre_apply hook failed: {}", e),
+            };
+            let _ = tx.send(processing_error_event.clone()).await;
+            #[cfg(feature = "web-monitoring")]
+            if let Some(ws) = &web_state {
+                ws.apply_execution_event(&processing_error_event).await;
+            }
             break;
         }
 
@@ -805,6 +837,18 @@ pub async fn run_orchestrator(
             output_collector.stderr_tail(),
         );
 
+        // Send ApplyOutput event to update iteration number in TUI state
+        let apply_output_event = OrchestratorEvent::ApplyOutput {
+            change_id: change_id.clone(),
+            output: String::new(), // Not used by handler, only iteration matters
+            iteration: Some(apply_count),
+        };
+        let _ = tx.send(apply_output_event.clone()).await;
+        #[cfg(feature = "web-monitoring")]
+        if let Some(ws) = &web_state {
+            ws.apply_execution_event(&apply_output_event).await;
+        }
+
         if status.success() {
             // Run post_apply hook
             let post_apply_context =
@@ -815,12 +859,15 @@ pub async fn run_orchestrator(
                 .run_hook(HookType::PostApply, &post_apply_context)
                 .await
             {
-                let _ = tx
-                    .send(OrchestratorEvent::ProcessingError {
-                        id: change_id.clone(),
-                        error: format!("post_apply hook failed: {}", e),
-                    })
-                    .await;
+                let processing_error_event = OrchestratorEvent::ProcessingError {
+                    id: change_id.clone(),
+                    error: format!("post_apply hook failed: {}", e),
+                };
+                let _ = tx.send(processing_error_event.clone()).await;
+                #[cfg(feature = "web-monitoring")]
+                if let Some(ws) = &web_state {
+                    ws.apply_execution_event(&processing_error_event).await;
+                }
                 break;
             }
 
@@ -842,11 +889,14 @@ pub async fn run_orchestrator(
                 let updated_change = updated_change.unwrap(); // Safe: we checked is_complete above
 
                 // Send AcceptanceStarted event
-                let _ = tx
-                    .send(OrchestratorEvent::AcceptanceStarted {
-                        change_id: change_id.clone(),
-                    })
-                    .await;
+                let acceptance_started_event = OrchestratorEvent::AcceptanceStarted {
+                    change_id: change_id.clone(),
+                };
+                let _ = tx.send(acceptance_started_event.clone()).await;
+                #[cfg(feature = "web-monitoring")]
+                if let Some(ws) = &web_state {
+                    ws.apply_execution_event(&acceptance_started_event).await;
+                }
 
                 // Get the acceptance iteration number (attempt number that will be used)
                 let acceptance_iteration = agent.next_acceptance_attempt_number(&change_id);
@@ -937,29 +987,57 @@ pub async fn run_orchestrator(
                             ))))
                             .await;
 
-                        // Send AcceptanceCompleted event
+                        // Send AcceptanceOutput event to update iteration number
                         let _ = tx
-                            .send(OrchestratorEvent::AcceptanceCompleted {
+                            .send(OrchestratorEvent::AcceptanceOutput {
                                 change_id: change_id.clone(),
+                                output: String::new(),
+                                iteration: Some(acceptance_iteration),
                             })
                             .await;
 
+                        // Send AcceptanceCompleted event
+                        let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
+                            change_id: change_id.clone(),
+                        };
+                        let _ = tx.send(acceptance_completed_event.clone()).await;
+                        #[cfg(feature = "web-monitoring")]
+                        if let Some(ws) = &web_state {
+                            ws.apply_execution_event(&acceptance_completed_event).await;
+                        }
+
                         // Only send ProcessingCompleted when tasks are 100% done and acceptance passes
-                        let _ = tx
-                            .send(OrchestratorEvent::ProcessingCompleted(change_id.clone()))
-                            .await;
+                        let processing_completed_event =
+                            OrchestratorEvent::ProcessingCompleted(change_id.clone());
+                        let _ = tx.send(processing_completed_event.clone()).await;
+                        #[cfg(feature = "web-monitoring")]
+                        if let Some(ws) = &web_state {
+                            ws.apply_execution_event(&processing_completed_event).await;
+                        }
                     }
                     Ok(AcceptanceResult::Continue) => {
                         let continue_count =
                             agent.count_consecutive_acceptance_continues(&change_id);
                         let max_continues = acceptance_max_continues;
 
-                        // Send AcceptanceCompleted event
+                        // Send AcceptanceOutput event to update iteration number
                         let _ = tx
-                            .send(OrchestratorEvent::AcceptanceCompleted {
+                            .send(OrchestratorEvent::AcceptanceOutput {
                                 change_id: change_id.clone(),
+                                output: String::new(),
+                                iteration: Some(acceptance_iteration),
                             })
                             .await;
+
+                        // Send AcceptanceCompleted event
+                        let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
+                            change_id: change_id.clone(),
+                        };
+                        let _ = tx.send(acceptance_completed_event.clone()).await;
+                        #[cfg(feature = "web-monitoring")]
+                        if let Some(ws) = &web_state {
+                            ws.apply_execution_event(&acceptance_completed_event).await;
+                        }
 
                         if continue_count >= max_continues {
                             let _ = tx
@@ -988,12 +1066,24 @@ pub async fn run_orchestrator(
                             ))))
                             .await;
 
-                        // Send AcceptanceCompleted event
+                        // Send AcceptanceOutput event to update iteration number
                         let _ = tx
-                            .send(OrchestratorEvent::AcceptanceCompleted {
+                            .send(OrchestratorEvent::AcceptanceOutput {
                                 change_id: change_id.clone(),
+                                output: String::new(),
+                                iteration: Some(acceptance_iteration),
                             })
                             .await;
+
+                        // Send AcceptanceCompleted event
+                        let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
+                            change_id: change_id.clone(),
+                        };
+                        let _ = tx.send(acceptance_completed_event.clone()).await;
+                        #[cfg(feature = "web-monitoring")]
+                        if let Some(ws) = &web_state {
+                            ws.apply_execution_event(&acceptance_completed_event).await;
+                        }
 
                         // Update tasks.md with acceptance findings
                         if let Err(e) =
@@ -1014,6 +1104,15 @@ pub async fn run_orchestrator(
                                 "Acceptance command failed for {}: {}",
                                 change_id, error
                             ))))
+                            .await;
+
+                        // Send AcceptanceOutput event to update iteration number
+                        let _ = tx
+                            .send(OrchestratorEvent::AcceptanceOutput {
+                                change_id: change_id.clone(),
+                                output: String::new(),
+                                iteration: Some(acceptance_iteration),
+                            })
                             .await;
 
                         // Send AcceptanceCompleted event
@@ -1044,6 +1143,15 @@ pub async fn run_orchestrator(
                             ))))
                             .await;
 
+                        // Send AcceptanceOutput event to update iteration number
+                        let _ = tx
+                            .send(OrchestratorEvent::AcceptanceOutput {
+                                change_id: change_id.clone(),
+                                output: String::new(),
+                                iteration: Some(acceptance_iteration),
+                            })
+                            .await;
+
                         // Send AcceptanceCompleted event even on cancellation
                         let _ = tx
                             .send(OrchestratorEvent::AcceptanceCompleted {
@@ -1055,6 +1163,15 @@ pub async fn run_orchestrator(
                         pending_changes.clear();
                     }
                     Err(e) => {
+                        // Send AcceptanceOutput event to update iteration number even on error
+                        let _ = tx
+                            .send(OrchestratorEvent::AcceptanceOutput {
+                                change_id: change_id.clone(),
+                                output: String::new(),
+                                iteration: Some(acceptance_iteration),
+                            })
+                            .await;
+
                         let _ = tx
                             .send(OrchestratorEvent::Log(LogEntry::error(format!(
                                 "Acceptance error for {}: {}",
@@ -1092,84 +1209,40 @@ pub async fn run_orchestrator(
                     .with_error(&error_msg);
             let _ = hooks.run_hook(HookType::OnError, &error_context).await;
 
-            let _ = tx
-                .send(OrchestratorEvent::ProcessingError {
-                    id: change_id.clone(),
-                    error: error_msg,
-                })
-                .await;
-
-            // Remove failed change from pending to prevent infinite retry
-            pending_changes.remove(&change_id);
+            let processing_error_event = OrchestratorEvent::ProcessingError {
+                id: change_id.clone(),
+                error: error_msg,
+            };
+            let _ = tx.send(processing_error_event.clone()).await;
+            #[cfg(feature = "web-monitoring")]
+            if let Some(ws) = &web_state {
+                ws.apply_execution_event(&processing_error_event).await;
+            }
+            break;
         }
     }
 
-    // Final verification: check if any changes remain unarchived
-    let _ = tx
-        .send(OrchestratorEvent::Log(LogEntry::info(
-            "Verifying all changes have been archived...".to_string(),
-        )))
-        .await;
-
-    // Check against our tracked archived set for reliable verification
-    let unarchived_by_tracking: Vec<&str> = processed_change_ids
-        .iter()
-        .filter(|id| !archived_changes.contains(*id))
-        .map(|id| id.as_str())
-        .collect();
-
-    // Also verify against native list as backup
-    let final_changes = openspec::list_changes_native().ok();
-    if let Some(changes) = final_changes {
-        let unarchived_by_list: Vec<&str> = processed_change_ids
-            .iter()
-            .filter(|id| changes.iter().any(|c| &c.id == *id))
-            .map(|id| id.as_str())
-            .collect();
-
-        // Report unarchived changes (use tracking as primary, list as confirmation)
-        if !unarchived_by_tracking.is_empty() {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                    "Warning: {} change(s) were not archived (tracking): {}",
-                    unarchived_by_tracking.len(),
-                    unarchived_by_tracking.join(", ")
-                ))))
-                .await;
-        }
-        if !unarchived_by_list.is_empty() {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                    "Warning: {} change(s) remain in openspec list: {}",
-                    unarchived_by_list.len(),
-                    unarchived_by_list.join(", ")
-                ))))
-                .await;
-        }
-        if unarchived_by_tracking.is_empty() && unarchived_by_list.is_empty() {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::success(
-                    "All processed changes have been archived".to_string(),
-                )))
-                .await;
-        }
-    } else if !unarchived_by_tracking.is_empty() {
-        // Could not fetch final list, but tracking shows unarchived changes
+    // Run on_finish hook after all changes processed or stopped
+    let complete_context = HookContext::new(changes_processed, total_changes, 0, false);
+    if let Err(e) = hooks.run_hook(HookType::OnFinish, &complete_context).await {
         let _ = tx
             .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                "Warning: {} change(s) were not archived (tracking): {}",
-                unarchived_by_tracking.len(),
-                unarchived_by_tracking.join(", ")
+                "on_finish hook failed: {}",
+                e
             ))))
             .await;
     }
 
+    // Send completion event
     let _ = tx.send(OrchestratorEvent::AllCompleted).await;
+
     Ok(())
 }
 
-/// Run the orchestrator in parallel mode using git worktrees
-/// This function executes all changes in parallel using ParallelRunService
+/// Run the orchestrator in parallel mode
+///
+/// Executes multiple changes concurrently using git worktrees, with dependency analysis
+/// and automatic workspace management.
 ///
 /// Supports dynamic queue: continuously processes changes as slots become available,
 /// without waiting for batch boundaries.
@@ -1204,91 +1277,25 @@ pub async fn run_orchestrator_parallel(
     // Create shared queue change timestamp for debouncing
     let shared_queue_change = Arc::new(tokio::sync::Mutex::new(None::<std::time::Instant>));
 
-    // Check Git availability
-    if !service.check_vcs_available().await? {
-        let _ = tx
-            .send(OrchestratorEvent::Log(LogEntry::error(
-                "Git repository is not available for parallel execution".to_string(),
-            )))
-            .await;
-        return Err(crate::error::OrchestratorError::AgentCommand(
-            "Git repository not available".to_string(),
-        ));
-    }
-
-    // Collect initial pending changes
-    let mut pending_ids: HashSet<String> = change_ids.into_iter().collect();
-
-    // Track execution termination reason for correct completion message
     let mut stopped_or_cancelled = false;
     let mut had_errors = false;
 
-    // Check for dynamically added changes before starting execution
-    while let Some(dynamic_id) = dynamic_queue.pop().await {
-        if !pending_ids.contains(&dynamic_id) {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                    "Dynamically added to parallel queue: {}",
-                    dynamic_id
-                ))))
-                .await;
-            pending_ids.insert(dynamic_id);
-        }
-    }
-
-    // Handle removed changes
-    let removed_ids = dynamic_queue.drain_removed().await;
-    for id in removed_ids {
-        if pending_ids.remove(&id) {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::info(format!(
-                    "Removed from pending queue: {}",
-                    id
-                ))))
-                .await;
-        }
-    }
-
-    // Exit early if no changes to process
-    if pending_ids.is_empty() {
-        let _ = tx
-            .send(OrchestratorEvent::Log(LogEntry::info(
-                "No changes to process".to_string(),
-            )))
-            .await;
-        let _ = tx.send(OrchestratorEvent::AllCompleted).await;
-        return Ok(());
-    }
-
-    let _ = tx
-        .send(OrchestratorEvent::Log(LogEntry::info(format!(
-            "Processing {} change(s) with slot-driven continuous dispatch...",
-            pending_ids.len()
-        ))))
-        .await;
-
-    // Load all pending changes
-    let all_changes = list_changes_native()?;
-    let changes_to_process: Vec<_> = all_changes
+    // Fetch changes to process using native implementation
+    let changes_to_process: Vec<Change> = list_changes_native()?
         .into_iter()
-        .filter(|c| pending_ids.contains(&c.id))
+        .filter(|c| change_ids.contains(&c.id))
         .collect();
 
-    if changes_to_process.is_empty() {
-        let _ = tx
-            .send(OrchestratorEvent::Log(LogEntry::warn(
-                "No valid changes found (may be already archived)".to_string(),
-            )))
-            .await;
-        let _ = tx.send(OrchestratorEvent::AllCompleted).await;
-        return Ok(());
-    }
-
+    // Send initial ChangesRefreshed event with empty worktree data
+    // (Worktree data will be populated during parallel execution)
     let _ = tx
-        .send(OrchestratorEvent::Log(LogEntry::info(format!(
-            "Analyzing {} changes for parallelization...",
-            changes_to_process.len()
-        ))))
+        .send(OrchestratorEvent::ChangesRefreshed {
+            changes: changes_to_process.clone(),
+            committed_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::new(),
+            worktree_paths: HashMap::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+        })
         .await;
 
     // Create WebState event forwarding channel and task

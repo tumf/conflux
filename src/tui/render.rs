@@ -158,7 +158,7 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
                 .filter(|c| {
                     matches!(
                         c.queue_status,
-                        QueueStatus::Processing | QueueStatus::Archiving
+                        QueueStatus::Applying | QueueStatus::Archiving
                     )
                 })
                 .count();
@@ -462,11 +462,35 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             };
 
             let status_text = match &change.queue_status {
-                QueueStatus::Processing => {
-                    format!("{} [{:>3.0}%]", spinner_char, change.progress_percent())
+                QueueStatus::Applying => {
+                    if let Some(iter) = change.iteration_number {
+                        format!(
+                            "{} [{}:{} {:>3.0}%]",
+                            spinner_char,
+                            change.queue_status.display(),
+                            iter,
+                            change.progress_percent()
+                        )
+                    } else {
+                        format!(
+                            "{} [{} {:>3.0}%]",
+                            spinner_char,
+                            change.queue_status.display(),
+                            change.progress_percent()
+                        )
+                    }
                 }
                 QueueStatus::Archiving | QueueStatus::Resolving | QueueStatus::Accepting => {
-                    format!("{} [{}]", spinner_char, change.queue_status.display())
+                    if let Some(iter) = change.iteration_number {
+                        format!(
+                            "{} [{}:{}]",
+                            spinner_char,
+                            change.queue_status.display(),
+                            iter
+                        )
+                    } else {
+                        format!("{} [{}]", spinner_char, change.queue_status.display())
+                    }
                 }
                 QueueStatus::Archived | QueueStatus::Merged | QueueStatus::Error(_) => {
                     format!("[{}]", change.queue_status.display())
@@ -1259,8 +1283,8 @@ mod tests {
 
     #[test]
     fn test_get_checkbox_display_processing_states() {
-        // Processing state should show green when selected
-        let (text, color) = get_checkbox_display(&QueueStatus::Processing, true, true);
+        // Applying state should show green when selected
+        let (text, color) = get_checkbox_display(&QueueStatus::Applying, true, true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
 
