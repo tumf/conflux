@@ -81,6 +81,31 @@ pub async fn get_current_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<String> {
     run_git(&["rev-parse", "HEAD"], cwd).await
 }
 
+/// Get list of changed files between two commits.
+/// Returns a list of file paths that changed between `from_commit` and `to_commit`.
+/// If `from_commit` is None, returns all files in `to_commit`.
+pub async fn get_changed_files<P: AsRef<Path>>(
+    cwd: P,
+    from_commit: Option<&str>,
+    to_commit: &str,
+) -> VcsResult<Vec<String>> {
+    let output = if let Some(from) = from_commit {
+        run_git(
+            &["diff", "--name-only", &format!("{}..{}", from, to_commit)],
+            cwd,
+        )
+        .await?
+    } else {
+        run_git(&["ls-tree", "--name-only", "-r", to_commit], cwd).await?
+    };
+
+    Ok(output
+        .lines()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect())
+}
+
 /// Check whether the current HEAD commit has no file changes.
 pub async fn is_head_empty_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
     let output = run_git(

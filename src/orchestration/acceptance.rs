@@ -90,6 +90,11 @@ where
     info!("Running acceptance test for: {}", change.id);
     output.on_info(&format!("Acceptance test: {}", change.id));
 
+    // Capture current commit hash for diff tracking
+    let commit_hash = crate::vcs::git::commands::get_current_commit(".")
+        .await
+        .ok(); // Allow to fail silently (non-git repos)
+
     // Execute acceptance command with streaming
     let (mut child, mut output_rx, start_time) =
         agent.run_acceptance_streaming(&change.id, None).await?;
@@ -152,6 +157,7 @@ where
             exit_code: status.code(),
             stdout_tail,
             stderr_tail,
+            commit_hash: commit_hash.clone(),
         };
         agent.record_acceptance_attempt(&change.id, attempt);
         output.on_error(&error_msg);
@@ -173,6 +179,7 @@ where
                 exit_code: status.code(),
                 stdout_tail,
                 stderr_tail: stderr_tail.clone(),
+                commit_hash: commit_hash.clone(),
             };
             agent.record_acceptance_attempt(&change.id, attempt);
             output.on_success("Acceptance test passed");
@@ -188,6 +195,7 @@ where
                 exit_code: status.code(),
                 stdout_tail,
                 stderr_tail,
+                commit_hash: commit_hash.clone(),
             };
             agent.record_acceptance_attempt(&change.id, attempt);
             output.on_info("Acceptance test requires continuation");
@@ -208,6 +216,7 @@ where
                 exit_code: status.code(),
                 stdout_tail,
                 stderr_tail,
+                commit_hash: commit_hash.clone(),
             };
             agent.record_acceptance_attempt(&change.id, attempt);
             output.on_warn(&format!(

@@ -1308,6 +1308,11 @@ pub async fn execute_acceptance_in_workspace(
 
     info!("Running acceptance test for {} in workspace", change_id);
 
+    // Capture current commit hash for diff tracking
+    let commit_hash = crate::vcs::git::commands::get_current_commit(workspace_path)
+        .await
+        .ok(); // Allow to fail silently (non-git repos)
+
     // Get the acceptance iteration number (attempt number that will be used)
     let acceptance_iteration = agent.next_acceptance_attempt_number(change_id);
 
@@ -1414,6 +1419,7 @@ pub async fn execute_acceptance_in_workspace(
             exit_code: status.code(),
             stdout_tail,
             stderr_tail,
+            commit_hash: commit_hash.clone(),
         };
         agent.record_acceptance_attempt(change_id, attempt);
 
@@ -1451,6 +1457,7 @@ pub async fn execute_acceptance_in_workspace(
                 exit_code: status.code(),
                 stdout_tail,
                 stderr_tail: stderr_tail.clone(),
+                commit_hash: commit_hash.clone(),
             };
             agent.record_acceptance_attempt(change_id, attempt);
 
@@ -1482,6 +1489,7 @@ pub async fn execute_acceptance_in_workspace(
                 exit_code: status.code(),
                 stdout_tail,
                 stderr_tail,
+                commit_hash: commit_hash.clone(),
             };
             agent.record_acceptance_attempt(change_id, attempt);
 
@@ -1518,6 +1526,7 @@ pub async fn execute_acceptance_in_workspace(
                 exit_code: status.code(),
                 stdout_tail,
                 stderr_tail,
+                commit_hash: commit_hash.clone(),
             };
             agent.record_acceptance_attempt(change_id, attempt);
 
