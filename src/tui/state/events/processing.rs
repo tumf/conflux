@@ -24,7 +24,7 @@ impl AppState {
     /// Handle ProcessingCompleted event
     pub(super) fn handle_processing_completed(&mut self, id: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-            change.queue_status = QueueStatus::Completed;
+            change.queue_status = QueueStatus::Archiving;
             // Reload final progress from tasks.md to preserve it
             if let Ok(progress) = crate::task_parser::parse_change(&id) {
                 change.completed_tasks = progress.completed;
