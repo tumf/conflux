@@ -210,6 +210,7 @@ pub async fn ensure_archive_commit<F, Fut>(
     change_id: &str,
     repo_root: &Path,
     agent: &AgentRunner,
+    ai_runner: &crate::ai_command_runner::AiCommandRunner,
     vcs_backend: VcsBackend,
     mut handle_output: F,
 ) -> Result<()>
@@ -287,7 +288,7 @@ Requirements:\n\
             );
 
             let (mut child, mut rx) = agent
-                .run_resolve_streaming_in_dir(&prompt, repo_root)
+                .run_resolve_streaming_in_dir_with_runner(&prompt, repo_root, ai_runner)
                 .await?;
 
             while let Some(line) = rx.recv().await {
@@ -750,6 +751,7 @@ pub async fn execute_archive_loop<E, F, Fut>(
     change_id: &str,
     workspace_path: &Path,
     agent: &mut AgentRunner,
+    ai_runner: &crate::ai_command_runner::AiCommandRunner,
     vcs_backend: VcsBackend,
     hooks: Option<&HookRunner>,
     hook_ctx: &ArchiveLoopHookContext,
@@ -968,6 +970,7 @@ where
             change_id,
             workspace_path,
             agent,
+            ai_runner,
             vcs_backend,
             output_handler,
         )
@@ -1342,11 +1345,45 @@ fi\n";
             resolve_command: Some("sh archive-resolver.sh".to_string()),
             ..Default::default()
         };
-        let agent = AgentRunner::new(config);
+        let agent = AgentRunner::new(config.clone());
 
-        ensure_archive_commit("change-a", repo_root, &agent, VcsBackend::Git, |_| async {})
-            .await
-            .unwrap();
+        // Create AiCommandRunner for test
+        use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
+        use crate::command_queue::CommandQueueConfig;
+        use crate::config::defaults::*;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: config
+                .command_queue_stagger_delay_ms
+                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+            max_retries: config
+                .command_queue_max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_delay_ms: config
+                .command_queue_retry_delay_ms
+                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+            retry_error_patterns: config
+                .command_queue_retry_patterns
+                .clone()
+                .unwrap_or_else(default_retry_patterns),
+            retry_if_duration_under_secs: config
+                .command_queue_retry_if_duration_under_secs
+                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+        };
+        let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+
+        ensure_archive_commit(
+            "change-a",
+            repo_root,
+            &agent,
+            &ai_runner,
+            VcsBackend::Git,
+            |_| async {},
+        )
+        .await
+        .unwrap();
 
         let result = is_archive_commit_complete("change-a", Some(repo_root))
             .await
@@ -1693,13 +1730,41 @@ fi\n";
             .unwrap();
 
         let config = OrchestratorConfig::default();
-        let agent = AgentRunner::new(config);
+        let agent = AgentRunner::new(config.clone());
+
+        // Create AiCommandRunner for test
+        use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
+        use crate::command_queue::CommandQueueConfig;
+        use crate::config::defaults::*;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: config
+                .command_queue_stagger_delay_ms
+                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+            max_retries: config
+                .command_queue_max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_delay_ms: config
+                .command_queue_retry_delay_ms
+                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+            retry_error_patterns: config
+                .command_queue_retry_patterns
+                .clone()
+                .unwrap_or_else(default_retry_patterns),
+            retry_if_duration_under_secs: config
+                .command_queue_retry_if_duration_under_secs
+                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+        };
+        let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
 
         // ensure_archive_commit should fail because change directory exists
         let result = ensure_archive_commit(
             "test-change",
             repo_root,
             &agent,
+            &ai_runner,
             VcsBackend::Git,
             |_| async {},
         )

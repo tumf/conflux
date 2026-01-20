@@ -24,10 +24,15 @@ use tracing::{info, warn};
 /// # Arguments
 /// * `changes` - Available changes to select from
 /// * `agent` - Optional agent for LLM-based selection
+/// * `ai_runner` - Optional AI command runner for shared stagger state
 ///
 /// # Returns
 /// The selected change, or an error if no changes available
-pub async fn select_next_change(changes: &[Change], agent: Option<&AgentRunner>) -> Result<Change> {
+pub async fn select_next_change(
+    changes: &[Change],
+    agent: Option<&AgentRunner>,
+    ai_runner: Option<&crate::ai_command_runner::AiCommandRunner>,
+) -> Result<Change> {
     if changes.is_empty() {
         return Err(OrchestratorError::NoChanges);
     }
@@ -40,7 +45,7 @@ pub async fn select_next_change(changes: &[Change], agent: Option<&AgentRunner>)
 
     // Priority 2: Use LLM for dependency analysis (if agent available)
     if let Some(agent) = agent {
-        match analyze_with_llm(changes, agent).await {
+        match analyze_with_llm(changes, agent, ai_runner).await {
             Ok(selected) => {
                 info!("LLM selected: {}", selected.id);
                 return Ok(selected);
@@ -76,9 +81,19 @@ pub fn select_by_progress(changes: &[Change]) -> Result<Change> {
 }
 
 /// Analyze dependencies using LLM.
-async fn analyze_with_llm(changes: &[Change], agent: &AgentRunner) -> Result<Change> {
+async fn analyze_with_llm(
+    changes: &[Change],
+    agent: &AgentRunner,
+    ai_runner: Option<&crate::ai_command_runner::AiCommandRunner>,
+) -> Result<Change> {
     let prompt = build_analysis_prompt(changes);
-    let response = agent.analyze_dependencies(&prompt).await?;
+    let response = if let Some(ai_runner) = ai_runner {
+        agent
+            .analyze_dependencies_with_runner(&prompt, ai_runner)
+            .await?
+    } else {
+        agent.analyze_dependencies(&prompt).await?
+    };
 
     // Parse the response to extract change ID
     for change in changes {
@@ -166,7 +181,7 @@ mod tests {
             test_change("complete", 10, 10), // 100% complete
         ];
 
-        let selected = select_next_change(&changes, None).await.unwrap();
+        let selected = select_next_change(&changes, None, None).await.unwrap();
         assert_eq!(selected.id, "complete");
     }
 
@@ -174,14 +189,14 @@ mod tests {
     async fn test_select_next_change_fallback_to_progress() {
         let changes = vec![test_change("low", 1, 10), test_change("high", 8, 10)];
 
-        let selected = select_next_change(&changes, None).await.unwrap();
+        let selected = select_next_change(&changes, None, None).await.unwrap();
         assert_eq!(selected.id, "high");
     }
 
     #[tokio::test]
     async fn test_select_next_change_empty() {
         let changes: Vec<Change> = vec![];
-        let result = select_next_change(&changes, None).await;
+        let result = select_next_change(&changes, None, None).await;
         assert!(result.is_err());
     }
 

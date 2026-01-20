@@ -14,6 +14,7 @@
 //! as they have mode-specific concerns (WIP commits for CLI, DynamicQueue for TUI).
 
 use crate::agent::AgentRunner;
+use crate::ai_command_runner::AiCommandRunner;
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::hooks::{HookContext, HookRunner, HookType};
@@ -192,6 +193,7 @@ impl SerialRunService {
         &mut self,
         change: &Change,
         agent: &mut AgentRunner,
+        ai_runner: &AiCommandRunner,
         hooks: &HookRunner,
         output: &O,
         total_changes: usize,
@@ -232,6 +234,7 @@ impl SerialRunService {
             self.archive_change_internal(
                 change,
                 agent,
+                ai_runner,
                 hooks,
                 output,
                 total_changes,
@@ -244,6 +247,7 @@ impl SerialRunService {
             self.apply_change_internal(
                 change,
                 agent,
+                ai_runner,
                 hooks,
                 output,
                 total_changes,
@@ -261,6 +265,7 @@ impl SerialRunService {
         &mut self,
         change: &Change,
         agent: &mut AgentRunner,
+        ai_runner: &AiCommandRunner,
         hooks: &HookRunner,
         output: &O,
         total_changes: usize,
@@ -281,6 +286,7 @@ impl SerialRunService {
         match archive_change(
             change,
             agent,
+            ai_runner,
             hooks,
             &archive_ctx,
             output,
@@ -330,6 +336,7 @@ impl SerialRunService {
         &mut self,
         change: &Change,
         agent: &mut AgentRunner,
+        ai_runner: &AiCommandRunner,
         hooks: &HookRunner,
         output: &O,
         total_changes: usize,
@@ -353,7 +360,17 @@ impl SerialRunService {
             new_apply_count,
         );
 
-        match apply_change_streaming(change, agent, hooks, &apply_ctx, output, cancel_check).await {
+        match apply_change_streaming(
+            change,
+            agent,
+            hooks,
+            &apply_ctx,
+            output,
+            ai_runner,
+            cancel_check,
+        )
+        .await
+        {
             Ok(ApplyResult::Success) => {
                 // Re-fetch change to get updated task counts after apply
                 let updated_changes = openspec::list_changes_native().unwrap_or_default();
@@ -368,9 +385,14 @@ impl SerialRunService {
                     );
 
                     // Run acceptance test
-                    match acceptance_test_streaming(&updated_change, agent, output, || {
-                        cancel_check()
-                    })
+                    match acceptance_test_streaming(
+                        &updated_change,
+                        agent,
+                        ai_runner,
+                        &self.config,
+                        output,
+                        cancel_check,
+                    )
                     .await
                     {
                         Ok(AcceptanceResult::Pass) => {

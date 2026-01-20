@@ -4,15 +4,18 @@
 //! that can be used by both CLI and TUI orchestrators, eliminating
 //! code duplication between the two modes.
 
-use crate::agent::AgentRunner;
+use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
 use crate::analyzer::{ParallelGroup, ParallelizationAnalyzer};
+use crate::command_queue::CommandQueueConfig;
+use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::openspec::Change;
 use crate::parallel::{ParallelEvent, ParallelExecutor};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -30,15 +33,77 @@ pub struct ParallelRunService {
     repo_root: PathBuf,
     /// Disable automatic workspace resume (always create new workspaces)
     no_resume: bool,
+    /// Shared stagger state for coordinating AI command execution delays
+    shared_stagger_state: SharedStaggerState,
+    /// AI command runner for analyze commands
+    ai_runner: AiCommandRunner,
 }
 
 impl ParallelRunService {
     /// Create a new parallel run service
     pub fn new(repo_root: PathBuf, config: OrchestratorConfig) -> Self {
+        let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: config
+                .command_queue_stagger_delay_ms
+                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+            max_retries: config
+                .command_queue_max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_delay_ms: config
+                .command_queue_retry_delay_ms
+                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+            retry_error_patterns: config
+                .command_queue_retry_patterns
+                .clone()
+                .unwrap_or_else(default_retry_patterns),
+            retry_if_duration_under_secs: config
+                .command_queue_retry_if_duration_under_secs
+                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+        };
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+
         Self {
             config,
             repo_root,
             no_resume: false,
+            shared_stagger_state,
+            ai_runner,
+        }
+    }
+
+    /// Create a new parallel run service with a shared stagger state
+    pub fn new_with_shared_state(
+        repo_root: PathBuf,
+        config: OrchestratorConfig,
+        shared_stagger_state: SharedStaggerState,
+    ) -> Self {
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: config
+                .command_queue_stagger_delay_ms
+                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+            max_retries: config
+                .command_queue_max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_delay_ms: config
+                .command_queue_retry_delay_ms
+                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+            retry_error_patterns: config
+                .command_queue_retry_patterns
+                .clone()
+                .unwrap_or_else(default_retry_patterns),
+            retry_if_duration_under_secs: config
+                .command_queue_retry_if_duration_under_secs
+                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+        };
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+
+        Self {
+            config,
+            repo_root,
+            no_resume: false,
+            shared_stagger_state,
+            ai_runner,
         }
     }
 
@@ -68,12 +133,13 @@ impl ParallelRunService {
         dynamic_queue: Option<std::sync::Arc<crate::tui::queue::DynamicQueue>>,
     ) -> ParallelExecutor {
         let vcs_backend = self.config.get_vcs_backend();
-        let mut executor = ParallelExecutor::with_backend_and_queue_state(
+        let mut executor = ParallelExecutor::with_backend_and_queue_and_stagger(
             self.repo_root.clone(),
             self.config.clone(),
             event_tx,
             vcs_backend,
             shared_queue_change,
+            Some(self.shared_stagger_state.clone()),
         );
         executor.set_no_resume(self.no_resume);
         if let Some(token) = cancel_token {
@@ -172,11 +238,14 @@ impl ParallelRunService {
             }
         });
 
-        // Create and run executor with re-analysis (same as TUI)
-        let mut executor = ParallelExecutor::new(
+        // Create and run executor with re-analysis (same as TUI), passing shared stagger state
+        let mut executor = ParallelExecutor::with_backend_and_queue_and_stagger(
             self.repo_root.clone(),
             self.config.clone(),
             Some(event_tx.clone()),
+            self.config.get_vcs_backend(),
+            None,
+            Some(self.shared_stagger_state.clone()),
         );
         executor.set_no_resume(self.no_resume);
 
@@ -185,9 +254,10 @@ impl ParallelRunService {
             executor.set_cancel_token(token);
         }
 
-        // Clone config for the analyzer closure
+        // Clone config and shared stagger state for the analyzer closure
         let config = self.config.clone();
         let repo_root = self.repo_root.clone();
+        let shared_stagger_state = self.shared_stagger_state.clone();
 
         // Use order-based execution (aligned with spec)
         let result = executor
@@ -195,8 +265,13 @@ impl ParallelRunService {
                 let config = config.clone();
                 let repo_root = repo_root.clone();
                 let event_tx = event_tx.clone();
+                let shared_stagger_state = shared_stagger_state.clone();
                 Box::pin(async move {
-                    let service = ParallelRunService::new(repo_root, config);
+                    let service = ParallelRunService::new_with_shared_state(
+                        repo_root,
+                        config,
+                        shared_stagger_state,
+                    );
                     service
                         .analyze_order_with_sender(remaining, Some(&event_tx), iteration)
                         .await
@@ -277,6 +352,7 @@ impl ParallelRunService {
 
         let config = self.config.clone();
         let repo_root = self.repo_root.clone();
+        let shared_stagger_state = self.shared_stagger_state.clone();
 
         // Use order-based execution
         executor
@@ -284,8 +360,13 @@ impl ParallelRunService {
                 let config = config.clone();
                 let repo_root = repo_root.clone();
                 let event_tx = event_tx.clone();
+                let shared_stagger_state = shared_stagger_state.clone();
                 Box::pin(async move {
-                    let service = ParallelRunService::new(repo_root, config);
+                    let service = ParallelRunService::new_with_shared_state(
+                        repo_root,
+                        config,
+                        shared_stagger_state,
+                    );
                     service
                         .analyze_order_with_sender(remaining, Some(&event_tx), iteration)
                         .await
@@ -416,8 +497,7 @@ impl ParallelRunService {
         event_tx: Option<&mpsc::Sender<ParallelEvent>>,
         iteration: u32,
     ) -> Result<crate::analyzer::AnalysisResult> {
-        let agent = AgentRunner::new(self.config.clone());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = ParallelizationAnalyzer::new(self.ai_runner.clone(), self.config.clone());
 
         if let Some(tx) = event_tx {
             let tx = tx.clone();
@@ -446,8 +526,7 @@ impl ParallelRunService {
         event_tx: Option<&mpsc::Sender<ParallelEvent>>,
         iteration: u32,
     ) -> Result<Vec<ParallelGroup>> {
-        let agent = AgentRunner::new(self.config.clone());
-        let analyzer = ParallelizationAnalyzer::new(agent);
+        let analyzer = ParallelizationAnalyzer::new(self.ai_runner.clone(), self.config.clone());
 
         if let Some(tx) = event_tx {
             let tx = tx.clone();

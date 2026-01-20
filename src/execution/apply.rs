@@ -560,6 +560,7 @@ pub async fn execute_apply_loop<E, F, Fut>(
     hook_ctx: &ApplyLoopHookContext,
     event_handler: &E,
     cancel_token: Option<&CancellationToken>,
+    ai_runner: &crate::ai_command_runner::AiCommandRunner,
     mut output_handler: F,
 ) -> Result<ApplyLoopResult>
 where
@@ -665,9 +666,9 @@ where
             }
         }
 
-        // Execute apply command with history context
+        // Execute apply command with history context via AiCommandRunner
         let (mut child, mut rx, start_time) = agent
-            .run_apply_streaming(change_id, Some(workspace_path))
+            .run_apply_streaming_with_runner(change_id, ai_runner, Some(workspace_path))
             .await?;
 
         // Create output collector for history

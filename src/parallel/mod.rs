@@ -138,6 +138,26 @@ impl ParallelExecutor {
         vcs_backend: VcsBackend,
         shared_queue_change: Option<Arc<Mutex<Option<std::time::Instant>>>>,
     ) -> Self {
+        Self::with_backend_and_queue_and_stagger(
+            repo_root,
+            config,
+            event_tx,
+            vcs_backend,
+            shared_queue_change,
+            None,
+        )
+    }
+
+    /// Create a new parallel executor with a specific VCS backend, optional shared queue change timestamp,
+    /// and optional shared stagger state
+    pub fn with_backend_and_queue_and_stagger(
+        repo_root: PathBuf,
+        config: OrchestratorConfig,
+        event_tx: Option<mpsc::Sender<ParallelEvent>>,
+        vcs_backend: VcsBackend,
+        shared_queue_change: Option<Arc<Mutex<Option<std::time::Instant>>>>,
+        shared_stagger_state: Option<SharedStaggerState>,
+    ) -> Self {
         // Resolve workspace base directory
         let base_dir = if let Some(configured_dir) = config.get_workspace_base_dir() {
             // User configured a specific directory
@@ -168,8 +188,9 @@ impl ParallelExecutor {
         let last_queue_change_at =
             shared_queue_change.unwrap_or_else(|| Arc::new(Mutex::new(None)));
 
-        // Create shared stagger state for AI command coordination
-        let shared_stagger_state = Arc::new(Mutex::new(None));
+        // Use provided shared stagger state or create a new one
+        let shared_stagger_state =
+            shared_stagger_state.unwrap_or_else(|| Arc::new(Mutex::new(None)));
 
         // Build CommandQueue configuration from orchestrator config
         let queue_config = CommandQueueConfig {
@@ -1122,7 +1143,7 @@ impl ParallelExecutor {
                     continue;
                 }
                 WorkspaceState::Archived => {
-                    // Archive complete, ensure archive commit then merge
+                    // Archive already committed. Check workspace state, ensure commit, then merge.
                     let workspace = existing_workspace.unwrap();
                     cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
 
@@ -1146,13 +1167,17 @@ impl ParallelExecutor {
                     )
                     .await;
 
-                    let resolve_agent = AgentRunner::new(self.config.clone());
+                    let resolve_agent = AgentRunner::new_with_shared_state(
+                        self.config.clone(),
+                        self.shared_stagger_state.clone(),
+                    );
                     let change_id_owned = change_id.clone();
                     let event_tx = self.event_tx.clone();
                     if let Err(err) = ensure_archive_commit(
                         change_id,
                         &workspace.path,
                         &resolve_agent,
+                        &self.ai_runner,
                         self.workspace_manager.backend_type(),
                         move |line| {
                             let event_tx = event_tx.clone();
@@ -1253,7 +1278,10 @@ impl ParallelExecutor {
                     self.workspace_manager
                         .update_workspace_status(&workspace.name, WorkspaceStatus::Accepting);
 
-                    let mut agent = AgentRunner::new(self.config.clone());
+                    let mut agent = AgentRunner::new_with_shared_state(
+                        self.config.clone(),
+                        self.shared_stagger_state.clone(),
+                    );
                     info!(
                         "Running acceptance test for {} before archive (resume)",
                         change_id
@@ -1264,6 +1292,8 @@ impl ParallelExecutor {
                         &mut agent,
                         self.event_tx.clone(),
                         self.cancel_token.as_ref(),
+                        &self.ai_runner,
+                        &self.config,
                     )
                     .await;
 
@@ -1420,13 +1450,17 @@ impl ParallelExecutor {
                     )
                     .await;
 
-                    let resolve_agent = AgentRunner::new(self.config.clone());
+                    let resolve_agent = AgentRunner::new_with_shared_state(
+                        self.config.clone(),
+                        self.shared_stagger_state.clone(),
+                    );
                     let change_id_owned = change_id.clone();
                     let event_tx = self.event_tx.clone();
                     if let Err(err) = ensure_archive_commit(
                         change_id,
                         &workspace.path,
                         &resolve_agent,
+                        &self.ai_runner,
                         self.workspace_manager.backend_type(),
                         move |line| {
                             let event_tx = event_tx.clone();
@@ -1892,13 +1926,14 @@ impl ParallelExecutor {
         let apply_history = self.apply_history.clone();
         let archive_history = self.archive_history.clone();
         let cancel_token = self.cancel_token.clone();
+        let shared_stagger_state = self.shared_stagger_state.clone();
 
         // Spawn apply + acceptance + archive task
         join_set.spawn(async move {
             let _permit = permit; // Hold permit until task completes
 
             // Create agent for acceptance testing
-            let mut agent = AgentRunner::new(config.clone());
+            let mut agent = AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state.clone());
 
             // Track apply+acceptance cycles to prevent infinite loops
             const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
@@ -1993,6 +2028,8 @@ impl ParallelExecutor {
                     &mut agent,
                     event_tx.clone(),
                     cancel_token.as_ref(),
+                    &ai_runner,
+                    &config,
                 )
                 .await;
 
@@ -2191,6 +2228,7 @@ impl ParallelExecutor {
                 &ai_runner,
                 &archive_history,
                 &apply_history,
+                &shared_stagger_state,
             )
             .await;
 
@@ -2394,6 +2432,7 @@ impl ParallelExecutor {
             let apply_history = self.apply_history.clone();
             let archive_history = self.archive_history.clone();
             let status_tx_clone = status_tx.clone();
+            let shared_stagger_state = self.shared_stagger_state.clone();
 
             // Build parallel hook context
             let parallel_ctx = ParallelHookContext {
@@ -2413,7 +2452,7 @@ impl ParallelExecutor {
                 let _permit = permit;
 
                 // Create agent for this workspace
-                let mut agent = AgentRunner::new(config.clone());
+                let mut agent = AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state.clone());
 
                 // Track apply+acceptance cycles to prevent infinite loops
                 const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
@@ -2509,6 +2548,8 @@ impl ParallelExecutor {
                         &mut agent,
                         event_tx.clone(),
                         cancel_token.as_ref(),
+                        &ai_runner,
+                        &config,
                     )
                     .await;
 
@@ -2710,6 +2751,7 @@ impl ParallelExecutor {
                     &ai_runner,
                     &archive_history,
                     &apply_history,
+                    &shared_stagger_state,
                 )
                 .await;
 
@@ -3006,6 +3048,7 @@ impl ParallelExecutor {
                                                         let apply_history = self.apply_history.clone();
                                                         let archive_history = self.archive_history.clone();
                                                         let status_tx_clone = status_tx.clone();
+                                                        let shared_stagger_state = self.shared_stagger_state.clone();
 
                                                         // Build parallel hook context
                                                         let parallel_ctx = ParallelHookContext {
@@ -3023,7 +3066,7 @@ impl ParallelExecutor {
                                                         join_set.spawn(async move {
                                                             let _permit = permit;
 
-                                                            let mut agent = AgentRunner::new(config.clone());
+                                                            let mut agent = AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state.clone());
 
                                                             const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
                                                             let mut cycle_count = 0u32;
@@ -3107,6 +3150,8 @@ impl ParallelExecutor {
                                                                     &mut agent,
                                                                     event_tx.clone(),
                                                                     cancel_token.as_ref(),
+                                                                    &ai_runner,
+                                                                    &config,
                                                                 )
                                                                 .await;
 
@@ -3299,6 +3344,7 @@ impl ParallelExecutor {
                                                                 &ai_runner,
                                                                 &archive_history,
                                                                 &apply_history,
+                                                                &shared_stagger_state,
                                                             )
                                                             .await;
 
@@ -3495,8 +3541,10 @@ impl ParallelExecutor {
     /// Merge revisions and resolve any conflicts
     async fn merge_and_resolve(&self, revisions: &[String], change_ids: &[String]) -> Result<()> {
         let change_ids_vec = change_ids.to_vec();
+        let shared_stagger_state = self.shared_stagger_state.clone();
         self.merge_and_resolve_with(revisions, change_ids, |revisions, details| {
             let change_ids_clone = change_ids_vec.clone();
+            let shared_stagger_state_clone = shared_stagger_state.clone();
             async move {
                 conflict::resolve_conflicts_with_retry(
                     self.workspace_manager.as_ref(),
@@ -3506,6 +3554,7 @@ impl ParallelExecutor {
                     &change_ids_clone,
                     &details,
                     self.max_conflict_retries,
+                    shared_stagger_state_clone,
                 )
                 .await
             }
@@ -3559,6 +3608,7 @@ impl ParallelExecutor {
                 target_branch: target_branch.as_str(),
                 base_revision: base_revision.as_str(),
                 max_retries: max_attempts,
+                shared_stagger_state: self.shared_stagger_state.clone(),
             })
             .await?;
 
