@@ -167,12 +167,12 @@ The HTTP server SHALL serve a web-based dashboard interface for visualizing orch
 
 ### Requirement: Dashboard UI - Change List Display
 
-Webダッシュボードは、TUIの表示語彙と一致するステータス語彙でchange一覧を表示しなければならない（SHALL）。processing/completed 表記は使用せず、`not queued, queued, applying, accepting, archiving, resolving, completed, archived, merged, merge wait, error` を使用すること。反復回数がある場合は `status:iteration` 形式で表示すること。
+Webダッシュボードは、TUIの表示語彙と一致するステータス語彙でchange一覧を表示しなければならない（SHALL）。processing/completed 表記は使用せず、`not queued, queued, applying, accepting, archiving, resolving, blocked, completed, archived, merged, merge wait, error` を使用すること。反復回数がある場合は `status:iteration` 形式で表示すること。
 
 #### Scenario: QueueStatusに一致するステータス表示
 - **GIVEN** Web UI が change 一覧を表示している
 - **WHEN** change の queue_status が更新される
-- **THEN** Web UI は `not queued, queued, applying, accepting, archiving, resolving, completed, archived, merged, merge wait, error` の語彙で表示する
+- **THEN** Web UI は `not queued, queued, applying, accepting, archiving, resolving, blocked, completed, archived, merged, merge wait, error` の語彙で表示する
 - **AND** processing/completed の表記は表示しない
 
 #### Scenario: Applying の iteration 表示

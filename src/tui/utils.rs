@@ -184,7 +184,8 @@ mod tests {
     #[test]
     fn test_get_version_string() {
         let version = get_version_string();
-        assert!(version.starts_with("v"));
+        // Format is "cflx v{version} ({build_number})"
+        assert!(version.starts_with("cflx v"));
         // Should contain build number in parentheses
         assert!(version.contains('('));
         assert!(version.contains(')'));

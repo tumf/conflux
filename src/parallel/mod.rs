@@ -282,23 +282,11 @@ impl ParallelExecutor {
         !self.merge_deferred_changes.is_empty()
     }
 
-    fn should_skip_due_to_merge_wait(&self, change_id: &str) -> Option<String> {
-        if let Some(deps) = self.change_dependencies.get(change_id) {
-            for dep in deps {
-                if self.merge_deferred_changes.contains(dep) {
-                    return Some(dep.clone());
-                }
-            }
-        }
-        None
-    }
-
     fn skip_reason_for_change(&self, change_id: &str) -> Option<String> {
+        // Only skip changes with failed dependencies (not merge-wait dependencies).
+        // Merge-wait dependencies are handled as blocked/queued status via dependency resolution.
         if let Some(failed_dep) = self.failed_tracker.should_skip(change_id) {
             return Some(format!("Dependency '{}' failed", failed_dep));
-        }
-        if let Some(deferred_dep) = self.should_skip_due_to_merge_wait(change_id) {
-            return Some(format!("Dependency '{}' awaiting merge", deferred_dep));
         }
         None
     }
@@ -565,8 +553,12 @@ impl ParallelExecutor {
                         let mut skipped_changes: Vec<(String, String)> = Vec::new();
 
                         for change in &queued {
-                            if let Some(reason) = self.skip_reason_for_change(&change.id) {
-                                warn!("Excluding '{}' from analysis: {}", change.id, reason);
+                            if let Some(failed_dep) = self.failed_tracker.should_skip(&change.id) {
+                                let reason = format!("Dependency '{}' failed", failed_dep);
+                                warn!(
+                                    "Skipping change-{} because dependency change-{} failed",
+                                    change.id, failed_dep
+                                );
                                 skipped_changes.push((change.id.clone(), reason));
                             } else {
                                 executable_changes.push(change.clone());

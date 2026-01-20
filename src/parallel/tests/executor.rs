@@ -290,10 +290,10 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         needs_reanalysis: false,
     };
 
-    assert_eq!(
-        executor.skip_reason_for_change("change-b"),
-        Some("Dependency 'change-a' awaiting merge".to_string())
-    );
+    // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
+    // via dependency resolution checks (is_dependency_resolved). Only failed dependencies
+    // are skip reasons.
+    assert!(executor.skip_reason_for_change("change-b").is_none());
     assert!(executor.skip_reason_for_change("change-c").is_none());
 }
 
