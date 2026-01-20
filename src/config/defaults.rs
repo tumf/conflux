@@ -83,22 +83,48 @@ FINDINGS format requirements:
 - Bad: "Integration is incomplete" (vague, no evidence)
 - Good: "src/orchestrator.rs: run_loop() does not call acceptance_test() - missing call at line 150"
 
+Verification strategy:
+- Use "ACCEPTANCE: CONTINUE" to perform thorough, multi-pass verification
+- Do NOT output PASS or FAIL until you have verified ALL aspects of the implementation
+- First pass: verify task completion and basic code existence
+- Second pass: trace integration paths from entry points to features
+- Third pass: check for regressions and state management completeness
+- Only after completing all verification passes, output PASS or FAIL
+
 Output format:
-- If all checks pass: Output "ACCEPTANCE: PASS"
-- If checks fail: Output "ACCEPTANCE: FAIL" followed by "FINDINGS:" and list each issue on a new line prefixed with "- "
+- If verification is incomplete and more investigation needed: Output "ACCEPTANCE: CONTINUE"
+- If all checks pass after thorough verification: Output "ACCEPTANCE: PASS"
+- If checks fail: Output "ACCEPTANCE: FAIL" followed by "FINDINGS:" and list ALL issues found (not just the first one)
+
+IMPORTANT: When outputting FAIL, list ALL issues discovered across all verification passes.
+Do not stop at the first issue - continue checking and report everything in one FAIL response.
+
+Example of CONTINUE (investigation in progress):
+```
+ACCEPTANCE: CONTINUE
+Verified so far:
+- Tasks 1.1-1.3: completed
+- Integration path for feature A: confirmed
+Still need to verify:
+- Integration path for feature B
+- State transitions for error handling
+- Regression check for shared modules
+```
 
 Example of PASS:
 ```
 ACCEPTANCE: PASS
 ```
 
-Example of FAIL:
+Example of FAIL (with ALL issues):
 ```
 ACCEPTANCE: FAIL
 FINDINGS:
 - Task 2.3 "Add acceptance test integration" in tasks.md is marked [ ] but not implemented
 - src/orchestrator.rs: run_loop() (line 142-180) does not call acceptance_test_streaming() between apply and archive
 - src/parallel/executor.rs: execute_change() calls apply() at line 95 but never calls acceptance before archive() at line 120
+- src/web/state.rs: broadcast_snapshot() does not include app_mode field, violating state broadcast requirement
+- src/main.rs: ControlCommand::Stop handler does not update app_mode to "stopping" before orchestrator processes it
 ```
 "#;
 
