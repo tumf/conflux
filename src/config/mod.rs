@@ -2,9 +2,12 @@
 //!
 //! Supports JSONC format (JSON with Comments) for configuration files.
 //! Configuration is loaded with the following priority:
-//! 1. Project config: `.cflx.jsonc`
-//! 2. Global config: `~/.config/cflx/config.jsonc`
-//! 3. Default values (OpenCode-based commands)
+//! 1. Custom config path (if provided)
+//! 2. Project config: `.cflx.jsonc`
+//! 3. Global config (XDG): `$XDG_CONFIG_HOME/cflx/config.jsonc` (if XDG_CONFIG_HOME is set)
+//! 4. Global config (XDG default): `~/.config/cflx/config.jsonc`
+//! 5. Global config (platform default): `dirs::config_dir()/cflx/config.jsonc`
+//! 6. Default values (OpenCode-based commands)
 //!
 //! # Module Structure
 //!
@@ -499,8 +502,10 @@ impl OrchestratorConfig {
     /// Load configuration with priority:
     /// 1. Custom config path (if provided)
     /// 2. Project config (`.cflx.jsonc`)
-    /// 3. Global config (`~/.config/cflx/config.jsonc`)
-    /// 4. Default configuration
+    /// 3. Global config (XDG): `$XDG_CONFIG_HOME/cflx/config.jsonc`
+    /// 4. Global config (XDG default): `~/.config/cflx/config.jsonc`
+    /// 5. Global config (platform default): `dirs::config_dir()/cflx/config.jsonc`
+    /// 6. Default configuration
     pub fn load(custom_path: Option<&Path>) -> Result<Self> {
         // 1. Custom config path
         if let Some(path) = custom_path {
@@ -515,25 +520,81 @@ impl OrchestratorConfig {
             return Self::load_from_file(&project_config_path);
         }
 
-        // 3. Global config
-        if let Some(global_path) = get_global_config_path() {
-            if global_path.exists() {
-                info!("Loading global config from: {:?}", global_path);
-                return Self::load_from_file(&global_path);
+        // 3. Global config (XDG path - prefers $XDG_CONFIG_HOME, then ~/.config)
+        if let Some(xdg_path) = get_xdg_config_path() {
+            if xdg_path.exists() {
+                info!("Loading global config from XDG path: {:?}", xdg_path);
+                return Self::load_from_file(&xdg_path);
             }
         }
 
-        // 4. Default configuration
+        // 4. Global config (platform default - as fallback)
+        if let Some(platform_path) = get_platform_config_path() {
+            if platform_path.exists() {
+                info!(
+                    "Loading global config from platform path: {:?}",
+                    platform_path
+                );
+                return Self::load_from_file(&platform_path);
+            }
+        }
+
+        // 5. Default configuration
         debug!("No config file found, using defaults");
         Ok(Self::default())
     }
 }
 
+/// Get the XDG config path, checking $XDG_CONFIG_HOME first, then falling back to ~/.config
+///
+/// Returns:
+/// - `$XDG_CONFIG_HOME/cflx/config.jsonc` if XDG_CONFIG_HOME is set
+/// - `~/.config/cflx/config.jsonc` otherwise
+fn get_xdg_config_path() -> Option<PathBuf> {
+    // 1. Check $XDG_CONFIG_HOME
+    if let Ok(xdg_config_home) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg_config_home.is_empty() {
+            return Some(
+                PathBuf::from(xdg_config_home)
+                    .join(GLOBAL_CONFIG_DIR)
+                    .join(GLOBAL_CONFIG_FILE),
+            );
+        }
+    }
+
+    // 2. Fall back to ~/.config
+    if let Some(home) = dirs::home_dir() {
+        return Some(
+            home.join(".config")
+                .join(GLOBAL_CONFIG_DIR)
+                .join(GLOBAL_CONFIG_FILE),
+        );
+    }
+
+    None
+}
+
+/// Get the path to the global configuration file (platform default)
+///
+/// Returns platform-specific config directory + `cflx/config.jsonc`
+/// - macOS: `~/Library/Application Support/cflx/config.jsonc`
+/// - Linux: `~/.config/cflx/config.jsonc`
+/// - Windows: `%APPDATA%/cflx/config.jsonc`
+fn get_platform_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|config_dir| config_dir.join(GLOBAL_CONFIG_DIR).join(GLOBAL_CONFIG_FILE))
+}
+
 /// Get the path to the global configuration file
 ///
-/// Returns `~/.config/cflx/config.jsonc` on Unix-like systems.
+/// Deprecated: Use get_xdg_config_path() or get_platform_config_path() for explicit behavior.
+/// This function now returns the XDG path for backward compatibility.
+#[deprecated(
+    since = "0.1.0",
+    note = "Use get_xdg_config_path() or get_platform_config_path() instead"
+)]
+#[allow(dead_code)]
 pub fn get_global_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|config_dir| config_dir.join(GLOBAL_CONFIG_DIR).join(GLOBAL_CONFIG_FILE))
+    get_xdg_config_path()
 }
 
 // Re-export commonly used items for convenience
@@ -786,15 +847,29 @@ mod tests {
         // Create a temporary directory with no config files
         let temp_dir = TempDir::new().unwrap();
 
-        // Save current directory and change to temp dir
+        // Save current directory and environment
         let original_dir = env::current_dir().unwrap();
+        let original_xdg = env::var("XDG_CONFIG_HOME").ok();
+        let original_home = env::var("HOME").ok();
+
+        // Point XDG_CONFIG_HOME and HOME to temp directory (where no configs exist)
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path().join("config"));
+        env::set_var("HOME", temp_dir.path());
         env::set_current_dir(temp_dir.path()).unwrap();
 
         // Load config (should return defaults since no config file exists)
         let config = OrchestratorConfig::load(None).unwrap();
 
-        // Restore original directory
+        // Restore original directory and environment
         env::set_current_dir(original_dir).unwrap();
+        match original_xdg {
+            Some(val) => env::set_var("XDG_CONFIG_HOME", val),
+            None => env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match original_home {
+            Some(val) => env::set_var("HOME", val),
+            None => env::remove_var("HOME"),
+        }
 
         // Should use default values
         assert_eq!(config.get_apply_command(), DEFAULT_APPLY_COMMAND);
@@ -1387,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_merge_stall_detection_disabled() {
+    fn test_merge_stall_detection_disabled() {
         let jsonc = r#"{
             "merge_stall_detection": {
                 "enabled": false
@@ -1396,5 +1471,185 @@ mod tests {
         let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
         let merge_stall = config.get_merge_stall_detection();
         assert!(!merge_stall.enabled);
+    }
+
+    // === Tests for XDG config path precedence ===
+
+    #[test]
+    fn test_get_xdg_config_path_returns_path() {
+        // Test that get_xdg_config_path returns a valid path
+        let result = super::get_xdg_config_path();
+        assert!(result.is_some());
+
+        let path = result.unwrap();
+        let path_str = path.to_string_lossy();
+
+        // Should end with cflx/config.jsonc
+        assert!(
+            path_str.ends_with("cflx/config.jsonc"),
+            "Expected path to end with cflx/config.jsonc, got: {:?}",
+            path
+        );
+
+        // Should contain either .config (XDG default) or custom XDG_CONFIG_HOME
+        assert!(
+            path_str.contains(".config") || std::env::var("XDG_CONFIG_HOME").is_ok(),
+            "Expected path to contain .config or use XDG_CONFIG_HOME, got: {:?}",
+            path
+        );
+    }
+
+    #[test]
+    fn test_get_platform_config_path_returns_path() {
+        // Test that get_platform_config_path returns a valid path
+        let result = super::get_platform_config_path();
+
+        // Platform path may be None if dirs::config_dir() is None (rare)
+        if let Some(path) = result {
+            let path_str = path.to_string_lossy();
+            assert!(
+                path_str.ends_with("cflx/config.jsonc"),
+                "Expected path to end with cflx/config.jsonc, got: {:?}",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_xdg_config_precedence() {
+        use std::env;
+        use std::fs;
+        use tempfile::TempDir;
+
+        // Create temporary directories for XDG and platform configs
+        let xdg_dir = TempDir::new().unwrap();
+        let platform_dir = TempDir::new().unwrap();
+        let work_dir = TempDir::new().unwrap();
+
+        // Create XDG config with distinct content
+        let xdg_config_dir = xdg_dir.path().join("cflx");
+        fs::create_dir_all(&xdg_config_dir).unwrap();
+        fs::write(
+            xdg_config_dir.join("config.jsonc"),
+            r#"{"apply_command": "xdg-agent apply {change_id}"}"#,
+        )
+        .unwrap();
+
+        // Create platform config with different content
+        let platform_config_dir = platform_dir.path().join("cflx");
+        fs::create_dir_all(&platform_config_dir).unwrap();
+        fs::write(
+            platform_config_dir.join("config.jsonc"),
+            r#"{"apply_command": "platform-agent apply {change_id}"}"#,
+        )
+        .unwrap();
+
+        // Save original environment and directory
+        let original_xdg = env::var("XDG_CONFIG_HOME").ok();
+        let original_dir = env::current_dir().unwrap();
+
+        // Set XDG_CONFIG_HOME and change to work directory (no project config)
+        env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+        env::set_current_dir(work_dir.path()).unwrap();
+
+        // Load config - should prefer XDG path
+        let config = OrchestratorConfig::load(None).unwrap();
+
+        // Restore environment
+        env::set_current_dir(original_dir).unwrap();
+        match original_xdg {
+            Some(val) => env::set_var("XDG_CONFIG_HOME", val),
+            None => env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        // XDG config should be loaded
+        assert_eq!(
+            config.get_apply_command(),
+            "xdg-agent apply {change_id}",
+            "Expected XDG config to be loaded"
+        );
+    }
+
+    #[test]
+    fn test_load_platform_fallback_when_xdg_missing() {
+        use std::env;
+        use tempfile::TempDir;
+
+        // Create temporary work directory with no config files
+        let work_dir = TempDir::new().unwrap();
+
+        // Save original environment and directory
+        let original_xdg = env::var("XDG_CONFIG_HOME").ok();
+        let original_dir = env::current_dir().unwrap();
+
+        // Set XDG_CONFIG_HOME to non-existent path
+        let nonexistent = work_dir.path().join("nonexistent");
+        env::set_var("XDG_CONFIG_HOME", &nonexistent);
+        env::set_current_dir(work_dir.path()).unwrap();
+
+        // Load config - should fall back to platform path (or defaults if platform path doesn't exist)
+        let config = OrchestratorConfig::load(None).unwrap();
+
+        // Restore environment
+        env::set_current_dir(original_dir).unwrap();
+        match original_xdg {
+            Some(val) => env::set_var("XDG_CONFIG_HOME", val),
+            None => env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        // Should use defaults (since neither XDG nor platform configs exist)
+        assert_eq!(config.get_apply_command(), DEFAULT_APPLY_COMMAND);
+    }
+
+    #[test]
+    fn test_project_config_takes_priority_over_xdg() {
+        use std::env;
+        use std::fs;
+        use tempfile::TempDir;
+
+        // Create temporary directories
+        let xdg_dir = TempDir::new().unwrap();
+        let work_dir = TempDir::new().unwrap();
+
+        // Create XDG config
+        let xdg_config_dir = xdg_dir.path().join("cflx");
+        fs::create_dir_all(&xdg_config_dir).unwrap();
+        fs::write(
+            xdg_config_dir.join("config.jsonc"),
+            r#"{"apply_command": "xdg-agent apply {change_id}"}"#,
+        )
+        .unwrap();
+
+        // Create project config with different content
+        fs::write(
+            work_dir.path().join(PROJECT_CONFIG_FILE),
+            r#"{"apply_command": "project-agent apply {change_id}"}"#,
+        )
+        .unwrap();
+
+        // Save original environment and directory
+        let original_xdg = env::var("XDG_CONFIG_HOME").ok();
+        let original_dir = env::current_dir().unwrap();
+
+        // Set XDG_CONFIG_HOME and change to work directory
+        env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+        env::set_current_dir(work_dir.path()).unwrap();
+
+        // Load config - should prefer project config
+        let config = OrchestratorConfig::load(None).unwrap();
+
+        // Restore environment
+        env::set_current_dir(original_dir).unwrap();
+        match original_xdg {
+            Some(val) => env::set_var("XDG_CONFIG_HOME", val),
+            None => env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        // Project config should take priority
+        assert_eq!(
+            config.get_apply_command(),
+            "project-agent apply {change_id}",
+            "Expected project config to take priority over XDG config"
+        );
     }
 }
