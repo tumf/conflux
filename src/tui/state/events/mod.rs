@@ -110,6 +110,13 @@ impl AppState {
             OrchestratorEvent::ChangeSkipped { change_id, reason } => {
                 self.handle_change_skipped(change_id, reason)
             }
+            OrchestratorEvent::DependencyBlocked {
+                change_id,
+                dependency_ids: _,
+            } => self.handle_dependency_blocked(change_id),
+            OrchestratorEvent::DependencyResolved { change_id } => {
+                self.handle_dependency_resolved(change_id)
+            }
 
             // Output events
             OrchestratorEvent::ApplyOutput {

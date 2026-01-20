@@ -647,21 +647,45 @@ impl ParallelExecutor {
 
                             // Check if change has unresolved dependencies
                             if let Some(deps) = analysis_result.dependencies.get(change_id) {
-                                let mut all_resolved = true;
+                                let mut unresolved_deps = Vec::new();
                                 for dep_id in deps {
                                     if !self.is_dependency_resolved(dep_id).await {
-                                        all_resolved = false;
-                                        info!(
-                                            "Change '{}' blocked: waiting for dependency '{}'",
-                                            change_id, dep_id
-                                        );
-                                        break;
+                                        unresolved_deps.push(dep_id.clone());
                                     }
                                 }
 
-                                if !all_resolved {
+                                if !unresolved_deps.is_empty() {
+                                    info!(
+                                        "Change '{}' blocked: waiting for dependencies {:?}",
+                                        change_id, unresolved_deps
+                                    );
+                                    // Track this change as blocked
+                                    self.previously_blocked_changes.insert(change_id.clone());
+                                    // Send DependencyBlocked event
+                                    send_event(
+                                        &self.event_tx,
+                                        ParallelEvent::DependencyBlocked {
+                                            change_id: change_id.clone(),
+                                            dependency_ids: unresolved_deps,
+                                        },
+                                    )
+                                    .await;
                                     continue;
                                 }
+                            }
+
+                            // Check if this change was previously blocked and is now resolved
+                            if self.previously_blocked_changes.contains(change_id) {
+                                info!("Change '{}' dependencies resolved, now ready", change_id);
+                                self.previously_blocked_changes.remove(change_id);
+                                // Send DependencyResolved event
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::DependencyResolved {
+                                        change_id: change_id.clone(),
+                                    },
+                                )
+                                .await;
                             }
 
                             selected_changes.push(change_id.clone());

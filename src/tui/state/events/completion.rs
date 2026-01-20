@@ -115,4 +115,29 @@ impl AppState {
             wt.is_merging = false;
         }
     }
+
+    /// Handle DependencyBlocked event
+    pub(super) fn handle_dependency_blocked(&mut self, change_id: String) {
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            change.queue_status = QueueStatus::Blocked;
+        }
+        self.add_log(LogEntry::info(format!(
+            "Change '{}' blocked by dependencies",
+            change_id
+        )));
+    }
+
+    /// Handle DependencyResolved event
+    pub(super) fn handle_dependency_resolved(&mut self, change_id: String) {
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            // Only update if currently blocked, otherwise preserve the current state
+            if change.queue_status == QueueStatus::Blocked {
+                change.queue_status = QueueStatus::Queued;
+            }
+        }
+        self.add_log(LogEntry::info(format!(
+            "Change '{}' dependencies resolved",
+            change_id
+        )));
+    }
 }
