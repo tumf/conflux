@@ -35,12 +35,8 @@ impl AppState {
 
                 if was_archived {
                     // If change still exists after archiving, it means archive failed
-                    // Revert to appropriate status based on completion
-                    existing.queue_status = if fetched.is_complete() {
-                        QueueStatus::Completed
-                    } else {
-                        QueueStatus::NotQueued
-                    };
+                    // Revert to NotQueued status
+                    existing.queue_status = QueueStatus::NotQueued;
                     // Update progress for unarchived changes
                     if fetched.total_tasks > 0 {
                         existing.completed_tasks = fetched.completed_tasks;
@@ -120,8 +116,7 @@ impl AppState {
                 || c.started_at.is_some()
                 || matches!(
                     c.queue_status,
-                    QueueStatus::Completed
-                        | QueueStatus::Archiving
+                    QueueStatus::Archiving
                         | QueueStatus::Archived
                         | QueueStatus::Merged
                         | QueueStatus::MergeWait

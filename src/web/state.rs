@@ -48,7 +48,7 @@ pub struct ChangeStatus {
     pub dependencies: Vec<String>,
     /// Queue status (for parallel/serial execution tracking)
     /// Aligned with TUI QueueStatus display values: "not queued", "queued", "processing",
-    /// "completed", "archiving", "archived", "merged", "merge wait", "resolving", "error"
+    /// "accepting", "archiving", "archived", "merged", "merge wait", "resolving", "error"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_status: Option<String>,
     /// Current iteration number for apply/archive loops
@@ -110,11 +110,19 @@ impl OrchestratorState {
 
         let completed = change_statuses
             .iter()
-            .filter(|c| c.queue_status.as_ref().is_some_and(|s| s == "completed"))
+            .filter(|c| {
+                c.queue_status
+                    .as_ref()
+                    .is_some_and(|s| s == "archived" || s == "merged")
+            })
             .count();
         let in_progress = change_statuses
             .iter()
-            .filter(|c| c.queue_status.as_ref().is_some_and(|s| s == "processing"))
+            .filter(|c| {
+                c.queue_status.as_ref().is_some_and(|s| {
+                    s == "processing" || s == "accepting" || s == "archiving" || s == "resolving"
+                })
+            })
             .count();
         let pending = change_statuses
             .iter()
@@ -162,7 +170,7 @@ fn refresh_summary(state: &mut OrchestratorState) {
             change
                 .queue_status
                 .as_ref()
-                .is_some_and(|s| s == "completed")
+                .is_some_and(|s| s == "archived" || s == "merged")
         })
         .count();
     state.in_progress_changes = state
@@ -287,7 +295,7 @@ impl WebState {
                             change.completed_tasks = change.total_tasks;
                         }
                         change.status = "complete".to_string();
-                        change.queue_status = Some("completed".to_string());
+                        change.queue_status = Some("archiving".to_string());
                         change.progress_percent =
                             progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
@@ -376,7 +384,7 @@ impl WebState {
                 }
                 ExecutionEvent::ResolveCompleted { change_id, .. } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.queue_status = Some("completed".to_string());
+                        change.queue_status = Some("archiving".to_string());
                         updated = true;
                     }
                 }
@@ -755,7 +763,7 @@ mod tests {
         // Set queue_status to test aggregation
         state.changes[0].queue_status = Some("queued".to_string());
         state.changes[1].queue_status = Some("processing".to_string());
-        state.changes[2].queue_status = Some("completed".to_string());
+        state.changes[2].queue_status = Some("archived".to_string());
         refresh_summary(&mut state);
 
         assert_eq!(state.pending_changes, 1);

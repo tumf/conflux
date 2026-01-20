@@ -81,7 +81,7 @@ impl AppState {
     /// Handle AcceptanceCompleted event
     pub(super) fn handle_acceptance_completed(&mut self, change_id: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            change.queue_status = QueueStatus::Completed;
+            change.queue_status = QueueStatus::Archiving;
         }
         self.add_log(LogEntry::info(format!(
             "Acceptance completed: {}",

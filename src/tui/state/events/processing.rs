@@ -24,7 +24,7 @@ impl AppState {
     /// Handle ProcessingCompleted event
     pub(super) fn handle_processing_completed(&mut self, id: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-            change.queue_status = QueueStatus::Completed;
+            change.queue_status = QueueStatus::Archiving;
             // Reload final progress from tasks.md to preserve it
             if let Ok(progress) = crate::task_parser::parse_change(&id) {
                 change.completed_tasks = progress.completed;
@@ -38,6 +38,7 @@ impl AppState {
     pub(super) fn handle_processing_error(&mut self, id: String, error: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
             change.queue_status = QueueStatus::Error(error.clone());
+            change.selected = true;
             // Record elapsed time on error
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
@@ -56,6 +57,13 @@ impl AppState {
 
     /// Handle AllCompleted event
     pub(super) fn handle_all_completed(&mut self) {
+        if matches!(self.mode, AppMode::Stopped | AppMode::Error) {
+            if let Some(started) = self.orchestration_started_at {
+                self.orchestration_elapsed = Some(started.elapsed());
+            }
+            return;
+        }
+
         self.mode = AppMode::Select;
         self.current_change = None;
         self.stop_mode = StopMode::None;

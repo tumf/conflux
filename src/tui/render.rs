@@ -468,10 +468,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 QueueStatus::Archiving | QueueStatus::Resolving | QueueStatus::Accepting => {
                     format!("{} [{}]", spinner_char, change.queue_status.display())
                 }
-                QueueStatus::Completed
-                | QueueStatus::Archived
-                | QueueStatus::Merged
-                | QueueStatus::Error(_) => {
+                QueueStatus::Archived | QueueStatus::Merged | QueueStatus::Error(_) => {
                     format!("[{}]", change.queue_status.display())
                 }
                 status => format!("[{}]", status.display()),
@@ -1262,12 +1259,13 @@ mod tests {
 
     #[test]
     fn test_get_checkbox_display_processing_states() {
-        // Processing and Completed states should show green when selected
+        // Processing state should show green when selected
         let (text, color) = get_checkbox_display(&QueueStatus::Processing, true, true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
 
-        let (text, color) = get_checkbox_display(&QueueStatus::Completed, true, true);
+        // Archiving state should show green when selected
+        let (text, color) = get_checkbox_display(&QueueStatus::Archiving, true, true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
     }

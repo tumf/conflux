@@ -752,7 +752,23 @@ impl ParallelExecutor {
                                 )
                                 .await
                             {
-                                error!("Failed to dispatch change '{}': {}", change_id, e);
+                                let message =
+                                    format!("Failed to dispatch change '{}': {}", change_id, e);
+                                self.failed_tracker.mark_failed(change_id);
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::ProcessingError {
+                                        id: change_id.clone(),
+                                        error: message.clone(),
+                                    },
+                                )
+                                .await;
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::Log(LogEntry::error(message.clone())),
+                                )
+                                .await;
+                                error!("{}", message);
                             }
                         }
 
