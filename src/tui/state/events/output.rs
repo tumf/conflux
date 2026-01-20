@@ -88,12 +88,11 @@ impl AppState {
             change.iteration_number = iteration;
         }
 
-        let mut entry = LogEntry::info(output)
-            .with_change_id(&change_id)
-            .with_operation("resolve");
-        if let Some(iter) = iteration {
-            entry = entry.with_iteration(iter);
-        }
-        self.add_log(entry);
+        self.add_log(
+            LogEntry::info(output)
+                .with_change_id(&change_id)
+                .with_operation("resolve")
+                .with_iteration(iteration.unwrap_or(1)),
+        );
     }
 }
