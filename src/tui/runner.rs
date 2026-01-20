@@ -312,6 +312,54 @@ async fn run_tui_loop(
     // Cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
 
+    // Wire web control channel to TUI command channel
+    #[cfg(feature = "web-monitoring")]
+    if let Some(ref ws) = web_state {
+        // Create unbounded channel for web control commands
+        let (control_tx, mut control_rx) =
+            mpsc::unbounded_channel::<crate::web::state::ControlCommand>();
+
+        // Set the control channel in WebState
+        ws.set_control_channel(control_tx).await;
+
+        // Spawn bridge task to translate ControlCommand -> TuiCommand
+        let bridge_cmd_tx = cmd_tx.clone();
+        let bridge_cancel = cancel_token.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = bridge_cancel.cancelled() => {
+                        break;
+                    }
+                    Some(control_cmd) = control_rx.recv() => {
+                        use crate::web::state::ControlCommand;
+
+                        // For Start command, we need a special marker that will be handled
+                        // in the main loop to call app.start_processing()/resume_processing()/retry_error_changes()
+                        // For other commands, we can directly translate to TuiCommand
+                        let tui_cmd_opt = match control_cmd {
+                            ControlCommand::Start => {
+                                // Send a special StartProcessing with empty vec as a signal
+                                // The main loop will need to handle this by calling the appropriate method
+                                Some(TuiCommand::StartProcessing(vec![]))
+                            }
+                            ControlCommand::Stop => Some(TuiCommand::Stop),
+                            ControlCommand::CancelStop => Some(TuiCommand::CancelStop),
+                            ControlCommand::ForceStop => Some(TuiCommand::ForceStop),
+                            ControlCommand::Retry => Some(TuiCommand::Retry),
+                        };
+
+                        if let Some(tui_cmd) = tui_cmd_opt {
+                            if bridge_cmd_tx.send(tui_cmd).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Start auto-refresh task
     let refresh_tx = tx.clone();
     let refresh_cancel = cancel_token.clone();
@@ -1077,11 +1125,26 @@ async fn run_tui_loop(
 
         // Handle orchestrator events
         while let Ok(event) = rx.try_recv() {
-            // Update web state when changes are refreshed (web-monitoring feature only)
+            // Forward execution events to web state (web-monitoring feature only)
             #[cfg(feature = "web-monitoring")]
-            if let OrchestratorEvent::ChangesRefreshed { ref changes, .. } = event {
-                if let Some(ref web_state) = web_state {
-                    web_state.update(changes).await;
+            if let Some(ref web_state) = web_state {
+                use crate::events::ExecutionEvent;
+                match &event {
+                    // Changes refreshed - use update method to preserve state
+                    ExecutionEvent::ChangesRefreshed { changes, .. } => {
+                        web_state.update(changes).await;
+                    }
+                    // Execution lifecycle events - forward to apply_execution_event
+                    ExecutionEvent::ProcessingStarted(_)
+                    | ExecutionEvent::ProcessingError { .. }
+                    | ExecutionEvent::Stopping
+                    | ExecutionEvent::Stopped
+                    | ExecutionEvent::AllCompleted => {
+                        web_state.apply_execution_event(&event).await;
+                    }
+                    _ => {
+                        // Other events are not needed for web state updates
+                    }
                 }
             }
 
@@ -1091,6 +1154,93 @@ async fn run_tui_loop(
         // Handle dynamic queue additions and removals
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
+                TuiCommand::StartProcessing(ids) => {
+                    // Handle web control Start command (empty ids vec) or regular Start
+                    let cmd = if ids.is_empty() {
+                        // Web control start - determine which command based on app mode
+                        if app.mode == AppMode::Error {
+                            app.retry_error_changes()
+                        } else if app.mode == AppMode::Stopped {
+                            app.resume_processing()
+                        } else {
+                            app.start_processing()
+                        }
+                    } else {
+                        // Regular start with specific IDs (from F5 key)
+                        Some(TuiCommand::StartProcessing(ids.clone()))
+                    };
+
+                    if let Some(TuiCommand::StartProcessing(selected_ids)) = cmd {
+                        if !selected_ids.is_empty() {
+                            graceful_stop_flag.store(false, Ordering::SeqCst);
+                            let orch_tx = tx.clone();
+                            let orch_config = config.clone();
+                            let orch_cancel = CancellationToken::new();
+                            let orch_dynamic_queue = dynamic_queue.clone();
+                            let orch_graceful_stop = graceful_stop_flag.clone();
+                            let orch_shared_state = shared_state.clone();
+                            orchestrator_cancel = Some(orch_cancel.clone());
+                            let use_parallel = app.parallel_mode;
+                            #[cfg(feature = "web-monitoring")]
+                            let orch_web_state = web_state.clone();
+
+                            orchestrator_handle = Some(tokio::spawn(async move {
+                                #[cfg(feature = "web-monitoring")]
+                                let result = if use_parallel {
+                                    run_orchestrator_parallel(
+                                        selected_ids,
+                                        orch_config,
+                                        orch_tx.clone(),
+                                        orch_cancel,
+                                        orch_dynamic_queue,
+                                        orch_graceful_stop,
+                                        orch_shared_state,
+                                        orch_web_state,
+                                    )
+                                    .await
+                                } else {
+                                    run_orchestrator(
+                                        selected_ids,
+                                        orch_config,
+                                        orch_tx.clone(),
+                                        orch_cancel,
+                                        orch_dynamic_queue,
+                                        orch_graceful_stop,
+                                        orch_shared_state,
+                                        orch_web_state,
+                                    )
+                                    .await
+                                };
+                                #[cfg(not(feature = "web-monitoring"))]
+                                let result = if use_parallel {
+                                    run_orchestrator_parallel(
+                                        selected_ids,
+                                        orch_config,
+                                        orch_tx.clone(),
+                                        orch_cancel,
+                                        orch_dynamic_queue,
+                                        orch_graceful_stop,
+                                        orch_shared_state,
+                                    )
+                                    .await
+                                } else {
+                                    run_orchestrator(
+                                        selected_ids,
+                                        orch_config,
+                                        orch_tx.clone(),
+                                        orch_cancel,
+                                        orch_dynamic_queue,
+                                        orch_graceful_stop,
+                                        orch_shared_state,
+                                    )
+                                    .await
+                                };
+                                let _ = orch_tx.send(OrchestratorEvent::Stopped).await;
+                                result
+                            }));
+                        }
+                    }
+                }
                 TuiCommand::AddToQueue(id) => {
                     // Push to dynamic queue for orchestrator to pick up
                     if dynamic_queue.push(id.clone()).await {
@@ -1300,6 +1450,175 @@ async fn run_tui_loop(
                         }
                     }
                 }
+                TuiCommand::Stop => {
+                    // Initiate graceful stop
+                    if app.mode == AppMode::Running {
+                        app.stop_mode = StopMode::GracefulPending;
+                        graceful_stop_flag.store(true, Ordering::SeqCst);
+                        app.mode = AppMode::Stopping;
+                        app.add_log(LogEntry::warn("Stopping after current change completes..."));
+                        // Emit Stopping event for web clients
+                        app.handle_orchestrator_event(OrchestratorEvent::Stopping);
+                        // Forward to web state immediately for web control API
+                        #[cfg(feature = "web-monitoring")]
+                        if let Some(ref web_state) = web_state {
+                            web_state
+                                .apply_execution_event(&OrchestratorEvent::Stopping)
+                                .await;
+                        }
+                    } else {
+                        app.add_log(LogEntry::warn(format!(
+                            "Cannot stop: not running (current mode: {:?})",
+                            app.mode
+                        )));
+                    }
+                }
+                TuiCommand::CancelStop => {
+                    // Cancel graceful stop and return to Running mode
+                    if app.mode == AppMode::Stopping {
+                        // Check if orchestrator is still running
+                        if orchestrator_handle
+                            .as_ref()
+                            .is_some_and(|h| !h.is_finished())
+                        {
+                            graceful_stop_flag.store(false, Ordering::SeqCst);
+                            app.stop_mode = StopMode::None;
+                            app.mode = AppMode::Running;
+                            app.add_log(LogEntry::info("Stop canceled, continuing..."));
+                            // Forward to web state immediately for web control API
+                            #[cfg(feature = "web-monitoring")]
+                            if let Some(ref web_state) = web_state {
+                                // Use ProcessingStarted with empty string to transition to running mode
+                                web_state
+                                    .apply_execution_event(&OrchestratorEvent::ProcessingStarted(
+                                        "".to_string(),
+                                    ))
+                                    .await;
+                            }
+                        } else {
+                            app.add_log(LogEntry::warn(
+                                "Cannot cancel stop: processing already completed",
+                            ));
+                        }
+                    } else {
+                        app.add_log(LogEntry::warn(format!(
+                            "Cannot cancel stop: not stopping (current mode: {:?})",
+                            app.mode
+                        )));
+                    }
+                }
+                TuiCommand::ForceStop => {
+                    // Force stop immediately
+                    if matches!(app.mode, AppMode::Running | AppMode::Stopping) {
+                        app.stop_mode = StopMode::ForceStopped;
+                        if let Some(cancel) = &orchestrator_cancel {
+                            cancel.cancel();
+                        }
+                        app.handle_orchestrator_event(OrchestratorEvent::Stopped);
+                        app.current_change = None;
+                        app.add_log(LogEntry::warn("Force stopped"));
+
+                        // Forward stopped event to web state
+                        #[cfg(feature = "web-monitoring")]
+                        if let Some(ref web_state) = web_state {
+                            use crate::events::ExecutionEvent;
+                            web_state
+                                .apply_execution_event(&ExecutionEvent::Stopped)
+                                .await;
+                        }
+                    } else {
+                        app.add_log(LogEntry::warn(format!(
+                            "Cannot force stop: not running or stopping (current mode: {:?})",
+                            app.mode
+                        )));
+                    }
+                }
+                TuiCommand::Retry => {
+                    // Retry error changes (same as F5 in error mode)
+                    if app.mode == AppMode::Error {
+                        if let Some(cmd) = app.retry_error_changes() {
+                            // Start orchestrator task
+                            let selected_ids = match &cmd {
+                                TuiCommand::StartProcessing(ids) => ids.clone(),
+                                _ => vec![],
+                            };
+
+                            if !selected_ids.is_empty() {
+                                graceful_stop_flag.store(false, Ordering::SeqCst);
+                                let orch_tx = tx.clone();
+                                let orch_config = config.clone();
+                                let orch_cancel = CancellationToken::new();
+                                let orch_dynamic_queue = dynamic_queue.clone();
+                                let orch_graceful_stop = graceful_stop_flag.clone();
+                                let orch_shared_state = shared_state.clone();
+                                orchestrator_cancel = Some(orch_cancel.clone());
+                                let use_parallel = app.parallel_mode;
+                                #[cfg(feature = "web-monitoring")]
+                                let orch_web_state = web_state.clone();
+
+                                orchestrator_handle = Some(tokio::spawn(async move {
+                                    #[cfg(feature = "web-monitoring")]
+                                    let result = if use_parallel {
+                                        run_orchestrator_parallel(
+                                            selected_ids,
+                                            orch_config,
+                                            orch_tx.clone(),
+                                            orch_cancel,
+                                            orch_dynamic_queue,
+                                            orch_graceful_stop,
+                                            orch_shared_state,
+                                            orch_web_state,
+                                        )
+                                        .await
+                                    } else {
+                                        run_orchestrator(
+                                            selected_ids,
+                                            orch_config,
+                                            orch_tx.clone(),
+                                            orch_cancel,
+                                            orch_dynamic_queue,
+                                            orch_graceful_stop,
+                                            orch_shared_state,
+                                            orch_web_state,
+                                        )
+                                        .await
+                                    };
+                                    #[cfg(not(feature = "web-monitoring"))]
+                                    let result = if use_parallel {
+                                        run_orchestrator_parallel(
+                                            selected_ids,
+                                            orch_config,
+                                            orch_tx.clone(),
+                                            orch_cancel,
+                                            orch_dynamic_queue,
+                                            orch_graceful_stop,
+                                            orch_shared_state,
+                                        )
+                                        .await
+                                    } else {
+                                        run_orchestrator(
+                                            selected_ids,
+                                            orch_config,
+                                            orch_tx.clone(),
+                                            orch_cancel,
+                                            orch_dynamic_queue,
+                                            orch_graceful_stop,
+                                            orch_shared_state,
+                                        )
+                                        .await
+                                    };
+                                    let _ = orch_tx.send(OrchestratorEvent::Stopped).await;
+                                    result
+                                }));
+                            }
+                        }
+                    } else {
+                        app.add_log(LogEntry::warn(format!(
+                            "Cannot retry: not in error mode (current mode: {:?})",
+                            app.mode
+                        )));
+                    }
+                }
                 TuiCommand::MergeWorktreeBranch {
                     worktree_path,
                     branch_name,
@@ -1466,7 +1785,6 @@ async fn run_tui_loop(
                         }
                     });
                 }
-                _ => {}
             }
         }
 
