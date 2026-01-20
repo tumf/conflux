@@ -129,8 +129,8 @@ TUI SHALL display a dashboard-style UI in running mode.
 
 #### Scenario: Running mode header shows processing count
 - **GIVEN** the TUI is in running mode
-- **WHEN** one or more changes are processing or archiving
-- **THEN** the header shows "Running <count>" where <count> is the number of active operations
+- **WHEN** one or more changes are in active state (Queued, Processing, Accepting, Archiving, or Resolving)
+- **THEN** the header shows "Running <count>" where <count> is the number of active changes
 
 #### Scenario: Status line uses selected change progress
 - **GIVEN** the TUI is in any mode
