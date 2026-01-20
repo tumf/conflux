@@ -104,6 +104,24 @@ impl QueueStatus {
             QueueStatus::Error(_) => Color::Red,
         }
     }
+
+    /// Check if the queue status represents an active processing state
+    ///
+    /// Active states are those where work is currently being performed.
+    /// This is used for counting "Running N" in the TUI header.
+    ///
+    /// Active: Queued, Processing, Accepting, Archiving, Resolving
+    /// Inactive: NotQueued, MergeWait, Archived, Merged, Error
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            QueueStatus::Queued
+                | QueueStatus::Processing
+                | QueueStatus::Accepting
+                | QueueStatus::Archiving
+                | QueueStatus::Resolving
+        )
+    }
 }
 
 /// Information about a git worktree
@@ -236,6 +254,21 @@ mod tests {
     #[test]
     fn test_queue_status_merged_color() {
         assert_eq!(QueueStatus::Merged.color(), Color::LightBlue);
+    }
+
+    #[test]
+    fn test_queue_status_is_active() {
+        assert!(QueueStatus::Queued.is_active());
+        assert!(QueueStatus::Processing.is_active());
+        assert!(QueueStatus::Accepting.is_active());
+        assert!(QueueStatus::Archiving.is_active());
+        assert!(QueueStatus::Resolving.is_active());
+
+        assert!(!QueueStatus::NotQueued.is_active());
+        assert!(!QueueStatus::MergeWait.is_active());
+        assert!(!QueueStatus::Archived.is_active());
+        assert!(!QueueStatus::Merged.is_active());
+        assert!(!QueueStatus::Error("err".to_string()).is_active());
     }
 
     #[test]
