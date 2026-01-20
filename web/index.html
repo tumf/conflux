@@ -57,6 +57,29 @@
             </div>
         </section>
 
+        <section class="control-bar" id="control-bar" aria-label="Execution Controls">
+            <button id="btn-run" class="control-btn control-btn-primary" aria-label="Start or resume processing">
+                <span class="btn-icon">▶</span>
+                <span class="btn-text">Run</span>
+            </button>
+            <button id="btn-stop" class="control-btn control-btn-warning" aria-label="Stop processing gracefully" disabled>
+                <span class="btn-icon">⏸</span>
+                <span class="btn-text">Stop</span>
+            </button>
+            <button id="btn-cancel-stop" class="control-btn control-btn-info" aria-label="Cancel stop request" disabled>
+                <span class="btn-icon">↩</span>
+                <span class="btn-text">Cancel Stop</span>
+            </button>
+            <button id="btn-force-stop" class="control-btn control-btn-danger" aria-label="Force stop immediately" disabled>
+                <span class="btn-icon">⏹</span>
+                <span class="btn-text">Force Stop</span>
+            </button>
+            <button id="btn-retry" class="control-btn control-btn-success" aria-label="Retry error changes" disabled>
+                <span class="btn-icon">🔄</span>
+                <span class="btn-text">Retry</span>
+            </button>
+        </section>
+
         <main id="changes-container" role="main">
             <div class="loading" id="loading" aria-busy="true">
                 <div class="spinner" aria-hidden="true"></div>

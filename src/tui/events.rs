@@ -27,6 +27,12 @@ pub enum TuiCommand {
     /// Stop processing (graceful shutdown)
     #[allow(dead_code)]
     Stop,
+    /// Cancel a pending stop request
+    CancelStop,
+    /// Force stop immediately
+    ForceStop,
+    /// Retry error changes
+    Retry,
     /// Delete worktrees associated with a change
     #[allow(dead_code)]
     DeleteWorktree(String),

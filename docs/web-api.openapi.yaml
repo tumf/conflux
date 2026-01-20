@@ -170,6 +170,168 @@ paths:
               example:
                 error: "Failed to unapprove change: IO error"
 
+  /api/control/start:
+    post:
+      summary: Start or resume processing
+      description: |
+        Initiates processing of selected changes or resumes from stopped state.
+        Returns 409 Conflict if already running or stopping.
+      operationId: controlStart
+      responses:
+        '200':
+          description: Processing started successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+              example:
+                success: true
+                message: "Processing started"
+        '409':
+          description: Cannot start (already running or stopping)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Cannot start: already running"
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Failed to start processing: control channel not available"
+
+  /api/control/stop:
+    post:
+      summary: Stop processing (graceful shutdown)
+      description: |
+        Initiates graceful stop of processing. Current change will complete before stopping.
+        Returns 409 Conflict if not running.
+      operationId: controlStop
+      responses:
+        '200':
+          description: Stop initiated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+              example:
+                success: true
+                message: "Stopping after current change completes..."
+        '409':
+          description: Cannot stop (not running)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Cannot stop: not running (current mode: select)"
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/control/cancel-stop:
+    post:
+      summary: Cancel a pending stop request
+      description: |
+        Cancels a graceful stop request and continues processing.
+        Returns 409 Conflict if not in stopping mode.
+      operationId: controlCancelStop
+      responses:
+        '200':
+          description: Stop canceled successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+              example:
+                success: true
+                message: "Stop canceled, continuing..."
+        '409':
+          description: Cannot cancel stop (not stopping)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Cannot cancel stop: not stopping (current mode: running)"
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/control/force-stop:
+    post:
+      summary: Force stop immediately
+      description: |
+        Immediately terminates processing without waiting for current change to complete.
+        Returns 409 Conflict if not running or stopping.
+      operationId: controlForceStop
+      responses:
+        '200':
+          description: Force stop initiated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+              example:
+                success: true
+                message: "Force stopping..."
+        '409':
+          description: Cannot force stop (not running or stopping)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Cannot force stop: not running or stopping (current mode: select)"
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/control/retry:
+    post:
+      summary: Retry error changes
+      description: |
+        Retries changes that failed with errors. Resets error changes to queued and starts processing.
+        Returns 409 Conflict if not in error mode.
+      operationId: controlRetry
+      responses:
+        '200':
+          description: Retry initiated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+              example:
+                success: true
+                message: "Retrying error changes..."
+        '409':
+          description: Cannot retry (not in error mode)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Cannot retry: not in error mode (current mode: select)"
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /ws:
     get:
       summary: WebSocket endpoint for real-time updates
@@ -224,6 +386,22 @@ components:
           type: string
           description: Human-readable error message
           example: "Change 'my-change' not found"
+
+    ControlResponse:
+      type: object
+      description: Response for control operations (start/stop/retry)
+      required:
+        - success
+        - message
+      properties:
+        success:
+          type: boolean
+          description: Whether the operation was successful
+          example: true
+        message:
+          type: string
+          description: Human-readable status message
+          example: "Processing started"
 
     ChangeStatus:
       type: object
@@ -360,11 +538,19 @@ components:
             $ref: '#/components/schemas/WorktreeInfo'
         app_mode:
           type: string
-          description: Application mode
+          description: |
+            Application mode indicating current execution state.
+            - select: Initial state, ready to start processing
+            - running: Processing changes
+            - stopping: Graceful stop initiated, waiting for current change to complete
+            - stopped: Processing stopped, can be resumed
+            - error: Error occurred during processing
           enum:
             - select
             - running
+            - stopping
             - stopped
+            - error
           example: select
 
     StateUpdate:
@@ -410,7 +596,9 @@ components:
           enum:
             - select
             - running
+            - stopping
             - stopped
+            - error
           example: running
 
     LogEntry:
