@@ -33,32 +33,42 @@ Defines the configuration file format, agent command templates, and settings for
 オーケストレーターは以下の優先順位で設定ファイルを読み込まなければならない (MUST):
 
 1. **プロジェクト設定** (優先): `.cflx.jsonc` (プロジェクトルート)
-2. **グローバル設定**: `~/.config/cflx/config.jsonc`
+2. **XDG グローバル設定 (環境変数)**: `$XDG_CONFIG_HOME/cflx/config.jsonc`
+3. **XDG グローバル設定 (デフォルト)**: `~/.config/cflx/config.jsonc`
+4. **プラットフォーム標準のグローバル設定**: `dirs::config_dir()/cflx/config.jsonc`
 
 プロジェクト設定が存在する場合はそちらを使用し、存在しない場合のみグローバル設定を使用する。
 
-#### Scenario: プロジェクト設定がグローバル設定より優先される
-
-- **GIVEN** グローバル設定 `~/.config/cflx/config.jsonc` に:
+#### Scenario: XDG_CONFIG_HOME が設定されている場合は最優先で使用する
+- **GIVEN** 環境変数 `XDG_CONFIG_HOME=/custom/config` が設定されている
+- **AND** `/custom/config/cflx/config.jsonc` に:
   ```jsonc
-  { "apply_command": "global-agent apply {change_id}" }
+  { "apply_command": "xdg-agent apply {change_id}" }
   ```
-- **AND** プロジェクト設定 `.cflx.jsonc` に:
-  ```jsonc
-  { "apply_command": "project-agent apply {change_id}" }
-  ```
+- **AND** `.cflx.jsonc` が存在しない
 - **WHEN** 変更 `fix-bug` を適用する
-- **THEN** `project-agent apply fix-bug` が実行される（プロジェクト設定が優先）
+- **THEN** `xdg-agent apply fix-bug` が実行される
 
-#### Scenario: プロジェクト設定がない場合はグローバル設定を使用
-
-- **GIVEN** プロジェクトルートに `.cflx.jsonc` が存在しない
-- **AND** グローバル設定 `~/.config/cflx/config.jsonc` に:
+#### Scenario: XDG_CONFIG_HOME が未設定の場合は ~/.config を優先する
+- **GIVEN** `XDG_CONFIG_HOME` が未設定である
+- **AND** `~/.config/cflx/config.jsonc` に:
   ```jsonc
-  { "apply_command": "global-agent apply {change_id}" }
+  { "apply_command": "xdg-default apply {change_id}" }
   ```
+- **AND** `.cflx.jsonc` が存在しない
 - **WHEN** 変更 `fix-bug` を適用する
-- **THEN** `global-agent apply fix-bug` が実行される
+- **THEN** `xdg-default apply fix-bug` が実行される
+
+#### Scenario: XDG 設定が存在しない場合は platform 標準のグローバル設定を使用する
+- **GIVEN** `XDG_CONFIG_HOME` が未設定である
+- **AND** `~/.config/cflx/config.jsonc` が存在しない
+- **AND** platform 標準のグローバル設定に:
+  ```jsonc
+  { "apply_command": "platform-default apply {change_id}" }
+  ```
+- **AND** `.cflx.jsonc` が存在しない
+- **WHEN** 変更 `fix-bug` を適用する
+- **THEN** `platform-default apply fix-bug` が実行される
 
 ### Requirement: プレースホルダーの展開
 
