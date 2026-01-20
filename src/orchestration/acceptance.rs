@@ -268,8 +268,7 @@ pub async fn update_tasks_on_acceptance_failure(
     } else {
         findings
             .iter()
-            .enumerate()
-            .map(|(i, f)| format!("  {}) {}", i + 1, f))
+            .map(|f| format!("  - {}", f))
             .collect::<Vec<_>>()
             .join("\n")
     };
