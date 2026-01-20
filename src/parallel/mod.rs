@@ -5,13 +5,18 @@
 
 mod cleanup;
 mod conflict;
+mod dynamic_queue;
 mod events;
 mod executor;
+mod merge;
 mod output_bridge;
 mod types;
+mod workspace;
 
 // Re-export ExecutionEvent as ParallelEvent for backward compatibility
 pub use crate::events::ExecutionEvent as ParallelEvent;
+pub use dynamic_queue::ReanalysisReason;
+pub use merge::{base_dirty_reason, MergeAttempt};
 pub use types::{FailedChangeTracker, WorkspaceResult};
 
 use crate::agent::{AgentRunner, OutputLine};
@@ -111,62 +116,7 @@ pub struct ParallelExecutor {
     needs_reanalysis: bool,
 }
 
-pub async fn base_dirty_reason(repo_root: &Path) -> Result<Option<String>> {
-    let is_git_repo = git_commands::check_git_repo(repo_root)
-        .await
-        .map_err(OrchestratorError::from_vcs_error)?;
-    if !is_git_repo {
-        return Ok(None);
-    }
-
-    let merge_in_progress = git_commands::is_merge_in_progress(repo_root)
-        .await
-        .map_err(OrchestratorError::from_vcs_error)?;
-    if merge_in_progress {
-        return Ok(Some("Merge in progress (MERGE_HEAD exists)".to_string()));
-    }
-
-    let (has_changes, status) = git_commands::has_uncommitted_changes(repo_root)
-        .await
-        .map_err(OrchestratorError::from_vcs_error)?;
-    if has_changes {
-        let trimmed = status.trim();
-        let reason = if trimmed.is_empty() {
-            "Working tree has uncommitted changes".to_string()
-        } else {
-            format!("Working tree has uncommitted changes:\n{}", trimmed)
-        };
-        return Ok(Some(reason));
-    }
-
-    Ok(None)
-}
-
-enum MergeAttempt {
-    Merged,
-    Deferred(String),
-}
-
-/// Reason for triggering re-analysis (for logging and diagnostics)
-#[derive(Debug, Clone, Copy)]
-enum ReanalysisReason {
-    /// Initial analysis (first iteration)
-    Initial,
-    /// Task completion (apply/archive/acceptance finished)
-    Completion,
-    /// Queue notification (dynamic queue has new items)
-    QueueNotification,
-}
-
-impl std::fmt::Display for ReanalysisReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReanalysisReason::Initial => write!(f, "initial"),
-            ReanalysisReason::Completion => write!(f, "completion"),
-            ReanalysisReason::QueueNotification => write!(f, "queue"),
-        }
-    }
-}
+// Re-exported from merge module (see above pub use statement)
 
 impl ParallelExecutor {
     /// Create a new parallel executor with automatic VCS detection
@@ -318,31 +268,7 @@ impl ParallelExecutor {
     /// proceed even when available_slots == 0, and the next dispatch will happen
     /// when slots become available.
     pub async fn should_reanalyze(&self) -> bool {
-        let last_change = self.last_queue_change_at.lock().await;
-        match *last_change {
-            None => {
-                // No recent queue changes, proceed with re-analysis
-                true
-            }
-            Some(timestamp) => {
-                let elapsed = timestamp.elapsed();
-                let debounce_duration = std::time::Duration::from_secs(10);
-
-                if elapsed >= debounce_duration {
-                    info!(
-                        "Debounce period elapsed ({:.1}s >= 10s), proceeding with re-analysis",
-                        elapsed.as_secs_f64()
-                    );
-                    true
-                } else {
-                    info!(
-                        "Debounce period active ({:.1}s < 10s), deferring re-analysis",
-                        elapsed.as_secs_f64()
-                    );
-                    false
-                }
-            }
-        }
+        dynamic_queue::should_reanalyze_queue(&self.last_queue_change_at).await
     }
 
     fn is_cancelled(&self) -> bool {
@@ -3477,7 +3403,7 @@ impl ParallelExecutor {
         use crate::execution::archive::verify_archive_completion;
 
         let _merge_guard = global_merge_lock().lock().await;
-        if let Some(reason) = base_dirty_reason(&self.repo_root).await? {
+        if let Some(reason) = merge::base_dirty_reason(&self.repo_root).await? {
             return Ok(MergeAttempt::Deferred(reason));
         }
 
