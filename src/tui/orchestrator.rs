@@ -66,6 +66,7 @@ pub async fn archive_single_change(
     change_id: &str,
     change: &Change,
     agent: &mut AgentRunner,
+    ai_runner: &crate::ai_command_runner::AiCommandRunner,
     hooks: &crate::hooks::HookRunner,
     tx: &mpsc::Sender<OrchestratorEvent>,
     cancel_token: &CancellationToken,
@@ -136,9 +137,10 @@ pub async fn archive_single_change(
     loop {
         attempt += 1;
 
-        // Run archive command with streaming output
-        let (mut child, mut output_rx, start) =
-            agent.run_archive_streaming(change_id, None).await?;
+        // Run archive command via AiCommandRunner with streaming output (shared stagger state)
+        let (mut child, mut output_rx, start) = agent
+            .run_archive_streaming_with_runner(change_id, ai_runner, None)
+            .await?;
 
         // Create output collector for history
         let mut output_collector = OutputCollector::new();
@@ -248,6 +250,7 @@ pub async fn archive_single_change(
                 change_id,
                 Path::new("."),
                 &*agent,
+                ai_runner,
                 crate::vcs::VcsBackend::Auto,
                 move |line| {
                     let log_tx = log_tx.clone();
@@ -381,6 +384,7 @@ pub async fn archive_single_change(
 pub async fn archive_all_complete_changes(
     pending_ids: &HashSet<String>,
     agent: &mut AgentRunner,
+    ai_runner: &crate::ai_command_runner::AiCommandRunner,
     hooks: &crate::hooks::HookRunner,
     tx: &mpsc::Sender<OrchestratorEvent>,
     cancel_token: &CancellationToken,
@@ -447,6 +451,7 @@ pub async fn archive_all_complete_changes(
             &change.id,
             &change,
             agent,
+            ai_runner,
             hooks,
             tx,
             cancel_token,
@@ -494,6 +499,7 @@ pub async fn archive_all_complete_changes(
 /// - Phase 2: Apply one incomplete change
 ///
 /// This ensures complete changes are never skipped.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_orchestrator(
     change_ids: Vec<String>,
     config: OrchestratorConfig,
@@ -501,6 +507,7 @@ pub async fn run_orchestrator(
     cancel_token: CancellationToken,
     dynamic_queue: DynamicQueue,
     _graceful_stop_flag: Arc<AtomicBool>,
+    shared_stagger_state: crate::ai_command_runner::SharedStaggerState,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
     use crate::agent::OutputLine;
@@ -510,7 +517,31 @@ pub async fn run_orchestrator(
     let hooks = HookRunner::new(config.get_hooks());
     let max_iterations = config.get_max_iterations();
     let acceptance_max_continues = config.get_acceptance_max_continues();
-    let mut agent = AgentRunner::new(config);
+    let mut agent = AgentRunner::new(config.clone());
+
+    // Create AiCommandRunner for acceptance execution using shared stagger state
+    use crate::ai_command_runner::AiCommandRunner;
+    use crate::command_queue::CommandQueueConfig;
+    use crate::config::defaults::*;
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: config
+            .command_queue_stagger_delay_ms
+            .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+        max_retries: config
+            .command_queue_max_retries
+            .unwrap_or(DEFAULT_MAX_RETRIES),
+        retry_delay_ms: config
+            .command_queue_retry_delay_ms
+            .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+        retry_error_patterns: config
+            .command_queue_retry_patterns
+            .clone()
+            .unwrap_or_else(default_retry_patterns),
+        retry_if_duration_under_secs: config
+            .command_queue_retry_if_duration_under_secs
+            .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+    };
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
 
     let mut total_changes = change_ids.len();
     let mut iteration: u32 = 0;
@@ -624,6 +655,7 @@ pub async fn run_orchestrator(
         let archived_count = archive_all_complete_changes(
             &pending_changes,
             &mut agent,
+            &ai_runner,
             &hooks,
             &tx,
             &cancel_token,
@@ -767,9 +799,10 @@ pub async fn run_orchestrator(
             ))))
             .await;
 
-        // Run apply command with streaming output
-        let (mut child, mut output_rx, start_time) =
-            agent.run_apply_streaming(&change_id, None).await?;
+        // Run apply command via AiCommandRunner with streaming output (shared stagger state)
+        let (mut child, mut output_rx, start_time) = agent
+            .run_apply_streaming_with_runner(&change_id, &ai_runner, None)
+            .await?;
 
         // Create output collector for history
         let mut output_collector = OutputCollector::new();
@@ -976,8 +1009,15 @@ pub async fn run_orchestrator(
                 // Check for cancellation
                 let cancel_check = || cancel_token.is_cancelled();
 
-                match acceptance_test_streaming(&updated_change, &mut agent, &output, cancel_check)
-                    .await
+                match acceptance_test_streaming(
+                    &updated_change,
+                    &mut agent,
+                    &ai_runner,
+                    &config,
+                    &output,
+                    cancel_check,
+                )
+                .await
                 {
                     Ok(AcceptanceResult::Pass) => {
                         let _ = tx
@@ -1254,6 +1294,7 @@ pub async fn run_orchestrator_parallel(
     cancel_token: CancellationToken,
     dynamic_queue: DynamicQueue,
     _graceful_stop_flag: Arc<AtomicBool>,
+    shared_stagger_state: crate::ai_command_runner::SharedStaggerState,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
     use crate::openspec::list_changes_native;
@@ -1271,8 +1312,12 @@ pub async fn run_orchestrator_parallel(
     // Get repo root
     let repo_root = std::env::current_dir()?;
 
-    // Create ParallelRunService
-    let service = ParallelRunService::new(repo_root.clone(), config.clone());
+    // Create ParallelRunService with shared stagger state
+    let service = ParallelRunService::new_with_shared_state(
+        repo_root.clone(),
+        config.clone(),
+        shared_stagger_state,
+    );
 
     // Create shared queue change timestamp for debouncing
     let shared_queue_change = Arc::new(tokio::sync::Mutex::new(None::<std::time::Instant>));

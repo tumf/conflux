@@ -848,6 +848,7 @@ pub async fn execute_archive_in_workspace(
     ai_runner: &AiCommandRunner,
     archive_history: &Arc<Mutex<crate::history::ArchiveHistory>>,
     apply_history: &Arc<Mutex<crate::history::ApplyHistory>>,
+    shared_stagger_state: &crate::ai_command_runner::SharedStaggerState,
 ) -> Result<String> {
     if cancel_token.is_some_and(|token| token.is_cancelled()) {
         return Err(OrchestratorError::AgentCommand(format!(
@@ -1172,7 +1173,8 @@ pub async fn execute_archive_in_workspace(
         }
     }
 
-    let resolve_agent = AgentRunner::new(config.clone());
+    let resolve_agent =
+        AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state.clone());
     let change_id_owned = change_id.to_string();
     let event_tx_clone = event_tx.clone();
     let final_attempt = attempt;
@@ -1180,6 +1182,7 @@ pub async fn execute_archive_in_workspace(
         change_id,
         workspace_path,
         &resolve_agent,
+        ai_runner,
         vcs_backend,
         move |line| {
             let event_tx = event_tx_clone.clone();
@@ -1298,6 +1301,8 @@ pub async fn execute_acceptance_in_workspace(
     agent: &mut AgentRunner,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
     cancel_token: Option<&CancellationToken>,
+    ai_runner: &AiCommandRunner,
+    config: &OrchestratorConfig,
 ) -> Result<crate::orchestration::AcceptanceResult> {
     use crate::acceptance::{parse_acceptance_output, AcceptanceResult as ParseResult};
 
@@ -1327,9 +1332,28 @@ pub async fn execute_acceptance_in_workspace(
             .await;
     }
 
-    // Execute acceptance command with streaming (in workspace directory)
-    let (mut child, mut output_rx, start_time) = agent
-        .run_acceptance_streaming(change_id, Some(workspace_path))
+    // Build prompt with system instructions and history context
+    let user_prompt = config.get_acceptance_prompt();
+    let history_context = agent.format_acceptance_history(change_id);
+    let full_prompt =
+        crate::agent::build_acceptance_prompt(change_id, user_prompt, &history_context);
+
+    // Expand change_id and prompt in command
+    let template = config.get_acceptance_command();
+    let command = OrchestratorConfig::expand_change_id(template, change_id);
+    let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+
+    debug!(
+        module = module_path!(),
+        "Executing acceptance command via AiCommandRunner: {} (cwd: {:?})", command, workspace_path
+    );
+
+    // Capture start time for history recording
+    let start_time = std::time::Instant::now();
+
+    // Execute command via AiCommandRunner (with stagger and retry)
+    let (mut child, mut output_rx) = ai_runner
+        .execute_streaming_with_retry(&command, Some(workspace_path))
         .await?;
 
     // Create output collector for history
@@ -1337,6 +1361,7 @@ pub async fn execute_acceptance_in_workspace(
     let mut full_stdout = String::new();
 
     // Stream output until channel closes
+    use crate::ai_command_runner::OutputLine as AiOutputLine;
     while let Some(line) = output_rx.recv().await {
         // Check for cancellation
         if cancel_token.is_some_and(|token| token.is_cancelled()) {
@@ -1346,7 +1371,7 @@ pub async fn execute_acceptance_in_workspace(
         }
 
         match line {
-            OutputLine::Stdout(s) => {
+            AiOutputLine::Stdout(s) => {
                 output_collector.add_stdout(&s);
                 full_stdout.push_str(&s);
                 full_stdout.push('\n');
@@ -1363,7 +1388,7 @@ pub async fn execute_acceptance_in_workspace(
                         .await;
                 }
             }
-            OutputLine::Stderr(s) => {
+            AiOutputLine::Stderr(s) => {
                 output_collector.add_stderr(&s);
 
                 // Forward to event channel

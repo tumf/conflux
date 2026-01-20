@@ -65,7 +65,9 @@ impl AcceptanceResult {
 ///
 /// # Arguments
 /// * `change` - The change to test
-/// * `agent` - The agent runner for executing commands
+/// * `agent` - The agent runner for history tracking
+/// * `ai_runner` - The AI command runner for command execution
+/// * `config` - Orchestrator configuration
 /// * `output` - Output handler for streaming command output
 /// * `cancel_check` - Function to check if operation should be cancelled
 ///
@@ -78,6 +80,8 @@ impl AcceptanceResult {
 pub async fn acceptance_test_streaming<O, F>(
     change: &Change,
     agent: &mut AgentRunner,
+    ai_runner: &crate::ai_command_runner::AiCommandRunner,
+    config: &crate::config::OrchestratorConfig,
     output: &O,
     cancel_check: F,
 ) -> Result<AcceptanceResult>
@@ -85,14 +89,32 @@ where
     O: OutputHandler,
     F: Fn() -> bool,
 {
-    use crate::agent::OutputLine;
+    use crate::ai_command_runner::OutputLine as AiOutputLine;
 
     info!("Running acceptance test for: {}", change.id);
     output.on_info(&format!("Acceptance test: {}", change.id));
 
-    // Execute acceptance command with streaming
-    let (mut child, mut output_rx, start_time) =
-        agent.run_acceptance_streaming(&change.id, None).await?;
+    // Get the acceptance iteration number (attempt number that will be used)
+    let _acceptance_iteration = agent.next_acceptance_attempt_number(&change.id);
+
+    // Build prompt with system instructions and history context
+    let user_prompt = config.get_acceptance_prompt();
+    let history_context = agent.format_acceptance_history(&change.id);
+    let full_prompt =
+        crate::agent::build_acceptance_prompt(&change.id, user_prompt, &history_context);
+
+    // Expand change_id and prompt in command
+    let template = config.get_acceptance_command();
+    let command = crate::config::OrchestratorConfig::expand_change_id(template, &change.id);
+    let command = crate::config::OrchestratorConfig::expand_prompt(&command, &full_prompt);
+
+    // Capture start time for history recording
+    let start_time = std::time::Instant::now();
+
+    // Execute command via AiCommandRunner (with stagger and retry)
+    let (mut child, mut output_rx) = ai_runner
+        .execute_streaming_with_retry(&command, None)
+        .await?;
 
     // Create output collector for history and parsing
     let mut output_collector = OutputCollector::new();
@@ -109,13 +131,13 @@ where
         }
 
         match line {
-            OutputLine::Stdout(s) => {
+            AiOutputLine::Stdout(s) => {
                 output_collector.add_stdout(&s);
                 full_stdout.push_str(&s);
                 full_stdout.push('\n');
                 output.on_stdout(&s);
             }
-            OutputLine::Stderr(s) => {
+            AiOutputLine::Stderr(s) => {
                 output_collector.add_stderr(&s);
                 output.on_stderr(&s);
             }

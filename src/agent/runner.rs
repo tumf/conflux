@@ -117,6 +117,7 @@ impl AgentRunner {
     /// - user_prompt: from config.apply_prompt (user-customizable)
     /// - system_prompt: APPLY_SYSTEM_PROMPT constant (always included)
     /// - history_context: previous apply attempts (if any)
+    #[allow(dead_code)] // Replaced by run_apply_streaming_with_runner
     pub async fn run_apply_streaming(
         &self,
         change_id: &str,
@@ -143,6 +144,61 @@ impl AgentRunner {
             }
             None => self.execute_shell_command_streaming(&command).await?,
         };
+        Ok((child, rx, start))
+    }
+
+    /// Run apply command using AiCommandRunner with streaming output.
+    /// This ensures apply commands share stagger state with acceptance/archive/resolve.
+    /// Returns a child process handle, a receiver for output lines, and a start time.
+    /// The caller is responsible for recording the attempt after the child completes
+    /// by calling `record_apply_attempt()`.
+    ///
+    /// The prompt is constructed as: user_prompt + system_prompt + history_context
+    /// - user_prompt: from config.apply_prompt (user-customizable)
+    /// - system_prompt: APPLY_SYSTEM_PROMPT constant (always included)
+    /// - history_context: previous apply attempts (if any)
+    pub async fn run_apply_streaming_with_runner(
+        &self,
+        change_id: &str,
+        ai_runner: &crate::ai_command_runner::AiCommandRunner,
+        cwd: Option<&Path>,
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
+        use crate::ai_command_runner::OutputLine as AiOutputLine;
+        let start = Instant::now();
+        let template = self.config.get_apply_command();
+        let user_prompt = self.config.get_apply_prompt();
+        let history_context = self.apply_history.format_context(change_id);
+
+        // Build full prompt: user_prompt + system_prompt + history_context
+        let full_prompt = build_apply_prompt(user_prompt, &history_context);
+
+        let command = OrchestratorConfig::expand_change_id(template, change_id);
+        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        info!(
+            module = module_path!(),
+            "Running apply command via AiCommandRunner: {}", command
+        );
+
+        // Execute via AiCommandRunner (with shared stagger state)
+        let (child, ai_rx) = ai_runner
+            .execute_streaming_with_retry(&command, cwd)
+            .await?;
+
+        // Convert AiCommandRunner output to AgentRunner output format
+        let (tx, rx) = mpsc::channel::<OutputLine>(1024);
+        tokio::spawn(async move {
+            let mut ai_rx = ai_rx;
+            while let Some(line) = ai_rx.recv().await {
+                let converted = match line {
+                    AiOutputLine::Stdout(s) => OutputLine::Stdout(s),
+                    AiOutputLine::Stderr(s) => OutputLine::Stderr(s),
+                };
+                if tx.send(converted).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         Ok((child, rx, start))
     }
 
@@ -203,6 +259,60 @@ impl AgentRunner {
         Ok((child, rx, start))
     }
 
+    /// Run archive command using AiCommandRunner with streaming output.
+    /// This ensures archive commands share stagger state with acceptance/apply/resolve.
+    /// Returns a child process handle, a receiver for output lines, and a start time.
+    /// The caller is responsible for recording the attempt after the child completes
+    /// by calling `record_archive_attempt()`.
+    ///
+    /// The prompt is constructed as: user_prompt + history_context
+    /// - user_prompt: from config.archive_prompt (user-customizable)
+    /// - history_context: previous archive attempts (if any)
+    pub async fn run_archive_streaming_with_runner(
+        &self,
+        change_id: &str,
+        ai_runner: &crate::ai_command_runner::AiCommandRunner,
+        cwd: Option<&Path>,
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
+        use crate::ai_command_runner::OutputLine as AiOutputLine;
+        let start = Instant::now();
+        let template = self.config.get_archive_command();
+        let user_prompt = self.config.get_archive_prompt();
+        let history_context = self.archive_history.format_context(change_id);
+
+        // Build full prompt: user_prompt + history_context
+        let full_prompt = build_archive_prompt(user_prompt, &history_context);
+
+        let command = OrchestratorConfig::expand_change_id(template, change_id);
+        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        info!(
+            module = module_path!(),
+            "Running archive command via AiCommandRunner: {}", command
+        );
+
+        // Execute via AiCommandRunner (with shared stagger state)
+        let (child, ai_rx) = ai_runner
+            .execute_streaming_with_retry(&command, cwd)
+            .await?;
+
+        // Convert AiCommandRunner output to AgentRunner output format
+        let (tx, rx) = mpsc::channel::<OutputLine>(1024);
+        tokio::spawn(async move {
+            let mut ai_rx = ai_rx;
+            while let Some(line) = ai_rx.recv().await {
+                let converted = match line {
+                    AiOutputLine::Stdout(s) => OutputLine::Stdout(s),
+                    AiOutputLine::Stderr(s) => OutputLine::Stderr(s),
+                };
+                if tx.send(converted).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok((child, rx, start))
+    }
+
     /// Run apply command for the given change ID (blocking, no streaming)
     /// Records the attempt result in history for subsequent retries.
     ///
@@ -210,6 +320,7 @@ impl AgentRunner {
     /// - user_prompt: from config.apply_prompt (user-customizable)
     /// - system_prompt: APPLY_SYSTEM_PROMPT constant (always included)
     /// - history_context: previous apply attempts (if any)
+    #[allow(dead_code)] // Replaced by run_apply_with_runner in CLI/TUI flows
     pub async fn run_apply(&mut self, change_id: &str) -> Result<ExitStatus> {
         let start = Instant::now();
 
@@ -237,6 +348,86 @@ impl AgentRunner {
             start,
             None,
             None,
+        );
+
+        Ok(status)
+    }
+
+    /// Run apply command using AiCommandRunner (blocking, with output collection)
+    /// This ensures apply commands share stagger state with acceptance/archive/resolve.
+    ///
+    /// The prompt is constructed as: user_prompt + system_prompt + history_context
+    /// - user_prompt: from config.apply_prompt (user-customizable)
+    /// - system_prompt: APPLY_SYSTEM_PROMPT constant (always included)
+    /// - history_context: previous apply attempts (if any)
+    pub async fn run_apply_with_runner(
+        &mut self,
+        change_id: &str,
+        ai_runner: &crate::ai_command_runner::AiCommandRunner,
+    ) -> Result<ExitStatus> {
+        use crate::ai_command_runner::OutputLine as AiOutputLine;
+        let start = Instant::now();
+
+        let template = self.config.get_apply_command();
+        let user_prompt = self.config.get_apply_prompt();
+        let history_context = self.apply_history.format_context(change_id);
+
+        // Build full prompt: user_prompt + system_prompt + history_context
+        let full_prompt = build_apply_prompt(user_prompt, &history_context);
+
+        let command = OrchestratorConfig::expand_change_id(template, change_id);
+        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        info!(
+            module = module_path!(),
+            "Running apply command via AiCommandRunner: {}", command
+        );
+
+        // Execute via AiCommandRunner (with shared stagger state)
+        let (mut child, mut output_rx) = ai_runner
+            .execute_streaming_with_retry(&command, None)
+            .await?;
+
+        // Collect output for history recording
+        let mut stdout_lines = Vec::new();
+        let mut stderr_lines = Vec::new();
+
+        while let Some(line) = output_rx.recv().await {
+            match line {
+                AiOutputLine::Stdout(s) => stdout_lines.push(s),
+                AiOutputLine::Stderr(s) => stderr_lines.push(s),
+            }
+        }
+
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| OrchestratorError::AgentCommand(format!("Apply command failed: {}", e)))?;
+
+        // Collect last N lines for history
+        let stdout_tail = if stdout_lines.len() > 10 {
+            Some(stdout_lines[stdout_lines.len() - 10..].join("\n"))
+        } else if !stdout_lines.is_empty() {
+            Some(stdout_lines.join("\n"))
+        } else {
+            None
+        };
+
+        let stderr_tail = if stderr_lines.len() > 10 {
+            Some(stderr_lines[stderr_lines.len() - 10..].join("\n"))
+        } else if !stderr_lines.is_empty() {
+            Some(stderr_lines.join("\n"))
+        } else {
+            None
+        };
+
+        // Record the attempt
+        history_ops::record_apply_attempt(
+            &mut self.apply_history,
+            change_id,
+            &status,
+            start,
+            stdout_tail,
+            stderr_tail,
         );
 
         Ok(status)
@@ -280,6 +471,12 @@ impl AgentRunner {
         history_ops::clear_acceptance_history(&mut self.acceptance_history, change_id);
     }
 
+    /// Format acceptance history context for a change.
+    /// Returns the formatted history string that can be injected into prompts.
+    pub fn format_acceptance_history(&self, change_id: &str) -> String {
+        self.acceptance_history.format_context(change_id)
+    }
+
     /// Run acceptance command for the given change ID with output streaming.
     /// Returns a child process handle, a receiver for output lines, and a start time.
     /// The caller is responsible for recording the attempt after the child completes
@@ -289,6 +486,7 @@ impl AgentRunner {
     /// - system_prompt: ACCEPTANCE_SYSTEM_PROMPT constant (always included)
     /// - user_prompt: from config.acceptance_prompt (user-customizable)
     /// - history_context: previous acceptance attempts (if any)
+    #[allow(dead_code)] // Replaced by AiCommandRunner in acceptance_test_streaming
     pub async fn run_acceptance_streaming(
         &self,
         change_id: &str,
@@ -335,6 +533,7 @@ impl AgentRunner {
     }
 
     /// Run archive command for the given change ID (blocking, no streaming)
+    #[allow(dead_code)] // Replaced by run_archive_with_runner in CLI/TUI flows
     pub async fn run_archive(&self, change_id: &str) -> Result<ExitStatus> {
         let template = self.config.get_archive_command();
         let prompt = self.config.get_archive_prompt();
@@ -345,6 +544,47 @@ impl AgentRunner {
             "Running archive command: {}", command
         );
         self.execute_shell_command(&command).await
+    }
+
+    /// Run archive command using AiCommandRunner (blocking, with output collection)
+    /// This ensures archive commands share stagger state with acceptance/apply/resolve.
+    ///
+    /// Note: This method does NOT record archive attempts in history.
+    /// The caller is responsible for calling record_archive_attempt() after verification.
+    pub async fn run_archive_with_runner(
+        &self,
+        change_id: &str,
+        ai_runner: &crate::ai_command_runner::AiCommandRunner,
+    ) -> Result<ExitStatus> {
+        let template = self.config.get_archive_command();
+        let user_prompt = self.config.get_archive_prompt();
+        let history_context = self.archive_history.format_context(change_id);
+
+        // Build full prompt: user_prompt + history_context
+        let full_prompt = build_archive_prompt(user_prompt, &history_context);
+
+        let command = OrchestratorConfig::expand_change_id(template, change_id);
+        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        info!(
+            module = module_path!(),
+            "Running archive command via AiCommandRunner: {}", command
+        );
+
+        // Execute via AiCommandRunner (with shared stagger state)
+        let (mut child, mut output_rx) = ai_runner
+            .execute_streaming_with_retry(&command, None)
+            .await?;
+
+        // Drain output (not needed for archive, but required to complete execution)
+        while let Some(_line) = output_rx.recv().await {
+            // Discard output - archive doesn't need it for history
+        }
+
+        let status = child.wait().await.map_err(|e| {
+            OrchestratorError::AgentCommand(format!("Archive command failed: {}", e))
+        })?;
+
+        Ok(status)
     }
 
     /// Analyze dependencies using the configured analyze command (blocking)
@@ -381,8 +621,67 @@ impl AgentRunner {
         Ok(result)
     }
 
+    /// Analyze dependencies using AiCommandRunner (blocking, with output collection)
+    /// This ensures analyze commands share stagger state with acceptance/apply/archive/resolve.
+    pub async fn analyze_dependencies_with_runner(
+        &self,
+        prompt: &str,
+        ai_runner: &crate::ai_command_runner::AiCommandRunner,
+    ) -> Result<String> {
+        use crate::ai_command_runner::OutputLine as AiOutputLine;
+        let template = self.config.get_analyze_command();
+        let command = OrchestratorConfig::expand_prompt(template, prompt);
+        info!(
+            module = module_path!(),
+            "Running analyze command via AiCommandRunner: {}", template
+        );
+        info!("Expanded command length: {} chars", command.len());
+
+        // Execute via AiCommandRunner (with shared stagger state)
+        let (mut child, mut output_rx) = ai_runner
+            .execute_streaming_with_retry(&command, None)
+            .await?;
+
+        // Collect stdout for result
+        let mut stdout_lines = Vec::new();
+        let mut stderr_lines = Vec::new();
+
+        while let Some(line) = output_rx.recv().await {
+            match line {
+                AiOutputLine::Stdout(s) => stdout_lines.push(s),
+                AiOutputLine::Stderr(s) => stderr_lines.push(s),
+            }
+        }
+
+        let status = child.wait().await.map_err(|e| {
+            OrchestratorError::AgentCommand(format!("Analyze command failed: {}", e))
+        })?;
+
+        if !status.success() {
+            let stderr = stderr_lines.join("\n");
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Analysis failed: {}",
+                stderr
+            )));
+        }
+
+        let stdout = stdout_lines.join("\n");
+        info!(
+            "Analyze command completed, output length: {} chars",
+            stdout.len()
+        );
+        debug!("Raw analysis output: {}", stdout);
+
+        // Extract result from stream-json format if applicable
+        let result = self.extract_stream_json_result(&stdout);
+        info!("Extracted result length: {} chars", result.len());
+        debug!("Extracted analysis result: {}", result);
+        Ok(result)
+    }
+
     /// Analyze dependencies using the configured analyze command with streaming output
     /// Returns a child process handle and a receiver for output lines
+    #[allow(dead_code)] // Replaced by AiCommandRunner in ParallelizationAnalyzer
     pub async fn analyze_dependencies_streaming(
         &self,
         prompt: &str,
@@ -398,6 +697,7 @@ impl AgentRunner {
 
     /// Execute resolve command with streaming output in a specific directory.
     /// Returns a child process handle and a receiver for output lines.
+    #[allow(dead_code)] // Replaced by run_resolve_streaming_in_dir_with_runner in ensure_archive_commit
     pub async fn run_resolve_streaming_in_dir(
         &self,
         prompt: &str,
@@ -411,6 +711,46 @@ impl AgentRunner {
         );
         self.execute_shell_command_streaming_in_dir(&command, cwd)
             .await
+    }
+
+    /// Execute resolve command using AiCommandRunner with streaming output in a specific directory.
+    /// This ensures resolve commands share stagger state with acceptance/apply/archive/analyze.
+    /// Returns a child process handle and a receiver for output lines.
+    pub async fn run_resolve_streaming_in_dir_with_runner(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        ai_runner: &crate::ai_command_runner::AiCommandRunner,
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
+        use crate::ai_command_runner::OutputLine as AiOutputLine;
+        let template = self.config.get_resolve_command();
+        let command = OrchestratorConfig::expand_prompt(template, prompt);
+        info!(
+            module = module_path!(),
+            "Running resolve command via AiCommandRunner (streaming) in {:?}: {}", cwd, command
+        );
+
+        // Execute via AiCommandRunner (with shared stagger state)
+        let (child, ai_rx) = ai_runner
+            .execute_streaming_with_retry(&command, Some(cwd))
+            .await?;
+
+        // Convert AiCommandRunner output to AgentRunner output format
+        let (tx, rx) = mpsc::channel::<OutputLine>(1024);
+        tokio::spawn(async move {
+            let mut ai_rx = ai_rx;
+            while let Some(line) = ai_rx.recv().await {
+                let converted = match line {
+                    AiOutputLine::Stdout(s) => OutputLine::Stdout(s),
+                    AiOutputLine::Stderr(s) => OutputLine::Stderr(s),
+                };
+                if tx.send(converted).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok((child, rx))
     }
 
     /// Extract the result from stream-json output format
@@ -632,90 +972,97 @@ impl AgentRunner {
     }
 
     /// Execute a shell command and wait for completion (blocking, no streaming)
+    /// Now uses CommandQueue for stagger delay and retry logic
+    #[allow(dead_code)] // Used by run_apply/run_archive (legacy non-streaming methods)
     async fn execute_shell_command(&self, command: &str) -> Result<ExitStatus> {
-        let output = if cfg!(target_os = "windows") {
-            debug!(
-                module = module_path!(),
-                "Executing shell command: cmd /C {}", command
-            );
-            Command::new("cmd")
-                .arg("/C")
-                .arg(command)
-                .env_clear()
-                .envs(std::env::vars())
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
-                })?
-        } else {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            debug!(
-                module = module_path!(),
-                "Executing shell command: {} -l -c {}", shell, command
-            );
-            Command::new(&shell)
-                .arg("-l")
-                .arg("-c")
-                .arg(command)
-                .env_clear()
-                .envs(std::env::vars())
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::AgentCommand(format!("Failed to spawn process: {}", e))
-                })?
-        };
+        debug!(
+            module = module_path!(),
+            "Executing shell command with stagger/retry: {}", command
+        );
 
-        debug!("Command exited with status: {:?}", output.status);
-        Ok(output.status)
+        // Use command queue for stagger and retry
+        let command_str = command.to_string();
+        let (status, _stderr) = self
+            .command_queue
+            .execute_with_retry_streaming(
+                || build_command(&command_str),
+                None::<
+                    fn(
+                        StreamingOutputLine,
+                    )
+                        -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+                >,
+            )
+            .await?;
+
+        debug!("Command exited with status: {:?}", status);
+        Ok(status)
     }
 
     /// Execute a shell command and capture its output
+    /// Now uses CommandQueue for stagger delay and retry logic
     async fn execute_shell_command_with_output(
         &self,
         command: &str,
     ) -> Result<std::process::Output> {
-        let output = if cfg!(target_os = "windows") {
-            debug!(
-                module = module_path!(),
-                "Executing shell command: cmd /C {}", command
-            );
-            Command::new("cmd")
-                .arg("/C")
-                .arg(command)
-                .env_clear()
-                .envs(std::env::vars())
-                .stdin(Stdio::null())
-                .output()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::AgentCommand(format!("Failed to execute command: {}", e))
-                })?
-        } else {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            debug!(
-                module = module_path!(),
-                "Executing shell command: {} -l -c {}", shell, command
-            );
-            Command::new(&shell)
-                .arg("-l")
-                .arg("-c")
-                .arg(command)
-                .env_clear()
-                .envs(std::env::vars())
-                .stdin(Stdio::null())
-                .output()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::AgentCommand(format!("Failed to execute command: {}", e))
-                })?
+        debug!(
+            module = module_path!(),
+            "Executing shell command with output capture (stagger/retry): {}", command
+        );
+
+        // Collect stdout/stderr via callback
+        let stdout_lines = Arc::new(Mutex::new(Vec::new()));
+        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+
+        let stdout_clone = stdout_lines.clone();
+        let stderr_clone = stderr_lines.clone();
+
+        let output_callback = move |line: StreamingOutputLine| {
+            let stdout = stdout_clone.clone();
+            let stderr = stderr_clone.clone();
+            async move {
+                match line {
+                    StreamingOutputLine::Stdout(s) => {
+                        stdout.lock().await.push(s);
+                    }
+                    StreamingOutputLine::Stderr(s) => {
+                        stderr.lock().await.push(s);
+                    }
+                }
+            }
+        };
+
+        // Use command queue for stagger and retry
+        let command_str = command.to_string();
+        let (status, _stderr_buf) = self
+            .command_queue
+            .execute_with_retry_streaming(|| build_command(&command_str), Some(output_callback))
+            .await?;
+
+        // Reconstruct Output from collected lines
+        let stdout_vec = stdout_lines.lock().await;
+        let stderr_vec = stderr_lines.lock().await;
+
+        let stdout_bytes = stdout_vec.join("\n").into_bytes();
+        let stderr_bytes = stderr_vec.join("\n").into_bytes();
+
+        // Create a synthetic Output struct
+        #[cfg(unix)]
+        let output = std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(
+                status.code().unwrap_or(1) << 8,
+            ),
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        };
+
+        #[cfg(windows)]
+        let output = std::process::Output {
+            status: std::os::windows::process::ExitStatusExt::from_raw(
+                status.code().unwrap_or(1) as u32
+            ),
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
         };
 
         Ok(output)

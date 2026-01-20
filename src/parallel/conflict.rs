@@ -1,6 +1,5 @@
 //! Conflict detection and resolution logic for parallel execution.
 
-use crate::agent::AgentRunner;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{ResolveAttempt, ResolveContext};
@@ -106,6 +105,30 @@ pub async fn resolve_conflicts_with_retry(
     // Create a combined change_id for logging (join multiple IDs if present)
     let combined_change_id = change_ids.join("+");
 
+    // Create AiCommandRunner for resolve command execution
+    use crate::ai_command_runner::AiCommandRunner;
+    use crate::command_queue::CommandQueueConfig;
+    use crate::config::defaults::*;
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: config
+            .command_queue_stagger_delay_ms
+            .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+        max_retries: config
+            .command_queue_max_retries
+            .unwrap_or(DEFAULT_MAX_RETRIES),
+        retry_delay_ms: config
+            .command_queue_retry_delay_ms
+            .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+        retry_error_patterns: config
+            .command_queue_retry_patterns
+            .clone()
+            .unwrap_or_else(default_retry_patterns),
+        retry_if_duration_under_secs: config
+            .command_queue_retry_if_duration_under_secs
+            .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+    };
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+
     for attempt in 1..=max_retries {
         let start = Instant::now();
         info!(
@@ -146,11 +169,11 @@ pub async fn resolve_conflicts_with_retry(
             resolve_prompt = format!("{}\n\n{}", resolve_prompt, continuation_context);
         }
 
-        // Use AgentRunner for streaming resolve command execution with shared stagger state
-        let agent =
-            AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state.clone());
-        let (mut child, mut rx) = agent
-            .run_resolve_streaming_in_dir(&resolve_prompt, workspace_manager.repo_root())
+        // Use AiCommandRunner for streaming resolve command execution
+        let template = config.get_resolve_command();
+        let command = crate::config::OrchestratorConfig::expand_prompt(template, &resolve_prompt);
+        let (mut child, mut rx) = ai_runner
+            .execute_streaming_with_retry(&command, Some(workspace_manager.repo_root()))
             .await?;
 
         // Create output collector for history
@@ -159,11 +182,11 @@ pub async fn resolve_conflicts_with_retry(
         // Stream output to events
         while let Some(line) = rx.recv().await {
             let text = match &line {
-                crate::agent::OutputLine::Stdout(s) => {
+                crate::ai_command_runner::OutputLine::Stdout(s) => {
                     output_collector.add_stdout(s);
                     s.clone()
                 }
-                crate::agent::OutputLine::Stderr(s) => {
+                crate::ai_command_runner::OutputLine::Stderr(s) => {
                     output_collector.add_stderr(s);
                     s.clone()
                 }
@@ -356,6 +379,30 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
     // Create a combined change_id for logging (join multiple IDs if present)
     let combined_change_id = change_ids.join("+");
 
+    // Create AiCommandRunner for resolve command execution
+    use crate::ai_command_runner::AiCommandRunner;
+    use crate::command_queue::CommandQueueConfig;
+    use crate::config::defaults::*;
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: config
+            .command_queue_stagger_delay_ms
+            .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+        max_retries: config
+            .command_queue_max_retries
+            .unwrap_or(DEFAULT_MAX_RETRIES),
+        retry_delay_ms: config
+            .command_queue_retry_delay_ms
+            .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+        retry_error_patterns: config
+            .command_queue_retry_patterns
+            .clone()
+            .unwrap_or_else(default_retry_patterns),
+        retry_if_duration_under_secs: config
+            .command_queue_retry_if_duration_under_secs
+            .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+    };
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+
     for attempt in 1..=max_retries {
         let start = Instant::now();
         info!(
@@ -415,10 +462,11 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             resolve_prompt = format!("{}\n\n{}", resolve_prompt, continuation_context);
         }
 
-        let agent =
-            AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state.clone());
-        let (mut child, mut rx) = agent
-            .run_resolve_streaming_in_dir(&resolve_prompt, workspace_manager.repo_root())
+        // Use AiCommandRunner for streaming resolve command execution
+        let template = config.get_resolve_command();
+        let command = crate::config::OrchestratorConfig::expand_prompt(template, &resolve_prompt);
+        let (mut child, mut rx) = ai_runner
+            .execute_streaming_with_retry(&command, Some(workspace_manager.repo_root()))
             .await?;
 
         // Create output collector for history
@@ -426,11 +474,11 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
 
         while let Some(line) = rx.recv().await {
             let text = match &line {
-                crate::agent::OutputLine::Stdout(s) => {
+                crate::ai_command_runner::OutputLine::Stdout(s) => {
                     output_collector.add_stdout(s);
                     s.clone()
                 }
-                crate::agent::OutputLine::Stderr(s) => {
+                crate::ai_command_runner::OutputLine::Stderr(s) => {
                     output_collector.add_stderr(s);
                     s.clone()
                 }

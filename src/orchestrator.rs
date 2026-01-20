@@ -1,4 +1,7 @@
 use crate::agent::AgentRunner;
+use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
+use crate::command_queue::CommandQueueConfig;
+use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::error_history::{CircuitBreakerConfig, ErrorHistory};
@@ -19,6 +22,8 @@ use crate::vcs::git::commands as git_commands;
 use crate::vcs::{GitWorkspaceManager, VcsBackend, WorkspaceManager};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 #[cfg(feature = "web-monitoring")]
@@ -30,11 +35,10 @@ struct SerialSnapshot {
     progress: crate::task_parser::TaskProgress,
     empty_commit: Option<bool>,
 }
-#[cfg(feature = "web-monitoring")]
-use std::sync::Arc;
 
 pub struct Orchestrator {
     agent: AgentRunner,
+    ai_runner: AiCommandRunner,
     config: OrchestratorConfig,
     progress: Option<ProgressDisplay>,
     /// Target changes specified by --change option (comma-separated)
@@ -104,8 +108,31 @@ impl Orchestrator {
         let vcs_backend = vcs_override.unwrap_or_else(|| config.get_vcs_backend());
         let stall_detector = StallDetector::new(config.get_stall_detection());
 
+        // Create AiCommandRunner for serial mode execution
+        let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: config
+                .command_queue_stagger_delay_ms
+                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+            max_retries: config
+                .command_queue_max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_delay_ms: config
+                .command_queue_retry_delay_ms
+                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+            retry_error_patterns: config
+                .command_queue_retry_patterns
+                .clone()
+                .unwrap_or_else(default_retry_patterns),
+            retry_if_duration_under_secs: config
+                .command_queue_retry_if_duration_under_secs
+                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+        };
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+
         Ok(Self {
             agent,
+            ai_runner,
             config,
             progress: None,
             target_changes,
@@ -161,8 +188,31 @@ impl Orchestrator {
         let agent = AgentRunner::new(config.clone());
         let stall_detector = StallDetector::new(config.get_stall_detection());
 
+        // Create AiCommandRunner for serial mode execution
+        let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: config
+                .command_queue_stagger_delay_ms
+                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+            max_retries: config
+                .command_queue_max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_delay_ms: config
+                .command_queue_retry_delay_ms
+                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+            retry_error_patterns: config
+                .command_queue_retry_patterns
+                .clone()
+                .unwrap_or_else(default_retry_patterns),
+            retry_if_duration_under_secs: config
+                .command_queue_retry_if_duration_under_secs
+                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+        };
+        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+
         Ok(Self {
             agent,
+            ai_runner,
             config,
             progress: None,
             target_changes,
@@ -395,6 +445,7 @@ impl Orchestrator {
                 match archive_change(
                     &next,
                     &mut self.agent,
+                    &self.ai_runner,
                     &self.hooks,
                     &archive_ctx,
                     &output,
@@ -474,7 +525,16 @@ impl Orchestrator {
                 );
                 let output = LogOutputHandler::new();
 
-                match apply_change(&next, &mut self.agent, &self.hooks, &apply_ctx, &output).await {
+                match apply_change(
+                    &next,
+                    &mut self.agent,
+                    &self.ai_runner,
+                    &self.hooks,
+                    &apply_ctx,
+                    &output,
+                )
+                .await
+                {
                     Ok(ApplyResult::Success) => {
                         let snapshot = match self
                             .snapshot_serial_iteration(&next.id, new_apply_count)
@@ -527,6 +587,8 @@ impl Orchestrator {
                             match acceptance_test_streaming(
                                 &next,
                                 &mut self.agent,
+                                &self.ai_runner,
+                                &self.config,
                                 &output,
                                 cancel_check,
                             )
@@ -756,7 +818,7 @@ impl Orchestrator {
     /// 2. LLM-based selection (via agent)
     /// 3. Fallback to highest progress
     async fn select_next_change(&self, changes: &[Change]) -> Result<Change> {
-        selection::select_next_change(changes, Some(&self.agent)).await
+        selection::select_next_change(changes, Some(&self.agent), Some(&self.ai_runner)).await
     }
 
     /// Filter changes to only include those present in the initial snapshot.
