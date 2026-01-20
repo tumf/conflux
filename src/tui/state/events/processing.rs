@@ -87,7 +87,10 @@ impl AppState {
         for change in &mut self.changes {
             if matches!(
                 change.queue_status,
-                QueueStatus::Processing | QueueStatus::Archiving | QueueStatus::Queued
+                QueueStatus::Processing
+                    | QueueStatus::Accepting
+                    | QueueStatus::Archiving
+                    | QueueStatus::Queued
             ) {
                 // Record elapsed time before resetting status (for in-flight changes)
                 if let Some(started) = change.started_at {
