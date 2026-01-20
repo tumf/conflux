@@ -468,10 +468,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 QueueStatus::Archiving | QueueStatus::Resolving | QueueStatus::Accepting => {
                     format!("{} [{}]", spinner_char, change.queue_status.display())
                 }
-                QueueStatus::Completed
-                | QueueStatus::Archived
-                | QueueStatus::Merged
-                | QueueStatus::Error(_) => {
+                QueueStatus::Archived | QueueStatus::Merged | QueueStatus::Error(_) => {
                     format!("[{}]", change.queue_status.display())
                 }
                 status => format!("[{}]", status.display()),
@@ -755,16 +752,20 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
         .collect();
 
     // Build title with scroll position indicator and auto-scroll status
+    // Debug: show offset value to verify it's incrementing
     let auto_scroll_indicator = if app.log_auto_scroll { "▼" } else { "⏸" };
     let title = if total_logs > visible_height {
         let visible_start = start_index + 1;
         let visible_end = end_index;
         format!(
-            " Logs [{}-{}/{}] {} ",
-            visible_start, visible_end, total_logs, auto_scroll_indicator
+            " Logs [{}-{}/{}] off={} {} ",
+            visible_start, visible_end, total_logs, app.log_scroll_offset, auto_scroll_indicator
         )
     } else {
-        format!(" Logs {} ", auto_scroll_indicator)
+        format!(
+            " Logs off={} {} ",
+            app.log_scroll_offset, auto_scroll_indicator
+        )
     };
 
     let logs = Paragraph::new(log_items).block(
@@ -1258,12 +1259,13 @@ mod tests {
 
     #[test]
     fn test_get_checkbox_display_processing_states() {
-        // Processing and Completed states should show green when selected
+        // Processing state should show green when selected
         let (text, color) = get_checkbox_display(&QueueStatus::Processing, true, true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
 
-        let (text, color) = get_checkbox_display(&QueueStatus::Completed, true, true);
+        // Archiving state should show green when selected
+        let (text, color) = get_checkbox_display(&QueueStatus::Archiving, true, true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
     }

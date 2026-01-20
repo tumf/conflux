@@ -326,7 +326,7 @@ mod tests {
         app.mode = AppMode::Error;
         app.error_change_id = Some("a".to_string());
         app.changes[0].queue_status = QueueStatus::Error("LLM error".to_string());
-        app.changes[1].queue_status = QueueStatus::Completed;
+        app.changes[1].queue_status = QueueStatus::Archiving;
 
         // Retry should reset error changes
         let cmd = app.retry_error_changes();
@@ -343,8 +343,8 @@ mod tests {
         assert!(app.error_change_id.is_none());
         assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
         assert!(app.changes[0].selected);
-        // Completed change should remain completed
-        assert_eq!(app.changes[1].queue_status, QueueStatus::Completed);
+        // Archiving change should remain archiving
+        assert_eq!(app.changes[1].queue_status, QueueStatus::Archiving);
     }
 
     #[test]

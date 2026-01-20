@@ -23,7 +23,7 @@ This document provides essential information for AI coding agents working on thi
 
 ## Project Overview
 
-Conflux automates the OpenSpec change workflow (list -> dependency analysis -> apply -> archive). It orchestrates `openspec` and AI coding agent tools to process changes autonomously.
+Conflux automates the OpenSpec change workflow (list -> dependency analysis -> apply -> acceptance -> archive -> resolve (when needed) -> merged). It orchestrates `openspec` and AI coding agent tools to process changes autonomously.
 
 ## Build Commands
 

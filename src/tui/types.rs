@@ -56,8 +56,6 @@ pub enum QueueStatus {
     Queued,
     /// Currently being processed
     Processing,
-    /// Processing completed, waiting for archive
-    Completed,
     /// Running acceptance tests
     Accepting,
     /// Currently being archived
@@ -81,7 +79,6 @@ impl QueueStatus {
             QueueStatus::NotQueued => "not queued",
             QueueStatus::Queued => "queued",
             QueueStatus::Processing => "processing",
-            QueueStatus::Completed => "completed",
             QueueStatus::Accepting => "accepting",
             QueueStatus::Archiving => "archiving",
             QueueStatus::Archived => "archived",
@@ -98,7 +95,6 @@ impl QueueStatus {
             QueueStatus::NotQueued => Color::DarkGray,
             QueueStatus::Queued => Color::Yellow,
             QueueStatus::Processing => Color::Cyan,
-            QueueStatus::Completed => Color::Green,
             QueueStatus::Accepting => Color::LightGreen,
             QueueStatus::Archiving => Color::Magenta,
             QueueStatus::Archived => Color::Blue,
@@ -209,7 +205,6 @@ mod tests {
         assert_eq!(QueueStatus::NotQueued.display(), "not queued");
         assert_eq!(QueueStatus::Queued.display(), "queued");
         assert_eq!(QueueStatus::Processing.display(), "processing");
-        assert_eq!(QueueStatus::Completed.display(), "completed");
         assert_eq!(QueueStatus::Accepting.display(), "accepting");
         assert_eq!(QueueStatus::Archiving.display(), "archiving");
         assert_eq!(QueueStatus::Archived.display(), "archived");
@@ -224,7 +219,6 @@ mod tests {
         assert_eq!(QueueStatus::NotQueued.color(), Color::DarkGray);
         assert_eq!(QueueStatus::Queued.color(), Color::Yellow);
         assert_eq!(QueueStatus::Processing.color(), Color::Cyan);
-        assert_eq!(QueueStatus::Completed.color(), Color::Green);
         assert_eq!(QueueStatus::Accepting.color(), Color::LightGreen);
         assert_eq!(QueueStatus::Archiving.color(), Color::Magenta);
         assert_eq!(QueueStatus::Archived.color(), Color::Blue);

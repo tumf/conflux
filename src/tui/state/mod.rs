@@ -923,19 +923,19 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle_selection_does_nothing_for_completed_status() {
+    fn test_toggle_selection_does_nothing_for_archiving_status() {
         // Use approved change so it starts selected
         let changes = vec![create_approved_change("a", 0, 1)];
         let mut app = AppState::new(changes);
 
-        // Start processing and set the change to Completed status
+        // Start processing and set the change to Archiving status
         app.start_processing();
-        app.changes[0].queue_status = QueueStatus::Completed;
+        app.changes[0].queue_status = QueueStatus::Archiving;
 
         // Toggle should do nothing
         let cmd = app.toggle_selection();
         assert!(cmd.is_none());
-        assert_eq!(app.changes[0].queue_status, QueueStatus::Completed);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Archiving);
     }
 
     #[test]
@@ -1092,11 +1092,11 @@ mod tests {
         app.start_processing();
         assert_eq!(app.mode, AppMode::Running);
 
-        // Simulate: a is processing, b is completed
+        // Simulate: a is processing, b is archiving
         app.changes[0].queue_status = QueueStatus::Processing;
-        app.changes[1].queue_status = QueueStatus::Completed;
+        app.changes[1].queue_status = QueueStatus::Archiving;
 
-        // Calculate progress (includes Completed changes)
+        // Calculate progress (includes Archiving changes)
         let (total_tasks, completed_tasks) = app
             .changes
             .iter()
@@ -1110,7 +1110,7 @@ mod tests {
                 (total + c.total_tasks, completed + c.completed_tasks)
             });
 
-        // Both a (Processing) and b (Completed) should be included
+        // Both a (Processing) and b (Archiving) should be included
         assert_eq!(total_tasks, 8);
         assert_eq!(completed_tasks, 5);
     }
