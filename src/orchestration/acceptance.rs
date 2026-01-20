@@ -262,16 +262,12 @@ pub async fn update_tasks_on_acceptance_failure(
         OrchestratorError::ConfigLoad(format!("Failed to read tasks file {:?}: {}", tasks_path, e))
     })?;
 
-    // Format findings into a single follow-up task
-    let findings_text = if findings.len() == 1 {
-        findings[0].clone()
-    } else {
-        findings
-            .iter()
-            .map(|f| format!("  - {}", f))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    // Format findings into a single follow-up task (always use bullet points)
+    let findings_text = findings
+        .iter()
+        .map(|f| format!("  - {}", f))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // Create follow-up task
     let follow_up_task = format!(

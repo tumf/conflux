@@ -4,3 +4,10 @@
 
 ## 2. 検証
 - [x] 2.1 `npx @fission-ai/openspec@latest validate update-acceptance-followup-formatting --strict` を実行し、エラーがないことを確認する
+
+
+## Acceptance Failure Follow-up
+- [x] Address acceptance findings:
+  1) ACCEPTANCE: FAIL
+  2) FINDINGS:
+  3) - `src/orchestration/acceptance.rs` の `update_tasks_on_acceptance_failure` が `findings.len() == 1` の場合に箇条書きの `- ` を付けず、仕様の「行ごとの箇条書き」に一致しません（統合は `src/orchestrator.rs` の `acceptance_test_streaming` 失敗分岐から呼ばれています）。
