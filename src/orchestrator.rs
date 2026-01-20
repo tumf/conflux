@@ -3,18 +3,15 @@ use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::error_history::{CircuitBreakerConfig, ErrorHistory};
 use crate::events::ExecutionEvent;
-use crate::execution::apply::{check_task_progress, create_progress_commit, is_progress_complete};
+use crate::execution::apply::{check_task_progress, create_progress_commit};
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::state::OrchestratorState;
-use crate::orchestration::{
-    acceptance_test_streaming, apply_change, archive_change, selection,
-    update_tasks_on_acceptance_failure, AcceptanceResult, ApplyContext, ApplyResult,
-    ArchiveContext, ArchiveResult, LogOutputHandler,
-};
+use crate::orchestration::LogOutputHandler;
 use crate::parallel_run_service::ParallelRunService;
 use crate::progress::ProgressDisplay;
-use crate::stall::{StallDetector, StallPhase};
+use crate::serial_run_service::SerialRunService;
+use crate::stall::StallDetector;
 use crate::task_parser::TaskProgress;
 use crate::tui::log_deduplicator;
 use crate::vcs::git::commands as git_commands;
@@ -306,6 +303,10 @@ impl Orchestrator {
 
         let total_changes = filtered_initial.len();
 
+        // Create serial run service for shared state and helpers
+        let repo_root = std::env::current_dir()?;
+        let mut serial_service = SerialRunService::new(repo_root, self.config.clone());
+
         // Run on_start hook
         let start_context = HookContext::new(0, total_changes, total_changes, false);
         self.hooks
@@ -376,15 +377,19 @@ impl Orchestrator {
                 break;
             }
 
-            // Select next change to process
-            let next = self.select_next_change(&eligible_changes).await?;
+            // Select next change to process using serial service
+            let next = serial_service
+                .select_next_change(&eligible_changes)
+                .ok_or_else(|| {
+                    OrchestratorError::AgentCommand("No eligible change found".to_string())
+                })?;
             info!("Selected change: {}", next.id);
 
             if let Some(progress) = &mut self.progress {
-                progress.update_change(&next);
+                progress.update_change(next);
             }
 
-            // Check if this is a new change (for on_change_start hook)
+            // Check if this is a new change (for state tracking)
             let is_new_change = self.current_change_id.as_ref() != Some(&next.id);
             if is_new_change {
                 // Update shared state: processing started
@@ -393,302 +398,223 @@ impl Orchestrator {
                     .await
                     .apply_execution_event(&ExecutionEvent::ProcessingStarted(next.id.clone()));
 
-                // Run on_change_start hook
-                let change_start_context = HookContext::new(
-                    self.changes_processed,
-                    total_changes,
-                    remaining_changes,
-                    false,
-                )
-                .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                .with_apply_count(0);
-                self.hooks
-                    .run_hook(HookType::OnChangeStart, &change_start_context)
-                    .await?;
+                // Note: OnChangeStart hook is called by process_change() internally
                 self.current_change_id = Some(next.id.clone());
             }
 
-            // Get current apply count for this change
-            let apply_count = *self.apply_counts.get(&next.id).unwrap_or(&0);
+            // Process the change through SerialRunService
+            let output = LogOutputHandler::new();
+            let cancel_check = || false; // No cancellation in CLI mode
 
-            // Process the change
-            if next.is_complete() {
-                // Archive completed change using shared function
-                info!("Change {} is complete, archiving...", next.id);
-
-                let archive_ctx = ArchiveContext::new(
-                    self.changes_processed,
-                    total_changes,
-                    remaining_changes,
-                    apply_count,
-                );
-                let output = LogOutputHandler::new();
-
-                let stall_config = self.config.get_stall_detection();
-
-                match archive_change(
-                    &next,
+            let result = serial_service
+                .process_change(
+                    next,
                     &mut self.agent,
                     &self.hooks,
-                    &archive_ctx,
                     &output,
-                    None,
-                    &stall_config,
-                )
-                .await
-                {
-                    Ok(ArchiveResult::Success) => {
-                        // Update changes_processed count
-                        self.changes_processed += 1;
-                        let new_remaining = remaining_changes - 1;
-
-                        // Update shared state: mark change as archived
-                        self.shared_state.write().await.apply_execution_event(
-                            &ExecutionEvent::ChangeArchived(next.id.clone()),
-                        );
-
-                        // Clear acceptance history after successful archive
-                        self.agent.clear_acceptance_history(&next.id);
-
-                        // Run on_change_end hook (not included in shared archive_change)
-                        let change_end_context = HookContext::new(
-                            self.changes_processed,
-                            total_changes,
-                            new_remaining,
-                            false,
-                        )
-                        .with_change(&next.id, next.completed_tasks, next.total_tasks)
-                        .with_apply_count(apply_count);
-                        self.hooks
-                            .run_hook(HookType::OnChangeEnd, &change_end_context)
-                            .await?;
-
-                        // Mark change as completed and clear current
-                        self.completed_change_ids.insert(next.id.clone());
-                        self.current_change_id = None;
-                        self.apply_counts.remove(&next.id);
-                        self.stall_detector.clear_change(&next.id);
-
-                        if let Some(progress) = &mut self.progress {
-                            progress.archive_change(&next.id);
-                        }
-                    }
-                    Ok(ArchiveResult::Stalled { error }) => {
-                        warn!("Archive stalled for {}: {}", next.id, error);
-                        self.mark_change_stalled(&next.id, &error);
-                        continue;
-                    }
-                    Ok(ArchiveResult::Failed { error }) => {
-                        error!("Archive failed for {}: {}", next.id, error);
-                        if let Some(progress) = &mut self.progress {
-                            progress.error(&format!("Archive failed: {}", next.id));
-                        }
-                        return Err(OrchestratorError::AgentCommand(error));
-                    }
-                    Ok(ArchiveResult::Cancelled) => {
-                        info!("Archive cancelled for {}", next.id);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        error!("Archive error for {}: {}", next.id, e);
-                        if let Some(progress) = &mut self.progress {
-                            progress.error(&format!("Archive failed: {}", next.id));
-                        }
-                        return Err(e);
-                    }
-                }
-            } else {
-                // Apply change using shared function
-                info!("Applying change: {}", next.id);
-
-                // Update shared state: apply started
-                self.shared_state.write().await.apply_execution_event(
-                    &ExecutionEvent::ApplyStarted {
-                        change_id: next.id.clone(),
-                    },
-                );
-
-                // Increment apply count
-                let new_apply_count = apply_count + 1;
-                self.apply_counts.insert(next.id.clone(), new_apply_count);
-
-                let apply_ctx = ApplyContext::new(
-                    self.changes_processed,
                     total_changes,
                     remaining_changes,
-                    new_apply_count,
-                );
-                let output = LogOutputHandler::new();
+                    cancel_check,
+                )
+                .await?;
 
-                match apply_change(&next, &mut self.agent, &self.hooks, &apply_ctx, &output).await {
-                    Ok(ApplyResult::Success) => {
-                        // Update shared state: apply completed
-                        self.shared_state.write().await.apply_execution_event(
-                            &ExecutionEvent::ApplyCompleted {
-                                change_id: next.id.clone(),
-                                revision: "serial".to_string(), // Serial mode doesn't use git revisions
-                            },
-                        );
+            // Handle mode-specific concerns based on result
+            use crate::serial_run_service::ChangeProcessResult;
+            match result {
+                ChangeProcessResult::Archived => {
+                    // Update changes_processed count
+                    self.changes_processed += 1;
 
-                        let snapshot = match self
-                            .snapshot_serial_iteration(&next.id, new_apply_count)
-                            .await
-                        {
-                            Ok(snapshot) => snapshot,
-                            Err(e) => {
-                                warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
-                                SerialSnapshot {
-                                    progress: crate::task_parser::TaskProgress::default(),
-                                    empty_commit: None,
-                                }
-                            }
-                        };
+                    // Update shared state: mark change as archived
+                    self.shared_state
+                        .write()
+                        .await
+                        .apply_execution_event(&ExecutionEvent::ChangeArchived(next.id.clone()));
 
-                        let progress_snapshot = snapshot.progress;
+                    // Mark change as completed and clear current (already done in service)
+                    self.completed_change_ids.insert(next.id.clone());
+                    self.current_change_id = None;
+                    self.apply_counts.remove(&next.id);
+                    self.stall_detector.clear_change(&next.id);
 
-                        if let Some(is_empty) = snapshot.empty_commit {
-                            if !is_progress_complete(&progress_snapshot)
-                                && self.stall_detector.register_commit(
-                                    &next.id,
-                                    StallPhase::Apply,
-                                    is_empty,
-                                )
-                            {
-                                let count = self
-                                    .stall_detector
-                                    .current_count(&next.id, StallPhase::Apply);
-                                let threshold = self.stall_detector.config().threshold;
-                                let message = format!(
-                                    "Stall detected for {} after {} empty WIP commits (apply)",
-                                    next.id, count
-                                );
-                                warn!("{} (threshold {})", message, threshold);
-                                self.mark_change_stalled(&next.id, &message);
-                                continue;
-                            }
-                        }
-
-                        if is_progress_complete(&progress_snapshot) {
-                            let _ = self
-                                .squash_serial_wip_commits(&next.id, new_apply_count)
-                                .await;
-
-                            // Run acceptance test after apply completion
-                            info!("Tasks complete for {}, running acceptance test...", next.id);
-                            let output = LogOutputHandler::new();
-                            let cancel_check = || false; // No cancellation in CLI mode
-
-                            match acceptance_test_streaming(
-                                &next,
-                                &mut self.agent,
-                                &output,
-                                cancel_check,
-                            )
-                            .await
-                            {
-                                Ok(AcceptanceResult::Pass) => {
-                                    info!("Acceptance passed for {}, ready for archive", next.id);
-                                    // Change will be archived in next iteration
-                                }
-                                Ok(AcceptanceResult::Continue) => {
-                                    let continue_count =
-                                        self.agent.count_consecutive_acceptance_continues(&next.id);
-                                    let max_continues = self.config.get_acceptance_max_continues();
-
-                                    if continue_count >= max_continues {
-                                        warn!(
-                                            "Acceptance CONTINUE limit ({}) exceeded for {}, treating as FAIL",
-                                            max_continues, next.id
-                                        );
-                                        // Exceeded limit - treat as FAIL and return to apply loop
-                                    } else {
-                                        info!(
-                                            "Acceptance requires continuation for {} (attempt {}/{}), retrying...",
-                                            next.id,
-                                            continue_count,
-                                            max_continues
-                                        );
-                                        // Will retry acceptance in next iteration
-                                    }
-                                }
-                                Ok(AcceptanceResult::Fail { findings }) => {
-                                    warn!(
-                                        "Acceptance failed for {} with {} findings, will retry apply",
-                                        next.id,
-                                        findings.len()
-                                    );
-                                    // Update tasks.md with acceptance findings
-                                    if let Err(e) = update_tasks_on_acceptance_failure(
-                                        &next.id, &findings, None,
-                                    )
-                                    .await
-                                    {
-                                        warn!("Failed to update tasks.md for {}: {}", next.id, e);
-                                    }
-                                    // Change will be selected again for apply in next iteration
-                                }
-                                Ok(AcceptanceResult::CommandFailed { error, findings }) => {
-                                    error!("Acceptance command failed for {}: {}", next.id, error);
-                                    // Update tasks.md with command failure
-                                    if let Err(e) = update_tasks_on_acceptance_failure(
-                                        &next.id, &findings, None,
-                                    )
-                                    .await
-                                    {
-                                        warn!("Failed to update tasks.md for {}: {}", next.id, e);
-                                    }
-                                    // Change will be selected again for apply in next iteration
-                                }
-                                Ok(AcceptanceResult::Cancelled) => {
-                                    info!("Acceptance cancelled for {}", next.id);
-                                    return Ok(());
-                                }
-                                Err(e) => {
-                                    error!("Acceptance error for {}: {}", next.id, e);
-                                    return Err(e);
-                                }
-                            }
-                        }
-
-                        if let Some(progress) = &mut self.progress {
-                            progress.complete_change(&next.id);
-                        }
+                    if let Some(progress) = &mut self.progress {
+                        progress.archive_change(&next.id);
                     }
-                    Ok(ApplyResult::Failed { error }) => {
-                        if let Err(e) = self
-                            .snapshot_serial_iteration(&next.id, new_apply_count)
-                            .await
-                        {
+                }
+                ChangeProcessResult::Stalled { error } => {
+                    warn!("Change stalled: {} - {}", next.id, error);
+                    self.mark_change_stalled(&next.id, &error);
+                    continue;
+                }
+                ChangeProcessResult::Failed { error } => {
+                    error!("Change failed: {} - {}", next.id, error);
+                    if let Some(progress) = &mut self.progress {
+                        progress.error(&format!("Failed: {}", next.id));
+                    }
+                    return Err(OrchestratorError::AgentCommand(error));
+                }
+                ChangeProcessResult::Cancelled => {
+                    info!("Processing cancelled for {}", next.id);
+                    return Ok(());
+                }
+                ChangeProcessResult::ApplySuccessIncomplete => {
+                    // Update shared state: apply completed
+                    self.shared_state.write().await.apply_execution_event(
+                        &ExecutionEvent::ApplyCompleted {
+                            change_id: next.id.clone(),
+                            revision: "serial".to_string(),
+                        },
+                    );
+
+                    // CLI-specific: Create WIP snapshot
+                    let apply_count = serial_service.apply_count(&next.id);
+                    let snapshot = match self.snapshot_serial_iteration(&next.id, apply_count).await
+                    {
+                        Ok(snapshot) => snapshot,
+                        Err(e) => {
                             warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
+                            SerialSnapshot {
+                                progress: crate::task_parser::TaskProgress::default(),
+                                empty_commit: None,
+                            }
                         }
+                    };
 
-                        // Record error and check circuit breaker
-                        if self.record_error_and_check_circuit_breaker(&next.id, &error) {
-                            let message = format!(
-                                "Circuit breaker opened for '{}' due to repeated errors",
-                                next.id
-                            );
-                            warn!("{}", message);
-                            self.mark_change_stalled(&next.id, &message);
-                            continue;
-                        }
+                    // CLI-specific: Check for stall on empty commits
+                    if let Some(stall_reason) = serial_service.check_stall_after_apply(
+                        &next.id,
+                        &snapshot.progress,
+                        snapshot.empty_commit,
+                    ) {
+                        warn!("{}", stall_reason);
+                        self.mark_change_stalled(&next.id, &stall_reason);
+                        continue;
+                    }
 
-                        error!("Apply failed for {}: {}", next.id, error);
-                        if let Some(progress) = &mut self.progress {
-                            progress.error(&format!("Apply failed: {}", next.id));
-                        }
-                        return Err(OrchestratorError::AgentCommand(error));
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_change(&next.id);
                     }
-                    Ok(ApplyResult::Cancelled) => {
-                        info!("Apply cancelled for {}", next.id);
-                        return Ok(());
+                }
+                ChangeProcessResult::ApplyFailed { error } => {
+                    // Update shared state: apply started (for tracking)
+                    self.shared_state.write().await.apply_execution_event(
+                        &ExecutionEvent::ApplyStarted {
+                            change_id: next.id.clone(),
+                        },
+                    );
+
+                    // CLI-specific: Create WIP snapshot even on failure
+                    let apply_count = serial_service.apply_count(&next.id);
+                    if let Err(e) = self.snapshot_serial_iteration(&next.id, apply_count).await {
+                        warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
                     }
-                    Err(e) => {
-                        error!("Apply error for {}: {}", next.id, e);
-                        if let Some(progress) = &mut self.progress {
-                            progress.error(&format!("Apply failed: {}", next.id));
-                        }
-                        return Err(e);
+
+                    // CLI-specific: Check circuit breaker
+                    if self.record_error_and_check_circuit_breaker(&next.id, &error) {
+                        let message = format!(
+                            "Circuit breaker opened for '{}' due to repeated errors",
+                            next.id
+                        );
+                        warn!("{}", message);
+                        self.mark_change_stalled(&next.id, &message);
+                        serial_service.mark_stalled(&next.id, &message);
+                        continue;
+                    }
+
+                    error!("Apply failed for {}: {}", next.id, error);
+                    if let Some(progress) = &mut self.progress {
+                        progress.error(&format!("Apply failed: {}", next.id));
+                    }
+                    return Err(OrchestratorError::AgentCommand(error));
+                }
+                ChangeProcessResult::AcceptancePassed => {
+                    // Update shared state
+                    self.shared_state.write().await.apply_execution_event(
+                        &ExecutionEvent::ApplyCompleted {
+                            change_id: next.id.clone(),
+                            revision: "serial".to_string(),
+                        },
+                    );
+
+                    // CLI-specific: Squash WIP commits after acceptance pass
+                    let apply_count = serial_service.apply_count(&next.id);
+                    let _ = self.squash_serial_wip_commits(&next.id, apply_count).await;
+
+                    info!("Acceptance passed for {}, ready for archive", next.id);
+
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_change(&next.id);
+                    }
+                }
+                ChangeProcessResult::AcceptanceContinue => {
+                    // Update shared state
+                    self.shared_state.write().await.apply_execution_event(
+                        &ExecutionEvent::ApplyCompleted {
+                            change_id: next.id.clone(),
+                            revision: "serial".to_string(),
+                        },
+                    );
+
+                    info!(
+                        "Acceptance requires continuation for {}, retrying...",
+                        next.id
+                    );
+
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_change(&next.id);
+                    }
+                }
+                ChangeProcessResult::AcceptanceContinueExceeded => {
+                    // Update shared state
+                    self.shared_state.write().await.apply_execution_event(
+                        &ExecutionEvent::ApplyCompleted {
+                            change_id: next.id.clone(),
+                            revision: "serial".to_string(),
+                        },
+                    );
+
+                    warn!(
+                        "Acceptance CONTINUE limit exceeded for {}, treating as FAIL",
+                        next.id
+                    );
+
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_change(&next.id);
+                    }
+                }
+                ChangeProcessResult::AcceptanceFailed { findings: _ } => {
+                    // Update shared state
+                    self.shared_state.write().await.apply_execution_event(
+                        &ExecutionEvent::ApplyCompleted {
+                            change_id: next.id.clone(),
+                            revision: "serial".to_string(),
+                        },
+                    );
+
+                    // Findings already logged and tasks.md updated by SerialRunService
+                    info!("Acceptance failed for {}, will retry apply", next.id);
+
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_change(&next.id);
+                    }
+                }
+                ChangeProcessResult::AcceptanceCommandFailed { error: _ } => {
+                    // Update shared state
+                    self.shared_state.write().await.apply_execution_event(
+                        &ExecutionEvent::ApplyCompleted {
+                            change_id: next.id.clone(),
+                            revision: "serial".to_string(),
+                        },
+                    );
+
+                    // Error already logged and tasks.md updated by SerialRunService
+                    info!(
+                        "Acceptance command failed for {}, will retry apply",
+                        next.id
+                    );
+
+                    if let Some(progress) = &mut self.progress {
+                        progress.complete_change(&next.id);
                     }
                 }
             }
@@ -806,13 +732,6 @@ impl Orchestrator {
     /// Select the next change to process.
     ///
     /// Uses the shared selection module which provides:
-    /// 1. Complete changes first (ready for archive)
-    /// 2. LLM-based selection (via agent)
-    /// 3. Fallback to highest progress
-    async fn select_next_change(&self, changes: &[Change]) -> Result<Change> {
-        selection::select_next_change(changes, Some(&self.agent)).await
-    }
-
     /// Filter changes to only include those present in the initial snapshot.
     /// Returns an empty vector if no snapshot was captured.
     fn filter_to_snapshot(&self, changes: &[Change]) -> Vec<Change> {
