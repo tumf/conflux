@@ -815,6 +815,14 @@ impl ParallelExecutor {
                             if let Some(error) = &workspace_result.error {
                                 error!("Change '{}' failed: {}", workspace_result.change_id, error);
                                 self.failed_tracker.mark_failed(&workspace_result.change_id);
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::ProcessingError {
+                                        id: workspace_result.change_id.clone(),
+                                        error: error.clone(),
+                                    },
+                                )
+                                .await;
                             } else {
                                 info!("Change '{}' completed successfully", workspace_result.change_id);
 

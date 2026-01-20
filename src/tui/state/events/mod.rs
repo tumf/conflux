@@ -107,6 +107,9 @@ impl AppState {
             OrchestratorEvent::WorktreesRefreshed { worktrees } => {
                 self.handle_worktrees_refreshed(worktrees)
             }
+            OrchestratorEvent::ChangeSkipped { change_id, reason } => {
+                self.handle_change_skipped(change_id, reason)
+            }
 
             // Output events
             OrchestratorEvent::ApplyOutput {
