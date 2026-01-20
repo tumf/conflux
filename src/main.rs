@@ -225,7 +225,7 @@ async fn main() -> Result<()> {
             // Set web state for broadcasting updates
             #[cfg(feature = "web-monitoring")]
             if let Some(web_state) = web_state_arc {
-                orchestrator.set_web_state(web_state);
+                orchestrator.set_web_state(web_state).await;
             }
 
             // Setup signal handling for graceful shutdown

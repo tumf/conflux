@@ -106,7 +106,39 @@ pub struct OrchestratorStateSnapshot {
 impl OrchestratorStateSnapshot {
     /// Create a new state snapshot from a list of changes
     pub fn from_changes(changes: &[Change]) -> Self {
-        let change_statuses: Vec<ChangeStatus> = changes.iter().map(ChangeStatus::from).collect();
+        Self::from_changes_with_shared_state(changes, None)
+    }
+
+    /// Create a new state snapshot from a list of changes with optional shared orchestration state.
+    /// When shared state is provided, additional metadata (apply counts, pending/archived status) is derived from it.
+    pub fn from_changes_with_shared_state(
+        changes: &[Change],
+        shared_state: Option<&crate::orchestration::state::OrchestratorState>,
+    ) -> Self {
+        let mut change_statuses: Vec<ChangeStatus> =
+            changes.iter().map(ChangeStatus::from).collect();
+
+        // Enrich with data from shared state if available
+        if let Some(shared) = shared_state {
+            for status in &mut change_statuses {
+                // Set queue_status based on shared state tracking
+                if shared.is_archived(&status.id) {
+                    status.queue_status = Some("archived".to_string());
+                } else if shared.is_pending(&status.id) {
+                    if shared.current_change_id() == Some(&status.id) {
+                        status.queue_status = Some("applying".to_string());
+                    } else {
+                        status.queue_status = Some("queued".to_string());
+                    }
+                }
+
+                // Set iteration_number from apply_count if available
+                let apply_count = shared.apply_count(&status.id);
+                if apply_count > 0 {
+                    status.iteration_number = Some(apply_count);
+                }
+            }
+        }
 
         let completed = change_statuses
             .iter()
@@ -196,6 +228,11 @@ pub struct WebState {
     state: RwLock<OrchestratorStateSnapshot>,
     /// Broadcast channel for state updates
     tx: broadcast::Sender<StateUpdate>,
+    /// Reference to shared orchestration state (for unified state tracking)
+    /// Wrapped in RwLock for interior mutability (can be set after construction via Arc)
+    shared_orchestrator_state: tokio::sync::RwLock<
+        Option<std::sync::Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>>,
+    >,
 }
 
 impl WebState {
@@ -207,7 +244,19 @@ impl WebState {
         Self {
             state: RwLock::new(state),
             tx,
+            shared_orchestrator_state: tokio::sync::RwLock::new(None),
         }
+    }
+
+    /// Set reference to shared orchestration state for unified tracking.
+    /// This allows WebState to query core orchestration state (pending/archived, apply counts, etc.)
+    pub async fn set_shared_state(
+        &self,
+        shared_state: std::sync::Arc<
+            tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>,
+        >,
+    ) {
+        *self.shared_orchestrator_state.write().await = Some(shared_state);
     }
 
     /// Get a read lock on the current state snapshot
@@ -218,7 +267,20 @@ impl WebState {
     /// Update state with new changes and broadcast to WebSocket clients.
     /// Only broadcasts if there are actual changes from the previous state.
     pub async fn update(&self, changes: &[Change]) {
-        let mut new_state = OrchestratorStateSnapshot::from_changes(changes);
+        // Query shared state if available for enriched metadata
+        let shared_state_opt = self.shared_orchestrator_state.read().await;
+        let shared_state_data = if let Some(ref shared_arc) = *shared_state_opt {
+            shared_arc.try_read().ok()
+        } else {
+            None
+        };
+
+        let mut new_state = OrchestratorStateSnapshot::from_changes_with_shared_state(
+            changes,
+            shared_state_data.as_deref(),
+        );
+        drop(shared_state_data); // Drop guard before awaiting
+        drop(shared_state_opt); // Drop read lock
 
         // Preserve progress and queue_status from existing state
         let old_changes = {
@@ -228,11 +290,15 @@ impl WebState {
 
         for new_change in &mut new_state.changes {
             if let Some(existing) = old_changes.iter().find(|c| c.id == new_change.id) {
-                // Preserve queue_status
-                new_change.queue_status = existing.queue_status.clone();
+                // Preserve queue_status ONLY if shared state didn't provide it
+                if new_change.queue_status.is_none() {
+                    new_change.queue_status = existing.queue_status.clone();
+                }
 
-                // Preserve iteration_number
-                new_change.iteration_number = existing.iteration_number;
+                // Preserve iteration_number ONLY if shared state didn't provide it
+                if new_change.iteration_number.is_none() {
+                    new_change.iteration_number = existing.iteration_number;
+                }
 
                 // Preserve existing progress if retrieval failed (new data is 0/0)
                 // This prevents resetting progress to 0 on retrieval failure

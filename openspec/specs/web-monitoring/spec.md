@@ -112,6 +112,7 @@ The HTTP server SHALL provide detailed information for a specific change.
 - **AND** response body contains error message with change ID
 
 ### Requirement: WebSocket - Real-time Updates
+
 The HTTP server SHALL broadcast state updates to the dashboard via WebSocket for both serial and parallel execution (`--parallel`) modes.
 The HTTP server SHALL ensure that TUI and Web UI states remain consistent by broadcasting real-time state updates that occur in the TUI via WebSocket.
 This broadcast MUST be based on a unified state model that includes not only change list progress but also TUI-visible states (queue status, logs, worktrees, running operations, etc.).
@@ -132,6 +133,12 @@ For dashboard compatibility, the `changes` field in `state_update` messages MUST
 - **WHEN** state_update が送信される
 - **THEN** completed_tasks/total_tasks は直前の値を維持する
 - **AND** 取得失敗を 0 件完了として扱わない
+
+#### Scenario: Web state uses unified model
+- **GIVEN** WebState が state_update を生成する
+- **WHEN** 変更状態のスナップショットを作成する
+- **THEN** the snapshot derives from the shared orchestration state
+- **AND** Web-specific DTO naming does not conflict with shared state types
 
 ### Requirement: Static File Serving - Dashboard
 The HTTP server SHALL serve a web-based dashboard interface for visualizing orchestration state.

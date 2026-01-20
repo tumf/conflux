@@ -70,6 +70,7 @@ pub async fn archive_single_change(
     tx: &mpsc::Sender<OrchestratorEvent>,
     cancel_token: &CancellationToken,
     context: &ArchiveContext,
+    shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     #[cfg(feature = "web-monitoring")] web_state: &Option<Arc<crate::web::WebState>>,
 ) -> Result<ArchiveResult> {
     use crate::agent::OutputLine;
@@ -321,6 +322,11 @@ pub async fn archive_single_change(
 
             let change_archived_event = OrchestratorEvent::ChangeArchived(change_id.to_string());
             let _ = tx.send(change_archived_event.clone()).await;
+            // Update shared orchestration state (marks as archived, removes from pending)
+            shared_state
+                .write()
+                .await
+                .apply_execution_event(&change_archived_event);
             #[cfg(feature = "web-monitoring")]
             if let Some(ws) = web_state {
                 ws.apply_execution_event(&change_archived_event).await;
@@ -388,6 +394,7 @@ pub async fn archive_all_complete_changes(
     total_changes: usize,
     changes_processed: &mut usize,
     apply_counts: &HashMap<String, u32>,
+    shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     #[cfg(feature = "web-monitoring")] web_state: &Option<Arc<crate::web::WebState>>,
 ) -> Result<usize> {
     use crate::openspec;
@@ -451,6 +458,7 @@ pub async fn archive_all_complete_changes(
             tx,
             cancel_token,
             &context,
+            shared_state,
             #[cfg(feature = "web-monitoring")]
             web_state,
         )
@@ -494,6 +502,7 @@ pub async fn archive_all_complete_changes(
 /// - Phase 2: Apply one incomplete change
 ///
 /// This ensures complete changes are never skipped.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_orchestrator(
     change_ids: Vec<String>,
     config: OrchestratorConfig,
@@ -501,6 +510,7 @@ pub async fn run_orchestrator(
     cancel_token: CancellationToken,
     dynamic_queue: DynamicQueue,
     _graceful_stop_flag: Arc<AtomicBool>,
+    shared_state: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
     use crate::agent::OutputLine;
@@ -631,6 +641,7 @@ pub async fn run_orchestrator(
             total_changes,
             &mut changes_processed,
             &apply_counts,
+            &shared_state,
             #[cfg(feature = "web-monitoring")]
             &web_state,
         )
@@ -704,6 +715,11 @@ pub async fn run_orchestrator(
         // Notify processing started
         let processing_started_event = OrchestratorEvent::ProcessingStarted(change_id.clone());
         let _ = tx.send(processing_started_event.clone()).await;
+        // Update shared orchestration state
+        shared_state
+            .write()
+            .await
+            .apply_execution_event(&processing_started_event);
         #[cfg(feature = "web-monitoring")]
         if let Some(ws) = &web_state {
             ws.apply_execution_event(&processing_started_event).await;
@@ -766,6 +782,21 @@ pub async fn run_orchestrator(
                 change_id
             ))))
             .await;
+
+        // Notify apply started
+        let apply_started_event = OrchestratorEvent::ApplyStarted {
+            change_id: change_id.clone(),
+        };
+        let _ = tx.send(apply_started_event.clone()).await;
+        // Update shared orchestration state
+        shared_state
+            .write()
+            .await
+            .apply_execution_event(&apply_started_event);
+        #[cfg(feature = "web-monitoring")]
+        if let Some(ws) = &web_state {
+            ws.apply_execution_event(&apply_started_event).await;
+        }
 
         // Run apply command with streaming output
         let (mut child, mut output_rx, start_time) =
@@ -850,6 +881,22 @@ pub async fn run_orchestrator(
         }
 
         if status.success() {
+            // Notify apply completed
+            let apply_completed_event = OrchestratorEvent::ApplyCompleted {
+                change_id: change_id.clone(),
+                revision: String::new(), // Revision tracking not used in TUI mode
+            };
+            let _ = tx.send(apply_completed_event.clone()).await;
+            // Update shared orchestration state (increments apply count)
+            shared_state
+                .write()
+                .await
+                .apply_execution_event(&apply_completed_event);
+            #[cfg(feature = "web-monitoring")]
+            if let Some(ws) = &web_state {
+                ws.apply_execution_event(&apply_completed_event).await;
+            }
+
             // Run post_apply hook
             let post_apply_context =
                 HookContext::new(changes_processed, total_changes, remaining_changes, false)
@@ -1214,6 +1261,11 @@ pub async fn run_orchestrator(
                 error: error_msg,
             };
             let _ = tx.send(processing_error_event.clone()).await;
+            // Update shared orchestration state (removes from pending)
+            shared_state
+                .write()
+                .await
+                .apply_execution_event(&processing_error_event);
             #[cfg(feature = "web-monitoring")]
             if let Some(ws) = &web_state {
                 ws.apply_execution_event(&processing_error_event).await;
@@ -1254,6 +1306,7 @@ pub async fn run_orchestrator_parallel(
     cancel_token: CancellationToken,
     dynamic_queue: DynamicQueue,
     _graceful_stop_flag: Arc<AtomicBool>,
+    shared_state: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
     use crate::openspec::list_changes_native;
@@ -1327,6 +1380,7 @@ pub async fn run_orchestrator_parallel(
     let forward_cancel = cancel_token.clone();
     let merge_deferred_stop = Arc::new(AtomicBool::new(false));
     let forward_merge_stop = merge_deferred_stop.clone();
+    let forward_shared_state = shared_state.clone();
     #[cfg(feature = "web-monitoring")]
     let forward_web_tx = web_event_tx.clone();
     let forward_handle = tokio::spawn(async move {
@@ -1355,6 +1409,11 @@ pub async fn run_orchestrator_parallel(
                             break;
                         }
                         Some(parallel_event) => {
+                            // Apply to shared orchestration state
+                            forward_shared_state
+                                .write()
+                                .await
+                                .apply_execution_event(&parallel_event);
                             // Forward to TUI
                             let _ = forward_tx.send(parallel_event.clone()).await;
                             // Forward to WebState

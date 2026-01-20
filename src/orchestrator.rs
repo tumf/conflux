@@ -2,9 +2,11 @@ use crate::agent::AgentRunner;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::error_history::{CircuitBreakerConfig, ErrorHistory};
+use crate::events::ExecutionEvent;
 use crate::execution::apply::{check_task_progress, create_progress_commit, is_progress_complete};
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
+use crate::orchestration::state::OrchestratorState;
 use crate::orchestration::{
     acceptance_test_streaming, apply_change, archive_change, selection,
     update_tasks_on_acceptance_failure, AcceptanceResult, ApplyContext, ApplyResult,
@@ -76,6 +78,9 @@ pub struct Orchestrator {
     vcs_backend: VcsBackend,
     /// Disable automatic workspace resume (always create new workspaces)
     no_resume: bool,
+    /// Shared orchestration state (single source of truth for state tracking)
+    /// Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
+    shared_state: std::sync::Arc<tokio::sync::RwLock<OrchestratorState>>,
     /// Web monitoring state (for broadcasting updates to WebSocket clients)
     #[cfg(feature = "web-monitoring")]
     web_state: Option<Arc<WebState>>,
@@ -104,6 +109,13 @@ impl Orchestrator {
         let vcs_backend = vcs_override.unwrap_or_else(|| config.get_vcs_backend());
         let stall_detector = StallDetector::new(config.get_stall_detection());
 
+        // Initialize shared state (will be populated when run() is called with actual changes)
+        // Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            Vec::new(),
+            max_iterations,
+        )));
+
         Ok(Self {
             agent,
             config,
@@ -126,14 +138,18 @@ impl Orchestrator {
             dry_run,
             vcs_backend,
             no_resume,
+            shared_state,
             #[cfg(feature = "web-monitoring")]
             web_state: None,
         })
     }
 
-    /// Set web monitoring state for broadcasting updates to WebSocket clients
+    /// Set web monitoring state for broadcasting updates to WebSocket clients.
+    /// Also injects the shared orchestration state reference into WebState for unified tracking.
     #[cfg(feature = "web-monitoring")]
-    pub fn set_web_state(&mut self, web_state: Arc<WebState>) {
+    pub async fn set_web_state(&mut self, web_state: Arc<WebState>) {
+        // Inject shared state reference into WebState
+        web_state.set_shared_state(self.shared_state.clone()).await;
         self.web_state = Some(web_state);
     }
 
@@ -161,6 +177,13 @@ impl Orchestrator {
         let agent = AgentRunner::new(config.clone());
         let stall_detector = StallDetector::new(config.get_stall_detection());
 
+        // Initialize shared state (for testing, will use empty change list)
+        // Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            Vec::new(),
+            max_iterations,
+        )));
+
         Ok(Self {
             agent,
             config,
@@ -183,6 +206,7 @@ impl Orchestrator {
             dry_run: false,
             vcs_backend: VcsBackend::Auto,
             no_resume: false,
+            shared_state,
             #[cfg(feature = "web-monitoring")]
             web_state: None,
         })
@@ -273,6 +297,10 @@ impl Orchestrator {
         );
         self.initial_change_ids = Some(snapshot_ids.clone());
 
+        // Initialize shared orchestration state with filtered changes
+        let change_ids: Vec<String> = filtered_initial.iter().map(|c| c.id.clone()).collect();
+        *self.shared_state.write().await = OrchestratorState::new(change_ids, self.max_iterations);
+
         // Initialize progress display
         self.progress = Some(ProgressDisplay::new(filtered_initial.len()));
 
@@ -359,6 +387,12 @@ impl Orchestrator {
             // Check if this is a new change (for on_change_start hook)
             let is_new_change = self.current_change_id.as_ref() != Some(&next.id);
             if is_new_change {
+                // Update shared state: processing started
+                self.shared_state
+                    .write()
+                    .await
+                    .apply_execution_event(&ExecutionEvent::ProcessingStarted(next.id.clone()));
+
                 // Run on_change_start hook
                 let change_start_context = HookContext::new(
                     self.changes_processed,
@@ -407,6 +441,11 @@ impl Orchestrator {
                         // Update changes_processed count
                         self.changes_processed += 1;
                         let new_remaining = remaining_changes - 1;
+
+                        // Update shared state: mark change as archived
+                        self.shared_state.write().await.apply_execution_event(
+                            &ExecutionEvent::ChangeArchived(next.id.clone()),
+                        );
 
                         // Clear acceptance history after successful archive
                         self.agent.clear_acceptance_history(&next.id);
@@ -462,6 +501,13 @@ impl Orchestrator {
                 // Apply change using shared function
                 info!("Applying change: {}", next.id);
 
+                // Update shared state: apply started
+                self.shared_state.write().await.apply_execution_event(
+                    &ExecutionEvent::ApplyStarted {
+                        change_id: next.id.clone(),
+                    },
+                );
+
                 // Increment apply count
                 let new_apply_count = apply_count + 1;
                 self.apply_counts.insert(next.id.clone(), new_apply_count);
@@ -476,6 +522,14 @@ impl Orchestrator {
 
                 match apply_change(&next, &mut self.agent, &self.hooks, &apply_ctx, &output).await {
                     Ok(ApplyResult::Success) => {
+                        // Update shared state: apply completed
+                        self.shared_state.write().await.apply_execution_event(
+                            &ExecutionEvent::ApplyCompleted {
+                                change_id: next.id.clone(),
+                                revision: "serial".to_string(), // Serial mode doesn't use git revisions
+                            },
+                        );
+
                         let snapshot = match self
                             .snapshot_serial_iteration(&next.id, new_apply_count)
                             .await
