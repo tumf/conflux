@@ -292,6 +292,16 @@ pub enum ExecutionEvent {
     #[allow(dead_code)]
     ChangeSkipped { change_id: String, reason: String },
 
+    /// A change is blocked waiting for dependencies to be resolved
+    DependencyBlocked {
+        change_id: String,
+        #[allow(dead_code)]
+        dependency_ids: Vec<String>,
+    },
+
+    /// A change's dependencies were resolved and it can now be queued
+    DependencyResolved { change_id: String },
+
     // Analysis events (parallel mode)
     /// Analysis started for remaining changes
     #[allow(dead_code)]

@@ -494,6 +494,16 @@ main {
     background-color: var(--accent-yellow);
 }
 
+.badge-status.blocked {
+    background-color: #808080; /* Gray - matches TUI Gray */
+    color: var(--text-primary);
+}
+
+.badge-status.applying {
+    background-color: #00ffff; /* Cyan - matches TUI Cyan */
+    color: var(--bg-primary);
+}
+
 .badge-status.processing {
     background-color: var(--accent-blue);
 }

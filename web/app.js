@@ -622,6 +622,7 @@ class WebMonitor {
         const statusIcons = {
             'not queued': '○',
             'queued': '⏳',
+            'blocked': '🚫',
             'applying': '⚙️',
             'accepting': '✓',
             'archiving': '📦',

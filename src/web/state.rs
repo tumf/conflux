@@ -62,7 +62,7 @@ pub struct ChangeStatus {
     /// Dependencies on other changes
     pub dependencies: Vec<String>,
     /// Queue status (for parallel/serial execution tracking)
-    /// Aligned with TUI QueueStatus display values: "not queued", "queued", "processing",
+    /// Aligned with TUI QueueStatus display values: "not queued", "queued", "blocked", "processing",
     /// "accepting", "archiving", "archived", "merged", "merge wait", "resolving", "error"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_status: Option<String>,
@@ -634,6 +634,23 @@ impl WebState {
                 ExecutionEvent::WorktreesRefreshed { worktrees } => {
                     state.worktrees = worktrees.clone();
                     worktree_broadcast = Some(worktrees.clone());
+                }
+
+                // Dependency blocking events
+                ExecutionEvent::DependencyBlocked {
+                    change_id,
+                    dependency_ids: _,
+                } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.queue_status = Some("blocked".to_string());
+                        updated = true;
+                    }
+                }
+                ExecutionEvent::DependencyResolved { change_id } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.queue_status = Some("queued".to_string());
+                        updated = true;
+                    }
                 }
 
                 // Completion events

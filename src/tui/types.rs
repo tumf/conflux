@@ -54,6 +54,8 @@ pub enum QueueStatus {
     NotQueued,
     /// Waiting in the execution queue
     Queued,
+    /// Blocked by unresolved dependencies
+    Blocked,
     /// Currently being applied
     Applying,
     /// Running acceptance tests
@@ -78,6 +80,7 @@ impl QueueStatus {
         match self {
             QueueStatus::NotQueued => "not queued",
             QueueStatus::Queued => "queued",
+            QueueStatus::Blocked => "blocked",
             QueueStatus::Applying => "applying",
             QueueStatus::Accepting => "accepting",
             QueueStatus::Archiving => "archiving",
@@ -94,6 +97,7 @@ impl QueueStatus {
         match self {
             QueueStatus::NotQueued => Color::DarkGray,
             QueueStatus::Queued => Color::Yellow,
+            QueueStatus::Blocked => Color::Gray,
             QueueStatus::Applying => Color::Cyan,
             QueueStatus::Accepting => Color::LightGreen,
             QueueStatus::Archiving => Color::Magenta,
@@ -222,6 +226,7 @@ mod tests {
     fn test_queue_status_display() {
         assert_eq!(QueueStatus::NotQueued.display(), "not queued");
         assert_eq!(QueueStatus::Queued.display(), "queued");
+        assert_eq!(QueueStatus::Blocked.display(), "blocked");
         assert_eq!(QueueStatus::Applying.display(), "applying");
         assert_eq!(QueueStatus::Accepting.display(), "accepting");
         assert_eq!(QueueStatus::Archiving.display(), "archiving");
@@ -236,6 +241,7 @@ mod tests {
     fn test_queue_status_color() {
         assert_eq!(QueueStatus::NotQueued.color(), Color::DarkGray);
         assert_eq!(QueueStatus::Queued.color(), Color::Yellow);
+        assert_eq!(QueueStatus::Blocked.color(), Color::Gray);
         assert_eq!(QueueStatus::Applying.color(), Color::Cyan);
         assert_eq!(QueueStatus::Accepting.color(), Color::LightGreen);
         assert_eq!(QueueStatus::Archiving.color(), Color::Magenta);
@@ -265,6 +271,7 @@ mod tests {
         assert!(QueueStatus::Resolving.is_active());
 
         assert!(!QueueStatus::NotQueued.is_active());
+        assert!(!QueueStatus::Blocked.is_active());
         assert!(!QueueStatus::MergeWait.is_active());
         assert!(!QueueStatus::Archived.is_active());
         assert!(!QueueStatus::Merged.is_active());
@@ -360,5 +367,32 @@ mod tests {
             is_merging: false,
         };
         assert_eq!(wt.conflict_file_count(), 2);
+    }
+
+    #[test]
+    fn test_queue_status_blocked_display() {
+        assert_eq!(QueueStatus::Blocked.display(), "blocked");
+    }
+
+    #[test]
+    fn test_queue_status_blocked_color() {
+        assert_eq!(QueueStatus::Blocked.color(), Color::Gray);
+    }
+
+    #[test]
+    fn test_queue_status_blocked_is_not_active() {
+        assert!(!QueueStatus::Blocked.is_active());
+    }
+
+    #[test]
+    fn test_queue_status_blocked_transition() {
+        // Test transition from NotQueued to Blocked
+        let status = QueueStatus::Blocked;
+        assert_eq!(status, QueueStatus::Blocked);
+
+        // Test transition from Blocked to Queued (when dependencies resolve)
+        let status = QueueStatus::Queued;
+        assert_eq!(status, QueueStatus::Queued);
+        assert!(status.is_active());
     }
 }
