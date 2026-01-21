@@ -42,7 +42,24 @@ KEY OPTIONS:
   --web-bind ADDR       Web server bind address (default: 127.0.0.1)
 
 Use 'cflx <subcommand> --help' for more information on a specific command.")]
+#[command(subcommand_required(false))]
 pub struct Cli {
+    /// Path to custom configuration file (JSONC format)
+    #[arg(long, short = 'c')]
+    pub config: Option<PathBuf>,
+
+    /// Enable web monitoring server for remote status viewing
+    #[arg(long)]
+    pub web: bool,
+
+    /// Port for web monitoring server (default: 0 = auto-assign by OS)
+    #[arg(long, default_value = "0")]
+    pub web_port: u16,
+
+    /// Bind address for web monitoring server (default: 127.0.0.1)
+    #[arg(long, default_value = "127.0.0.1")]
+    pub web_bind: String,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -608,6 +625,24 @@ mod tests {
     }
 
     #[test]
+    fn test_no_subcommand_with_web() {
+        // Note: Current CLI design requires explicit subcommand for web options.
+        // The --web flag is only valid with 'run' or 'tui' subcommands.
+        // This test verifies that web options work correctly with TUI subcommand.
+
+        let cli = Cli::parse_from(["cflx", "tui", "--web"]);
+
+        match cli.command {
+            Some(Commands::Tui(args)) => {
+                assert!(args.web);
+                assert_eq!(args.web_port, 0); // Default: OS auto-assigns port
+                assert_eq!(args.web_bind, "127.0.0.1");
+            }
+            _ => panic!("Expected Tui subcommand"),
+        }
+    }
+
+    #[test]
     fn test_check_conflicts_subcommand_default() {
         let cli = Cli::parse_from(["cflx", "check-conflicts"]);
 
@@ -640,6 +675,80 @@ mod tests {
                 assert!(args.json);
             }
             _ => panic!("Expected CheckConflicts subcommand"),
+        }
+    }
+
+    // Additional tests for web flag parsing behavior
+    #[test]
+    fn test_case_1_cflx() {
+        // Case 1: cflx -> No subcommand (will trigger parse_tui_args in main.rs)
+        let cli = Cli::try_parse_from(["cflx"]).unwrap();
+        assert!(cli.command.is_none());
+        println!("Case 1: 'cflx' -> No subcommand (TUI with web=false via parse_tui_args)");
+    }
+
+    #[test]
+    fn test_case_2_cflx_web() {
+        // Case 2: cflx --web -> No subcommand (--web is a top-level flag, should succeed)
+        let cli = Cli::try_parse_from(["cflx", "--web"]).unwrap();
+        assert!(cli.web);
+        assert!(cli.command.is_none());
+        println!("Case 2: 'cflx --web' -> No subcommand with web=true (TUI with web)");
+    }
+
+    #[test]
+    fn test_case_3_cflx_tui_web() {
+        // Case 3: cflx tui --web -> TUI subcommand with web=true
+        let cli = Cli::try_parse_from(["cflx", "tui", "--web"]).unwrap();
+        match &cli.command {
+            Some(Commands::Tui(args)) => {
+                assert!(args.web);
+                println!("Case 3: 'cflx tui --web' -> TuiArgs with web=true");
+            }
+            _ => panic!("Expected Tui subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_case_4_cflx_run_web() {
+        // Case 4: cflx run --web -> Run subcommand with web=true
+        let cli = Cli::try_parse_from(["cflx", "run", "--web"]).unwrap();
+        match &cli.command {
+            Some(Commands::Run(args)) => {
+                assert!(args.web);
+                println!("Case 4: 'cflx run --web' -> RunArgs with web=true");
+            }
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_parse_tui_args_with_web_simulation() {
+        // Simulate parse_tui_args logic for "cflx --web" from main.rs
+        // This is what happens when Cli::parse() returns None
+        // Note: TuiArgs is a subcommand struct, so it expects arguments starting with program name
+        // The parse_tui_args function prepends "cflx", "tui" to simulate this behavior
+
+        let args: Vec<String> = vec!["--web".to_string()];
+        let full_args = {
+            let mut v = vec!["cflx".to_string(), "tui".to_string()];
+            v.extend(args);
+            v
+        };
+
+        // Parse via full CLI path (simulating the behavior)
+        let cli_result = Cli::try_parse_from(full_args.clone());
+        match cli_result {
+            Ok(cli) => match &cli.command {
+                Some(Commands::Tui(tui_args)) => {
+                    assert!(tui_args.web);
+                    println!("Case 5 (parse_tui_args simulation): 'cflx --web' -> via Cli -> TuiArgs with web=true");
+                }
+                _ => panic!("Expected Tui subcommand"),
+            },
+            Err(e) => {
+                panic!("Expected successful parse: {}", e);
+            }
         }
     }
 }

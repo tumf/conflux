@@ -33,7 +33,7 @@ mod vcs;
 mod web;
 
 use clap::Parser;
-use cli::{ApproveAction, Cli, Commands};
+use cli::{ApproveAction, Cli, Commands, TuiArgs};
 use config::OrchestratorConfig;
 use error::Result;
 use orchestrator::Orchestrator;
@@ -74,23 +74,56 @@ async fn main() -> Result<()> {
     match cli.command {
         // No subcommand: launch TUI (default behavior)
         None => {
-            // Don't initialize tracing subscriber for TUI mode
-            // (TUI handles its own output)
+            // Build TuiArgs from global flags
+            let tui_args = TuiArgs {
+                config: cli.config,
+                logs: None,
+                web: cli.web,
+                web_port: cli.web_port,
+                web_bind: cli.web_bind,
+            };
 
-            // Load config (uses default paths)
-            let config = OrchestratorConfig::load(None)?;
+            // Load config
+            let config = OrchestratorConfig::load(tui_args.config.as_deref())?;
             tui::log_deduplicator::configure_logging(config.get_logging());
 
             // Get initial changes using native implementation
             let changes = openspec::list_changes_native()?;
 
-            // Run TUI (no web server in default mode)
+            // Start web monitoring server if enabled and build URL
+            #[cfg(feature = "web-monitoring")]
+            let (web_url, web_state_opt) = if tui_args.web {
+                let web_state = std::sync::Arc::new(web::WebState::new(&changes));
+                let web_config =
+                    web::WebConfig::enabled(tui_args.web_port, tui_args.web_bind.clone());
+                match web::spawn_server_with_url(web_config, web_state.clone()).await {
+                    Ok((_web_handle, url)) => (Some(url), Some(web_state)),
+                    Err(e) => {
+                        tracing::warn!("Failed to start web monitoring server: {}", e);
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            };
+
+            #[cfg(not(feature = "web-monitoring"))]
+            let web_url: Option<String> = {
+                if tui_args.web {
+                    eprintln!(
+                        "Warning: Web monitoring is not enabled. Compile with --features web-monitoring"
+                    );
+                }
+                None
+            };
+
+            // Run TUI
             tui::run_tui(
                 changes,
                 config,
-                None,
+                web_url,
                 #[cfg(feature = "web-monitoring")]
-                None,
+                web_state_opt,
             )
             .await?;
         }
