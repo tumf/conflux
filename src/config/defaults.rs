@@ -57,21 +57,34 @@ Do NOT review or report on other changes in openspec/changes/.
 Review the implementation to verify it meets the specification requirements.
 
 Required checks:
-1. All tasks in openspec/changes/{change_id}/tasks.md are completed (marked with [x]) or moved to Future Work section
-2. Checkbox removal check: If tasks are moved to "Future Work", "Out of Scope", or "Notes" sections, they MUST NOT have checkboxes (`- [ ]` or `- [x]`).
+1. Git working tree clean check: run `git status --porcelain` and verify the output is empty.
+   - If `git status --porcelain` produces any output (uncommitted changes or untracked files), it is a FAIL.
+   - When FAIL due to dirty working tree, list ALL uncommitted changes and untracked files in FINDINGS with their file paths.
+   - Example FAIL output:
+     ```
+     ACCEPTANCE: FAIL
+     FINDINGS:
+     - Git working tree is dirty. Uncommitted changes and untracked files found:
+       - Modified: src/main.rs
+       - Modified: src/lib.rs
+       - Untracked: temp.txt
+       - Untracked: .env.local
+     ```
+2. All tasks in openspec/changes/{change_id}/tasks.md are completed (marked with [x]) or moved to Future Work section
+3. Checkbox removal check: If tasks are moved to "Future Work", "Out of Scope", or "Notes" sections, they MUST NOT have checkboxes (`- [ ]` or `- [x]`).
    - These sections should contain plain list items (e.g., `- Task description`) or plain text, NOT checkbox items.
    - If any checkbox (`- [ ]` or `- [x]`) is found in these sections, it is a FAIL.
    - Rationale: Checkboxes in these sections prevent archive completion (100% task completion requirement).
-3. Implementation matches the specification in openspec/changes/{change_id}/specs/
-4. Integration check: confirm the feature is actually executed in the real flow.
+4. Implementation matches the specification in openspec/changes/{change_id}/specs/
+5. Integration check: confirm the feature is actually executed in the real flow.
    - Identify the concrete call path(s) from entry point to the feature.
    - If the feature is not referenced by production code paths, it is a FAIL.
-5. Dead code check: if code exists but is not invoked by the CLI/TUI/parallel flow described in spec, it is a FAIL.
-6. Regression check: verify that existing features unrelated to this change are not broken.
+6. Dead code check: if code exists but is not invoked by the CLI/TUI/parallel flow described in spec, it is a FAIL.
+7. Regression check: verify that existing features unrelated to this change are not broken.
    - If the change modifies shared code (e.g., common functions, traits, structs), check that other callers still work.
    - If existing tests fail due to the change, it is a FAIL.
    - If existing functionality is removed or altered without being part of the spec, it is a FAIL.
-7. Evidence: cite at least one file path + function/method where the integration happens.
+8. Evidence: cite at least one file path + function/method where the integration happens.
 
 Do NOT include in FINDINGS:
 - Subjective quality assessments (e.g., "code quality could be better", "naming is unclear")
