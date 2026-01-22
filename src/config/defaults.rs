@@ -44,7 +44,7 @@ pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
 
 /// Hardcoded acceptance prompt - always prepended to user's acceptance_prompt
 /// Contains `{change_id}` placeholder that must be expanded before use.
-pub const ACCEPTANCE_SYSTEM_PROMPT: &str = r#"
+pub const ACCEPTANCE_SYSTEM_PROMPT: &str = r###"
 You are reviewing the implementation for change: {change_id}
 
 IMPORTANT: Only review the specific change "{change_id}".
@@ -98,10 +98,37 @@ Verification strategy:
 Output format:
 - If verification is incomplete and more investigation needed: Output "ACCEPTANCE: CONTINUE"
 - If all checks pass after thorough verification: Output "ACCEPTANCE: PASS"
-- If checks fail: Output "ACCEPTANCE: FAIL" followed by "FINDINGS:" and list ALL issues found (not just the first one)
+- If checks fail: Output "ACCEPTANCE: FAIL" followed by instructions to update tasks.md
 
-IMPORTANT: When outputting FAIL, list ALL issues discovered across all verification passes.
-Do not stop at the first issue - continue checking and report everything in one FAIL response.
+CRITICAL - When outputting FAIL:
+1. List ALL issues discovered across all verification passes in the FINDINGS section
+2. Do not stop at the first issue - continue checking and report everything in one FAIL response
+3. After listing all findings, you MUST directly update openspec/changes/{change_id}/tasks.md:
+   - Determine the next acceptance attempt number (check existing "## Acceptance #N Failure Follow-up" sections)
+   - If an "## Acceptance #N Failure Follow-up" section already exists for this attempt number, append findings to that section
+   - If no section exists for this attempt number, create a new section: "## Acceptance #<attempt_number> Failure Follow-up"
+   - Add each finding as a separate unchecked task: "- [ ] <finding>"
+   - Do NOT add lines like "ACCEPTANCE: FAIL" or "FINDINGS:" to tasks.md
+   - Do NOT create a wrapper task like "Address acceptance findings"
+   - Each finding should be a direct, actionable task at the top level of the follow-up section
+
+Example of updating tasks.md on FAIL (if this is attempt #2):
+```
+(Read current tasks.md, find existing content, then append:)
+
+## Acceptance #2 Failure Follow-up
+- [ ] Task 2.3 "Add acceptance test integration" in tasks.md is marked [ ] but not implemented
+- [ ] src/orchestrator.rs: run_loop() (line 142-180) does not call acceptance_test_streaming() between apply and archive
+- [ ] src/parallel/executor.rs: execute_change() calls apply() at line 95 but never calls acceptance before archive() at line 120
+- [ ] src/web/state.rs: broadcast_snapshot() does not include app_mode field, violating state broadcast requirement
+- [ ] src/main.rs: ControlCommand::Stop handler does not update app_mode to "stopping" before orchestrator processes it
+```
+
+If you discover findings, you MUST:
+1. Output "ACCEPTANCE: FAIL"
+2. Output "FINDINGS:" followed by all issues
+3. Use the Edit or Write tool to update openspec/changes/{change_id}/tasks.md with the follow-up section
+4. Verify the update was successful
 
 Example of CONTINUE (investigation in progress):
 ```
@@ -120,17 +147,17 @@ Example of PASS:
 ACCEPTANCE: PASS
 ```
 
-Example of FAIL (with ALL issues):
+Example of FAIL (with ALL issues and tasks.md update):
 ```
 ACCEPTANCE: FAIL
 FINDINGS:
 - Task 2.3 "Add acceptance test integration" in tasks.md is marked [ ] but not implemented
 - src/orchestrator.rs: run_loop() (line 142-180) does not call acceptance_test_streaming() between apply and archive
 - src/parallel/executor.rs: execute_change() calls apply() at line 95 but never calls acceptance before archive() at line 120
-- src/web/state.rs: broadcast_snapshot() does not include app_mode field, violating state broadcast requirement
-- src/main.rs: ControlCommand::Stop handler does not update app_mode to "stopping" before orchestrator processes it
+
+(Then use Edit tool to append to tasks.md)
 ```
-"#;
+"###;
 
 /// Default prompt for acceptance command - appended after hardcoded prompt
 pub const DEFAULT_ACCEPTANCE_PROMPT: &str = "";

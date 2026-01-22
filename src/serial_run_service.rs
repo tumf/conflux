@@ -20,9 +20,8 @@ use crate::error::Result;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::{
-    acceptance_test_streaming, apply_change_streaming, archive_change,
-    update_tasks_on_acceptance_failure, AcceptanceResult, ApplyContext, ApplyResult,
-    ArchiveContext, ArchiveResult, OutputHandler,
+    acceptance_test_streaming, apply_change_streaming, archive_change, AcceptanceResult,
+    ApplyContext, ApplyResult, ArchiveContext, ArchiveResult, OutputHandler,
 };
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser::TaskProgress;
@@ -425,41 +424,21 @@ impl SerialRunService {
                                 Ok(ChangeProcessResult::AcceptanceContinue)
                             }
                         }
-                        Ok((AcceptanceResult::Fail { findings }, attempt_number)) => {
+                        Ok((AcceptanceResult::Fail { findings }, _attempt_number)) => {
                             warn!(
                                 "Acceptance failed for {} with {} findings, will retry apply",
                                 change.id,
                                 findings.len()
                             );
-                            // Update tasks.md with acceptance findings using the attempt number from the function
-                            if let Err(e) = update_tasks_on_acceptance_failure(
-                                &change.id,
-                                &findings,
-                                None,
-                                attempt_number,
-                            )
-                            .await
-                            {
-                                warn!("Failed to update tasks.md for {}: {}", change.id, e);
-                            }
+                            // Note: tasks.md is now updated by the acceptance agent itself
                             Ok(ChangeProcessResult::AcceptanceFailed { findings })
                         }
                         Ok((
-                            AcceptanceResult::CommandFailed { error, findings },
-                            attempt_number,
+                            AcceptanceResult::CommandFailed { error, findings: _ },
+                            _attempt_number,
                         )) => {
                             error!("Acceptance command failed for {}: {}", change.id, error);
-                            // Update tasks.md with command failure
-                            if let Err(e) = update_tasks_on_acceptance_failure(
-                                &change.id,
-                                &findings,
-                                None,
-                                attempt_number,
-                            )
-                            .await
-                            {
-                                warn!("Failed to update tasks.md for {}: {}", change.id, e);
-                            }
+                            // Note: tasks.md is now updated by the acceptance agent itself
                             Ok(ChangeProcessResult::AcceptanceCommandFailed { error })
                         }
                         Ok((AcceptanceResult::Cancelled, _attempt_number)) => {
