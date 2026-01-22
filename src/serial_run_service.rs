@@ -312,6 +312,13 @@ impl SerialRunService {
                     .run_hook(HookType::OnChangeEnd, &change_end_context)
                     .await?;
 
+                // Run on_merged hook after on_change_end (serial mode: archive success = merge complete equivalent)
+                let merged_context =
+                    HookContext::new(self.changes_processed, total_changes, new_remaining, false)
+                        .with_change(&change.id, change.completed_tasks, change.total_tasks)
+                        .with_apply_count(apply_count);
+                hooks.run_hook(HookType::OnMerged, &merged_context).await?;
+
                 // Mark change as completed and clear current
                 self.completed_change_ids.insert(change.id.clone());
                 self.current_change_id = None;
@@ -395,11 +402,11 @@ impl SerialRunService {
                     )
                     .await
                     {
-                        Ok(AcceptanceResult::Pass) => {
+                        Ok((AcceptanceResult::Pass, _attempt_number)) => {
                             info!("Acceptance passed for {}, ready for archive", change.id);
                             Ok(ChangeProcessResult::AcceptancePassed)
                         }
-                        Ok(AcceptanceResult::Continue) => {
+                        Ok((AcceptanceResult::Continue, _attempt_number)) => {
                             let continue_count =
                                 agent.count_consecutive_acceptance_continues(&change.id);
                             let max_continues = self.config.get_acceptance_max_continues();
@@ -418,33 +425,44 @@ impl SerialRunService {
                                 Ok(ChangeProcessResult::AcceptanceContinue)
                             }
                         }
-                        Ok(AcceptanceResult::Fail { findings }) => {
+                        Ok((AcceptanceResult::Fail { findings }, attempt_number)) => {
                             warn!(
                                 "Acceptance failed for {} with {} findings, will retry apply",
                                 change.id,
                                 findings.len()
                             );
-                            // Update tasks.md with acceptance findings
-                            if let Err(e) =
-                                update_tasks_on_acceptance_failure(&change.id, &findings, None)
-                                    .await
+                            // Update tasks.md with acceptance findings using the attempt number from the function
+                            if let Err(e) = update_tasks_on_acceptance_failure(
+                                &change.id,
+                                &findings,
+                                None,
+                                attempt_number,
+                            )
+                            .await
                             {
                                 warn!("Failed to update tasks.md for {}: {}", change.id, e);
                             }
                             Ok(ChangeProcessResult::AcceptanceFailed { findings })
                         }
-                        Ok(AcceptanceResult::CommandFailed { error, findings }) => {
+                        Ok((
+                            AcceptanceResult::CommandFailed { error, findings },
+                            attempt_number,
+                        )) => {
                             error!("Acceptance command failed for {}: {}", change.id, error);
                             // Update tasks.md with command failure
-                            if let Err(e) =
-                                update_tasks_on_acceptance_failure(&change.id, &findings, None)
-                                    .await
+                            if let Err(e) = update_tasks_on_acceptance_failure(
+                                &change.id,
+                                &findings,
+                                None,
+                                attempt_number,
+                            )
+                            .await
                             {
                                 warn!("Failed to update tasks.md for {}: {}", change.id, e);
                             }
                             Ok(ChangeProcessResult::AcceptanceCommandFailed { error })
                         }
-                        Ok(AcceptanceResult::Cancelled) => {
+                        Ok((AcceptanceResult::Cancelled, _attempt_number)) => {
                             info!("Acceptance cancelled for {}", change.id);
                             Ok(ChangeProcessResult::Cancelled)
                         }

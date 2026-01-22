@@ -50,35 +50,44 @@ The `run` subcommand SHALL execute the OpenSpec change workflow orchestration lo
 - **AND** the snapshot log shows only `a` and `c`
 
 ### Requirement: Orchestration loop runs apply and archive
-The `run` subcommand SHALL execute the OpenSpec change workflow orchestration loop.
-The orchestrator SHALL execute an acceptance loop after a successful apply and before starting archive.
-The acceptance loop SHALL run `acceptance_command` for the change, parse the output text to determine acceptance success, failure, or continue, and route the change accordingly.
-- Exit code indicates command execution success, not acceptance verdict.
-- Acceptance prompt MUST include a hardcoded acceptance prompt followed by configured `acceptance_prompt`.
-- The acceptance verdict parsing MUST recognize PASS/FAIL/CONTINUE markers even when the marker line includes non-semantic decoration (example: Markdown emphasis or surrounding punctuation).
-- When acceptance fails, the orchestrator MUST update tasks.md before returning to the apply loop.
-- Task updates MUST either add a new follow-up task or uncheck a previously completed task that must be revisited.
-- The acceptance failure reason MUST be recorded in tasks.md together with the task update.
-- The acceptance failure reason MUST be captured from the acceptance output tail rather than parsed findings.
-- The acceptance failure reason MUST be recorded as a line-by-line bullet list without numbering.
-- The apply loop MUST resume with the same iteration counter value (no reset) after acceptance failure.
-- If the output indicates CONTINUE, the orchestrator MUST retry acceptance up to `acceptance_max_continues` times.
-- If no acceptance marker is present, the orchestrator MUST treat the outcome as CONTINUE and retry according to `acceptance_max_continues`.
-- If the CONTINUE limit is exceeded, the orchestrator MUST treat the outcome as FAIL and return to the apply loop.
-- The acceptance loop MUST carry forward its iteration counter when returning to the apply loop after acceptance failure.
-- The acceptance loop iteration counter MUST increment on each acceptance attempt, and MUST NOT reset when the apply loop is re-entered due to acceptance failure.
-- The second and later acceptance attempts MUST focus on the updated file list since the previous acceptance attempt and the previously reported findings, rather than performing a full re-check.
-- The acceptance prompt for second and later attempts MUST include the updated file list (file paths only) since the previous acceptance attempt.
-- The acceptance prompt for second and later attempts MUST include the previous acceptance findings and instruct the agent to verify whether those findings are resolved.
-- The acceptance prompt for second and later attempts MUST instruct the agent to read relevant files as needed; it MUST NOT include diff content.
+`run` サブコマンドは OpenSpec change workflow のオーケストレーションループを実行しなければならない（SHALL）。
+オーケストレーターは apply 成功後に acceptance ループを実行し、archive 開始前に結果を判定しなければならない（SHALL）。
+acceptance ループは change に対して `acceptance_command` を実行し、出力テキストから pass/fail/continue を判定して処理を分岐しなければならない（SHALL）。
+- exit code はコマンド実行成否のみを示し、acceptance 判定には使用しない。
+- acceptance prompt はハードコードされた acceptance prompt の後に設定値の `acceptance_prompt` を連結しなければならない（MUST）。
+- acceptance verdict parsing は PASS/FAIL/CONTINUE マーカーが非意味的な装飾（Markdown 強調など）を伴っていても認識しなければならない（MUST）。
+- acceptance が FAIL の場合、apply ループへ戻る前に tasks.md を更新しなければならない（MUST）。
+- tasks.md の更新は、acceptance の失敗回数に対応する `## Acceptance #<n> Failure Follow-up` セクションを末尾に追加するか、既存の関連タスクを未完了に戻す形で行わなければならない（MUST）。
+- `Acceptance #<n> Failure Follow-up` の `<n>` は当該 acceptance 試行の 1 始まりの試行番号と一致しなければならない（MUST）。
+- acceptance の失敗理由（findings）は tasks.md に記録しなければならない（MUST）。
+- 失敗理由は acceptance 出力の末尾から取得し、解析済み findings ではなく tail を使用しなければならない（MUST）。
+- `Acceptance #<n> Failure Follow-up` セクションでは、各 finding を `- [ ] <finding>` の未完了タスクとして 1 行ずつ記録しなければならない（MUST）。番号付きの箇条書きを使用してはならない（MUST NOT）。
+- follow-up セクションに `Address acceptance findings:` のようなラッパー行やネストされた箇条書きを追加してはならない（MUST NOT）。
+- apply ループは acceptance failure 後も同じ iteration カウンター値で再開しなければならない（MUST）。
+- 出力が CONTINUE を示す場合、オーケストレーターは `acceptance_max_continues` 回まで acceptance を再試行しなければならない（MUST）。
+- acceptance マーカーが存在しない場合、オーケストレーターは CONTINUE として扱い、`acceptance_max_continues` に従って再試行しなければならない（MUST）。
+- CONTINUE の上限を超えた場合、オーケストレーターは FAIL として扱い apply ループへ戻らなければならない（MUST）。
+- acceptance 失敗後に apply ループへ戻る際、acceptance ループの iteration カウンターを引き継がなければならない（MUST）。
+- acceptance ループの iteration カウンターは試行ごとに増加し、acceptance failure 後に apply ループへ戻ってもリセットしてはならない（MUST NOT）。
+- 2 回目以降の acceptance は、前回の acceptance 以降に更新されたファイル一覧と過去の findings に集中し、フルチェックを行ってはならない（MUST NOT）。
+- 2 回目以降の acceptance prompt は、前回 acceptance 以降に更新されたファイル一覧（パスのみ）を含めなければならない（MUST）。
+- 2 回目以降の acceptance prompt は、前回の acceptance findings を含め、解消確認を指示しなければならない（MUST）。
+- 2 回目以降の acceptance prompt は、必要に応じて関連ファイルを読むよう指示し、diff 内容を含めてはならない（MUST NOT）。
 
 #### Scenario: Acceptance retry narrows to updated files and prior findings
-- **GIVEN** a change completes an apply iteration successfully
-- **AND** acceptance output indicates CONTINUE
-- **WHEN** the orchestrator runs a subsequent acceptance attempt for the same change
-- **THEN** the acceptance prompt includes only the updated file list since the previous acceptance attempt (no diff content)
-- **AND** the acceptance prompt includes the prior acceptance findings for verification
-- **AND** the acceptance prompt instructs the agent to read files as needed to confirm fixes
+- **GIVEN** change が apply iteration を正常完了する
+- **AND** acceptance output が CONTINUE を示す
+- **WHEN** オーケストレーターが同じ change に対して次の acceptance を実行する
+- **THEN** acceptance prompt は前回の acceptance 以降の更新ファイル一覧のみを含む（diff content なし）
+- **AND** acceptance prompt は前回の acceptance findings を含み、解消確認を指示する
+- **AND** acceptance prompt は必要に応じて関連ファイルを読むよう指示し、diff 内容を含めない
+
+#### Scenario: Acceptance failure follow-up uses numbered section and flat tasks
+- **GIVEN** acceptance output が FAIL で 2 件の findings を含む
+- **WHEN** acceptance failure の tasks.md 更新が実行される
+- **THEN** tasks.md の末尾に `## Acceptance #1 Failure Follow-up` が追加される
+- **AND** セクション内に `- [ ] <finding>` の未完了タスクが 2 行追加される
+- **AND** `Address acceptance findings` のようなラッパー行やネスト箇条書きは含まれない
 
 ### Requirement: Default TUI Launch
 
