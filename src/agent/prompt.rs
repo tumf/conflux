@@ -46,18 +46,24 @@ pub fn build_archive_prompt(user_prompt: &str, history_context: &str) -> String 
 /// The prompt is constructed as:
 /// 1. ACCEPTANCE_SYSTEM_PROMPT with {change_id} expanded (always included)
 /// 2. diff_context (if not empty) - for 2nd+ acceptance attempts
-/// 3. user_prompt (if not empty)
-/// 4. history_context (if not empty)
+/// 3. last_output_context (if not empty) - previous acceptance stdout/stderr tail for 2nd+ attempts
+/// 4. user_prompt (if not empty)
+/// 5. history_context (if not empty)
 pub fn build_acceptance_prompt(
     change_id: &str,
     user_prompt: &str,
     history_context: &str,
+    last_output_context: &str,
 ) -> String {
     let mut parts = Vec::new();
 
     // System prompt is always included first, with change_id expanded
     let system_prompt = ACCEPTANCE_SYSTEM_PROMPT.replace("{change_id}", change_id);
     parts.push(system_prompt);
+
+    if !last_output_context.is_empty() {
+        parts.push(last_output_context.to_string());
+    }
 
     if !user_prompt.is_empty() {
         parts.push(user_prompt.to_string());
@@ -102,6 +108,47 @@ pub fn build_acceptance_diff_context(
     lines.push("2. Whether the changes introduce new issues".to_string());
     lines.push("3. Read relevant files if needed to confirm the fixes".to_string());
     lines.push("</acceptance_diff_context>".to_string());
+
+    lines.join("\n")
+}
+
+/// Build last acceptance output context for 2nd+ acceptance attempts.
+///
+/// Returns formatted context with stdout/stderr tail from the previous acceptance attempt.
+/// This allows the agent to see what was investigated in the previous acceptance run.
+pub fn build_last_acceptance_output_context(
+    stdout_tail: Option<&str>,
+    stderr_tail: Option<&str>,
+) -> String {
+    // If both are empty, return empty string
+    if stdout_tail.is_none() && stderr_tail.is_none() {
+        return String::new();
+    }
+
+    let mut lines = vec!["<last_acceptance_output>".to_string()];
+    lines.push(
+        "Previous acceptance investigation output (for context - avoid repeating the same checks):"
+            .to_string(),
+    );
+    lines.push(String::new());
+
+    if let Some(stdout) = stdout_tail {
+        if !stdout.trim().is_empty() {
+            lines.push("stdout:".to_string());
+            lines.push(stdout.to_string());
+            lines.push(String::new());
+        }
+    }
+
+    if let Some(stderr) = stderr_tail {
+        if !stderr.trim().is_empty() {
+            lines.push("stderr:".to_string());
+            lines.push(stderr.to_string());
+            lines.push(String::new());
+        }
+    }
+
+    lines.push("</last_acceptance_output>".to_string());
 
     lines.join("\n")
 }
