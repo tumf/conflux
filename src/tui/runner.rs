@@ -1710,6 +1710,7 @@ async fn run_tui_loop(
                     let merge_tx = tx.clone();
                     let merge_repo_root = repo_root.clone();
                     let merge_branch = branch_name.clone();
+                    let merge_config = config.clone();
 
                     tokio::spawn(async move {
                         debug!(
@@ -1742,6 +1743,49 @@ async fn run_tui_loop(
                                         branch_name: merge_branch.clone(),
                                     })
                                     .await;
+
+                                // Run on_merged hook after manual branch merge
+                                // Try to extract change_id from branch name; if it fails, log a warning
+                                if let Some(change_id) = crate::vcs::GitWorkspaceManager::extract_change_id_from_worktree_name(&merge_branch) {
+                                    // Create hook runner from config
+                                    let hooks_config = merge_config.get_hooks();
+                                    let hooks = crate::hooks::HookRunner::new(hooks_config);
+
+                                    // Fetch actual task counts from change data
+                                    let (completed_tasks, total_tasks) =
+                                        match crate::openspec::list_changes_native() {
+                                            Ok(changes) => changes
+                                                .iter()
+                                                .find(|c| c.id == change_id)
+                                                .map(|c| (c.completed_tasks, c.total_tasks))
+                                                .unwrap_or((0, 0)),
+                                            Err(e) => {
+                                                use tracing::warn;
+                                                warn!(
+                                                    "Failed to fetch task counts for on_merged hook: {}",
+                                                    e
+                                                );
+                                                (0, 0)
+                                            }
+                                        };
+
+                                    let hook_context = crate::hooks::HookContext::new(
+                                        0, // changes_processed not available in manual merge
+                                        0, // total_changes not available
+                                        0, // remaining_changes not available
+                                        false,
+                                    )
+                                    .with_change(&change_id, completed_tasks, total_tasks)
+                                    .with_apply_count(0);
+
+                                    if let Err(e) = hooks.run_hook(crate::hooks::HookType::OnMerged, &hook_context).await {
+                                        use tracing::warn;
+                                        warn!("on_merged hook failed for {}: {}", change_id, e);
+                                    }
+                                } else {
+                                    use tracing::warn;
+                                    warn!("Could not extract change_id from branch name '{}', skipping on_merged hook", merge_branch);
+                                }
 
                                 // Refresh worktree list to update UI with conflict check
                                 debug!("Refreshing worktree list after successful merge");

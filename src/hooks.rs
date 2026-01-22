@@ -43,6 +43,8 @@ pub enum HookType {
     PostArchive,
     /// Triggered when change processing ends (once per change, after archive)
     OnChangeEnd,
+    /// Triggered when a change is merged to base branch
+    OnMerged,
 
     // === User interaction (TUI only) ===
     /// Triggered when user adds a change to queue (Space key)
@@ -71,6 +73,7 @@ impl HookType {
             HookType::PreArchive => "pre_archive",
             HookType::PostArchive => "post_archive",
             HookType::OnChangeEnd => "on_change_end",
+            HookType::OnMerged => "on_merged",
             // User interaction (TUI only)
             HookType::OnQueueAdd => "on_queue_add",
             HookType::OnQueueRemove => "on_queue_remove",
@@ -208,6 +211,8 @@ pub struct HooksConfig {
     pub post_archive: Option<HookConfigValue>,
     #[serde(default)]
     pub on_change_end: Option<HookConfigValue>,
+    #[serde(default)]
+    pub on_merged: Option<HookConfigValue>,
 
     // === User interaction (TUI only) ===
     #[serde(default)]
@@ -236,6 +241,7 @@ impl HooksConfig {
             HookType::PreArchive => self.pre_archive.clone(),
             HookType::PostArchive => self.post_archive.clone(),
             HookType::OnChangeEnd => self.on_change_end.clone(),
+            HookType::OnMerged => self.on_merged.clone(),
             // User interaction (TUI only)
             HookType::OnQueueAdd => self.on_queue_add.clone(),
             HookType::OnQueueRemove => self.on_queue_remove.clone(),
@@ -258,6 +264,7 @@ impl HooksConfig {
             || self.pre_archive.is_some()
             || self.post_archive.is_some()
             || self.on_change_end.is_some()
+            || self.on_merged.is_some()
             || self.on_queue_add.is_some()
             || self.on_queue_remove.is_some()
             || self.on_approve.is_some()
@@ -974,6 +981,7 @@ mod tests {
         assert_eq!(HookType::PreArchive.config_key(), "pre_archive");
         assert_eq!(HookType::PostArchive.config_key(), "post_archive");
         assert_eq!(HookType::OnChangeEnd.config_key(), "on_change_end");
+        assert_eq!(HookType::OnMerged.config_key(), "on_merged");
         assert_eq!(HookType::OnFinish.config_key(), "on_finish");
     }
 
@@ -1107,6 +1115,7 @@ mod tests {
             "pre_archive": "echo pre_archive",
             "post_archive": "echo post_archive",
             "on_change_end": "echo change_end",
+            "on_merged": "echo merged",
             "on_queue_add": "echo queue_add",
             "on_queue_remove": "echo queue_remove",
             "on_approve": "echo approve",
@@ -1126,6 +1135,7 @@ mod tests {
         assert!(runner.has_hook(HookType::PreArchive));
         assert!(runner.has_hook(HookType::PostArchive));
         assert!(runner.has_hook(HookType::OnChangeEnd));
+        assert!(runner.has_hook(HookType::OnMerged));
         assert!(runner.has_hook(HookType::OnQueueAdd));
         assert!(runner.has_hook(HookType::OnQueueRemove));
         assert!(runner.has_hook(HookType::OnApprove));
