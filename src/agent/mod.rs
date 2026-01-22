@@ -11,12 +11,11 @@ mod runner;
 
 // Re-export public types for backward compatibility
 pub use output::OutputLine;
-pub use prompt::{build_apply_prompt, build_archive_prompt};
+pub use prompt::{
+    build_acceptance_prompt, build_apply_prompt, build_archive_prompt,
+    build_last_acceptance_output_context,
+};
 pub use runner::AgentRunner;
-
-// Re-export for testing and potential future use
-#[allow(unused_imports)]
-pub use prompt::{build_acceptance_prompt, APPLY_SYSTEM_PROMPT};
 
 #[cfg(test)]
 mod tests;

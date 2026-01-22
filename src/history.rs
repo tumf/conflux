@@ -414,6 +414,31 @@ impl AcceptanceHistory {
             .and_then(|a| a.findings.clone())
     }
 
+    /// Get the last acceptance attempt for a change.
+    /// Returns None if there are no previous attempts.
+    #[allow(dead_code)] // Reserved for future direct use
+    pub fn get_last_attempt(&self, change_id: &str) -> Option<&AcceptanceAttempt> {
+        self.attempts.get(change_id).and_then(|v| v.last())
+    }
+
+    /// Get the last stdout tail from the most recent acceptance attempt.
+    /// Returns None if there are no previous attempts or the last attempt has no stdout tail.
+    pub fn last_stdout_tail(&self, change_id: &str) -> Option<String> {
+        self.attempts
+            .get(change_id)
+            .and_then(|v| v.last())
+            .and_then(|a| a.stdout_tail.clone())
+    }
+
+    /// Get the last stderr tail from the most recent acceptance attempt.
+    /// Returns None if there are no previous attempts or the last attempt has no stderr tail.
+    pub fn last_stderr_tail(&self, change_id: &str) -> Option<String> {
+        self.attempts
+            .get(change_id)
+            .and_then(|v| v.last())
+            .and_then(|a| a.stderr_tail.clone())
+    }
+
     /// Format history as context string for prompt injection.
     /// Returns an empty string if there are no previous attempts.
     pub fn format_context(&self, change_id: &str) -> String {
