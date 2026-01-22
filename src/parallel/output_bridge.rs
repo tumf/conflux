@@ -166,7 +166,7 @@ impl ApplyEventHandler for ParallelApplyEventHandler {
         }
     }
 
-    fn on_apply_output(&self, change_id: &str, line: &OutputLine) {
+    fn on_apply_output(&self, change_id: &str, line: &OutputLine, iteration: u32) {
         let output = match line {
             OutputLine::Stdout(s) | OutputLine::Stderr(s) => s.clone(),
         };
@@ -174,7 +174,7 @@ impl ApplyEventHandler for ParallelApplyEventHandler {
             let _ = tx.try_send(ParallelEvent::ApplyOutput {
                 change_id: change_id.to_string(),
                 output,
-                iteration: None, // Iteration tracking is internal to apply loop
+                iteration: Some(iteration),
             });
         }
     }

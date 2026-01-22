@@ -428,7 +428,7 @@ pub trait ApplyEventHandler {
     /// Called when hook fails
     fn on_hook_failed(&self, change_id: &str, hook_type: &str, error: &str);
     /// Called when apply output is generated
-    fn on_apply_output(&self, change_id: &str, line: &OutputLine);
+    fn on_apply_output(&self, change_id: &str, line: &OutputLine, iteration: u32);
 }
 
 /// No-op event handler for cases where events are not needed
@@ -440,7 +440,7 @@ impl ApplyEventHandler for NoOpEventHandler {
     fn on_hook_started(&self, _change_id: &str, _hook_type: &str) {}
     fn on_hook_completed(&self, _change_id: &str, _hook_type: &str) {}
     fn on_hook_failed(&self, _change_id: &str, _hook_type: &str, _error: &str) {}
-    fn on_apply_output(&self, _change_id: &str, _line: &OutputLine) {}
+    fn on_apply_output(&self, _change_id: &str, _line: &OutputLine, _iteration: u32) {}
 }
 
 /// Context for building hook contexts in the apply loop
@@ -681,7 +681,7 @@ where
                 OutputLine::Stdout(s) => output_collector.add_stdout(s),
                 OutputLine::Stderr(s) => output_collector.add_stderr(s),
             }
-            event_handler.on_apply_output(change_id, &line);
+            event_handler.on_apply_output(change_id, &line, iteration);
             output_handler(line).await;
         }
 
