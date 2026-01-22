@@ -1,6 +1,7 @@
 //! Tests for agent module
 
 use super::*;
+use crate::agent::prompt::APPLY_SYSTEM_PROMPT;
 use crate::config::OrchestratorConfig;
 
 #[test]

@@ -4,7 +4,6 @@
 
 #![allow(dead_code)]
 
-use crate::acceptance::{parse_acceptance_output, AcceptanceResult as ParseResult};
 use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{AcceptanceAttempt, OutputCollector};
@@ -146,8 +145,8 @@ where
     let stdout_tail = output_collector.stdout_tail();
     let stderr_tail = output_collector.stderr_tail();
 
-    // Parse acceptance output
-    let parse_result = parse_acceptance_output(&full_stdout);
+    // TODO: Use actual command output (tail_findings) instead of parsing
+    // Build findings from last N lines of output
     let tail_findings = build_acceptance_tail_findings(stdout_tail.clone(), stderr_tail.clone());
 
     // Check if command failed
@@ -178,76 +177,23 @@ where
         ));
     }
 
-    // Process parsed result
-    match parse_result {
-        ParseResult::Pass => {
-            info!("Acceptance passed for: {}", change.id);
-            let attempt_number = agent.next_acceptance_attempt_number(&change.id);
-            let attempt = AcceptanceAttempt {
-                attempt: attempt_number,
-                passed: true,
-                duration: start_time.elapsed(),
-                findings: None,
-                exit_code: status.code(),
-                stdout_tail,
-                stderr_tail: stderr_tail.clone(),
-                commit_hash: commit_hash.clone(),
-            };
-            agent.record_acceptance_attempt(&change.id, attempt);
-            output.on_success("Acceptance test passed");
-            Ok((AcceptanceResult::Pass, attempt_number))
-        }
-        ParseResult::Continue => {
-            info!("Acceptance requires continuation for: {}", change.id);
-            let attempt_number = agent.next_acceptance_attempt_number(&change.id);
-            let attempt = AcceptanceAttempt {
-                attempt: attempt_number,
-                passed: false,
-                duration: start_time.elapsed(),
-                findings: Some(vec!["Investigation incomplete - continue later".to_string()]),
-                exit_code: status.code(),
-                stdout_tail,
-                stderr_tail,
-                commit_hash: commit_hash.clone(),
-            };
-            agent.record_acceptance_attempt(&change.id, attempt);
-            output.on_info("Acceptance test requires continuation");
-            Ok((AcceptanceResult::Continue, attempt_number))
-        }
-        ParseResult::Fail { .. } => {
-            let findings_for_tasks = tail_findings.clone();
-            info!(
-                "Acceptance failed for: {} with {} findings",
-                change.id,
-                findings_for_tasks.len()
-            );
-            let attempt_number = agent.next_acceptance_attempt_number(&change.id);
-            let attempt = AcceptanceAttempt {
-                attempt: attempt_number,
-                passed: false,
-                duration: start_time.elapsed(),
-                findings: Some(findings_for_tasks.clone()),
-                exit_code: status.code(),
-                stdout_tail,
-                stderr_tail,
-                commit_hash: commit_hash.clone(),
-            };
-            agent.record_acceptance_attempt(&change.id, attempt);
-            output.on_warn(&format!(
-                "Acceptance test failed with {} findings",
-                findings_for_tasks.len()
-            ));
-            for finding in &findings_for_tasks {
-                output.on_warn(&format!("  - {}", finding));
-            }
-            Ok((
-                AcceptanceResult::Fail {
-                    findings: findings_for_tasks,
-                },
-                attempt_number,
-            ))
-        }
-    }
+    // TODO: Always return Continue with tail_findings for investigation
+    // This allows the acceptance loop to carry tail output to next apply iteration
+    info!("Acceptance requires continuation for: {}", change.id);
+    let attempt_number = agent.next_acceptance_attempt_number(&change.id);
+    let attempt = AcceptanceAttempt {
+        attempt: attempt_number,
+        passed: false,
+        duration: start_time.elapsed(),
+        findings: Some(tail_findings.clone()),
+        exit_code: status.code(),
+        stdout_tail,
+        stderr_tail,
+        commit_hash: commit_hash.clone(),
+    };
+    agent.record_acceptance_attempt(&change.id, attempt);
+    output.on_info("Acceptance test requires continuation");
+    Ok((AcceptanceResult::Continue, attempt_number))
 }
 
 #[cfg(test)]
