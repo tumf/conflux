@@ -1465,18 +1465,7 @@ impl ParallelExecutor {
                                 change_id,
                                 findings.len()
                             );
-                            // Update tasks.md with acceptance findings
-                            if let Err(e) =
-                                crate::orchestration::update_tasks_on_acceptance_failure(
-                                    change_id,
-                                    &findings,
-                                    Some(&workspace.path),
-                                    acceptance_iteration,
-                                )
-                                .await
-                            {
-                                warn!("Failed to update tasks.md for {}: {}", change_id, e);
-                            }
+                            // Note: tasks.md is now updated by the acceptance agent itself
                             send_event(
                                 &self.event_tx,
                                 ParallelEvent::Log(
@@ -1497,7 +1486,7 @@ impl ParallelExecutor {
                         Ok((
                             crate::orchestration::AcceptanceResult::CommandFailed {
                                 error,
-                                findings,
+                                findings: _,
                             },
                             acceptance_iteration,
                         )) => {
@@ -1505,17 +1494,7 @@ impl ParallelExecutor {
                                 "Acceptance command failed for {} on resume: {}",
                                 change_id, error
                             );
-                            if let Err(e) =
-                                crate::orchestration::update_tasks_on_acceptance_failure(
-                                    change_id,
-                                    &findings,
-                                    Some(&workspace.path),
-                                    acceptance_iteration,
-                                )
-                                .await
-                            {
-                                warn!("Failed to update tasks.md for {}: {}", change_id, e);
-                            }
+                            // Note: tasks.md is now updated by the acceptance agent itself
                             send_event(
                                 &self.event_tx,
                                 ParallelEvent::Log(
@@ -2223,21 +2202,7 @@ impl ParallelExecutor {
                             findings.len(),
                             cycle_count
                         );
-                        // Update tasks.md with acceptance findings
-                        if let Err(e) =
-                            crate::orchestration::update_tasks_on_acceptance_failure(
-                                &change_id,
-                                &findings,
-                                Some(&workspace.path),
-                                acceptance_iteration,
-                            )
-                            .await
-                        {
-                            warn!(
-                                "Failed to update tasks.md for {}: {}",
-                                change_id, e
-                            );
-                        }
+                        // Note: tasks.md is now updated by the acceptance agent itself
                         if let Some(ref tx) = event_tx {
                             let _ = tx
                                 .send(ParallelEvent::Log(
@@ -2257,26 +2222,13 @@ impl ParallelExecutor {
                     }
                     Ok((crate::orchestration::AcceptanceResult::CommandFailed {
                         error,
-                        findings,
+                        findings: _,
                     }, acceptance_iteration)) => {
                         error!(
                             "Acceptance command failed for {} (cycle {}): {}",
                             change_id, cycle_count, error
                         );
-                        // Update tasks.md with command failure
-                        if let Err(e) = crate::orchestration::update_tasks_on_acceptance_failure(
-                            &change_id,
-                            &findings,
-                            Some(&workspace.path),
-                            acceptance_iteration,
-                        )
-                        .await
-                        {
-                            warn!(
-                                "Failed to update tasks.md for {}: {}",
-                                change_id, e
-                            );
-                        }
+                        // Note: tasks.md is now updated by the acceptance agent itself
                         if let Some(ref tx) = event_tx {
                             let _ = tx
                                 .send(ParallelEvent::Log(
@@ -2742,21 +2694,7 @@ impl ParallelExecutor {
                                 findings.len(),
                                 cycle_count
                             );
-                            // Update tasks.md with acceptance findings
-                            if let Err(e) =
-                                crate::orchestration::update_tasks_on_acceptance_failure(
-                                    &change_id,
-                                    &findings,
-                                    Some(&workspace_path),
-                                    acceptance_iteration,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    "Failed to update tasks.md for {}: {}",
-                                    change_id, e
-                                );
-                            }
+                            // Note: tasks.md is now updated by the acceptance agent itself
                             if let Some(ref tx) = event_tx {
                                 let _ = tx
                                     .send(ParallelEvent::Log(
@@ -2776,27 +2714,13 @@ impl ParallelExecutor {
                         }
                         Ok((crate::orchestration::AcceptanceResult::CommandFailed {
                             error,
-                            findings,
+                            findings: _,
                         }, acceptance_iteration)) => {
                             error!(
                                 "Acceptance command failed for {} (cycle {}): {}",
                                 change_id, cycle_count, error
                             );
-                            // Update tasks.md with command failure
-                            if let Err(e) =
-                                crate::orchestration::update_tasks_on_acceptance_failure(
-                                    &change_id,
-                                    &findings,
-                                    Some(&workspace_path),
-                                    acceptance_iteration,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    "Failed to update tasks.md for {}: {}",
-                                    change_id, e
-                                );
-                            }
+                            // Note: tasks.md is now updated by the acceptance agent itself
                             if let Some(ref tx) = event_tx {
                                 let _ = tx
                                     .send(ParallelEvent::Log(
@@ -3341,20 +3265,7 @@ impl ParallelExecutor {
                                                                             findings.len(),
                                                                             cycle_count
                                                                         );
-                                                                        if let Err(e) =
-                                                                            crate::orchestration::update_tasks_on_acceptance_failure(
-                                                                                &change_id,
-                                                                                &findings,
-                                                                                Some(&workspace_path),
-                                                                                acceptance_iteration,
-                                                                            )
-                                                                            .await
-                                                                        {
-                                                                            warn!(
-                                                                                "Failed to update tasks.md for {}: {}",
-                                                                                change_id, e
-                                                                            );
-                                                                        }
+                                                                        // Note: tasks.md is now updated by the acceptance agent itself
                                                                         if let Some(ref tx) = event_tx {
                                                                             let _ = tx
                                                                                 .send(ParallelEvent::Log(
@@ -3373,26 +3284,13 @@ impl ParallelExecutor {
                                                                     }
                                                                     Ok((crate::orchestration::AcceptanceResult::CommandFailed {
                                                                         error,
-                                                                        findings,
+                                                                        findings: _,
                                                                     }, acceptance_iteration)) => {
                                                                         error!(
                                                                             "Acceptance command failed for {} (cycle {}): {}",
                                                                             change_id, cycle_count, error
                                                                         );
-                                                                        if let Err(e) =
-                                                                            crate::orchestration::update_tasks_on_acceptance_failure(
-                                                                                &change_id,
-                                                                                &findings,
-                                                                                Some(&workspace_path),
-                                                                                acceptance_iteration,
-                                                                            )
-                                                                            .await
-                                                                        {
-                                                                            warn!(
-                                                                                "Failed to update tasks.md for {}: {}",
-                                                                                change_id, e
-                                                                            );
-                                                                        }
+                                                                        // Note: tasks.md is now updated by the acceptance agent itself
                                                                         if let Some(ref tx) = event_tx {
                                                                             let _ = tx
                                                                                 .send(ParallelEvent::Log(

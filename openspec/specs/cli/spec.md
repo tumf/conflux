@@ -60,7 +60,8 @@ acceptance ループは change に対して `acceptance_command` を実行し、
 - tasks.md の更新は、acceptance の失敗回数に対応する `## Acceptance #<n> Failure Follow-up` セクションを末尾に追加するか、既存の関連タスクを未完了に戻す形で行わなければならない（MUST）。
 - `Acceptance #<n> Failure Follow-up` の `<n>` は当該 acceptance 試行の 1 始まりの試行番号と一致しなければならない（MUST）。
 - acceptance の失敗理由（findings）は tasks.md に記録しなければならない（MUST）。
-- 失敗理由は acceptance 出力の末尾から取得し、解析済み findings ではなく tail を使用しなければならない（MUST）。
+- 失敗理由の記録は acceptance エージェントが tasks.md を直接編集して行い、オーケストレーターは acceptance 出力から findings を抽出して tasks.md に追記してはならない（MUST NOT）。
+- acceptance prompt は FAIL 時に tasks.md の follow-up を更新する指示を含めなければならない（MUST）。
 - `Acceptance #<n> Failure Follow-up` セクションでは、各 finding を `- [ ] <finding>` の未完了タスクとして 1 行ずつ記録しなければならない（MUST）。番号付きの箇条書きを使用してはならない（MUST NOT）。
 - follow-up セクションに `Address acceptance findings:` のようなラッパー行やネストされた箇条書きを追加してはならない（MUST NOT）。
 - apply ループは acceptance failure 後も同じ iteration カウンター値で再開しなければならない（MUST）。
@@ -84,7 +85,7 @@ acceptance ループは change に対して `acceptance_command` を実行し、
 
 #### Scenario: Acceptance failure follow-up uses numbered section and flat tasks
 - **GIVEN** acceptance output が FAIL で 2 件の findings を含む
-- **WHEN** acceptance failure の tasks.md 更新が実行される
+- **WHEN** acceptance エージェントが指示に従って tasks.md を更新する
 - **THEN** tasks.md の末尾に `## Acceptance #1 Failure Follow-up` が追加される
 - **AND** セクション内に `- [ ] <finding>` の未完了タスクが 2 行追加される
 - **AND** `Address acceptance findings` のようなラッパー行やネスト箇条書きは含まれない
