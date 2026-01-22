@@ -12,3 +12,7 @@
 
 ## 4. Validation
 - [x] 4.1 `cargo test acceptance` を実行し、acceptance 関連のテストが通ることを確認する。
+
+## Acceptance #1 Failure Follow-up
+- [x] `src/orchestration/acceptance.rs` の `update_tasks_on_acceptance_failure` 関数を削除し、`src/orchestration/mod.rs` からも公開を削除する（デッドコードのため）
+- [x] `src/orchestration/acceptance.rs` の `test_update_tasks_on_acceptance_failure_format` と `test_update_tasks_on_acceptance_failure_multiple_attempts` テストを削除する（旧仕様のテストのため）
