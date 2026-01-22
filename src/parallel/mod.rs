@@ -1313,19 +1313,22 @@ impl ParallelExecutor {
                     )
                     .await;
 
-                    // Get the acceptance iteration number for logging (count after recording)
-                    let acceptance_iteration = agent.next_acceptance_attempt_number(change_id);
-
                     // Handle acceptance result
                     match acceptance_result {
-                        Ok(crate::orchestration::AcceptanceResult::Pass) => {
+                        Ok((
+                            crate::orchestration::AcceptanceResult::Pass,
+                            _acceptance_iteration,
+                        )) => {
                             info!(
                                 "Acceptance passed for {} on resume, proceeding to archive commit",
                                 change_id
                             );
                             // Continue to archive commit below
                         }
-                        Ok(crate::orchestration::AcceptanceResult::Continue) => {
+                        Ok((
+                            crate::orchestration::AcceptanceResult::Continue,
+                            acceptance_iteration,
+                        )) => {
                             let continue_count =
                                 agent.count_consecutive_acceptance_continues(change_id);
                             let max_continues = self.config.get_acceptance_max_continues();
@@ -1375,12 +1378,27 @@ impl ParallelExecutor {
                             changes_for_apply.push(change_id.clone());
                             continue;
                         }
-                        Ok(crate::orchestration::AcceptanceResult::Fail { findings }) => {
+                        Ok((
+                            crate::orchestration::AcceptanceResult::Fail { findings },
+                            acceptance_iteration,
+                        )) => {
                             warn!(
                                 "Acceptance failed for {} with {} findings on resume, will not commit archive",
                                 change_id,
                                 findings.len()
                             );
+                            // Update tasks.md with acceptance findings
+                            if let Err(e) =
+                                crate::orchestration::update_tasks_on_acceptance_failure(
+                                    change_id,
+                                    &findings,
+                                    Some(&workspace.path),
+                                    acceptance_iteration,
+                                )
+                                .await
+                            {
+                                warn!("Failed to update tasks.md for {}: {}", change_id, e);
+                            }
                             send_event(
                                 &self.event_tx,
                                 ParallelEvent::Log(
@@ -1398,10 +1416,13 @@ impl ParallelExecutor {
                             changes_for_apply.push(change_id.clone());
                             continue;
                         }
-                        Ok(crate::orchestration::AcceptanceResult::CommandFailed {
-                            error,
-                            findings,
-                        }) => {
+                        Ok((
+                            crate::orchestration::AcceptanceResult::CommandFailed {
+                                error,
+                                findings,
+                            },
+                            acceptance_iteration,
+                        )) => {
                             error!(
                                 "Acceptance command failed for {} on resume: {}",
                                 change_id, error
@@ -1411,6 +1432,7 @@ impl ParallelExecutor {
                                     change_id,
                                     &findings,
                                     Some(&workspace.path),
+                                    acceptance_iteration,
                                 )
                                 .await
                             {
@@ -1433,7 +1455,10 @@ impl ParallelExecutor {
                             changes_for_apply.push(change_id.clone());
                             continue;
                         }
-                        Ok(crate::orchestration::AcceptanceResult::Cancelled) => {
+                        Ok((
+                            crate::orchestration::AcceptanceResult::Cancelled,
+                            _acceptance_iteration,
+                        )) => {
                             info!("Acceptance cancelled for {} on resume", change_id);
                             continue;
                         }
@@ -1445,7 +1470,7 @@ impl ParallelExecutor {
                                     LogEntry::error(format!("Acceptance error on resume: {}", e))
                                         .with_change_id(change_id)
                                         .with_operation("acceptance")
-                                        .with_iteration(acceptance_iteration),
+                                        .with_iteration(0),
                                 ),
                             )
                             .await;
@@ -2049,16 +2074,13 @@ impl ParallelExecutor {
                 )
                 .await;
 
-                // Get the acceptance iteration number for logging (count after recording)
-                let acceptance_iteration = agent.next_acceptance_attempt_number(&change_id);
-
                 match acceptance_result {
-                    Ok(crate::orchestration::AcceptanceResult::Pass) => {
+                    Ok((crate::orchestration::AcceptanceResult::Pass, _acceptance_iteration)) => {
                         info!("Acceptance passed for {}, proceeding to archive", change_id);
                         // Break out of loop, proceed to archive
                         break revision;
                     }
-                    Ok(crate::orchestration::AcceptanceResult::Continue) => {
+                    Ok((crate::orchestration::AcceptanceResult::Continue, acceptance_iteration)) => {
                         let continue_count = agent.count_consecutive_acceptance_continues(&change_id);
                         let max_continues = config.get_acceptance_max_continues();
 
@@ -2116,7 +2138,7 @@ impl ParallelExecutor {
                             continue;
                         }
                     }
-                    Ok(crate::orchestration::AcceptanceResult::Fail { findings }) => {
+                    Ok((crate::orchestration::AcceptanceResult::Fail { findings }, acceptance_iteration)) => {
                         warn!(
                             "Acceptance failed for {} with {} findings (cycle {}), returning to apply loop",
                             change_id,
@@ -2129,6 +2151,7 @@ impl ParallelExecutor {
                                 &change_id,
                                 &findings,
                                 Some(&workspace.path),
+                                acceptance_iteration,
                             )
                             .await
                         {
@@ -2154,10 +2177,10 @@ impl ParallelExecutor {
                         // Continue loop - retry apply with updated tasks
                         continue;
                     }
-                    Ok(crate::orchestration::AcceptanceResult::CommandFailed {
+                    Ok((crate::orchestration::AcceptanceResult::CommandFailed {
                         error,
                         findings,
-                    }) => {
+                    }, acceptance_iteration)) => {
                         error!(
                             "Acceptance command failed for {} (cycle {}): {}",
                             change_id, cycle_count, error
@@ -2167,6 +2190,7 @@ impl ParallelExecutor {
                             &change_id,
                             &findings,
                             Some(&workspace.path),
+                            acceptance_iteration,
                         )
                         .await
                         {
@@ -2196,7 +2220,7 @@ impl ParallelExecutor {
                             error: Some(format!("Acceptance command failed: {}", error)),
                         };
                     }
-                    Ok(crate::orchestration::AcceptanceResult::Cancelled) => {
+                    Ok((crate::orchestration::AcceptanceResult::Cancelled, _acceptance_iteration)) => {
                         info!("Acceptance cancelled for {}", change_id);
                         return WorkspaceResult {
                             change_id,
@@ -2569,16 +2593,13 @@ impl ParallelExecutor {
                     )
                     .await;
 
-                    // Get the acceptance iteration number for logging (count after recording)
-                    let acceptance_iteration = agent.next_acceptance_attempt_number(&change_id);
-
                     match acceptance_result {
-                        Ok(crate::orchestration::AcceptanceResult::Pass) => {
+                        Ok((crate::orchestration::AcceptanceResult::Pass, _acceptance_iteration)) => {
                             info!("Acceptance passed for {}, proceeding to archive", change_id);
                             // Break out of loop, proceed to archive
                             break revision;
                         }
-                        Ok(crate::orchestration::AcceptanceResult::Continue) => {
+                        Ok((crate::orchestration::AcceptanceResult::Continue, acceptance_iteration)) => {
                             let continue_count = agent.count_consecutive_acceptance_continues(&change_id);
                             let max_continues = config.get_acceptance_max_continues();
 
@@ -2636,7 +2657,7 @@ impl ParallelExecutor {
                                 continue;
                             }
                         }
-                        Ok(crate::orchestration::AcceptanceResult::Fail { findings }) => {
+                        Ok((crate::orchestration::AcceptanceResult::Fail { findings }, acceptance_iteration)) => {
                             warn!(
                                 "Acceptance failed for {} with {} findings (cycle {}), returning to apply loop",
                                 change_id,
@@ -2649,6 +2670,7 @@ impl ParallelExecutor {
                                     &change_id,
                                     &findings,
                                     Some(&workspace_path),
+                                    acceptance_iteration,
                                 )
                                 .await
                             {
@@ -2674,10 +2696,10 @@ impl ParallelExecutor {
                             // Continue loop - retry apply with updated tasks
                             continue;
                         }
-                        Ok(crate::orchestration::AcceptanceResult::CommandFailed {
+                        Ok((crate::orchestration::AcceptanceResult::CommandFailed {
                             error,
                             findings,
-                        }) => {
+                        }, acceptance_iteration)) => {
                             error!(
                                 "Acceptance command failed for {} (cycle {}): {}",
                                 change_id, cycle_count, error
@@ -2688,6 +2710,7 @@ impl ParallelExecutor {
                                     &change_id,
                                     &findings,
                                     Some(&workspace_path),
+                                    acceptance_iteration,
                                 )
                                 .await
                             {
@@ -2718,7 +2741,7 @@ impl ParallelExecutor {
                         };
 
                         }
-                        Ok(crate::orchestration::AcceptanceResult::Cancelled) => {
+                        Ok((crate::orchestration::AcceptanceResult::Cancelled, _acceptance_iteration)) => {
                             info!("Acceptance cancelled for {}", change_id);
                             return WorkspaceResult {
                                 change_id,
@@ -3171,14 +3194,12 @@ impl ParallelExecutor {
                                                                 )
                                                                 .await;
 
-                                                                let acceptance_iteration = agent.next_acceptance_attempt_number(&change_id);
-
                                                                 match acceptance_result {
-                                                                    Ok(crate::orchestration::AcceptanceResult::Pass) => {
+                                                                    Ok((crate::orchestration::AcceptanceResult::Pass, _acceptance_iteration)) => {
                                                                         info!("Acceptance passed for {}, proceeding to archive", change_id);
                                                                         break revision;
                                                                     }
-                                                                    Ok(crate::orchestration::AcceptanceResult::Continue) => {
+                        Ok((crate::orchestration::AcceptanceResult::Continue, acceptance_iteration)) => {
                                                                         let continue_count = agent.count_consecutive_acceptance_continues(&change_id);
                                                                         let max_continues = config.get_acceptance_max_continues();
 
@@ -3235,7 +3256,7 @@ impl ParallelExecutor {
                                                                             continue;
                                                                         }
                                                                     }
-                                                                    Ok(crate::orchestration::AcceptanceResult::Fail { findings }) => {
+                                                                    Ok((crate::orchestration::AcceptanceResult::Fail { findings }, acceptance_iteration)) => {
                                                                         warn!(
                                                                             "Acceptance failed for {} with {} findings (cycle {}), returning to apply loop",
                                                                             change_id,
@@ -3247,6 +3268,7 @@ impl ParallelExecutor {
                                                                                 &change_id,
                                                                                 &findings,
                                                                                 Some(&workspace_path),
+                                                                                acceptance_iteration,
                                                                             )
                                                                             .await
                                                                         {
@@ -3271,10 +3293,10 @@ impl ParallelExecutor {
                                                                         }
                                                                         continue;
                                                                     }
-                                                                    Ok(crate::orchestration::AcceptanceResult::CommandFailed {
+                                                                    Ok((crate::orchestration::AcceptanceResult::CommandFailed {
                                                                         error,
                                                                         findings,
-                                                                    }) => {
+                                                                    }, acceptance_iteration)) => {
                                                                         error!(
                                                                             "Acceptance command failed for {} (cycle {}): {}",
                                                                             change_id, cycle_count, error
@@ -3284,6 +3306,7 @@ impl ParallelExecutor {
                                                                                 &change_id,
                                                                                 &findings,
                                                                                 Some(&workspace_path),
+                                                                                acceptance_iteration,
                                                                             )
                                                                             .await
                                                                         {
@@ -3313,7 +3336,7 @@ impl ParallelExecutor {
                                                                             error: Some(format!("Acceptance command failed: {}", error)),
                                                                         };
                                                                     }
-                                                                    Ok(crate::orchestration::AcceptanceResult::Cancelled) => {
+                                                                    Ok((crate::orchestration::AcceptanceResult::Cancelled, _acceptance_iteration)) => {
                                                                         info!("Acceptance cancelled for {}", change_id);
                                                                         return WorkspaceResult {
                                                                             change_id,
