@@ -131,6 +131,7 @@ impl ParallelRunService {
         cancel_token: Option<CancellationToken>,
         shared_queue_change: Option<std::sync::Arc<tokio::sync::Mutex<Option<std::time::Instant>>>>,
         dynamic_queue: Option<std::sync::Arc<crate::tui::queue::DynamicQueue>>,
+        manual_resolve_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     ) -> ParallelExecutor {
         let vcs_backend = self.config.get_vcs_backend();
         let mut executor = ParallelExecutor::with_backend_and_queue_and_stagger(
@@ -147,6 +148,9 @@ impl ParallelRunService {
         }
         if let Some(queue) = dynamic_queue {
             executor.set_dynamic_queue(queue);
+        }
+        if let Some(counter) = manual_resolve_counter {
+            executor.set_manual_resolve_counter(counter);
         }
         executor
     }
@@ -302,12 +306,14 @@ impl ParallelRunService {
         cancel_token: Option<CancellationToken>,
         shared_queue_change: Option<std::sync::Arc<tokio::sync::Mutex<Option<std::time::Instant>>>>,
         dynamic_queue: Option<std::sync::Arc<crate::tui::queue::DynamicQueue>>,
+        manual_resolve_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     ) -> Result<()> {
         let executor = self.create_executor_with_queue_state(
             Some(event_tx.clone()),
             cancel_token,
             shared_queue_change,
             dynamic_queue,
+            manual_resolve_counter,
         );
         // Use order-based execution (aligned with spec)
         self.run_parallel_order_based_with_executor(executor, changes, event_tx)

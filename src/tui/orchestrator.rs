@@ -1197,6 +1197,7 @@ pub async fn run_orchestrator_parallel(
     dynamic_queue: DynamicQueue,
     _graceful_stop_flag: Arc<AtomicBool>,
     shared_state: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    manual_resolve_counter: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
     use crate::openspec::list_changes_native;
@@ -1360,6 +1361,7 @@ pub async fn run_orchestrator_parallel(
             Some(cancel_token.clone()),
             Some(shared_queue_change.clone()),
             Some(Arc::new(dynamic_queue.clone())),
+            Some(manual_resolve_counter.clone()),
         ) => {
             result
         }
