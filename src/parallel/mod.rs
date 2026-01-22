@@ -114,6 +114,9 @@ pub struct ParallelExecutor {
     archive_history: Arc<Mutex<crate::history::ArchiveHistory>>,
     /// Flag to trigger re-analysis on next loop iteration
     needs_reanalysis: bool,
+    /// Counter for active manual resolve operations (TUI mode)
+    /// This allows manual resolves to consume parallel execution slots
+    manual_resolve_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 // Re-exported from merge module (see above pub use statement)
@@ -238,6 +241,7 @@ impl ParallelExecutor {
             apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
             archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             needs_reanalysis: false,
+            manual_resolve_count: None,
         }
     }
 
@@ -274,6 +278,12 @@ impl ParallelExecutor {
     /// Set the dynamic queue for runtime change additions (TUI mode).
     pub fn set_dynamic_queue(&mut self, dynamic_queue: Arc<crate::tui::queue::DynamicQueue>) {
         self.dynamic_queue = Some(dynamic_queue);
+    }
+
+    /// Set the manual resolve counter for tracking active manual resolve operations (TUI mode).
+    /// This allows manual resolves to consume parallel execution slots.
+    pub fn set_manual_resolve_counter(&mut self, counter: Arc<std::sync::atomic::AtomicUsize>) {
+        self.manual_resolve_count = Some(counter);
     }
 
     /// Check if debounce period has elapsed for queue changes.
@@ -547,7 +557,15 @@ impl ParallelExecutor {
 
             if self.needs_reanalysis && !queued.is_empty() {
                 // Gate re-analysis by available execution slots
-                let available_slots = max_parallelism.saturating_sub(in_flight.len());
+                // Account for manual resolves consuming slots (TUI mode)
+                let manual_resolve_count = self
+                    .manual_resolve_count
+                    .as_ref()
+                    .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(0);
+                let available_slots = max_parallelism
+                    .saturating_sub(in_flight.len())
+                    .saturating_sub(manual_resolve_count);
 
                 if available_slots == 0 {
                     // No available slots, defer re-analysis until slots become available
@@ -642,7 +660,15 @@ impl ParallelExecutor {
                         self.change_dependencies = analysis_result.dependencies.clone();
 
                         // Recalculate available slots (may have changed during analysis if tasks completed)
-                        let available_slots = max_parallelism.saturating_sub(in_flight.len());
+                        // Account for manual resolves consuming slots (TUI mode)
+                        let manual_resolve_count = self
+                            .manual_resolve_count
+                            .as_ref()
+                            .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
+                            .unwrap_or(0);
+                        let available_slots = max_parallelism
+                            .saturating_sub(in_flight.len())
+                            .saturating_sub(manual_resolve_count);
                         info!(
                             "Available slots after analysis: {} (max: {}, in_flight: {}, queued: {})",
                             available_slots,

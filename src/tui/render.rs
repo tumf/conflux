@@ -1569,4 +1569,77 @@ mod tests {
             content
         );
     }
+
+    #[test]
+    fn test_running_header_counts_only_in_flight_changes() {
+        // Test that Running header only counts in-flight changes (not queued)
+        let mut app = create_test_app(vec![
+            create_test_change("change-a", true),
+            create_test_change("change-b", true),
+            create_test_change("change-c", true),
+            create_test_change("change-d", true),
+        ]);
+
+        // Set mode to Running
+        app.mode = AppMode::Running;
+
+        // Set up different statuses:
+        // - change-a: Queued (should NOT be counted)
+        // - change-b: Applying (should be counted)
+        // - change-c: Archiving (should be counted)
+        // - change-d: NotQueued (should NOT be counted)
+        app.changes[0].queue_status = QueueStatus::Queued;
+        app.changes[1].queue_status = QueueStatus::Applying;
+        app.changes[2].queue_status = QueueStatus::Archiving;
+        app.changes[3].queue_status = QueueStatus::NotQueued;
+
+        // Add a log to trigger running mode display
+        app.add_log(LogEntry::info("test"));
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        // Should show "Running 2" (only Applying and Archiving)
+        assert!(
+            content.contains("[Running 2]"),
+            "Header should show 'Running 2' (only in-flight changes), but got:\n{}",
+            content
+        );
+
+        // Should NOT show "Running 3" or "Running 4"
+        assert!(
+            !content.contains("[Running 3]") && !content.contains("[Running 4]"),
+            "Header should not count Queued changes, but got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_running_header_counts_resolving_as_in_flight() {
+        // Test that Resolving status is counted as in-flight
+        let mut app = create_test_app(vec![
+            create_test_change("change-a", true),
+            create_test_change("change-b", true),
+        ]);
+
+        // Set mode to Running
+        app.mode = AppMode::Running;
+
+        // Set one change to Resolving, one to Queued
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[1].queue_status = QueueStatus::Queued;
+
+        // Add a log to trigger running mode display
+        app.add_log(LogEntry::info("test"));
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        // Should show "Running 1" (only Resolving)
+        assert!(
+            content.contains("[Running 1]"),
+            "Header should show 'Running 1' (Resolving is in-flight), but got:\n{}",
+            content
+        );
+    }
 }

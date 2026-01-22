@@ -4,3 +4,5 @@
 mod conflict;
 #[cfg(test)]
 mod executor;
+#[cfg(test)]
+mod manual_resolve;

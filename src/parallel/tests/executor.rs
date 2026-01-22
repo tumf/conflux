@@ -288,6 +288,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         needs_reanalysis: false,
+        manual_resolve_count: None,
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -528,6 +529,7 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         shared_stagger_state,
         needs_reanalysis: false,
+        manual_resolve_count: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -692,6 +694,7 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         shared_stagger_state,
         needs_reanalysis: false,
+        manual_resolve_count: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -828,6 +831,7 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         shared_stagger_state,
         needs_reanalysis: false,
+        manual_resolve_count: None,
     };
 
     let revisions = vec![workspace_a.name];
@@ -993,6 +997,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         shared_stagger_state,
         needs_reanalysis: false,
+        manual_resolve_count: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1172,6 +1177,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         shared_stagger_state,
         needs_reanalysis: false,
+        manual_resolve_count: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1353,10 +1359,11 @@ async fn test_merge_retries_after_pre_commit_changes() {
         last_queue_change_at: Arc::new(Mutex::new(None)),
         dynamic_queue: None,
         ai_runner,
-        shared_stagger_state,
         apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
+        shared_stagger_state,
         needs_reanalysis: false,
+        manual_resolve_count: None,
     };
 
     let revisions = vec![workspace_a.name];

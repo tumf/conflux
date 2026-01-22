@@ -335,6 +335,10 @@ async fn run_tui_loop(
     // Dynamic queue for runtime change additions
     let dynamic_queue = DynamicQueue::new();
 
+    // Manual resolve counter for tracking active manual resolves
+    // This allows manual resolves to consume parallel execution slots
+    let manual_resolve_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     // Cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
 
@@ -808,6 +812,7 @@ async fn run_tui_loop(
                                     let orch_dynamic_queue = dynamic_queue.clone();
                                     let orch_graceful_stop = graceful_stop_flag.clone();
                                     let orch_shared_state = shared_state.clone();
+                                    let orch_manual_resolve = manual_resolve_counter.clone();
                                     orchestrator_cancel = Some(orch_cancel.clone());
                                     let use_parallel = app.parallel_mode;
                                     #[cfg(feature = "web-monitoring")]
@@ -823,6 +828,7 @@ async fn run_tui_loop(
                                                 orch_dynamic_queue,
                                                 orch_graceful_stop,
                                                 orch_shared_state.clone(),
+                                                orch_manual_resolve,
                                                 #[cfg(feature = "web-monitoring")]
                                                 orch_web_state,
                                             )
@@ -1255,6 +1261,7 @@ async fn run_tui_loop(
                             let orch_dynamic_queue = dynamic_queue.clone();
                             let orch_graceful_stop = graceful_stop_flag.clone();
                             let orch_shared_state = shared_state.clone();
+                            let orch_manual_resolve = manual_resolve_counter.clone();
                             orchestrator_cancel = Some(orch_cancel.clone());
                             let use_parallel = app.parallel_mode;
                             #[cfg(feature = "web-monitoring")]
@@ -1271,6 +1278,7 @@ async fn run_tui_loop(
                                         orch_dynamic_queue,
                                         orch_graceful_stop,
                                         orch_shared_state,
+                                        orch_manual_resolve.clone(),
                                         orch_web_state,
                                     )
                                     .await
@@ -1297,6 +1305,7 @@ async fn run_tui_loop(
                                         orch_dynamic_queue,
                                         orch_graceful_stop,
                                         orch_shared_state,
+                                        orch_manual_resolve,
                                     )
                                     .await
                                 } else {
@@ -1627,6 +1636,7 @@ async fn run_tui_loop(
                                 let orch_dynamic_queue = dynamic_queue.clone();
                                 let orch_graceful_stop = graceful_stop_flag.clone();
                                 let orch_shared_state = shared_state.clone();
+                                let orch_manual_resolve = manual_resolve_counter.clone();
                                 orchestrator_cancel = Some(orch_cancel.clone());
                                 let use_parallel = app.parallel_mode;
                                 #[cfg(feature = "web-monitoring")]
@@ -1643,6 +1653,7 @@ async fn run_tui_loop(
                                             orch_dynamic_queue,
                                             orch_graceful_stop,
                                             orch_shared_state,
+                                            orch_manual_resolve.clone(),
                                             orch_web_state,
                                         )
                                         .await
@@ -1669,6 +1680,7 @@ async fn run_tui_loop(
                                             orch_dynamic_queue,
                                             orch_graceful_stop,
                                             orch_shared_state,
+                                            orch_manual_resolve,
                                         )
                                         .await
                                     } else {
@@ -1829,30 +1841,38 @@ async fn run_tui_loop(
                     let resolve_repo_root = repo_root.clone();
                     let resolve_config = config.clone();
                     let resolve_worktree_base_dir = worktree_base_dir.clone();
+                    let resolve_counter = manual_resolve_counter.clone();
                     tokio::spawn(async move {
+                        // Increment counter when resolve starts (consumes a parallel execution slot)
+                        resolve_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
                         let _ = resolve_tx
                             .send(OrchestratorEvent::ResolveStarted {
                                 change_id: id.clone(),
                             })
                             .await;
 
+                        // Helper closure to decrement counter and send event
+                        let finish_resolve = |event: OrchestratorEvent| async {
+                            resolve_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            let _ = resolve_tx.send(event).await;
+                        };
+
                         match crate::parallel::base_dirty_reason(&resolve_repo_root).await {
                             Ok(Some(reason)) => {
-                                let _ = resolve_tx
-                                    .send(OrchestratorEvent::ResolveFailed {
-                                        change_id: id.clone(),
-                                        error: format!("Base is dirty: {}", reason),
-                                    })
-                                    .await;
+                                finish_resolve(OrchestratorEvent::ResolveFailed {
+                                    change_id: id.clone(),
+                                    error: format!("Base is dirty: {}", reason),
+                                })
+                                .await;
                                 return;
                             }
                             Err(e) => {
-                                let _ = resolve_tx
-                                    .send(OrchestratorEvent::ResolveFailed {
-                                        change_id: id.clone(),
-                                        error: format!("Failed to check base status: {}", e),
-                                    })
-                                    .await;
+                                finish_resolve(OrchestratorEvent::ResolveFailed {
+                                    change_id: id.clone(),
+                                    error: format!("Failed to check base status: {}", e),
+                                })
+                                .await;
                                 return;
                             }
                             Ok(None) => {}
@@ -1887,20 +1907,18 @@ async fn run_tui_loop(
                                         None
                                     }
                                 };
-                                let _ = resolve_tx
-                                    .send(OrchestratorEvent::ResolveCompleted {
-                                        change_id: id.clone(),
-                                        worktree_change_ids,
-                                    })
-                                    .await;
+                                finish_resolve(OrchestratorEvent::ResolveCompleted {
+                                    change_id: id.clone(),
+                                    worktree_change_ids,
+                                })
+                                .await;
                             }
                             Err(e) => {
-                                let _ = resolve_tx
-                                    .send(OrchestratorEvent::ResolveFailed {
-                                        change_id: id.clone(),
-                                        error: e.to_string(),
-                                    })
-                                    .await;
+                                finish_resolve(OrchestratorEvent::ResolveFailed {
+                                    change_id: id.clone(),
+                                    error: e.to_string(),
+                                })
+                                .await;
                             }
                         }
                     });
