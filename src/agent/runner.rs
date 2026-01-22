@@ -501,8 +501,20 @@ impl AgentRunner {
         // Build diff context for 2nd+ attempts
         let diff_context = self.build_acceptance_diff_context(change_id, cwd).await?;
 
-        // Build full prompt: system_prompt (with change_id) + diff_context + user_prompt + history_context
-        let mut full_prompt = build_acceptance_prompt(change_id, user_prompt, &history_context);
+        // Build last acceptance output context for 2nd+ attempts
+        use super::prompt::build_last_acceptance_output_context;
+        let stdout_tail = self.acceptance_history.last_stdout_tail(change_id);
+        let stderr_tail = self.acceptance_history.last_stderr_tail(change_id);
+        let last_output_context =
+            build_last_acceptance_output_context(stdout_tail.as_deref(), stderr_tail.as_deref());
+
+        // Build full prompt: system_prompt (with change_id) + last_output_context + diff_context + user_prompt + history_context
+        let mut full_prompt = build_acceptance_prompt(
+            change_id,
+            user_prompt,
+            &history_context,
+            &last_output_context,
+        );
         if !diff_context.is_empty() {
             // Insert diff_context after system_prompt, before user_prompt
             full_prompt = format!("{}\n\n{}", full_prompt, diff_context);
@@ -592,6 +604,28 @@ impl AgentRunner {
     /// Get the count of consecutive CONTINUE attempts for a change.
     pub fn count_consecutive_acceptance_continues(&self, change_id: &str) -> u32 {
         history_ops::count_consecutive_acceptance_continues(&self.acceptance_history, change_id)
+    }
+
+    /// Get the last acceptance attempt for a change.
+    /// Returns None if there are no previous attempts.
+    #[allow(dead_code)] // Reserved for future direct use
+    pub fn get_last_acceptance_attempt(
+        &self,
+        change_id: &str,
+    ) -> Option<&crate::history::AcceptanceAttempt> {
+        self.acceptance_history.get_last_attempt(change_id)
+    }
+
+    /// Get the last stdout tail from the most recent acceptance attempt.
+    /// Returns None if there are no previous attempts or the last attempt has no stdout tail.
+    pub fn get_last_acceptance_stdout_tail(&self, change_id: &str) -> Option<String> {
+        self.acceptance_history.last_stdout_tail(change_id)
+    }
+
+    /// Get the last stderr tail from the most recent acceptance attempt.
+    /// Returns None if there are no previous attempts or the last attempt has no stderr tail.
+    pub fn get_last_acceptance_stderr_tail(&self, change_id: &str) -> Option<String> {
+        self.acceptance_history.last_stderr_tail(change_id)
     }
 
     /// Run archive command for the given change ID (blocking, no streaming)

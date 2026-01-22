@@ -1341,8 +1341,21 @@ pub async fn execute_acceptance_in_workspace(
     // Build prompt with system instructions and history context
     let user_prompt = config.get_acceptance_prompt();
     let history_context = agent.format_acceptance_history(change_id);
-    let full_prompt =
-        crate::agent::build_acceptance_prompt(change_id, user_prompt, &history_context);
+
+    // Build last acceptance output context for 2nd+ attempts
+    let stdout_tail = agent.get_last_acceptance_stdout_tail(change_id);
+    let stderr_tail = agent.get_last_acceptance_stderr_tail(change_id);
+    let last_output_context = crate::agent::build_last_acceptance_output_context(
+        stdout_tail.as_deref(),
+        stderr_tail.as_deref(),
+    );
+
+    let full_prompt = crate::agent::build_acceptance_prompt(
+        change_id,
+        user_prompt,
+        &history_context,
+        &last_output_context,
+    );
 
     // Expand change_id and prompt in command
     let template = config.get_acceptance_command();
