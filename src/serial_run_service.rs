@@ -312,6 +312,13 @@ impl SerialRunService {
                     .run_hook(HookType::OnChangeEnd, &change_end_context)
                     .await?;
 
+                // Run on_merged hook after on_change_end (serial mode: archive success = merge complete equivalent)
+                let merged_context =
+                    HookContext::new(self.changes_processed, total_changes, new_remaining, false)
+                        .with_change(&change.id, change.completed_tasks, change.total_tasks)
+                        .with_apply_count(apply_count);
+                hooks.run_hook(HookType::OnMerged, &merged_context).await?;
+
                 // Mark change as completed and clear current
                 self.completed_change_ids.insert(change.id.clone());
                 self.current_change_id = None;

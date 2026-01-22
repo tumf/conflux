@@ -1131,6 +1131,40 @@ impl ParallelExecutor {
                     )
                     .await;
 
+                    // Run on_merged hook after merge completion
+                    if let Some(ref hooks) = self.hooks {
+                        // Fetch actual task counts from change data
+                        let (completed_tasks, total_tasks) =
+                            match crate::openspec::list_changes_native() {
+                                Ok(changes) => changes
+                                    .iter()
+                                    .find(|c| c.id == *change_id)
+                                    .map(|c| (c.completed_tasks, c.total_tasks))
+                                    .unwrap_or((0, 0)),
+                                Err(e) => {
+                                    warn!("Failed to fetch task counts for on_merged hook: {}", e);
+                                    (0, 0)
+                                }
+                            };
+
+                        let hook_context = crate::hooks::HookContext::new(
+                            changes_processed,
+                            total_changes,
+                            0, // remaining_changes not easily available here
+                            false,
+                        )
+                        .with_change(change_id, completed_tasks, total_tasks)
+                        .with_apply_count(0)
+                        .with_parallel_context(&workspace.path.to_string_lossy(), None);
+
+                        if let Err(e) = hooks
+                            .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
+                            .await
+                        {
+                            warn!("on_merged hook failed for {}: {}", change_id, e);
+                        }
+                    }
+
                     send_event(
                         &self.event_tx,
                         ParallelEvent::CleanupStarted {
@@ -3636,10 +3670,47 @@ impl ParallelExecutor {
                 &self.event_tx,
                 ParallelEvent::MergeCompleted {
                     change_id: change_ids[0].clone(),
-                    revision: merge_revision,
+                    revision: merge_revision.clone(),
                 },
             )
             .await;
+
+            // Run on_merged hook for each change_id that was merged
+            if let Some(ref hooks) = self.hooks {
+                // Fetch change data once for all changes
+                let changes_map = match crate::openspec::list_changes_native() {
+                    Ok(changes) => changes
+                        .into_iter()
+                        .map(|c| (c.id.clone(), (c.completed_tasks, c.total_tasks)))
+                        .collect::<std::collections::HashMap<_, _>>(),
+                    Err(e) => {
+                        warn!("Failed to fetch task counts for on_merged hook: {}", e);
+                        std::collections::HashMap::new()
+                    }
+                };
+
+                for change_id in change_ids {
+                    let (completed_tasks, total_tasks) =
+                        changes_map.get(change_id).copied().unwrap_or((0, 0));
+
+                    let hook_context = crate::hooks::HookContext::new(
+                        0, // changes_processed not available in this context
+                        0, // total_changes not available
+                        0, // remaining_changes not available
+                        false,
+                    )
+                    .with_change(change_id, completed_tasks, total_tasks)
+                    .with_apply_count(0);
+
+                    if let Err(e) = hooks
+                        .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
+                        .await
+                    {
+                        warn!("on_merged hook failed for {}: {}", change_id, e);
+                    }
+                }
+            }
+
             return Ok(());
         }
 
@@ -3662,10 +3733,49 @@ impl ParallelExecutor {
                         &self.event_tx,
                         ParallelEvent::MergeCompleted {
                             change_id: change_ids[0].clone(),
-                            revision: merge_revision,
+                            revision: merge_revision.clone(),
                         },
                     )
                     .await;
+
+                    // Run on_merged hook for each change_id that was merged
+                    if let Some(ref hooks) = self.hooks {
+                        for change_id in change_ids {
+                            // Get actual task counts from the change
+                            let (completed_tasks, total_tasks) =
+                                match crate::openspec::list_changes_native() {
+                                    Ok(changes) => {
+                                        if let Some(change) =
+                                            changes.iter().find(|c| c.id == *change_id)
+                                        {
+                                            (change.completed_tasks, change.total_tasks)
+                                        } else {
+                                            (0, 0)
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to get change info for {}: {}", change_id, e);
+                                        (0, 0)
+                                    }
+                                };
+
+                            let hook_context = crate::hooks::HookContext::new(
+                                0, // changes_processed not available in this context
+                                0, // total_changes not available
+                                0, // remaining_changes not available
+                                false,
+                            )
+                            .with_change(change_id, completed_tasks, total_tasks)
+                            .with_apply_count(0);
+
+                            if let Err(e) = hooks
+                                .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
+                                .await
+                            {
+                                warn!("on_merged hook failed for {}: {}", change_id, e);
+                            }
+                        }
+                    }
 
                     // Send ResolveCompleted for each change_id if there were conflicts resolved
                     if attempt > 1 {

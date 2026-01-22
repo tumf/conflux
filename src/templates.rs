@@ -44,17 +44,35 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
 
   // Command to create a worktree for proposals from TUI (+ key)
   // Supports {workspace_dir} and {repo_root} placeholders
-  // "worktree_command": "claude --dangerously-skip-permissions --verbose -p '/openspec:proposal --worktree {workspace_dir}'",
+  // "worktree_command": "codex '/openspec:proposal --worktree {workspace_dir}'",
 
   // Lifecycle hooks (optional)
   // Available hooks:
   //   Run lifecycle: on_start, on_finish, on_error
-  //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end
+  //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end, on_merged
   //   TUI interaction: on_queue_add, on_queue_remove, on_approve, on_unapprove
-  // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}
+  // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}, {completed_tasks}, {total_tasks}
   "hooks": {
-    // "on_change_start": "echo 'Starting {change_id}'",
-    // "post_apply": "echo 'Applied {change_id} (attempt {apply_count})'"
+    // Run lifecycle
+    // "on_start": "echo '[on_start] changes_processed={changes_processed} total={total_changes} remaining={remaining_changes}'",
+    // "on_finish": "echo '[on_finish] status={status} processed={changes_processed}/{total_changes}'",
+    // "on_error": "echo '[on_error] change={change_id} error={error}'",
+
+    // Change lifecycle
+    // "on_change_start": "echo '[on_change_start] change={change_id} tasks={completed_tasks}/{total_tasks} progress={changes_processed}/{total_changes}'",
+    // "pre_apply": "echo '[pre_apply] change={change_id} apply_count={apply_count} tasks={completed_tasks}/{total_tasks}'",
+    // "post_apply": "echo '[post_apply] change={change_id} apply_count={apply_count} tasks={completed_tasks}/{total_tasks}'",
+    // "on_change_complete": "echo '[on_change_complete] change={change_id} tasks={total_tasks}/{total_tasks}'",
+    // "pre_archive": "echo '[pre_archive] change={change_id} progress={changes_processed}/{total_changes}'",
+    // "post_archive": "echo '[post_archive] change={change_id} progress={changes_processed}/{total_changes}'",
+    // "on_change_end": "echo '[on_change_end] change={change_id} progress={changes_processed}/{total_changes} remaining={remaining_changes}'",
+    // "on_merged": "echo '[on_merged] change={change_id} tasks={completed_tasks}/{total_tasks} progress={changes_processed}/{total_changes}'",
+
+    // TUI interaction
+    // "on_queue_add": "echo '[on_queue_add] change={change_id} tasks={completed_tasks}/{total_tasks}'",
+    // "on_queue_remove": "echo '[on_queue_remove] change={change_id} tasks={completed_tasks}/{total_tasks}'",
+    // "on_approve": "echo '[on_approve] change={change_id} tasks={completed_tasks}/{total_tasks}'",
+    // "on_unapprove": "echo '[on_unapprove] change={change_id} tasks={completed_tasks}/{total_tasks}'"
   }
 }
 "#;
@@ -101,17 +119,35 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
 
   // Command to create a worktree for proposals from TUI (+ key)
   // Supports {workspace_dir} and {repo_root} placeholders
-  // "worktree_command": "opencode run '/openspec:proposal --worktree {workspace_dir}'",
+  // "worktree_command": "claude run '/openspec:proposal --worktree {workspace_dir}'",
 
   // Lifecycle hooks (optional)
   // Available hooks:
   //   Run lifecycle: on_start, on_finish, on_error
-  //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end
+  //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end, on_merged
   //   TUI interaction: on_queue_add, on_queue_remove, on_approve, on_unapprove
-  // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}
+  // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}, {completed_tasks}, {total_tasks}
   "hooks": {
-    // "on_change_start": "echo 'Starting {change_id}'",
-    // "post_apply": "echo 'Applied {change_id} (attempt {apply_count})'"
+    // Run lifecycle
+    // "on_start": "echo '[on_start] changes_processed={changes_processed} total={total_changes} remaining={remaining_changes}'",
+    // "on_finish": "echo '[on_finish] status={status} processed={changes_processed}/{total_changes}'",
+    // "on_error": "echo '[on_error] change={change_id} error={error}'",
+
+    // Change lifecycle
+    // "on_change_start": "echo '[on_change_start] change={change_id} tasks={completed_tasks}/{total_tasks} progress={changes_processed}/{total_changes}'",
+    // "pre_apply": "echo '[pre_apply] change={change_id} apply_count={apply_count} tasks={completed_tasks}/{total_tasks}'",
+    // "post_apply": "echo '[post_apply] change={change_id} apply_count={apply_count} tasks={completed_tasks}/{total_tasks}'",
+    // "on_change_complete": "echo '[on_change_complete] change={change_id} tasks={total_tasks}/{total_tasks}'",
+    // "pre_archive": "echo '[pre_archive] change={change_id} progress={changes_processed}/{total_changes}'",
+    // "post_archive": "echo '[post_archive] change={change_id} progress={changes_processed}/{total_changes}'",
+    // "on_change_end": "echo '[on_change_end] change={change_id} progress={changes_processed}/{total_changes} remaining={remaining_changes}'",
+    // "on_merged": "echo '[on_merged] change={change_id} tasks={completed_tasks}/{total_tasks} progress={changes_processed}/{total_changes}'",
+
+    // TUI interaction
+    // "on_queue_add": "echo '[on_queue_add] change={change_id} tasks={completed_tasks}/{total_tasks}'",
+    // "on_queue_remove": "echo '[on_queue_remove] change={change_id} tasks={completed_tasks}/{total_tasks}'",
+    // "on_approve": "echo '[on_approve] change={change_id} tasks={completed_tasks}/{total_tasks}'",
+    // "on_unapprove": "echo '[on_unapprove] change={change_id} tasks={completed_tasks}/{total_tasks}'"
   }
 }
 "#;
@@ -158,17 +194,35 @@ pub const CODEX_TEMPLATE: &str = r#"{
 
   // Command to create a worktree for proposals from TUI (+ key)
   // Supports {workspace_dir} and {repo_root} placeholders
-  // "worktree_command": "codex '/openspec:proposal --worktree {workspace_dir}'",
+  // "worktree_command": "opencode run '/openspec:proposal --worktree {workspace_dir}'",
 
   // Lifecycle hooks (optional)
   // Available hooks:
   //   Run lifecycle: on_start, on_finish, on_error
-  //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end
+  //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end, on_merged
   //   TUI interaction: on_queue_add, on_queue_remove, on_approve, on_unapprove
-  // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}
+  // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}, {completed_tasks}, {total_tasks}
   "hooks": {
-    // "on_change_start": "echo 'Starting {change_id}'",
-    // "post_apply": "echo 'Applied {change_id} (attempt {apply_count})'"
+    // Run lifecycle
+    // "on_start": "echo '[on_start] changes_processed={changes_processed} total={total_changes} remaining={remaining_changes}'",
+    // "on_finish": "echo '[on_finish] status={status} processed={changes_processed}/{total_changes}'",
+    // "on_error": "echo '[on_error] change={change_id} error={error}'",
+
+    // Change lifecycle
+    // "on_change_start": "echo '[on_change_start] change={change_id} tasks={completed_tasks}/{total_tasks} progress={changes_processed}/{total_changes}'",
+    // "pre_apply": "echo '[pre_apply] change={change_id} apply_count={apply_count} tasks={completed_tasks}/{total_tasks}'",
+    // "post_apply": "echo '[post_apply] change={change_id} apply_count={apply_count} tasks={completed_tasks}/{total_tasks}'",
+    // "on_change_complete": "echo '[on_change_complete] change={change_id} tasks={total_tasks}/{total_tasks}'",
+    // "pre_archive": "echo '[pre_archive] change={change_id} progress={changes_processed}/{total_changes}'",
+    // "post_archive": "echo '[post_archive] change={change_id} progress={changes_processed}/{total_changes}'",
+    // "on_change_end": "echo '[on_change_end] change={change_id} progress={changes_processed}/{total_changes} remaining={remaining_changes}'",
+    // "on_merged": "echo '[on_merged] change={change_id} tasks={completed_tasks}/{total_tasks} progress={changes_processed}/{total_changes}'",
+
+    // TUI interaction
+    // "on_queue_add": "echo '[on_queue_add] change={change_id} tasks={completed_tasks}/{total_tasks}'",
+    // "on_queue_remove": "echo '[on_queue_remove] change={change_id} tasks={completed_tasks}/{total_tasks}'",
+    // "on_approve": "echo '[on_approve] change={change_id} tasks={completed_tasks}/{total_tasks}'",
+    // "on_unapprove": "echo '[on_unapprove] change={change_id} tasks={completed_tasks}/{total_tasks}'"
   }
 }
 "#;
