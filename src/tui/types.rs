@@ -111,16 +111,15 @@ impl QueueStatus {
 
     /// Check if the queue status represents an active processing state
     ///
-    /// Active states are those where work is currently being performed.
+    /// Active states are those where work is currently being performed (in-flight).
     /// This is used for counting "Running N" in the TUI header.
     ///
-    /// Active: Queued, Applying, Accepting, Archiving, Resolving
-    /// Inactive: NotQueued, MergeWait, Archived, Merged, Error
+    /// Active (in-flight): Applying, Accepting, Archiving, Resolving
+    /// Inactive: NotQueued, Queued, Blocked, MergeWait, Archived, Merged, Error
     pub fn is_active(&self) -> bool {
         matches!(
             self,
-            QueueStatus::Queued
-                | QueueStatus::Applying
+            QueueStatus::Applying
                 | QueueStatus::Accepting
                 | QueueStatus::Archiving
                 | QueueStatus::Resolving
@@ -264,13 +263,15 @@ mod tests {
 
     #[test]
     fn test_queue_status_is_active() {
-        assert!(QueueStatus::Queued.is_active());
+        // In-flight states (actively processing)
         assert!(QueueStatus::Applying.is_active());
         assert!(QueueStatus::Accepting.is_active());
         assert!(QueueStatus::Archiving.is_active());
         assert!(QueueStatus::Resolving.is_active());
 
+        // Not in-flight (queued but not started, or completed/waiting states)
         assert!(!QueueStatus::NotQueued.is_active());
+        assert!(!QueueStatus::Queued.is_active());
         assert!(!QueueStatus::Blocked.is_active());
         assert!(!QueueStatus::MergeWait.is_active());
         assert!(!QueueStatus::Archived.is_active());
@@ -393,6 +394,11 @@ mod tests {
         // Test transition from Blocked to Queued (when dependencies resolve)
         let status = QueueStatus::Queued;
         assert_eq!(status, QueueStatus::Queued);
+        // Queued is not considered active (only in-flight states are active)
+        assert!(!status.is_active());
+
+        // When processing starts, it becomes active
+        let status = QueueStatus::Applying;
         assert!(status.is_active());
     }
 }
