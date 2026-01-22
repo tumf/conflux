@@ -224,6 +224,7 @@ async fn test_resolve_merges_with_retry_args_struct() {
     let max_retries = 3;
 
     let shared_stagger_state = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let auto_resolve_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let args = ResolveMergesWithRetryArgs {
         workspace_manager: &manager as &dyn WorkspaceManager,
         config: &config,
@@ -234,6 +235,7 @@ async fn test_resolve_merges_with_retry_args_struct() {
         base_revision,
         max_retries,
         shared_stagger_state,
+        auto_resolve_count,
     };
 
     // Verify fields are accessible
@@ -256,6 +258,7 @@ fn test_resolve_merges_with_retry_args_clone() {
     let max_retries = 3;
 
     let shared_stagger_state = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let auto_resolve_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let args1 = ResolveMergesWithRetryArgs {
         workspace_manager: &manager as &dyn WorkspaceManager,
         config: &config,
@@ -266,6 +269,7 @@ fn test_resolve_merges_with_retry_args_clone() {
         base_revision,
         max_retries,
         shared_stagger_state,
+        auto_resolve_count,
     };
 
     let args2 = args1.clone(); // Clone instead of Copy

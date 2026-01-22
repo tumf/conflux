@@ -14,6 +14,26 @@ use tracing::{info, warn};
 
 use super::events::{send_event, ParallelEvent};
 
+/// RAII guard that decrements auto_resolve_count on drop.
+/// This ensures the counter is decremented on all exit paths (success, error, early return).
+struct AutoResolveGuard {
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl AutoResolveGuard {
+    fn new(counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for AutoResolveGuard {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Detect conflicted files using the workspace manager.
 pub async fn detect_conflicts(workspace_manager: &dyn WorkspaceManager) -> Result<Vec<String>> {
     workspace_manager
@@ -81,7 +101,11 @@ pub async fn resolve_conflicts_with_retry(
     vcs_error: &str,
     max_retries: u32,
     shared_stagger_state: crate::ai_command_runner::SharedStaggerState,
+    auto_resolve_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<()> {
+    // Create RAII guard to ensure counter is decremented on all exit paths
+    let _guard = AutoResolveGuard::new(auto_resolve_count);
+
     send_event(event_tx, ParallelEvent::ConflictResolutionStarted).await;
 
     // Get conflict files for the resolve command
@@ -236,6 +260,7 @@ pub async fn resolve_conflicts_with_retry(
                 stderr_tail: output_collector.stderr_tail(),
             });
             send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
+            // Guard will decrement auto resolve counter on drop
             return Ok(());
         }
 
@@ -281,6 +306,8 @@ pub async fn resolve_conflicts_with_retry(
     )
     .await;
 
+    // Guard will decrement auto resolve counter on drop
+
     // Return VCS-specific error
     match workspace_manager.backend_type() {
         VcsBackend::Git | VcsBackend::Auto => Err(OrchestratorError::GitConflict(error_msg)),
@@ -298,6 +325,7 @@ pub struct ResolveMergesWithRetryArgs<'a> {
     pub base_revision: &'a str,
     pub max_retries: u32,
     pub shared_stagger_state: crate::ai_command_runner::SharedStaggerState,
+    pub auto_resolve_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Attempt to resolve merges with retries using the configured resolve command.
@@ -312,7 +340,11 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         base_revision,
         max_retries,
         shared_stagger_state,
+        auto_resolve_count,
     } = args;
+
+    // Create RAII guard to ensure counter is decremented on all exit paths
+    let _guard = AutoResolveGuard::new(auto_resolve_count);
 
     send_event(event_tx, ParallelEvent::ConflictResolutionStarted).await;
 
@@ -824,6 +856,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                 .await;
             }
 
+            // Guard will decrement auto resolve counter on drop
             return Ok(());
         }
 
@@ -880,6 +913,8 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         )
         .await;
     }
+
+    // Guard will decrement auto resolve counter on drop
 
     match workspace_manager.backend_type() {
         VcsBackend::Git | VcsBackend::Auto => Err(OrchestratorError::GitConflict(error_msg)),

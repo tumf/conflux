@@ -289,6 +289,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         needs_reanalysis: false,
         manual_resolve_count: None,
+        auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -530,6 +531,7 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         shared_stagger_state,
         needs_reanalysis: false,
         manual_resolve_count: None,
+        auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -695,6 +697,7 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         shared_stagger_state,
         needs_reanalysis: false,
         manual_resolve_count: None,
+        auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -832,6 +835,7 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         shared_stagger_state,
         needs_reanalysis: false,
         manual_resolve_count: None,
+        auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let revisions = vec![workspace_a.name];
@@ -998,6 +1002,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         shared_stagger_state,
         needs_reanalysis: false,
         manual_resolve_count: None,
+        auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1178,6 +1183,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         shared_stagger_state,
         needs_reanalysis: false,
         manual_resolve_count: None,
+        auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1364,6 +1370,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         shared_stagger_state,
         needs_reanalysis: false,
         manual_resolve_count: None,
+        auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let revisions = vec![workspace_a.name];
