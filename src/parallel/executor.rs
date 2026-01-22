@@ -1304,11 +1304,11 @@ pub async fn execute_acceptance_in_workspace(
     cancel_token: Option<&CancellationToken>,
     ai_runner: &AiCommandRunner,
     config: &OrchestratorConfig,
-) -> Result<crate::orchestration::AcceptanceResult> {
+) -> Result<(crate::orchestration::AcceptanceResult, u32)> {
     use crate::acceptance::{parse_acceptance_output, AcceptanceResult as ParseResult};
 
     if cancel_token.is_some_and(|token| token.is_cancelled()) {
-        return Ok(crate::orchestration::AcceptanceResult::Cancelled);
+        return Ok((crate::orchestration::AcceptanceResult::Cancelled, 0));
     }
 
     info!("Running acceptance test for {} in workspace", change_id);
@@ -1373,7 +1373,7 @@ pub async fn execute_acceptance_in_workspace(
         if cancel_token.is_some_and(|token| token.is_cancelled()) {
             warn!("Acceptance test cancelled for: {}", change_id);
             let _ = child.terminate();
-            return Ok(crate::orchestration::AcceptanceResult::Cancelled);
+            return Ok((crate::orchestration::AcceptanceResult::Cancelled, 0));
         }
 
         match line {
@@ -1436,8 +1436,9 @@ pub async fn execute_acceptance_in_workspace(
             "Acceptance command failed with exit code: {:?}",
             status.code()
         );
+        let attempt_number = agent.next_acceptance_attempt_number(change_id);
         let attempt = crate::history::AcceptanceAttempt {
-            attempt: agent.next_acceptance_attempt_number(change_id),
+            attempt: attempt_number,
             passed: false,
             duration: start_time.elapsed(),
             findings: Some(tail_findings.clone()),
@@ -1454,7 +1455,7 @@ pub async fn execute_acceptance_in_workspace(
                     crate::events::LogEntry::error(&error_msg)
                         .with_change_id(change_id)
                         .with_operation("acceptance")
-                        .with_iteration(acceptance_iteration),
+                        .with_iteration(attempt_number),
                 ))
                 .await;
             let _ = tx
@@ -1464,18 +1465,22 @@ pub async fn execute_acceptance_in_workspace(
                 .await;
         }
 
-        return Ok(crate::orchestration::AcceptanceResult::CommandFailed {
-            error: error_msg,
-            findings: tail_findings,
-        });
+        return Ok((
+            crate::orchestration::AcceptanceResult::CommandFailed {
+                error: error_msg,
+                findings: tail_findings,
+            },
+            attempt_number,
+        ));
     }
 
     // Process parsed result
     match parse_result {
         ParseResult::Pass => {
             info!("Acceptance passed for: {}", change_id);
+            let attempt_number = agent.next_acceptance_attempt_number(change_id);
             let attempt = crate::history::AcceptanceAttempt {
-                attempt: agent.next_acceptance_attempt_number(change_id),
+                attempt: attempt_number,
                 passed: true,
                 duration: start_time.elapsed(),
                 findings: None,
@@ -1492,7 +1497,7 @@ pub async fn execute_acceptance_in_workspace(
                         crate::events::LogEntry::info("Acceptance test passed")
                             .with_change_id(change_id)
                             .with_operation("acceptance")
-                            .with_iteration(acceptance_iteration),
+                            .with_iteration(attempt_number),
                     ))
                     .await;
                 let _ = tx
@@ -1502,12 +1507,13 @@ pub async fn execute_acceptance_in_workspace(
                     .await;
             }
 
-            Ok(crate::orchestration::AcceptanceResult::Pass)
+            Ok((crate::orchestration::AcceptanceResult::Pass, attempt_number))
         }
         ParseResult::Continue => {
             info!("Acceptance requires continuation for: {}", change_id);
+            let attempt_number = agent.next_acceptance_attempt_number(change_id);
             let attempt = crate::history::AcceptanceAttempt {
-                attempt: agent.next_acceptance_attempt_number(change_id),
+                attempt: attempt_number,
                 passed: false,
                 duration: start_time.elapsed(),
                 findings: Some(vec!["Investigation incomplete - continue later".to_string()]),
@@ -1524,7 +1530,7 @@ pub async fn execute_acceptance_in_workspace(
                         crate::events::LogEntry::info("Acceptance test requires continuation")
                             .with_change_id(change_id)
                             .with_operation("acceptance")
-                            .with_iteration(acceptance_iteration),
+                            .with_iteration(attempt_number),
                     ))
                     .await;
                 let _ = tx
@@ -1534,7 +1540,10 @@ pub async fn execute_acceptance_in_workspace(
                     .await;
             }
 
-            Ok(crate::orchestration::AcceptanceResult::Continue)
+            Ok((
+                crate::orchestration::AcceptanceResult::Continue,
+                attempt_number,
+            ))
         }
         ParseResult::Fail { .. } => {
             let findings_for_tasks = tail_findings.clone();
@@ -1543,8 +1552,9 @@ pub async fn execute_acceptance_in_workspace(
                 change_id,
                 findings_for_tasks.len()
             );
+            let attempt_number = agent.next_acceptance_attempt_number(change_id);
             let attempt = crate::history::AcceptanceAttempt {
-                attempt: agent.next_acceptance_attempt_number(change_id),
+                attempt: attempt_number,
                 passed: false,
                 duration: start_time.elapsed(),
                 findings: Some(findings_for_tasks.clone()),
@@ -1564,7 +1574,7 @@ pub async fn execute_acceptance_in_workspace(
                         ))
                         .with_change_id(change_id)
                         .with_operation("acceptance")
-                        .with_iteration(acceptance_iteration),
+                        .with_iteration(attempt_number),
                     ))
                     .await;
                 let _ = tx
@@ -1574,9 +1584,12 @@ pub async fn execute_acceptance_in_workspace(
                     .await;
             }
 
-            Ok(crate::orchestration::AcceptanceResult::Fail {
-                findings: findings_for_tasks,
-            })
+            Ok((
+                crate::orchestration::AcceptanceResult::Fail {
+                    findings: findings_for_tasks,
+                },
+                attempt_number,
+            ))
         }
     }
 }

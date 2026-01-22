@@ -1315,13 +1315,14 @@ pub async fn run_orchestrator_parallel(
                             break;
                         }
                         Some(parallel_event) => {
+                            // Forward to TUI first (before acquiring write lock)
+                            // This prevents TUI updates from being blocked when acceptance tests run for a long time
+                            let _ = forward_tx.send(parallel_event.clone()).await;
                             // Apply to shared orchestration state
                             forward_shared_state
                                 .write()
                                 .await
                                 .apply_execution_event(&parallel_event);
-                            // Forward to TUI
-                            let _ = forward_tx.send(parallel_event.clone()).await;
                             // Forward to WebState
                             #[cfg(feature = "web-monitoring")]
                             if let Some(tx) = &forward_web_tx {
