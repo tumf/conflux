@@ -15,4 +15,5 @@
 ## Acceptance #1 Failure Follow-up
 - [x] src/orchestration/acceptance.rs の acceptance_test_streaming が base branch を渡さず agent.run_acceptance_streaming を呼び出しており、初回 acceptance で base 差分コンテキストが入らないため、base branch を渡すか差分生成を更新する。
   確認: `src/orchestration/acceptance.rs` が `get_current_branch` で base branch を取得し `run_acceptance_streaming` に渡す。
-- [ ] Git working tree をクリーンにする (すべての変更をコミット)。
+- [x] Git working tree をクリーンにする (すべての変更をコミット)。
+  確認: コミット 2177ee03 でコミット完了。
