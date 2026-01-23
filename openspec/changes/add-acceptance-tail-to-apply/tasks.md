@@ -7,4 +7,4 @@
 - [x] 2.1 `cargo test agent::tests::test_build_apply_prompt_with_acceptance_tail` を実行し成功する。確認: テスト出力が PASS で終了する。
 
 ## Acceptance #1 Failure Follow-up
-- [ ] Git 作業ツリーが dirty のままです。未コミットの変更: `openspec/changes/add-acceptance-tail-to-apply/tasks.md`、`src/agent/prompt.rs`、`src/agent/runner.rs`、`src/agent/tests.rs`、`src/execution/apply.rs`、`src/parallel/executor.rs`、`src/parallel/mod.rs`、`src/parallel/tests/executor.rs`
+- [x] Git 作業ツリーが dirty のままです。未コミットの変更: `openspec/changes/add-acceptance-tail-to-apply/tasks.md`、`src/agent/prompt.rs`、`src/agent/runner.rs`、`src/agent/tests.rs`、`src/execution/apply.rs`、`src/parallel/executor.rs`、`src/parallel/mod.rs`、`src/parallel/tests/executor.rs`
