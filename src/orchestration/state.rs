@@ -290,7 +290,10 @@ impl OrchestratorState {
             }
 
             // Apply events
-            ExecutionEvent::ApplyStarted { change_id } => {
+            ExecutionEvent::ApplyStarted {
+                change_id,
+                command: _,
+            } => {
                 self.set_current_change(Some(change_id.clone()));
             }
             ExecutionEvent::ApplyCompleted { change_id, .. } => {

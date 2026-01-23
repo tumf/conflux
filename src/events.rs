@@ -162,7 +162,7 @@ pub enum ExecutionEvent {
     // Apply events
     /// Apply started in a workspace
     #[allow(dead_code)]
-    ApplyStarted { change_id: String },
+    ApplyStarted { change_id: String, command: String },
     /// Apply completed in a workspace
     ApplyCompleted {
         change_id: String,
@@ -182,7 +182,7 @@ pub enum ExecutionEvent {
 
     // Archive events
     /// Archive started for a change
-    ArchiveStarted(String),
+    ArchiveStarted { change_id: String, command: String },
     /// Change archived successfully
     ChangeArchived(String),
     /// Change archive failed
@@ -269,7 +269,7 @@ pub enum ExecutionEvent {
     #[allow(dead_code)]
     MergeDeferred { change_id: String, reason: String },
     /// Merge resolution started for a change
-    ResolveStarted { change_id: String },
+    ResolveStarted { change_id: String, command: String },
     /// Merge resolution completed for a change
     ResolveCompleted {
         change_id: String,

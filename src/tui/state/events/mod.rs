@@ -46,11 +46,15 @@ impl AppState {
             } => self.handle_progress_updated(change_id, completed, total),
 
             // Stage events
-            OrchestratorEvent::ApplyStarted { change_id } => self.handle_apply_started(change_id),
-            OrchestratorEvent::ArchiveStarted(id) => self.handle_archive_started(id),
+            OrchestratorEvent::ApplyStarted { change_id, command } => {
+                self.handle_apply_started(change_id, command)
+            }
+            OrchestratorEvent::ArchiveStarted { change_id, command } => {
+                self.handle_archive_started(change_id, command)
+            }
             OrchestratorEvent::ChangeArchived(id) => self.handle_change_archived(id),
-            OrchestratorEvent::ResolveStarted { change_id } => {
-                self.handle_resolve_started(change_id)
+            OrchestratorEvent::ResolveStarted { change_id, command } => {
+                self.handle_resolve_started(change_id, command)
             }
             OrchestratorEvent::ResolveCompleted {
                 change_id,

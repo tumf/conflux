@@ -1304,9 +1304,28 @@ impl ParallelExecutor {
                     )
                     .await;
 
+                    // Note: ensure_archive_commit uses resolve command, not archive command
+                    // Build the expanded resolve command for TUI display
+                    let resolve_prompt = format!(
+                        "You are finalizing the archive commit for change '{change_id}'.\n\n\
+Requirements:\n\
+1) Ensure `git status --porcelain` is empty when done.\n\
+2) If there are changes, run `git add -A` and commit with message \"Archive: {change_id}\".\n\
+3) If a pre-commit hook modifies files or stops the commit, re-run `git add -A` and commit with the same message.\n\
+4) If the latest commit already has subject \"Archive: {change_id}\" and the working tree is clean, do nothing.\n\
+5) Do not use destructive commands like `git reset --hard`.",
+                        change_id = change_id
+                    );
+                    let resolve_template = self.config.get_resolve_command();
+                    let expanded_resolve_command =
+                        OrchestratorConfig::expand_prompt(resolve_template, &resolve_prompt);
+
                     send_event(
                         &self.event_tx,
-                        ParallelEvent::ArchiveStarted(change_id.clone()),
+                        ParallelEvent::ArchiveStarted {
+                            change_id: change_id.clone(),
+                            command: expanded_resolve_command,
+                        },
                     )
                     .await;
 
@@ -1658,9 +1677,28 @@ impl ParallelExecutor {
                     self.workspace_manager
                         .update_workspace_status(&workspace.name, WorkspaceStatus::Archiving);
 
+                    // Note: ensure_archive_commit uses resolve command, not archive command
+                    // Build the expanded resolve command for TUI display
+                    let resolve_prompt = format!(
+                        "You are finalizing the archive commit for change '{change_id}'.\n\n\
+Requirements:\n\
+1) Ensure `git status --porcelain` is empty when done.\n\
+2) If there are changes, run `git add -A` and commit with message \"Archive: {change_id}\".\n\
+3) If a pre-commit hook modifies files or stops the commit, re-run `git add -A` and commit with the same message.\n\
+4) If the latest commit already has subject \"Archive: {change_id}\" and the working tree is clean, do nothing.\n\
+5) Do not use destructive commands like `git reset --hard`.",
+                        change_id = change_id
+                    );
+                    let resolve_template = self.config.get_resolve_command();
+                    let expanded_resolve_command =
+                        OrchestratorConfig::expand_prompt(resolve_template, &resolve_prompt);
+
                     send_event(
                         &self.event_tx,
-                        ParallelEvent::ArchiveStarted(change_id.clone()),
+                        ParallelEvent::ArchiveStarted {
+                            change_id: change_id.clone(),
+                            command: expanded_resolve_command,
+                        },
                     )
                     .await;
 
@@ -2439,11 +2477,9 @@ impl ParallelExecutor {
                         status: WorkspaceStatus::Archiving,
                     })
                     .await;
-                let _ = tx
-                    .send(ParallelEvent::ArchiveStarted(change_id.clone()))
-                    .await;
             }
 
+            // ArchiveStarted event is sent inside execute_archive_in_workspace with command string
             let archive_result = execute_archive_in_workspace(
                 &change_id,
                 &workspace.path,
@@ -2936,14 +2972,12 @@ impl ParallelExecutor {
                     let _ = tx
                         .send(ParallelEvent::WorkspaceStatusUpdated {
                             workspace_name: workspace_name.clone(),
-                            status: WorkspaceStatus::Archiving,
-                        })
-                        .await;
-                    let _ = tx
-                        .send(ParallelEvent::ArchiveStarted(change_id.clone()))
-                        .await;
+                        status: WorkspaceStatus::Archiving,
+                    })
+                    .await;
                 }
 
+                // ArchiveStarted event is sent inside execute_archive_in_workspace with command string
                 let archive_result = execute_archive_in_workspace(
                     &change_id,
                     &workspace_path,
@@ -3550,14 +3584,12 @@ impl ParallelExecutor {
                                                                 let _ = tx
                                                                     .send(ParallelEvent::WorkspaceStatusUpdated {
                                                                         workspace_name: workspace_name.clone(),
-                                                                        status: WorkspaceStatus::Archiving,
-                                                                    })
-                                                                    .await;
-                                                                let _ = tx
-                                                                    .send(ParallelEvent::ArchiveStarted(change_id.clone()))
-                                                                    .await;
+                                                                    status: WorkspaceStatus::Archiving,
+                                                                })
+                                                                .await;
                                                             }
 
+                                                            // ArchiveStarted event is sent inside execute_archive_in_workspace with command string
                                                             let archive_result = execute_archive_in_workspace(
                                                                 &change_id,
                                                                 &workspace_path,
@@ -3697,14 +3729,7 @@ impl ParallelExecutor {
         let revisions = vec![workspace.name.clone()];
         let change_ids = vec![change_id.to_string()];
 
-        // Send ResolveStarted to update TUI status
-        send_event(
-            &self.event_tx,
-            ParallelEvent::ResolveStarted {
-                change_id: change_id.to_string(),
-            },
-        )
-        .await;
+        // ResolveStarted event will be sent from within conflict resolution functions with command string
 
         let archive_paths = vec![workspace.path.clone()];
         match self
@@ -3974,16 +3999,7 @@ impl ParallelExecutor {
                         attempt, max_attempts
                     );
 
-                    // Send ResolveStarted for each change_id to update TUI status
-                    for change_id in change_ids {
-                        send_event(
-                            &self.event_tx,
-                            ParallelEvent::ResolveStarted {
-                                change_id: change_id.to_string(),
-                            },
-                        )
-                        .await;
-                    }
+                    // ResolveStarted event will be sent from within conflict resolution functions with command string
 
                     if let Err(err) = resolve_conflicts(revisions.to_vec(), details.clone()).await {
                         warn!(
