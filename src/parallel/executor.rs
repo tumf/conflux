@@ -1352,6 +1352,7 @@ pub async fn execute_acceptance_in_workspace(
     config: &OrchestratorConfig,
     acceptance_tail_injected: &Arc<Mutex<std::collections::HashMap<String, bool>>>,
     acceptance_history: &Arc<Mutex<crate::history::AcceptanceHistory>>,
+    base_branch: Option<&str>,
 ) -> Result<(crate::orchestration::AcceptanceResult, u32)> {
     use crate::acceptance::{parse_acceptance_output, AcceptanceResult as ParseResult};
 
@@ -1390,6 +1391,64 @@ pub async fn execute_acceptance_in_workspace(
     let user_prompt = config.get_acceptance_prompt();
     let history_context = agent.format_acceptance_history(change_id);
 
+    // Build diff context for all acceptance attempts
+    let diff_context = {
+        // Get current commit hash
+        let current_commit = crate::vcs::git::commands::get_current_commit(workspace_path)
+            .await
+            .ok();
+
+        // Determine base commit for diff
+        let base_commit = {
+            let acc_history = acceptance_history.lock().await;
+            if acc_history.count(change_id) == 0 {
+                // First acceptance: use base branch
+                base_branch.map(|b| b.to_string())
+            } else {
+                // 2nd+ acceptance: use last acceptance commit
+                acc_history.last_commit_hash(change_id)
+            }
+        };
+
+        // Get changed files if we have both base and current commits
+        if let (Some(base), Some(current)) = (base_commit.as_ref(), current_commit.as_ref()) {
+            match crate::vcs::git::commands::get_changed_files(workspace_path, Some(base), current)
+                .await
+            {
+                Ok(files) => {
+                    // Get previous findings for 2nd+ attempts
+                    let previous_findings = {
+                        let acc_history = acceptance_history.lock().await;
+                        if acc_history.count(change_id) > 0 {
+                            acc_history.last_findings(change_id)
+                        } else {
+                            None
+                        }
+                    };
+
+                    // Build diff context if we have files or findings
+                    if !files.is_empty() || previous_findings.is_some() {
+                        crate::agent::build_acceptance_diff_context(
+                            &files,
+                            previous_findings.as_deref(),
+                        )
+                    } else {
+                        String::new()
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to get changed files for acceptance diff context: {}",
+                        e
+                    );
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        }
+    };
+
     // Build last acceptance output context for 2nd+ attempts
     let stdout_tail = agent.get_last_acceptance_stdout_tail(change_id);
     let stderr_tail = agent.get_last_acceptance_stderr_tail(change_id);
@@ -1398,11 +1457,13 @@ pub async fn execute_acceptance_in_workspace(
         stderr_tail.as_deref(),
     );
 
+    // Build full prompt: system_prompt + diff_context + last_output_context + user_prompt + history_context
     let full_prompt = crate::agent::build_acceptance_prompt(
         change_id,
         user_prompt,
         &history_context,
         &last_output_context,
+        &diff_context,
     );
 
     // Expand change_id and prompt in command

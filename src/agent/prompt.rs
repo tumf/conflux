@@ -65,7 +65,7 @@ pub fn build_archive_prompt(user_prompt: &str, history_context: &str) -> String 
 ///
 /// The prompt is constructed as:
 /// 1. ACCEPTANCE_SYSTEM_PROMPT with {change_id} expanded (always included)
-/// 2. diff_context (if not empty) - for 2nd+ acceptance attempts
+/// 2. diff_context (if not empty) - changed files context for all acceptance attempts
 /// 3. last_output_context (if not empty) - previous acceptance stdout/stderr tail for 2nd+ attempts
 /// 4. user_prompt (if not empty)
 /// 5. history_context (if not empty)
@@ -74,12 +74,18 @@ pub fn build_acceptance_prompt(
     user_prompt: &str,
     history_context: &str,
     last_output_context: &str,
+    diff_context: &str,
 ) -> String {
     let mut parts = Vec::new();
 
     // System prompt is always included first, with change_id expanded
     let system_prompt = ACCEPTANCE_SYSTEM_PROMPT.replace("{change_id}", change_id);
     parts.push(system_prompt);
+
+    // Diff context comes right after system prompt
+    if !diff_context.is_empty() {
+        parts.push(diff_context.to_string());
+    }
 
     if !last_output_context.is_empty() {
         parts.push(last_output_context.to_string());
@@ -96,9 +102,10 @@ pub fn build_acceptance_prompt(
     parts.join("\n\n")
 }
 
-/// Build diff context for 2nd+ acceptance attempts.
+/// Build diff context for acceptance attempts.
 ///
 /// Returns formatted context with changed files and previous findings.
+/// Used for all acceptance attempts (1st shows base→current, 2nd+ shows last→current).
 pub fn build_acceptance_diff_context(
     changed_files: &[String],
     previous_findings: Option<&[String]>,
@@ -236,5 +243,94 @@ mod tests {
         assert!(!context.contains("Previous acceptance findings:"));
         assert!(context.contains("Focus your verification on:"));
         assert!(context.contains("</acceptance_diff_context>"));
+    }
+
+    #[test]
+    fn test_build_acceptance_prompt_insertion_order() {
+        // Test that the prompt components are inserted in the correct order:
+        // 1. system_prompt
+        // 2. diff_context
+        // 3. last_output_context
+        // 4. user_prompt
+        // 5. history_context
+
+        let change_id = "test-change";
+        let user_prompt = "USER_PROMPT_MARKER";
+        let history_context = "HISTORY_CONTEXT_MARKER";
+        let last_output_context =
+            "<last_acceptance_output>\nLAST_OUTPUT_MARKER\n</last_acceptance_output>";
+        let diff_context =
+            "<acceptance_diff_context>\nDIFF_CONTEXT_MARKER\n</acceptance_diff_context>";
+
+        let result = build_acceptance_prompt(
+            change_id,
+            user_prompt,
+            history_context,
+            last_output_context,
+            diff_context,
+        );
+
+        // Find positions of each marker
+        let system_pos = result
+            .find("You are reviewing the implementation")
+            .expect("System prompt should be present");
+        let diff_pos = result
+            .find("DIFF_CONTEXT_MARKER")
+            .expect("Diff context should be present");
+        let last_output_pos = result
+            .find("LAST_OUTPUT_MARKER")
+            .expect("Last output context should be present");
+        let user_pos = result
+            .find("USER_PROMPT_MARKER")
+            .expect("User prompt should be present");
+        let history_pos = result
+            .find("HISTORY_CONTEXT_MARKER")
+            .expect("History context should be present");
+
+        // Verify order: system < diff < last_output < user < history
+        assert!(
+            system_pos < diff_pos,
+            "System prompt should come before diff context"
+        );
+        assert!(
+            diff_pos < last_output_pos,
+            "Diff context should come before last output context"
+        );
+        assert!(
+            last_output_pos < user_pos,
+            "Last output context should come before user prompt"
+        );
+        assert!(
+            user_pos < history_pos,
+            "User prompt should come before history context"
+        );
+    }
+
+    #[test]
+    fn test_build_acceptance_prompt_empty_diff_context() {
+        // Test that empty diff context is correctly omitted
+        let change_id = "test-change";
+        let user_prompt = "USER_PROMPT";
+        let history_context = "";
+        let last_output_context = "";
+        let diff_context = ""; // Empty diff context
+
+        let result = build_acceptance_prompt(
+            change_id,
+            user_prompt,
+            history_context,
+            last_output_context,
+            diff_context,
+        );
+
+        // Should contain system prompt and user prompt
+        assert!(result.contains("You are reviewing the implementation"));
+        assert!(result.contains("USER_PROMPT"));
+
+        // Should NOT contain diff context section with actual content
+        // (Note: The ACCEPTANCE_SYSTEM_PROMPT mentions <acceptance_diff_context> in instructions,
+        // but we should not have a separate block with actual file listings)
+        assert!(!result.contains("Files changed since last acceptance check:"));
+        assert!(!result.contains("Previous acceptance findings:"));
     }
 }

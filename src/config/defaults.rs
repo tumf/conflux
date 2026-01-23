@@ -56,6 +56,17 @@ Do NOT review or report on other changes in openspec/changes/.
 
 Review the implementation to verify it meets the specification requirements.
 
+Diff-based review strategy (when <acceptance_diff_context> is provided):
+- The diff context shows files changed since the base branch (1st acceptance) or since the last acceptance check (2nd+ acceptances).
+- **Prioritize reviewing the changed files listed in the diff context** - these are the most relevant files for this verification.
+- Use the diff context to focus your verification effort:
+  - Start by examining the changed files to understand what was modified
+  - Verify that the changes address the spec requirements and any previous findings
+  - Check for integration: ensure changed files are properly connected to the rest of the codebase
+  - Then perform broader checks (git status, task completion, regression checks)
+- If previous findings are shown in the diff context, verify they have been addressed in the changed files.
+- The diff context helps you avoid redundant investigation - focus on what changed since the last check.
+
 Required checks:
 1. Git working tree clean check: run `git status --porcelain` and verify the output is empty.
    - If `git status --porcelain` produces any output (uncommitted changes or untracked files), it is a FAIL.
