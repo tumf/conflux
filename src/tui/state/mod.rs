@@ -1672,6 +1672,67 @@ mod tests {
         assert_eq!(app.log_scroll_offset, 0);
     }
 
+    #[test]
+    fn test_log_scroll_offset_freeze() {
+        use crate::tui::events::LogEntry;
+        use crate::tui::state::logs::MAX_LOG_ENTRIES;
+
+        let changes = vec![create_test_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Fill the buffer to MAX_LOG_ENTRIES
+        for i in 0..MAX_LOG_ENTRIES {
+            app.add_log(LogEntry::info(format!("Log entry {}", i)));
+        }
+
+        // Auto-scroll is enabled, offset should be 0
+        assert!(app.log_auto_scroll);
+        assert_eq!(app.log_scroll_offset, 0);
+
+        // Disable auto-scroll by scrolling up
+        app.scroll_logs_up(10);
+        assert!(!app.log_auto_scroll);
+        assert_eq!(app.log_scroll_offset, 10);
+
+        // Add new logs that trigger buffer trimming
+        // Each new log should increment offset to maintain view position
+        for i in 0..50 {
+            app.add_log(LogEntry::info(format!("New log entry {}", i)));
+
+            // Offset should increment to compensate for new log
+            // When buffer is trimmed, offset stays the same (freeze position)
+            // Should not exceed max_offset
+            let max_offset = app.logs.len().saturating_sub(1);
+            assert!(
+                app.log_scroll_offset <= max_offset,
+                "Offset should be clamped to max_offset"
+            );
+        }
+
+        // After adding 50 new logs with buffer trimming, the offset should be adjusted
+        // to keep showing approximately the same log content (clamped to available range)
+        // The key assertion: we should still see old logs, not the newest ones
+        // Offset should be > 0 (not auto-scrolled to bottom)
+        assert!(
+            app.log_scroll_offset > 0,
+            "Offset should remain > 0, indicating frozen view position"
+        );
+
+        // Verify that auto-scroll was not re-enabled
+        assert!(
+            !app.log_auto_scroll,
+            "Auto-scroll should remain disabled during buffer trim"
+        );
+
+        // The log at the current offset should NOT be one of the newly added logs
+        let current_log = &app.logs[app.logs.len() - 1 - app.log_scroll_offset].message;
+        assert!(
+            !current_log.starts_with("New log entry"),
+            "View should be frozen on old logs, not showing new log entries. Current: {}",
+            current_log
+        );
+    }
+
     // === Tests for stop mode ===
 
     #[test]
