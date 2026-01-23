@@ -822,7 +822,8 @@ pub async fn run_orchestrator(
 
         // Build expanded apply command for ApplyStarted event
         // This mirrors the logic in AgentRunner::run_apply_streaming_with_runner
-        let acceptance_tail = agent.get_acceptance_tail_context_for_apply(&change_id);
+        // Use peek method to avoid consuming the acceptance_tail_injected flag
+        let acceptance_tail = agent.peek_acceptance_tail_context_for_apply(&change_id);
         let apply_template = agent.config().get_apply_command();
         let apply_user_prompt = agent.config().get_apply_prompt();
         let apply_history_context = agent.format_apply_history(&change_id);

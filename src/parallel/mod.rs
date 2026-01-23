@@ -1305,12 +1305,26 @@ impl ParallelExecutor {
                     .await;
 
                     // Note: ensure_archive_commit uses resolve command, not archive command
-                    // Command string is a placeholder since this is just finalizing the commit
+                    // Build the expanded resolve command for TUI display
+                    let resolve_prompt = format!(
+                        "You are finalizing the archive commit for change '{change_id}'.\n\n\
+Requirements:\n\
+1) Ensure `git status --porcelain` is empty when done.\n\
+2) If there are changes, run `git add -A` and commit with message \"Archive: {change_id}\".\n\
+3) If a pre-commit hook modifies files or stops the commit, re-run `git add -A` and commit with the same message.\n\
+4) If the latest commit already has subject \"Archive: {change_id}\" and the working tree is clean, do nothing.\n\
+5) Do not use destructive commands like `git reset --hard`.",
+                        change_id = change_id
+                    );
+                    let resolve_template = self.config.get_resolve_command();
+                    let expanded_resolve_command =
+                        OrchestratorConfig::expand_prompt(resolve_template, &resolve_prompt);
+
                     send_event(
                         &self.event_tx,
                         ParallelEvent::ArchiveStarted {
                             change_id: change_id.clone(),
-                            command: "(finalizing archive commit)".to_string(),
+                            command: expanded_resolve_command,
                         },
                     )
                     .await;
@@ -1664,12 +1678,26 @@ impl ParallelExecutor {
                         .update_workspace_status(&workspace.name, WorkspaceStatus::Archiving);
 
                     // Note: ensure_archive_commit uses resolve command, not archive command
-                    // Command string is a placeholder since this is just finalizing the commit
+                    // Build the expanded resolve command for TUI display
+                    let resolve_prompt = format!(
+                        "You are finalizing the archive commit for change '{change_id}'.\n\n\
+Requirements:\n\
+1) Ensure `git status --porcelain` is empty when done.\n\
+2) If there are changes, run `git add -A` and commit with message \"Archive: {change_id}\".\n\
+3) If a pre-commit hook modifies files or stops the commit, re-run `git add -A` and commit with the same message.\n\
+4) If the latest commit already has subject \"Archive: {change_id}\" and the working tree is clean, do nothing.\n\
+5) Do not use destructive commands like `git reset --hard`.",
+                        change_id = change_id
+                    );
+                    let resolve_template = self.config.get_resolve_command();
+                    let expanded_resolve_command =
+                        OrchestratorConfig::expand_prompt(resolve_template, &resolve_prompt);
+
                     send_event(
                         &self.event_tx,
                         ParallelEvent::ArchiveStarted {
                             change_id: change_id.clone(),
-                            command: "(finalizing archive commit)".to_string(),
+                            command: expanded_resolve_command,
                         },
                     )
                     .await;

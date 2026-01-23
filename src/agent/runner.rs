@@ -688,6 +688,29 @@ impl AgentRunner {
         context
     }
 
+    /// Peek at the acceptance tail context without consuming the injection flag.
+    /// This is useful for display purposes (e.g., TUI command logging) where we want
+    /// to show what will be sent without affecting the actual execution.
+    pub fn peek_acceptance_tail_context_for_apply(&self, change_id: &str) -> String {
+        // Check if we've already injected the tail for this change
+        if self
+            .acceptance_tail_injected
+            .get(change_id)
+            .copied()
+            .unwrap_or(false)
+        {
+            return String::new();
+        }
+
+        // Get stdout/stderr tails from the last acceptance attempt
+        let stdout_tail = self.acceptance_history.last_stdout_tail(change_id);
+        let stderr_tail = self.acceptance_history.last_stderr_tail(change_id);
+
+        // Build the context without marking as injected
+        use super::prompt::build_last_acceptance_output_context;
+        build_last_acceptance_output_context(stdout_tail.as_deref(), stderr_tail.as_deref())
+    }
+
     /// Reset acceptance tail injection flag for a change.
     /// This should be called when a new acceptance attempt is recorded,
     /// so the next apply retry can receive the new acceptance output.
