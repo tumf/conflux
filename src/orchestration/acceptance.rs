@@ -100,9 +100,16 @@ where
         .await
         .ok(); // Allow to fail silently (non-git repos)
 
+    // Get current branch for diff context (first acceptance needs base branch)
+    let base_branch = crate::vcs::git::commands::get_current_branch(".")
+        .await
+        .ok()
+        .flatten(); // None if in detached HEAD or non-git repo
+
     // Execute acceptance command with streaming
-    let (mut child, mut output_rx, start_time) =
-        agent.run_acceptance_streaming(&change.id, None).await?;
+    let (mut child, mut output_rx, start_time) = agent
+        .run_acceptance_streaming(&change.id, None, base_branch.as_deref())
+        .await?;
 
     // Create output collector for history and parsing
     let mut output_collector = OutputCollector::new();

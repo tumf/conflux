@@ -514,14 +514,17 @@ impl AgentRunner {
         &self,
         change_id: &str,
         cwd: Option<&Path>,
+        base_branch: Option<&str>,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
         let start = Instant::now();
         let template = self.config.get_acceptance_command();
         let user_prompt = self.config.get_acceptance_prompt();
         let history_context = self.acceptance_history.format_context(change_id);
 
-        // Build diff context for 2nd+ attempts
-        let diff_context = self.build_acceptance_diff_context(change_id, cwd).await?;
+        // Build diff context for all attempts
+        let diff_context = self
+            .build_acceptance_diff_context(change_id, cwd, base_branch)
+            .await?;
 
         // Build last acceptance output context for 2nd+ attempts
         use super::prompt::build_last_acceptance_output_context;
@@ -530,17 +533,14 @@ impl AgentRunner {
         let last_output_context =
             build_last_acceptance_output_context(stdout_tail.as_deref(), stderr_tail.as_deref());
 
-        // Build full prompt: system_prompt (with change_id) + last_output_context + diff_context + user_prompt + history_context
-        let mut full_prompt = build_acceptance_prompt(
+        // Build full prompt: system_prompt (with change_id) + diff_context + last_output_context + user_prompt + history_context
+        let full_prompt = build_acceptance_prompt(
             change_id,
             user_prompt,
             &history_context,
             &last_output_context,
+            &diff_context,
         );
-        if !diff_context.is_empty() {
-            // Insert diff_context after system_prompt, before user_prompt
-            full_prompt = format!("{}\n\n{}", full_prompt, diff_context);
-        }
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
@@ -558,25 +558,19 @@ impl AgentRunner {
         Ok((child, rx, start))
     }
 
-    /// Build acceptance diff context for 2nd+ attempts.
-    /// Returns empty string for 1st attempt, or formatted diff context for 2nd+ attempts.
+    /// Build acceptance diff context for all acceptance attempts.
+    /// - 1st attempt: Shows files changed from base_branch to current commit
+    /// - 2nd+ attempts: Shows files changed since last acceptance check
     async fn build_acceptance_diff_context(
         &self,
         change_id: &str,
         cwd: Option<&Path>,
+        base_branch: Option<&str>,
     ) -> Result<String> {
         use super::prompt::build_acceptance_diff_context;
 
-        // Only build diff context for 2nd+ attempts
-        if self.acceptance_history.count(change_id) == 0 {
-            return Ok(String::new());
-        }
-
         // Get repository path
         let repo_path = cwd.unwrap_or_else(|| Path::new("."));
-
-        // Get last commit hash from previous acceptance
-        let last_commit = self.acceptance_history.last_commit_hash(change_id);
 
         // Get current commit hash
         let current_commit = crate::vcs::git::commands::get_current_commit(repo_path)
@@ -585,20 +579,33 @@ impl AgentRunner {
                 OrchestratorError::GitCommand(format!("Failed to get current commit hash: {}", e))
             })?;
 
-        // Get changed files between last acceptance and now
-        let changed_files = if let Some(ref last) = last_commit {
-            crate::vcs::git::commands::get_changed_files(repo_path, Some(last), &current_commit)
+        // Determine the base commit for diff
+        let base_commit = if self.acceptance_history.count(change_id) == 0 {
+            // First acceptance: use base branch if provided
+            base_branch.map(|b| b.to_string())
+        } else {
+            // 2nd+ acceptance: use last acceptance commit
+            self.acceptance_history.last_commit_hash(change_id)
+        };
+
+        // Get changed files between base and current commit
+        let changed_files = if let Some(ref base) = base_commit {
+            crate::vcs::git::commands::get_changed_files(repo_path, Some(base), &current_commit)
                 .await
                 .map_err(|e| {
                     OrchestratorError::GitCommand(format!("Failed to get changed files: {}", e))
                 })?
         } else {
-            // First attempt had no commit hash recorded, fall back to empty list
+            // No base commit available (non-git repo or first attempt without base_branch)
             Vec::new()
         };
 
-        // Get previous findings
-        let previous_findings = self.acceptance_history.last_findings(change_id);
+        // Get previous findings (only for 2nd+ attempts)
+        let previous_findings = if self.acceptance_history.count(change_id) > 0 {
+            self.acceptance_history.last_findings(change_id)
+        } else {
+            None
+        };
 
         // Build diff context only if there are changed files or previous findings
         if changed_files.is_empty() && previous_findings.is_none() {

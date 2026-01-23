@@ -1430,6 +1430,7 @@ impl ParallelExecutor {
                         "Running acceptance test for {} before archive (resume)",
                         change_id
                     );
+                    let base_branch = self.workspace_manager.original_branch();
                     let acceptance_result = execute_acceptance_in_workspace(
                         change_id,
                         &workspace.path,
@@ -1440,6 +1441,7 @@ impl ParallelExecutor {
                         &self.config,
                         &self.acceptance_tail_injected,
                         &self.acceptance_history,
+                        base_branch.as_deref(),
                     )
                     .await;
 
@@ -2180,6 +2182,7 @@ impl ParallelExecutor {
         let acceptance_tail_injected = self.acceptance_tail_injected.clone();
         let cancel_token = self.cancel_token.clone();
         let shared_stagger_state = self.shared_stagger_state.clone();
+        let base_branch = self.workspace_manager.original_branch();
 
         // Spawn apply + acceptance + archive task
         join_set.spawn(async move {
@@ -2287,6 +2290,7 @@ impl ParallelExecutor {
                     &config,
                     &acceptance_tail_injected,
                     &acceptance_history,
+                    base_branch.as_deref(),
                 )
                 .await;
 
@@ -2664,6 +2668,7 @@ impl ParallelExecutor {
             let acceptance_tail_injected = self.acceptance_tail_injected.clone();
             let status_tx_clone = status_tx.clone();
             let shared_stagger_state = self.shared_stagger_state.clone();
+            let base_branch = self.workspace_manager.original_branch();
 
             // Build parallel hook context
             let parallel_ctx = ParallelHookContext {
@@ -2785,6 +2790,7 @@ impl ParallelExecutor {
                         &config,
                         &acceptance_tail_injected,
                         &acceptance_history,
+                        base_branch.as_deref(),
                     )
                     .await;
 
@@ -3298,6 +3304,7 @@ impl ParallelExecutor {
                                                         let acceptance_tail_injected = self.acceptance_tail_injected.clone();
                                                         let status_tx_clone = status_tx.clone();
                                                         let shared_stagger_state = self.shared_stagger_state.clone();
+                                                        let base_branch = self.workspace_manager.original_branch();
 
                                                         // Build parallel hook context
                                                         let parallel_ctx = ParallelHookContext {
@@ -3405,6 +3412,7 @@ impl ParallelExecutor {
                                                                     &config,
                                                                     &acceptance_tail_injected,
                                                                     &acceptance_history,
+                                                                    base_branch.as_deref(),
                                                                 )
                                                                 .await;
 
