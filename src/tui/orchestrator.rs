@@ -131,8 +131,23 @@ pub async fn archive_single_change(
             .await;
     }
 
-    // Archive the change - send ArchiveStarted event
-    let archive_started_event = OrchestratorEvent::ArchiveStarted(change_id.to_string());
+    // Build expanded archive command for ArchiveStarted event
+    // This mirrors the logic in AgentRunner::run_archive_streaming_with_runner
+    let archive_template = agent.config().get_archive_command();
+    let archive_user_prompt = agent.config().get_archive_prompt();
+    let archive_history_context = agent.format_archive_history(change_id);
+    let archive_full_prompt =
+        crate::agent::build_archive_prompt(archive_user_prompt, &archive_history_context);
+    let archive_expanded_command =
+        OrchestratorConfig::expand_change_id(archive_template, change_id);
+    let archive_expanded_command =
+        OrchestratorConfig::expand_prompt(&archive_expanded_command, &archive_full_prompt);
+
+    // Archive the change - send ArchiveStarted event with expanded command
+    let archive_started_event = OrchestratorEvent::ArchiveStarted {
+        change_id: change_id.to_string(),
+        command: archive_expanded_command,
+    };
     let _ = tx.send(archive_started_event.clone()).await;
     #[cfg(feature = "web-monitoring")]
     if let Some(ws) = web_state {
@@ -151,7 +166,7 @@ pub async fn archive_single_change(
         attempt += 1;
 
         // Run archive command via AiCommandRunner with streaming output (shared stagger state)
-        let (mut child, mut output_rx, start) = agent
+        let (mut child, mut output_rx, start, _command) = agent
             .run_archive_streaming_with_runner(change_id, ai_runner, None)
             .await?;
 
@@ -805,9 +820,26 @@ pub async fn run_orchestrator(
             });
         });
 
-        // Send ApplyStarted event
+        // Build expanded apply command for ApplyStarted event
+        // This mirrors the logic in AgentRunner::run_apply_streaming_with_runner
+        let acceptance_tail = agent.get_acceptance_tail_context_for_apply(&change_id);
+        let apply_template = agent.config().get_apply_command();
+        let apply_user_prompt = agent.config().get_apply_prompt();
+        let apply_history_context = agent.format_apply_history(&change_id);
+        let apply_full_prompt = crate::agent::build_apply_prompt(
+            apply_user_prompt,
+            &apply_history_context,
+            &acceptance_tail,
+        );
+        let apply_expanded_command =
+            OrchestratorConfig::expand_change_id(apply_template, &change_id);
+        let apply_expanded_command =
+            OrchestratorConfig::expand_prompt(&apply_expanded_command, &apply_full_prompt);
+
+        // Send ApplyStarted event with expanded command
         let apply_started_event = OrchestratorEvent::ApplyStarted {
-            change_id: change_id.clone(),
+            change_id: change_id.to_string(),
+            command: apply_expanded_command,
         };
         let _ = tx.send(apply_started_event.clone()).await;
         shared_state

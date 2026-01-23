@@ -14,7 +14,7 @@ use super::super::AppState;
 
 impl AppState {
     /// Handle ApplyStarted event
-    pub(super) fn handle_apply_started(&mut self, change_id: String) {
+    pub(super) fn handle_apply_started(&mut self, change_id: String, command: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             if change.started_at.is_none() {
                 change.started_at = Some(Instant::now());
@@ -23,10 +23,11 @@ impl AppState {
             change.elapsed_time = None;
         }
         self.add_log(LogEntry::info(format!("Apply started: {}", change_id)));
+        self.add_log(LogEntry::info(format!("  Command: {}", command)));
     }
 
     /// Handle ArchiveStarted event
-    pub(super) fn handle_archive_started(&mut self, id: String) {
+    pub(super) fn handle_archive_started(&mut self, id: String, command: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
             if change.started_at.is_none() {
                 change.started_at = Some(Instant::now());
@@ -50,6 +51,7 @@ impl AppState {
             }
         }
         self.add_log(LogEntry::info(format!("Archiving: {}", id)));
+        self.add_log(LogEntry::info(format!("  Command: {}", command)));
     }
 
     /// Handle ChangeArchived event
@@ -81,7 +83,7 @@ impl AppState {
     }
 
     /// Handle ResolveStarted event
-    pub(super) fn handle_resolve_started(&mut self, change_id: String) {
+    pub(super) fn handle_resolve_started(&mut self, change_id: String, command: String) {
         self.is_resolving = true;
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             if change.started_at.is_none() {
@@ -94,6 +96,7 @@ impl AppState {
             "Resolving merge for '{}'",
             change_id
         )));
+        self.add_log(LogEntry::info(format!("  Command: {}", command)));
     }
 
     /// Handle ResolveCompleted event

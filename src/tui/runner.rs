@@ -1867,11 +1867,8 @@ async fn run_tui_loop(
                         // Increment counter when resolve starts (consumes a parallel execution slot)
                         resolve_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                        let _ = resolve_tx
-                            .send(OrchestratorEvent::ResolveStarted {
-                                change_id: id.clone(),
-                            })
-                            .await;
+                        // Note: ResolveStarted event is sent by resolve_deferred_merge -> resolve_merges_with_retry
+                        // with the actual expanded command. We don't send it here to avoid duplicate events.
 
                         // Helper closure to decrement counter and send event
                         let finish_resolve = |event: OrchestratorEvent| async {

@@ -647,6 +647,7 @@ impl Orchestrator {
                     self.shared_state.write().await.apply_execution_event(
                         &ExecutionEvent::ApplyStarted {
                             change_id: next.id.clone(),
+                            command: "(placeholder)".to_string(),
                         },
                     );
 

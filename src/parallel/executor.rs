@@ -450,17 +450,7 @@ pub async fn execute_apply_in_workspace(
             iteration, change_id, progress.completed, progress.total
         );
 
-        // Send ApplyStarted event on first apply
-        if first_apply {
-            first_apply = false;
-            if let Some(ref tx) = event_tx {
-                let _ = tx
-                    .send(ParallelEvent::ApplyStarted {
-                        change_id: change_id.to_string(),
-                    })
-                    .await;
-            }
-        }
+        // ApplyStarted event will be sent after command is built (moved below)
 
         // Run pre_apply hook
         if let Some(hook_runner) = hooks {
@@ -555,6 +545,19 @@ pub async fn execute_apply_in_workspace(
 
         debug!("Workspace path: {:?}", workspace_path);
         debug!("Apply command: {}", command);
+
+        // Send ApplyStarted event on first apply (after command is built)
+        if first_apply {
+            first_apply = false;
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::ApplyStarted {
+                        change_id: change_id.to_string(),
+                        command: command.clone(),
+                    })
+                    .await;
+            }
+        }
 
         // Capture start time for history recording
         let start = std::time::Instant::now();
@@ -1001,6 +1004,16 @@ pub async fn execute_archive_in_workspace(
     let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
 
     debug!("Archive command in workspace: {}", command);
+
+    // Send ArchiveStarted event with expanded command
+    if let Some(ref tx) = event_tx {
+        let _ = tx
+            .send(ParallelEvent::ArchiveStarted {
+                change_id: change_id.to_string(),
+                command: command.clone(),
+            })
+            .await;
+    }
 
     use crate::execution::archive::{
         build_archive_error_message, ensure_archive_commit, verify_archive_completion,
