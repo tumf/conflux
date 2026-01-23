@@ -177,13 +177,31 @@ where
         ));
     }
 
-    // TODO: Always return Continue with tail_findings for investigation
-    // This allows the acceptance loop to carry tail output to next apply iteration
-    info!("Acceptance requires continuation for: {}", change.id);
+    // Parse acceptance output to determine result
+    let parsed_result = crate::acceptance::parse_acceptance_output(&full_stdout);
+
+    let (result, passed) = match parsed_result {
+        crate::acceptance::AcceptanceResult::Pass => {
+            info!("Acceptance test passed for: {}", change.id);
+            output.on_info("Acceptance test: PASS");
+            (AcceptanceResult::Pass, true)
+        }
+        crate::acceptance::AcceptanceResult::Fail { findings } => {
+            info!("Acceptance test failed for: {}", change.id);
+            output.on_warn("Acceptance test: FAIL");
+            (AcceptanceResult::Fail { findings }, false)
+        }
+        crate::acceptance::AcceptanceResult::Continue => {
+            info!("Acceptance requires continuation for: {}", change.id);
+            output.on_info("Acceptance test: CONTINUE");
+            (AcceptanceResult::Continue, false)
+        }
+    };
+
     let attempt_number = agent.next_acceptance_attempt_number(&change.id);
     let attempt = AcceptanceAttempt {
         attempt: attempt_number,
-        passed: false,
+        passed,
         duration: start_time.elapsed(),
         findings: Some(tail_findings.clone()),
         exit_code: status.code(),
@@ -192,8 +210,7 @@ where
         commit_hash: commit_hash.clone(),
     };
     agent.record_acceptance_attempt(&change.id, attempt);
-    output.on_info("Acceptance test requires continuation");
-    Ok((AcceptanceResult::Continue, attempt_number))
+    Ok((result, attempt_number))
 }
 
 #[cfg(test)]

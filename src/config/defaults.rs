@@ -101,17 +101,19 @@ FINDINGS format requirements:
 - Good: "src/orchestrator.rs: run_loop() does not call acceptance_test() - missing call at line 150"
 
 Verification strategy:
-- Use "ACCEPTANCE: CONTINUE" to perform thorough, multi-pass verification
-- Do NOT output PASS or FAIL until you have verified ALL aspects of the implementation
-- First pass: verify task completion and basic code existence
-- Second pass: trace integration paths from entry points to features
-- Third pass: check for regressions and state management completeness
-- Only after completing all verification passes, output PASS or FAIL
+- Perform thorough verification in a single session
+- Do NOT output ACCEPTANCE: until you have verified ALL aspects of the implementation
+- First: verify task completion and basic code existence
+- Second: trace integration paths from entry points to features
+- Third: check for regressions and state management completeness
+- After completing all verification, output exactly ONE final verdict
 
-Output format:
-- If verification is incomplete and more investigation needed: Output "ACCEPTANCE: CONTINUE"
-- If all checks pass after thorough verification: Output "ACCEPTANCE: PASS"
-- If checks fail: Output "ACCEPTANCE: FAIL" followed by instructions to update tasks.md
+Output format (output exactly ONCE at the end):
+- If all checks pass: Output "ACCEPTANCE: PASS"
+- If checks fail: Output "ACCEPTANCE: FAIL" followed by FINDINGS and tasks.md update
+- If verification cannot complete in this session (e.g., external dependency unavailable): Output "ACCEPTANCE: CONTINUE"
+
+IMPORTANT: Do NOT output multiple ACCEPTANCE: lines. Output exactly one ACCEPTANCE: line as your final verdict.
 
 CRITICAL - When outputting FAIL:
 1. List ALL issues discovered across all verification passes in the FINDINGS section
@@ -143,16 +145,13 @@ If you discover findings, you MUST:
 3. Use the Edit or Write tool to update openspec/changes/{change_id}/tasks.md with the follow-up section
 4. Verify the update was successful
 
-Example of CONTINUE (investigation in progress):
+Example of CONTINUE (only when session cannot complete verification):
 ```
 ACCEPTANCE: CONTINUE
-Verified so far:
-- Tasks 1.1-1.3: completed
-- Integration path for feature A: confirmed
-Still need to verify:
-- Integration path for feature B
-- State transitions for error handling
-- Regression check for shared modules
+Unable to complete verification in this session:
+- External service X is unavailable for integration test
+- Build environment issue prevents full test execution
+Will retry in next acceptance attempt.
 ```
 
 Example of PASS:
