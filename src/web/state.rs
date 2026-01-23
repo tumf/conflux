@@ -504,7 +504,10 @@ impl WebState {
                 }
 
                 // Archive events
-                ExecutionEvent::ArchiveStarted(change_id) => {
+                ExecutionEvent::ArchiveStarted {
+                    change_id,
+                    command: _,
+                } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
                         change.queue_status = Some("archiving".to_string());
                         updated = true;
@@ -556,7 +559,10 @@ impl WebState {
                         updated = true;
                     }
                 }
-                ExecutionEvent::ResolveStarted { change_id } => {
+                ExecutionEvent::ResolveStarted {
+                    change_id,
+                    command: _,
+                } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
                         change.queue_status = Some("resolving".to_string());
                         updated = true;
@@ -1375,7 +1381,10 @@ mod tests {
 
         // Set to archiving with ArchiveStarted
         web_state
-            .apply_execution_event(&ExecutionEvent::ArchiveStarted("change-a".to_string()))
+            .apply_execution_event(&ExecutionEvent::ArchiveStarted {
+                change_id: "change-a".to_string(),
+                command: "test command".to_string(),
+            })
             .await;
 
         // Progress should be preserved
@@ -1402,7 +1411,10 @@ mod tests {
 
         // Set to archiving
         web_state
-            .apply_execution_event(&ExecutionEvent::ArchiveStarted("change-a".to_string()))
+            .apply_execution_event(&ExecutionEvent::ArchiveStarted {
+                change_id: "change-a".to_string(),
+                command: "test command".to_string(),
+            })
             .await;
 
         // Send ProgressUpdated with 0/0 (retrieval failure during archiving)
@@ -1435,6 +1447,7 @@ mod tests {
         web_state
             .apply_execution_event(&ExecutionEvent::ResolveStarted {
                 change_id: "change-a".to_string(),
+                command: "test resolve command".to_string(),
             })
             .await;
 
@@ -1466,7 +1479,10 @@ mod tests {
 
         // Set to archiving
         web_state
-            .apply_execution_event(&ExecutionEvent::ArchiveStarted("change-a".to_string()))
+            .apply_execution_event(&ExecutionEvent::ArchiveStarted {
+                change_id: "change-a".to_string(),
+                command: "test command".to_string(),
+            })
             .await;
 
         // Send ChangesRefreshed with 0/0 (retrieval failure)
@@ -1508,6 +1524,7 @@ mod tests {
         web_state
             .apply_execution_event(&ExecutionEvent::ResolveStarted {
                 change_id: "change-a".to_string(),
+                command: "test resolve command".to_string(),
             })
             .await;
 

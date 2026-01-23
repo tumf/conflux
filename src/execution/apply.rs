@@ -423,7 +423,7 @@ pub fn summarize_output(output: &str, max_lines: usize) -> String {
 /// (e.g., TUI event channel, CLI logger, parallel event bus).
 pub trait ApplyEventHandler {
     /// Called when apply iteration starts
-    fn on_apply_started(&self, change_id: &str);
+    fn on_apply_started(&self, change_id: &str, command: &str);
     /// Called when progress is updated
     fn on_progress_updated(&self, change_id: &str, completed: u32, total: u32);
     /// Called when hook starts
@@ -440,7 +440,7 @@ pub trait ApplyEventHandler {
 pub struct NoOpEventHandler;
 
 impl ApplyEventHandler for NoOpEventHandler {
-    fn on_apply_started(&self, _change_id: &str) {}
+    fn on_apply_started(&self, _change_id: &str, _command: &str) {}
     fn on_progress_updated(&self, _change_id: &str, _completed: u32, _total: u32) {}
     fn on_hook_started(&self, _change_id: &str, _hook_type: &str) {}
     fn on_hook_completed(&self, _change_id: &str, _hook_type: &str) {}
@@ -639,10 +639,15 @@ where
             iteration, change_id, progress.completed, progress.total
         );
 
-        // Send ApplyStarted event on first iteration
+        // Execute apply command with history context via AiCommandRunner
+        let (mut child, mut rx, start_time, command) = agent
+            .run_apply_streaming_with_runner(change_id, ai_runner, Some(workspace_path))
+            .await?;
+
+        // Send ApplyStarted event on first iteration (after getting command)
         if first_apply {
             first_apply = false;
-            event_handler.on_apply_started(change_id);
+            event_handler.on_apply_started(change_id, &command);
         }
 
         // Run pre_apply hook
@@ -670,11 +675,6 @@ where
                 }
             }
         }
-
-        // Execute apply command with history context via AiCommandRunner
-        let (mut child, mut rx, start_time) = agent
-            .run_apply_streaming_with_runner(change_id, ai_runner, Some(workspace_path))
-            .await?;
 
         // Create output collector for history
         let mut output_collector = OutputCollector::new();

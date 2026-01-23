@@ -157,7 +157,7 @@ impl AgentRunner {
 
     /// Run apply command using AiCommandRunner with streaming output.
     /// This ensures apply commands share stagger state with acceptance/archive/resolve.
-    /// Returns a child process handle, a receiver for output lines, and a start time.
+    /// Returns a child process handle, a receiver for output lines, a start time, and the command string.
     /// The caller is responsible for recording the attempt after the child completes
     /// by calling `record_apply_attempt()`.
     ///
@@ -170,7 +170,7 @@ impl AgentRunner {
         change_id: &str,
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
         cwd: Option<&Path>,
-    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant, String)> {
         use crate::ai_command_runner::OutputLine as AiOutputLine;
         let start = Instant::now();
         // Get acceptance tail first (requires &mut self)
@@ -211,7 +211,7 @@ impl AgentRunner {
             }
         });
 
-        Ok((child, rx, start))
+        Ok((child, rx, start, command))
     }
 
     /// Record an apply attempt after streaming execution completes.
@@ -273,7 +273,7 @@ impl AgentRunner {
 
     /// Run archive command using AiCommandRunner with streaming output.
     /// This ensures archive commands share stagger state with acceptance/apply/resolve.
-    /// Returns a child process handle, a receiver for output lines, and a start time.
+    /// Returns a child process handle, a receiver for output lines, a start time, and the command string.
     /// The caller is responsible for recording the attempt after the child completes
     /// by calling `record_archive_attempt()`.
     ///
@@ -285,7 +285,7 @@ impl AgentRunner {
         change_id: &str,
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
         cwd: Option<&Path>,
-    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant, String)> {
         use crate::ai_command_runner::OutputLine as AiOutputLine;
         let start = Instant::now();
         let template = self.config.get_archive_command();
@@ -322,7 +322,7 @@ impl AgentRunner {
             }
         });
 
-        Ok((child, rx, start))
+        Ok((child, rx, start, command))
     }
 
     /// Run apply command for the given change ID (blocking, no streaming)
@@ -478,25 +478,26 @@ impl AgentRunner {
     /// Clear apply history for a change (call after archiving)
     pub fn clear_apply_history(&mut self, change_id: &str) {
         history_ops::clear_apply_history(&mut self.apply_history, change_id);
-        // Clear acceptance tail injection flag when apply history is cleared
-        self.acceptance_tail_injected.remove(change_id);
     }
 
-    /// Clear archive history for a change (call after successful archiving)
     pub fn clear_archive_history(&mut self, change_id: &str) {
         history_ops::clear_archive_history(&mut self.archive_history, change_id);
     }
 
-    /// Clear acceptance history for a change (call after successful archiving)
-    #[allow(dead_code)]
     pub fn clear_acceptance_history(&mut self, change_id: &str) {
         history_ops::clear_acceptance_history(&mut self.acceptance_history, change_id);
     }
 
-    /// Format acceptance history context for a change.
-    /// Returns the formatted history string that can be injected into prompts.
     pub fn format_acceptance_history(&self, change_id: &str) -> String {
         self.acceptance_history.format_context(change_id)
+    }
+
+    pub fn format_apply_history(&self, change_id: &str) -> String {
+        self.apply_history.format_context(change_id)
+    }
+
+    pub fn format_archive_history(&self, change_id: &str) -> String {
+        self.archive_history.format_context(change_id)
     }
 
     /// Run acceptance command for the given change ID with output streaming.
@@ -665,7 +666,7 @@ impl AgentRunner {
     /// 2. The tail has not been injected yet for this change
     ///
     /// This ensures the tail is only injected on the first apply retry after acceptance failure.
-    fn get_acceptance_tail_context_for_apply(&mut self, change_id: &str) -> String {
+    pub fn get_acceptance_tail_context_for_apply(&mut self, change_id: &str) -> String {
         // Check if we've already injected the tail for this change
         if self
             .acceptance_tail_injected
@@ -692,6 +693,29 @@ impl AgentRunner {
         }
 
         context
+    }
+
+    /// Peek at the acceptance tail context without consuming the injection flag.
+    /// This is useful for display purposes (e.g., TUI command logging) where we want
+    /// to show what will be sent without affecting the actual execution.
+    pub fn peek_acceptance_tail_context_for_apply(&self, change_id: &str) -> String {
+        // Check if we've already injected the tail for this change
+        if self
+            .acceptance_tail_injected
+            .get(change_id)
+            .copied()
+            .unwrap_or(false)
+        {
+            return String::new();
+        }
+
+        // Get stdout/stderr tails from the last acceptance attempt
+        let stdout_tail = self.acceptance_history.last_stdout_tail(change_id);
+        let stderr_tail = self.acceptance_history.last_stderr_tail(change_id);
+
+        // Build the context without marking as injected
+        use super::prompt::build_last_acceptance_output_context;
+        build_last_acceptance_output_context(stdout_tail.as_deref(), stderr_tail.as_deref())
     }
 
     /// Reset acceptance tail injection flag for a change.
@@ -1237,8 +1261,7 @@ impl AgentRunner {
         Ok(output)
     }
 
-    /// Get the underlying configuration (for testing)
-    #[cfg(test)]
+    /// Get the underlying configuration
     pub fn config(&self) -> &OrchestratorConfig {
         &self.config
     }

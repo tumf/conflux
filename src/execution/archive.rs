@@ -612,7 +612,7 @@ pub fn build_archive_error_message(change_id: &str, workspace_path: Option<&Path
 #[allow(dead_code)]
 pub trait ArchiveEventHandler {
     /// Called when archive iteration starts
-    fn on_archive_started(&self, change_id: &str);
+    fn on_archive_started(&self, change_id: &str, command: &str);
     /// Called when hook starts
     fn on_hook_started(&self, change_id: &str, hook_type: &str);
     /// Called when hook completes
@@ -628,7 +628,7 @@ pub trait ArchiveEventHandler {
 pub struct NoOpArchiveEventHandler;
 
 impl ArchiveEventHandler for NoOpArchiveEventHandler {
-    fn on_archive_started(&self, _change_id: &str) {}
+    fn on_archive_started(&self, _change_id: &str, _command: &str) {}
     fn on_hook_started(&self, _change_id: &str, _hook_type: &str) {}
     fn on_hook_completed(&self, _change_id: &str, _hook_type: &str) {}
     fn on_hook_failed(&self, _change_id: &str, _hook_type: &str, _error: &str) {}
@@ -816,7 +816,9 @@ where
     }
 
     // Send ArchiveStarted event
-    event_handler.on_archive_started(change_id);
+    // NOTE: This function is not currently used - execute_archive_in_workspace is used instead
+    // Using placeholder command since command isn't built until loop iteration
+    event_handler.on_archive_started(change_id, "(archive loop - placeholder)");
 
     let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
     let mut attempt: u32 = 0;

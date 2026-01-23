@@ -153,6 +153,51 @@ pub async fn resolve_conflicts_with_retry(
     };
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
 
+    // Build initial resolve command to send in ResolveStarted event (before retry loop)
+    let initial_resolve_prompt = format!(
+        "{}\n\n\
+         A merge conflict occurred while trying to merge the following revisions:\n\
+         {}\n\n\
+         VCS error output:\n\
+         {}\n\n\
+         Current VCS status:\n\
+         {}\n\n\
+         VCS log for conflicting changes:\n\
+         {}\n\n\
+         Conflicting files: {}\n\n\
+         Please resolve the merge conflicts in the listed files.\n\n\
+         IMPORTANT:\n\
+         - Do NOT use --no-verify flag when committing. Always run pre-commit hooks.\n\
+         - Do NOT break existing functionality unrelated to the conflicting changes.\n\
+         - When resolving conflicts, preserve both sides' intent where possible.\n\
+         - If shared code is modified, ensure all existing callers still work correctly.\n\
+         - Do NOT remove or alter existing functionality that is not part of the conflicting changes.",
+        vcs_prompt_prefix,
+        revisions.join(", "),
+        vcs_error,
+        vcs_status,
+        vcs_log,
+        conflict_files_str
+    );
+    let template = config.get_resolve_command();
+    let initial_command =
+        crate::config::OrchestratorConfig::expand_prompt(template, &initial_resolve_prompt);
+    // Expand {conflict_files} placeholder if present in the command template
+    let initial_command =
+        crate::config::expand::expand_conflict_files(&initial_command, &conflict_files_str);
+
+    // Send ResolveStarted event for each change_id with the command string
+    for change_id in change_ids {
+        send_event(
+            event_tx,
+            ParallelEvent::ResolveStarted {
+                change_id: change_id.to_string(),
+                command: initial_command.clone(),
+            },
+        )
+        .await;
+    }
+
     for attempt in 1..=max_retries {
         let start = Instant::now();
         info!(
@@ -348,17 +393,6 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
 
     send_event(event_tx, ParallelEvent::ConflictResolutionStarted).await;
 
-    // Send ResolveStarted for each change_id to update TUI status
-    for change_id in change_ids {
-        send_event(
-            event_tx,
-            ParallelEvent::ResolveStarted {
-                change_id: change_id.to_string(),
-            },
-        )
-        .await;
-    }
-
     let conflict_files = detect_conflicts(workspace_manager).await?;
     let conflict_files_str = if conflict_files.is_empty() {
         "(none)".to_string()
@@ -434,6 +468,69 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
     };
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+
+    // Build initial resolve command to send in ResolveStarted event (before retry loop)
+    let initial_resolve_prompt = format!(
+        "{}\n\n\
+         You must complete sequential Git merges into the target branch.\n\n\
+         Target branch: {}\n\
+         Base revision before merges: {}\n\
+         Merge plan (branch => change_id):\n{}\n\n\
+         Worktree directories (branch => path):\n{}\n\n\
+         Requirements:\n\
+         - Before merging each branch into the target branch, you MUST pre-sync base into that worktree branch (base -> worktree) from inside the worktree directory.\n\
+         - If a pre-sync merge commit is created, its subject MUST be exactly: \"Pre-sync base into <change_id>\".\n\
+         - The final merge into the target branch MUST create a merge commit with subject exactly: \"Merge change: <change_id>\".\n\
+         - Do NOT use --no-verify flag when committing. Always run pre-commit hooks.\n\
+         - Do NOT break existing functionality unrelated to the changes being merged.\n\
+         - When resolving conflicts, preserve both sides' intent where possible.\n\
+         - If shared code is modified, ensure all existing callers still work correctly.\n\
+         - Do NOT remove or alter existing functionality that is not part of the changes being merged.\n\n\
+         Instructions (repeat for each branch in order):\n\
+         1) Pre-sync in the worktree directory:\n\
+            - cd <worktree_path>\n\
+            - git checkout <branch>\n\
+            - git merge --no-ff -m \"Pre-sync base into <change_id>\" <target_branch>\n\
+            - If a conflict occurs, resolve it, git add, then git commit -m \"Pre-sync base into <change_id>\" to complete the merge.\n\
+            - If the merge commit message is wrong, fix it with: git commit --amend -m \"Pre-sync base into <change_id>\".\n\
+         2) Final merge into the target branch (in the repo root):\n\
+            - cd <repo_root>\n\
+            - git checkout <target_branch>\n\
+            - git merge --no-ff -m \"Merge change: <change_id>\" <branch>\n\
+            - If a conflict occurs, resolve it, git add, then git commit -m \"Merge change: <change_id>\" to complete the merge.\n\
+         3) If a pre-commit hook modifies files and stops the commit, re-stage and re-run git commit with the same message.\n\
+         4) Do not use destructive commands like reset --hard.\n\n\
+         Current VCS status:\n{}\n\n\
+         VCS log for branches:\n{}\n\n\
+         Conflicting files (repo root, if any): {}\n\n\
+         Complete the merges so that the target branch has merge commits for every change_id.",
+        vcs_prompt_prefix,
+        target_branch,
+        base_revision,
+        merge_plan,
+        worktree_locations,
+        vcs_status,
+        vcs_log,
+        conflict_files_str
+    );
+    let template = config.get_resolve_command();
+    let initial_command =
+        crate::config::OrchestratorConfig::expand_prompt(template, &initial_resolve_prompt);
+    // Expand {conflict_files} placeholder if present in the command template
+    let initial_command =
+        crate::config::expand::expand_conflict_files(&initial_command, &conflict_files_str);
+
+    // Send ResolveStarted for each change_id to update TUI status with command string
+    for change_id in change_ids {
+        send_event(
+            event_tx,
+            ParallelEvent::ResolveStarted {
+                change_id: change_id.to_string(),
+                command: initial_command.clone(),
+            },
+        )
+        .await;
+    }
 
     for attempt in 1..=max_retries {
         let start = Instant::now();

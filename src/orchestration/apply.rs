@@ -194,7 +194,7 @@ where
     output.on_info(&format!("Applying: {}", change.id));
 
     // Execute apply command with streaming via AiCommandRunner
-    let (mut child, mut output_rx, start_time) = agent
+    let (mut child, mut output_rx, start_time, _command) = agent
         .run_apply_streaming_with_runner(&change.id, ai_runner, None)
         .await?;
 

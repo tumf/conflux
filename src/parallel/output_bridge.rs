@@ -112,11 +112,12 @@ impl ParallelApplyEventHandler {
 }
 
 impl ApplyEventHandler for ParallelApplyEventHandler {
-    fn on_apply_started(&self, change_id: &str) {
-        info!("Apply started for {}", change_id);
+    fn on_apply_started(&self, change_id: &str, command: &str) {
+        info!("Apply started for {}: {}", change_id, command);
         if let Some(ref tx) = self.event_tx {
             let _ = tx.try_send(ParallelEvent::ApplyStarted {
                 change_id: change_id.to_string(),
+                command: command.to_string(),
             });
         }
     }
@@ -218,7 +219,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let handler = ParallelApplyEventHandler::new("test-change".to_string(), Some(tx));
 
-        handler.on_apply_started("test-change");
+        handler.on_apply_started("test-change", "test command");
         handler.on_progress_updated("test-change", 5, 10);
         handler.on_hook_started("test-change", "pre_apply");
         handler.on_hook_completed("test-change", "pre_apply");
@@ -234,7 +235,7 @@ mod tests {
         let handler = ParallelApplyEventHandler::new("test-change".to_string(), None);
 
         // Should not panic when no channel is provided
-        handler.on_apply_started("test-change");
+        handler.on_apply_started("test-change", "test command");
         handler.on_progress_updated("test-change", 5, 10);
         handler.on_hook_started("test-change", "pre_apply");
         handler.on_hook_completed("test-change", "pre_apply");
