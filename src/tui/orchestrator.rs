@@ -1255,6 +1255,7 @@ pub async fn run_orchestrator_parallel(
             worktree_change_ids: HashSet::new(),
             worktree_paths: HashMap::new(),
             worktree_not_ahead_ids: HashSet::new(),
+            resolve_wait_ids: HashSet::new(),
         })
         .await;
 
