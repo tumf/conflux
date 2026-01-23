@@ -74,6 +74,8 @@ acceptance ループは change に対して `acceptance_command` を実行し、
 - 2 回目以降の acceptance prompt は、前回 acceptance 以降に更新されたファイル一覧（パスのみ）を含めなければならない（MUST）。
 - 2 回目以降の acceptance prompt は、前回の acceptance findings を含め、解消確認を指示しなければならない（MUST）。
 - 2 回目以降の acceptance prompt は、必要に応じて関連ファイルを読むよう指示し、diff 内容を含めてはならない（MUST NOT）。
+- 2 回目以降の acceptance prompt は、前回の acceptance コマンド出力（stdout_tail/stderr_tail）を `<last_acceptance_output>` タグで囲んで含めなければならない（MUST）。
+- acceptance コマンド出力は `AcceptanceHistory` に既に保存されているため、新規フィールド追加なしで参照可能でなければならない（MUST）。
 
 #### Scenario: Acceptance retry narrows to updated files and prior findings
 - **GIVEN** change が apply iteration を正常完了する
@@ -89,6 +91,13 @@ acceptance ループは change に対して `acceptance_command` を実行し、
 - **THEN** tasks.md の末尾に `## Acceptance #1 Failure Follow-up` が追加される
 - **AND** セクション内に `- [ ] <finding>` の未完了タスクが 2 行追加される
 - **AND** `Address acceptance findings` のようなラッパー行やネスト箇条書きは含まれない
+
+#### Scenario: CONTINUE tail propagation to next acceptance prompt
+- **GIVEN** acceptance output が CONTINUE を示す
+- **AND** `AcceptanceHistory` に前回の acceptance 試行が記録されている
+- **WHEN** オーケストレーターが acceptance ループを継続する
+- **THEN** 次の acceptance プロンプトに `<last_acceptance_output>` タグで囲まれた前回の stdout_tail/stderr_tail が含まれる
+- **AND** エージェントは前回の調査結果を参照して次の調査アクションを決定できる
 
 ### Requirement: Default TUI Launch
 
