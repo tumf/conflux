@@ -10,6 +10,7 @@ use crate::command_queue::CommandQueueConfig;
 use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
+use crate::hooks::HookRunner;
 use crate::openspec::Change;
 use crate::parallel::{ParallelEvent, ParallelExecutor};
 use std::collections::{HashMap, HashSet};
@@ -143,6 +144,11 @@ impl ParallelRunService {
             Some(self.shared_stagger_state.clone()),
         );
         executor.set_no_resume(self.no_resume);
+
+        // Set hooks from config
+        let hooks = HookRunner::new(self.config.get_hooks());
+        executor.set_hooks(hooks);
+
         if let Some(token) = cancel_token {
             executor.set_cancel_token(token);
         }
@@ -252,6 +258,10 @@ impl ParallelRunService {
             Some(self.shared_stagger_state.clone()),
         );
         executor.set_no_resume(self.no_resume);
+
+        // Set hooks from config
+        let hooks = HookRunner::new(self.config.get_hooks());
+        executor.set_hooks(hooks);
 
         // Set cancel token if provided
         if let Some(token) = cancel_token {
