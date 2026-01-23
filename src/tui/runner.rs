@@ -473,6 +473,8 @@ async fn run_tui_loop(
 
                             // Check which worktrees are not ahead of base (for MergeWait auto-clear)
                             let mut worktree_not_ahead_ids = std::collections::HashSet::new();
+                            // Check which worktrees are archived but not merged (for ResolveWait)
+                            let mut resolve_wait_ids = std::collections::HashSet::new();
 
                             // Get base branch (current branch in main repo)
                             if let Ok(Some(base_branch)) = crate::vcs::git::commands::get_current_branch(&refresh_repo_root).await {
@@ -499,6 +501,22 @@ async fn run_tui_loop(
                                             }
                                         }
                                     }
+
+                                    // Detect WorkspaceState::Archived for ResolveWait
+                                    match crate::execution::state::detect_workspace_state(change_id, wt_path, &base_branch).await {
+                                        Ok(crate::execution::state::WorkspaceState::Archived) => {
+                                            // Worktree is archived but not merged, set ResolveWait
+                                            resolve_wait_ids.insert(change_id.clone());
+                                            debug!("Detected ResolveWait for '{}': archive complete, waiting for resolve", change_id);
+                                        }
+                                        Ok(_) => {
+                                            // Other states, do nothing
+                                        }
+                                        Err(e) => {
+                                            debug!("Failed to detect workspace state for {}: {}", change_id, e);
+                                            // On error, skip detection (safe default)
+                                        }
+                                    }
                                 }
                             }
 
@@ -509,6 +527,7 @@ async fn run_tui_loop(
                                     worktree_change_ids,
                                     worktree_paths,
                                     worktree_not_ahead_ids,
+                                    resolve_wait_ids,
                                 })
                                 .await
                                 .is_err()

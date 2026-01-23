@@ -70,6 +70,8 @@ pub enum QueueStatus {
     MergeWait,
     /// Currently resolving a merge
     Resolving,
+    /// Waiting for resolve execution after archive completion
+    ResolveWait,
     /// Error occurred during processing
     Error(String),
 }
@@ -88,6 +90,7 @@ impl QueueStatus {
             QueueStatus::Merged => "merged",
             QueueStatus::MergeWait => "merge wait",
             QueueStatus::Resolving => "resolving",
+            QueueStatus::ResolveWait => "resolve wait",
             QueueStatus::Error(_) => "error",
         }
     }
@@ -105,6 +108,7 @@ impl QueueStatus {
             QueueStatus::Merged => Color::LightBlue,
             QueueStatus::MergeWait => Color::LightMagenta,
             QueueStatus::Resolving => Color::LightCyan,
+            QueueStatus::ResolveWait => Color::Magenta,
             QueueStatus::Error(_) => Color::Red,
         }
     }
@@ -233,6 +237,7 @@ mod tests {
         assert_eq!(QueueStatus::Merged.display(), "merged");
         assert_eq!(QueueStatus::MergeWait.display(), "merge wait");
         assert_eq!(QueueStatus::Resolving.display(), "resolving");
+        assert_eq!(QueueStatus::ResolveWait.display(), "resolve wait");
         assert_eq!(QueueStatus::Error("err".to_string()).display(), "error");
     }
 
@@ -248,6 +253,7 @@ mod tests {
         assert_eq!(QueueStatus::Merged.color(), Color::LightBlue);
         assert_eq!(QueueStatus::MergeWait.color(), Color::LightMagenta);
         assert_eq!(QueueStatus::Resolving.color(), Color::LightCyan);
+        assert_eq!(QueueStatus::ResolveWait.color(), Color::Magenta);
         assert_eq!(QueueStatus::Error("err".to_string()).color(), Color::Red);
     }
 
@@ -274,6 +280,7 @@ mod tests {
         assert!(!QueueStatus::Queued.is_active());
         assert!(!QueueStatus::Blocked.is_active());
         assert!(!QueueStatus::MergeWait.is_active());
+        assert!(!QueueStatus::ResolveWait.is_active());
         assert!(!QueueStatus::Archived.is_active());
         assert!(!QueueStatus::Merged.is_active());
         assert!(!QueueStatus::Error("err".to_string()).is_active());

@@ -35,6 +35,7 @@ impl AppState {
             if let Some(existing) = self.changes.iter_mut().find(|c| c.id == fetched.id) {
                 let was_archived = existing.queue_status == QueueStatus::Archived;
                 let is_merge_wait = existing.queue_status == QueueStatus::MergeWait;
+                let is_resolve_wait = existing.queue_status == QueueStatus::ResolveWait;
 
                 if was_archived {
                     // If change still exists after archiving, it means archive failed
@@ -51,6 +52,16 @@ impl AppState {
                     // MergeWait is a persistent state that requires explicit user action (M key)
                     // to transition to Resolving, and should not be cleared by progress updates
                     // Update progress for all states (including MergeWait)
+                    if fetched.total_tasks > 0 {
+                        existing.completed_tasks = fetched.completed_tasks;
+                        existing.total_tasks = fetched.total_tasks;
+                    }
+                    // If fetched.total_tasks == 0, preserve existing progress
+                } else if is_resolve_wait {
+                    // Preserve ResolveWait status during auto-refresh
+                    // ResolveWait is a persistent state indicating archive is complete
+                    // and the change is waiting for resolve execution
+                    // Update progress for ResolveWait changes
                     if fetched.total_tasks > 0 {
                         existing.completed_tasks = fetched.completed_tasks;
                         existing.total_tasks = fetched.total_tasks;
@@ -139,6 +150,7 @@ impl AppState {
                         | QueueStatus::Merged
                         | QueueStatus::MergeWait
                         | QueueStatus::Resolving
+                        | QueueStatus::ResolveWait
                         | QueueStatus::Error(_)
                 )
         });
@@ -188,6 +200,29 @@ impl AppState {
                 "Auto-cleared MergeWait for '{}': {}",
                 id, reason
             )));
+        }
+    }
+
+    /// Apply ResolveWait status for changes detected in WorkspaceState::Archived.
+    ///
+    /// Sets ResolveWait for changes that:
+    /// - Are currently in NotQueued status (from auto-refresh reset)
+    /// - Have a worktree in WorkspaceState::Archived state
+    pub fn apply_resolve_wait_status(
+        &mut self,
+        resolve_wait_ids: &std::collections::HashSet<String>,
+    ) {
+        for change in &mut self.changes {
+            if resolve_wait_ids.contains(&change.id) {
+                // Only set ResolveWait if currently NotQueued or Archived
+                // (to avoid overwriting active processing states)
+                if matches!(
+                    change.queue_status,
+                    QueueStatus::NotQueued | QueueStatus::Archived
+                ) {
+                    change.queue_status = QueueStatus::ResolveWait;
+                }
+            }
         }
     }
 }
