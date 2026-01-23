@@ -1,3 +1,3 @@
 # Tasks
 
-(No tasks - this is a simple test change)
+- [x] Add test comment to main.rs
