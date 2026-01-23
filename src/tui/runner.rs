@@ -1723,6 +1723,7 @@ async fn run_tui_loop(
                     let merge_repo_root = repo_root.clone();
                     let merge_branch = branch_name.clone();
                     let merge_config = config.clone();
+                    let merge_worktree_path = worktree_path.clone();
 
                     tokio::spawn(async move {
                         debug!(
@@ -1788,7 +1789,8 @@ async fn run_tui_loop(
                                         false,
                                     )
                                     .with_change(&change_id, completed_tasks, total_tasks)
-                                    .with_apply_count(0);
+                                    .with_apply_count(0)
+                                    .with_parallel_context(&merge_worktree_path.to_string_lossy(), None);
 
                                     if let Err(e) = hooks.run_hook(crate::hooks::HookType::OnMerged, &hook_context).await {
                                         use tracing::warn;
