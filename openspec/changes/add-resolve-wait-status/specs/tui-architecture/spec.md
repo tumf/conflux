@@ -56,3 +56,10 @@ TUI は 5 秒ごとの自動更新で `MergeWait` を評価し、以下のいず
 - **AND** resolveが別changeで進行中である
 - **WHEN** 5秒ポーリングの自動更新が実行される
 - **THEN** change のステータスは `ResolveWait` のまま維持される
+
+#### Scenario: WorkspaceState::Archived を持つ change は ResolveWait として識別される
+- **GIVEN** worktree が存在し、`detect_workspace_state` が `WorkspaceState::Archived` を返す
+- **AND** change が merge されていない（base に ahead している）
+- **WHEN** TUI の自動更新が実行される
+- **THEN** change のステータスは `ResolveWait` として表示される
+- **AND** Space/@キーによる操作は受け付けない

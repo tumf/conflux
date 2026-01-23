@@ -2,9 +2,9 @@
 - [ ] 1.1 `QueueStatus`に`ResolveWait`を追加し、表示文字列/色を定義する（`src/tui/types.rs`）
   - 完了条件: `QueueStatus::ResolveWait`がenumと`display()`/`color()`に追加されている
 
-## 2. Resolve待ち状態の遷移
-- [ ] 2.1 resolveシリアライズで待機が発生したchangeを`ResolveWait`として通知する（`src/parallel/mod.rs` または関連イベント処理）
-  - 完了条件: resolve待機中のchangeに対しTUIへ`ResolveWait`状態が反映される経路がある
+## 2. WorkspaceState連携によるResolveWait判定
+- [ ] 2.1 TUI自動更新時に`WorkspaceState::Archived`を持つchangeを`ResolveWait`として識別する（`src/tui/state/events/helpers.rs` または `src/tui/runner.rs`）
+  - 完了条件: worktreeが存在し`WorkspaceState::Archived`のchangeが`ResolveWait`として表示される
 
 ## 3. TUI更新と操作制御
 - [ ] 3.1 自動更新で`ResolveWait`を`NotQueued`へ戻さないようにする（`src/tui/state/events/helpers.rs`）
