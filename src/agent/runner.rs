@@ -29,6 +29,8 @@ pub struct AgentRunner {
     archive_history: ArchiveHistory,
     /// History of acceptance attempts per change for context injection
     acceptance_history: AcceptanceHistory,
+    /// Tracks which changes have had acceptance tail injected (to prevent re-injection)
+    acceptance_tail_injected: std::collections::HashMap<String, bool>,
 }
 
 impl AgentRunner {
@@ -60,6 +62,7 @@ impl AgentRunner {
             apply_history: ApplyHistory::new(),
             archive_history: ArchiveHistory::new(),
             acceptance_history: AcceptanceHistory::new(),
+            acceptance_tail_injected: std::collections::HashMap::new(),
         }
     }
 
@@ -105,6 +108,7 @@ impl AgentRunner {
             apply_history: ApplyHistory::new(),
             archive_history: ArchiveHistory::new(),
             acceptance_history: AcceptanceHistory::new(),
+            acceptance_tail_injected: std::collections::HashMap::new(),
         }
     }
 
@@ -119,17 +123,21 @@ impl AgentRunner {
     /// - history_context: previous apply attempts (if any)
     #[allow(dead_code)] // Replaced by run_apply_streaming_with_runner
     pub async fn run_apply_streaming(
-        &self,
+        &mut self,
         change_id: &str,
         cwd: Option<&Path>,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
         let start = Instant::now();
+        // Get acceptance tail first (requires &mut self)
+        let acceptance_tail = self.get_acceptance_tail_context_for_apply(change_id);
+
+        // Then get immutable data
         let template = self.config.get_apply_command();
         let user_prompt = self.config.get_apply_prompt();
         let history_context = self.apply_history.format_context(change_id);
 
-        // Build full prompt: user_prompt + system_prompt + history_context
-        let full_prompt = build_apply_prompt(user_prompt, &history_context);
+        // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
+        let full_prompt = build_apply_prompt(user_prompt, &history_context, &acceptance_tail);
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
@@ -158,19 +166,23 @@ impl AgentRunner {
     /// - system_prompt: APPLY_SYSTEM_PROMPT constant (always included)
     /// - history_context: previous apply attempts (if any)
     pub async fn run_apply_streaming_with_runner(
-        &self,
+        &mut self,
         change_id: &str,
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
         cwd: Option<&Path>,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
         use crate::ai_command_runner::OutputLine as AiOutputLine;
         let start = Instant::now();
+        // Get acceptance tail first (requires &mut self)
+        let acceptance_tail = self.get_acceptance_tail_context_for_apply(change_id);
+
+        // Then get immutable data
         let template = self.config.get_apply_command();
         let user_prompt = self.config.get_apply_prompt();
         let history_context = self.apply_history.format_context(change_id);
 
-        // Build full prompt: user_prompt + system_prompt + history_context
-        let full_prompt = build_apply_prompt(user_prompt, &history_context);
+        // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
+        let full_prompt = build_apply_prompt(user_prompt, &history_context, &acceptance_tail);
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
@@ -324,12 +336,16 @@ impl AgentRunner {
     pub async fn run_apply(&mut self, change_id: &str) -> Result<ExitStatus> {
         let start = Instant::now();
 
+        // Get acceptance tail first (requires &mut self)
+        let acceptance_tail = self.get_acceptance_tail_context_for_apply(change_id);
+
+        // Then get immutable data
         let template = self.config.get_apply_command();
         let user_prompt = self.config.get_apply_prompt();
         let history_context = self.apply_history.format_context(change_id);
 
-        // Build full prompt: user_prompt + system_prompt + history_context
-        let full_prompt = build_apply_prompt(user_prompt, &history_context);
+        // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
+        let full_prompt = build_apply_prompt(user_prompt, &history_context, &acceptance_tail);
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
@@ -368,12 +384,16 @@ impl AgentRunner {
         use crate::ai_command_runner::OutputLine as AiOutputLine;
         let start = Instant::now();
 
+        // Get acceptance tail first (requires &mut self)
+        let acceptance_tail = self.get_acceptance_tail_context_for_apply(change_id);
+
+        // Then get immutable data
         let template = self.config.get_apply_command();
         let user_prompt = self.config.get_apply_prompt();
         let history_context = self.apply_history.format_context(change_id);
 
-        // Build full prompt: user_prompt + system_prompt + history_context
-        let full_prompt = build_apply_prompt(user_prompt, &history_context);
+        // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
+        let full_prompt = build_apply_prompt(user_prompt, &history_context, &acceptance_tail);
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
@@ -458,6 +478,8 @@ impl AgentRunner {
     /// Clear apply history for a change (call after archiving)
     pub fn clear_apply_history(&mut self, change_id: &str) {
         history_ops::clear_apply_history(&mut self.apply_history, change_id);
+        // Clear acceptance tail injection flag when apply history is cleared
+        self.acceptance_tail_injected.remove(change_id);
     }
 
     /// Clear archive history for a change (call after successful archiving)
@@ -594,6 +616,8 @@ impl AgentRunner {
     /// Call this after `run_acceptance_streaming()` child process finishes.
     pub fn record_acceptance_attempt(&mut self, change_id: &str, attempt: AcceptanceAttempt) {
         history_ops::record_acceptance_attempt(&mut self.acceptance_history, change_id, attempt);
+        // Reset acceptance tail injection flag so the next apply can receive the new output
+        self.reset_acceptance_tail_injection(change_id);
     }
 
     /// Get the next acceptance attempt number for a change.
@@ -626,6 +650,48 @@ impl AgentRunner {
     /// Returns None if there are no previous attempts or the last attempt has no stderr tail.
     pub fn get_last_acceptance_stderr_tail(&self, change_id: &str) -> Option<String> {
         self.acceptance_history.last_stderr_tail(change_id)
+    }
+
+    /// Get acceptance tail context for apply prompt.
+    /// Returns the formatted context block if:
+    /// 1. There is a previous acceptance attempt with output
+    /// 2. The tail has not been injected yet for this change
+    ///
+    /// This ensures the tail is only injected on the first apply retry after acceptance failure.
+    fn get_acceptance_tail_context_for_apply(&mut self, change_id: &str) -> String {
+        // Check if we've already injected the tail for this change
+        if self
+            .acceptance_tail_injected
+            .get(change_id)
+            .copied()
+            .unwrap_or(false)
+        {
+            return String::new();
+        }
+
+        // Get stdout/stderr tails from the last acceptance attempt
+        let stdout_tail = self.acceptance_history.last_stdout_tail(change_id);
+        let stderr_tail = self.acceptance_history.last_stderr_tail(change_id);
+
+        // If we have output, build the context and mark as injected
+        use super::prompt::build_last_acceptance_output_context;
+        let context =
+            build_last_acceptance_output_context(stdout_tail.as_deref(), stderr_tail.as_deref());
+
+        if !context.is_empty() {
+            // Mark as injected
+            self.acceptance_tail_injected
+                .insert(change_id.to_string(), true);
+        }
+
+        context
+    }
+
+    /// Reset acceptance tail injection flag for a change.
+    /// This should be called when a new acceptance attempt is recorded,
+    /// so the next apply retry can receive the new acceptance output.
+    fn reset_acceptance_tail_injection(&mut self, change_id: &str) {
+        self.acceptance_tail_injected.remove(change_id);
     }
 
     /// Run archive command for the given change ID (blocking, no streaming)

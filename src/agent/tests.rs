@@ -73,7 +73,7 @@ async fn test_run_apply_streaming() {
         apply_command: Some("echo test".to_string()),
         ..Default::default()
     };
-    let runner = AgentRunner::new(config);
+    let mut runner = AgentRunner::new(config);
     let result = runner.run_apply_streaming("test-change", None).await;
     assert!(result.is_ok());
     let (mut child, mut rx, _start) = result.unwrap();
@@ -98,7 +98,7 @@ async fn test_run_apply_with_prompt_expansion() {
         apply_prompt: Some("prompt-marker".to_string()),
         ..Default::default()
     };
-    let runner = AgentRunner::new(config);
+    let mut runner = AgentRunner::new(config);
     let result = runner.run_apply_streaming("my-change", None).await;
     assert!(result.is_ok());
     let (mut child, mut rx, _start) = result.unwrap();
@@ -131,7 +131,7 @@ async fn test_run_apply_with_default_prompt() {
         apply_prompt: None, // Use default empty prompt
         ..Default::default()
     };
-    let runner = AgentRunner::new(config);
+    let mut runner = AgentRunner::new(config);
     let result = runner.run_apply_streaming("my-change", None).await;
     assert!(result.is_ok());
     let (mut child, mut rx, _start) = result.unwrap();
@@ -177,7 +177,7 @@ async fn test_run_apply_streaming_with_prompt() {
         apply_prompt: Some("prompt-marker".to_string()),
         ..Default::default()
     };
-    let runner = AgentRunner::new(config);
+    let mut runner = AgentRunner::new(config);
     let result = runner.run_apply_streaming("my-change", None).await;
     assert!(result.is_ok());
     let (mut child, mut rx, _start) = result.unwrap();
@@ -209,7 +209,8 @@ async fn test_run_apply_streaming_with_prompt() {
 fn test_build_apply_prompt_with_all_parts() {
     let user_prompt = "Focus on implementation.";
     let history_context = "Previous attempt failed.";
-    let result = build_apply_prompt(user_prompt, history_context);
+    let acceptance_tail = "";
+    let result = build_apply_prompt(user_prompt, history_context, acceptance_tail);
 
     assert!(result.contains("Focus on implementation."));
     assert!(result.contains("Previous attempt failed."));
@@ -219,7 +220,8 @@ fn test_build_apply_prompt_with_all_parts() {
 fn test_build_apply_prompt_with_empty_user_prompt() {
     let user_prompt = "";
     let history_context = "Previous attempt failed.";
-    let result = build_apply_prompt(user_prompt, history_context);
+    let acceptance_tail = "";
+    let result = build_apply_prompt(user_prompt, history_context, acceptance_tail);
 
     assert!(result.contains("Previous attempt failed."));
 }
@@ -228,7 +230,8 @@ fn test_build_apply_prompt_with_empty_user_prompt() {
 fn test_build_apply_prompt_with_empty_history() {
     let user_prompt = "Focus on implementation.";
     let history_context = "";
-    let result = build_apply_prompt(user_prompt, history_context);
+    let acceptance_tail = "";
+    let result = build_apply_prompt(user_prompt, history_context, acceptance_tail);
 
     assert!(result.contains("Focus on implementation."));
 }
@@ -237,9 +240,60 @@ fn test_build_apply_prompt_with_empty_history() {
 fn test_build_apply_prompt_with_only_system_prompt() {
     let user_prompt = "";
     let history_context = "";
-    let result = build_apply_prompt(user_prompt, history_context);
+    let acceptance_tail = "";
+    let result = build_apply_prompt(user_prompt, history_context, acceptance_tail);
 
     assert_eq!(result, APPLY_SYSTEM_PROMPT);
+}
+
+#[test]
+fn test_build_apply_prompt_with_acceptance_tail() {
+    let user_prompt = "Focus on implementation.";
+    let history_context = "<last_apply attempt=\"1\">\nstatus: failed\n</last_apply>";
+    let acceptance_tail =
+        "<last_acceptance_output>\nTest failure detected\n</last_acceptance_output>";
+    let result = build_apply_prompt(user_prompt, history_context, acceptance_tail);
+
+    // Check all parts are present
+    assert!(result.contains("Focus on implementation."));
+    assert!(result.contains("<last_acceptance_output>"));
+    assert!(result.contains("Test failure detected"));
+    assert!(result.contains("<last_apply attempt=\"1\">"));
+
+    // Check order: user_prompt, then system, then acceptance_tail, then history
+    let user_pos = result.find("Focus on implementation.").unwrap();
+    let acceptance_pos = result.find("<last_acceptance_output>").unwrap();
+    let history_pos = result.find("<last_apply attempt=\"1\">").unwrap();
+
+    assert!(
+        user_pos < acceptance_pos,
+        "User prompt should come before acceptance tail"
+    );
+    assert!(
+        acceptance_pos < history_pos,
+        "Acceptance tail should come before history"
+    );
+}
+
+#[test]
+fn test_build_apply_prompt_with_acceptance_tail_priority() {
+    use super::build_last_acceptance_output_context;
+
+    // Test stdout priority
+    let stdout_tail = Some("stdout content");
+    let stderr_tail = Some("stderr content");
+    let context = build_last_acceptance_output_context(stdout_tail, stderr_tail);
+    assert!(context.contains("stdout content"));
+    assert!(context.contains("stderr content"));
+
+    // Test stderr fallback when stdout is empty
+    let context = build_last_acceptance_output_context(None, stderr_tail);
+    assert!(context.contains("stderr content"));
+    assert!(!context.contains("stdout"));
+
+    // Test both empty
+    let context = build_last_acceptance_output_context(None, None);
+    assert!(context.is_empty());
 }
 
 #[test]

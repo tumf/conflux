@@ -6,9 +6,24 @@ use crate::config::defaults::ACCEPTANCE_SYSTEM_PROMPT;
 /// Kept only for compatibility in tests; actual prompt is sourced from OpenCode command files.
 pub const APPLY_SYSTEM_PROMPT: &str = "";
 
-/// Build apply prompt from user prompt and history context
-/// Format: user_prompt + APPLY_SYSTEM_PROMPT + history_context
-pub fn build_apply_prompt(user_prompt: &str, history_context: &str) -> String {
+/// Build apply prompt from user prompt, history context, and acceptance tail
+/// Format: user_prompt + APPLY_SYSTEM_PROMPT + acceptance_tail_context + history_context
+///
+/// # Arguments
+///
+/// * `user_prompt` - User-customizable apply prompt
+/// * `history_context` - Previous apply attempts context
+/// * `acceptance_tail_context` - Acceptance output tail context (optional)
+///
+/// # Note
+///
+/// The acceptance_tail_context should be built using `build_last_acceptance_output_context`
+/// and should only be provided for the first apply attempt after acceptance failure.
+pub fn build_apply_prompt(
+    user_prompt: &str,
+    history_context: &str,
+    acceptance_tail_context: &str,
+) -> String {
     let mut parts = Vec::new();
 
     if !user_prompt.is_empty() {
@@ -17,6 +32,11 @@ pub fn build_apply_prompt(user_prompt: &str, history_context: &str) -> String {
 
     // System prompt is always included
     parts.push(APPLY_SYSTEM_PROMPT.to_string());
+
+    // Acceptance tail context (if acceptance failed and this is the first apply retry)
+    if !acceptance_tail_context.is_empty() {
+        parts.push(acceptance_tail_context.to_string());
+    }
 
     if !history_context.is_empty() {
         parts.push(history_context.to_string());

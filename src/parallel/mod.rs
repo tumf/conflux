@@ -112,6 +112,10 @@ pub struct ParallelExecutor {
     apply_history: Arc<Mutex<crate::history::ApplyHistory>>,
     /// History of archive attempts per change for context injection
     archive_history: Arc<Mutex<crate::history::ArchiveHistory>>,
+    /// History of acceptance attempts per change for context injection
+    acceptance_history: Arc<Mutex<crate::history::AcceptanceHistory>>,
+    /// Tracks which changes have had acceptance tail injected (to prevent re-injection)
+    acceptance_tail_injected: Arc<Mutex<std::collections::HashMap<String, bool>>>,
     /// Flag to trigger re-analysis on next loop iteration
     needs_reanalysis: bool,
     /// Counter for active manual resolve operations (TUI mode)
@@ -243,6 +247,8 @@ impl ParallelExecutor {
             shared_stagger_state,
             apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
             archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
+            acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
+            acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
             needs_reanalysis: false,
             manual_resolve_count: None,
             auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1432,6 +1438,8 @@ impl ParallelExecutor {
                         self.cancel_token.as_ref(),
                         &self.ai_runner,
                         &self.config,
+                        &self.acceptance_tail_injected,
+                        &self.acceptance_history,
                     )
                     .await;
 
@@ -2168,6 +2176,8 @@ impl ParallelExecutor {
         let ai_runner = self.ai_runner.clone();
         let apply_history = self.apply_history.clone();
         let archive_history = self.archive_history.clone();
+        let acceptance_history = self.acceptance_history.clone();
+        let acceptance_tail_injected = self.acceptance_tail_injected.clone();
         let cancel_token = self.cancel_token.clone();
         let shared_stagger_state = self.shared_stagger_state.clone();
 
@@ -2216,6 +2226,8 @@ impl ParallelExecutor {
                     &ai_runner,
                     &repo_root,
                     &apply_history,
+                    &acceptance_history,
+                    &acceptance_tail_injected,
                     cumulative_iteration, // Pass current iteration count
                 )
                 .await;
@@ -2273,6 +2285,8 @@ impl ParallelExecutor {
                     cancel_token.as_ref(),
                     &ai_runner,
                     &config,
+                    &acceptance_tail_injected,
+                    &acceptance_history,
                 )
                 .await;
 
@@ -2646,6 +2660,8 @@ impl ParallelExecutor {
             let repo_root = self.repo_root.clone();
             let apply_history = self.apply_history.clone();
             let archive_history = self.archive_history.clone();
+            let acceptance_history = self.acceptance_history.clone();
+            let acceptance_tail_injected = self.acceptance_tail_injected.clone();
             let status_tx_clone = status_tx.clone();
             let shared_stagger_state = self.shared_stagger_state.clone();
 
@@ -2707,6 +2723,8 @@ impl ParallelExecutor {
                         &ai_runner,
                         &repo_root,
                         &apply_history,
+                        &acceptance_history,
+                        &acceptance_tail_injected,
                         cumulative_iteration, // Pass current iteration count
                     )
                     .await;
@@ -2765,6 +2783,8 @@ impl ParallelExecutor {
                         cancel_token.as_ref(),
                         &ai_runner,
                         &config,
+                        &acceptance_tail_injected,
+                        &acceptance_history,
                     )
                     .await;
 
@@ -3274,6 +3294,8 @@ impl ParallelExecutor {
                                                         let repo_root = self.repo_root.clone();
                                                         let apply_history = self.apply_history.clone();
                                                         let archive_history = self.archive_history.clone();
+                                                        let acceptance_history = self.acceptance_history.clone();
+                                                        let acceptance_tail_injected = self.acceptance_tail_injected.clone();
                                                         let status_tx_clone = status_tx.clone();
                                                         let shared_stagger_state = self.shared_stagger_state.clone();
 
@@ -3330,6 +3352,8 @@ impl ParallelExecutor {
                                                                     &ai_runner,
                                                                     &repo_root,
                                                                     &apply_history,
+                                                                    &acceptance_history,
+                                                                    &acceptance_tail_injected,
                                                                     cumulative_iteration,
                                                                 )
                                                                 .await;
@@ -3379,6 +3403,8 @@ impl ParallelExecutor {
                                                                     cancel_token.as_ref(),
                                                                     &ai_runner,
                                                                     &config,
+                                                                    &acceptance_tail_injected,
+                                                                    &acceptance_history,
                                                                 )
                                                                 .await;
 
