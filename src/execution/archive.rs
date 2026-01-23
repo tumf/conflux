@@ -138,11 +138,15 @@ pub fn is_change_archived(change_id: &str, base_path: Option<&Path>) -> bool {
 ///
 /// The archive commit is considered complete when:
 /// 1. The working tree is clean
-/// 2. The latest commit subject matches `Archive: <change_id>`
-/// 3. The change directory does not exist in `openspec/changes/<change_id>`
+/// 2. The change directory does not exist in `openspec/changes/<change_id>`
+/// 3. An archive entry exists in `openspec/changes/archive/`
+///
+/// This function uses file state only and does NOT check commit messages,
+/// making it reliable for workspace resume scenarios.
 pub async fn is_archive_commit_complete(change_id: &str, base_path: Option<&Path>) -> Result<bool> {
     let repo_root = base_path.unwrap_or_else(|| Path::new("."));
 
+    // Check if working tree is clean
     let status_output = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(repo_root)
@@ -162,41 +166,32 @@ pub async fn is_archive_commit_complete(change_id: &str, base_path: Option<&Path
         .trim()
         .is_empty();
 
-    let log_output = Command::new("git")
-        .args(["log", "-1", "--format=%s"])
-        .current_dir(repo_root)
-        .output()
-        .await
-        .map_err(|e| OrchestratorError::GitCommand(format!("Failed to read git log: {}", e)))?;
-
-    if !log_output.status.success() {
-        let stderr = String::from_utf8_lossy(&log_output.stderr);
-        return Err(OrchestratorError::GitCommand(format!(
-            "Failed to read git log: {}",
-            stderr
-        )));
-    }
-
-    let subject = String::from_utf8_lossy(&log_output.stdout)
-        .trim()
-        .to_string();
-    let expected_subject = format!("Archive: {}", change_id);
-
     // Check if openspec/changes/<change_id> exists (should NOT exist for complete archive)
     let change_path = repo_root.join("openspec/changes").join(change_id);
     let change_exists = change_path.exists();
 
+    // Check if archive entry exists
+    let archive_dir = repo_root.join("openspec/changes/archive");
+    let archive_exists = archive_entry_exists(change_id, &archive_dir);
+
     debug!(
         change_id = %change_id,
         is_clean = is_clean,
-        subject = %subject,
-        expected_subject = %expected_subject,
         change_path = %change_path.display(),
         change_exists = change_exists,
-        "is_archive_commit_complete: checking commit state"
+        archive_dir = %archive_dir.display(),
+        archive_exists = archive_exists,
+        "is_archive_commit_complete: checking file state (clean={}, change_gone={}, archive_exists={})",
+        is_clean,
+        !change_exists,
+        archive_exists
     );
 
-    Ok(is_clean && subject == expected_subject && !change_exists)
+    // Archive commit is complete when:
+    // 1. Working tree is clean
+    // 2. Change directory is gone
+    // 3. Archive entry exists
+    Ok(is_clean && !change_exists && archive_exists)
 }
 
 /// Ensure the archive commit exists for a change.
@@ -1215,6 +1210,12 @@ mod tests {
             .output()
             .unwrap();
 
+        // Create archive directory (change moved to archive)
+        let archive_dir = repo_root.join("openspec/changes/archive/change-a");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("proposal.md"), "# Archived").unwrap();
+
+        // Commit the archive structure
         fs::write(repo_root.join("README.md"), "base").unwrap();
         Command::new("git")
             .args(["add", "-A"])
@@ -1254,6 +1255,11 @@ mod tests {
             .output()
             .unwrap();
 
+        // Create archive directory (change moved to archive)
+        let archive_dir = repo_root.join("openspec/changes/archive/change-a");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("proposal.md"), "# Archived").unwrap();
+
         fs::write(repo_root.join("README.md"), "base").unwrap();
         Command::new("git")
             .args(["add", "-A"])
@@ -1266,6 +1272,7 @@ mod tests {
             .output()
             .unwrap();
 
+        // Make working tree dirty
         fs::write(repo_root.join("README.md"), "dirty").unwrap();
 
         let result = is_archive_commit_complete("change-a", Some(repo_root))
@@ -1608,6 +1615,11 @@ fi\n";
             .output()
             .unwrap();
 
+        // Create archive directory (change moved to archive)
+        let archive_dir = repo_root.join("openspec/changes/archive/test-change");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("proposal.md"), "# Archived").unwrap();
+
         // Create archive commit
         fs::write(repo_root.join("README.md"), "base").unwrap();
         Command::new("git")
@@ -1621,11 +1633,11 @@ fi\n";
             .output()
             .unwrap();
 
-        // Create openspec/changes/test-change directory (simulating archive reversion)
+        // Create openspec/changes/test-change directory (simulating archive reversion or incomplete archive)
         let change_dir = repo_root.join("openspec/changes/test-change");
         fs::create_dir_all(&change_dir).unwrap();
 
-        // Archive commit should be incomplete because change directory exists
+        // Archive commit should be incomplete because change directory still exists
         let result = is_archive_commit_complete("test-change", Some(repo_root))
             .await
             .unwrap();
@@ -1657,6 +1669,11 @@ fi\n";
             .output()
             .unwrap();
 
+        // Create archive directory (change moved to archive)
+        let archive_dir = repo_root.join("openspec/changes/archive/test-change");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("proposal.md"), "# Archived").unwrap();
+
         // Create archive commit
         fs::write(repo_root.join("README.md"), "base").unwrap();
         Command::new("git")
@@ -1678,7 +1695,7 @@ fi\n";
             .unwrap();
         assert!(
             result,
-            "Archive commit should be complete when change directory does not exist"
+            "Archive commit should be complete when change directory does not exist and archive entry exists"
         );
     }
 

@@ -26,20 +26,27 @@ impl AppState {
         }
 
         self.logs.push(entry);
+
+        // Handle buffer trimming when exceeding max entries
         if self.logs.len() > MAX_LOG_ENTRIES {
             self.logs.remove(0);
-            // Adjust scroll offset if oldest logs are removed
-            if self.log_scroll_offset > 0 {
-                self.log_scroll_offset = self.log_scroll_offset.saturating_sub(1);
-            }
         }
-        // Auto-scroll to bottom if enabled, otherwise maintain relative position
+
+        // Auto-scroll to bottom if enabled, otherwise freeze view position
         if self.log_auto_scroll {
             self.log_scroll_offset = 0;
         } else {
-            // When auto-scroll is disabled, increment offset to maintain view position
-            // This compensates for the new log entry shifting the display
+            // When auto-scroll is disabled, freeze the displayed log range
+            // by incrementing offset for new log additions
             self.log_scroll_offset += 1;
+
+            // When buffer is trimmed, we don't decrement offset because we want
+            // to keep showing the same log content (freeze position)
+            // However, if trimming pushed us out of range, clamp to oldest available
+            let max_offset = self.logs.len().saturating_sub(1);
+            if self.log_scroll_offset > max_offset {
+                self.log_scroll_offset = max_offset;
+            }
         }
     }
 

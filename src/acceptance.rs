@@ -46,9 +46,24 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
     let lines: Vec<&str> = output.lines().collect();
 
     // Look for ACCEPTANCE: PASS, ACCEPTANCE: FAIL, or ACCEPTANCE: CONTINUE
+    // Skip code blocks (delimited by ```) to avoid matching examples in prompts
     let mut acceptance_status = None;
+    let mut in_code_block = false;
+
     for line in &lines {
         let trimmed = line.trim();
+
+        // Toggle code block state on triple backticks
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+
+        // Skip lines inside code blocks
+        if in_code_block {
+            continue;
+        }
+
         // Strip markdown decorations (**, *, _, etc.) before matching
         let normalized = strip_markdown_decorations(trimmed);
         if normalized == "ACCEPTANCE: PASS" {
@@ -292,5 +307,70 @@ Additional output here
             strip_markdown_decorations("ACCEPTANCE: PASS"),
             "ACCEPTANCE: PASS"
         );
+    }
+
+    #[test]
+    fn test_parse_ignores_acceptance_in_code_blocks() {
+        // Code block with FAIL should be ignored, actual PASS should be detected
+        let output = r#"
+Example output:
+```
+ACCEPTANCE: FAIL
+FINDINGS:
+- Issue 1
+```
+
+Actual result:
+ACCEPTANCE: PASS
+"#;
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_ignores_multiple_code_blocks() {
+        // Multiple code blocks with different statuses should be ignored
+        let output = r#"
+First example:
+```
+ACCEPTANCE: FAIL
+```
+
+Second example:
+```
+ACCEPTANCE: CONTINUE
+```
+
+Actual result:
+ACCEPTANCE: PASS
+"#;
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_code_block_with_language_specifier() {
+        // Code blocks with language specifier should also be ignored
+        let output = r#"
+Example:
+```bash
+ACCEPTANCE: FAIL
+```
+
+Result:
+ACCEPTANCE: PASS
+"#;
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_unclosed_code_block() {
+        // If code block is not closed, everything after opening should be skipped
+        let output = r#"
+Example:
+```
+ACCEPTANCE: FAIL
+ACCEPTANCE: PASS
+"#;
+        // Both are inside unclosed code block, default to Continue
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
     }
 }

@@ -1379,6 +1379,7 @@ impl ParallelExecutor {
                     // Archive files moved but commit not complete
                     // IMPORTANT: Must run acceptance before committing archive
                     // Acceptance results are not persisted, so we must re-run on resume
+                    // Per spec: "archiving の場合は apply を再実行せず、archive ループに進めなければならない（MUST）"
                     let workspace = existing_workspace.unwrap();
                     cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
 
@@ -1435,6 +1436,7 @@ impl ParallelExecutor {
                     .await;
 
                     // Handle acceptance result
+                    // Per spec: archiving state must stay in archive loop, not return to apply
                     match acceptance_result {
                         Ok((
                             crate::orchestration::AcceptanceResult::Pass,
@@ -1454,76 +1456,98 @@ impl ParallelExecutor {
                                 agent.count_consecutive_acceptance_continues(change_id);
                             let max_continues = self.config.get_acceptance_max_continues();
 
-                            if continue_count >= max_continues {
-                                warn!(
-                                    "Acceptance CONTINUE limit ({}) exceeded for {} on resume, treating as FAIL",
+                            let error_msg = if continue_count >= max_continues {
+                                format!(
+                                    "Acceptance CONTINUE limit ({}) exceeded for {} in archiving state. Per spec, archiving state must not return to apply loop. Workspace preserved for manual intervention.",
                                     max_continues,
                                     change_id
-                                );
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::Log(
-                                        LogEntry::warn(format!(
-                                            "Acceptance CONTINUE limit exceeded ({}), archive will not be committed. Change needs to return to apply loop.",
-                                            max_continues
-                                        ))
-                                        .with_change_id(change_id)
-                                        .with_operation("acceptance")
-                                        .with_iteration(acceptance_iteration),
-                                    ),
                                 )
-                                .await;
                             } else {
-                                info!(
-                                    "Acceptance requires continuation for {} on resume (attempt {}/{}), returning to apply loop",
+                                format!(
+                                    "Acceptance requires continuation for {} in archiving state (attempt {}/{}). Per spec, archiving state must not return to apply loop. Workspace preserved for manual intervention.",
                                     change_id,
                                     continue_count,
                                     max_continues
-                                );
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::Log(
-                                        LogEntry::info(format!(
-                                            "Acceptance requires continuation on resume (attempt {}/{}), archive will not be committed. Change needs to return to apply loop.",
-                                            continue_count,
-                                            max_continues
-                                        ))
+                                )
+                            };
+
+                            error!("{}", error_msg);
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::Log(
+                                    LogEntry::error(&error_msg)
                                         .with_change_id(change_id)
                                         .with_operation("acceptance")
                                         .with_iteration(acceptance_iteration),
-                                    ),
-                                )
-                                .await;
-                            }
+                                ),
+                            )
+                            .await;
 
-                            changes_for_apply.push(change_id.clone());
+                            // Mark as failed and preserve workspace
+                            cleanup_guard.preserve(&workspace.name);
+                            self.failed_tracker.mark_failed(change_id);
+
+                            // Emit WorkspacePreserved event
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::WorkspacePreserved {
+                                    change_id: change_id.clone(),
+                                    workspace_name: workspace.name.clone(),
+                                },
+                            )
+                            .await;
+
+                            // Add to results as failed
+                            archived_results.push(WorkspaceResult {
+                                change_id: change_id.clone(),
+                                workspace_name: workspace.name.clone(),
+                                final_revision: None,
+                                error: Some(error_msg),
+                            });
                             continue;
                         }
                         Ok((
                             crate::orchestration::AcceptanceResult::Fail { findings },
                             acceptance_iteration,
                         )) => {
-                            warn!(
-                                "Acceptance failed for {} with {} findings on resume, will not commit archive",
+                            let error_msg = format!(
+                                "Acceptance failed for {} with {} findings in archiving state. Per spec, archiving state must not return to apply loop. Workspace preserved for manual intervention.",
                                 change_id,
                                 findings.len()
                             );
-                            // Note: tasks.md is now updated by the acceptance agent itself
+                            error!("{}", error_msg);
                             send_event(
                                 &self.event_tx,
                                 ParallelEvent::Log(
-                                    LogEntry::warn(format!(
-                                        "Acceptance failed with {} findings on resume, archive will not be committed. Change needs to return to apply loop.",
-                                        findings.len()
-                                    ))
-                                    .with_change_id(change_id)
-                                    .with_operation("acceptance")
-                                    .with_iteration(acceptance_iteration),
+                                    LogEntry::error(&error_msg)
+                                        .with_change_id(change_id)
+                                        .with_operation("acceptance")
+                                        .with_iteration(acceptance_iteration),
                                 ),
                             )
                             .await;
-                            // Add to changes_for_apply to retry the full cycle
-                            changes_for_apply.push(change_id.clone());
+
+                            // Mark as failed and preserve workspace
+                            cleanup_guard.preserve(&workspace.name);
+                            self.failed_tracker.mark_failed(change_id);
+
+                            // Emit WorkspacePreserved event
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::WorkspacePreserved {
+                                    change_id: change_id.clone(),
+                                    workspace_name: workspace.name.clone(),
+                                },
+                            )
+                            .await;
+
+                            // Add to results as failed
+                            archived_results.push(WorkspaceResult {
+                                change_id: change_id.clone(),
+                                workspace_name: workspace.name.clone(),
+                                final_revision: None,
+                                error: Some(error_msg),
+                            });
                             continue;
                         }
                         Ok((
@@ -1533,26 +1557,43 @@ impl ParallelExecutor {
                             },
                             acceptance_iteration,
                         )) => {
-                            error!(
-                                "Acceptance command failed for {} on resume: {}",
+                            let error_msg = format!(
+                                "Acceptance command failed for {} in archiving state: {}. Per spec, archiving state must not return to apply loop. Workspace preserved for manual intervention.",
                                 change_id, error
                             );
-                            // Note: tasks.md is now updated by the acceptance agent itself
+                            error!("{}", error_msg);
                             send_event(
                                 &self.event_tx,
                                 ParallelEvent::Log(
-                                    LogEntry::error(format!(
-                                        "Acceptance command failed on resume: {}",
-                                        error
-                                    ))
-                                    .with_change_id(change_id)
-                                    .with_operation("acceptance")
-                                    .with_iteration(acceptance_iteration),
+                                    LogEntry::error(&error_msg)
+                                        .with_change_id(change_id)
+                                        .with_operation("acceptance")
+                                        .with_iteration(acceptance_iteration),
                                 ),
                             )
                             .await;
-                            // Add to changes_for_apply to retry
-                            changes_for_apply.push(change_id.clone());
+
+                            // Mark as failed and preserve workspace
+                            cleanup_guard.preserve(&workspace.name);
+                            self.failed_tracker.mark_failed(change_id);
+
+                            // Emit WorkspacePreserved event
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::WorkspacePreserved {
+                                    change_id: change_id.clone(),
+                                    workspace_name: workspace.name.clone(),
+                                },
+                            )
+                            .await;
+
+                            // Add to results as failed
+                            archived_results.push(WorkspaceResult {
+                                change_id: change_id.clone(),
+                                workspace_name: workspace.name.clone(),
+                                final_revision: None,
+                                error: Some(error_msg),
+                            });
                             continue;
                         }
                         Ok((
@@ -1563,19 +1604,43 @@ impl ParallelExecutor {
                             continue;
                         }
                         Err(e) => {
-                            error!("Acceptance error for {} on resume: {}", change_id, e);
+                            let error_msg = format!(
+                                "Acceptance error for {} in archiving state: {}. Per spec, archiving state must not return to apply loop. Workspace preserved for manual intervention.",
+                                change_id, e
+                            );
+                            error!("{}", error_msg);
                             send_event(
                                 &self.event_tx,
                                 ParallelEvent::Log(
-                                    LogEntry::error(format!("Acceptance error on resume: {}", e))
+                                    LogEntry::error(&error_msg)
                                         .with_change_id(change_id)
                                         .with_operation("acceptance")
                                         .with_iteration(0),
                                 ),
                             )
                             .await;
-                            // Add to changes_for_apply to retry
-                            changes_for_apply.push(change_id.clone());
+
+                            // Mark as failed and preserve workspace
+                            cleanup_guard.preserve(&workspace.name);
+                            self.failed_tracker.mark_failed(change_id);
+
+                            // Emit WorkspacePreserved event
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::WorkspacePreserved {
+                                    change_id: change_id.clone(),
+                                    workspace_name: workspace.name.clone(),
+                                },
+                            )
+                            .await;
+
+                            // Add to results as failed
+                            archived_results.push(WorkspaceResult {
+                                change_id: change_id.clone(),
+                                workspace_name: workspace.name.clone(),
+                                final_revision: None,
+                                error: Some(error_msg),
+                            });
                             continue;
                         }
                     }
