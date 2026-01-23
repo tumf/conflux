@@ -336,6 +336,8 @@ pub async fn execute_apply_in_workspace(
     ai_runner: &AiCommandRunner,
     repo_root: &Path,
     apply_history: &Arc<Mutex<crate::history::ApplyHistory>>,
+    acceptance_history: &Arc<Mutex<crate::history::AcceptanceHistory>>,
+    acceptance_tail_injected: &Arc<Mutex<std::collections::HashMap<String, bool>>>,
     initial_iteration: u32,
 ) -> Result<(String, u32)> {
     const MAX_ITERATIONS: u32 = 50;
@@ -514,7 +516,38 @@ pub async fn execute_apply_in_workspace(
             let history = apply_history.lock().await;
             history.format_context(change_id)
         };
-        let full_prompt = build_apply_prompt(user_prompt, &history_context);
+
+        // Get acceptance tail context (only inject on first apply after acceptance failure)
+        let acceptance_tail = {
+            use crate::agent::build_last_acceptance_output_context;
+
+            // Check if already injected
+            let mut injected_map = acceptance_tail_injected.lock().await;
+            let already_injected = injected_map.get(change_id).copied().unwrap_or(false);
+
+            if already_injected {
+                String::new()
+            } else {
+                // Get tails from acceptance history
+                let acc_history = acceptance_history.lock().await;
+                let stdout_tail = acc_history.last_stdout_tail(change_id);
+                let stderr_tail = acc_history.last_stderr_tail(change_id);
+
+                let context = build_last_acceptance_output_context(
+                    stdout_tail.as_deref(),
+                    stderr_tail.as_deref(),
+                );
+
+                // Mark as injected if we got output
+                if !context.is_empty() {
+                    injected_map.insert(change_id.to_string(), true);
+                }
+
+                context
+            }
+        };
+
+        let full_prompt = build_apply_prompt(user_prompt, &history_context, &acceptance_tail);
 
         // Expand change_id and prompt in command
         let command = OrchestratorConfig::expand_change_id(apply_cmd_template, change_id);
@@ -1304,6 +1337,7 @@ pub async fn execute_acceptance_in_workspace(
     cancel_token: Option<&CancellationToken>,
     ai_runner: &AiCommandRunner,
     config: &OrchestratorConfig,
+    acceptance_tail_injected: &Arc<Mutex<std::collections::HashMap<String, bool>>>,
 ) -> Result<(crate::orchestration::AcceptanceResult, u32)> {
     use crate::acceptance::{parse_acceptance_output, AcceptanceResult as ParseResult};
 
@@ -1461,6 +1495,8 @@ pub async fn execute_acceptance_in_workspace(
             commit_hash: commit_hash.clone(),
         };
         agent.record_acceptance_attempt(change_id, attempt);
+        // Reset acceptance tail injection flag so next apply can receive new output
+        acceptance_tail_injected.lock().await.remove(change_id);
 
         if let Some(ref tx) = event_tx {
             let _ = tx
@@ -1503,6 +1539,8 @@ pub async fn execute_acceptance_in_workspace(
                 commit_hash: commit_hash.clone(),
             };
             agent.record_acceptance_attempt(change_id, attempt);
+            // Reset acceptance tail injection flag so next apply can receive new output
+            acceptance_tail_injected.lock().await.remove(change_id);
 
             if let Some(ref tx) = event_tx {
                 let _ = tx
@@ -1536,6 +1574,8 @@ pub async fn execute_acceptance_in_workspace(
                 commit_hash: commit_hash.clone(),
             };
             agent.record_acceptance_attempt(change_id, attempt);
+            // Reset acceptance tail injection flag so next apply can receive new output
+            acceptance_tail_injected.lock().await.remove(change_id);
 
             if let Some(ref tx) = event_tx {
                 let _ = tx
@@ -1577,6 +1617,8 @@ pub async fn execute_acceptance_in_workspace(
                 commit_hash: commit_hash.clone(),
             };
             agent.record_acceptance_attempt(change_id, attempt);
+            // Reset acceptance tail injection flag so next apply can receive new output
+            acceptance_tail_injected.lock().await.remove(change_id);
 
             if let Some(ref tx) = event_tx {
                 let _ = tx

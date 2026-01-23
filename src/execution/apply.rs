@@ -329,13 +329,18 @@ pub async fn get_workspace_revision<W: WorkspaceManager + ?Sized>(
 ///
 /// * `config` - The orchestrator configuration
 /// * `history` - Optional apply history for context
+/// * `acceptance_tail` - Optional acceptance tail context (for first retry after acceptance failure)
 ///
 /// # Returns
 ///
 /// The full prompt string to use for the apply command.
-pub fn build_apply_prompt(config: &OrchestratorConfig, history: &str) -> String {
+pub fn build_apply_prompt(
+    config: &OrchestratorConfig,
+    history: &str,
+    acceptance_tail: &str,
+) -> String {
     let user_prompt = config.get_apply_prompt();
-    crate::agent::build_apply_prompt(user_prompt, history)
+    crate::agent::build_apply_prompt(user_prompt, history, acceptance_tail)
 }
 
 /// Expand the apply command template with change_id and prompt.
