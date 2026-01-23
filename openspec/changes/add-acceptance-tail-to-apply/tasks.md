@@ -8,3 +8,6 @@
 
 ## Acceptance #1 Failure Follow-up
 - [x] Git 作業ツリーが dirty のままです。未コミットの変更: `openspec/changes/add-acceptance-tail-to-apply/tasks.md`、`src/agent/prompt.rs`、`src/agent/runner.rs`、`src/agent/tests.rs`、`src/execution/apply.rs`、`src/parallel/executor.rs`、`src/parallel/mod.rs`、`src/parallel/tests/executor.rs`
+
+## Acceptance #2 Failure Follow-up
+- [x] `src/parallel/executor.rs:execute_apply_in_workspace` が `acceptance_history` から `<last_acceptance_output>` を構築する一方、`src/parallel/executor.rs:execute_acceptance_in_workspace` は `AgentRunner` の履歴のみ更新して `ParallelExecutor.acceptance_history` を更新していないため、並列モードで acceptance 失敗後の apply に tail が注入されない。acceptance 実行時に共有 `acceptance_history` を更新する。

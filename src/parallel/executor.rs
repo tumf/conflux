@@ -1338,6 +1338,7 @@ pub async fn execute_acceptance_in_workspace(
     ai_runner: &AiCommandRunner,
     config: &OrchestratorConfig,
     acceptance_tail_injected: &Arc<Mutex<std::collections::HashMap<String, bool>>>,
+    acceptance_history: &Arc<Mutex<crate::history::AcceptanceHistory>>,
 ) -> Result<(crate::orchestration::AcceptanceResult, u32)> {
     use crate::acceptance::{parse_acceptance_output, AcceptanceResult as ParseResult};
 
@@ -1490,11 +1491,13 @@ pub async fn execute_acceptance_in_workspace(
             duration: start_time.elapsed(),
             findings: Some(tail_findings.clone()),
             exit_code: status.code(),
-            stdout_tail,
-            stderr_tail,
+            stdout_tail: stdout_tail.clone(),
+            stderr_tail: stderr_tail.clone(),
             commit_hash: commit_hash.clone(),
         };
-        agent.record_acceptance_attempt(change_id, attempt);
+        // Record to both agent history (local) and shared acceptance history
+        agent.record_acceptance_attempt(change_id, attempt.clone());
+        acceptance_history.lock().await.record(change_id, attempt);
         // Reset acceptance tail injection flag so next apply can receive new output
         acceptance_tail_injected.lock().await.remove(change_id);
 
@@ -1534,11 +1537,13 @@ pub async fn execute_acceptance_in_workspace(
                 duration: start_time.elapsed(),
                 findings: None,
                 exit_code: status.code(),
-                stdout_tail,
+                stdout_tail: stdout_tail.clone(),
                 stderr_tail: stderr_tail.clone(),
                 commit_hash: commit_hash.clone(),
             };
-            agent.record_acceptance_attempt(change_id, attempt);
+            // Record to both agent history (local) and shared acceptance history
+            agent.record_acceptance_attempt(change_id, attempt.clone());
+            acceptance_history.lock().await.record(change_id, attempt);
             // Reset acceptance tail injection flag so next apply can receive new output
             acceptance_tail_injected.lock().await.remove(change_id);
 
@@ -1569,11 +1574,13 @@ pub async fn execute_acceptance_in_workspace(
                 duration: start_time.elapsed(),
                 findings: Some(vec!["Investigation incomplete - continue later".to_string()]),
                 exit_code: status.code(),
-                stdout_tail,
-                stderr_tail,
+                stdout_tail: stdout_tail.clone(),
+                stderr_tail: stderr_tail.clone(),
                 commit_hash: commit_hash.clone(),
             };
-            agent.record_acceptance_attempt(change_id, attempt);
+            // Record to both agent history (local) and shared acceptance history
+            agent.record_acceptance_attempt(change_id, attempt.clone());
+            acceptance_history.lock().await.record(change_id, attempt);
             // Reset acceptance tail injection flag so next apply can receive new output
             acceptance_tail_injected.lock().await.remove(change_id);
 
@@ -1612,11 +1619,13 @@ pub async fn execute_acceptance_in_workspace(
                 duration: start_time.elapsed(),
                 findings: Some(findings_for_tasks.clone()),
                 exit_code: status.code(),
-                stdout_tail,
-                stderr_tail,
+                stdout_tail: stdout_tail.clone(),
+                stderr_tail: stderr_tail.clone(),
                 commit_hash: commit_hash.clone(),
             };
-            agent.record_acceptance_attempt(change_id, attempt);
+            // Record to both agent history (local) and shared acceptance history
+            agent.record_acceptance_attempt(change_id, attempt.clone());
+            acceptance_history.lock().await.record(change_id, attempt);
             // Reset acceptance tail injection flag so next apply can receive new output
             acceptance_tail_injected.lock().await.remove(change_id);
 

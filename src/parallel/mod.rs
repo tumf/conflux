@@ -1395,6 +1395,7 @@ impl ParallelExecutor {
                         &self.ai_runner,
                         &self.config,
                         &self.acceptance_tail_injected,
+                        &self.acceptance_history,
                     )
                     .await;
 
@@ -2140,6 +2141,7 @@ impl ParallelExecutor {
                     &ai_runner,
                     &config,
                     &acceptance_tail_injected,
+                    &acceptance_history,
                 )
                 .await;
 
@@ -2637,6 +2639,7 @@ impl ParallelExecutor {
                         &ai_runner,
                         &config,
                         &acceptance_tail_injected,
+                        &acceptance_history,
                     )
                     .await;
 
@@ -3215,6 +3218,7 @@ impl ParallelExecutor {
                                                                     &ai_runner,
                                                                     &config,
                                                                     &acceptance_tail_injected,
+                                                                    &acceptance_history,
                                                                 )
                                                                 .await;
 
