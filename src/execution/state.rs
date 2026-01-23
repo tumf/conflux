@@ -56,9 +56,9 @@ pub enum WorkspaceState {
 
 /// Check if a change has been merged to the base branch.
 ///
-/// This function checks if the archive commit for the given change exists in
-/// the base branch's commit history AND the change directory has been removed
-/// from openspec/changes/.
+/// This function checks if the archive entry exists and the change directory
+/// has been removed in the base branch's HEAD tree. It uses file state only
+/// and does NOT check commit messages.
 ///
 /// # Arguments
 ///
@@ -68,100 +68,98 @@ pub enum WorkspaceState {
 ///
 /// # Returns
 ///
-/// * `Ok(true)` - Change has been merged to base branch and change directory removed
-/// * `Ok(false)` - Change has not been merged to base branch or change directory still exists
+/// * `Ok(true)` - Archive entry exists in base branch HEAD tree and change directory is gone
+/// * `Ok(false)` - Archive entry does not exist or change directory still exists in base branch
 /// * `Err` - Failed to check merge status
 pub async fn is_merged_to_base(
     change_id: &str,
     repo_root: &Path,
     base_branch: &str,
 ) -> Result<bool> {
-    // Check if the archive commit exists in main branch
-    let expected_subject = format!("Archive: {}", change_id);
-
-    // Get the merge-base between current HEAD and base branch
-    let merge_base_output = Command::new("git")
-        .args(["merge-base", "HEAD", base_branch])
+    // Check if base branch exists
+    let rev_parse_output = Command::new("git")
+        .args(["rev-parse", "--verify", base_branch])
         .current_dir(repo_root)
         .output()
         .await
-        .map_err(|e| OrchestratorError::GitCommand(format!("Failed to get merge-base: {}", e)))?;
+        .map_err(|e| {
+            OrchestratorError::GitCommand(format!("Failed to verify base branch: {}", e))
+        })?;
 
-    if !merge_base_output.status.success() {
-        // If merge-base fails, base branch might not exist or we're on base branch
-        // Check if we're on the base branch
-        let branch_output = Command::new("git")
-            .args(["branch", "--show-current"])
-            .current_dir(repo_root)
-            .output()
-            .await
-            .map_err(|e| {
-                OrchestratorError::GitCommand(format!("Failed to get current branch: {}", e))
-            })?;
-
-        if !branch_output.status.success() {
-            return Ok(false);
-        }
-
-        let current_branch = String::from_utf8_lossy(&branch_output.stdout)
-            .trim()
-            .to_string();
-        if current_branch != base_branch {
-            return Ok(false);
-        }
-    }
-
-    // Search for the archive commit in base branch history
-    let log_output = Command::new("git")
-        .args([
-            "log",
-            base_branch,
-            "--format=%s",
-            "--all-match",
-            "--grep",
-            &expected_subject,
-        ])
-        .current_dir(repo_root)
-        .output()
-        .await
-        .map_err(|e| OrchestratorError::GitCommand(format!("Failed to search git log: {}", e)))?;
-
-    if !log_output.status.success() {
-        let stderr = String::from_utf8_lossy(&log_output.stderr);
-        return Err(OrchestratorError::GitCommand(format!(
-            "Failed to search git log: {}",
-            stderr
-        )));
-    }
-
-    let commits = String::from_utf8_lossy(&log_output.stdout);
-    let archive_commit_found = commits.lines().any(|line| line.trim() == expected_subject);
-
-    // Check if the changes directory still exists
-    let change_path = repo_root.join("openspec/changes").join(change_id);
-    let change_dir_exists = change_path.exists();
-
-    debug!(
-        change_id = %change_id,
-        base_branch = %base_branch,
-        expected_subject = %expected_subject,
-        archive_commit_found = archive_commit_found,
-        change_dir_exists = change_dir_exists,
-        "is_merged_to_base: checking base branch and change directory"
-    );
-
-    // Only consider merged if archive commit exists AND change directory is gone
-    if archive_commit_found && change_dir_exists {
-        tracing::warn!(
-            change_id = %change_id,
-            change_path = %change_path.display(),
-            "Archive commit found in base branch but change directory still exists at {}",
-            change_path.display()
+    if !rev_parse_output.status.success() {
+        debug!(
+            base_branch = %base_branch,
+            "is_merged_to_base: base branch does not exist"
         );
         return Ok(false);
     }
 
-    Ok(archive_commit_found && !change_dir_exists)
+    // Check if archive entry exists in base branch HEAD tree
+    let archive_path = format!("{}:openspec/changes/archive/", base_branch);
+    let ls_tree_output = Command::new("git")
+        .args(["ls-tree", "-d", &archive_path])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .map_err(|e| {
+            OrchestratorError::GitCommand(format!("Failed to list archive tree: {}", e))
+        })?;
+
+    if !ls_tree_output.status.success() {
+        // Archive directory doesn't exist in base branch
+        debug!(
+            base_branch = %base_branch,
+            "is_merged_to_base: archive directory does not exist in base branch"
+        );
+        return Ok(false);
+    }
+
+    // Parse ls-tree output to find matching archive entries
+    let output = String::from_utf8_lossy(&ls_tree_output.stdout);
+    let archive_entry_exists = output.lines().any(|line| {
+        // Parse line format: "040000 tree <hash>\t<name>"
+        if let Some(name) = line.split('\t').nth(1) {
+            name == change_id || name.ends_with(&format!("-{}", change_id))
+        } else {
+            false
+        }
+    });
+
+    // Check if change directory exists in base branch HEAD tree
+    let change_path = format!("{}:openspec/changes/{}", base_branch, change_id);
+    let change_exists_output = Command::new("git")
+        .args(["ls-tree", "-d", &change_path])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .map_err(|e| {
+            OrchestratorError::GitCommand(format!("Failed to check change tree: {}", e))
+        })?;
+
+    let change_dir_exists = change_exists_output.status.success()
+        && !String::from_utf8_lossy(&change_exists_output.stdout)
+            .trim()
+            .is_empty();
+
+    debug!(
+        change_id = %change_id,
+        base_branch = %base_branch,
+        archive_entry_exists = archive_entry_exists,
+        change_dir_exists = change_dir_exists,
+        "is_merged_to_base: checking base branch HEAD tree file state"
+    );
+
+    // Only consider merged if archive entry exists in base AND change directory is gone from base
+    if archive_entry_exists && change_dir_exists {
+        tracing::warn!(
+            change_id = %change_id,
+            base_branch = %base_branch,
+            "Archive entry found in base branch but change directory still exists in base branch tree"
+        );
+        return Ok(false);
+    }
+
+    Ok(archive_entry_exists && !change_dir_exists)
 }
 
 /// Get the latest WIP snapshot iteration number.
@@ -227,11 +225,15 @@ pub async fn get_latest_wip_snapshot(change_id: &str, repo_root: &Path) -> Resul
     Ok(max_iteration)
 }
 
-/// Check if archive files exist in the worktree (files moved but commit not complete).
+/// Check if the workspace is in the "archiving" state.
 ///
-/// This function checks if the change directory has been moved to the archive directory
-/// in the worktree's filesystem, indicating that archiving has started but the commit
-/// may not yet be complete.
+/// The archiving state occurs when files have been moved to the archive directory
+/// but the commit is not yet complete (working tree is dirty).
+///
+/// This function checks if:
+/// 1. The worktree is dirty (has uncommitted changes)
+/// 2. The change directory does NOT exist in `openspec/changes/<change_id>`
+/// 3. An archive entry exists in `openspec/changes/archive/`
 ///
 /// # Arguments
 ///
@@ -240,57 +242,78 @@ pub async fn get_latest_wip_snapshot(change_id: &str, repo_root: &Path) -> Resul
 ///
 /// # Returns
 ///
-/// * `Ok(true)` - Archive directory exists (files moved)
-/// * `Ok(false)` - Archive directory does not exist
-/// * `Err` - Failed to check archive directory
+/// * `Ok(true)` - In archiving state (dirty, change gone, archive exists)
+/// * `Ok(false)` - Not in archiving state
+/// * `Err` - Failed to check archiving state
 pub async fn has_archive_files(change_id: &str, repo_root: &Path) -> Result<bool> {
+    // Check if working tree is dirty
+    let status_output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .map_err(|e| OrchestratorError::GitCommand(format!("Failed to check git status: {}", e)))?;
+
+    if !status_output.status.success() {
+        let stderr = String::from_utf8_lossy(&status_output.stderr);
+        return Err(OrchestratorError::GitCommand(format!(
+            "Failed to check git status: {}",
+            stderr
+        )));
+    }
+
+    let is_dirty = !String::from_utf8_lossy(&status_output.stdout)
+        .trim()
+        .is_empty();
+
+    // Check if change directory exists (should NOT exist for archiving state)
+    let change_path = repo_root.join("openspec/changes").join(change_id);
+    let change_exists = change_path.exists();
+
     // Check for archive directory (supports both formats)
     // 1. openspec/changes/archive/{change_id}
     // 2. openspec/changes/archive/{date}-{change_id}
-
     let archive_base = repo_root.join("openspec/changes/archive");
+    let mut archive_entry_exists = false;
 
-    if !archive_base.exists() {
-        return Ok(false);
-    }
+    if archive_base.exists() {
+        // Check for exact match first
+        let exact_match = archive_base.join(change_id);
+        if exact_match.exists() && exact_match.is_dir() {
+            archive_entry_exists = true;
+        } else {
+            // Check for date-prefixed match
+            if let Ok(entries) = std::fs::read_dir(&archive_base) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
 
-    // Check for exact match first
-    let exact_match = archive_base.join(change_id);
-    if exact_match.exists() && exact_match.is_dir() {
-        debug!(
-            change_id = %change_id,
-            archive_path = %exact_match.display(),
-            "has_archive_files: found exact match archive directory"
-        );
-        return Ok(true);
-    }
-
-    // Check for date-prefixed match
-    let entries = match std::fs::read_dir(&archive_base) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(false),
-    };
-
-    for entry in entries.filter_map(|e| e.ok()) {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        // Check if it ends with "-{change_id}" and is a directory
-        if name_str.ends_with(&format!("-{}", change_id)) && entry.path().is_dir() {
-            debug!(
-                change_id = %change_id,
-                archive_path = %entry.path().display(),
-                "has_archive_files: found date-prefixed archive directory"
-            );
-            return Ok(true);
+                    // Check if it ends with "-{change_id}" and is a directory
+                    if name_str.ends_with(&format!("-{}", change_id)) && entry.path().is_dir() {
+                        archive_entry_exists = true;
+                        break;
+                    }
+                }
+            }
         }
     }
 
     debug!(
         change_id = %change_id,
-        "has_archive_files: no archive directory found"
+        is_dirty = is_dirty,
+        change_exists = change_exists,
+        archive_entry_exists = archive_entry_exists,
+        "has_archive_files: checking archiving state (dirty={}, change_gone={}, archive_exists={})",
+        is_dirty,
+        !change_exists,
+        archive_entry_exists
     );
-    Ok(false)
+
+    // Archiving state requires:
+    // 1. Worktree is dirty
+    // 2. Change directory is gone
+    // 3. Archive entry exists
+    Ok(is_dirty && !change_exists && archive_entry_exists)
 }
 
 /// Check if an apply commit exists for a change.
@@ -504,6 +527,12 @@ mod tests {
             .current_dir(repo_root)
             .output()
             .unwrap();
+
+        // Create archive directory (change moved to archive)
+        let archive_dir = repo_root.join("openspec/changes/archive/test-change");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("proposal.md"), "# Test").unwrap();
+
         commit(repo_root, "Archive: test-change");
 
         let state = detect_workspace_state("test-change", repo_root, "main")
@@ -518,6 +547,12 @@ mod tests {
         let repo_root = temp_dir.path();
         init_git_repo(repo_root);
         commit(repo_root, "Initial commit");
+
+        // Create archive directory (change moved to archive)
+        let archive_dir = repo_root.join("openspec/changes/archive/test-change");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("proposal.md"), "# Test").unwrap();
+
         commit(repo_root, "Archive: test-change");
 
         // We're on main, so the archive commit is in main
@@ -611,6 +646,12 @@ mod tests {
         let repo_root = temp_dir.path();
         init_git_repo(repo_root);
         commit(repo_root, "Initial commit");
+
+        // Create archive directory (change moved to archive)
+        let archive_dir = repo_root.join("openspec/changes/archive/test-change");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("proposal.md"), "# Test").unwrap();
+
         commit(repo_root, "Archive: test-change");
 
         let result = is_merged_to_base("test-change", repo_root, "main")
@@ -632,8 +673,15 @@ mod tests {
             .current_dir(repo_root)
             .output()
             .unwrap();
+
+        // Create archive directory in feature branch
+        let archive_dir = repo_root.join("openspec/changes/archive/test-change");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("proposal.md"), "# Test").unwrap();
+
         commit(repo_root, "Archive: test-change");
 
+        // Archive is in feature branch, not in main
         let result = is_merged_to_base("test-change", repo_root, "main")
             .await
             .unwrap();
@@ -647,11 +695,12 @@ mod tests {
         init_git_repo(repo_root);
         commit(repo_root, "Initial commit");
 
-        // Create archive directory (exact match)
+        // Create archive directory (exact match) with uncommitted changes (dirty)
         let archive_dir = repo_root.join("openspec/changes/archive/test-archiving");
         fs::create_dir_all(&archive_dir).unwrap();
         fs::write(archive_dir.join("proposal.md"), "# Test").unwrap();
 
+        // Archiving state requires dirty worktree (uncommitted archive files)
         let result = has_archive_files("test-archiving", repo_root)
             .await
             .unwrap();
@@ -665,11 +714,12 @@ mod tests {
         init_git_repo(repo_root);
         commit(repo_root, "Initial commit");
 
-        // Create archive directory (date-prefixed)
+        // Create archive directory (date-prefixed) with uncommitted changes (dirty)
         let archive_dir = repo_root.join("openspec/changes/archive/2024-01-15-test-archiving");
         fs::create_dir_all(&archive_dir).unwrap();
         fs::write(archive_dir.join("proposal.md"), "# Test").unwrap();
 
+        // Archiving state requires dirty worktree (uncommitted archive files)
         let result = has_archive_files("test-archiving", repo_root)
             .await
             .unwrap();
@@ -741,5 +791,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, WorkspaceState::Archiving);
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspace_state_archived_file_state_only() {
+        // Test that archive detection uses file state only, not commit messages
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        init_git_repo(repo_root);
+        commit(repo_root, "Initial commit");
+
+        // Create a branch to simulate workspace
+        StdCommand::new("git")
+            .args(["checkout", "-b", "workspace-file-state-test"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        // Create archive directory (change moved to archive)
+        let archive_dir = repo_root.join("openspec/changes/archive/file-state-test");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("proposal.md"), "# File State Test").unwrap();
+
+        // Commit with ANY message (not necessarily "Archive: ...")
+        // This tests that we don't rely on commit message matching
+        commit(repo_root, "Some other commit message");
+
+        // State should be Archived because:
+        // 1. Working tree is clean (committed)
+        // 2. Change directory does not exist in openspec/changes/
+        // 3. Archive entry exists in openspec/changes/archive/
+        let state = detect_workspace_state("file-state-test", repo_root, "main")
+            .await
+            .unwrap();
+        assert_eq!(state, WorkspaceState::Archived);
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspace_state_not_archived_without_archive_entry() {
+        // Test that archived state requires archive entry existence
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        init_git_repo(repo_root);
+        commit(repo_root, "Initial commit");
+
+        // Create a branch
+        StdCommand::new("git")
+            .args(["checkout", "-b", "workspace-no-archive-entry"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        // Commit with "Archive: ..." message but NO archive directory
+        // This tests that commit message alone is not sufficient
+        commit(repo_root, "Archive: no-archive-entry");
+
+        // State should NOT be Archived because archive entry does not exist
+        // Should fall back to Created (no apply commit, no WIP)
+        let state = detect_workspace_state("no-archive-entry", repo_root, "main")
+            .await
+            .unwrap();
+        assert_eq!(state, WorkspaceState::Created);
     }
 }

@@ -1816,3 +1816,56 @@ async fn test_concurrent_reanalysis_queue_dispatch() {
     // Verify AnalysisStarted event would be emitted
     // (Full execution test would require mocking apply/archive commands)
 }
+
+/// Test that on_merged hook is executed when parallel merge succeeds
+#[tokio::test]
+async fn test_on_merged_hook_execution() {
+    use crate::hooks::{HookConfig, HookRunner, HooksConfig};
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let repo_root = temp_dir.path().to_path_buf();
+
+    // Create a marker file path to verify hook execution
+    let marker_file = repo_root.join("hook_executed.marker");
+    let marker_file_str = marker_file.to_string_lossy().to_string();
+
+    // Set up hooks configuration with on_merged hook that creates a marker file
+    let hook_command = if cfg!(target_os = "windows") {
+        format!("cmd /C echo executed > {}", marker_file_str)
+    } else {
+        format!("touch {}", marker_file_str)
+    };
+
+    let hooks_config = HooksConfig {
+        on_merged: Some(crate::hooks::HookConfigValue::Full(HookConfig {
+            command: hook_command,
+            continue_on_failure: true,
+            timeout: 5,
+        })),
+        ..Default::default()
+    };
+
+    let hook_runner = HookRunner::new(hooks_config);
+
+    // Create a simple HookContext for testing
+    let hook_context = crate::hooks::HookContext::new(1, 1, 0, false)
+        .with_change("test-change", 5, 5)
+        .with_parallel_context("/tmp/test-workspace", None);
+
+    // Execute the hook
+    let result = hook_runner
+        .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
+        .await;
+    assert!(result.is_ok(), "Hook execution should succeed");
+
+    // Allow some time for file creation
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Verify the marker file was created
+    assert!(
+        marker_file.exists(),
+        "Hook marker file should exist at {:?}",
+        marker_file
+    );
+}

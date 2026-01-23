@@ -879,6 +879,49 @@ impl ParallelExecutor {
 
                                         match self.attempt_merge(&revisions, &change_ids, &archive_paths).await {
                                             Ok(MergeAttempt::Merged) => {
+                                                // Run on_merged hook after merge completion
+                                                if let Some(ref hooks) = self.hooks {
+                                                    // Fetch actual task counts from change data
+                                                    let (completed_tasks, total_tasks) =
+                                                        match crate::openspec::list_changes_native() {
+                                                            Ok(changes) => changes
+                                                                .iter()
+                                                                .find(|c| c.id == workspace_result.change_id)
+                                                                .map(|c| (c.completed_tasks, c.total_tasks))
+                                                                .unwrap_or((0, 0)),
+                                                            Err(e) => {
+                                                                warn!("Failed to fetch task counts for on_merged hook: {}", e);
+                                                                (0, 0)
+                                                            }
+                                                        };
+
+                                                    // Find workspace path
+                                                    let workspace_path = self
+                                                        .workspace_manager
+                                                        .workspaces()
+                                                        .iter()
+                                                        .find(|w| w.name == workspace_result.workspace_name)
+                                                        .map(|w| w.path.to_string_lossy().to_string())
+                                                        .unwrap_or_default();
+
+                                                    let hook_context = crate::hooks::HookContext::new(
+                                                        0, // changes_processed not easily available here
+                                                        0, // total_changes not easily available here
+                                                        0, // remaining_changes not easily available here
+                                                        false,
+                                                    )
+                                                    .with_change(&workspace_result.change_id, completed_tasks, total_tasks)
+                                                    .with_apply_count(0)
+                                                    .with_parallel_context(&workspace_path, None);
+
+                                                    if let Err(e) = hooks
+                                                        .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
+                                                        .await
+                                                    {
+                                                        warn!("on_merged hook failed for {}: {}", workspace_result.change_id, e);
+                                                    }
+                                                }
+
                                                 // Merge succeeded, cleanup workspace
                                                 send_event(
                                                     &self.event_tx,
@@ -1342,6 +1385,7 @@ impl ParallelExecutor {
                     // Archive files moved but commit not complete
                     // IMPORTANT: Must run acceptance before committing archive
                     // Acceptance results are not persisted, so we must re-run on resume
+                    // Per spec: "archiving の場合は apply を再実行せず、archive ループに進めなければならない（MUST）"
                     let workspace = existing_workspace.unwrap();
                     cleanup_guard.track(workspace.name.clone(), workspace.path.clone());
 
@@ -1400,6 +1444,7 @@ impl ParallelExecutor {
                     .await;
 
                     // Handle acceptance result
+                    // Per spec: archiving state must stay in archive loop, not return to apply
                     match acceptance_result {
                         Ok((
                             crate::orchestration::AcceptanceResult::Pass,
@@ -1419,76 +1464,98 @@ impl ParallelExecutor {
                                 agent.count_consecutive_acceptance_continues(change_id);
                             let max_continues = self.config.get_acceptance_max_continues();
 
-                            if continue_count >= max_continues {
-                                warn!(
-                                    "Acceptance CONTINUE limit ({}) exceeded for {} on resume, treating as FAIL",
+                            let error_msg = if continue_count >= max_continues {
+                                format!(
+                                    "Acceptance CONTINUE limit ({}) exceeded for {} in archiving state. Per spec, archiving state must not return to apply loop. Workspace preserved for manual intervention.",
                                     max_continues,
                                     change_id
-                                );
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::Log(
-                                        LogEntry::warn(format!(
-                                            "Acceptance CONTINUE limit exceeded ({}), archive will not be committed. Change needs to return to apply loop.",
-                                            max_continues
-                                        ))
-                                        .with_change_id(change_id)
-                                        .with_operation("acceptance")
-                                        .with_iteration(acceptance_iteration),
-                                    ),
                                 )
-                                .await;
                             } else {
-                                info!(
-                                    "Acceptance requires continuation for {} on resume (attempt {}/{}), returning to apply loop",
+                                format!(
+                                    "Acceptance requires continuation for {} in archiving state (attempt {}/{}). Per spec, archiving state must not return to apply loop. Workspace preserved for manual intervention.",
                                     change_id,
                                     continue_count,
                                     max_continues
-                                );
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::Log(
-                                        LogEntry::info(format!(
-                                            "Acceptance requires continuation on resume (attempt {}/{}), archive will not be committed. Change needs to return to apply loop.",
-                                            continue_count,
-                                            max_continues
-                                        ))
+                                )
+                            };
+
+                            error!("{}", error_msg);
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::Log(
+                                    LogEntry::error(&error_msg)
                                         .with_change_id(change_id)
                                         .with_operation("acceptance")
                                         .with_iteration(acceptance_iteration),
-                                    ),
-                                )
-                                .await;
-                            }
+                                ),
+                            )
+                            .await;
 
-                            changes_for_apply.push(change_id.clone());
+                            // Mark as failed and preserve workspace
+                            cleanup_guard.preserve(&workspace.name);
+                            self.failed_tracker.mark_failed(change_id);
+
+                            // Emit WorkspacePreserved event
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::WorkspacePreserved {
+                                    change_id: change_id.clone(),
+                                    workspace_name: workspace.name.clone(),
+                                },
+                            )
+                            .await;
+
+                            // Add to results as failed
+                            archived_results.push(WorkspaceResult {
+                                change_id: change_id.clone(),
+                                workspace_name: workspace.name.clone(),
+                                final_revision: None,
+                                error: Some(error_msg),
+                            });
                             continue;
                         }
                         Ok((
                             crate::orchestration::AcceptanceResult::Fail { findings },
                             acceptance_iteration,
                         )) => {
-                            warn!(
-                                "Acceptance failed for {} with {} findings on resume, will not commit archive",
+                            let error_msg = format!(
+                                "Acceptance failed for {} with {} findings in archiving state. Per spec, archiving state must not return to apply loop. Workspace preserved for manual intervention.",
                                 change_id,
                                 findings.len()
                             );
-                            // Note: tasks.md is now updated by the acceptance agent itself
+                            error!("{}", error_msg);
                             send_event(
                                 &self.event_tx,
                                 ParallelEvent::Log(
-                                    LogEntry::warn(format!(
-                                        "Acceptance failed with {} findings on resume, archive will not be committed. Change needs to return to apply loop.",
-                                        findings.len()
-                                    ))
-                                    .with_change_id(change_id)
-                                    .with_operation("acceptance")
-                                    .with_iteration(acceptance_iteration),
+                                    LogEntry::error(&error_msg)
+                                        .with_change_id(change_id)
+                                        .with_operation("acceptance")
+                                        .with_iteration(acceptance_iteration),
                                 ),
                             )
                             .await;
-                            // Add to changes_for_apply to retry the full cycle
-                            changes_for_apply.push(change_id.clone());
+
+                            // Mark as failed and preserve workspace
+                            cleanup_guard.preserve(&workspace.name);
+                            self.failed_tracker.mark_failed(change_id);
+
+                            // Emit WorkspacePreserved event
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::WorkspacePreserved {
+                                    change_id: change_id.clone(),
+                                    workspace_name: workspace.name.clone(),
+                                },
+                            )
+                            .await;
+
+                            // Add to results as failed
+                            archived_results.push(WorkspaceResult {
+                                change_id: change_id.clone(),
+                                workspace_name: workspace.name.clone(),
+                                final_revision: None,
+                                error: Some(error_msg),
+                            });
                             continue;
                         }
                         Ok((
@@ -1498,26 +1565,43 @@ impl ParallelExecutor {
                             },
                             acceptance_iteration,
                         )) => {
-                            error!(
-                                "Acceptance command failed for {} on resume: {}",
+                            let error_msg = format!(
+                                "Acceptance command failed for {} in archiving state: {}. Per spec, archiving state must not return to apply loop. Workspace preserved for manual intervention.",
                                 change_id, error
                             );
-                            // Note: tasks.md is now updated by the acceptance agent itself
+                            error!("{}", error_msg);
                             send_event(
                                 &self.event_tx,
                                 ParallelEvent::Log(
-                                    LogEntry::error(format!(
-                                        "Acceptance command failed on resume: {}",
-                                        error
-                                    ))
-                                    .with_change_id(change_id)
-                                    .with_operation("acceptance")
-                                    .with_iteration(acceptance_iteration),
+                                    LogEntry::error(&error_msg)
+                                        .with_change_id(change_id)
+                                        .with_operation("acceptance")
+                                        .with_iteration(acceptance_iteration),
                                 ),
                             )
                             .await;
-                            // Add to changes_for_apply to retry
-                            changes_for_apply.push(change_id.clone());
+
+                            // Mark as failed and preserve workspace
+                            cleanup_guard.preserve(&workspace.name);
+                            self.failed_tracker.mark_failed(change_id);
+
+                            // Emit WorkspacePreserved event
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::WorkspacePreserved {
+                                    change_id: change_id.clone(),
+                                    workspace_name: workspace.name.clone(),
+                                },
+                            )
+                            .await;
+
+                            // Add to results as failed
+                            archived_results.push(WorkspaceResult {
+                                change_id: change_id.clone(),
+                                workspace_name: workspace.name.clone(),
+                                final_revision: None,
+                                error: Some(error_msg),
+                            });
                             continue;
                         }
                         Ok((
@@ -1528,19 +1612,43 @@ impl ParallelExecutor {
                             continue;
                         }
                         Err(e) => {
-                            error!("Acceptance error for {} on resume: {}", change_id, e);
+                            let error_msg = format!(
+                                "Acceptance error for {} in archiving state: {}. Per spec, archiving state must not return to apply loop. Workspace preserved for manual intervention.",
+                                change_id, e
+                            );
+                            error!("{}", error_msg);
                             send_event(
                                 &self.event_tx,
                                 ParallelEvent::Log(
-                                    LogEntry::error(format!("Acceptance error on resume: {}", e))
+                                    LogEntry::error(&error_msg)
                                         .with_change_id(change_id)
                                         .with_operation("acceptance")
                                         .with_iteration(0),
                                 ),
                             )
                             .await;
-                            // Add to changes_for_apply to retry
-                            changes_for_apply.push(change_id.clone());
+
+                            // Mark as failed and preserve workspace
+                            cleanup_guard.preserve(&workspace.name);
+                            self.failed_tracker.mark_failed(change_id);
+
+                            // Emit WorkspacePreserved event
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::WorkspacePreserved {
+                                    change_id: change_id.clone(),
+                                    workspace_name: workspace.name.clone(),
+                                },
+                            )
+                            .await;
+
+                            // Add to results as failed
+                            archived_results.push(WorkspaceResult {
+                                change_id: change_id.clone(),
+                                workspace_name: workspace.name.clone(),
+                                final_revision: None,
+                                error: Some(error_msg),
+                            });
                             continue;
                         }
                     }
@@ -1696,12 +1804,49 @@ impl ParallelExecutor {
                             result.workspace_name
                         ))
                     })?;
-                let archive_paths = vec![workspace_path];
+                let archive_paths = vec![workspace_path.clone()];
                 let merge_result = self
                     .attempt_merge(&revisions, &change_ids, &archive_paths)
                     .await;
                 match merge_result {
-                    Ok(MergeAttempt::Merged) => {}
+                    Ok(MergeAttempt::Merged) => {
+                        // Run on_merged hook after merge completion
+                        if let Some(ref hooks) = self.hooks {
+                            // Fetch actual task counts from change data
+                            let (completed_tasks, total_tasks) =
+                                match crate::openspec::list_changes_native() {
+                                    Ok(changes) => changes
+                                        .iter()
+                                        .find(|c| c.id == result.change_id)
+                                        .map(|c| (c.completed_tasks, c.total_tasks))
+                                        .unwrap_or((0, 0)),
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to fetch task counts for on_merged hook: {}",
+                                            e
+                                        );
+                                        (0, 0)
+                                    }
+                                };
+
+                            let hook_context = crate::hooks::HookContext::new(
+                                0, // changes_processed not easily available here
+                                0, // total_changes not easily available here
+                                0, // remaining_changes not easily available here
+                                false,
+                            )
+                            .with_change(&result.change_id, completed_tasks, total_tasks)
+                            .with_apply_count(0)
+                            .with_parallel_context(&workspace_path.to_string_lossy(), None);
+
+                            if let Err(e) = hooks
+                                .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
+                                .await
+                            {
+                                warn!("on_merged hook failed for {}: {}", result.change_id, e);
+                            }
+                        }
+                    }
                     Ok(MergeAttempt::Deferred(reason)) => {
                         self.merge_deferred_changes.insert(result.change_id.clone());
 
@@ -2914,6 +3059,47 @@ impl ParallelExecutor {
                                             "Successfully merged {} (workspace: {})",
                                             workspace_result.change_id, workspace_result.workspace_name
                                         );
+
+                                        // Run on_merged hook after merge completion
+                                        if let Some(ref hooks) = self.hooks {
+                                            // Fetch actual task counts from change data
+                                            let (completed_tasks, total_tasks) =
+                                                match crate::openspec::list_changes_native() {
+                                                    Ok(changes) => changes
+                                                        .iter()
+                                                        .find(|c| c.id == workspace_result.change_id)
+                                                        .map(|c| (c.completed_tasks, c.total_tasks))
+                                                        .unwrap_or((0, 0)),
+                                                    Err(e) => {
+                                                        warn!("Failed to fetch task counts for on_merged hook: {}", e);
+                                                        (0, 0)
+                                                    }
+                                                };
+
+                                            // Get workspace path from archive_paths
+                                            let workspace_path = archive_paths
+                                                .first()
+                                                .map(|p| p.to_string_lossy().to_string())
+                                                .unwrap_or_default();
+
+                                            let hook_context = crate::hooks::HookContext::new(
+                                                0, // changes_processed not easily available here
+                                                0, // total_changes not easily available here
+                                                0, // remaining_changes not easily available here
+                                                false,
+                                            )
+                                            .with_change(&workspace_result.change_id, completed_tasks, total_tasks)
+                                            .with_apply_count(0)
+                                            .with_parallel_context(&workspace_path, None);
+
+                                            if let Err(e) = hooks
+                                                .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
+                                                .await
+                                            {
+                                                warn!("on_merged hook failed for {}: {}", workspace_result.change_id, e);
+                                            }
+                                        }
+
                                         send_event(
                                             &self.event_tx,
                                             ParallelEvent::CleanupStarted {
@@ -3526,6 +3712,40 @@ impl ParallelExecutor {
             .await?
         {
             MergeAttempt::Merged => {
+                // Run on_merged hook after merge completion
+                if let Some(ref hooks) = self.hooks {
+                    // Fetch actual task counts from change data
+                    let (completed_tasks, total_tasks) =
+                        match crate::openspec::list_changes_native() {
+                            Ok(changes) => changes
+                                .iter()
+                                .find(|c| c.id == *change_id)
+                                .map(|c| (c.completed_tasks, c.total_tasks))
+                                .unwrap_or((0, 0)),
+                            Err(e) => {
+                                warn!("Failed to fetch task counts for on_merged hook: {}", e);
+                                (0, 0)
+                            }
+                        };
+
+                    let hook_context = crate::hooks::HookContext::new(
+                        0, // changes_processed not easily available here
+                        0, // total_changes not easily available here
+                        0, // remaining_changes not easily available here
+                        false,
+                    )
+                    .with_change(change_id, completed_tasks, total_tasks)
+                    .with_apply_count(0)
+                    .with_parallel_context(&workspace.path.to_string_lossy(), None);
+
+                    if let Err(e) = hooks
+                        .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
+                        .await
+                    {
+                        warn!("on_merged hook failed for {}: {}", change_id, e);
+                    }
+                }
+
                 send_event(
                     &self.event_tx,
                     ParallelEvent::CleanupStarted {
@@ -3670,42 +3890,8 @@ impl ParallelExecutor {
             )
             .await;
 
-            // Run on_merged hook for each change_id that was merged
-            if let Some(ref hooks) = self.hooks {
-                // Fetch change data once for all changes
-                let changes_map = match crate::openspec::list_changes_native() {
-                    Ok(changes) => changes
-                        .into_iter()
-                        .map(|c| (c.id.clone(), (c.completed_tasks, c.total_tasks)))
-                        .collect::<std::collections::HashMap<_, _>>(),
-                    Err(e) => {
-                        warn!("Failed to fetch task counts for on_merged hook: {}", e);
-                        std::collections::HashMap::new()
-                    }
-                };
-
-                for change_id in change_ids {
-                    let (completed_tasks, total_tasks) =
-                        changes_map.get(change_id).copied().unwrap_or((0, 0));
-
-                    let hook_context = crate::hooks::HookContext::new(
-                        0, // changes_processed not available in this context
-                        0, // total_changes not available
-                        0, // remaining_changes not available
-                        false,
-                    )
-                    .with_change(change_id, completed_tasks, total_tasks)
-                    .with_apply_count(0);
-
-                    if let Err(e) = hooks
-                        .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
-                        .await
-                    {
-                        warn!("on_merged hook failed for {}: {}", change_id, e);
-                    }
-                }
-            }
-
+            // Note: on_merged hook is executed by the caller of attempt_merge()
+            // which has better context (workspace paths, etc.)
             return Ok(());
         }
 
@@ -3733,59 +3919,8 @@ impl ParallelExecutor {
                     )
                     .await;
 
-                    // Run on_merged hook for each change_id that was merged
-                    if let Some(ref hooks) = self.hooks {
-                        for change_id in change_ids {
-                            // Get actual task counts from the change
-                            let (completed_tasks, total_tasks) =
-                                match crate::openspec::list_changes_native() {
-                                    Ok(changes) => {
-                                        if let Some(change) =
-                                            changes.iter().find(|c| c.id == *change_id)
-                                        {
-                                            (change.completed_tasks, change.total_tasks)
-                                        } else {
-                                            (0, 0)
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to get change info for {}: {}", change_id, e);
-                                        (0, 0)
-                                    }
-                                };
-
-                            let hook_context = crate::hooks::HookContext::new(
-                                0, // changes_processed not available in this context
-                                0, // total_changes not available
-                                0, // remaining_changes not available
-                                false,
-                            )
-                            .with_change(change_id, completed_tasks, total_tasks)
-                            .with_apply_count(0);
-
-                            if let Err(e) = hooks
-                                .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
-                                .await
-                            {
-                                warn!("on_merged hook failed for {}: {}", change_id, e);
-                            }
-                        }
-                    }
-
-                    // Send ResolveCompleted for each change_id if there were conflicts resolved
-                    if attempt > 1 {
-                        for change_id in change_ids {
-                            send_event(
-                                &self.event_tx,
-                                ParallelEvent::ResolveCompleted {
-                                    change_id: change_id.to_string(),
-                                    worktree_change_ids: None,
-                                },
-                            )
-                            .await;
-                        }
-                    }
-
+                    // Note: on_merged hook is executed by the caller of attempt_merge()
+                    // which has better context (workspace paths, etc.)
                     return Ok(());
                 }
                 Err(VcsError::Conflict { details, .. }) => {

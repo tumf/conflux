@@ -534,6 +534,15 @@ impl AppState {
             return None;
         }
 
+        // Cannot toggle selection for changes in ResolveWait status
+        if matches!(change.queue_status, QueueStatus::ResolveWait) {
+            self.warning_message = Some(format!(
+                "Cannot modify change '{}' in resolve wait status",
+                change.id
+            ));
+            return None;
+        }
+
         match self.mode {
             AppMode::Select => {
                 change.selected = !change.selected;
@@ -685,13 +694,13 @@ impl AppState {
             change.id, change.queue_status, change.is_approved, self.mode
         );
 
-        // Block approval toggle for processing changes
+        // Block approval toggle for processing changes and resolve wait
         if matches!(
             change.queue_status,
-            QueueStatus::Applying | QueueStatus::Resolving
+            QueueStatus::Applying | QueueStatus::Resolving | QueueStatus::ResolveWait
         ) {
             self.warning_message = Some("Cannot change approval for processing change".to_string());
-            debug!("toggle_approval: blocked by Processing/Resolving status");
+            debug!("toggle_approval: blocked by Processing/Resolving/ResolveWait status");
             return None;
         }
 
@@ -2542,5 +2551,89 @@ mod tests {
 
         // Should return MergeWorktreeBranch command
         assert!(matches!(cmd, Some(TuiCommand::MergeWorktreeBranch { .. })));
+    }
+
+    // === Tests for ResolveWait status ===
+
+    #[test]
+    fn test_toggle_selection_blocks_resolve_wait() {
+        // ResolveWait status should block Space key (toggle_selection)
+        let changes = vec![create_approved_change("resolve-wait-change", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set change to ResolveWait status
+        app.changes[0].queue_status = QueueStatus::ResolveWait;
+
+        // Try to toggle selection
+        let cmd = app.toggle_selection();
+
+        // Should be blocked
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app
+            .warning_message
+            .as_ref()
+            .unwrap()
+            .contains("resolve wait"));
+        // Status should remain unchanged
+        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+    }
+
+    #[test]
+    fn test_toggle_approval_blocks_resolve_wait() {
+        // ResolveWait status should block @ key (toggle_approval)
+        let changes = vec![create_approved_change("resolve-wait-change", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set change to ResolveWait status
+        app.changes[0].queue_status = QueueStatus::ResolveWait;
+
+        // Try to toggle approval
+        let cmd = app.toggle_approval();
+
+        // Should be blocked
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app
+            .warning_message
+            .as_ref()
+            .unwrap()
+            .contains("Cannot change approval"));
+        // Approval status should remain unchanged
+        assert!(app.changes[0].is_approved);
+    }
+
+    #[test]
+    fn test_resolve_wait_preserved_during_auto_refresh() {
+        let changes = vec![create_approved_change("resolve-wait-change", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set change to ResolveWait status
+        app.changes[0].queue_status = QueueStatus::ResolveWait;
+
+        // Simulate auto-refresh with updated progress
+        let fetched_changes = vec![create_approved_change("resolve-wait-change", 5, 5)];
+        app.update_changes(fetched_changes);
+
+        // ResolveWait status should be preserved
+        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+    }
+
+    #[test]
+    fn test_resolve_wait_retained_during_cleanup() {
+        // ResolveWait changes should be retained even if they no longer exist in the base tree
+        let changes = vec![create_approved_change("resolve-wait-change", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set change to ResolveWait status
+        app.changes[0].queue_status = QueueStatus::ResolveWait;
+
+        // Simulate refresh with empty change list (archived externally)
+        let empty_changes = vec![];
+        app.update_changes(empty_changes);
+
+        // ResolveWait change should still be retained
+        assert_eq!(app.changes.len(), 1);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
     }
 }
