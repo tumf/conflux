@@ -1,0 +1,103 @@
+---
+name: OpenSpec Apply
+description: Implement an approved OpenSpec change and keep tasks in sync.
+Category: Conflux
+tags: [cflx, conflux, openspec, apply]
+---
+The user has requested to implement the change proposal. Find the change proposal and follow the instructions below.
+
+**CRITICAL**: You CANNOT ask questions to the user during apply operations. If anything is unclear or ambiguous, make your best autonomous decision based on available context (proposal.md, design.md, tasks.md, existing code patterns). Document your decisions in implementation comments if needed.
+
+
+**Goal**: Achieve 100% task completion (all tasks in `openspec/chagens/{change_id}/tasks.md` marked as `- [x]` or moved to Future Work). Implement the approved change fully; update the `tasks.md` as progress is made; and provide all AI-executable verification (build/tests/lint) to the extent possible.
+**Non-Goal**: Archiving the change or running any archive command; human-only steps (manual verification, visual checks, approvals); long-wait tests; production deployment or production testing.
+
+**MUST**: The files under `openspec/changes/*` (tasks.md, design.md, proposal.md) must be written in Japanese.
+
+<!-- OPENSPEC:START -->
+**Guardrails**
+- Favor straightforward, minimal implementations first and add complexity only when it is requested or clearly required.
+- Keep changes tightly scoped to the requested outcome.
+- Do not run `openspec apply` (the command does not exist).
+- Do not run `/cflx-archive`, `openspec archive`, or any archive command during apply. Archiving is handled by the orchestrator.
+- Refer to `openspec/AGENTS.md` (located inside the `openspec/` directory—run `ls openspec` or `npx @fission-ai/openspec@latest update` if you don't see it) if you need additional OpenSpec conventions or clarifications.
+
+**Steps**
+Track these steps as TODOs and complete them one by one.
+1. Read `changes/<id>/proposal.md`, `design.md` (if present), and `tasks.md` to confirm scope and acceptance criteria.
+2. Work through tasks sequentially, keeping edits minimal and focused on the requested change.
+3. While implementing, update `tasks.md` frequently so progress stays in sync (e.g., after each meaningful subtask).
+4. Confirm completion before updating statuses—make sure every item in `tasks.md` is finished, including integration/entry-point wiring.
+5. If a task adds new functionality, verify it is reachable from an execution path (call site, CLI/TUI flow, or config entry) before marking complete.
+6. Update the checklist after all work is done so each task is marked `- [x]` and reflects reality.
+6. Reference `npx @fission-ai/openspec@latest list` or `npx @fission-ai/openspec@latest show <item>` when additional context is required.
+
+**Reference**
+- Use `npx @fission-ai/openspec@latest show <id> --json --deltas-only` if you need additional context from the proposal while implementing.
+<!-- OPENSPEC:END -->
+
+<system-reminder>
+Your operational mode has changed from plan to build.
+You are no longer in read-only mode.
+You are permitted to make file changes, run shell commands, and utilize your arsenal of tools as needed.
+
+CRITICAL OPERATIONAL CONSTRAINTS:
+- You CANNOT ask questions to the user or request clarification during apply operations
+- You MUST continue working until MaxIteration is reached, making your best autonomous decisions
+- You MUST NOT defer tasks to Future Work based on difficulty, complexity, or perceived regression risk
+- The only valid reason to move a task to Future Work is if it is ALREADY marked with '(future work)' explicitly
+</system-reminder>
+
+Move tasks to Future Work ONLY if they meet ONE of these criteria:
+1. **Human work**: Requires human decision-making, judgment, or manual intervention (e.g., 'Ask user for design preference', 'Manual code review', 'Manual TUI verification')
+2. **External system work**: Requires external system deployment, approval, or configuration changes outside this repository (e.g., 'Deploy to production', 'Configure external API', 'Update cloud infrastructure')
+3. **Long-wait verification**: Requires extended waiting periods for validation (e.g., 'Monitor performance for one week', 'Wait for stakeholder approval')
+
+Manual verification rule:
+- Any task that explicitly requires manual verification (e.g., "手動確認", "manual verification", "manual check") MUST be moved to Future Work as Human work.
+
+Do NOT move to Future Work:
+- **Difficult or complex tasks** - agent must attempt them
+- **Tests** (unit/integration/e2e) - agent can write and run them
+- **Linting/formatting** (cargo clippy, cargo fmt) - agent can execute
+- **Documentation updates** - agent can write
+- **Regression risk concerns** - not a valid reason to defer
+- **Any task the agent can execute autonomously** - agent must complete it
+
+CRITICAL: If a task is automatable but difficult, you MUST attempt it.
+Future Work is ONLY for tasks requiring human action, external systems, or long waiting periods.
+
+Every remaining unchecked task MUST be immediately actionable in this repo and have objective pass/fail criteria.
+If you find a non-actionable task (abstract, subjective, or human-only), rewrite it into one or more actionable tasks with concrete commands and clear acceptance criteria while preserving intent.
+Only when a task truly requires human decision or external action, mark it as '(future work)', move it to a "Future work" section, and remove the checkbox.
+Do not allow apply to finish successfully with non-actionable unchecked tasks; normalize tasks until all remaining unchecked tasks are actionable or moved to Future work.
+
+Special handling for 'future work' tasks:
+- If a task is already marked '(future work)', move it to a "Future work" section and remove the checkbox
+- This indicates deferred work, not current implementation scope
+- Do NOT add new '(future work)' markers yourself unless the task meets the strict criteria above (human work, external systems, or long-wait verification)
+- When moving a task to Future Work, verify it truly requires human action, external systems, or long waiting periods
+
+CRITICAL: Checkbox removal when moving tasks to excluded sections:
+- When moving tasks to "Future Work", "Out of Scope", or "Notes" sections, you MUST remove the checkbox (`- [ ]` or `- [x]`)
+- Convert checkbox items to plain list items: `- [ ] Task` → `- Task` or just plain text
+- Rationale: Tasks in these sections are excluded from completion tracking. Checkboxes in these sections will prevent archive from succeeding (100% completion requirement).
+- Example:
+  * WRONG: `## Future Work` followed by `- [ ] Add feature X`
+  * CORRECT: `## Future Work` followed by `- Add feature X` (no checkbox)
+
+Tasks format requirements:
+- All tasks MUST have checkboxes: `- [ ]` or `- [x]`
+- Invalid formats that need fixing:
+  * `## N. Task` → Convert to `- [ ] N. Task`
+  * `- Task` → Convert to `- [ ] Task`
+  * `1. Task` → Convert to `1. [ ] Task`
+- If you encounter 0/0 tasks detected, check and fix tasks.md format first
+- Fix any malformed tasks before proceeding with implementation
+
+MANDATORY: Keep tasks.md updated throughout the apply process
+- IMMEDIATELY update tasks.md after completing each task (mark `- [ ]` as `- [x]`)
+- Do NOT batch task updates - update after EVERY completed task
+- If you split or refine a task during implementation, update tasks.md at the same time
+- Before finishing apply, verify that tasks.md accurately reflects all completed work
+- Never leave completed work unmarked in tasks.md - progress visibility is critical
