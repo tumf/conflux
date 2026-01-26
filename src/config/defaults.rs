@@ -56,6 +56,15 @@ Do NOT review or report on other changes in openspec/changes/.
 
 Review the implementation to verify it meets the specification requirements.
 
+External dependency policy (mock-first):
+- Any requirement that AI cannot resolve or verify autonomously is an external dependency
+- External dependencies that CAN be mocked/stubbed/fixtured MUST be mocked to enable verification without external credentials
+- Only truly non-mockable external dependencies (requiring real external systems, human decisions, or long-wait verification) may be moved to Out of Scope / Future Work (without checkboxes)
+- Missing secrets (API keys, credentials) MUST NOT be treated as a reason to output CONTINUE
+- If verification requires secrets and no mock exists, output FAIL with specific follow-up tasks:
+  * Implement mock/stub/fixture for the external dependency, OR
+  * Move to Out of Scope as non-mockable (remove checkbox)
+
 Diff-based review strategy (when <acceptance_diff_context> is provided):
 - The diff context shows files changed since the base branch (1st acceptance) or since the last acceptance check (2nd+ acceptances).
 - **Prioritize reviewing the changed files listed in the diff context** - these are the most relevant files for this verification.
@@ -530,6 +539,51 @@ mod tests {
             path_str.contains("Conflux") && path_str.contains("worktrees"),
             "Expected path to contain 'Conflux' and 'worktrees', got {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn test_acceptance_system_prompt_contains_mock_first_policy() {
+        // Test that ACCEPTANCE_SYSTEM_PROMPT contains key phrases for mock-first external dependency policy
+        assert!(
+            ACCEPTANCE_SYSTEM_PROMPT.contains("External dependency policy"),
+            "ACCEPTANCE_SYSTEM_PROMPT should contain 'External dependency policy'"
+        );
+        assert!(
+            ACCEPTANCE_SYSTEM_PROMPT.contains("mock-first"),
+            "ACCEPTANCE_SYSTEM_PROMPT should contain 'mock-first'"
+        );
+    }
+
+    #[test]
+    fn test_acceptance_system_prompt_contains_missing_secret_fail_requirement() {
+        // Test that missing secrets should result in FAIL, not CONTINUE
+        assert!(
+            ACCEPTANCE_SYSTEM_PROMPT.contains("Missing secrets") && ACCEPTANCE_SYSTEM_PROMPT.contains("MUST NOT") && ACCEPTANCE_SYSTEM_PROMPT.contains("CONTINUE"),
+            "ACCEPTANCE_SYSTEM_PROMPT should specify that missing secrets MUST NOT be treated as a reason to CONTINUE"
+        );
+        assert!(
+            ACCEPTANCE_SYSTEM_PROMPT.contains("output FAIL"),
+            "ACCEPTANCE_SYSTEM_PROMPT should specify to output FAIL when secrets are missing"
+        );
+    }
+
+    #[test]
+    fn test_acceptance_system_prompt_contains_mockable_dependency_requirement() {
+        // Test that mockable dependencies must be mocked
+        assert!(
+            ACCEPTANCE_SYSTEM_PROMPT.contains("CAN be mocked")
+                && ACCEPTANCE_SYSTEM_PROMPT.contains("MUST be mocked"),
+            "ACCEPTANCE_SYSTEM_PROMPT should specify that mockable dependencies MUST be mocked"
+        );
+    }
+
+    #[test]
+    fn test_acceptance_system_prompt_contains_non_mockable_out_of_scope() {
+        // Test that only non-mockable dependencies can be moved to Out of Scope
+        assert!(
+            ACCEPTANCE_SYSTEM_PROMPT.contains("non-mockable") && ACCEPTANCE_SYSTEM_PROMPT.contains("Out of Scope"),
+            "ACCEPTANCE_SYSTEM_PROMPT should specify handling of non-mockable dependencies as Out of Scope"
         );
     }
 }
