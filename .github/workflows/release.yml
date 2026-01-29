@@ -17,11 +17,11 @@ env:
   # Target platforms for cargo-dist
   PLAN: >-
     [
-      {"os": "macos-14", "target": "aarch64-apple-darwin", "install-dist": "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh"},
-      {"os": "macos-13", "target": "x86_64-apple-darwin", "install-dist": "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh"},
-      {"os": "ubuntu-22.04", "target": "x86_64-unknown-linux-gnu", "install-dist": "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh"},
-      {"os": "ubuntu-22.04", "target": "aarch64-unknown-linux-gnu", "install-dist": "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh"},
-      {"os": "windows-2022", "target": "x86_64-pc-windows-msvc", "install-dist": "powershell -c \"irm https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.ps1 | iex\""}
+      {"os": "macos-14", "target": "aarch64-apple-darwin"},
+      {"os": "macos-latest", "target": "x86_64-apple-darwin"},
+      {"os": "ubuntu-22.04", "target": "x86_64-unknown-linux-gnu"},
+      {"os": "ubuntu-22.04", "target": "aarch64-unknown-linux-gnu"},
+      {"os": "windows-2022", "target": "x86_64-pc-windows-msvc"}
     ]
 
 jobs:
@@ -81,7 +81,7 @@ jobs:
           submodules: recursive
 
       - name: Install Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
