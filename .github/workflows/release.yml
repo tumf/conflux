@@ -47,7 +47,13 @@ jobs:
             TAG="dev"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "matrix=$PLAN" >> "$GITHUB_OUTPUT"
+
+          # Write matrix as multiline output
+          {
+            echo "matrix<<EOF"
+            echo "$PLAN"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
           # Validate version format for release tags
           if [[ "$TAG" != "dev" ]]; then
@@ -96,19 +102,19 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/openspec dist/
+          cp target/${{ matrix.target }}/release/cflx dist/
           cd dist
-          tar -czvf openspec-${{ needs.plan.outputs.tag }}-${{ matrix.target }}.tar.gz openspec
-          rm openspec
+          tar -czvf cflx-${{ needs.plan.outputs.tag }}-${{ matrix.target }}.tar.gz cflx
+          rm cflx
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
-          Copy-Item target/${{ matrix.target }}/release/openspec.exe dist/
-          Compress-Archive -Path dist/openspec.exe -DestinationPath dist/openspec-${{ needs.plan.outputs.tag }}-${{ matrix.target }}.zip
-          Remove-Item dist/openspec.exe
+          Copy-Item target/${{ matrix.target }}/release/cflx.exe dist/
+          Compress-Archive -Path dist/cflx.exe -DestinationPath dist/cflx-${{ needs.plan.outputs.tag }}-${{ matrix.target }}.zip
+          Remove-Item dist/cflx.exe
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -141,11 +147,11 @@ jobs:
         run: |
           cat > artifacts/install.sh << 'INSTALLER'
           #!/bin/sh
-          # openspec installer script
+          # cflx (Conflux) installer script
           set -e
 
-          REPO="tumf/conflux"
-          BINARY="openspec"
+          REPO="tumf/openspec-orchestrator"
+          BINARY="cflx"
 
           # Detect OS and architecture
           OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -187,11 +193,11 @@ jobs:
       - name: Generate PowerShell installer
         run: |
           cat > artifacts/install.ps1 << 'INSTALLER'
-          # openspec installer script for Windows
+          # cflx (Conflux) installer script for Windows
           $ErrorActionPreference = "Stop"
 
-          $Repo = "tumf/conflux"
-          $Binary = "openspec"
+          $Repo = "tumf/openspec-orchestrator"
+          $Binary = "cflx"
           $Target = "x86_64-pc-windows-msvc"
 
           if ($env:VERSION) {
@@ -206,7 +212,7 @@ jobs:
             $DownloadUrl = "https://github.com/$Repo/releases/download/$Version/$Binary-$Target.zip"
           }
 
-          $TempDir = Join-Path $env:TEMP "openspec-install"
+          $TempDir = Join-Path $env:TEMP "cflx-install"
           $ZipPath = Join-Path $TempDir "$Binary.zip"
 
           New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
@@ -281,47 +287,47 @@ jobs:
           TAG="${{ needs.plan.outputs.tag }}"
           VERSION="${TAG#v}"
 
-          # Get SHA256 for macOS ARM64
-          DARWIN_ARM64_SHA=$(sha256sum artifacts/openspec-${TAG}-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
-          DARWIN_X64_SHA=$(sha256sum artifacts/openspec-${TAG}-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
-          LINUX_ARM64_SHA=$(sha256sum artifacts/openspec-${TAG}-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
-          LINUX_X64_SHA=$(sha256sum artifacts/openspec-${TAG}-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
+          # Get SHA256 for each platform
+          DARWIN_ARM64_SHA=$(sha256sum artifacts/cflx-${TAG}-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
+          DARWIN_X64_SHA=$(sha256sum artifacts/cflx-${TAG}-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
+          LINUX_ARM64_SHA=$(sha256sum artifacts/cflx-${TAG}-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
+          LINUX_X64_SHA=$(sha256sum artifacts/cflx-${TAG}-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
 
-          cat > openspec.rb << FORMULA
-          class Openspec < Formula
-            desc "OpenSpec orchestrator for AI-assisted development workflows"
-            homepage "https://github.com/tumf/conflux"
+          cat > conflux.rb << FORMULA
+          class Conflux < Formula
+            desc "Conflux - OpenSpec orchestrator for AI-assisted development workflows"
+            homepage "https://github.com/tumf/openspec-orchestrator"
             version "${VERSION}"
             license "MIT"
 
             on_macos do
               on_arm do
-                url "https://github.com/tumf/conflux/releases/download/${TAG}/openspec-${TAG}-aarch64-apple-darwin.tar.gz"
+                url "https://github.com/tumf/openspec-orchestrator/releases/download/${TAG}/cflx-${TAG}-aarch64-apple-darwin.tar.gz"
                 sha256 "${DARWIN_ARM64_SHA}"
               end
               on_intel do
-                url "https://github.com/tumf/conflux/releases/download/${TAG}/openspec-${TAG}-x86_64-apple-darwin.tar.gz"
+                url "https://github.com/tumf/openspec-orchestrator/releases/download/${TAG}/cflx-${TAG}-x86_64-apple-darwin.tar.gz"
                 sha256 "${DARWIN_X64_SHA}"
               end
             end
 
             on_linux do
               on_arm do
-                url "https://github.com/tumf/conflux/releases/download/${TAG}/openspec-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/tumf/openspec-orchestrator/releases/download/${TAG}/cflx-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
                 sha256 "${LINUX_ARM64_SHA}"
               end
               on_intel do
-                url "https://github.com/tumf/conflux/releases/download/${TAG}/openspec-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/tumf/openspec-orchestrator/releases/download/${TAG}/cflx-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
                 sha256 "${LINUX_X64_SHA}"
               end
             end
 
             def install
-              bin.install "openspec"
+              bin.install "cflx"
             end
 
             test do
-              system "#{bin}/openspec", "--version"
+              system "#{bin}/cflx", "--version"
             end
           end
           FORMULA
@@ -337,10 +343,10 @@ jobs:
 
           git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/tumf/homebrew-tap.git tap
           mkdir -p tap/Formula
-          cp openspec.rb tap/Formula/
+          cp conflux.rb tap/Formula/
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/openspec.rb
-          git commit -m "Update openspec to ${{ needs.plan.outputs.tag }}" || exit 0
+          git add Formula/conflux.rb
+          git commit -m "Update conflux to ${{ needs.plan.outputs.tag }}" || exit 0
           git push
