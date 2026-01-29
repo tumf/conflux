@@ -25,6 +25,14 @@ struct JobObjectGuard {
     handle: windows::Win32::Foundation::HANDLE,
 }
 
+// SAFETY: Windows HANDLE is safe to send between threads
+// The HANDLE represents a kernel object that can be used from any thread
+#[cfg(windows)]
+unsafe impl Send for JobObjectGuard {}
+
+#[cfg(windows)]
+unsafe impl Sync for JobObjectGuard {}
+
 #[cfg(windows)]
 impl Drop for JobObjectGuard {
     fn drop(&mut self) {
