@@ -263,6 +263,8 @@ archive 検証の失敗理由は、次回の archive 試行のプロンプトに
 
 `archive_change()` および `archive_change_streaming()` は、archive コマンドの実行結果を記録し、再試行時には前回の履歴をプロンプトに含めなければならない（MUST）。
 
+archive ループの実装は、フック実行・コマンド実行・検証・履歴記録をヘルパー関数に分割してもよい（MAY）。ただし、履歴の記録と再試行時の伝播は必ず維持しなければならない（MUST）。
+
 #### Scenario: Archive 実行後の履歴記録
 
 - **GIVEN** システムが change の archive を実行する
@@ -275,7 +277,7 @@ archive 検証の失敗理由は、次回の archive 試行のプロンプトに
 - **GIVEN** 1回目の archive が検証失敗した
 - **WHEN** システムが同じ change の archive を再試行する
 - **THEN** `AgentRunner::run_archive_streaming()` に渡されるプロンプトに前回の履歴が含まれる
-- **AND** 履歴には検証失敗の理由（"Change still exists at..."）が含まれる
+- **AND** 履歴には検証失敗の理由（"Change still exists at...") が含まれる
 
 #### Scenario: Archive 成功時の履歴クリア
 
@@ -317,3 +319,4 @@ archive 検証の失敗理由は、次回の archive 試行のプロンプトに
 #### Scenario: Not Found 応答の形式を維持する
 - **WHEN** Web API が change を見つけられない
 - **THEN** 共通ヘルパーが既存と同等の StatusCode とエラーメッセージを返す
+
