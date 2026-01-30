@@ -389,6 +389,345 @@ impl ParallelExecutor {
             .map_err(Into::into)
     }
 
+    /// Calculate available execution slots accounting for in-flight changes and resolves.
+    ///
+    /// # Arguments
+    /// * `max_parallelism` - Maximum number of concurrent slots
+    /// * `in_flight` - Set of currently executing changes
+    ///
+    /// # Returns
+    /// Number of available slots for new dispatches
+    fn calculate_available_slots(
+        &self,
+        max_parallelism: usize,
+        in_flight: &HashSet<String>,
+    ) -> usize {
+        let manual_resolve_count = self
+            .manual_resolve_count
+            .as_ref()
+            .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0);
+        let auto_resolve_count = self
+            .auto_resolve_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        max_parallelism
+            .saturating_sub(in_flight.len())
+            .saturating_sub(manual_resolve_count)
+            .saturating_sub(auto_resolve_count)
+    }
+
+    /// Filter queued changes to remove those with failed dependencies.
+    ///
+    /// # Arguments
+    /// * `queued` - List of queued changes to filter
+    ///
+    /// # Returns
+    /// Tuple of (executable_changes, skipped_changes_with_reasons)
+    fn filter_executable_changes(
+        &self,
+        queued: &[crate::openspec::Change],
+    ) -> (Vec<crate::openspec::Change>, Vec<(String, String)>) {
+        let mut executable_changes: Vec<crate::openspec::Change> = Vec::new();
+        let mut skipped_changes: Vec<(String, String)> = Vec::new();
+
+        for change in queued {
+            if let Some(failed_dep) = self.failed_tracker.should_skip(&change.id) {
+                let reason = format!("Dependency '{}' failed", failed_dep);
+                warn!(
+                    "Skipping change-{} because dependency change-{} failed",
+                    change.id, failed_dep
+                );
+                skipped_changes.push((change.id.clone(), reason));
+            } else {
+                executable_changes.push(change.clone());
+            }
+        }
+
+        (executable_changes, skipped_changes)
+    }
+
+    /// Select changes to dispatch based on order, available slots, and dependency resolution.
+    ///
+    /// # Arguments
+    /// * `analysis_result` - Result from dependency analysis
+    /// * `available_slots` - Number of available execution slots
+    ///
+    /// # Returns
+    /// Vector of selected change IDs ready for dispatch
+    async fn select_changes_for_dispatch(
+        &mut self,
+        analysis_result: &crate::analyzer::AnalysisResult,
+        available_slots: usize,
+    ) -> Vec<String> {
+        let mut selected_changes: Vec<String> = Vec::new();
+
+        for change_id in &analysis_result.order {
+            if selected_changes.len() >= available_slots {
+                break;
+            }
+
+            // Check if change has unresolved dependencies
+            if let Some(deps) = analysis_result.dependencies.get(change_id) {
+                let mut unresolved_deps = Vec::new();
+                for dep_id in deps {
+                    if !self.is_dependency_resolved(dep_id).await {
+                        unresolved_deps.push(dep_id.clone());
+                    }
+                }
+
+                if !unresolved_deps.is_empty() {
+                    info!(
+                        "Change '{}' blocked: waiting for dependencies {:?}",
+                        change_id, unresolved_deps
+                    );
+                    // Track this change as blocked
+                    self.previously_blocked_changes.insert(change_id.clone());
+                    // Send DependencyBlocked event
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::DependencyBlocked {
+                            change_id: change_id.clone(),
+                            dependency_ids: unresolved_deps,
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+            }
+
+            // Check if this change was previously blocked and is now resolved
+            if self.previously_blocked_changes.contains(change_id) {
+                info!("Change '{}' dependencies resolved, now ready", change_id);
+                self.previously_blocked_changes.remove(change_id);
+                // Send DependencyResolved event
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::DependencyResolved {
+                        change_id: change_id.clone(),
+                    },
+                )
+                .await;
+            }
+
+            selected_changes.push(change_id.clone());
+        }
+
+        selected_changes
+    }
+
+    /// Handle completion of a workspace task (apply+archive).
+    ///
+    /// This processes success/failure, attempts merge if archived, and triggers cleanup.
+    ///
+    /// # Arguments
+    /// * `workspace_result` - Result from completed workspace task
+    /// * `max_parallelism` - Maximum parallelism for logging
+    /// * `in_flight` - Set to update (remove completed change)
+    /// * `cleanup_guard` - Guard for workspace cleanup tracking
+    async fn handle_workspace_completion(
+        &mut self,
+        workspace_result: WorkspaceResult,
+        max_parallelism: usize,
+        in_flight: &mut HashSet<String>,
+        cleanup_guard: &mut WorkspaceCleanupGuard,
+    ) {
+        // Remove from in-flight
+        in_flight.remove(&workspace_result.change_id);
+
+        info!(
+            "Task completed: change='{}', in_flight={}, available_slots={}, error={:?}",
+            workspace_result.change_id,
+            in_flight.len(),
+            max_parallelism.saturating_sub(in_flight.len()),
+            workspace_result.error
+        );
+
+        // Handle result (success or failure)
+        if let Some(error) = &workspace_result.error {
+            error!("Change '{}' failed: {}", workspace_result.change_id, error);
+            self.failed_tracker.mark_failed(&workspace_result.change_id);
+            send_event(
+                &self.event_tx,
+                ParallelEvent::ProcessingError {
+                    id: workspace_result.change_id.clone(),
+                    error: error.clone(),
+                },
+            )
+            .await;
+        } else {
+            info!(
+                "Change '{}' completed successfully",
+                workspace_result.change_id
+            );
+
+            // Attempt merge if archive completed successfully
+            if workspace_result.final_revision.is_some() {
+                self.handle_merge_and_cleanup(workspace_result, cleanup_guard)
+                    .await;
+            }
+        }
+    }
+
+    /// Handle merge attempt and cleanup after successful archive.
+    ///
+    /// # Arguments
+    /// * `workspace_result` - Result from archived workspace
+    /// * `cleanup_guard` - Guard for workspace cleanup tracking
+    async fn handle_merge_and_cleanup(
+        &mut self,
+        workspace_result: WorkspaceResult,
+        cleanup_guard: &mut WorkspaceCleanupGuard,
+    ) {
+        let revisions = vec![workspace_result.workspace_name.clone()];
+        let change_ids = vec![workspace_result.change_id.clone()];
+
+        // Find workspace path for archive verification
+        let workspace_path = self
+            .workspace_manager
+            .workspaces()
+            .iter()
+            .find(|workspace| workspace.name == workspace_result.workspace_name)
+            .map(|workspace| workspace.path.clone());
+
+        if let Some(path) = workspace_path {
+            let archive_paths = vec![path];
+
+            info!(
+                "Merging archived {} (workspace: {})",
+                workspace_result.change_id, workspace_result.workspace_name
+            );
+
+            match self
+                .attempt_merge(&revisions, &change_ids, &archive_paths)
+                .await
+            {
+                Ok(MergeAttempt::Merged) => {
+                    // Run on_merged hook after merge completion
+                    if let Some(ref hooks) = self.hooks {
+                        // Fetch actual task counts from change data
+                        let (completed_tasks, total_tasks) =
+                            match crate::openspec::list_changes_native() {
+                                Ok(changes) => changes
+                                    .iter()
+                                    .find(|c| c.id == workspace_result.change_id)
+                                    .map(|c| (c.completed_tasks, c.total_tasks))
+                                    .unwrap_or((0, 0)),
+                                Err(e) => {
+                                    warn!("Failed to fetch task counts for on_merged hook: {}", e);
+                                    (0, 0)
+                                }
+                            };
+
+                        // Find workspace path
+                        let workspace_path = self
+                            .workspace_manager
+                            .workspaces()
+                            .iter()
+                            .find(|w| w.name == workspace_result.workspace_name)
+                            .map(|w| w.path.to_string_lossy().to_string())
+                            .unwrap_or_default();
+
+                        let hook_context = crate::hooks::HookContext::new(
+                            0, // changes_processed not easily available here
+                            0, // total_changes not easily available here
+                            0, // remaining_changes not easily available here
+                            false,
+                        )
+                        .with_change(&workspace_result.change_id, completed_tasks, total_tasks)
+                        .with_apply_count(0)
+                        .with_parallel_context(&workspace_path, None);
+
+                        if let Err(e) = hooks
+                            .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
+                            .await
+                        {
+                            warn!(
+                                "on_merged hook failed for {}: {}",
+                                workspace_result.change_id, e
+                            );
+                        }
+                    }
+
+                    // Merge succeeded, cleanup workspace
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::CleanupStarted {
+                            workspace: workspace_result.workspace_name.clone(),
+                        },
+                    )
+                    .await;
+
+                    if let Err(err) = self
+                        .workspace_manager
+                        .cleanup_workspace(&workspace_result.workspace_name)
+                        .await
+                    {
+                        warn!(
+                            "Failed to cleanup worktree '{}' after merge: {}",
+                            workspace_result.workspace_name, err
+                        );
+                    } else {
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::CleanupCompleted {
+                                workspace: workspace_result.workspace_name.clone(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+                Ok(MergeAttempt::Deferred(reason)) => {
+                    // Merge deferred, preserve workspace and transition to MergeWait
+                    self.merge_deferred_changes
+                        .insert(workspace_result.change_id.clone());
+
+                    // Update workspace status to MergeWait so it's no longer counted as active
+                    self.workspace_manager.update_workspace_status(
+                        &workspace_result.workspace_name,
+                        WorkspaceStatus::MergeWait,
+                    );
+
+                    // Preserve this workspace from cleanup
+                    cleanup_guard.preserve(&workspace_result.workspace_name);
+
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::MergeDeferred {
+                            change_id: workspace_result.change_id.clone(),
+                            reason,
+                        },
+                    )
+                    .await;
+
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::WorkspaceStatusUpdated {
+                            workspace_name: workspace_result.workspace_name.clone(),
+                            status: WorkspaceStatus::MergeWait,
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    let error_msg = format!(
+                        "Failed to merge archived {} (workspace: {}): {}",
+                        workspace_result.change_id, workspace_result.workspace_name, e
+                    );
+                    error!("{}", error_msg);
+                    send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
+                    // Preserve workspace on merge error to allow debugging
+                    cleanup_guard.preserve(&workspace_result.workspace_name);
+                }
+            }
+        } else {
+            warn!(
+                "Workspace '{}' not found after archive completion, skipping merge",
+                workspace_result.workspace_name
+            );
+        }
+    }
+
     /// Execute changes with order-based dependency analysis and concurrent re-analysis.
     ///
     /// This method uses a `tokio::select!` based scheduler loop that:
@@ -573,19 +912,7 @@ impl ParallelExecutor {
 
             if self.needs_reanalysis && !queued.is_empty() {
                 // Gate re-analysis by available execution slots
-                // Account for manual and automatic resolves consuming slots
-                let manual_resolve_count = self
-                    .manual_resolve_count
-                    .as_ref()
-                    .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
-                    .unwrap_or(0);
-                let auto_resolve_count = self
-                    .auto_resolve_count
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let available_slots = max_parallelism
-                    .saturating_sub(in_flight.len())
-                    .saturating_sub(manual_resolve_count)
-                    .saturating_sub(auto_resolve_count);
+                let available_slots = self.calculate_available_slots(max_parallelism, &in_flight);
 
                 if available_slots == 0 {
                     // No available slots, defer re-analysis until slots become available
@@ -608,21 +935,8 @@ impl ParallelExecutor {
 
                     if should_analyze {
                         // Filter out changes that depend on failed changes
-                        let mut executable_changes: Vec<crate::openspec::Change> = Vec::new();
-                        let mut skipped_changes: Vec<(String, String)> = Vec::new();
-
-                        for change in &queued {
-                            if let Some(failed_dep) = self.failed_tracker.should_skip(&change.id) {
-                                let reason = format!("Dependency '{}' failed", failed_dep);
-                                warn!(
-                                    "Skipping change-{} because dependency change-{} failed",
-                                    change.id, failed_dep
-                                );
-                                skipped_changes.push((change.id.clone(), reason));
-                            } else {
-                                executable_changes.push(change.clone());
-                            }
-                        }
+                        let (executable_changes, skipped_changes) =
+                            self.filter_executable_changes(&queued);
 
                         // Emit skip events
                         for (change_id, reason) in skipped_changes {
@@ -680,19 +994,8 @@ impl ParallelExecutor {
                         self.change_dependencies = analysis_result.dependencies.clone();
 
                         // Recalculate available slots (may have changed during analysis if tasks completed)
-                        // Account for manual and auto resolves consuming slots (TUI mode)
-                        let manual_resolve_count = self
-                            .manual_resolve_count
-                            .as_ref()
-                            .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
-                            .unwrap_or(0);
-                        let auto_resolve_count = self
-                            .auto_resolve_count
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        let available_slots = max_parallelism
-                            .saturating_sub(in_flight.len())
-                            .saturating_sub(manual_resolve_count)
-                            .saturating_sub(auto_resolve_count);
+                        let available_slots =
+                            self.calculate_available_slots(max_parallelism, &in_flight);
                         info!(
                             "Available slots after analysis: {} (max: {}, in_flight: {}, queued: {})",
                             available_slots,
@@ -702,57 +1005,9 @@ impl ParallelExecutor {
                         );
 
                         // Select changes to dispatch based on order and available slots
-                        let mut selected_changes: Vec<String> = Vec::new();
-                        for change_id in &analysis_result.order {
-                            if selected_changes.len() >= available_slots {
-                                break;
-                            }
-
-                            // Check if change has unresolved dependencies
-                            if let Some(deps) = analysis_result.dependencies.get(change_id) {
-                                let mut unresolved_deps = Vec::new();
-                                for dep_id in deps {
-                                    if !self.is_dependency_resolved(dep_id).await {
-                                        unresolved_deps.push(dep_id.clone());
-                                    }
-                                }
-
-                                if !unresolved_deps.is_empty() {
-                                    info!(
-                                        "Change '{}' blocked: waiting for dependencies {:?}",
-                                        change_id, unresolved_deps
-                                    );
-                                    // Track this change as blocked
-                                    self.previously_blocked_changes.insert(change_id.clone());
-                                    // Send DependencyBlocked event
-                                    send_event(
-                                        &self.event_tx,
-                                        ParallelEvent::DependencyBlocked {
-                                            change_id: change_id.clone(),
-                                            dependency_ids: unresolved_deps,
-                                        },
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                            }
-
-                            // Check if this change was previously blocked and is now resolved
-                            if self.previously_blocked_changes.contains(change_id) {
-                                info!("Change '{}' dependencies resolved, now ready", change_id);
-                                self.previously_blocked_changes.remove(change_id);
-                                // Send DependencyResolved event
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::DependencyResolved {
-                                        change_id: change_id.clone(),
-                                    },
-                                )
-                                .await;
-                            }
-
-                            selected_changes.push(change_id.clone());
-                        }
+                        let selected_changes = self
+                            .select_changes_for_dispatch(&analysis_result, available_slots)
+                            .await;
 
                         // Dispatch selected changes
                         if !selected_changes.is_empty() {
@@ -830,177 +1085,7 @@ impl ParallelExecutor {
                 Some(result) = join_set.join_next() => {
                     match result {
                         Ok(workspace_result) => {
-                            // Remove from in-flight
-                            in_flight.remove(&workspace_result.change_id);
-
-                            info!(
-                                "Task completed: change='{}', in_flight={}, available_slots={}, error={:?}",
-                                workspace_result.change_id,
-                                in_flight.len(),
-                                max_parallelism.saturating_sub(in_flight.len()),
-                                workspace_result.error
-                            );
-
-                            // Handle result (success or failure)
-                            if let Some(error) = &workspace_result.error {
-                                error!("Change '{}' failed: {}", workspace_result.change_id, error);
-                                self.failed_tracker.mark_failed(&workspace_result.change_id);
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::ProcessingError {
-                                        id: workspace_result.change_id.clone(),
-                                        error: error.clone(),
-                                    },
-                                )
-                                .await;
-                            } else {
-                                info!("Change '{}' completed successfully", workspace_result.change_id);
-
-                                // Attempt merge if archive completed successfully
-                                if workspace_result.final_revision.is_some() {
-                                    let revisions = vec![workspace_result.workspace_name.clone()];
-                                    let change_ids = vec![workspace_result.change_id.clone()];
-
-                                    // Find workspace path for archive verification
-                                    let workspace_path = self
-                                        .workspace_manager
-                                        .workspaces()
-                                        .iter()
-                                        .find(|workspace| workspace.name == workspace_result.workspace_name)
-                                        .map(|workspace| workspace.path.clone());
-
-                                    if let Some(path) = workspace_path {
-                                        let archive_paths = vec![path];
-
-                                        info!(
-                                            "Merging archived {} (workspace: {})",
-                                            workspace_result.change_id, workspace_result.workspace_name
-                                        );
-
-                                        match self.attempt_merge(&revisions, &change_ids, &archive_paths).await {
-                                            Ok(MergeAttempt::Merged) => {
-                                                // Run on_merged hook after merge completion
-                                                if let Some(ref hooks) = self.hooks {
-                                                    // Fetch actual task counts from change data
-                                                    let (completed_tasks, total_tasks) =
-                                                        match crate::openspec::list_changes_native() {
-                                                            Ok(changes) => changes
-                                                                .iter()
-                                                                .find(|c| c.id == workspace_result.change_id)
-                                                                .map(|c| (c.completed_tasks, c.total_tasks))
-                                                                .unwrap_or((0, 0)),
-                                                            Err(e) => {
-                                                                warn!("Failed to fetch task counts for on_merged hook: {}", e);
-                                                                (0, 0)
-                                                            }
-                                                        };
-
-                                                    // Find workspace path
-                                                    let workspace_path = self
-                                                        .workspace_manager
-                                                        .workspaces()
-                                                        .iter()
-                                                        .find(|w| w.name == workspace_result.workspace_name)
-                                                        .map(|w| w.path.to_string_lossy().to_string())
-                                                        .unwrap_or_default();
-
-                                                    let hook_context = crate::hooks::HookContext::new(
-                                                        0, // changes_processed not easily available here
-                                                        0, // total_changes not easily available here
-                                                        0, // remaining_changes not easily available here
-                                                        false,
-                                                    )
-                                                    .with_change(&workspace_result.change_id, completed_tasks, total_tasks)
-                                                    .with_apply_count(0)
-                                                    .with_parallel_context(&workspace_path, None);
-
-                                                    if let Err(e) = hooks
-                                                        .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
-                                                        .await
-                                                    {
-                                                        warn!("on_merged hook failed for {}: {}", workspace_result.change_id, e);
-                                                    }
-                                                }
-
-                                                // Merge succeeded, cleanup workspace
-                                                send_event(
-                                                    &self.event_tx,
-                                                    ParallelEvent::CleanupStarted {
-                                                        workspace: workspace_result.workspace_name.clone(),
-                                                    },
-                                                )
-                                                .await;
-
-                                                if let Err(err) = self
-                                                    .workspace_manager
-                                                    .cleanup_workspace(&workspace_result.workspace_name)
-                                                    .await
-                                                {
-                                                    warn!(
-                                                        "Failed to cleanup worktree '{}' after merge: {}",
-                                                        workspace_result.workspace_name, err
-                                                    );
-                                                } else {
-                                                    send_event(
-                                                        &self.event_tx,
-                                                        ParallelEvent::CleanupCompleted {
-                                                            workspace: workspace_result.workspace_name.clone(),
-                                                        },
-                                                    )
-                                                    .await;
-                                                }
-                                            }
-                                            Ok(MergeAttempt::Deferred(reason)) => {
-                                                // Merge deferred, preserve workspace and transition to MergeWait
-                                                self.merge_deferred_changes.insert(workspace_result.change_id.clone());
-
-                                                // Update workspace status to MergeWait so it's no longer counted as active
-                                                self.workspace_manager.update_workspace_status(
-                                                    &workspace_result.workspace_name,
-                                                    WorkspaceStatus::MergeWait,
-                                                );
-
-                                                // Preserve this workspace from cleanup
-                                                cleanup_guard.preserve(&workspace_result.workspace_name);
-
-                                                send_event(
-                                                    &self.event_tx,
-                                                    ParallelEvent::MergeDeferred {
-                                                        change_id: workspace_result.change_id.clone(),
-                                                        reason,
-                                                    },
-                                                )
-                                                .await;
-
-                                                send_event(
-                                                    &self.event_tx,
-                                                    ParallelEvent::WorkspaceStatusUpdated {
-                                                        workspace_name: workspace_result.workspace_name.clone(),
-                                                        status: WorkspaceStatus::MergeWait,
-                                                    },
-                                                )
-                                                .await;
-                                            }
-                                            Err(e) => {
-                                                let error_msg = format!(
-                                                    "Failed to merge archived {} (workspace: {}): {}",
-                                                    workspace_result.change_id, workspace_result.workspace_name, e
-                                                );
-                                                error!("{}", error_msg);
-                                                send_event(&self.event_tx, ParallelEvent::Error { message: error_msg })
-                                                    .await;
-                                                // Preserve workspace on merge error to allow debugging
-                                                cleanup_guard.preserve(&workspace_result.workspace_name);
-                                            }
-                                        }
-                                    } else {
-                                        warn!(
-                                            "Workspace '{}' not found after archive completion, skipping merge",
-                                            workspace_result.workspace_name
-                                        );
-                                    }
-                                }
-                            }
+                            self.handle_workspace_completion(workspace_result, max_parallelism, &mut in_flight, &mut cleanup_guard).await;
 
                             // Trigger re-analysis on next iteration
                             self.needs_reanalysis = true;
