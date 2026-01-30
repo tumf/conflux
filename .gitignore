@@ -3,3 +3,5 @@ error.log
 .tldr/
 .leann/
 .opencode/
+openspec/changes/*/approved
+
