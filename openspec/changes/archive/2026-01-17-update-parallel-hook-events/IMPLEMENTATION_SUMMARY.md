@@ -28,7 +28,7 @@ if let Some(hook_runner) = hooks {
             hook_type: "pre_apply".to_string(),
         }).await;
     }
-    
+
     // Execute hook
     match hook_runner.run_hook(HookType::PreApply, &hook_ctx).await {
         Ok(()) => {
@@ -89,7 +89,7 @@ This is implemented in `src/hooks.rs` lines 476-527:
 ```rust
 pub async fn run_hook(&self, hook_type: HookType, context: &HookContext) -> Result<()> {
     // ... execute hook ...
-    
+
     match self.execute_hook(...).await {
         Ok(success) => {
             if success {

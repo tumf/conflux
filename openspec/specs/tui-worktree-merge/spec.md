@@ -174,4 +174,3 @@ Merge operation SHOULD NOT crash TUI silently; errors SHALL be displayed to user
 - **THEN** TUI SHALL NOT crash silently
 - **AND** error SHALL be displayed via warning_popup or log entry
 - **AND** TUI SHALL remain operational
-

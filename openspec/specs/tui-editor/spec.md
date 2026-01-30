@@ -238,4 +238,3 @@ The TUI SHALL detect git availability at startup and cache the result.
 - **THEN** git_available flag is set to false
 - **AND** parallel mode features are hidden
 - **AND** no error is displayed (silent degradation)
-

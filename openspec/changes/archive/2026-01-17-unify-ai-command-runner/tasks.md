@@ -11,7 +11,7 @@
 
 **Deferred** (infrastructure ready, integration pending):
 - Integration of `execute_apply_in_workspace()` with shared runner
-- Integration of `execute_archive_in_workspace()` with shared runner  
+- Integration of `execute_archive_in_workspace()` with shared runner
 - Integration of resolve functions with shared runner
 
 **Rationale**: The core infrastructure for shared stagger state is complete and tested. The actual integration into parallel apply/archive/resolve requires careful testing and validation to ensure no regression in the complex parallel execution logic. This can be done as a follow-up change after thorough review.

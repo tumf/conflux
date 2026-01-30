@@ -60,7 +60,7 @@ loop {
             queue_changed = true;
         }
     }
-    
+
     // ... existing group execution logic
 }
 ```

@@ -22,7 +22,7 @@ The key event handling and TuiCommand processing logic was extracted from `runne
 ### key_handlers.rs (532 lines)
 Handles all keyboard input:
 - `handle_tab_key()`: Switch between Changes/Worktrees views
-- `handle_cursor_movement()`: Navigate with arrows/k/j keys  
+- `handle_cursor_movement()`: Navigate with arrows/k/j keys
 - `handle_editor_launch()`: Launch editor with 'e' key
 - `handle_merge_key()`: Merge operations with 'M' key
 - `handle_esc_key()`: Graceful/force stop
@@ -39,7 +39,7 @@ Handles all TuiCommand variants:
 
 ### Integration Status
 
-The helper modules are created and tested but not yet integrated into `run_tui_loop()`. 
+The helper modules are created and tested but not yet integrated into `run_tui_loop()`.
 Integration is deferred to allow for manual TUI behavior testing before making the change.
 
 To integrate the helpers:

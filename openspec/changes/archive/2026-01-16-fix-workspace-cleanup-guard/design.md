@@ -175,7 +175,7 @@ for (workspace_name, workspace_path) in &workspaces_to_clean {
         .args(["worktree", "remove", workspace_path.to_str().unwrap(), "--force"])
         .current_dir(&self.repo_root)
         .output();
-    
+
     // 2. ブランチ削除
     let _ = std::process::Command::new("git")
         .args(["branch", "-D", workspace_name])
