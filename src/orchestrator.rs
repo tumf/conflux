@@ -91,6 +91,12 @@ pub struct Orchestrator {
     execution_mode: String,
 }
 
+/// Control flow result indicating whether to continue or break the main loop
+enum LoopControl {
+    Continue,
+    Break { finish_status: &'static str },
+}
+
 impl Orchestrator {
     /// Create a new orchestrator with optional custom config path and max iterations override
     #[allow(clippy::too_many_arguments)]
@@ -269,6 +275,347 @@ impl Orchestrator {
         })
     }
 
+    /// Check for graceful stop flag and update state accordingly
+    /// Returns LoopControl indicating whether to continue or break
+    async fn check_graceful_stop(
+        &mut self,
+        graceful_stop_flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        previous_graceful_stop: &mut bool,
+    ) -> LoopControl {
+        if let Some(ref graceful_flag) = graceful_stop_flag {
+            let current_graceful_stop = graceful_flag.load(std::sync::atomic::Ordering::SeqCst);
+
+            // Detect transition from false to true (entering stopping state)
+            if current_graceful_stop && !*previous_graceful_stop {
+                info!("Graceful stop requested, entering stopping state");
+                #[cfg(feature = "web-monitoring")]
+                {
+                    self.execution_mode = "stopping".to_string();
+                    let current_changes = openspec::list_changes_native().unwrap_or_default();
+                    self.broadcast_state_update(&current_changes).await;
+                }
+            }
+
+            // Detect transition from true to false (cancel stop - resume running)
+            if !current_graceful_stop && *previous_graceful_stop {
+                info!("Graceful stop cancelled, resuming running state");
+                #[cfg(feature = "web-monitoring")]
+                {
+                    self.execution_mode = "running".to_string();
+                    let current_changes = openspec::list_changes_native().unwrap_or_default();
+                    self.broadcast_state_update(&current_changes).await;
+                }
+            }
+
+            *previous_graceful_stop = current_graceful_stop;
+
+            // If stop is still requested, exit loop
+            if current_graceful_stop {
+                info!("Graceful stop: stopping after current change");
+                #[cfg(feature = "web-monitoring")]
+                {
+                    self.execution_mode = "stopped".to_string();
+                    let current_changes = openspec::list_changes_native().unwrap_or_default();
+                    self.broadcast_state_update(&current_changes).await;
+                }
+                if let Some(progress) = &mut self.progress {
+                    progress.complete_all();
+                }
+                return LoopControl::Break {
+                    finish_status: "graceful_stop",
+                };
+            }
+        }
+        LoopControl::Continue
+    }
+
+    /// Check for cancellation token
+    /// Returns LoopControl indicating whether to continue or break
+    async fn check_cancellation(
+        &mut self,
+        cancel_token: &tokio_util::sync::CancellationToken,
+    ) -> LoopControl {
+        if cancel_token.is_cancelled() {
+            info!("Cancellation requested, stopping orchestration");
+            #[cfg(feature = "web-monitoring")]
+            {
+                self.execution_mode = "stopped".to_string();
+                let current_changes = openspec::list_changes_native().unwrap_or_default();
+                self.broadcast_state_update(&current_changes).await;
+            }
+            if let Some(progress) = &mut self.progress {
+                progress.complete_all();
+            }
+            return LoopControl::Break {
+                finish_status: "cancelled",
+            };
+        }
+        LoopControl::Continue
+    }
+
+    /// Check max iterations limit and increment counter
+    /// Returns LoopControl indicating whether to continue or break
+    fn check_max_iterations(&mut self) -> LoopControl {
+        self.iteration += 1;
+
+        if self.max_iterations > 0 {
+            // Log warning when approaching limit (80%)
+            let warning_threshold = (self.max_iterations as f32 * 0.8) as u32;
+            if self.iteration == warning_threshold {
+                warn!(
+                    "Approaching max iterations: {}/{}",
+                    self.iteration, self.max_iterations
+                );
+            }
+
+            // Stop if max iterations reached
+            if self.iteration > self.max_iterations {
+                info!(
+                    "Max iterations ({}) reached, stopping orchestration",
+                    self.max_iterations
+                );
+                if let Some(progress) = &mut self.progress {
+                    progress.complete_all();
+                }
+                return LoopControl::Break {
+                    finish_status: "iteration_limit",
+                };
+            }
+        }
+        LoopControl::Continue
+    }
+
+    /// Update shared state with an execution event
+    async fn update_shared_state(&self, event: ExecutionEvent) {
+        self.shared_state
+            .write()
+            .await
+            .apply_execution_event(&event);
+    }
+
+    /// Handle Archived result
+    async fn handle_archived(&mut self, next: &Change) {
+        self.changes_processed += 1;
+
+        self.update_shared_state(ExecutionEvent::ChangeArchived(next.id.clone()))
+            .await;
+
+        self.completed_change_ids.insert(next.id.clone());
+        self.current_change_id = None;
+        self.apply_counts.remove(&next.id);
+        self.stall_detector.clear_change(&next.id);
+
+        if let Some(progress) = &mut self.progress {
+            progress.archive_change(&next.id);
+        }
+    }
+
+    /// Handle Stalled result
+    fn handle_stalled(&mut self, next: &Change, error: &str) -> LoopControl {
+        warn!("Change stalled: {} - {}", next.id, error);
+        self.mark_change_stalled(&next.id, error);
+        LoopControl::Continue
+    }
+
+    /// Handle Failed result
+    async fn handle_failed(&mut self, next: &Change, error: &str) -> Result<()> {
+        error!("Change failed: {} - {}", next.id, error);
+        if let Some(progress) = &mut self.progress {
+            progress.error(&format!("Failed: {}", next.id));
+        }
+        #[cfg(feature = "web-monitoring")]
+        {
+            self.execution_mode = "error".to_string();
+            let current_changes = openspec::list_changes_native().unwrap_or_default();
+            self.broadcast_state_update(&current_changes).await;
+        }
+        Err(OrchestratorError::AgentCommand(error.to_string()))
+    }
+
+    /// Handle ApplySuccessIncomplete result
+    async fn handle_apply_success_incomplete(
+        &mut self,
+        next: &Change,
+        serial_service: &mut SerialRunService,
+    ) -> LoopControl {
+        self.update_shared_state(ExecutionEvent::ApplyCompleted {
+            change_id: next.id.clone(),
+            revision: "serial".to_string(),
+        })
+        .await;
+
+        // CLI-specific: Create WIP snapshot
+        let apply_count = serial_service.apply_count(&next.id);
+        let snapshot = match self.snapshot_serial_iteration(&next.id, apply_count).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
+                SerialSnapshot {
+                    progress: crate::task_parser::TaskProgress::default(),
+                    empty_commit: None,
+                }
+            }
+        };
+
+        // CLI-specific: Check for stall on empty commits
+        if let Some(stall_reason) = serial_service.check_stall_after_apply(
+            &next.id,
+            &snapshot.progress,
+            snapshot.empty_commit,
+        ) {
+            warn!("{}", stall_reason);
+            self.mark_change_stalled(&next.id, &stall_reason);
+            return LoopControl::Continue;
+        }
+
+        if let Some(progress) = &mut self.progress {
+            progress.complete_change(&next.id);
+        }
+        LoopControl::Continue
+    }
+
+    /// Handle ApplyFailed result
+    async fn handle_apply_failed(
+        &mut self,
+        next: &Change,
+        error: &str,
+        serial_service: &mut SerialRunService,
+    ) -> Result<()> {
+        self.update_shared_state(ExecutionEvent::ApplyStarted {
+            change_id: next.id.clone(),
+            command: "(placeholder)".to_string(),
+        })
+        .await;
+
+        // CLI-specific: Create WIP snapshot even on failure
+        let apply_count = serial_service.apply_count(&next.id);
+        if let Err(e) = self.snapshot_serial_iteration(&next.id, apply_count).await {
+            warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
+        }
+
+        // CLI-specific: Check circuit breaker
+        if self.record_error_and_check_circuit_breaker(&next.id, error) {
+            let message = format!(
+                "Circuit breaker opened for '{}' due to repeated errors",
+                next.id
+            );
+            warn!("{}", message);
+            self.mark_change_stalled(&next.id, &message);
+            serial_service.mark_stalled(&next.id, &message);
+            return Ok(());
+        }
+
+        error!("Apply failed for {}: {}", next.id, error);
+        if let Some(progress) = &mut self.progress {
+            progress.error(&format!("Apply failed: {}", next.id));
+        }
+        #[cfg(feature = "web-monitoring")]
+        {
+            self.execution_mode = "error".to_string();
+            let current_changes = openspec::list_changes_native().unwrap_or_default();
+            self.broadcast_state_update(&current_changes).await;
+        }
+        Err(OrchestratorError::AgentCommand(error.to_string()))
+    }
+
+    /// Handle acceptance-related results (Passed, Continue, ContinueExceeded, Failed, CommandFailed)
+    async fn handle_acceptance_result(
+        &mut self,
+        next: &Change,
+        serial_service: &SerialRunService,
+        result: &crate::serial_run_service::ChangeProcessResult,
+    ) {
+        use crate::serial_run_service::ChangeProcessResult;
+
+        // Common state update for all acceptance results
+        self.update_shared_state(ExecutionEvent::ApplyCompleted {
+            change_id: next.id.clone(),
+            revision: "serial".to_string(),
+        })
+        .await;
+
+        // Specific handling based on result type
+        match result {
+            ChangeProcessResult::AcceptancePassed => {
+                // CLI-specific: Squash WIP commits after acceptance pass
+                let apply_count = serial_service.apply_count(&next.id);
+                let _ = self.squash_serial_wip_commits(&next.id, apply_count).await;
+                info!("Acceptance passed for {}, ready for archive", next.id);
+            }
+            ChangeProcessResult::AcceptanceContinue => {
+                info!(
+                    "Acceptance requires continuation for {}, retrying...",
+                    next.id
+                );
+            }
+            ChangeProcessResult::AcceptanceContinueExceeded => {
+                warn!(
+                    "Acceptance CONTINUE limit exceeded for {}, treating as FAIL",
+                    next.id
+                );
+            }
+            ChangeProcessResult::AcceptanceFailed { .. } => {
+                info!("Acceptance failed for {}, will retry apply", next.id);
+            }
+            ChangeProcessResult::AcceptanceCommandFailed { .. } => {
+                info!(
+                    "Acceptance command failed for {}, will retry apply",
+                    next.id
+                );
+            }
+            _ => {}
+        }
+
+        if let Some(progress) = &mut self.progress {
+            progress.complete_change(&next.id);
+        }
+    }
+
+    /// Handle ChangeProcessResult and return LoopControl
+    async fn handle_change_result(
+        &mut self,
+        result: crate::serial_run_service::ChangeProcessResult,
+        next: &Change,
+        serial_service: &mut SerialRunService,
+    ) -> Result<LoopControl> {
+        use crate::serial_run_service::ChangeProcessResult;
+
+        match result {
+            ChangeProcessResult::Archived => {
+                self.handle_archived(next).await;
+                Ok(LoopControl::Continue)
+            }
+            ChangeProcessResult::Stalled { error } => Ok(self.handle_stalled(next, &error)),
+            ChangeProcessResult::Failed { error } => {
+                self.handle_failed(next, &error).await?;
+                Ok(LoopControl::Continue)
+            }
+            ChangeProcessResult::Cancelled => {
+                info!("Processing cancelled for {}", next.id);
+                Ok(LoopControl::Break {
+                    finish_status: "cancelled",
+                })
+            }
+            ChangeProcessResult::ApplySuccessIncomplete => Ok(self
+                .handle_apply_success_incomplete(next, serial_service)
+                .await),
+            ChangeProcessResult::ApplyFailed { error } => {
+                self.handle_apply_failed(next, &error, serial_service)
+                    .await?;
+                Ok(LoopControl::Continue)
+            }
+            ChangeProcessResult::AcceptancePassed
+            | ChangeProcessResult::AcceptanceContinue
+            | ChangeProcessResult::AcceptanceContinueExceeded
+            | ChangeProcessResult::AcceptanceFailed { .. }
+            | ChangeProcessResult::AcceptanceCommandFailed { .. } => {
+                self.handle_acceptance_result(next, serial_service, &result)
+                    .await;
+                Ok(LoopControl::Continue)
+            }
+        }
+    }
+
     /// Run the orchestration loop with cancellation support
     pub async fn run(
         &mut self,
@@ -390,95 +737,38 @@ impl Orchestrator {
         let mut previous_graceful_stop = false;
 
         loop {
-            // Check for graceful stop flag (stop after current change completes)
-            if let Some(ref graceful_flag) = graceful_stop_flag {
-                let current_graceful_stop = graceful_flag.load(std::sync::atomic::Ordering::SeqCst);
-
-                // Detect transition from false to true (entering stopping state)
-                if current_graceful_stop && !previous_graceful_stop {
-                    info!("Graceful stop requested, entering stopping state");
-                    #[cfg(feature = "web-monitoring")]
-                    {
-                        self.execution_mode = "stopping".to_string();
-                        // Broadcast mode change to web monitoring
-                        let current_changes = openspec::list_changes_native().unwrap_or_default();
-                        self.broadcast_state_update(&current_changes).await;
-                    }
-                }
-
-                // Detect transition from true to false (cancel stop - resume running)
-                if !current_graceful_stop && previous_graceful_stop {
-                    info!("Graceful stop cancelled, resuming running state");
-                    #[cfg(feature = "web-monitoring")]
-                    {
-                        self.execution_mode = "running".to_string();
-                        // Broadcast mode change to web monitoring
-                        let current_changes = openspec::list_changes_native().unwrap_or_default();
-                        self.broadcast_state_update(&current_changes).await;
-                    }
-                }
-
-                previous_graceful_stop = current_graceful_stop;
-
-                // If stop is still requested, exit loop
-                if current_graceful_stop {
-                    info!("Graceful stop: stopping after current change");
-                    #[cfg(feature = "web-monitoring")]
-                    {
-                        self.execution_mode = "stopped".to_string();
-                        // Broadcast mode change to web monitoring
-                        let current_changes = openspec::list_changes_native().unwrap_or_default();
-                        self.broadcast_state_update(&current_changes).await;
-                    }
-                    if let Some(progress) = &mut self.progress {
-                        progress.complete_all();
-                    }
-                    finish_status = "graceful_stop";
+            // Check for graceful stop
+            match self
+                .check_graceful_stop(&graceful_stop_flag, &mut previous_graceful_stop)
+                .await
+            {
+                LoopControl::Continue => {}
+                LoopControl::Break {
+                    finish_status: status,
+                } => {
+                    finish_status = status;
                     break;
                 }
             }
 
-            // Check for cancellation request (force stop or signal)
-            if cancel_token.is_cancelled() {
-                info!("Cancellation requested, stopping orchestration");
-                #[cfg(feature = "web-monitoring")]
-                {
-                    self.execution_mode = "stopped".to_string();
-                    // Broadcast mode change to web monitoring
-                    let current_changes = openspec::list_changes_native().unwrap_or_default();
-                    self.broadcast_state_update(&current_changes).await;
+            // Check for cancellation
+            match self.check_cancellation(&cancel_token).await {
+                LoopControl::Continue => {}
+                LoopControl::Break {
+                    finish_status: status,
+                } => {
+                    finish_status = status;
+                    break;
                 }
-                if let Some(progress) = &mut self.progress {
-                    progress.complete_all();
-                }
-                finish_status = "cancelled";
-                break;
             }
 
-            // Increment iteration counter
-            self.iteration += 1;
-
-            // Check max iterations limit (0 = no limit)
-            if self.max_iterations > 0 {
-                // Log warning when approaching limit (80%)
-                let warning_threshold = (self.max_iterations as f32 * 0.8) as u32;
-                if self.iteration == warning_threshold {
-                    warn!(
-                        "Approaching max iterations: {}/{}",
-                        self.iteration, self.max_iterations
-                    );
-                }
-
-                // Stop if max iterations reached
-                if self.iteration > self.max_iterations {
-                    info!(
-                        "Max iterations ({}) reached, stopping orchestration",
-                        self.max_iterations
-                    );
-                    if let Some(progress) = &mut self.progress {
-                        progress.complete_all();
-                    }
-                    finish_status = "iteration_limit";
+            // Check max iterations
+            match self.check_max_iterations() {
+                LoopControl::Continue => {}
+                LoopControl::Break {
+                    finish_status: status,
+                } => {
+                    finish_status = status;
                     break;
                 }
             }
@@ -559,218 +849,16 @@ impl Orchestrator {
                 .await?;
 
             // Handle mode-specific concerns based on result
-            use crate::serial_run_service::ChangeProcessResult;
-            match result {
-                ChangeProcessResult::Archived => {
-                    // Update changes_processed count
-                    self.changes_processed += 1;
-
-                    // Update shared state: mark change as archived
-                    self.shared_state
-                        .write()
-                        .await
-                        .apply_execution_event(&ExecutionEvent::ChangeArchived(next.id.clone()));
-
-                    // Mark change as completed and clear current (already done in service)
-                    self.completed_change_ids.insert(next.id.clone());
-                    self.current_change_id = None;
-                    self.apply_counts.remove(&next.id);
-                    self.stall_detector.clear_change(&next.id);
-
-                    if let Some(progress) = &mut self.progress {
-                        progress.archive_change(&next.id);
-                    }
-                }
-                ChangeProcessResult::Stalled { error } => {
-                    warn!("Change stalled: {} - {}", next.id, error);
-                    self.mark_change_stalled(&next.id, &error);
-                    continue;
-                }
-                ChangeProcessResult::Failed { error } => {
-                    error!("Change failed: {} - {}", next.id, error);
-                    if let Some(progress) = &mut self.progress {
-                        progress.error(&format!("Failed: {}", next.id));
-                    }
-                    #[cfg(feature = "web-monitoring")]
-                    {
-                        self.execution_mode = "error".to_string();
-                        // Broadcast mode change to web monitoring
-                        let current_changes = openspec::list_changes_native().unwrap_or_default();
-                        self.broadcast_state_update(&current_changes).await;
-                    }
-                    return Err(OrchestratorError::AgentCommand(error));
-                }
-                ChangeProcessResult::Cancelled => {
-                    info!("Processing cancelled for {}", next.id);
-                    return Ok(());
-                }
-                ChangeProcessResult::ApplySuccessIncomplete => {
-                    // Update shared state: apply completed
-                    self.shared_state.write().await.apply_execution_event(
-                        &ExecutionEvent::ApplyCompleted {
-                            change_id: next.id.clone(),
-                            revision: "serial".to_string(),
-                        },
-                    );
-
-                    // CLI-specific: Create WIP snapshot
-                    let apply_count = serial_service.apply_count(&next.id);
-                    let snapshot = match self.snapshot_serial_iteration(&next.id, apply_count).await
-                    {
-                        Ok(snapshot) => snapshot,
-                        Err(e) => {
-                            warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
-                            SerialSnapshot {
-                                progress: crate::task_parser::TaskProgress::default(),
-                                empty_commit: None,
-                            }
-                        }
-                    };
-
-                    // CLI-specific: Check for stall on empty commits
-                    if let Some(stall_reason) = serial_service.check_stall_after_apply(
-                        &next.id,
-                        &snapshot.progress,
-                        snapshot.empty_commit,
-                    ) {
-                        warn!("{}", stall_reason);
-                        self.mark_change_stalled(&next.id, &stall_reason);
-                        continue;
-                    }
-
-                    if let Some(progress) = &mut self.progress {
-                        progress.complete_change(&next.id);
-                    }
-                }
-                ChangeProcessResult::ApplyFailed { error } => {
-                    // Update shared state: apply started (for tracking)
-                    self.shared_state.write().await.apply_execution_event(
-                        &ExecutionEvent::ApplyStarted {
-                            change_id: next.id.clone(),
-                            command: "(placeholder)".to_string(),
-                        },
-                    );
-
-                    // CLI-specific: Create WIP snapshot even on failure
-                    let apply_count = serial_service.apply_count(&next.id);
-                    if let Err(e) = self.snapshot_serial_iteration(&next.id, apply_count).await {
-                        warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
-                    }
-
-                    // CLI-specific: Check circuit breaker
-                    if self.record_error_and_check_circuit_breaker(&next.id, &error) {
-                        let message = format!(
-                            "Circuit breaker opened for '{}' due to repeated errors",
-                            next.id
-                        );
-                        warn!("{}", message);
-                        self.mark_change_stalled(&next.id, &message);
-                        serial_service.mark_stalled(&next.id, &message);
-                        continue;
-                    }
-
-                    error!("Apply failed for {}: {}", next.id, error);
-                    if let Some(progress) = &mut self.progress {
-                        progress.error(&format!("Apply failed: {}", next.id));
-                    }
-                    #[cfg(feature = "web-monitoring")]
-                    {
-                        self.execution_mode = "error".to_string();
-                        // Broadcast mode change to web monitoring
-                        let current_changes = openspec::list_changes_native().unwrap_or_default();
-                        self.broadcast_state_update(&current_changes).await;
-                    }
-                    return Err(OrchestratorError::AgentCommand(error));
-                }
-                ChangeProcessResult::AcceptancePassed => {
-                    // Update shared state
-                    self.shared_state.write().await.apply_execution_event(
-                        &ExecutionEvent::ApplyCompleted {
-                            change_id: next.id.clone(),
-                            revision: "serial".to_string(),
-                        },
-                    );
-
-                    // CLI-specific: Squash WIP commits after acceptance pass
-                    let apply_count = serial_service.apply_count(&next.id);
-                    let _ = self.squash_serial_wip_commits(&next.id, apply_count).await;
-
-                    info!("Acceptance passed for {}, ready for archive", next.id);
-
-                    if let Some(progress) = &mut self.progress {
-                        progress.complete_change(&next.id);
-                    }
-                }
-                ChangeProcessResult::AcceptanceContinue => {
-                    // Update shared state
-                    self.shared_state.write().await.apply_execution_event(
-                        &ExecutionEvent::ApplyCompleted {
-                            change_id: next.id.clone(),
-                            revision: "serial".to_string(),
-                        },
-                    );
-
-                    info!(
-                        "Acceptance requires continuation for {}, retrying...",
-                        next.id
-                    );
-
-                    if let Some(progress) = &mut self.progress {
-                        progress.complete_change(&next.id);
-                    }
-                }
-                ChangeProcessResult::AcceptanceContinueExceeded => {
-                    // Update shared state
-                    self.shared_state.write().await.apply_execution_event(
-                        &ExecutionEvent::ApplyCompleted {
-                            change_id: next.id.clone(),
-                            revision: "serial".to_string(),
-                        },
-                    );
-
-                    warn!(
-                        "Acceptance CONTINUE limit exceeded for {}, treating as FAIL",
-                        next.id
-                    );
-
-                    if let Some(progress) = &mut self.progress {
-                        progress.complete_change(&next.id);
-                    }
-                }
-                ChangeProcessResult::AcceptanceFailed { findings: _ } => {
-                    // Update shared state
-                    self.shared_state.write().await.apply_execution_event(
-                        &ExecutionEvent::ApplyCompleted {
-                            change_id: next.id.clone(),
-                            revision: "serial".to_string(),
-                        },
-                    );
-
-                    // Findings already logged and tasks.md updated by SerialRunService
-                    info!("Acceptance failed for {}, will retry apply", next.id);
-
-                    if let Some(progress) = &mut self.progress {
-                        progress.complete_change(&next.id);
-                    }
-                }
-                ChangeProcessResult::AcceptanceCommandFailed { error: _ } => {
-                    // Update shared state
-                    self.shared_state.write().await.apply_execution_event(
-                        &ExecutionEvent::ApplyCompleted {
-                            change_id: next.id.clone(),
-                            revision: "serial".to_string(),
-                        },
-                    );
-
-                    // Error already logged and tasks.md updated by SerialRunService
-                    info!(
-                        "Acceptance command failed for {}, will retry apply",
-                        next.id
-                    );
-
-                    if let Some(progress) = &mut self.progress {
-                        progress.complete_change(&next.id);
-                    }
+            match self
+                .handle_change_result(result, next, &mut serial_service)
+                .await?
+            {
+                LoopControl::Continue => {}
+                LoopControl::Break {
+                    finish_status: status,
+                } => {
+                    finish_status = status;
+                    break;
                 }
             }
         }
