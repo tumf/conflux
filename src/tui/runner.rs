@@ -689,37 +689,40 @@ async fn run_tui_loop(
                         (KeyCode::Char('e'), _) => {
                             use crate::tui::types::ViewMode;
 
-                            // Suspend TUI
-                            disable_raw_mode()?;
-                            execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+                            let view_mode = app.view_mode;
+                            let change_id = if !app.changes.is_empty()
+                                && app.cursor_index < app.changes.len()
+                            {
+                                Some(app.changes[app.cursor_index].id.clone())
+                            } else {
+                                None
+                            };
+                            let worktree_path = app.get_selected_worktree_path();
 
-                            // Launch editor based on view mode
-                            match app.view_mode {
-                                ViewMode::Changes => {
-                                    if !app.changes.is_empty()
-                                        && app.cursor_index < app.changes.len()
-                                    {
-                                        let change_id = app.changes[app.cursor_index].id.clone();
-                                        if let Err(e) =
-                                            super::utils::launch_editor_for_change(&change_id)
-                                        {
-                                            eprintln!("Failed to launch editor: {}", e);
+                            suspend_terminal_and_execute_sync(terminal, || {
+                                // Launch editor based on view mode
+                                match view_mode {
+                                    ViewMode::Changes => {
+                                        if let Some(id) = change_id {
+                                            if let Err(e) =
+                                                super::utils::launch_editor_for_change(&id)
+                                            {
+                                                eprintln!("Failed to launch editor: {}", e);
+                                            }
+                                        }
+                                    }
+                                    ViewMode::Worktrees => {
+                                        if let Some(path) = worktree_path {
+                                            if let Err(e) =
+                                                super::utils::launch_editor_in_dir(&path)
+                                            {
+                                                eprintln!("Failed to launch editor: {}", e);
+                                            }
                                         }
                                     }
                                 }
-                                ViewMode::Worktrees => {
-                                    if let Some(path) = app.get_selected_worktree_path() {
-                                        if let Err(e) = super::utils::launch_editor_in_dir(&path) {
-                                            eprintln!("Failed to launch editor: {}", e);
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Restore TUI
-                            enable_raw_mode()?;
-                            execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-                            terminal.clear()?;
+                                Ok(())
+                            })?;
                         }
                         (KeyCode::Char('m'), _) | (KeyCode::Char('M'), _) => {
                             use crate::tui::types::ViewMode;
@@ -940,66 +943,65 @@ async fn run_tui_loop(
                                 worktree_path_str
                             )));
 
-                            disable_raw_mode()?;
-                            execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+                            let command_clone = command.clone();
+                            let worktree_path_for_exec =
+                                Path::new(&worktree_path_str).to_path_buf();
+                            let ai_runner_clone = ai_runner.clone();
 
-                            info!(
-                                module = module_path!(),
-                                "Running worktree command via AiCommandRunner: sh -c {}", command
-                            );
+                            let status_result =
+                                suspend_terminal_and_execute(terminal, || async move {
+                                    info!(
+                                        module = module_path!(),
+                                        "Running worktree command via AiCommandRunner: sh -c {}",
+                                        command_clone
+                                    );
 
-                            // Execute via AiCommandRunner (with stagger and retry)
-                            let worktree_path_for_exec = Path::new(&worktree_path_str);
-                            let exec_result = ai_runner
-                                .execute_streaming_with_retry(
-                                    &command,
-                                    Some(worktree_path_for_exec),
-                                )
-                                .await;
+                                    // Execute via AiCommandRunner (with stagger and retry)
+                                    let exec_result = ai_runner_clone
+                                        .execute_streaming_with_retry(
+                                            &command_clone,
+                                            Some(&worktree_path_for_exec),
+                                        )
+                                        .await;
 
-                            let status_result = match exec_result {
-                                Ok((mut child, mut rx)) => {
-                                    // Forward output to stdout/stderr in real-time
-                                    use crate::ai_command_runner::OutputLine;
-                                    while let Some(line) = rx.recv().await {
-                                        match line {
-                                            OutputLine::Stdout(s) => {
-                                                println!("{}", s);
+                                    match exec_result {
+                                        Ok((mut child, mut rx)) => {
+                                            // Forward output to stdout/stderr in real-time
+                                            use crate::ai_command_runner::OutputLine;
+                                            while let Some(line) = rx.recv().await {
+                                                match line {
+                                                    OutputLine::Stdout(s) => {
+                                                        println!("{}", s);
+                                                    }
+                                                    OutputLine::Stderr(s) => {
+                                                        eprintln!("{}", s);
+                                                    }
+                                                }
                                             }
-                                            OutputLine::Stderr(s) => {
-                                                eprintln!("{}", s);
-                                            }
+                                            // Wait for child to complete
+                                            child
+                                                .wait()
+                                                .await
+                                                .map_err(crate::error::OrchestratorError::Io)
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Failed to execute worktree command: {}", e);
+                                            Err(e)
                                         }
                                     }
-                                    // Wait for child to complete
-                                    child.wait().await
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to execute worktree command: {}", e);
-                                    Err(std::io::Error::other(e.to_string()))
-                                }
-                            };
-
-                            enable_raw_mode()?;
-                            execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-                            terminal.clear()?;
+                                })
+                                .await?;
 
                             match status_result {
-                                Ok(exit_status) if exit_status.success() => {
+                                exit_status if exit_status.success() => {
                                     app.add_log(LogEntry::success(
                                         "Worktree command completed successfully",
                                     ));
                                 }
-                                Ok(exit_status) => {
+                                exit_status => {
                                     app.add_log(LogEntry::error(format!(
                                         "Worktree command failed with exit code: {:?}",
                                         exit_status.code()
-                                    )));
-                                }
-                                Err(err) => {
-                                    app.add_log(LogEntry::error(format!(
-                                        "Failed to execute worktree command: {}",
-                                        err
                                     )));
                                 }
                             }
@@ -1133,62 +1135,64 @@ async fn run_tui_loop(
                                 worktree_path_str
                             )));
 
-                            disable_raw_mode()?;
-                            execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+                            let command_clone = command.clone();
+                            let worktree_path_clone = worktree_path.clone();
+                            let ai_runner_clone = ai_runner.clone();
 
-                            info!(
-                                module = module_path!(),
-                                "Running worktree command via AiCommandRunner: sh -c {}", command
-                            );
+                            let status_result =
+                                suspend_terminal_and_execute(terminal, || async move {
+                                    info!(
+                                        module = module_path!(),
+                                        "Running worktree command via AiCommandRunner: sh -c {}",
+                                        command_clone
+                                    );
 
-                            // Execute via AiCommandRunner (with stagger and retry)
-                            let exec_result = ai_runner
-                                .execute_streaming_with_retry(&command, Some(&worktree_path))
-                                .await;
+                                    // Execute via AiCommandRunner (with stagger and retry)
+                                    let exec_result = ai_runner_clone
+                                        .execute_streaming_with_retry(
+                                            &command_clone,
+                                            Some(&worktree_path_clone),
+                                        )
+                                        .await;
 
-                            let status_result = match exec_result {
-                                Ok((mut child, mut rx)) => {
-                                    // Forward output to stdout/stderr in real-time
-                                    use crate::ai_command_runner::OutputLine;
-                                    while let Some(line) = rx.recv().await {
-                                        match line {
-                                            OutputLine::Stdout(s) => {
-                                                println!("{}", s);
+                                    match exec_result {
+                                        Ok((mut child, mut rx)) => {
+                                            // Forward output to stdout/stderr in real-time
+                                            use crate::ai_command_runner::OutputLine;
+                                            while let Some(line) = rx.recv().await {
+                                                match line {
+                                                    OutputLine::Stdout(s) => {
+                                                        println!("{}", s);
+                                                    }
+                                                    OutputLine::Stderr(s) => {
+                                                        eprintln!("{}", s);
+                                                    }
+                                                }
                                             }
-                                            OutputLine::Stderr(s) => {
-                                                eprintln!("{}", s);
-                                            }
+                                            // Wait for child to complete
+                                            child
+                                                .wait()
+                                                .await
+                                                .map_err(crate::error::OrchestratorError::Io)
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Failed to execute worktree command: {}", e);
+                                            Err(e)
                                         }
                                     }
-                                    // Wait for child to complete
-                                    child.wait().await
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to execute worktree command: {}", e);
-                                    Err(std::io::Error::other(e.to_string()))
-                                }
-                            };
-
-                            enable_raw_mode()?;
-                            execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-                            terminal.clear()?;
+                                })
+                                .await?;
 
                             match status_result {
-                                Ok(exit_status) if exit_status.success() => {
+                                exit_status if exit_status.success() => {
                                     app.add_log(LogEntry::success(
                                         "Worktree command completed successfully",
                                     ));
                                 }
-                                Ok(exit_status) => {
+                                exit_status => {
                                     app.add_log(LogEntry::error(format!(
                                         "Worktree command failed with exit code: {:?}",
                                         exit_status.code()
-                                    )));
-                                }
-                                Err(err) => {
-                                    app.add_log(LogEntry::error(format!(
-                                        "Failed to execute worktree command: {}",
-                                        err
                                     )));
                                 }
                             }
@@ -1967,6 +1971,52 @@ async fn run_tui_loop(
     }
 
     Ok(())
+}
+
+/// Suspend terminal, execute a function, then restore terminal
+///
+/// This helper encapsulates the pattern of:
+/// 1. Disable raw mode and leave alternate screen
+/// 2. Execute a function (which may interact with the terminal)
+/// 3. Restore raw mode and alternate screen
+async fn suspend_terminal_and_execute<F, Fut, T>(terminal: &mut DefaultTerminal, f: F) -> Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    // Suspend TUI
+    disable_raw_mode()?;
+    execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+
+    // Execute the provided function
+    let result = f().await;
+
+    // Restore TUI
+    enable_raw_mode()?;
+    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    terminal.clear()?;
+
+    result
+}
+
+/// Suspend terminal, execute a synchronous function, then restore terminal
+fn suspend_terminal_and_execute_sync<F, T>(terminal: &mut DefaultTerminal, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    // Suspend TUI
+    disable_raw_mode()?;
+    execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+
+    // Execute the provided function
+    let result = f();
+
+    // Restore TUI
+    enable_raw_mode()?;
+    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    terminal.clear()?;
+
+    result
 }
 
 #[cfg(test)]
