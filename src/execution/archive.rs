@@ -22,7 +22,7 @@ use std::future::Future;
 use std::path::Path;
 
 use tokio::process::Command;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::agent::{AgentRunner, OutputLine};
 use crate::error::{OrchestratorError, Result};
@@ -336,6 +336,8 @@ Requirements:\n\
 /// * `Err(e)` - Failed to delete the directory
 #[cfg(test)]
 pub fn delete_change_directory(change_id: &str, base_path: Option<&Path>) -> Result<()> {
+    use tracing::info;
+
     let change_path = match base_path {
         Some(base) => base.join("openspec/changes").join(change_id),
         None => Path::new("openspec/changes").join(change_id),
