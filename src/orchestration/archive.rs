@@ -152,11 +152,24 @@ where
     loop {
         attempt += 1;
 
+        // Record start time for this attempt
+        let start = std::time::Instant::now();
+
         // Execute archive command via AiCommandRunner (with shared stagger state)
         let status = agent.run_archive_with_runner(&change.id, ai_runner).await?;
 
         if !status.success() {
             let error_msg = format!("Archive command failed with exit code: {:?}", status.code());
+
+            // Record failed attempt
+            agent.record_archive_attempt(
+                &change.id,
+                &status,
+                start,
+                Some(error_msg.clone()),
+                None, // No stdout available in non-streaming mode
+                None, // No stderr available in non-streaming mode
+            );
 
             // Run on_error hook
             let error_ctx = hook_ctx.clone().with_error(&error_msg);
@@ -205,14 +218,37 @@ where
         }
 
         // Verify archive was successful
-        if verify_archive_completion(&change.id, base_path).is_success() {
+        let verification_status = verify_archive_completion(&change.id, base_path);
+        if verification_status.is_success() {
+            // Record successful attempt
+            agent.record_archive_attempt(
+                &change.id, &status, start, None,
+                None, // No stdout available in non-streaming mode
+                None, // No stderr available in non-streaming mode
+            );
             break;
         }
 
+        // Verification failed - record with reason
+        let verification_reason = match verification_status {
+            ArchiveVerificationResult::NotArchived { ref change_id } => {
+                format!("Change still exists at openspec/changes/{}", change_id)
+            }
+            _ => "Archive verification failed".to_string(),
+        };
+        agent.record_archive_attempt(
+            &change.id,
+            &status,
+            start,
+            Some(verification_reason.clone()),
+            None, // No stdout available in non-streaming mode
+            None, // No stderr available in non-streaming mode
+        );
+
         if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
             output.on_warn(&format!(
-                "Archive verification failed for {} (attempt {}/{}); retrying archive command",
-                change.id, attempt, max_attempts
+                "Archive verification failed for {} (attempt {}/{}): {}; retrying archive command",
+                change.id, attempt, max_attempts, verification_reason
             ));
             continue;
         }
@@ -231,8 +267,9 @@ where
         }
     }
 
-    // Clear apply history for the archived change
+    // Clear apply and archive history for the archived change
     agent.clear_apply_history(&change.id);
+    agent.clear_archive_history(&change.id);
 
     // Run post_archive hook with updated context
     let post_ctx = HookContext::new(
