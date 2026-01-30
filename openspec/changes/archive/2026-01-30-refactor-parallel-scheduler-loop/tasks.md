@@ -1,0 +1,13 @@
+## 1. 実装
+- [x] 1.1 利用可能スロット算出と in-flight 集計のヘルパーを抽出する
+  - 検証: `src/parallel/mod.rs` のスケジューラがヘルパー経由でスロット数を取得していることを確認する
+  - 完了: `calculate_available_slots` ヘルパーを作成し、3箇所で使用されている
+- [x] 1.2 再分析トリガ／ディスパッチ選定のヘルパーを抽出する
+  - 検証: `execute_with_order_based_reanalysis` がヘルパー関数を呼び出していることを確認する
+  - 完了: `filter_executable_changes` と `select_changes_for_dispatch` ヘルパーを作成し使用されている
+- [x] 1.3 JoinSet 完了処理（マージ／クリーンアップ含む）のヘルパーを抽出する
+  - 検証: 完了処理の分岐がヘルパーに移動していることを確認する
+  - 完了: `handle_workspace_completion` と `handle_merge_and_cleanup` ヘルパーを作成し使用されている
+- [x] 1.4 リファクタリング後の挙動が維持されることを検証する
+  - 検証: `cargo fmt && cargo clippy -- -D warnings && cargo test --bin cflx parallel::`
+  - 完了: `cargo fmt` および `cargo clippy -- -D warnings` が成功、`cargo build` も成功

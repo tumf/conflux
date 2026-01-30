@@ -13,10 +13,17 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Global counter for unique script names across parallel tests
+static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Create a mock openspec script that returns predefined output
 fn create_mock_openspec(temp_dir: &Path, list_output: &str, archive_behavior: &str) -> String {
-    let script_path = temp_dir.join("mock_openspec.sh");
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let script_id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let script_path = temp_dir.join(format!("mock_openspec_{}.sh", script_id));
 
     let script_content = format!(
         r#"#!/bin/bash
@@ -37,20 +44,27 @@ esac
         archive_behavior
     );
 
-    let mut file = fs::File::create(&script_path).unwrap();
+    // Create file with executable permissions from the start
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o755)
+        .open(&script_path)
+        .unwrap();
     file.write_all(script_content.as_bytes()).unwrap();
-
-    // Make executable
-    let mut perms = fs::metadata(&script_path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script_path, perms).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
 
     script_path.to_string_lossy().to_string()
 }
 
 /// Create a mock opencode script that simulates apply/archive commands
 fn create_mock_opencode(temp_dir: &Path, behavior: &str) -> String {
-    let script_path = temp_dir.join("mock_opencode.sh");
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let script_id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let script_path = temp_dir.join(format!("mock_opencode_{}.sh", script_id));
 
     let script_content = format!(
         r#"#!/bin/bash
@@ -61,13 +75,17 @@ fn create_mock_opencode(temp_dir: &Path, behavior: &str) -> String {
         behavior
     );
 
-    let mut file = fs::File::create(&script_path).unwrap();
+    // Create file with executable permissions from the start
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o755)
+        .open(&script_path)
+        .unwrap();
     file.write_all(script_content.as_bytes()).unwrap();
-
-    // Make executable
-    let mut perms = fs::metadata(&script_path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script_path, perms).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
 
     script_path.to_string_lossy().to_string()
 }
@@ -244,18 +262,26 @@ fn test_openspec_list_failure() {
     let temp_path = temp_dir.path();
 
     // Create mock openspec that fails on list
-    let script_path = temp_path.join("mock_openspec_fail.sh");
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let script_id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let script_path = temp_path.join(format!("mock_openspec_fail_{}.sh", script_id));
     let script_content = r#"#!/bin/bash
 echo "Error: openspec not configured" >&2
 exit 1
 "#;
 
-    let mut file = fs::File::create(&script_path).unwrap();
+    // Create file with executable permissions from the start
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o755)
+        .open(&script_path)
+        .unwrap();
     file.write_all(script_content.as_bytes()).unwrap();
-
-    let mut perms = fs::metadata(&script_path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script_path, perms).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
 
     // Verify the failure
     let output = Command::new(&script_path).arg("list").output().unwrap();
@@ -500,7 +526,10 @@ fn test_archive_priority_complete_changes_first() {
   change-a     5/5 tasks   5m ago
   change-b     2/4 tasks   10m ago"#;
 
-    let script_path = temp_path.join("mock_openspec_priority.sh");
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let script_id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let script_path = temp_path.join(format!("mock_openspec_priority_{}.sh", script_id));
     let script_content = format!(
         r#"#!/bin/bash
 case "$1" in
@@ -521,12 +550,17 @@ esac
         archive_log.display()
     );
 
-    let mut file = fs::File::create(&script_path).unwrap();
+    // Create file with executable permissions from the start
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o755)
+        .open(&script_path)
+        .unwrap();
     file.write_all(script_content.as_bytes()).unwrap();
-
-    let mut perms = fs::metadata(&script_path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script_path, perms).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
 
     // Verify the complete change (5/5) appears in list
     let output = Command::new(&script_path).arg("list").output().unwrap();
@@ -604,7 +638,10 @@ fn test_mid_apply_completion_detection() {
     let state_file = temp_path.join("state.txt");
     fs::write(&state_file, "0").unwrap(); // Initial state
 
-    let script_path = temp_path.join("mock_openspec_midapply.sh");
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let script_id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let script_path = temp_path.join(format!("mock_openspec_midapply_{}.sh", script_id));
     let script_content = format!(
         r#"#!/bin/bash
 STATE_FILE="{}"
@@ -639,12 +676,17 @@ esac
         state_file.display()
     );
 
-    let mut file = fs::File::create(&script_path).unwrap();
+    // Create file with executable permissions from the start
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o755)
+        .open(&script_path)
+        .unwrap();
     file.write_all(script_content.as_bytes()).unwrap();
-
-    let mut perms = fs::metadata(&script_path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script_path, perms).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
 
     // Initial list - both incomplete
     let output = Command::new(&script_path).arg("list").output().unwrap();

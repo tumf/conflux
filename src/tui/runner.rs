@@ -7,30 +7,29 @@ use crate::error::Result;
 use crate::openspec::Change;
 use crate::vcs::{GitWorkspaceManager, WorkspaceManager};
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
-    },
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::DefaultTerminal;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use super::command_handlers::{handle_tui_command, TuiCommandContext};
 use super::events::{LogEntry, OrchestratorEvent, TuiCommand};
+use super::key_handlers::{handle_key_event, KeyEventContext};
 use super::log_deduplicator;
-use super::orchestrator::{run_orchestrator, run_orchestrator_parallel};
+// orchestrator functions now called from command_handlers
 use super::queue::DynamicQueue;
 use super::render::{render, SPINNER_CHARS};
 use super::state::{AppState, AUTO_REFRESH_INTERVAL_SECS};
-use super::types::{AppMode, QueueStatus, StopMode};
+// AppMode, QueueStatus, StopMode now used in handlers
 use super::utils::clear_screen;
 
 /// Restore terminal state (called on panic or normal exit)
@@ -41,11 +40,14 @@ fn restore_terminal() {
     ratatui::restore();
 }
 
-fn should_trigger_worktree_command(config: &OrchestratorConfig, is_git_repo: bool) -> bool {
+pub(super) fn should_trigger_worktree_command(
+    config: &OrchestratorConfig,
+    is_git_repo: bool,
+) -> bool {
     config.get_worktree_command().is_some() && is_git_repo
 }
 
-fn build_worktree_path(base_dir: &Path) -> PathBuf {
+pub(super) fn build_worktree_path(base_dir: &Path) -> PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
@@ -54,7 +56,7 @@ fn build_worktree_path(base_dir: &Path) -> PathBuf {
 }
 
 /// Load worktrees and check for merge conflicts in parallel
-async fn load_worktrees_with_conflict_check(
+pub(super) async fn load_worktrees_with_conflict_check(
     repo_root: &Path,
 ) -> Result<Vec<super::types::WorktreeInfo>> {
     use super::types::{MergeConflictInfo, WorktreeInfo};
@@ -587,522 +589,38 @@ async fn run_tui_loop(
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    let had_warning_message = app.warning_message.is_some();
-                    let had_warning_popup = app.warning_popup.is_some();
+                    // Create context for key event handling
+                    let mut key_ctx = KeyEventContext {
+                        app: &mut app,
+                        terminal,
+                        repo_root: &repo_root,
+                        config: &config,
+                        worktree_base_dir: &worktree_base_dir,
+                        tx: &tx,
+                        cmd_tx: &cmd_tx,
+                        ai_runner: &ai_runner,
+                        graceful_stop_flag: &graceful_stop_flag,
+                        orchestrator_cancel: &orchestrator_cancel,
+                        orchestrator_handle: &orchestrator_handle,
+                    };
 
-                    // Handle QrPopup mode - any key closes the popup
-                    if app.mode == AppMode::QrPopup {
-                        app.hide_qr_popup();
-                        continue;
+                    // Handle key event using helper
+                    match handle_key_event(key, &mut key_ctx).await {
+                        Ok(Some(cmd)) => {
+                            // Send command to command channel for processing
+                            let _ = cmd_tx.send(cmd).await;
+                        }
+                        Ok(None) => {
+                            // No command to execute
+                        }
+                        Err(e) => {
+                            app.add_log(LogEntry::error(format!("Key handling error: {}", e)));
+                        }
                     }
 
-                    // Handle worktree delete confirmation
-                    if app.mode == AppMode::ConfirmWorktreeDelete {
-                        match (key.code, key.modifiers) {
-                            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
-                                if let Some(cmd) = app.confirm_worktree_action_delete() {
-                                    let _ = cmd_tx.send(cmd).await;
-                                }
-                            }
-                            (KeyCode::Char('n'), _)
-                            | (KeyCode::Char('N'), _)
-                            | (KeyCode::Esc, _) => {
-                                app.cancel_worktree_action();
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    match (key.code, key.modifiers) {
-                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                            app.should_quit = true;
-                            break;
-                        }
-                        (KeyCode::Tab, _) => {
-                            // Switch between Changes and Worktrees views
-                            use crate::tui::types::ViewMode;
-                            let new_view = match app.view_mode {
-                                ViewMode::Changes => ViewMode::Worktrees,
-                                ViewMode::Worktrees => ViewMode::Changes,
-                            };
-
-                            // Load worktrees with conflict check when switching to Worktrees view
-                            if new_view == ViewMode::Worktrees {
-                                let load_tx = tx.clone();
-                                let load_repo_root = repo_root.clone();
-                                tokio::spawn(async move {
-                                    match load_worktrees_with_conflict_check(&load_repo_root).await
-                                    {
-                                        Ok(worktrees) => {
-                                            let _ = load_tx
-                                                .send(OrchestratorEvent::WorktreesRefreshed {
-                                                    worktrees,
-                                                })
-                                                .await;
-                                        }
-                                        Err(e) => {
-                                            let _ = load_tx
-                                                .send(OrchestratorEvent::Log(LogEntry::error(
-                                                    format!("Failed to load worktrees: {}", e),
-                                                )))
-                                                .await;
-                                        }
-                                    }
-                                });
-                            }
-
-                            app.view_mode = new_view;
-                        }
-                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
-                            use crate::tui::types::ViewMode;
-                            match app.view_mode {
-                                ViewMode::Changes => app.cursor_up(),
-                                ViewMode::Worktrees => app.worktree_cursor_up(),
-                            }
-                        }
-                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
-                            use crate::tui::types::ViewMode;
-                            match app.view_mode {
-                                ViewMode::Changes => app.cursor_down(),
-                                ViewMode::Worktrees => app.worktree_cursor_down(),
-                            }
-                        }
-                        (KeyCode::Char(' '), _) => {
-                            if let Some(cmd) = app.toggle_selection() {
-                                let _ = cmd_tx.send(cmd).await;
-                            }
-                        }
-                        (KeyCode::Char('@'), _) => {
-                            // Toggle approval status
-                            debug!(
-                                "@ key pressed: mode={:?}, view_mode={:?}, cursor_index={}, changes_len={}",
-                                app.mode, app.view_mode, app.cursor_index, app.changes.len()
-                            );
-                            if let Some(cmd) = app.toggle_approval() {
-                                debug!("toggle_approval returned: {:?}", cmd);
-                                let _ = cmd_tx.send(cmd).await;
-                            } else {
-                                debug!("toggle_approval returned None");
-                            }
-                        }
-                        (KeyCode::Char('e'), _) => {
-                            use crate::tui::types::ViewMode;
-
-                            let view_mode = app.view_mode;
-                            let change_id = if !app.changes.is_empty()
-                                && app.cursor_index < app.changes.len()
-                            {
-                                Some(app.changes[app.cursor_index].id.clone())
-                            } else {
-                                None
-                            };
-                            let worktree_path = app.get_selected_worktree_path();
-
-                            suspend_terminal_and_execute_sync(terminal, || {
-                                // Launch editor based on view mode
-                                match view_mode {
-                                    ViewMode::Changes => {
-                                        if let Some(id) = change_id {
-                                            if let Err(e) =
-                                                super::utils::launch_editor_for_change(&id)
-                                            {
-                                                eprintln!("Failed to launch editor: {}", e);
-                                            }
-                                        }
-                                    }
-                                    ViewMode::Worktrees => {
-                                        if let Some(path) = worktree_path {
-                                            if let Err(e) =
-                                                super::utils::launch_editor_in_dir(&path)
-                                            {
-                                                eprintln!("Failed to launch editor: {}", e);
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(())
-                            })?;
-                        }
-                        (KeyCode::Char('m'), _) | (KeyCode::Char('M'), _) => {
-                            use crate::tui::types::ViewMode;
-                            use tracing::debug;
-
-                            debug!("M key pressed: view_mode={:?}", app.view_mode);
-
-                            match app.view_mode {
-                                ViewMode::Changes => {
-                                    // Changes view: resolve deferred merge
-                                    debug!("M key (Changes view): attempting resolve_merge");
-                                    if let Some(cmd) = app.resolve_merge() {
-                                        debug!("M key (Changes view): sending command {:?}", cmd);
-                                        let _ = cmd_tx.send(cmd).await;
-                                    } else {
-                                        debug!("M key (Changes view): resolve_merge returned None");
-                                    }
-                                }
-                                ViewMode::Worktrees => {
-                                    // Worktrees view: merge branch to base
-                                    debug!("M key (Worktrees view): attempting request_merge_worktree_branch");
-                                    if let Some(cmd) = app.request_merge_worktree_branch() {
-                                        debug!("M key (Worktrees view): sending command {:?}", cmd);
-                                        let _ = cmd_tx.send(cmd).await;
-                                    } else {
-                                        debug!("M key (Worktrees view): request_merge_worktree_branch returned None");
-                                    }
-                                }
-                            }
-                        }
-                        (KeyCode::Char('d'), _) | (KeyCode::Char('D'), _) => {
-                            use crate::tui::types::ViewMode;
-                            if app.view_mode == ViewMode::Worktrees {
-                                // Worktree view: delete selected worktree
-                                app.request_worktree_delete_from_list();
-                            }
-                            // Note: D key removed from Changes view as per spec
-                        }
-                        (KeyCode::Esc, _) => {
-                            // Handle stop in Running or Stopping mode
-                            match app.mode {
-                                AppMode::Running => {
-                                    // First Esc: Graceful stop
-                                    app.stop_mode = StopMode::GracefulPending;
-                                    graceful_stop_flag.store(true, Ordering::SeqCst);
-                                    app.mode = AppMode::Stopping;
-                                    app.add_log(LogEntry::warn(
-                                        "Stopping after current change completes...",
-                                    ));
-                                }
-                                AppMode::Stopping => {
-                                    // Second Esc: Force stop
-                                    app.stop_mode = StopMode::ForceStopped;
-                                    if let Some(cancel) = &orchestrator_cancel {
-                                        cancel.cancel();
-                                    }
-                                    // Use OrchestratorEvent::Stopped to properly reset queue status
-                                    // and preserve execution marks (same as graceful stop)
-                                    app.handle_orchestrator_event(OrchestratorEvent::Stopped);
-                                    app.current_change = None;
-                                    app.add_log(LogEntry::warn("Force stopped"));
-                                }
-                                _ => {}
-                            }
-                        }
-                        (KeyCode::F(5), _) => {
-                            // Handle F5 in Stopping mode to cancel graceful stop
-                            if app.mode == AppMode::Stopping {
-                                // Check if orchestrator is still running
-                                if orchestrator_handle
-                                    .as_ref()
-                                    .is_some_and(|h| !h.is_finished())
-                                {
-                                    // Cancel graceful stop and return to Running mode
-                                    graceful_stop_flag.store(false, Ordering::SeqCst);
-                                    app.stop_mode = StopMode::None;
-                                    app.mode = AppMode::Running;
-                                    app.add_log(LogEntry::info("Stop canceled, continuing..."));
-                                } else {
-                                    // Already stopped, cannot cancel
-                                    app.add_log(LogEntry::warn(
-                                        "Cannot cancel stop: processing already completed",
-                                    ));
-                                }
-                                continue;
-                            }
-
-                            // Determine which command to use based on mode
-                            let cmd = if app.mode == AppMode::Error {
-                                app.retry_error_changes()
-                            } else if app.mode == AppMode::Stopped {
-                                app.resume_processing()
-                            } else {
-                                app.start_processing()
-                            };
-
-                            if let Some(cmd) = cmd {
-                                // Start orchestrator task
-                                let selected_ids = match &cmd {
-                                    TuiCommand::StartProcessing(ids) => ids.clone(),
-                                    _ => vec![],
-                                };
-
-                                if !selected_ids.is_empty() {
-                                    graceful_stop_flag.store(false, Ordering::SeqCst);
-                                    let orch_tx = tx.clone();
-                                    let orch_config = config.clone();
-                                    let orch_cancel = CancellationToken::new();
-                                    let orch_dynamic_queue = dynamic_queue.clone();
-                                    let orch_graceful_stop = graceful_stop_flag.clone();
-                                    let orch_shared_state = shared_state.clone();
-                                    let orch_manual_resolve = manual_resolve_counter.clone();
-                                    orchestrator_cancel = Some(orch_cancel.clone());
-                                    let use_parallel = app.parallel_mode;
-                                    #[cfg(feature = "web-monitoring")]
-                                    let orch_web_state = web_state.clone();
-
-                                    orchestrator_handle = Some(tokio::spawn(async move {
-                                        let result = if use_parallel {
-                                            run_orchestrator_parallel(
-                                                selected_ids,
-                                                orch_config,
-                                                orch_tx.clone(),
-                                                orch_cancel,
-                                                orch_dynamic_queue,
-                                                orch_graceful_stop,
-                                                orch_shared_state.clone(),
-                                                orch_manual_resolve,
-                                                #[cfg(feature = "web-monitoring")]
-                                                orch_web_state,
-                                            )
-                                            .await
-                                        } else {
-                                            run_orchestrator(
-                                                selected_ids,
-                                                orch_config,
-                                                orch_tx.clone(),
-                                                orch_cancel,
-                                                orch_dynamic_queue,
-                                                orch_graceful_stop,
-                                                orch_shared_state,
-                                                #[cfg(feature = "web-monitoring")]
-                                                orch_web_state,
-                                            )
-                                            .await
-                                        };
-
-                                        // Log any errors from the orchestrator
-                                        if let Err(ref e) = result {
-                                            let _ = orch_tx
-                                                .send(OrchestratorEvent::Log(LogEntry::error(
-                                                    format!("Orchestrator error: {}", e),
-                                                )))
-                                                .await;
-                                        }
-
-                                        result
-                                    }));
-                                }
-                            }
-                        }
-                        (KeyCode::PageUp, _) => {
-                            // Scroll logs up (show older entries)
-                            app.scroll_logs_up(5);
-                        }
-                        (KeyCode::PageDown, _) => {
-                            // Scroll logs down (show newer entries)
-                            app.scroll_logs_down(5);
-                        }
-                        (KeyCode::Home, _) => {
-                            // Jump to oldest log entry
-                            app.scroll_logs_to_top();
-                        }
-                        (KeyCode::End, _) => {
-                            // Jump to newest log entry and re-enable auto-scroll
-                            app.scroll_logs_to_bottom();
-                        }
-                        (KeyCode::Char('='), _) => {
-                            // Toggle parallel mode (only if git is available)
-                            app.toggle_parallel_mode();
-                        }
-                        (KeyCode::Enter, _) => {
-                            use crate::tui::types::ViewMode;
-
-                            if app.view_mode != ViewMode::Worktrees {
-                                app.add_log(LogEntry::warn("Enter ignored: not in Worktrees view"));
-                                continue;
-                            }
-
-                            let Some(worktree_path_str) = app.get_selected_worktree_path() else {
-                                app.add_log(LogEntry::warn("Enter ignored: no worktree selected"));
-                                continue;
-                            };
-
-                            let Some(template) = config.get_worktree_command().map(str::to_string)
-                            else {
-                                app.add_log(LogEntry::warn(
-                                    "Enter ignored: worktree_command not configured",
-                                ));
-                                continue;
-                            };
-
-                            let Some(repo_root_str) = repo_root.to_str() else {
-                                app.add_log(LogEntry::error(
-                                    "Failed to resolve repo root path".to_string(),
-                                ));
-                                continue;
-                            };
-
-                            let command = OrchestratorConfig::expand_worktree_command(
-                                &template,
-                                &worktree_path_str,
-                                repo_root_str,
-                            );
-
-                            app.add_log(LogEntry::info(format!(
-                                "Running worktree command in {}",
-                                worktree_path_str
-                            )));
-
-                            let worktree_path = Path::new(&worktree_path_str);
-                            execute_worktree_command(
-                                terminal,
-                                &command,
-                                worktree_path,
-                                &ai_runner,
-                                &mut app,
-                            )
-                            .await?;
-                        }
-                        (KeyCode::Char('+'), _) => {
-                            use crate::tui::types::ViewMode;
-
-                            // Only work in Worktrees view
-                            if app.view_mode != ViewMode::Worktrees {
-                                continue;
-                            }
-
-                            let Some(template) = config.get_worktree_command().map(str::to_string)
-                            else {
-                                continue;
-                            };
-
-                            let is_git_repo =
-                                match crate::vcs::git::commands::check_git_repo(&repo_root).await {
-                                    Ok(is_repo) => is_repo,
-                                    Err(err) => {
-                                        app.add_log(LogEntry::error(format!(
-                                            "Failed to check git repo: {}",
-                                            err
-                                        )));
-                                        continue;
-                                    }
-                                };
-
-                            if !should_trigger_worktree_command(&config, is_git_repo) {
-                                continue;
-                            }
-
-                            if let Err(err) = std::fs::create_dir_all(&worktree_base_dir) {
-                                app.add_log(LogEntry::error(format!(
-                                    "Failed to prepare worktree base dir: {}",
-                                    err
-                                )));
-                                continue;
-                            }
-
-                            let worktree_path = build_worktree_path(&worktree_base_dir);
-                            let Some(worktree_path_str) = worktree_path.to_str() else {
-                                app.add_log(LogEntry::error(
-                                    "Failed to resolve worktree path".to_string(),
-                                ));
-                                continue;
-                            };
-                            let Some(repo_root_str) = repo_root.to_str() else {
-                                app.add_log(LogEntry::error(
-                                    "Failed to resolve repo root path".to_string(),
-                                ));
-                                continue;
-                            };
-
-                            // Generate unique branch name with format: ws-session-<timestamp>
-                            let branch_name =
-                                match crate::vcs::git::commands::generate_unique_branch_name(
-                                    &repo_root,
-                                    "ws-session",
-                                    10,
-                                )
-                                .await
-                                {
-                                    Ok(name) => name,
-                                    Err(err) => {
-                                        app.add_log(LogEntry::error(format!(
-                                            "Failed to generate unique branch name: {}",
-                                            err
-                                        )));
-                                        continue;
-                                    }
-                                };
-
-                            // Create worktree with branch instead of detached HEAD
-                            if let Err(err) = crate::vcs::git::commands::worktree_add(
-                                &repo_root,
-                                worktree_path_str,
-                                &branch_name,
-                                "HEAD",
-                            )
-                            .await
-                            {
-                                app.add_log(LogEntry::error(format!(
-                                    "Failed to create worktree: {}",
-                                    err
-                                )));
-                                continue;
-                            }
-
-                            app.add_log(LogEntry::info(format!(
-                                "Created worktree with branch '{}'",
-                                branch_name
-                            )));
-
-                            // Execute setup script if it exists
-                            if let Err(err) = crate::vcs::git::commands::run_worktree_setup(
-                                &repo_root,
-                                &worktree_path,
-                            )
-                            .await
-                            {
-                                app.add_log(LogEntry::error(format!(
-                                    "Failed to run worktree setup: {}",
-                                    err
-                                )));
-                                // Don't continue - setup failure is considered an error
-                                // but the worktree was already created, so we should clean it up
-                                if let Err(cleanup_err) =
-                                    crate::vcs::git::commands::worktree_remove(
-                                        &repo_root,
-                                        worktree_path_str,
-                                    )
-                                    .await
-                                {
-                                    app.add_log(LogEntry::error(format!(
-                                        "Failed to cleanup worktree after setup failure: {}",
-                                        cleanup_err
-                                    )));
-                                }
-                                continue;
-                            }
-
-                            let command = OrchestratorConfig::expand_worktree_command(
-                                &template,
-                                worktree_path_str,
-                                repo_root_str,
-                            );
-                            app.add_log(LogEntry::info(format!(
-                                "Running worktree command in {}",
-                                worktree_path_str
-                            )));
-
-                            execute_worktree_command(
-                                terminal,
-                                &command,
-                                &worktree_path,
-                                &ai_runner,
-                                &mut app,
-                            )
-                            .await?;
-                        }
-                        (KeyCode::Char('w'), _) => {
-                            // Show QR code popup (only if web_url is set)
-                            if app.web_url.is_some() {
-                                app.show_qr_popup();
-                            }
-                        }
-                        _ => {}
-                    }
-                    // Clear previous warning message on any key press
-                    if had_warning_message || had_warning_popup {
-                        app.warning_message = None;
-                        app.warning_popup = None;
+                    // Check if app should quit (set by Ctrl+C)
+                    if app.should_quit {
+                        break;
                     }
                 }
                 Event::Mouse(mouse) => {
@@ -1152,692 +670,36 @@ async fn run_tui_loop(
 
         // Handle dynamic queue additions and removals
         while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                TuiCommand::StartProcessing(ids) => {
-                    // Handle web control Start command (empty ids vec) or regular Start
-                    let cmd = if ids.is_empty() {
-                        // Web control start - determine which command based on app mode
-                        if app.mode == AppMode::Error {
-                            app.retry_error_changes()
-                        } else if app.mode == AppMode::Stopped {
-                            app.resume_processing()
-                        } else {
-                            app.start_processing()
-                        }
-                    } else {
-                        // Regular start with specific IDs (from F5 key)
-                        Some(TuiCommand::StartProcessing(ids.clone()))
-                    };
+            // Create context for TuiCommand handling
+            let mut cmd_ctx = TuiCommandContext {
+                app: &mut app,
+                repo_root: &repo_root,
+                config: &config,
+                tx: &tx,
+                dynamic_queue: &dynamic_queue,
+                #[cfg(feature = "web-monitoring")]
+                web_state: &web_state,
+            };
 
-                    if let Some(TuiCommand::StartProcessing(selected_ids)) = cmd {
-                        if !selected_ids.is_empty() {
-                            graceful_stop_flag.store(false, Ordering::SeqCst);
-                            let orch_tx = tx.clone();
-                            let orch_config = config.clone();
-                            let orch_cancel = CancellationToken::new();
-                            let orch_dynamic_queue = dynamic_queue.clone();
-                            let orch_graceful_stop = graceful_stop_flag.clone();
-                            let orch_shared_state = shared_state.clone();
-                            let orch_manual_resolve = manual_resolve_counter.clone();
-                            orchestrator_cancel = Some(orch_cancel.clone());
-                            let use_parallel = app.parallel_mode;
-                            #[cfg(feature = "web-monitoring")]
-                            let orch_web_state = web_state.clone();
-
-                            orchestrator_handle = Some(tokio::spawn(async move {
-                                #[cfg(feature = "web-monitoring")]
-                                let result = if use_parallel {
-                                    run_orchestrator_parallel(
-                                        selected_ids,
-                                        orch_config,
-                                        orch_tx.clone(),
-                                        orch_cancel,
-                                        orch_dynamic_queue,
-                                        orch_graceful_stop,
-                                        orch_shared_state,
-                                        orch_manual_resolve.clone(),
-                                        orch_web_state,
-                                    )
-                                    .await
-                                } else {
-                                    run_orchestrator(
-                                        selected_ids,
-                                        orch_config,
-                                        orch_tx.clone(),
-                                        orch_cancel,
-                                        orch_dynamic_queue,
-                                        orch_graceful_stop,
-                                        orch_shared_state,
-                                        orch_web_state,
-                                    )
-                                    .await
-                                };
-                                #[cfg(not(feature = "web-monitoring"))]
-                                let result = if use_parallel {
-                                    run_orchestrator_parallel(
-                                        selected_ids,
-                                        orch_config,
-                                        orch_tx.clone(),
-                                        orch_cancel,
-                                        orch_dynamic_queue,
-                                        orch_graceful_stop,
-                                        orch_shared_state,
-                                        orch_manual_resolve,
-                                    )
-                                    .await
-                                } else {
-                                    run_orchestrator(
-                                        selected_ids,
-                                        orch_config,
-                                        orch_tx.clone(),
-                                        orch_cancel,
-                                        orch_dynamic_queue,
-                                        orch_graceful_stop,
-                                        orch_shared_state,
-                                    )
-                                    .await
-                                };
-                                let _ = orch_tx.send(OrchestratorEvent::Stopped).await;
-                                result
-                            }));
-                        }
-                    }
+            // Handle TuiCommand using helper
+            match handle_tui_command(
+                cmd,
+                &mut cmd_ctx,
+                &graceful_stop_flag,
+                &shared_state,
+                &manual_resolve_counter,
+                &mut orchestrator_cancel,
+            )
+            .await
+            {
+                Ok(Some(handle)) => {
+                    orchestrator_handle = Some(handle);
                 }
-                TuiCommand::AddToQueue(id) => {
-                    // Push to dynamic queue for orchestrator to pick up
-                    if dynamic_queue.push(id.clone()).await {
-                        app.add_log(LogEntry::info(format!("Added to dynamic queue: {}", id)));
-                    } else {
-                        app.add_log(LogEntry::warn(format!("Already in dynamic queue: {}", id)));
-                    }
+                Ok(None) => {
+                    // Command processed without starting orchestrator
                 }
-                TuiCommand::RemoveFromQueue(id) => {
-                    // Remove from dynamic queue so orchestrator won't process it
-                    let removed_from_dynamic = dynamic_queue.remove(&id).await;
-                    let removed_from_pending = dynamic_queue.mark_removed(id.clone()).await;
-                    let mut details = Vec::new();
-                    if removed_from_dynamic {
-                        details.push("also removed from dynamic queue");
-                    }
-                    if removed_from_pending {
-                        details.push("removed from pending");
-                    }
-                    let suffix = if details.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", details.join(", "))
-                    };
-                    app.add_log(LogEntry::info(format!(
-                        "Removed from queue: {}{}",
-                        id, suffix
-                    )));
-                }
-                TuiCommand::ApproveOnly(id) => {
-                    // Approve without adding to queue (select/running/stopped modes)
-                    use crate::approval;
-
-                    match approval::approve_change(&id) {
-                        Ok(_) => {
-                            app.update_approval_status(&id, true);
-                            if app.mode == AppMode::Select {
-                                if let Some(change) = app.changes.iter_mut().find(|c| c.id == id) {
-                                    change.selected = true;
-                                    change.queue_status = QueueStatus::NotQueued;
-                                }
-                            }
-                            app.add_log(LogEntry::info(format!("Approved (not queued): {}", id)));
-                        }
-                        Err(e) => {
-                            app.add_log(LogEntry::error(format!(
-                                "Failed to approve '{}': {}",
-                                id, e
-                            )));
-                        }
-                    }
-                }
-                TuiCommand::UnapproveAndDequeue(id) => {
-                    // Unapprove and remove from queue (used in running/completed mode)
-                    use crate::approval;
-
-                    // First check if queued
-                    let was_queued = app
-                        .changes
-                        .iter()
-                        .find(|c| c.id == id)
-                        .map(|c| matches!(c.queue_status, QueueStatus::Queued))
-                        .unwrap_or(false);
-
-                    match approval::unapprove_change(&id) {
-                        Ok(_) => {
-                            app.update_approval_status(&id, false);
-                            // Also remove from queue if queued
-                            if let Some(change) = app.changes.iter_mut().find(|c| c.id == id) {
-                                if matches!(change.queue_status, QueueStatus::Queued) {
-                                    change.queue_status = QueueStatus::NotQueued;
-                                }
-                                change.selected = false;
-                            }
-                            // Remove from dynamic queue so orchestrator won't process it
-                            let removed_from_dynamic = dynamic_queue.remove(&id).await;
-                            let removed_from_pending = dynamic_queue.mark_removed(id.clone()).await;
-                            let mut details = Vec::new();
-                            if removed_from_dynamic {
-                                details.push("also removed from dynamic queue");
-                            }
-                            if removed_from_pending {
-                                details.push("removed from pending");
-                            }
-                            let suffix = if details.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" ({})", details.join(", "))
-                            };
-                            let msg = if was_queued {
-                                format!("Unapproved and removed from queue: {}{}", id, suffix)
-                            } else {
-                                format!("Unapproved: {}{}", id, suffix)
-                            };
-                            app.add_log(LogEntry::info(msg));
-                        }
-                        Err(e) => {
-                            app.add_log(LogEntry::error(format!(
-                                "Failed to unapprove '{}': {}",
-                                id, e
-                            )));
-                        }
-                    }
-                }
-                TuiCommand::DeleteWorktree(id) => {
-                    match crate::vcs::git::remove_worktrees_for_change(&repo_root, &id).await {
-                        Ok(removed) => {
-                            if removed == 0 {
-                                app.warning_popup = Some(super::state::WarningPopup {
-                                    title: "Worktree not found".to_string(),
-                                    message: format!("No worktree found for change '{}'.", id),
-                                });
-                                app.add_log(LogEntry::warn(format!(
-                                    "No worktree to delete for '{}'",
-                                    id
-                                )));
-                            } else {
-                                if let Some(change) =
-                                    app.changes.iter_mut().find(|change| change.id == id)
-                                {
-                                    change.has_worktree = false;
-                                }
-                                app.add_log(LogEntry::success(format!(
-                                    "Deleted {} worktree(s) for '{}'",
-                                    removed, id
-                                )));
-                            }
-                        }
-                        Err(e) => {
-                            app.warning_popup = Some(super::state::WarningPopup {
-                                title: "Worktree delete failed".to_string(),
-                                message: format!("Failed to delete worktrees for '{}': {}", id, e),
-                            });
-                            app.add_log(LogEntry::error(format!(
-                                "Worktree delete failed for '{}': {}",
-                                id, e
-                            )));
-                        }
-                    }
-                }
-                TuiCommand::DeleteWorktreeByPath(path, branch_name) => {
-                    match crate::vcs::git::commands::worktree_remove(
-                        &repo_root,
-                        path.to_string_lossy().as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            app.add_log(LogEntry::success(format!(
-                                "Deleted worktree: {}",
-                                path.display()
-                            )));
-
-                            // Delete the associated branch if it exists
-                            if let Some(branch) = branch_name {
-                                match crate::vcs::git::commands::branch_delete(&repo_root, &branch)
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        app.add_log(LogEntry::success(format!(
-                                            "Deleted branch: {}",
-                                            branch
-                                        )));
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to delete branch '{}': {} (continuing)",
-                                            branch, e
-                                        );
-                                        app.add_log(LogEntry::warn(format!(
-                                            "Failed to delete branch '{}': {}",
-                                            branch, e
-                                        )));
-                                    }
-                                }
-                            }
-
-                            // Refresh worktree list with conflict check
-                            match load_worktrees_with_conflict_check(&repo_root).await {
-                                Ok(worktrees) => {
-                                    let _ = tx
-                                        .send(OrchestratorEvent::WorktreesRefreshed { worktrees })
-                                        .await;
-                                }
-                                Err(e) => {
-                                    app.add_log(LogEntry::error(format!(
-                                        "Failed to refresh worktrees: {}",
-                                        e
-                                    )));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            app.warning_popup = Some(super::state::WarningPopup {
-                                title: "Worktree delete failed".to_string(),
-                                message: format!(
-                                    "Failed to delete worktree '{}': {}",
-                                    path.display(),
-                                    e
-                                ),
-                            });
-                            app.add_log(LogEntry::error(format!(
-                                "Worktree delete failed for '{}': {}",
-                                path.display(),
-                                e
-                            )));
-                        }
-                    }
-                }
-                TuiCommand::Stop => {
-                    // Initiate graceful stop
-                    if app.mode == AppMode::Running {
-                        app.stop_mode = StopMode::GracefulPending;
-                        graceful_stop_flag.store(true, Ordering::SeqCst);
-                        app.mode = AppMode::Stopping;
-                        app.add_log(LogEntry::warn("Stopping after current change completes..."));
-                        // Emit Stopping event for web clients
-                        app.handle_orchestrator_event(OrchestratorEvent::Stopping);
-                        // Forward to web state immediately for web control API
-                        #[cfg(feature = "web-monitoring")]
-                        if let Some(ref web_state) = web_state {
-                            web_state
-                                .apply_execution_event(&OrchestratorEvent::Stopping)
-                                .await;
-                        }
-                    } else {
-                        app.add_log(LogEntry::warn(format!(
-                            "Cannot stop: not running (current mode: {:?})",
-                            app.mode
-                        )));
-                    }
-                }
-                TuiCommand::CancelStop => {
-                    // Cancel graceful stop and return to Running mode
-                    if app.mode == AppMode::Stopping {
-                        // Check if orchestrator is still running
-                        if orchestrator_handle
-                            .as_ref()
-                            .is_some_and(|h| !h.is_finished())
-                        {
-                            graceful_stop_flag.store(false, Ordering::SeqCst);
-                            app.stop_mode = StopMode::None;
-                            app.mode = AppMode::Running;
-                            app.add_log(LogEntry::info("Stop canceled, continuing..."));
-                            // Forward to web state immediately for web control API
-                            #[cfg(feature = "web-monitoring")]
-                            if let Some(ref web_state) = web_state {
-                                // Use ProcessingStarted with empty string to transition to running mode
-                                web_state
-                                    .apply_execution_event(&OrchestratorEvent::ProcessingStarted(
-                                        "".to_string(),
-                                    ))
-                                    .await;
-                            }
-                        } else {
-                            app.add_log(LogEntry::warn(
-                                "Cannot cancel stop: processing already completed",
-                            ));
-                        }
-                    } else {
-                        app.add_log(LogEntry::warn(format!(
-                            "Cannot cancel stop: not stopping (current mode: {:?})",
-                            app.mode
-                        )));
-                    }
-                }
-                TuiCommand::ForceStop => {
-                    // Force stop immediately
-                    if matches!(app.mode, AppMode::Running | AppMode::Stopping) {
-                        app.stop_mode = StopMode::ForceStopped;
-                        if let Some(cancel) = &orchestrator_cancel {
-                            cancel.cancel();
-                        }
-                        app.handle_orchestrator_event(OrchestratorEvent::Stopped);
-                        app.current_change = None;
-                        app.add_log(LogEntry::warn("Force stopped"));
-
-                        // Forward stopped event to web state
-                        #[cfg(feature = "web-monitoring")]
-                        if let Some(ref web_state) = web_state {
-                            use crate::events::ExecutionEvent;
-                            web_state
-                                .apply_execution_event(&ExecutionEvent::Stopped)
-                                .await;
-                        }
-                    } else {
-                        app.add_log(LogEntry::warn(format!(
-                            "Cannot force stop: not running or stopping (current mode: {:?})",
-                            app.mode
-                        )));
-                    }
-                }
-                TuiCommand::Retry => {
-                    // Retry error changes (same as F5 in error mode)
-                    if app.mode == AppMode::Error {
-                        if let Some(cmd) = app.retry_error_changes() {
-                            // Start orchestrator task
-                            let selected_ids = match &cmd {
-                                TuiCommand::StartProcessing(ids) => ids.clone(),
-                                _ => vec![],
-                            };
-
-                            if !selected_ids.is_empty() {
-                                graceful_stop_flag.store(false, Ordering::SeqCst);
-                                let orch_tx = tx.clone();
-                                let orch_config = config.clone();
-                                let orch_cancel = CancellationToken::new();
-                                let orch_dynamic_queue = dynamic_queue.clone();
-                                let orch_graceful_stop = graceful_stop_flag.clone();
-                                let orch_shared_state = shared_state.clone();
-                                let orch_manual_resolve = manual_resolve_counter.clone();
-                                orchestrator_cancel = Some(orch_cancel.clone());
-                                let use_parallel = app.parallel_mode;
-                                #[cfg(feature = "web-monitoring")]
-                                let orch_web_state = web_state.clone();
-
-                                orchestrator_handle = Some(tokio::spawn(async move {
-                                    #[cfg(feature = "web-monitoring")]
-                                    let result = if use_parallel {
-                                        run_orchestrator_parallel(
-                                            selected_ids,
-                                            orch_config,
-                                            orch_tx.clone(),
-                                            orch_cancel,
-                                            orch_dynamic_queue,
-                                            orch_graceful_stop,
-                                            orch_shared_state,
-                                            orch_manual_resolve.clone(),
-                                            orch_web_state,
-                                        )
-                                        .await
-                                    } else {
-                                        run_orchestrator(
-                                            selected_ids,
-                                            orch_config,
-                                            orch_tx.clone(),
-                                            orch_cancel,
-                                            orch_dynamic_queue,
-                                            orch_graceful_stop,
-                                            orch_shared_state,
-                                            orch_web_state,
-                                        )
-                                        .await
-                                    };
-                                    #[cfg(not(feature = "web-monitoring"))]
-                                    let result = if use_parallel {
-                                        run_orchestrator_parallel(
-                                            selected_ids,
-                                            orch_config,
-                                            orch_tx.clone(),
-                                            orch_cancel,
-                                            orch_dynamic_queue,
-                                            orch_graceful_stop,
-                                            orch_shared_state,
-                                            orch_manual_resolve,
-                                        )
-                                        .await
-                                    } else {
-                                        run_orchestrator(
-                                            selected_ids,
-                                            orch_config,
-                                            orch_tx.clone(),
-                                            orch_cancel,
-                                            orch_dynamic_queue,
-                                            orch_graceful_stop,
-                                            orch_shared_state,
-                                        )
-                                        .await
-                                    };
-                                    let _ = orch_tx.send(OrchestratorEvent::Stopped).await;
-                                    result
-                                }));
-                            }
-                        }
-                    } else {
-                        app.add_log(LogEntry::warn(format!(
-                            "Cannot retry: not in error mode (current mode: {:?})",
-                            app.mode
-                        )));
-                    }
-                }
-                TuiCommand::MergeWorktreeBranch {
-                    worktree_path,
-                    branch_name,
-                } => {
-                    use tracing::debug;
-
-                    debug!(
-                        "Processing TuiCommand::MergeWorktreeBranch: worktree_path={}, branch_name={}",
-                        worktree_path.display(),
-                        branch_name
-                    );
-
-                    let merge_tx = tx.clone();
-                    let merge_repo_root = repo_root.clone();
-                    let merge_branch = branch_name.clone();
-                    let merge_config = config.clone();
-                    let merge_worktree_path = worktree_path.clone();
-
-                    tokio::spawn(async move {
-                        debug!(
-                            "Sending BranchMergeStarted event for branch: {}",
-                            merge_branch
-                        );
-                        let _ = merge_tx
-                            .send(OrchestratorEvent::BranchMergeStarted {
-                                branch_name: merge_branch.clone(),
-                            })
-                            .await;
-
-                        // FIX: Merge in base (main worktree), not in worktree directory
-                        // This ensures working directory clean check happens on base side
-                        debug!(
-                            "Executing merge in base repository: repo_root={}, branch={}",
-                            merge_repo_root.display(),
-                            merge_branch
-                        );
-                        match crate::vcs::git::commands::merge_branch(
-                            &merge_repo_root,
-                            &merge_branch,
-                        )
-                        .await
-                        {
-                            Ok(_) => {
-                                debug!("Merge succeeded for branch: {}", merge_branch);
-                                let _ = merge_tx
-                                    .send(OrchestratorEvent::BranchMergeCompleted {
-                                        branch_name: merge_branch.clone(),
-                                    })
-                                    .await;
-
-                                // Run on_merged hook after manual branch merge
-                                // Try to extract change_id from branch name; if it fails, log a warning
-                                if let Some(change_id) = crate::vcs::GitWorkspaceManager::extract_change_id_from_worktree_name(&merge_branch) {
-                                    // Create hook runner from config
-                                    let hooks_config = merge_config.get_hooks();
-                                    let hooks = crate::hooks::HookRunner::new(hooks_config);
-
-                                    // Fetch actual task counts from change data
-                                    let (completed_tasks, total_tasks) =
-                                        match crate::openspec::list_changes_native() {
-                                            Ok(changes) => changes
-                                                .iter()
-                                                .find(|c| c.id == change_id)
-                                                .map(|c| (c.completed_tasks, c.total_tasks))
-                                                .unwrap_or((0, 0)),
-                                            Err(e) => {
-                                                use tracing::warn;
-                                                warn!(
-                                                    "Failed to fetch task counts for on_merged hook: {}",
-                                                    e
-                                                );
-                                                (0, 0)
-                                            }
-                                        };
-
-                                    let hook_context = crate::hooks::HookContext::new(
-                                        0, // changes_processed not available in manual merge
-                                        0, // total_changes not available
-                                        0, // remaining_changes not available
-                                        false,
-                                    )
-                                    .with_change(&change_id, completed_tasks, total_tasks)
-                                    .with_apply_count(0)
-                                    .with_parallel_context(&merge_worktree_path.to_string_lossy(), None);
-
-                                    if let Err(e) = hooks.run_hook(crate::hooks::HookType::OnMerged, &hook_context).await {
-                                        use tracing::warn;
-                                        warn!("on_merged hook failed for {}: {}", change_id, e);
-                                    }
-                                } else {
-                                    use tracing::warn;
-                                    warn!("Could not extract change_id from branch name '{}', skipping on_merged hook", merge_branch);
-                                }
-
-                                // Refresh worktree list to update UI with conflict check
-                                debug!("Refreshing worktree list after successful merge");
-                                match load_worktrees_with_conflict_check(&merge_repo_root).await {
-                                    Ok(worktrees) => {
-                                        debug!(
-                                            "Worktree list refreshed: {} worktrees",
-                                            worktrees.len()
-                                        );
-                                        let _ = merge_tx
-                                            .send(OrchestratorEvent::WorktreesRefreshed {
-                                                worktrees,
-                                            })
-                                            .await;
-                                    }
-                                    Err(e) => {
-                                        debug!("Failed to refresh worktrees: {}", e);
-                                        let _ = merge_tx
-                                            .send(OrchestratorEvent::Log(LogEntry::error(format!(
-                                                "Failed to refresh worktrees: {}",
-                                                e
-                                            ))))
-                                            .await;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                debug!("Merge failed for branch {}: {}", merge_branch, e);
-                                let _ = merge_tx
-                                    .send(OrchestratorEvent::BranchMergeFailed {
-                                        branch_name: merge_branch,
-                                        error: format!("{}", e),
-                                    })
-                                    .await;
-                            }
-                        }
-                    });
-                }
-                TuiCommand::ResolveMerge(id) => {
-                    let resolve_tx = tx.clone();
-                    let resolve_repo_root = repo_root.clone();
-                    let resolve_config = config.clone();
-                    let resolve_worktree_base_dir = worktree_base_dir.clone();
-                    let resolve_counter = manual_resolve_counter.clone();
-                    tokio::spawn(async move {
-                        // Increment counter when resolve starts (consumes a parallel execution slot)
-                        resolve_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-                        // Note: ResolveStarted event is sent by resolve_deferred_merge -> resolve_merges_with_retry
-                        // with the actual expanded command. We don't send it here to avoid duplicate events.
-
-                        // Helper closure to decrement counter and send event
-                        let finish_resolve = |event: OrchestratorEvent| async {
-                            resolve_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                            let _ = resolve_tx.send(event).await;
-                        };
-
-                        match crate::parallel::base_dirty_reason(&resolve_repo_root).await {
-                            Ok(Some(reason)) => {
-                                finish_resolve(OrchestratorEvent::ResolveFailed {
-                                    change_id: id.clone(),
-                                    error: format!("Base is dirty: {}", reason),
-                                })
-                                .await;
-                                return;
-                            }
-                            Err(e) => {
-                                finish_resolve(OrchestratorEvent::ResolveFailed {
-                                    change_id: id.clone(),
-                                    error: format!("Failed to check base status: {}", e),
-                                })
-                                .await;
-                                return;
-                            }
-                            Ok(None) => {}
-                        }
-
-                        match crate::parallel::resolve_deferred_merge(
-                            resolve_repo_root.clone(),
-                            resolve_config.clone(),
-                            &id,
-                        )
-                        .await
-                        {
-                            Ok(_) => {
-                                let refresh_manager = GitWorkspaceManager::new(
-                                    resolve_worktree_base_dir.clone(),
-                                    resolve_repo_root.clone(),
-                                    resolve_config.get_max_concurrent_workspaces(),
-                                    resolve_config.clone(),
-                                );
-                                let worktree_change_ids = match refresh_manager
-                                    .list_worktree_change_ids()
-                                    .await
-                                {
-                                    Ok(ids) => Some(ids),
-                                    Err(err) => {
-                                        let _ = resolve_tx
-                                            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                                                "Failed to refresh worktree snapshot: {}",
-                                                err
-                                            ))))
-                                            .await;
-                                        None
-                                    }
-                                };
-                                finish_resolve(OrchestratorEvent::ResolveCompleted {
-                                    change_id: id.clone(),
-                                    worktree_change_ids,
-                                })
-                                .await;
-                            }
-                            Err(e) => {
-                                finish_resolve(OrchestratorEvent::ResolveFailed {
-                                    change_id: id.clone(),
-                                    error: e.to_string(),
-                                })
-                                .await;
-                            }
-                        }
-                    });
+                Err(e) => {
+                    app.add_log(LogEntry::error(format!("Command handling error: {}", e)));
                 }
             }
         }
@@ -1871,7 +733,7 @@ async fn run_tui_loop(
 ///
 /// This helper executes a worktree command using AiCommandRunner, forwards output
 /// to stdout/stderr, and logs the result to the app state.
-async fn execute_worktree_command(
+pub(super) async fn execute_worktree_command(
     terminal: &mut DefaultTerminal,
     command: &str,
     worktree_path: &Path,
@@ -1963,7 +825,10 @@ where
 }
 
 /// Suspend terminal, execute a synchronous function, then restore terminal
-fn suspend_terminal_and_execute_sync<F, T>(terminal: &mut DefaultTerminal, f: F) -> Result<T>
+pub(super) fn suspend_terminal_and_execute_sync<F, T>(
+    terminal: &mut DefaultTerminal,
+    f: F,
+) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
 {
