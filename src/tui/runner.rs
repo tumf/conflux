@@ -943,68 +943,15 @@ async fn run_tui_loop(
                                 worktree_path_str
                             )));
 
-                            let command_clone = command.clone();
-                            let worktree_path_for_exec =
-                                Path::new(&worktree_path_str).to_path_buf();
-                            let ai_runner_clone = ai_runner.clone();
-
-                            let status_result =
-                                suspend_terminal_and_execute(terminal, || async move {
-                                    info!(
-                                        module = module_path!(),
-                                        "Running worktree command via AiCommandRunner: sh -c {}",
-                                        command_clone
-                                    );
-
-                                    // Execute via AiCommandRunner (with stagger and retry)
-                                    let exec_result = ai_runner_clone
-                                        .execute_streaming_with_retry(
-                                            &command_clone,
-                                            Some(&worktree_path_for_exec),
-                                        )
-                                        .await;
-
-                                    match exec_result {
-                                        Ok((mut child, mut rx)) => {
-                                            // Forward output to stdout/stderr in real-time
-                                            use crate::ai_command_runner::OutputLine;
-                                            while let Some(line) = rx.recv().await {
-                                                match line {
-                                                    OutputLine::Stdout(s) => {
-                                                        println!("{}", s);
-                                                    }
-                                                    OutputLine::Stderr(s) => {
-                                                        eprintln!("{}", s);
-                                                    }
-                                                }
-                                            }
-                                            // Wait for child to complete
-                                            child
-                                                .wait()
-                                                .await
-                                                .map_err(crate::error::OrchestratorError::Io)
-                                        }
-                                        Err(e) => {
-                                            eprintln!("Failed to execute worktree command: {}", e);
-                                            Err(e)
-                                        }
-                                    }
-                                })
-                                .await?;
-
-                            match status_result {
-                                exit_status if exit_status.success() => {
-                                    app.add_log(LogEntry::success(
-                                        "Worktree command completed successfully",
-                                    ));
-                                }
-                                exit_status => {
-                                    app.add_log(LogEntry::error(format!(
-                                        "Worktree command failed with exit code: {:?}",
-                                        exit_status.code()
-                                    )));
-                                }
-                            }
+                            let worktree_path = Path::new(&worktree_path_str);
+                            execute_worktree_command(
+                                terminal,
+                                &command,
+                                worktree_path,
+                                &ai_runner,
+                                &mut app,
+                            )
+                            .await?;
                         }
                         (KeyCode::Char('+'), _) => {
                             use crate::tui::types::ViewMode;
@@ -1135,67 +1082,14 @@ async fn run_tui_loop(
                                 worktree_path_str
                             )));
 
-                            let command_clone = command.clone();
-                            let worktree_path_clone = worktree_path.clone();
-                            let ai_runner_clone = ai_runner.clone();
-
-                            let status_result =
-                                suspend_terminal_and_execute(terminal, || async move {
-                                    info!(
-                                        module = module_path!(),
-                                        "Running worktree command via AiCommandRunner: sh -c {}",
-                                        command_clone
-                                    );
-
-                                    // Execute via AiCommandRunner (with stagger and retry)
-                                    let exec_result = ai_runner_clone
-                                        .execute_streaming_with_retry(
-                                            &command_clone,
-                                            Some(&worktree_path_clone),
-                                        )
-                                        .await;
-
-                                    match exec_result {
-                                        Ok((mut child, mut rx)) => {
-                                            // Forward output to stdout/stderr in real-time
-                                            use crate::ai_command_runner::OutputLine;
-                                            while let Some(line) = rx.recv().await {
-                                                match line {
-                                                    OutputLine::Stdout(s) => {
-                                                        println!("{}", s);
-                                                    }
-                                                    OutputLine::Stderr(s) => {
-                                                        eprintln!("{}", s);
-                                                    }
-                                                }
-                                            }
-                                            // Wait for child to complete
-                                            child
-                                                .wait()
-                                                .await
-                                                .map_err(crate::error::OrchestratorError::Io)
-                                        }
-                                        Err(e) => {
-                                            eprintln!("Failed to execute worktree command: {}", e);
-                                            Err(e)
-                                        }
-                                    }
-                                })
-                                .await?;
-
-                            match status_result {
-                                exit_status if exit_status.success() => {
-                                    app.add_log(LogEntry::success(
-                                        "Worktree command completed successfully",
-                                    ));
-                                }
-                                exit_status => {
-                                    app.add_log(LogEntry::error(format!(
-                                        "Worktree command failed with exit code: {:?}",
-                                        exit_status.code()
-                                    )));
-                                }
-                            }
+                            execute_worktree_command(
+                                terminal,
+                                &command,
+                                &worktree_path,
+                                &ai_runner,
+                                &mut app,
+                            )
+                            .await?;
                         }
                         (KeyCode::Char('w'), _) => {
                             // Show QR code popup (only if web_url is set)
@@ -1967,6 +1861,75 @@ async fn run_tui_loop(
         match tokio::time::timeout(Duration::from_secs(5), handle).await {
             Ok(_) => tracing::info!("Orchestrator task finished gracefully"),
             Err(_) => tracing::warn!("Orchestrator task timeout after 5 seconds"),
+        }
+    }
+
+    Ok(())
+}
+
+/// Execute a worktree command with terminal suspension and result logging
+///
+/// This helper executes a worktree command using AiCommandRunner, forwards output
+/// to stdout/stderr, and logs the result to the app state.
+async fn execute_worktree_command(
+    terminal: &mut DefaultTerminal,
+    command: &str,
+    worktree_path: &Path,
+    ai_runner: &crate::ai_command_runner::AiCommandRunner,
+    app: &mut AppState,
+) -> Result<()> {
+    let command_clone = command.to_string();
+    let worktree_path_clone = worktree_path.to_path_buf();
+    let ai_runner_clone = ai_runner.clone();
+
+    let status_result = suspend_terminal_and_execute(terminal, || async move {
+        info!(
+            module = module_path!(),
+            "Running worktree command via AiCommandRunner: sh -c {}", command_clone
+        );
+
+        // Execute via AiCommandRunner (with stagger and retry)
+        let exec_result = ai_runner_clone
+            .execute_streaming_with_retry(&command_clone, Some(&worktree_path_clone))
+            .await;
+
+        match exec_result {
+            Ok((mut child, mut rx)) => {
+                // Forward output to stdout/stderr in real-time
+                use crate::ai_command_runner::OutputLine;
+                while let Some(line) = rx.recv().await {
+                    match line {
+                        OutputLine::Stdout(s) => {
+                            println!("{}", s);
+                        }
+                        OutputLine::Stderr(s) => {
+                            eprintln!("{}", s);
+                        }
+                    }
+                }
+                // Wait for child to complete
+                child
+                    .wait()
+                    .await
+                    .map_err(crate::error::OrchestratorError::Io)
+            }
+            Err(e) => {
+                eprintln!("Failed to execute worktree command: {}", e);
+                Err(e)
+            }
+        }
+    })
+    .await?;
+
+    match status_result {
+        exit_status if exit_status.success() => {
+            app.add_log(LogEntry::success("Worktree command completed successfully"));
+        }
+        exit_status => {
+            app.add_log(LogEntry::error(format!(
+                "Worktree command failed with exit code: {:?}",
+                exit_status.code()
+            )));
         }
     }
 
