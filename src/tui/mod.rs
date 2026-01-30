@@ -6,7 +6,9 @@
 //! - Dynamic queue management
 //! - Auto-refresh of change list
 
+mod command_handlers;
 mod events;
+mod key_handlers;
 pub mod log_deduplicator;
 mod orchestrator;
 mod qr;
