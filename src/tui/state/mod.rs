@@ -16,6 +16,7 @@
 
 mod change;
 mod events;
+mod guards;
 mod logs;
 mod modes;
 
@@ -387,7 +388,6 @@ impl AppState {
     ///
     /// Returns Some(TuiCommand) if merge should proceed, None if blocked.
     pub fn request_merge_worktree_branch(&mut self) -> Option<TuiCommand> {
-        use crate::tui::types::ViewMode;
         use tracing::debug;
 
         debug!(
@@ -397,39 +397,44 @@ impl AppState {
             self.worktree_cursor_index
         );
 
-        if self.view_mode != ViewMode::Worktrees {
+        // Validate view mode
+        if let guards::MergeGuardResult::Blocked(msg) = guards::validate_view_mode(self.view_mode) {
             debug!(
                 "Merge blocked: view_mode is {:?}, not Worktrees",
                 self.view_mode
             );
-            self.warning_message = Some("Switch to Worktrees view to merge".to_string());
+            self.warning_message = Some(msg);
             return None;
         }
 
-        // Block M key during resolve execution
-        if self.is_resolving {
+        // Validate not resolving
+        if let guards::MergeGuardResult::Blocked(msg) =
+            guards::validate_not_resolving(self.is_resolving)
+        {
             debug!("Merge blocked: resolve operation in progress");
-            self.warning_message = Some("Cannot merge: resolve operation in progress".to_string());
+            self.warning_message = Some(msg);
             return None;
         }
 
-        if self.worktrees.is_empty() {
+        // Validate worktrees not empty
+        if let guards::MergeGuardResult::Blocked(msg) =
+            guards::validate_worktrees_not_empty(self.worktrees.len())
+        {
             debug!("Merge blocked: worktrees list is empty");
-            self.warning_message = Some("No worktrees loaded".to_string());
+            self.warning_message = Some(msg);
             return None;
         }
 
-        if self.worktree_cursor_index >= self.worktrees.len() {
+        // Validate cursor in bounds
+        if let guards::MergeGuardResult::Blocked(msg) =
+            guards::validate_cursor_in_bounds(self.worktree_cursor_index, self.worktrees.len())
+        {
             debug!(
                 "Merge blocked: cursor out of range: {} >= {}",
                 self.worktree_cursor_index,
                 self.worktrees.len()
             );
-            self.warning_message = Some(format!(
-                "Cursor out of range: {} >= {}",
-                self.worktree_cursor_index,
-                self.worktrees.len()
-            ));
+            self.warning_message = Some(msg);
             return None;
         }
 
@@ -443,57 +448,18 @@ impl AppState {
             worktree.has_merge_conflict()
         );
 
-        // Cannot merge main worktree
-        if worktree.is_main {
-            debug!("Merge blocked: is main worktree");
-            self.warning_message = Some("Cannot merge main worktree".to_string());
-            return None;
-        }
-
-        // Cannot merge detached HEAD
-        if worktree.is_detached {
-            debug!("Merge blocked: is detached HEAD");
-            self.warning_message = Some("Cannot merge detached HEAD".to_string());
-            return None;
-        }
-
-        // Cannot merge if conflicts detected
-        if worktree.has_merge_conflict() {
-            debug!(
-                "Merge blocked: has {} conflict(s)",
-                worktree.conflict_file_count()
-            );
-            self.warning_message = Some(format!(
-                "Cannot merge: {} conflict(s) detected",
-                worktree.conflict_file_count()
-            ));
+        // Validate worktree is mergeable
+        if let guards::MergeGuardResult::Blocked(msg) =
+            guards::validate_worktree_mergeable(worktree)
+        {
+            debug!("Merge blocked: worktree validation failed");
+            self.warning_message = Some(msg);
             return None;
         }
 
         // Get worktree path and branch name
         let path = worktree.path.clone();
         let branch_name = worktree.branch.clone();
-
-        if branch_name.is_empty() {
-            debug!("Merge blocked: branch name is empty");
-            self.warning_message = Some("Cannot merge: no branch name".to_string());
-            return None;
-        }
-
-        // Cannot merge if no commits ahead of base branch
-        if !worktree.has_commits_ahead {
-            debug!("Merge blocked: no commits ahead of base branch");
-            self.warning_message =
-                Some("Cannot merge: no commits ahead of base branch".to_string());
-
-            // Cannot merge if already merging
-            if worktree.is_merging {
-                debug!("Merge blocked: merge already in progress");
-                self.warning_message = Some("Cannot merge: merge already in progress".to_string());
-                return None;
-            }
-            return None;
-        }
 
         debug!("Merge approved: creating TuiCommand::MergeWorktreeBranch");
         Some(TuiCommand::MergeWorktreeBranch {
@@ -517,93 +483,70 @@ impl AppState {
 
         let change = &mut self.changes[self.cursor_index];
 
-        // Cannot select unapproved changes
-        if !change.is_approved {
-            self.warning_message = Some(format!(
-                "Cannot queue unapproved change '{}'. Press @ to approve first.",
-                change.id
-            ));
+        // Validate that the change can be toggled
+        if let guards::ToggleGuardResult::Blocked(msg) = guards::validate_change_toggleable(
+            change.is_approved,
+            change.is_parallel_eligible,
+            self.parallel_mode,
+            &change.queue_status,
+            &change.id,
+        ) {
+            self.warning_message = Some(msg);
             return None;
         }
 
-        if self.parallel_mode && !change.is_parallel_eligible {
-            self.warning_message = Some(format!(
-                "Cannot queue uncommitted change '{}' in parallel mode. Commit it first.",
-                change.id
-            ));
-            return None;
-        }
-
-        // Cannot toggle selection for changes in ResolveWait status
-        if matches!(change.queue_status, QueueStatus::ResolveWait) {
-            self.warning_message = Some(format!(
-                "Cannot modify change '{}' in resolve wait status",
-                change.id
-            ));
-            return None;
-        }
-
+        // Dispatch to mode-specific handlers
         match self.mode {
             AppMode::Select => {
-                change.selected = !change.selected;
-                // Clear NEW flag when user interacts with the change
-                if change.is_new {
-                    change.is_new = false;
-                    self.new_change_count = self.new_change_count.saturating_sub(1);
+                match guards::handle_toggle_select_mode(change, &mut self.new_change_count) {
+                    guards::ToggleActionResult::StateOnly(log_msg) => {
+                        if let Some(msg) = log_msg {
+                            self.add_log(LogEntry::info(msg));
+                        }
+                        None
+                    }
+                    guards::ToggleActionResult::Command(cmd, log_msg) => {
+                        if let Some(msg) = log_msg {
+                            self.add_log(LogEntry::info(msg));
+                        }
+                        Some(cmd)
+                    }
+                    guards::ToggleActionResult::None => None,
                 }
-                None
             }
             AppMode::Running => {
-                match &change.queue_status {
-                    QueueStatus::NotQueued => {
-                        // Add to queue
-                        change.queue_status = QueueStatus::Queued;
-                        change.selected = true;
-                        // Clear NEW flag when user adds to queue
-                        if change.is_new {
-                            change.is_new = false;
-                            self.new_change_count = self.new_change_count.saturating_sub(1);
+                match guards::handle_toggle_running_mode(change, &mut self.new_change_count) {
+                    guards::ToggleActionResult::StateOnly(log_msg) => {
+                        if let Some(msg) = log_msg {
+                            self.add_log(LogEntry::info(msg));
                         }
-                        let id = change.id.clone();
-                        self.add_log(LogEntry::info(format!("Added to queue: {}", id)));
-                        Some(TuiCommand::AddToQueue(id))
+                        None
                     }
-                    QueueStatus::Queued => {
-                        // Remove from queue
-                        change.queue_status = QueueStatus::NotQueued;
-                        change.selected = false;
-                        let id = change.id.clone();
-                        self.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
-                        Some(TuiCommand::RemoveFromQueue(id))
+                    guards::ToggleActionResult::Command(cmd, log_msg) => {
+                        if let Some(msg) = log_msg {
+                            self.add_log(LogEntry::info(msg));
+                        }
+                        Some(cmd)
                     }
-                    // Processing, Completed, Archived, Error - cannot change status
-                    _ => None,
+                    guards::ToggleActionResult::None => None,
                 }
             }
             AppMode::Stopped => {
-                // In Stopped mode, only toggle execution mark (selected), not queue_status
-                // Queue status remains NotQueued until F5 resume
-                if !matches!(change.queue_status, QueueStatus::NotQueued) {
-                    // Cannot modify non-NotQueued changes (completed, error, etc.)
-                    return None;
+                match guards::handle_toggle_stopped_mode(change, &mut self.new_change_count) {
+                    guards::ToggleActionResult::StateOnly(log_msg) => {
+                        if let Some(msg) = log_msg {
+                            self.add_log(LogEntry::info(msg));
+                        }
+                        None
+                    }
+                    guards::ToggleActionResult::Command(cmd, log_msg) => {
+                        if let Some(msg) = log_msg {
+                            self.add_log(LogEntry::info(msg));
+                        }
+                        Some(cmd)
+                    }
+                    guards::ToggleActionResult::None => None,
                 }
-
-                // Toggle execution mark only
-                change.selected = !change.selected;
-
-                // Clear NEW flag when user interacts with the change
-                if change.is_new {
-                    change.is_new = false;
-                    self.new_change_count = self.new_change_count.saturating_sub(1);
-                }
-
-                let id = change.id.clone();
-                if change.selected {
-                    self.add_log(LogEntry::info(format!("Marked for execution: {}", id)));
-                } else {
-                    self.add_log(LogEntry::info(format!("Unmarked: {}", id)));
-                }
-                None // No command needed, just state change
             }
             AppMode::Stopping
             | AppMode::Error
