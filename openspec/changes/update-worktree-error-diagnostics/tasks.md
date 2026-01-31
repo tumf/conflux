@@ -19,3 +19,8 @@
 ## Acceptance #1 Failure Follow-up
 - [x] Stage and commit unstaged whitespace changes in src/vcs/commands.rs (trailing space removals at lines 30, 81, 181, 193, 210, 213, 216, 218)
 - [x] Stage and commit unstaged whitespace and formatting changes in src/vcs/git/commands/worktree.rs (trailing space removals and code formatting adjustments)
+
+## Acceptance #2 Failure Follow-up
+- [ ] Git working tree が dirty: openspec/changes/update-worktree-error-diagnostics/tasks.md が変更されています（git status --porcelain を空にする）
+- [ ] src/vcs/mod.rs: VcsError::Command の表示/変換で command/working_dir/stderr/stdout をエラーメッセージに含め、REQ-OBS-004 のコンテキスト要件を満たす（必要なら src/error.rs の OrchestratorError::from_vcs_error も修正）
+- [ ] src/tui/state/logs.rs: AppState::add_log の tracing 出力に change_id/operation/iteration（および利用可能なら workspace path）を含め、TUI とログの文脈情報を一致させる
