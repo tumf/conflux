@@ -97,6 +97,7 @@ pub fn launch_editor_in_dir(dir_path: &str) -> Result<()> {
 ///
 /// # Returns
 /// A truncated string with "..." appended if truncation occurred
+#[allow(dead_code)]
 pub fn truncate_to_display_width(s: &str, max_width: usize) -> String {
     let display_width = s.width();
     if display_width <= max_width {

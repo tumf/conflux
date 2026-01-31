@@ -20,15 +20,50 @@ use std::time::SystemTime;
 use thiserror::Error;
 use tracing::{debug, info};
 
+/// Helper function to format VcsError::Command with full context.
+fn format_command_error(
+    backend: &VcsBackend,
+    message: &str,
+    command: &Option<String>,
+    working_dir: &Option<PathBuf>,
+    stderr: &Option<String>,
+    stdout: &Option<String>,
+) -> String {
+    let mut parts = vec![format!("{} command failed: {}", backend, message)];
+
+    if let Some(cmd) = command {
+        parts.push(format!("command: {}", cmd));
+    }
+    if let Some(dir) = working_dir {
+        parts.push(format!("working_dir: {}", dir.display()));
+    }
+    if let Some(err) = stderr {
+        if !err.is_empty() {
+            parts.push(format!("stderr: {}", err));
+        }
+    }
+    if let Some(out) = stdout {
+        if !out.is_empty() {
+            parts.push(format!("stdout: {}", out));
+        }
+    }
+
+    parts.join("; ")
+}
+
 /// VCS-specific error type.
 ///
 /// Wraps all VCS-related errors with backend context for better error messages.
 #[derive(Error, Debug)]
 pub enum VcsError {
-    #[error("{backend} command failed: {message}")]
+    #[error("{}", format_command_error(.backend, .message, .command, .working_dir, .stderr, .stdout))]
     Command {
         backend: VcsBackend,
         message: String,
+        command: Option<String>,
+        working_dir: Option<PathBuf>,
+        stderr: Option<String>,
+        stdout: Option<String>,
     },
 
     #[error("Merge conflict in {backend}: {details}")]
@@ -58,6 +93,29 @@ impl VcsError {
         VcsError::Command {
             backend: VcsBackend::Git,
             message: message.into(),
+            command: None,
+            working_dir: None,
+            stderr: None,
+            stdout: None,
+        }
+    }
+
+    /// Create a command error for Git backend with full context.
+    #[allow(dead_code)]
+    pub fn git_command_with_context(
+        message: impl Into<String>,
+        command: Option<String>,
+        working_dir: Option<PathBuf>,
+        stderr: Option<String>,
+        stdout: Option<String>,
+    ) -> Self {
+        VcsError::Command {
+            backend: VcsBackend::Git,
+            message: message.into(),
+            command,
+            working_dir,
+            stderr,
+            stdout,
         }
     }
 

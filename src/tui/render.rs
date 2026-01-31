@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use super::state::AppState;
 use super::types::{AppMode, QueueStatus};
-use super::utils::{get_version_string, truncate_to_display_width};
+use super::utils::get_version_string;
 
 /// Determine checkbox display and color for a change item
 ///
@@ -714,7 +714,7 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
             // Add header with color if change_id or operation is present
             // Format: [change_id:operation:iteration] or [change_id:operation] or [change_id]
             //     or: [operation:iteration] or [operation] (when no change_id)
-            let msg_width = if let Some(ref change_id) = entry.change_id {
+            let _msg_width = if let Some(ref change_id) = entry.change_id {
                 // Use hash of change_id to pick a consistent color
                 let color_index = change_id
                     .bytes()
@@ -761,10 +761,12 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
                 available_width
             };
 
-            // Truncate message to fit in available width using Unicode display width
-            // This correctly handles CJK characters that occupy 2 terminal columns
-            let message = truncate_to_display_width(&entry.message, msg_width);
-            spans.push(Span::styled(message, Style::default().fg(entry.color)));
+            // Use full message without truncation - wrapping will handle overflow
+            // The message will be wrapped by the Paragraph widget's wrap setting
+            spans.push(Span::styled(
+                entry.message.clone(),
+                Style::default().fg(entry.color),
+            ));
 
             Line::from(spans)
         })
@@ -787,12 +789,14 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
         )
     };
 
-    let logs = Paragraph::new(log_items).block(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Blue)),
-    );
+    let logs = Paragraph::new(log_items)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Blue)),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: false });
 
     frame.render_widget(logs, area);
 }
