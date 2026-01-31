@@ -19,9 +19,28 @@ const DEFAULT_MAX_RETRIES: u32 = 2;
 const DEFAULT_RETRY_DELAY_MS: u64 = 5000;
 const DEFAULT_RETRY_IF_DURATION_UNDER_SECS: u64 = 5;
 
+/// Helper function to create a test config with all required commands
+fn create_test_config() -> OrchestratorConfig {
+    OrchestratorConfig {
+        apply_command: Some("echo apply {change_id}".to_string()),
+        archive_command: Some("echo archive {change_id}".to_string()),
+        analyze_command: Some("echo analyze".to_string()),
+        acceptance_command: Some("echo acceptance".to_string()),
+        resolve_command: Some("echo resolve".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Helper to create test config with custom overrides
+fn create_test_config_with(overrides: OrchestratorConfig) -> OrchestratorConfig {
+    let mut base = create_test_config();
+    base.merge(overrides);
+    base
+}
+
 #[test]
 fn test_parallel_executor_creation() {
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let executor = ParallelExecutor::new(repo_root, config, None);
 
@@ -255,7 +274,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
 
     // Create test AI runner
     let shared_stagger_state = Arc::new(Mutex::new(None));
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let queue_config = CommandQueueConfig {
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
@@ -309,10 +328,10 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
 
     init_git_repo(repo_root).await;
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
@@ -345,10 +364,10 @@ async fn test_resolve_merge_executes_selected_change_only() {
 
     init_git_repo(repo_root).await;
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some(format!("sh {}", resolver_script.display())),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
@@ -429,10 +448,10 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         .await
         .unwrap();
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
@@ -594,10 +613,10 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         .await
         .unwrap();
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
@@ -762,10 +781,10 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         .await
         .unwrap();
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 1, config.clone());
 
@@ -902,10 +921,10 @@ async fn test_merge_retries_when_merge_commit_missing() {
         .await
         .unwrap();
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
@@ -1081,10 +1100,10 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         .await
         .unwrap();
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
@@ -1258,10 +1277,10 @@ async fn test_merge_retries_after_pre_commit_changes() {
         .await
         .unwrap();
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 1, config.clone());
 
@@ -1417,7 +1436,7 @@ async fn test_dynamic_queue_injection() {
     assert_eq!(queue.len().await, 1);
 
     // Create a simple parallel executor with the queue
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let (tx, _rx) = mpsc::channel(10);
     let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
@@ -1435,7 +1454,7 @@ async fn test_debounce_with_queue_changes() {
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
 
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let (tx, _rx) = mpsc::channel(10);
     let executor = ParallelExecutor::new(repo_root, config, Some(tx));
@@ -1565,7 +1584,7 @@ async fn test_attempt_merge_defers_when_change_not_archived() {
         .unwrap();
 
     // Create executor
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let (tx, _rx) = mpsc::channel(10);
     let executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
 
@@ -1681,10 +1700,10 @@ async fn test_attempt_merge_succeeds_when_change_archived() {
         .unwrap();
 
     // Create executor
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
         ..Default::default()
-    };
+    });
     let (tx, _rx) = mpsc::channel(10);
     let executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
 
@@ -1721,7 +1740,7 @@ async fn test_attempt_merge_succeeds_when_change_archived() {
 /// are in MergeWait state for other logic purposes.
 #[test]
 fn test_merge_wait_suppresses_completion_events() {
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let mut executor = ParallelExecutor::new(repo_root, config, None);
 
@@ -1757,7 +1776,7 @@ fn test_merge_wait_does_not_block_runnable_changes() {
     // Changes in MergeWait have WorkspaceState::Archived (archive commit exists)
     // So they are correctly excluded from processing, allowing other changes to continue
 
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let executor = ParallelExecutor::new(repo_root, config, None);
 
@@ -1779,7 +1798,7 @@ async fn test_concurrent_reanalysis_queue_dispatch() {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let (tx, _rx) = mpsc::channel(100);
 

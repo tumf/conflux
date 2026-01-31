@@ -179,8 +179,14 @@ impl ParallelExecutor {
         info!("Using workspace base directory: {:?}", base_dir);
 
         let max_concurrent = config.get_max_concurrent_workspaces();
-        let apply_command = config.get_apply_command().to_string();
-        let archive_command = config.get_archive_command().to_string();
+        let apply_command = config
+            .get_apply_command()
+            .expect("apply_command must be configured before creating ParallelExecutor")
+            .to_string();
+        let archive_command = config
+            .get_archive_command()
+            .expect("archive_command must be configured before creating ParallelExecutor")
+            .to_string();
 
         // Resolve the VCS backend (handle Auto)
         let resolved_backend = Self::resolve_backend(vcs_backend, &repo_root);
@@ -1401,7 +1407,7 @@ Requirements:\n\
 5) Do not use destructive commands like `git reset --hard`.",
                         change_id = change_id
                     );
-                    let resolve_template = self.config.get_resolve_command();
+                    let resolve_template = self.config.get_resolve_command()?;
                     let expanded_resolve_command =
                         OrchestratorConfig::expand_prompt(resolve_template, &resolve_prompt);
 
@@ -1776,7 +1782,7 @@ Requirements:\n\
 5) Do not use destructive commands like `git reset --hard`.",
                         change_id = change_id
                     );
-                    let resolve_template = self.config.get_resolve_command();
+                    let resolve_template = self.config.get_resolve_command()?;
                     let expanded_resolve_command =
                         OrchestratorConfig::expand_prompt(resolve_template, &resolve_prompt);
 

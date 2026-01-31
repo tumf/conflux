@@ -12,21 +12,31 @@ pub const GLOBAL_CONFIG_DIR: &str = "cflx";
 pub const GLOBAL_CONFIG_FILE: &str = "config.jsonc";
 
 /// Default apply command template (OpenCode)
+/// Note: No longer used as fallback. Commands must be explicitly configured.
+#[allow(dead_code)]
 pub const DEFAULT_APPLY_COMMAND: &str = "opencode run '/openspec-apply {change_id}'";
 
 /// Default archive command template (OpenCode)
+/// Note: No longer used as fallback. Commands must be explicitly configured.
+#[allow(dead_code)]
 pub const DEFAULT_ARCHIVE_COMMAND: &str = "opencode run '/conflux:archive {change_id}'";
 
 /// Default acceptance command template (OpenCode)
 /// Supports `{change_id}` and `{prompt}` placeholders
+/// Note: No longer used as fallback. Commands must be explicitly configured.
+#[allow(dead_code)]
 pub const DEFAULT_ACCEPTANCE_COMMAND: &str =
     "opencode run '/conflux:acceptance {change_id} {prompt}'";
 
 /// Default resolve command template (OpenCode)
 /// Supports `{prompt}` placeholder for the resolve prompt
+/// Note: No longer used as fallback. Commands must be explicitly configured.
+#[allow(dead_code)]
 pub const DEFAULT_RESOLVE_COMMAND: &str = "opencode run {prompt}";
 
 /// Default analyze command template (OpenCode)
+/// Note: No longer used as fallback. Commands must be explicitly configured.
+#[allow(dead_code)]
 pub const DEFAULT_ANALYZE_COMMAND: &str = "opencode run --format json {prompt}";
 
 /// Default prompt for apply command - includes path context.

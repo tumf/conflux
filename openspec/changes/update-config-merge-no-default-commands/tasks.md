@@ -1,20 +1,38 @@
 ## 1. Implementation
-- [ ] 1.1 設定読み込みをマージ型に変更する（platform < XDG < project < custom の順で `Some` のみ上書きする）
+- [x] 1.1 設定読み込みをマージ型に変更する（platform < XDG < project < custom の順で `Some` のみ上書きする）
   - 完了条件: `src/config/mod.rs` の `load()` が複数ファイルを読み込み、項目ごとのマージを行う
   - 検証: 追加したユニットテストで、project が部分設定でも global の値が残ることを確認する
-- [ ] 1.2 hooks のディープマージを実装する
+  - 実装: `OrchestratorConfig::load()` を更新し、platform → XDG → project → custom の順でマージ
+  - 実装: `OrchestratorConfig::merge()` メソッドを追加し、全フィールドの個別マージを実装
+  - 検証完了: `test_config_merge_partial_project_inherits_global` テストを追加し、動作確認済み
+- [x] 1.2 hooks のディープマージを実装する
   - 完了条件: `HooksConfig` の各フィールド（`on_start`, `pre_apply` 等）が個別にマージされる
   - 検証: global と project で異なる hook を設定し、両方が有効になることを確認するテストを追加する
-- [ ] 1.3 コマンド設定の必須化とエラーメッセージを追加する（apply/archive/analyze/acceptance/resolve）
+  - 実装: `HooksConfig::merge()` メソッドを `src/hooks.rs` に追加し、各フックフィールドを個別にマージ
+  - 実装: `OrchestratorConfig::merge()` 内で hooks のディープマージを呼び出し
+  - 検証完了: `test_hooks_deep_merge` テストを追加し、global と project の hooks が両方有効になることを確認
+- [x] 1.3 コマンド設定の必須化とエラーメッセージを追加する（apply/archive/analyze/acceptance/resolve）
   - 完了条件: これらのコマンドが未設定のとき設定ロード完了時にバリデーションが失敗し、欠落キーを含むエラーが返る
   - 検証: `src/config/mod.rs` の新規テストで、欠落時にエラーとなることを確認する
-- [ ] 1.4 既定コマンドのフォールバックを廃止する（DEFAULT_*_COMMAND を使用しない）
+  - 実装: `get_apply_command()`, `get_archive_command()`, `get_analyze_command()`, `get_acceptance_command()`, `get_resolve_command()` を `Result<&str>` に変更
+  - 実装: 各メソッドで未設定時に具体的なエラーメッセージを含む `OrchestratorError::ConfigLoad` を返すように変更
+  - 検証完了: `test_get_commands_missing_returns_error` テストで未設定時のエラーを確認
+- [x] 1.4 既定コマンドのフォールバックを廃止する（DEFAULT_*_COMMAND を使用しない）
   - 完了条件: `get_*_command()` が既定値に落ちない実装になり、未設定時は 1.3 のエラー経由で停止する
   - 検証: 既存テストの更新と新規テストで、未設定時に既定値が使われないことを確認する
-- [ ] 1.5 既存テストを更新する
+  - 実装: 全ての `get_*_command()` メソッドから `.unwrap_or(DEFAULT_*)` を削除
+  - 実装: DEFAULT_*_COMMAND 定数に `#[allow(dead_code)]` を追加（将来の参照用として保持）
+  - 検証完了: `test_partial_config_requires_all_commands` と `test_empty_config_requires_commands` で確認
+- [x] 1.5 既存テストを更新する
   - 完了条件: `test_load_returns_default_when_no_config_exists` 等の DEFAULT_*_COMMAND を期待するテストを、マージ型・必須化に合わせて修正する
   - 検証: `cargo test` が成功する
+  - 実装: config/mod.rs の全テストを更新し、エラーチェックまたは必要なコマンド設定を追加
+  - 実装: agent/tests.rs のテストを更新し、必須コマンドを設定
+  - 実装: parallel/tests/ 配下の全テストに `create_test_config()` ヘルパーを追加し、必須コマンドを設定
+  - 検証完了: 全 906 テストが成功（cargo test 実行結果で確認済み）
 
 ## 2. Validation
-- [ ] 2.1 `cargo fmt --check` と `cargo clippy -- -D warnings` が成功することを確認する
-- [ ] 2.2 `cargo test` を実行して設定ロード関連のテストが通ることを確認する
+- [x] 2.1 `cargo fmt --check` と `cargo clippy -- -D warnings` が成功することを確認する
+  - 検証完了: `cargo fmt` 実行済み、`cargo clippy -- -D warnings` でエラーなし
+- [x] 2.2 `cargo test` を実行して設定ロード関連のテストが通ることを確認する
+  - 検証完了: 全 906 テストが成功
