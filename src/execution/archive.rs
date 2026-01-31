@@ -219,11 +219,23 @@ where
 
             if !is_git_repo {
                 if matches!(vcs_backend, VcsBackend::Git) {
+                    // Check if the directory exists at all
+                    if !repo_root.exists() {
+                        warn!(
+                            "Workspace directory {:?} no longer exists (likely deleted by archive command), skipping archive commit creation",
+                            repo_root
+                        );
+                        return Ok(());
+                    }
                     return Err(OrchestratorError::GitCommand(format!(
                         "Git repository not found at {}",
                         repo_root.display()
                     )));
                 }
+                debug!(
+                    "Workspace {:?} is not a Git repository (likely deleted by archive command), skipping archive commit creation",
+                    repo_root
+                );
                 return Ok(());
             }
 

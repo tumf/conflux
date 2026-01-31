@@ -1254,32 +1254,51 @@ pub async fn execute_archive_in_workspace(
     .await?;
 
     // Get the current revision after archive
+    // Note: The worktree may have been deleted by the archive command (e.g., /conflux:archive),
+    // so we need to handle the case where the Git repository is no longer accessible.
     let revision = match vcs_backend {
         VcsBackend::Git | VcsBackend::Auto => {
             debug!(
                 module = module_path!(),
                 "Executing git command: git rev-parse HEAD (cwd: {:?})", workspace_path
             );
-            let revision_output = Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(workspace_path)
-                .output()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::GitCommand(format!("Failed to get revision: {}", e))
-                })?;
 
-            if !revision_output.status.success() {
-                let stderr = String::from_utf8_lossy(&revision_output.stderr);
-                return Err(OrchestratorError::GitCommand(format!(
-                    "Failed to get revision: {}",
-                    stderr
-                )));
+            // Check if the workspace path still exists and is a Git repository
+            if !workspace_path.exists() {
+                warn!(
+                    "Workspace path {:?} no longer exists after archive (likely deleted by archive command), using placeholder revision",
+                    workspace_path
+                );
+                "archived".to_string()
+            } else {
+                match Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(workspace_path)
+                    .output()
+                    .await
+                {
+                    Ok(revision_output) if revision_output.status.success() => {
+                        String::from_utf8_lossy(&revision_output.stdout)
+                            .trim()
+                            .to_string()
+                    }
+                    Ok(revision_output) => {
+                        let stderr = String::from_utf8_lossy(&revision_output.stderr);
+                        warn!(
+                            "Failed to get revision from workspace {:?} after archive: {} (likely deleted by archive command), using placeholder",
+                            workspace_path, stderr
+                        );
+                        "archived".to_string()
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to execute git rev-parse in workspace {:?} after archive: {} (likely deleted by archive command), using placeholder",
+                            workspace_path, e
+                        );
+                        "archived".to_string()
+                    }
+                }
             }
-
-            String::from_utf8_lossy(&revision_output.stdout)
-                .trim()
-                .to_string()
         }
     };
 
