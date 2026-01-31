@@ -29,6 +29,10 @@ pub enum VcsError {
     Command {
         backend: VcsBackend,
         message: String,
+        command: Option<String>,
+        working_dir: Option<PathBuf>,
+        stderr: Option<String>,
+        stdout: Option<String>,
     },
 
     #[error("Merge conflict in {backend}: {details}")]
@@ -58,6 +62,29 @@ impl VcsError {
         VcsError::Command {
             backend: VcsBackend::Git,
             message: message.into(),
+            command: None,
+            working_dir: None,
+            stderr: None,
+            stdout: None,
+        }
+    }
+
+    /// Create a command error for Git backend with full context.
+    #[allow(dead_code)]
+    pub fn git_command_with_context(
+        message: impl Into<String>,
+        command: Option<String>,
+        working_dir: Option<PathBuf>,
+        stderr: Option<String>,
+        stdout: Option<String>,
+    ) -> Self {
+        VcsError::Command {
+            backend: VcsBackend::Git,
+            message: message.into(),
+            command,
+            working_dir,
+            stderr,
+            stdout,
         }
     }
 

@@ -43,7 +43,7 @@ pub enum OrchestratorError {
     ChangeNotFound(String),
 
     #[error("VCS error: {0}")]
-    Vcs(#[from] VcsError),
+    Vcs(Box<VcsError>),
 
     // Legacy error variants kept for backward compatibility
     // These delegate to VcsError internally
@@ -72,19 +72,41 @@ impl OrchestratorError {
     /// Create an error from VcsError with proper variant mapping
     pub fn from_vcs_error(err: VcsError) -> Self {
         match err {
-            VcsError::Command { backend, message } => match backend {
+            VcsError::Command {
+                backend,
+                message,
+                command,
+                working_dir,
+                stderr,
+                stdout,
+            } => match backend {
                 VcsBackend::Git => OrchestratorError::GitCommand(message),
-                VcsBackend::Auto => OrchestratorError::Vcs(VcsError::Command { backend, message }),
+                VcsBackend::Auto => OrchestratorError::Vcs(Box::new(VcsError::Command {
+                    backend,
+                    message,
+                    command,
+                    working_dir,
+                    stderr,
+                    stdout,
+                })),
             },
             VcsError::Conflict { backend, details } => match backend {
                 VcsBackend::Git => OrchestratorError::GitConflict(details),
-                VcsBackend::Auto => OrchestratorError::Vcs(VcsError::Conflict { backend, details }),
+                VcsBackend::Auto => {
+                    OrchestratorError::Vcs(Box::new(VcsError::Conflict { backend, details }))
+                }
             },
             VcsError::NotAvailable { .. } => OrchestratorError::NoVcsBackend,
             VcsError::UncommittedChanges(msg) => OrchestratorError::GitUncommittedChanges(msg),
             VcsError::NoBackend => OrchestratorError::NoVcsBackend,
             VcsError::Io(e) => OrchestratorError::Io(e),
         }
+    }
+}
+
+impl From<VcsError> for OrchestratorError {
+    fn from(err: VcsError) -> Self {
+        OrchestratorError::Vcs(Box::new(err))
     }
 }
 

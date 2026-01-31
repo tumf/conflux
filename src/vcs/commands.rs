@@ -25,29 +25,41 @@ pub async fn run_vcs_command<P: AsRef<Path>>(
     cwd: P,
     backend: VcsBackend,
 ) -> VcsResult<String> {
+    let cwd_path = cwd.as_ref();
+    let command_str = format!("{} {}", program, args.join(" "));
+
     debug!(
         module = module_path!(),
         "Executing {} command: {} (cwd: {:?})",
         program,
         args.join(" "),
-        cwd.as_ref()
+        cwd_path
     );
     let output = Command::new(program)
         .args(args)
-        .current_dir(cwd.as_ref())
+        .current_dir(cwd_path)
         .stdin(Stdio::null())
         .output()
         .await
         .map_err(|e| VcsError::Command {
             backend,
             message: format!("Failed to execute {}: {}", program, e),
+            command: Some(command_str.clone()),
+            working_dir: Some(cwd_path.to_path_buf()),
+            stderr: None,
+            stdout: None,
         })?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         return Err(VcsError::Command {
             backend,
             message: format!("{} {} failed: {}", program, args.join(" "), stderr),
+            command: Some(command_str),
+            working_dir: Some(cwd_path.to_path_buf()),
+            stderr: Some(stderr),
+            stdout: Some(stdout),
         });
     }
 
@@ -64,16 +76,19 @@ pub async fn run_vcs_command_silent<P: AsRef<Path>>(
     cwd: P,
     backend: VcsBackend,
 ) -> VcsResult<()> {
+    let cwd_path = cwd.as_ref();
+    let command_str = format!("{} {}", program, args.join(" "));
+
     debug!(
         module = module_path!(),
         "Executing {} command (silent): {} (cwd: {:?})",
         program,
         args.join(" "),
-        cwd.as_ref()
+        cwd_path
     );
     let output = Command::new(program)
         .args(args)
-        .current_dir(cwd.as_ref())
+        .current_dir(cwd_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -82,12 +97,20 @@ pub async fn run_vcs_command_silent<P: AsRef<Path>>(
         .map_err(|e| VcsError::Command {
             backend,
             message: format!("Failed to execute {}: {}", program, e),
+            command: Some(command_str.clone()),
+            working_dir: Some(cwd_path.to_path_buf()),
+            stderr: None,
+            stdout: None,
         })?;
 
     if !output.status.success() {
         return Err(VcsError::Command {
             backend,
             message: format!("{} {} failed", program, args.join(" ")),
+            command: Some(command_str),
+            working_dir: Some(cwd_path.to_path_buf()),
+            stderr: None,
+            stdout: None,
         });
     }
 
@@ -150,5 +173,52 @@ mod tests {
         let result = check_vcs_available("nonexistent-vcs-program", temp_dir.path()).await;
         assert!(result.is_ok());
         assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_vcs_error_includes_command_context() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Run a git command that will fail (invalid subcommand)
+        let result = run_vcs_command(
+            "git",
+            &["invalid-subcommand-xyz"],
+            temp_dir.path(),
+            VcsBackend::Git,
+        )
+        .await;
+
+        // Verify the command failed
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        match err {
+            VcsError::Command {
+                command,
+                working_dir,
+                stderr,
+                stdout,
+                ..
+            } => {
+                // Verify command context is included
+                assert!(command.is_some());
+                let cmd = command.unwrap();
+                assert!(cmd.contains("git"));
+                assert!(cmd.contains("invalid-subcommand-xyz"));
+
+                // Verify working directory is included
+                assert!(working_dir.is_some());
+                assert_eq!(working_dir.unwrap(), temp_dir.path());
+
+                // Verify stderr is captured
+                assert!(stderr.is_some());
+                let stderr_str = stderr.unwrap();
+                assert!(!stderr_str.is_empty());
+
+                // stdout may or may not be present
+                assert!(stdout.is_some());
+            }
+            _ => panic!("Expected VcsError::Command variant"),
+        }
     }
 }
