@@ -43,6 +43,8 @@ pub struct LogEntry {
     pub operation: Option<String>,
     /// Optional iteration number (for apply operations)
     pub iteration: Option<u32>,
+    /// Optional workspace path (for parallel mode logs with workspace context)
+    pub workspace_path: Option<String>,
 }
 
 fn ansi_csi_regex() -> &'static Regex {
@@ -77,6 +79,7 @@ impl LogEntry {
             change_id: None,
             operation: None,
             iteration: None,
+            workspace_path: None,
         }
     }
 
@@ -92,6 +95,7 @@ impl LogEntry {
             change_id: None,
             operation: None,
             iteration: None,
+            workspace_path: None,
         }
     }
 
@@ -107,6 +111,7 @@ impl LogEntry {
             change_id: None,
             operation: None,
             iteration: None,
+            workspace_path: None,
         }
     }
 
@@ -122,6 +127,7 @@ impl LogEntry {
             change_id: None,
             operation: None,
             iteration: None,
+            workspace_path: None,
         }
     }
 
@@ -141,6 +147,13 @@ impl LogEntry {
     /// Set iteration number (for apply operations)
     pub fn with_iteration(mut self, iteration: u32) -> Self {
         self.iteration = Some(iteration);
+        self
+    }
+
+    /// Set workspace path (for parallel mode logs with workspace context)
+    #[allow(dead_code)]
+    pub fn with_workspace_path(mut self, workspace_path: impl Into<String>) -> Self {
+        self.workspace_path = Some(workspace_path.into());
         self
     }
 }
