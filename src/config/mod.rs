@@ -1046,15 +1046,29 @@ mod tests {
         )
         .unwrap();
 
-        // Save current directory and change to temp dir
+        // Save current directory and environment
         let original_dir = env::current_dir().unwrap();
+        let original_xdg = env::var("XDG_CONFIG_HOME").ok();
+        let original_home = env::var("HOME").ok();
+
+        // Point XDG_CONFIG_HOME and HOME to temp directory (where no global configs exist)
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path().join("config"));
+        env::set_var("HOME", temp_dir.path());
         env::set_current_dir(temp_dir.path()).unwrap();
 
         // Load config (should use project config)
         let config = OrchestratorConfig::load(None).unwrap();
 
-        // Restore original directory
+        // Restore original directory and environment
         env::set_current_dir(original_dir).unwrap();
+        match original_xdg {
+            Some(val) => env::set_var("XDG_CONFIG_HOME", val),
+            None => env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match original_home {
+            Some(val) => env::set_var("HOME", val),
+            None => env::remove_var("HOME"),
+        }
 
         // Project config should be used
         assert_eq!(
