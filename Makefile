@@ -8,7 +8,7 @@ build:
 install:
 	cargo install --path .
 
-# Bump minor version (0.x.0 -> 0.x+1.0)
+# Bump minor version (0.x.0 -> 0.x+1.0) with git commit
 bump-minor:
 	@VERSION=$$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'); \
 	MAJOR=$$(echo $$VERSION | cut -d. -f1); \
@@ -17,9 +17,13 @@ bump-minor:
 	NEW_MINOR=$$((MINOR + 1)); \
 	NEW_VERSION="$$MAJOR.$$NEW_MINOR.0"; \
 	sed -i '' "s/^version = \"$$VERSION\"/version = \"$$NEW_VERSION\"/" Cargo.toml; \
+	cargo update -p conflux; \
+	git add Cargo.toml Cargo.lock; \
+	git commit -m "$$NEW_VERSION"; \
+	git tag "v$$NEW_VERSION"; \
 	echo "Bumped version: $$VERSION -> $$NEW_VERSION"
 
-# Bump patch version (0.0.x -> 0.0.x+1)
+# Bump patch version (0.0.x -> 0.0.x+1) with git commit
 bump-patch:
 	@VERSION=$$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'); \
 	MAJOR=$$(echo $$VERSION | cut -d. -f1); \
@@ -28,13 +32,21 @@ bump-patch:
 	NEW_PATCH=$$((PATCH + 1)); \
 	NEW_VERSION="$$MAJOR.$$MINOR.$$NEW_PATCH"; \
 	sed -i '' "s/^version = \"$$VERSION\"/version = \"$$NEW_VERSION\"/" Cargo.toml; \
+	cargo update -p conflux; \
+	git add Cargo.toml Cargo.lock; \
+	git commit -m "$$NEW_VERSION"; \
+	git tag "v$$NEW_VERSION"; \
 	echo "Bumped version: $$VERSION -> $$NEW_VERSION"
 
-# Bump major version (x.0.0 -> x+1.0.0)
+# Bump major version (x.0.0 -> x+1.0.0) with git commit
 bump-major:
 	@VERSION=$$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'); \
 	MAJOR=$$(echo $$VERSION | cut -d. -f1); \
 	NEW_MAJOR=$$((MAJOR + 1)); \
 	NEW_VERSION="$$NEW_MAJOR.0.0"; \
 	sed -i '' "s/^version = \"$$VERSION\"/version = \"$$NEW_VERSION\"/" Cargo.toml; \
+	cargo update -p conflux; \
+	git add Cargo.toml Cargo.lock; \
+	git commit -m "$$NEW_VERSION"; \
+	git tag "v$$NEW_VERSION"; \
 	echo "Bumped version: $$VERSION -> $$NEW_VERSION"
