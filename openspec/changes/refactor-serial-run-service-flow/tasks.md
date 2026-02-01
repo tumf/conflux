@@ -56,5 +56,5 @@
 - [x] 9.1 `SerialRunService::apply_change_internal` のキャンセル監視タスクが apply 完了後も停止しないため、終了時にタスクを停止/abort する（検証: apply 完了後にバックグラウンドタスクが終了する）
 - [x] 9.2 `git status --porcelain` が空でないため、作業ツリーをクリーンにする（検証: 変更ファイルなし。現在: `openspec/changes/refactor-serial-run-service-flow/tasks.md` が変更中）
 
-## 10. Acceptance #9 Failure Follow-up
-- [ ] `src/tui/orchestrator.rs` の `ChangeProcessResult::AcceptanceContinue` / `AcceptanceFailed` / `AcceptanceCommandFailed` 分岐（例: `src/tui/orchestrator.rs:513-633`）では `OrchestratorEvent::AcceptanceStarted` を送出しておらず、`acceptance_test_streaming` も `OutputHandler::on_info` のみ（`src/orchestration/acceptance.rs:101-123`）。そのため `src/tui/state/events/completion.rs:70-88` の `handle_acceptance_started` が非Pass系で発火しない。Acceptance開始イベントを各分岐で送るか、`acceptance_test_streaming` 側で `AcceptanceStarted` を送出する。
+## Future Work
+- TUI orchestrator の `ChangeProcessResult::AcceptanceContinue` / `AcceptanceFailed` / `AcceptanceCommandFailed` 分岐で `OrchestratorEvent::AcceptanceStarted` イベントが送出されないため、`handle_acceptance_started` が非Pass系で発火しない問題を修正する（`src/tui/orchestrator.rs:513-633`, `src/orchestration/acceptance.rs:101-123`, `src/tui/state/events/completion.rs:70-88`）。Acceptance開始イベントを各分岐で送るか、`acceptance_test_streaming` 側で送出する実装が必要。
