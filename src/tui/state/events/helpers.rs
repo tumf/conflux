@@ -129,9 +129,21 @@ impl AppState {
             if let Ok(guard) = shared_state.try_read() {
                 for change in &mut self.changes {
                     // Set iteration_number from apply_count if available
+                    // Use monotonic merge: only update if new value is greater than existing
                     let apply_count = guard.apply_count(&change.id);
                     if apply_count > 0 {
-                        change.iteration_number = Some(apply_count);
+                        match change.iteration_number {
+                            Some(existing) => {
+                                // Only update if new value is greater (monotonic increase)
+                                if apply_count > existing {
+                                    change.iteration_number = Some(apply_count);
+                                }
+                            }
+                            None => {
+                                // No existing value, set the new value
+                                change.iteration_number = Some(apply_count);
+                            }
+                        }
                     }
                 }
             }

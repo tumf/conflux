@@ -350,7 +350,8 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             "@: approve"
         });
         keys.push("e: edit");
-        if matches!(item.queue_status, QueueStatus::MergeWait) && !app.is_resolving {
+        // Use centralized resolve availability check
+        if app.is_resolve_available() {
             keys.push("M: resolve");
         }
     }
@@ -567,7 +568,8 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             "@: approve"
         });
         keys.push("e: edit");
-        if matches!(item.queue_status, QueueStatus::MergeWait) && !app.is_resolving {
+        // Use centralized resolve availability check
+        if app.is_resolve_available() {
             keys.push("M: resolve");
         }
     }
@@ -1359,6 +1361,114 @@ mod tests {
             !content.contains("M: resolve"),
             "Should NOT show M key hint when resolve is in progress"
         );
+    }
+
+    // === Tests for update-tui-error-mode-continuation ===
+
+    #[test]
+    fn test_render_uses_centralized_resolve_check_in_select_mode() {
+        // Verify that render uses is_resolve_available() in Select mode
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.mode = AppMode::Select;
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = false;
+        app.cursor_index = 0;
+
+        // is_resolve_available should be true
+        assert!(app.is_resolve_available());
+
+        // Render should show M: resolve
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            content.contains("M: resolve"),
+            "Should show M: resolve when is_resolve_available is true"
+        );
+    }
+
+    #[test]
+    fn test_render_hides_resolve_in_error_mode() {
+        // Verify that render does NOT show M: resolve in Error mode
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.mode = AppMode::Error; // Error mode
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = false;
+        app.cursor_index = 0;
+        app.add_log(LogEntry::info("log")); // Add log to show render_running_mode
+
+        // is_resolve_available should be false in Error mode
+        assert!(!app.is_resolve_available());
+
+        // Render should NOT show M: resolve
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            !content.contains("M: resolve"),
+            "Should NOT show M: resolve in Error mode"
+        );
+    }
+
+    #[test]
+    fn test_render_shows_resolve_in_running_mode() {
+        // Verify that render shows M: resolve in Running mode for MergeWait
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = false;
+        app.cursor_index = 0;
+        app.add_log(LogEntry::info("log")); // Add log to trigger render_running_mode
+
+        // is_resolve_available should be true
+        assert!(app.is_resolve_available());
+
+        // Render should show M: resolve
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            content.contains("M: resolve"),
+            "Should show M: resolve in Running mode when available"
+        );
+    }
+
+    #[test]
+    fn test_render_consistency_with_resolve_availability() {
+        // Test that whenever M: resolve is shown, resolve_merge() would succeed
+        let test_cases = vec![
+            // (mode, queue_status, is_resolving, should_be_available)
+            (AppMode::Select, QueueStatus::MergeWait, false, true),
+            (AppMode::Select, QueueStatus::MergeWait, true, false),
+            (AppMode::Running, QueueStatus::MergeWait, false, true),
+            (AppMode::Running, QueueStatus::MergeWait, true, false),
+            (AppMode::Error, QueueStatus::MergeWait, false, false),
+            (AppMode::Select, QueueStatus::Queued, false, false),
+        ];
+
+        for (mode, queue_status, is_resolving, should_be_available) in test_cases {
+            let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+            app.mode = mode.clone();
+            app.changes[0].queue_status = queue_status.clone();
+            app.is_resolving = is_resolving;
+            app.cursor_index = 0;
+            if mode != AppMode::Select {
+                app.add_log(LogEntry::info("log")); // Ensure logs exist for running mode
+            }
+
+            let is_available = app.is_resolve_available();
+            let buffer = render_buffer(&mut app, 100, 24);
+            let content = buffer_to_string(&buffer);
+            let shows_hint = content.contains("M: resolve");
+
+            assert_eq!(
+                is_available, should_be_available,
+                "is_resolve_available mismatch for mode={:?}, queue_status={:?}, is_resolving={}",
+                mode, queue_status, is_resolving
+            );
+            assert_eq!(
+                shows_hint, should_be_available,
+                "Render hint mismatch for mode={:?}, queue_status={:?}, is_resolving={}",
+                mode, queue_status, is_resolving
+            );
+        }
     }
 
     #[test]

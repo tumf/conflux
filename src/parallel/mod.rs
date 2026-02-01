@@ -1713,7 +1713,7 @@ Requirements:\n\
                             acceptance_iteration,
                         )) => {
                             let error_msg = format!(
-                                "Acceptance failed for {} with {} findings in archiving state. Per spec, archiving state must not return to apply loop. Workspace preserved for manual intervention.",
+                                "Acceptance failed for {} ({} tail lines) in archiving state. Per spec, archiving state must not return to apply loop. Workspace preserved for manual intervention.",
                                 change_id,
                                 findings.len()
                             );
@@ -2571,7 +2571,7 @@ Requirements:\n\
                     }
                     Ok((crate::orchestration::AcceptanceResult::Fail { findings }, acceptance_iteration)) => {
                         warn!(
-                            "Acceptance failed for {} with {} findings (cycle {}), returning to apply loop",
+                            "Acceptance failed for {} ({} tail lines) (cycle {}), returning to apply loop",
                             change_id,
                             findings.len(),
                             cycle_count
@@ -2581,7 +2581,7 @@ Requirements:\n\
                             let _ = tx
                                 .send(ParallelEvent::Log(
                                     LogEntry::warn(format!(
-                                        "Acceptance failed with {} findings, returning to apply loop (cycle {})",
+                                        "Acceptance failed ({} tail lines), returning to apply loop (cycle {})",
                                         findings.len(),
                                         cycle_count
                                     ))
@@ -3069,7 +3069,7 @@ Requirements:\n\
                         }
                         Ok((crate::orchestration::AcceptanceResult::Fail { findings }, acceptance_iteration)) => {
                             warn!(
-                                "Acceptance failed for {} with {} findings (cycle {}), returning to apply loop",
+                                "Acceptance failed for {} ({} tail lines) (cycle {}), returning to apply loop",
                                 change_id,
                                 findings.len(),
                                 cycle_count
@@ -3079,7 +3079,7 @@ Requirements:\n\
                                 let _ = tx
                                     .send(ParallelEvent::Log(
                                         LogEntry::warn(format!(
-                                            "Acceptance failed with {} findings, returning to apply loop (cycle {})",
+                                            "Acceptance failed ({} tail lines), returning to apply loop (cycle {})",
                                             findings.len(),
                                             cycle_count
                                         ))
@@ -3687,7 +3687,7 @@ Requirements:\n\
                                                                     }
                                                                     Ok((crate::orchestration::AcceptanceResult::Fail { findings }, acceptance_iteration)) => {
                                                                         warn!(
-                                                                            "Acceptance failed for {} with {} findings (cycle {}), returning to apply loop",
+                                                                            "Acceptance failed for {} ({} tail lines) (cycle {}), returning to apply loop",
                                                                             change_id,
                                                                             findings.len(),
                                                                             cycle_count
@@ -3697,7 +3697,7 @@ Requirements:\n\
                                                                             let _ = tx
                                                                                 .send(ParallelEvent::Log(
                                                                                     LogEntry::warn(format!(
-                                                                                        "Acceptance failed with {} findings, returning to apply loop (cycle {})",
+                                                                                        "Acceptance failed ({} tail lines), returning to apply loop (cycle {})",
                                                                                         findings.len(),
                                                                                         cycle_count
                                                                                     ))

@@ -441,7 +441,7 @@ impl SerialRunService {
                         }
                         Ok((AcceptanceResult::Fail { findings }, _attempt_number, _command)) => {
                             warn!(
-                                "Acceptance failed for {} with {} findings, will retry apply",
+                                "Acceptance failed for {} ({} tail lines), will retry apply",
                                 change.id,
                                 findings.len()
                             );
