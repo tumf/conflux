@@ -121,7 +121,9 @@ pub async fn handle_start_processing_command(
                     )
                     .await
                 };
-                let _ = orch_tx.send(OrchestratorEvent::Stopped).await;
+                // NOTE: Do not send Stopped here unconditionally.
+                // The orchestrator already sends AllCompleted on normal completion
+                // or Stopped when explicitly stopped via graceful_stop_flag.
                 result
             }));
         }

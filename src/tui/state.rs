@@ -2517,4 +2517,128 @@ mod tests {
             .iter()
             .any(|log| log.message.contains("Warning: Uncommitted")));
     }
+
+    // Processing lifecycle tests (from processing.rs)
+
+    #[test]
+    fn test_processing_error_keeps_app_mode() {
+        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start in Running mode
+        app.mode = AppMode::Running;
+        app.current_change = Some("test-change".to_string());
+
+        // Receive ProcessingError
+        app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
+
+        // AppMode should remain Running (NOT transition to Error)
+        assert_eq!(app.mode, AppMode::Running);
+
+        // Change should be marked as Error
+        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
+        assert!(matches!(change.queue_status, QueueStatus::Error(_)));
+
+        // error_change_id should be set
+        assert_eq!(app.error_change_id, Some("test-change".to_string()));
+
+        // current_change should be cleared
+        assert_eq!(app.current_change, None);
+    }
+
+    #[test]
+    fn test_processing_error_from_select_mode() {
+        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start in Select mode
+        app.mode = AppMode::Select;
+
+        // Receive ProcessingError
+        app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
+
+        // AppMode should remain Select (NOT transition to Error)
+        assert_eq!(app.mode, AppMode::Select);
+
+        // Change should be marked as Error
+        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
+        assert!(matches!(change.queue_status, QueueStatus::Error(_)));
+    }
+
+    #[test]
+    fn test_processing_started_sets_state() {
+        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.handle_processing_started("test-change".to_string());
+
+        assert_eq!(app.current_change, Some("test-change".to_string()));
+        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
+        assert_eq!(change.queue_status, QueueStatus::Applying);
+        assert!(change.started_at.is_some());
+    }
+
+    #[test]
+    fn test_processing_completed_updates_status() {
+        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.handle_processing_completed("test-change".to_string());
+
+        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
+        assert_eq!(change.queue_status, QueueStatus::Archiving);
+    }
+
+    #[test]
+    fn test_all_completed_transitions_to_select() {
+        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Running;
+        app.handle_all_completed();
+
+        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.current_change, None);
+    }
+
+    #[test]
+    fn test_all_completed_preserves_error_mode() {
+        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Error;
+        app.handle_all_completed();
+
+        // Should remain in Error mode
+        assert_eq!(app.mode, AppMode::Error);
+    }
+
+    #[test]
+    fn test_all_completed_preserves_stopped_mode() {
+        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Stopped;
+        app.handle_all_completed();
+
+        // Should remain in Stopped mode (not transition to Select)
+        assert_eq!(app.mode, AppMode::Stopped);
+    }
+
+    #[test]
+    fn test_stopped_resets_queue_status() {
+        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Set to Queued
+        app.changes[0].queue_status = QueueStatus::Queued;
+        app.changes[0].selected = true;
+
+        app.handle_stopped();
+
+        assert_eq!(app.mode, AppMode::Stopped);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+        // selected should be preserved
+        assert!(app.changes[0].selected);
+    }
 }
