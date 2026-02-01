@@ -37,9 +37,6 @@ pub enum TuiCommand {
     ForceStop,
     /// Retry error changes
     Retry,
-    /// Delete worktrees associated with a change
-    #[allow(dead_code)]
-    DeleteWorktree(String),
     /// Delete a worktree by path (from worktree view)
     /// The optional String is the branch name to delete after worktree removal
     DeleteWorktreeByPath(PathBuf, Option<String>),

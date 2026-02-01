@@ -126,23 +126,6 @@ pub fn truncate_to_display_width_with_suffix(s: &str, max_width: usize, suffix: 
     result
 }
 
-/// Truncate a string to fit within a specified display width.
-///
-/// This function respects Unicode character display widths, where CJK characters
-/// (e.g., Japanese, Chinese) typically occupy 2 terminal columns, while ASCII
-/// characters occupy 1 column.
-///
-/// # Arguments
-/// * `s` - The string to truncate
-/// * `max_width` - The maximum display width in terminal columns
-///
-/// # Returns
-/// A truncated string with "..." appended if truncation occurred
-#[allow(dead_code)]
-pub fn truncate_to_display_width(s: &str, max_width: usize) -> String {
-    truncate_to_display_width_with_suffix(s, max_width, "...")
-}
-
 /// Clear the terminal screen
 pub fn clear_screen() -> Result<()> {
     use std::io::stdout;
@@ -166,40 +149,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_truncate_to_display_width_short_string() {
+    fn test_truncate_to_display_width_with_suffix_short_string() {
         let s = "hello";
-        let result = truncate_to_display_width(s, 10);
+        let result = truncate_to_display_width_with_suffix(s, 10, "...");
         assert_eq!(result, "hello");
     }
 
     #[test]
-    fn test_truncate_to_display_width_exact_fit() {
+    fn test_truncate_to_display_width_with_suffix_exact_fit() {
         let s = "hello";
-        let result = truncate_to_display_width(s, 5);
+        let result = truncate_to_display_width_with_suffix(s, 5, "...");
         assert_eq!(result, "hello");
     }
 
     #[test]
-    fn test_truncate_to_display_width_needs_truncation() {
+    fn test_truncate_to_display_width_with_suffix_needs_truncation() {
         let s = "hello world";
-        let result = truncate_to_display_width(s, 8);
+        let result = truncate_to_display_width_with_suffix(s, 8, "...");
         assert_eq!(result, "hello...");
     }
 
     #[test]
-    fn test_truncate_to_display_width_cjk() {
+    fn test_truncate_to_display_width_with_suffix_cjk() {
         // CJK characters are 2 columns wide
         let s = "日本語テスト";
         // 6 characters * 2 columns = 12 columns
-        let result = truncate_to_display_width(s, 8);
+        let result = truncate_to_display_width_with_suffix(s, 8, "...");
         // Should fit "日本" (4 columns) + "..." (3 columns) = 7 columns
         assert_eq!(result, "日本...");
     }
 
     #[test]
-    fn test_truncate_to_display_width_with_emoji() {
+    fn test_truncate_to_display_width_with_suffix_emoji() {
         let s = "日本😀語";
-        let result = truncate_to_display_width(s, 6);
+        let result = truncate_to_display_width_with_suffix(s, 6, "...");
         assert_eq!(result, "日...");
     }
 

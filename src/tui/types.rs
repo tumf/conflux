@@ -106,12 +106,7 @@ pub struct MergeConflictInfo {
 
 /// Action to perform on a worktree
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub enum WorktreeAction {
     /// Delete the worktree
     Delete,
-    /// Open editor in the worktree directory
-    OpenEditor,
-    /// Open shell in the worktree directory
-    OpenShell,
 }

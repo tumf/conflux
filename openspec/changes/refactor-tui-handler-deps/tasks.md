@@ -27,3 +27,8 @@
 - [x] `src/tui/state.rs:64-65` の `ChangeState.last_modified` が `#[allow(dead_code)]` のまま未使用のため、TUI フローで参照するか削除する（削除完了）
 - [x] `src/tui/state.rs:193-200` の `ChangeState::progress_ratio` が `#[allow(dead_code)]` のまま未使用のため、TUI フローで参照するか削除する（削除完了）
 - [x] `src/tui/state.rs:202-205` の `ChangeState::is_complete` が `#[allow(dead_code)]` のまま未使用のため、TUI フローで参照するか削除する（削除完了）
+
+## Acceptance #5 Failure Follow-up
+- [x] `src/tui/events.rs:42` の `TuiCommand::DeleteWorktree` が生成経路を持たず、`src/tui/command_handlers.rs:296` のハンドラのみで未使用のため、呼び出し経路へ統合するか削除する（削除完了: `TuiCommand::DeleteWorktree` 定義とハンドラ削除、関連する `remove_worktrees_for_change` 関数も削除）
+- [x] `src/tui/types.rs:110-116` の `WorktreeAction::OpenEditor`/`OpenShell` が参照されていないため、利用経路を追加するか削除する（削除完了: `WorktreeAction::OpenEditor`/`OpenShell` を削除、`Delete` のみ保持）
+- [x] `src/tui/utils.rs:142-143` の `truncate_to_display_width` が本フローから未使用（参照はテストのみ）のため、利用するか削除する（削除完了: 関数削除、テストを `truncate_to_display_width_with_suffix` を直接呼ぶように更新）
