@@ -7,22 +7,81 @@ use crate::vcs::{VcsError, VcsResult};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// Classification of worktree add failures based on stderr output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeAddFailure {
+    /// Path already exists (possibly stale worktree)
+    PathExists,
+    /// Branch is already checked out in another worktree
+    BranchDuplicate,
+    /// Invalid reference (base commit/branch doesn't exist)
+    InvalidReference,
+    /// Permission denied
+    PermissionDenied,
+    /// Unknown/other error
+    Unknown,
+}
+
+impl WorktreeAddFailure {
+    /// Classify the failure based on stderr output.
+    pub fn classify(stderr: &str) -> Self {
+        let stderr_lower = stderr.to_lowercase();
+
+        // Check for branch duplicate first (more specific pattern)
+        if stderr_lower.contains("is already checked out")
+            || (stderr_lower.contains("already checked out") && stderr_lower.contains("at"))
+        {
+            Self::BranchDuplicate
+        } else if stderr_lower.contains("already exists")
+            || stderr_lower.contains("path already exists")
+        {
+            Self::PathExists
+        } else if stderr_lower.contains("invalid reference")
+            || stderr_lower.contains("not a valid")
+            || stderr_lower.contains("unknown revision")
+            || stderr_lower.contains("bad revision")
+        {
+            Self::InvalidReference
+        } else if stderr_lower.contains("permission denied")
+            || stderr_lower.contains("operation not permitted")
+        {
+            Self::PermissionDenied
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// Get a human-readable description of the failure.
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::PathExists => "path already exists (possibly stale worktree)",
+            Self::BranchDuplicate => "branch is already checked out in another worktree",
+            Self::InvalidReference => "invalid reference (base commit/branch not found)",
+            Self::PermissionDenied => "permission denied",
+            Self::Unknown => "unknown error",
+        }
+    }
+}
 
 /// Create a new worktree at the specified path.
 ///
 /// Creates a new branch with the given name based on the commit.
+/// If the worktree add fails due to a stale path, attempts to prune and retry once.
 pub async fn worktree_add<P: AsRef<Path>>(
     cwd: P,
     worktree_path: &str,
     branch_name: &str,
     base_commit: &str,
 ) -> VcsResult<()> {
+    let cwd_ref = cwd.as_ref();
     debug!(
         "Creating worktree at {} with branch {} from {}",
         worktree_path, branch_name, base_commit
     );
-    run_git(
+
+    let result = run_git(
         &[
             "worktree",
             "add",
@@ -31,10 +90,209 @@ pub async fn worktree_add<P: AsRef<Path>>(
             branch_name,
             base_commit,
         ],
-        cwd,
+        cwd_ref,
     )
-    .await?;
-    Ok(())
+    .await;
+
+    // If successful, return immediately
+    if result.is_ok() {
+        return Ok(());
+    }
+
+    // Classify the error and attempt retry if appropriate
+    let err = result.unwrap_err();
+
+    // Extract stderr from the error to classify the failure
+    let (classification, should_retry) = match &err {
+        VcsError::Command { stderr, .. } => {
+            let stderr_str = stderr.as_deref().unwrap_or("");
+            let classification = WorktreeAddFailure::classify(stderr_str);
+
+            // Only retry for PathExists failures
+            let should_retry = classification == WorktreeAddFailure::PathExists;
+
+            debug!(
+                "Worktree add failed with classification: {:?} ({})",
+                classification,
+                classification.description()
+            );
+
+            (classification, should_retry)
+        }
+        _ => (WorktreeAddFailure::Unknown, false),
+    };
+
+    if !should_retry {
+        // Not a retryable error, return the original error with classification info
+        return Err(enhance_error_with_classification(err, classification));
+    }
+
+    // Check if the path is truly stale (exists but not in worktree list)
+    let is_stale = match check_stale_worktree_path(cwd_ref, worktree_path).await {
+        Ok(stale) => stale,
+        Err(e) => {
+            warn!("Failed to check if worktree path is stale: {}", e);
+            false
+        }
+    };
+
+    if !is_stale {
+        // Path exists but is actually registered, don't retry
+        return Err(enhance_error_with_classification(err, classification));
+    }
+
+    // Path is stale, attempt prune and retry
+    info!(
+        "Detected stale worktree path at {}, attempting prune and retry",
+        worktree_path
+    );
+
+    if let Err(prune_err) = run_git(&["worktree", "prune"], cwd_ref).await {
+        warn!("git worktree prune failed: {}", prune_err);
+        return Err(enhance_error_with_classification(err, classification));
+    }
+
+    // After pruning, remove the stale directory
+    let path_buf = PathBuf::from(worktree_path);
+    if path_buf.exists() {
+        if let Err(remove_err) = std::fs::remove_dir_all(&path_buf) {
+            warn!(
+                "Failed to remove stale directory {}: {}",
+                worktree_path, remove_err
+            );
+            return Err(enhance_error_with_classification(err, classification));
+        }
+    }
+
+    // Retry the worktree add
+    let retry_result = run_git(
+        &[
+            "worktree",
+            "add",
+            worktree_path,
+            "-b",
+            branch_name,
+            base_commit,
+        ],
+        cwd_ref,
+    )
+    .await;
+
+    match retry_result {
+        Ok(_) => {
+            info!("Worktree add succeeded after prune");
+            Ok(())
+        }
+        Err(retry_err) => {
+            // Retry failed, return error with both original classification and retry info
+            warn!("Worktree add retry failed after prune");
+            Err(enhance_error_with_retry_info(
+                err,
+                retry_err,
+                classification,
+            ))
+        }
+    }
+}
+
+/// Check if a worktree path is stale (exists but not registered).
+async fn check_stale_worktree_path<P: AsRef<Path>>(cwd: P, worktree_path: &str) -> VcsResult<bool> {
+    let path_buf = PathBuf::from(worktree_path);
+
+    // If the path doesn't exist, it's not stale
+    if !path_buf.exists() {
+        return Ok(false);
+    }
+
+    // Get list of registered worktrees
+    let worktrees = list_worktrees(cwd).await?;
+
+    // Check if this path is in the registered list
+    let normalized_path = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
+
+    for (wt_path, _, _, _, _) in worktrees {
+        let wt_path_buf = PathBuf::from(&wt_path);
+        let normalized_wt = wt_path_buf.canonicalize().unwrap_or(wt_path_buf);
+
+        if normalized_path == normalized_wt {
+            // Path is registered, not stale
+            return Ok(false);
+        }
+    }
+
+    // Path exists but not registered - it's stale
+    Ok(true)
+}
+
+/// Enhance error with classification information.
+fn enhance_error_with_classification(
+    err: VcsError,
+    classification: WorktreeAddFailure,
+) -> VcsError {
+    match err {
+        VcsError::Command {
+            backend,
+            message,
+            command,
+            working_dir,
+            stderr,
+            stdout,
+        } => VcsError::Command {
+            backend,
+            message: format!(
+                "{} (classified as: {})",
+                message,
+                classification.description()
+            ),
+            command,
+            working_dir,
+            stderr,
+            stdout,
+        },
+        other => other,
+    }
+}
+
+/// Enhance error with retry information.
+fn enhance_error_with_retry_info(
+    original_err: VcsError,
+    retry_err: VcsError,
+    classification: WorktreeAddFailure,
+) -> VcsError {
+    match (original_err, retry_err) {
+        (
+            VcsError::Command {
+                backend,
+                message: orig_msg,
+                command,
+                working_dir,
+                stderr: orig_stderr,
+                stdout: orig_stdout,
+            },
+            VcsError::Command {
+                message: retry_msg,
+                stderr: retry_stderr,
+                ..
+            },
+        ) => VcsError::Command {
+            backend,
+            message: format!(
+                "{} (classified as: {}). Retry after prune also failed: {}",
+                orig_msg,
+                classification.description(),
+                retry_msg
+            ),
+            command,
+            working_dir,
+            stderr: Some(format!(
+                "Original: {}\nRetry: {}",
+                orig_stderr.unwrap_or_default(),
+                retry_stderr.unwrap_or_default()
+            )),
+            stdout: orig_stdout,
+        },
+        (orig, _) => orig,
+    }
 }
 
 /// Create a new detached worktree at the specified path.
@@ -267,6 +525,208 @@ pub async fn run_worktree_setup<P1: AsRef<Path>, P2: AsRef<Path>>(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_worktree_add_error_classification() {
+        // Test PathExists
+        let stderr = "fatal: '/path/to/worktree' already exists";
+        assert_eq!(
+            WorktreeAddFailure::classify(stderr),
+            WorktreeAddFailure::PathExists
+        );
+
+        // Test BranchDuplicate
+        let stderr = "fatal: 'my-branch' is already checked out at '/other/path'";
+        assert_eq!(
+            WorktreeAddFailure::classify(stderr),
+            WorktreeAddFailure::BranchDuplicate
+        );
+
+        // Test InvalidReference
+        let stderr = "fatal: invalid reference: nonexistent-branch";
+        assert_eq!(
+            WorktreeAddFailure::classify(stderr),
+            WorktreeAddFailure::InvalidReference
+        );
+
+        // Test PermissionDenied
+        let stderr = "fatal: could not create worktree: Permission denied";
+        assert_eq!(
+            WorktreeAddFailure::classify(stderr),
+            WorktreeAddFailure::PermissionDenied
+        );
+
+        // Test Unknown
+        let stderr = "fatal: some other error";
+        assert_eq!(
+            WorktreeAddFailure::classify(stderr),
+            WorktreeAddFailure::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn test_worktree_add_retry_on_stale_path() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let init = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init.is_err() {
+            return; // Skip if git not available
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create initial commit
+        std::fs::write(temp_dir.path().join("README.md"), "test").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create a worktree
+        let worktree_path = temp_dir.path().join("worktrees").join("test-wt");
+        std::fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
+
+        let _ = worktree_add(
+            temp_dir.path(),
+            worktree_path.to_str().unwrap(),
+            "test-branch",
+            "HEAD",
+        )
+        .await;
+
+        // Clean up the worktree registration, but keep the directory
+        // This simulates a stale worktree
+        let _ = Command::new("git")
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                worktree_path.to_str().unwrap(),
+            ])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Recreate the directory to simulate stale state
+        std::fs::create_dir_all(&worktree_path).unwrap();
+
+        // Verify the directory exists but is not registered
+        assert!(worktree_path.exists());
+        let worktrees = list_worktrees(temp_dir.path()).await.unwrap();
+        let is_registered = worktrees
+            .iter()
+            .any(|(path, _, _, _, _)| *path == worktree_path.to_str().unwrap());
+        assert!(!is_registered, "Worktree should not be registered");
+
+        // Try to create a worktree at the same path
+        // This should detect the stale path, prune, remove the directory, and retry successfully
+        let result = worktree_add(
+            temp_dir.path(),
+            worktree_path.to_str().unwrap(),
+            "test-branch-2",
+            "HEAD",
+        )
+        .await;
+
+        // The retry should succeed after pruning and removing the stale directory
+        if let Err(e) = &result {
+            eprintln!("Retry failed with error: {:?}", e);
+        }
+        assert!(
+            result.is_ok(),
+            "Expected retry to succeed after prune and cleanup"
+        );
+
+        // Cleanup
+        let _ = worktree_remove(temp_dir.path(), worktree_path.to_str().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn test_worktree_add_retry_preserves_error() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let init = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init.is_err() {
+            return; // Skip if git not available
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create initial commit
+        std::fs::write(temp_dir.path().join("README.md"), "test").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Try to create a worktree with an invalid base commit
+        let worktree_path = temp_dir.path().join("worktrees").join("test-wt");
+        std::fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
+
+        let result = worktree_add(
+            temp_dir.path(),
+            worktree_path.to_str().unwrap(),
+            "test-branch",
+            "nonexistent-commit",
+        )
+        .await;
+
+        // Should fail with InvalidReference classification
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+
+        match err {
+            VcsError::Command { message, .. } => {
+                // Error message should contain classification
+                assert!(
+                    message.contains("invalid reference") || message.contains("classified as"),
+                    "Expected error message to contain classification info, got: {}",
+                    message
+                );
+            }
+            _ => panic!("Expected VcsError::Command"),
+        }
+    }
 
     #[tokio::test]
     async fn test_worktree_add_with_oso_session_branch() {
