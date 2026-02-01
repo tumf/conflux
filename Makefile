@@ -1,4 +1,4 @@
-.PHONY: install build bump-minor bump-patch bump-major
+.PHONY: install build bump-minor bump-patch bump-major index index-full
 
 # Build the project
 build:
@@ -7,6 +7,29 @@ build:
 # Install the binary locally
 install:
 	cargo install --path .
+
+# Create fast indexes (LEANN + TLDR warm cache) - runs in parallel
+index:
+	@echo "Starting parallel index creation..."
+	@( \
+		(echo "[LEANN] Creating index..." && leann build openspec-spec --docs ./src --force && echo "[LEANN] ✓ Complete" || echo "[LEANN] ✗ Failed") & \
+		(echo "[TLDR] Warming cache..." && tldr warm . --lang rust && echo "[TLDR] ✓ Complete" || echo "[TLDR] ✗ Failed") & \
+		wait; \
+		echo ""; \
+		echo "Fast index creation complete!" \
+	)
+
+# Create full indexes including semantic search (may take several minutes) - runs in parallel
+index-full:
+	@echo "Starting parallel full index creation..."
+	@( \
+		(echo "[LEANN] Creating index..." && leann build openspec-spec --docs ./src --force && echo "[LEANN] ✓ Complete" || echo "[LEANN] ✗ Failed") & \
+		(echo "[TLDR] Warming cache..." && tldr warm . --lang rust && echo "[TLDR warm] ✓ Complete" || echo "[TLDR warm] ✗ Failed") & \
+		(echo "[TLDR] Creating semantic index (this may take a while)..." && tldr semantic index . --lang rust && echo "[TLDR semantic] ✓ Complete" || echo "[TLDR semantic] ✗ Failed") & \
+		wait; \
+		echo ""; \
+		echo "Full index creation complete!" \
+	)
 
 # Bump minor version (0.x.0 -> 0.x+1.0) with git commit
 bump-minor:
