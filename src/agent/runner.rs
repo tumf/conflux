@@ -516,7 +516,7 @@ impl AgentRunner {
         change_id: &str,
         cwd: Option<&Path>,
         base_branch: Option<&str>,
-    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant, String)> {
         let start = Instant::now();
         let template = self.config.get_acceptance_command()?;
         let user_prompt = self.config.get_acceptance_prompt();
@@ -556,7 +556,7 @@ impl AgentRunner {
             }
             None => self.execute_shell_command_streaming(&command).await?,
         };
-        Ok((child, rx, start))
+        Ok((child, rx, start, command))
     }
 
     /// Build acceptance diff context for all acceptance attempts.

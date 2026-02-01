@@ -68,14 +68,23 @@ impl AppState {
     }
 
     /// Handle AcceptanceStarted event
-    pub(super) fn handle_acceptance_started(&mut self, change_id: String) {
+    pub(super) fn handle_acceptance_started(&mut self, change_id: String, command: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             if change.started_at.is_none() {
                 change.started_at = Some(Instant::now());
             }
             change.queue_status = QueueStatus::Accepting;
         }
-        self.add_log(LogEntry::info(format!("Acceptance started: {}", change_id)));
+        self.add_log(
+            LogEntry::info(format!("Acceptance started: {}", change_id))
+                .with_operation("acceptance")
+                .with_change_id(&change_id),
+        );
+        self.add_log(
+            LogEntry::info(format!("  Command: {}", command))
+                .with_operation("acceptance")
+                .with_change_id(&change_id),
+        );
     }
 
     /// Handle AcceptanceCompleted event
