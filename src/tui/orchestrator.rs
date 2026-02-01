@@ -980,27 +980,8 @@ pub async fn run_orchestrator(
                     ws.apply_execution_event(&apply_completed_event).await;
                 }
 
-                // Send AcceptanceStarted event (acceptance ran and returned Continue)
-                let acceptance_command = {
-                    let template = agent
-                        .config()
-                        .get_acceptance_command()
-                        .unwrap_or("acceptance");
-                    let user_prompt = agent.config().get_acceptance_prompt();
-                    let history = agent.format_acceptance_history(&change_id);
-                    let prompt = format!("{}\n{}", user_prompt, history);
-                    let cmd = OrchestratorConfig::expand_change_id(template, &change_id);
-                    OrchestratorConfig::expand_prompt(&cmd, &prompt)
-                };
-                let acceptance_started_event = OrchestratorEvent::AcceptanceStarted {
-                    change_id: change_id.clone(),
-                    command: acceptance_command,
-                };
-                let _ = tx.send(acceptance_started_event.clone()).await;
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&acceptance_started_event).await;
-                }
+                // Note: AcceptanceStarted event is sent from acceptance_test_streaming
+                // with the actual command string (including diff context and last output)
 
                 // Send AcceptanceCompleted event
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
@@ -1082,27 +1063,8 @@ pub async fn run_orchestrator(
                     ws.apply_execution_event(&apply_completed_event).await;
                 }
 
-                // Send AcceptanceStarted event (acceptance ran and failed)
-                let acceptance_command = {
-                    let template = agent
-                        .config()
-                        .get_acceptance_command()
-                        .unwrap_or("acceptance");
-                    let user_prompt = agent.config().get_acceptance_prompt();
-                    let history = agent.format_acceptance_history(&change_id);
-                    let prompt = format!("{}\n{}", user_prompt, history);
-                    let cmd = OrchestratorConfig::expand_change_id(template, &change_id);
-                    OrchestratorConfig::expand_prompt(&cmd, &prompt)
-                };
-                let acceptance_started_event = OrchestratorEvent::AcceptanceStarted {
-                    change_id: change_id.clone(),
-                    command: acceptance_command,
-                };
-                let _ = tx.send(acceptance_started_event.clone()).await;
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&acceptance_started_event).await;
-                }
+                // Note: AcceptanceStarted event is sent from acceptance_test_streaming
+                // with the actual command string (including diff context and last output)
 
                 // Send AcceptanceCompleted event
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
@@ -1133,27 +1095,8 @@ pub async fn run_orchestrator(
                     ws.apply_execution_event(&apply_completed_event).await;
                 }
 
-                // Send AcceptanceStarted event (acceptance ran but command failed)
-                let acceptance_command = {
-                    let template = agent
-                        .config()
-                        .get_acceptance_command()
-                        .unwrap_or("acceptance");
-                    let user_prompt = agent.config().get_acceptance_prompt();
-                    let history = agent.format_acceptance_history(&change_id);
-                    let prompt = format!("{}\n{}", user_prompt, history);
-                    let cmd = OrchestratorConfig::expand_change_id(template, &change_id);
-                    OrchestratorConfig::expand_prompt(&cmd, &prompt)
-                };
-                let acceptance_started_event = OrchestratorEvent::AcceptanceStarted {
-                    change_id: change_id.clone(),
-                    command: acceptance_command,
-                };
-                let _ = tx.send(acceptance_started_event.clone()).await;
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&acceptance_started_event).await;
-                }
+                // Note: AcceptanceStarted event is sent from acceptance_test_streaming
+                // with the actual command string (including diff context and last output)
 
                 // Send AcceptanceCompleted event
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {

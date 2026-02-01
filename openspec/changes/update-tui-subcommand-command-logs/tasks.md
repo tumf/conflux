@@ -19,4 +19,5 @@
   - 完了確認: すべてのCommand行に.with_operation()と.with_change_id()を付与（apply/archive/acceptance/resolve）
 
 ## Acceptance #3 Failure Follow-up
-- [ ] src/tui/orchestrator.rs: AcceptanceContinue/AcceptanceFailed/AcceptanceCommandFailedで送信するAcceptanceStartedのcommandがuser_prompt+historyのみでbuild_acceptance_promptのdiff context/last outputを含まず、実際のacceptance実行コマンド（src/agent/runner.rsのrun_acceptance_streaming）と不一致になっているため、実行コマンドと一致する文字列を送信する
+- [x] src/tui/orchestrator.rs: AcceptanceContinue/AcceptanceFailed/AcceptanceCommandFailedで送信するAcceptanceStartedのcommandがuser_prompt+historyのみでbuild_acceptance_promptのdiff context/last outputを含まず、実際のacceptance実行コマンド（src/agent/runner.rsのrun_acceptance_streaming）と不一致になっているため、実行コマンドと一致する文字列を送信する
+  - 完了確認: AcceptanceContinue/AcceptanceFailed/AcceptanceCommandFailedの処理から重複するAcceptanceStartedイベント送信を削除。acceptance_test_streaming内で実際のコマンド文字列（diff context/last output含む）がログ出力される
