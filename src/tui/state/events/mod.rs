@@ -84,8 +84,8 @@ impl AppState {
             OrchestratorEvent::MergeDeferred { change_id, reason } => {
                 self.handle_merge_deferred(change_id, reason)
             }
-            OrchestratorEvent::AcceptanceStarted { change_id } => {
-                self.handle_acceptance_started(change_id)
+            OrchestratorEvent::AcceptanceStarted { change_id, command } => {
+                self.handle_acceptance_started(change_id, command)
             }
             OrchestratorEvent::AcceptanceCompleted { change_id } => {
                 self.handle_acceptance_completed(change_id)
@@ -101,14 +101,14 @@ impl AppState {
                 worktree_change_ids,
                 worktree_paths,
                 worktree_not_ahead_ids,
-                resolve_wait_ids,
+                merge_wait_ids,
             } => self.handle_changes_refreshed(
                 changes,
                 committed_change_ids,
                 worktree_change_ids,
                 worktree_paths,
                 worktree_not_ahead_ids,
-                resolve_wait_ids,
+                merge_wait_ids,
             ),
             OrchestratorEvent::WorktreesRefreshed { worktrees } => {
                 self.handle_worktrees_refreshed(worktrees)

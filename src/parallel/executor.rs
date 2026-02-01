@@ -1389,23 +1389,6 @@ pub async fn execute_acceptance_in_workspace(
     // Get the acceptance iteration number (attempt number that will be used)
     let acceptance_iteration = agent.next_acceptance_attempt_number(change_id);
 
-    // Send AcceptanceStarted event
-    if let Some(ref tx) = event_tx {
-        let _ = tx
-            .send(ParallelEvent::AcceptanceStarted {
-                change_id: change_id.to_string(),
-            })
-            .await;
-        let _ = tx
-            .send(ParallelEvent::Log(
-                crate::events::LogEntry::info(format!("Running acceptance test: {}", change_id))
-                    .with_change_id(change_id)
-                    .with_operation("acceptance")
-                    .with_iteration(acceptance_iteration),
-            ))
-            .await;
-    }
-
     // Build prompt with system instructions and history context
     let user_prompt = config.get_acceptance_prompt();
     let history_context = agent.format_acceptance_history(change_id);
@@ -1494,6 +1477,16 @@ pub async fn execute_acceptance_in_workspace(
         module = module_path!(),
         "Executing acceptance command via AiCommandRunner: {} (cwd: {:?})", command, workspace_path
     );
+
+    // Send AcceptanceStarted event with command
+    if let Some(ref tx) = event_tx {
+        let _ = tx
+            .send(ParallelEvent::AcceptanceStarted {
+                change_id: change_id.to_string(),
+                command: command.clone(),
+            })
+            .await;
+    }
 
     // Capture start time for history recording
     let start_time = std::time::Instant::now();
@@ -1701,7 +1694,7 @@ pub async fn execute_acceptance_in_workspace(
         ParseResult::Fail { .. } => {
             let findings_for_tasks = tail_findings.clone();
             info!(
-                "Acceptance failed for: {} with {} findings",
+                "Acceptance failed for: {} ({} tail lines)",
                 change_id,
                 findings_for_tasks.len()
             );
@@ -1726,7 +1719,7 @@ pub async fn execute_acceptance_in_workspace(
                 let _ = tx
                     .send(ParallelEvent::Log(
                         crate::events::LogEntry::warn(format!(
-                            "Acceptance test failed with {} findings",
+                            "Acceptance test failed ({} tail lines)",
                             findings_for_tasks.len()
                         ))
                         .with_change_id(change_id)

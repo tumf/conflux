@@ -60,35 +60,50 @@ Changes have two independent states: **approval** and **selection/queue**.
 **Queue Status (shown in Running mode):**
 | Status | Description |
 |--------|-------------|
-| `[Queued]` | Waiting to be processed |
-| `[Processing]` | Currently being applied |
-| `[Completed]` | All tasks finished |
-| `[Archived]` | Successfully archived |
-| `[Error]` | Processing failed |
+| `[not queued]` | Not in the execution queue (can be toggled dynamically while running) |
+| `[queued]` | Waiting to be processed |
+| `[blocked]` | Blocked by unresolved dependencies |
+| `[merge wait]` | Waiting for merge resolution (use `M` to trigger resolve) |
+| `[resolve wait]` | Waiting to run resolve (UI actions are restricted) |
+| `[applying]` | Applying (spinner + progress% / iteration when available) |
+| `[accepting]` | Acceptance/tests (spinner, iteration when available) |
+| `[archiving]` | Archiving (spinner, iteration when available) |
+| `[resolving]` | Resolving (spinner, iteration when available) |
+| `[archived]` | Archived successfully |
+| `[merged]` | Merged to base branch (parallel mode only) |
+| `[error]` | Processing failed |
 
 **Workflow:**
-1. **Select mode**: Use `@` to approve changes, then `Space` to select (reserve) them
-2. Press `F5` to start processing - all selected changes become `[Queued]`
-3. **Running mode**: Watch progress as changes move through Queued → Processing → Completed → Archived
+1. **Select mode (header shows `[Ready]`)**: Use `@` to approve changes, then `Space` to toggle the execution mark (`selected`) only
+2. Press `F5` to start processing - all execution-marked changes become `queued`
+3. **Running mode (header shows `[Running N]`)**: `queued` → `applying` → (optional `accepting`) → `archiving` → `archived` (parallel mode may also show `merge wait`/`resolving`/`merged`)
+
+#### Header Status
+
+| Display | Meaning |
+|---------|---------|
+| `[Ready]` | Selection/idle (`AppMode::Select`) |
+| `[Running N]` | Active processing, where N counts `applying`/`accepting`/`archiving`/`resolving` |
 
 #### TUI Key Bindings
 
 **Changes View:**
 
-| Key | Select Mode | Running Mode |
-|-----|-------------|--------------|
-| `↑/↓` or `j/k` | Navigate list | Navigate list |
-| `Tab` | Switch to Worktrees view | Switch to Worktrees view |
-| `Space` | Toggle selection | Add/remove from queue |
-| `@` | Toggle approval | Toggle approval |
-| `e` | Open editor | Open editor |
-| `+` | New proposal | New proposal |
-| `w` | Show QR code* | Show QR code* |
-| `F5` | Start processing | - |
-| `=` | Toggle parallel mode | - |
-| `Esc` | - | Stop (graceful/force) |
-| `q` | Quit | Quit |
-| `PageUp/Down` | - | Scroll logs |
+| Key | Select (`[Ready]`) | Running (/Stopping) | Stopped (/Error) |
+|-----|-------------------|--------------------|------------------|
+| `↑/↓` or `j/k` | Navigate list | Navigate list | Navigate list |
+| `Tab` | Switch to Worktrees view | Switch to Worktrees view | Switch to Worktrees view |
+| `Space` | Toggle execution mark only | Add/remove from dynamic queue (`not queued`⇄`queued`) | Toggle execution mark for `not queued` only |
+| `@` | Toggle approval | Toggle approval | Toggle approval |
+| `e` | Open editor | Open editor | Open editor |
+| `w` | Show QR code* | Show QR code* | Show QR code* |
+| `M` | Resolve when status is `merge wait` | Resolve when status is `merge wait` | Resolve when status is `merge wait` |
+| `F5` | Start processing | (In Stopping: cancel stop) | Resume (Stopped) / Retry (Error) |
+| `=` | Toggle parallel mode | - | Toggle parallel mode |
+| `Esc` | - | Stop (1st: graceful, 2nd: force) | - |
+| `PageUp/Down` | (When logs are shown) scroll logs | Scroll logs | Scroll logs |
+| `Home/End` | (When logs are shown) top/bottom | Top/bottom | Top/bottom |
+| `Ctrl+C` | Quit | Quit | Quit |
 
 **Worktrees View:**
 
@@ -100,17 +115,10 @@ Changes have two independent states: **approval** and **selection/queue**.
 | `D` | Delete worktree | Remove non-main, non-processing worktree |
 | `M` | Merge to base branch | Merge current worktree branch (conflict-free only) |
 | `e` | Open editor | Open editor in worktree directory |
-| `Enter` | Open shell | Run `worktree_command` in worktree |
-| `q` | Quit | Exit application |
+| `Enter` | Open shell | Runs only when `worktree_command` is configured |
+| `Ctrl+C` | Quit | Exit application |
 
 *QR code is only available when web monitoring is enabled (`--web` flag). Press any key to close the QR popup.
-
-**Proposal Mode:**
-
-| Key | Action |
-|-----|--------|
-| `Ctrl+S` | Submit proposal |
-| `Esc` | Cancel and return |
 
 ### TUI Worktree View
 

@@ -829,6 +829,7 @@ impl Orchestrator {
                     total_changes,
                     remaining_changes,
                     cancel_check,
+                    None, // No operation tracker in CLI mode
                 )
                 .await?;
 

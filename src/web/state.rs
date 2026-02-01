@@ -490,7 +490,7 @@ impl WebState {
                 }
 
                 // Acceptance events
-                ExecutionEvent::AcceptanceStarted { change_id } => {
+                ExecutionEvent::AcceptanceStarted { change_id, .. } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
                         change.queue_status = Some("accepting".to_string());
                         updated = true;
@@ -602,7 +602,7 @@ impl WebState {
                     worktree_change_ids,
                     worktree_paths: _,
                     worktree_not_ahead_ids: _,
-                    resolve_wait_ids: _,
+                    merge_wait_ids: _,
                 } => {
                     // Update changes with new data
                     let mut new_change_statuses: Vec<ChangeStatus> =
@@ -1054,6 +1054,7 @@ mod tests {
         web_state
             .apply_execution_event(&ExecutionEvent::AcceptanceStarted {
                 change_id: "change-a".to_string(),
+                command: "test command".to_string(),
             })
             .await;
 
@@ -1328,7 +1329,7 @@ mod tests {
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
                 worktree_not_ahead_ids: HashSet::new(),
-                resolve_wait_ids: HashSet::new(),
+                merge_wait_ids: HashSet::new(),
             })
             .await;
 
@@ -1358,7 +1359,7 @@ mod tests {
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
                 worktree_not_ahead_ids: HashSet::new(),
-                resolve_wait_ids: HashSet::new(),
+                merge_wait_ids: HashSet::new(),
             })
             .await;
 
@@ -1494,7 +1495,7 @@ mod tests {
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
                 worktree_not_ahead_ids: HashSet::new(),
-                resolve_wait_ids: HashSet::new(),
+                merge_wait_ids: HashSet::new(),
             })
             .await;
 
@@ -1537,7 +1538,7 @@ mod tests {
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
                 worktree_not_ahead_ids: HashSet::new(),
-                resolve_wait_ids: HashSet::new(),
+                merge_wait_ids: HashSet::new(),
             })
             .await;
 

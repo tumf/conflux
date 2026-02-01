@@ -129,9 +129,21 @@ impl AppState {
             if let Ok(guard) = shared_state.try_read() {
                 for change in &mut self.changes {
                     // Set iteration_number from apply_count if available
+                    // Use monotonic merge: only update if new value is greater than existing
                     let apply_count = guard.apply_count(&change.id);
                     if apply_count > 0 {
-                        change.iteration_number = Some(apply_count);
+                        match change.iteration_number {
+                            Some(existing) => {
+                                // Only update if new value is greater (monotonic increase)
+                                if apply_count > existing {
+                                    change.iteration_number = Some(apply_count);
+                                }
+                            }
+                            None => {
+                                // No existing value, set the new value
+                                change.iteration_number = Some(apply_count);
+                            }
+                        }
                     }
                 }
             }
@@ -203,24 +215,27 @@ impl AppState {
         }
     }
 
-    /// Apply ResolveWait status for changes detected in WorkspaceState::Archived.
+    /// Apply MergeWait status for changes detected in WorkspaceState::Archived.
     ///
-    /// Sets ResolveWait for changes that:
-    /// - Are currently in NotQueued status (from auto-refresh reset)
+    /// Sets MergeWait for changes that:
     /// - Have a worktree in WorkspaceState::Archived state
-    pub fn apply_resolve_wait_status(
-        &mut self,
-        resolve_wait_ids: &std::collections::HashSet<String>,
-    ) {
+    /// - Are not currently in active processing states (Applying, Archiving, Resolving, ResolveWait)
+    ///
+    /// This implements idempotent restoration of MergeWait from repository state.
+    /// ResolveWait is preserved to avoid overwriting single-launch wait states.
+    pub fn apply_merge_wait_status(&mut self, merge_wait_ids: &std::collections::HashSet<String>) {
         for change in &mut self.changes {
-            if resolve_wait_ids.contains(&change.id) {
-                // Only set ResolveWait if currently NotQueued or Archived
-                // (to avoid overwriting active processing states)
-                if matches!(
+            if merge_wait_ids.contains(&change.id) {
+                // Only set MergeWait if not in active processing or ResolveWait
+                // (to avoid overwriting active processing states or single-launch wait)
+                if !matches!(
                     change.queue_status,
-                    QueueStatus::NotQueued | QueueStatus::Archived
+                    QueueStatus::Applying
+                        | QueueStatus::Archiving
+                        | QueueStatus::Resolving
+                        | QueueStatus::ResolveWait
                 ) {
-                    change.queue_status = QueueStatus::ResolveWait;
+                    change.queue_status = QueueStatus::MergeWait;
                 }
             }
         }
