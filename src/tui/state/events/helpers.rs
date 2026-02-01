@@ -203,24 +203,27 @@ impl AppState {
         }
     }
 
-    /// Apply ResolveWait status for changes detected in WorkspaceState::Archived.
+    /// Apply MergeWait status for changes detected in WorkspaceState::Archived.
     ///
-    /// Sets ResolveWait for changes that:
-    /// - Are currently in NotQueued status (from auto-refresh reset)
+    /// Sets MergeWait for changes that:
     /// - Have a worktree in WorkspaceState::Archived state
-    pub fn apply_resolve_wait_status(
-        &mut self,
-        resolve_wait_ids: &std::collections::HashSet<String>,
-    ) {
+    /// - Are not currently in active processing states (Applying, Archiving, Resolving, ResolveWait)
+    ///
+    /// This implements idempotent restoration of MergeWait from repository state.
+    /// ResolveWait is preserved to avoid overwriting single-launch wait states.
+    pub fn apply_merge_wait_status(&mut self, merge_wait_ids: &std::collections::HashSet<String>) {
         for change in &mut self.changes {
-            if resolve_wait_ids.contains(&change.id) {
-                // Only set ResolveWait if currently NotQueued or Archived
-                // (to avoid overwriting active processing states)
-                if matches!(
+            if merge_wait_ids.contains(&change.id) {
+                // Only set MergeWait if not in active processing or ResolveWait
+                // (to avoid overwriting active processing states or single-launch wait)
+                if !matches!(
                     change.queue_status,
-                    QueueStatus::NotQueued | QueueStatus::Archived
+                    QueueStatus::Applying
+                        | QueueStatus::Archiving
+                        | QueueStatus::Resolving
+                        | QueueStatus::ResolveWait
                 ) {
-                    change.queue_status = QueueStatus::ResolveWait;
+                    change.queue_status = QueueStatus::MergeWait;
                 }
             }
         }
