@@ -8,14 +8,12 @@ use crate::command_queue::CommandQueueConfig;
 use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
-use crate::history::OutputCollector;
 use crate::openspec::Change;
 // Note: acceptance_test_streaming and related types are no longer imported here
 // as they are handled by SerialRunService internally.
 use crate::orchestration::output::{ChannelOutputHandler, ContextualOutputHandler, OutputMessage};
 use crate::serial_run_service::SerialRunService;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -68,475 +66,9 @@ fn apply_pending_removals(
     removed_pending
 }
 
-/// Archive a single completed change
-/// Returns Ok(ArchiveResult) indicating success, failure, or cancellation
-/// Note: This is legacy code from Phase 1 archive processing.
-/// It may be removed in the future as SerialRunService handles archiving.
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-pub async fn archive_single_change(
-    change_id: &str,
-    change: &Change,
-    agent: &mut AgentRunner,
-    ai_runner: &crate::ai_command_runner::AiCommandRunner,
-    hooks: &crate::hooks::HookRunner,
-    tx: &mpsc::Sender<OrchestratorEvent>,
-    cancel_token: &CancellationToken,
-    context: &ArchiveContext,
-    shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
-    #[cfg(feature = "web-monitoring")] web_state: &Option<Arc<crate::web::WebState>>,
-) -> Result<ArchiveResult> {
-    use crate::agent::OutputLine;
-    use crate::hooks::{HookContext, HookType};
-
-    // Run on_change_complete hook
-    let complete_context = HookContext::new(
-        context.changes_processed,
-        context.total_changes,
-        context.remaining_changes,
-        false,
-    )
-    .with_change(change_id, change.completed_tasks, change.total_tasks)
-    .with_apply_count(context.apply_count);
-    if let Err(e) = hooks
-        .run_hook(HookType::OnChangeComplete, &complete_context)
-        .await
-    {
-        let _ = tx
-            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                "on_change_complete hook failed: {}",
-                e
-            ))))
-            .await;
-    }
-
-    // Run pre_archive hook
-    let pre_archive_context = HookContext::new(
-        context.changes_processed,
-        context.total_changes,
-        context.remaining_changes,
-        false,
-    )
-    .with_change(change_id, change.completed_tasks, change.total_tasks)
-    .with_apply_count(context.apply_count);
-    if let Err(e) = hooks
-        .run_hook(HookType::PreArchive, &pre_archive_context)
-        .await
-    {
-        let _ = tx
-            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                "pre_archive hook failed: {}",
-                e
-            ))))
-            .await;
-    }
-
-    // Build expanded archive command for ArchiveStarted event
-    // This mirrors the logic in AgentRunner::run_archive_streaming_with_runner
-    let archive_template = agent.config().get_archive_command()?;
-    let archive_user_prompt = agent.config().get_archive_prompt();
-    let archive_history_context = agent.format_archive_history(change_id);
-    let archive_full_prompt =
-        crate::agent::build_archive_prompt(archive_user_prompt, &archive_history_context);
-    let archive_expanded_command =
-        OrchestratorConfig::expand_change_id(archive_template, change_id);
-    let archive_expanded_command =
-        OrchestratorConfig::expand_prompt(&archive_expanded_command, &archive_full_prompt);
-
-    // Archive the change - send ArchiveStarted event with expanded command
-    let archive_started_event = OrchestratorEvent::ArchiveStarted {
-        change_id: change_id.to_string(),
-        command: archive_expanded_command,
-    };
-    let _ = tx.send(archive_started_event.clone()).await;
-    #[cfg(feature = "web-monitoring")]
-    if let Some(ws) = web_state {
-        ws.apply_execution_event(&archive_started_event).await;
-    }
-
-    use crate::execution::archive::{
-        build_archive_error_message, ensure_archive_commit, verify_archive_completion,
-        ArchiveVerificationResult, ARCHIVE_COMMAND_MAX_RETRIES,
-    };
-
-    let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
-    let mut attempt: u32 = 0;
-
-    loop {
-        attempt += 1;
-
-        // Run archive command via AiCommandRunner with streaming output (shared stagger state)
-        let (mut child, mut output_rx, start, _command) = agent
-            .run_archive_streaming_with_runner(change_id, ai_runner, None)
-            .await?;
-
-        // Create output collector for history
-        let mut output_collector = OutputCollector::new();
-
-        // Stream output to TUI log, with cancellation support
-        loop {
-            tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    let _ = child.terminate();
-                    let _ = child.kill().await;
-                    let _ = tx
-                        .send(OrchestratorEvent::Log(LogEntry::warn(
-                            "Process killed due to cancellation".to_string(),
-                        )))
-                        .await;
-                    return Ok(ArchiveResult::Cancelled);
-                }
-                line = output_rx.recv() => {
-                    match line {
-                        Some(OutputLine::Stdout(s)) => {
-                            tracing::debug!("Archive stdout: {}", s);
-                            output_collector.add_stdout(&s);
-                            let _ = tx.send(OrchestratorEvent::Log(
-                                LogEntry::info(s)
-                                    .with_change_id(change_id)
-                                    .with_operation("archive")
-                                    .with_iteration(attempt)
-                            )).await;
-                        }
-                        Some(OutputLine::Stderr(s)) => {
-                            tracing::debug!("Archive stderr: {}", s);
-                            output_collector.add_stderr(&s);
-                            let _ = tx.send(OrchestratorEvent::Log(
-                                LogEntry::warn(s)
-                                    .with_change_id(change_id)
-                                    .with_operation("archive")
-                                    .with_iteration(attempt)
-                            )).await;
-                        }
-                        None => {
-                            tracing::debug!("Archive output stream closed");
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Wait for child process to complete
-        let status = child.wait().await.map_err(|e| {
-            crate::error::OrchestratorError::AgentCommand(format!(
-                "Failed to wait for archive command for change '{}': {}",
-                change_id, e
-            ))
-        })?;
-
-        if !status.success() {
-            let error_msg = format!("Archive failed with exit code: {:?}", status.code());
-
-            // Record the failed attempt
-            agent.record_archive_attempt(
-                change_id,
-                &status,
-                start,
-                Some(error_msg.clone()),
-                output_collector.stdout_tail(),
-                output_collector.stderr_tail(),
-            );
-
-            // Run on_error hook
-            let error_context = HookContext::new(
-                context.changes_processed,
-                context.total_changes,
-                context.remaining_changes,
-                false,
-            )
-            .with_change(change_id, change.completed_tasks, change.total_tasks)
-            .with_apply_count(context.apply_count)
-            .with_error(&error_msg);
-            let _ = hooks.run_hook(HookType::OnError, &error_context).await;
-
-            let processing_error_event = OrchestratorEvent::ProcessingError {
-                id: change_id.to_string(),
-                error: error_msg.clone(),
-            };
-            let _ = tx.send(processing_error_event.clone()).await;
-            #[cfg(feature = "web-monitoring")]
-            if let Some(ws) = web_state {
-                ws.apply_execution_event(&processing_error_event).await;
-            }
-            return Ok(ArchiveResult::Failed);
-        }
-
-        let verification = verify_archive_completion(change_id, None);
-        if verification.is_success() {
-            // Record successful archive attempt
-            agent.record_archive_attempt(
-                change_id,
-                &status,
-                start,
-                None,
-                output_collector.stdout_tail(),
-                output_collector.stderr_tail(),
-            );
-            let log_tx = tx.clone();
-            let commit_result = ensure_archive_commit(
-                change_id,
-                Path::new("."),
-                &*agent,
-                ai_runner,
-                crate::vcs::VcsBackend::Auto,
-                move |line| {
-                    let log_tx = log_tx.clone();
-                    async move {
-                        match line {
-                            OutputLine::Stdout(text) => {
-                                let _ = log_tx
-                                    .send(OrchestratorEvent::Log(LogEntry::info(text)))
-                                    .await;
-                            }
-                            OutputLine::Stderr(text) => {
-                                let _ = log_tx
-                                    .send(OrchestratorEvent::Log(LogEntry::warn(text)))
-                                    .await;
-                            }
-                        }
-                    }
-                },
-            )
-            .await;
-
-            if let Err(e) = commit_result {
-                let error_msg = format!("Archive commit failed for {}: {}", change_id, e);
-                let error_context = HookContext::new(
-                    context.changes_processed,
-                    context.total_changes,
-                    context.remaining_changes,
-                    false,
-                )
-                .with_change(change_id, change.completed_tasks, change.total_tasks)
-                .with_apply_count(context.apply_count)
-                .with_error(&error_msg);
-                let _ = hooks.run_hook(HookType::OnError, &error_context).await;
-
-                let processing_error_event = OrchestratorEvent::ProcessingError {
-                    id: change_id.to_string(),
-                    error: error_msg,
-                };
-                let _ = tx.send(processing_error_event.clone()).await;
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = web_state {
-                    ws.apply_execution_event(&processing_error_event).await;
-                }
-                return Ok(ArchiveResult::Failed);
-            }
-
-            // Clear apply and archive history for the archived change
-            agent.clear_apply_history(change_id);
-            agent.clear_archive_history(change_id);
-
-            // Run post_archive hook
-            let post_archive_context = HookContext::new(
-                context.changes_processed + 1,
-                context.total_changes,
-                context.remaining_changes.saturating_sub(1),
-                false,
-            )
-            .with_change(change_id, change.completed_tasks, change.total_tasks)
-            .with_apply_count(context.apply_count);
-            if let Err(e) = hooks
-                .run_hook(HookType::PostArchive, &post_archive_context)
-                .await
-            {
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                        "post_archive hook failed: {}",
-                        e
-                    ))))
-                    .await;
-            }
-
-            let change_archived_event = OrchestratorEvent::ChangeArchived(change_id.to_string());
-            let _ = tx.send(change_archived_event.clone()).await;
-            // Update shared orchestration state (marks as archived, removes from pending)
-            shared_state
-                .write()
-                .await
-                .apply_execution_event(&change_archived_event);
-            #[cfg(feature = "web-monitoring")]
-            if let Some(ws) = web_state {
-                ws.apply_execution_event(&change_archived_event).await;
-            }
-            return Ok(ArchiveResult::Success);
-        }
-
-        // Verification failed - record with reason
-        let verification_reason = match verification {
-            ArchiveVerificationResult::NotArchived { ref change_id } => {
-                format!("Change still exists at openspec/changes/{}", change_id)
-            }
-            _ => "Archive verification failed".to_string(),
-        };
-        agent.record_archive_attempt(
-            change_id,
-            &status,
-            start,
-            Some(verification_reason.clone()),
-            output_collector.stdout_tail(),
-            output_collector.stderr_tail(),
-        );
-
-        if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                    "Archive verification failed for {} (attempt {}/{}): {}; retrying archive command",
-                    change_id, attempt, max_attempts, verification_reason
-                ))))
-                .await;
-            tracing::warn!(
-                change_id = %change_id,
-                attempt = attempt,
-                max_attempts = max_attempts,
-                reason = %verification_reason,
-                "Archive verification failed; retrying archive command"
-            );
-            continue;
-        }
-
-        let error_msg = build_archive_error_message(change_id, None);
-        let processing_error_event = OrchestratorEvent::ProcessingError {
-            id: change_id.to_string(),
-            error: error_msg,
-        };
-        let _ = tx.send(processing_error_event.clone()).await;
-        #[cfg(feature = "web-monitoring")]
-        if let Some(ws) = web_state {
-            ws.apply_execution_event(&processing_error_event).await;
-        }
-        return Ok(ArchiveResult::Failed);
-    }
-}
-
-/// Archive all complete changes from the pending set
-/// Returns the number of successfully archived changes
-/// Note: This is legacy code from Phase 1 archive processing.
-/// It may be removed in the future as SerialRunService handles archiving.
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-pub async fn archive_all_complete_changes(
-    pending_ids: &HashSet<String>,
-    agent: &mut AgentRunner,
-    ai_runner: &crate::ai_command_runner::AiCommandRunner,
-    hooks: &crate::hooks::HookRunner,
-    tx: &mpsc::Sender<OrchestratorEvent>,
-    cancel_token: &CancellationToken,
-    archived_set: &mut HashSet<String>,
-    total_changes: usize,
-    changes_processed: &mut usize,
-    apply_counts: &HashMap<String, u32>,
-    shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
-    #[cfg(feature = "web-monitoring")] web_state: &Option<Arc<crate::web::WebState>>,
-) -> Result<usize> {
-    use crate::openspec;
-
-    // Log entry point with pending count
-    tracing::debug!(
-        pending_count = pending_ids.len(),
-        "archive_all_complete_changes: checking for complete changes to archive"
-    );
-
-    // Fetch current state of all changes using native implementation
-    let changes = openspec::list_changes_native()?;
-
-    // Find complete changes that are still in pending set
-    let complete_changes: Vec<Change> = changes
-        .into_iter()
-        .filter(|c| pending_ids.contains(&c.id) && !archived_set.contains(&c.id) && c.is_complete())
-        .collect();
-
-    tracing::debug!(
-        complete_count = complete_changes.len(),
-        complete_ids = ?complete_changes.iter().map(|c| &c.id).collect::<Vec<_>>(),
-        "archive_all_complete_changes: found complete changes to archive"
-    );
-
-    let mut archived_count = 0;
-
-    for change in complete_changes {
-        tracing::debug!(
-            change_id = %change.id,
-            "archive_all_complete_changes: starting archive for change"
-        );
-        if cancel_token.is_cancelled() {
-            break;
-        }
-
-        let remaining_changes = pending_ids.len().saturating_sub(archived_count);
-        let apply_count = *apply_counts.get(&change.id).unwrap_or(&0);
-        let context = ArchiveContext {
-            changes_processed: *changes_processed,
-            total_changes,
-            remaining_changes,
-            apply_count,
-        };
-
-        // Notify processing started for this change
-        let _ = tx
-            .send(OrchestratorEvent::ProcessingStarted(change.id.clone()))
-            .await;
-
-        // Send ProcessingCompleted before archiving
-        let _ = tx
-            .send(OrchestratorEvent::ProcessingCompleted(change.id.clone()))
-            .await;
-
-        let result = archive_single_change(
-            &change.id,
-            &change,
-            agent,
-            ai_runner,
-            hooks,
-            tx,
-            cancel_token,
-            &context,
-            shared_state,
-            #[cfg(feature = "web-monitoring")]
-            web_state,
-        )
-        .await?;
-
-        tracing::debug!(
-            change_id = %change.id,
-            result = ?result,
-            "archive_all_complete_changes: archive result for change"
-        );
-
-        match result {
-            ArchiveResult::Success => {
-                archived_set.insert(change.id.clone());
-                archived_count += 1;
-                *changes_processed += 1;
-            }
-            ArchiveResult::Failed => {
-                // Error already logged and sent, continue to next
-            }
-            ArchiveResult::Cancelled => {
-                break;
-            }
-        }
-    }
-
-    tracing::debug!(
-        archived_count = archived_count,
-        "archive_all_complete_changes: completed archiving loop"
-    );
-
-    Ok(archived_count)
-}
-
 /// Run the orchestrator for selected changes
 /// Uses streaming output to send log entries in real-time
 /// Supports cancellation via CancellationToken for graceful shutdown
-///
-/// The orchestrator uses a two-phase loop:
-/// - Phase 1: Archive all complete changes before doing any apply
-/// - Phase 2: Apply one incomplete change
-///
-/// This ensures complete changes are never skipped.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_orchestrator(
     change_ids: Vec<String>,
@@ -861,7 +393,8 @@ pub async fn run_orchestrator(
 
         // Process the change using SerialRunService
         use crate::serial_run_service::ChangeProcessResult;
-        let cancel_check = || cancel_token.is_cancelled();
+        let cancel_token_clone = cancel_token.clone();
+        let cancel_check = move || cancel_token_clone.is_cancelled();
         let result = serial_service
             .process_change(
                 &change,
@@ -917,7 +450,20 @@ pub async fn run_orchestrator(
                     ws.apply_execution_event(&apply_completed_event).await;
                 }
 
-                // Note: AcceptanceStarted logging is handled by acceptance_test_streaming internally
+                // Send AcceptanceStarted event
+                let acceptance_started_event = OrchestratorEvent::AcceptanceStarted {
+                    change_id: change_id.clone(),
+                    command: format!("opencode acceptance {}", change_id),
+                };
+                let _ = tx.send(acceptance_started_event.clone()).await;
+                shared_state
+                    .write()
+                    .await
+                    .apply_execution_event(&acceptance_started_event);
+                #[cfg(feature = "web-monitoring")]
+                if let Some(ws) = &web_state {
+                    ws.apply_execution_event(&acceptance_started_event).await;
+                }
 
                 // Send AcceptanceCompleted event
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
@@ -1118,6 +664,18 @@ pub async fn run_orchestrator(
                         change_id
                     ))))
                     .await;
+
+                // Send ChangeArchived event
+                let change_archived_event = OrchestratorEvent::ChangeArchived(change_id.clone());
+                let _ = tx.send(change_archived_event.clone()).await;
+                shared_state
+                    .write()
+                    .await
+                    .apply_execution_event(&change_archived_event);
+                #[cfg(feature = "web-monitoring")]
+                if let Some(ws) = &web_state {
+                    ws.apply_execution_event(&change_archived_event).await;
+                }
 
                 // Update local state tracking
                 archived_changes.insert(change_id.clone());
