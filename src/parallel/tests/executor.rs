@@ -376,6 +376,40 @@ async fn test_resolve_merge_executes_selected_change_only() {
     commit_workspace_change(&workspace_a, "change-a.txt", "A", "Apply: change-a").await;
     commit_workspace_change(&workspace_b, "change-b.txt", "B", "Apply: change-b").await;
 
+    // Create archive entries in workspace_a and workspace_b to satisfy archive verification
+    for (workspace, change_id) in [(&workspace_a, "change-a"), (&workspace_b, "change-b")] {
+        // Remove openspec/changes/<change_id> directory to simulate completed archive
+        let changes_dir = workspace
+            .path
+            .join(format!("openspec/changes/{}", change_id));
+        if changes_dir.exists() {
+            std::fs::remove_dir_all(&changes_dir).unwrap();
+        }
+
+        // Create archive entry as a directory (archive_entry_exists checks directory names)
+        let archive_dir = workspace.path.join("openspec/changes/archive");
+        let archive_entry = archive_dir.join(change_id);
+        std::fs::create_dir_all(&archive_entry).unwrap();
+        std::fs::write(
+            archive_entry.join("proposal.md"),
+            format!("# Archive entry for {}", change_id),
+        )
+        .unwrap();
+
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&workspace.path)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", &format!("Archive: {}", change_id)])
+            .current_dir(&workspace.path)
+            .output()
+            .await
+            .unwrap();
+    }
+
     let script_contents = format!(
         "#!/bin/sh\nset -e\nROOT=\"$(pwd)\"\n\
             cd \"{}\"\n\
@@ -1600,8 +1634,8 @@ async fn test_attempt_merge_defers_when_change_not_archived() {
     match result {
         Ok(MergeAttempt::Deferred(reason)) => {
             assert!(
-                reason.contains("Archive verification failed"),
-                "Expected deferred reason to mention archive verification, got: {}",
+                reason.contains("Archive incomplete"),
+                "Expected deferred reason to mention archive incomplete, got: {}",
                 reason
             );
             assert!(

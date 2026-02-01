@@ -11,3 +11,9 @@
   - 検証: `cargo test merge_deferred_when_archive_entry_missing` が通る
 - [x] 2.3 archive完了状態（clean + changes消失 + archiveエントリ存在）でmergeが実行されるテストを追加する
   - 検証: `cargo test merge_proceeds_when_archive_complete` が通る
+
+## Acceptance #1 Failure Follow-up
+- [x] src/parallel/tests/executor.rs: test_attempt_merge_defers_when_change_not_archived expects "Archive verification failed" but attempt_merge now returns "Archive incomplete"; update the assertion to match the new reason string
+  - 検証: `cargo test test_attempt_merge_defers_when_change_not_archived` が通る
+- [x] Git working tree is dirty. Modified: openspec/changes/update-merge-archive-verification/tasks.md
+  - 検証: tasks.md の変更をコミットして `git status` がクリーンであることを確認する
