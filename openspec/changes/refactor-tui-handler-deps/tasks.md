@@ -24,6 +24,6 @@
 - [x] `src/tui/state.rs:834-877` の `request_worktree_delete`/`confirm_worktree_delete`/`cancel_worktree_delete`/`should_refresh` が未使用のため、呼び出し経路へ統合するか削除する（削除完了: フィールド `pending_worktree_delete` と4つのメソッドを削除）
 
 ## Acceptance #4 Failure Follow-up
-- [ ] `src/tui/state.rs:64-65` の `ChangeState.last_modified` が `#[allow(dead_code)]` のまま未使用のため、TUI フローで参照するか削除する
-- [ ] `src/tui/state.rs:193-200` の `ChangeState::progress_ratio` が `#[allow(dead_code)]` のまま未使用のため、TUI フローで参照するか削除する
-- [ ] `src/tui/state.rs:202-205` の `ChangeState::is_complete` が `#[allow(dead_code)]` のまま未使用のため、TUI フローで参照するか削除する
+- [x] `src/tui/state.rs:64-65` の `ChangeState.last_modified` が `#[allow(dead_code)]` のまま未使用のため、TUI フローで参照するか削除する（削除完了）
+- [x] `src/tui/state.rs:193-200` の `ChangeState::progress_ratio` が `#[allow(dead_code)]` のまま未使用のため、TUI フローで参照するか削除する（削除完了）
+- [x] `src/tui/state.rs:202-205` の `ChangeState::is_complete` が `#[allow(dead_code)]` のまま未使用のため、TUI フローで参照するか削除する（削除完了）
