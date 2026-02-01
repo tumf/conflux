@@ -2,7 +2,7 @@
 ### Requirement: Queue State Synchronization
 システムは、UI上のキュー状態とDynamicQueueの状態を常に同期させなければならない（SHALL）。
 
-`ResolveWait`は、ユーザーが`M`キーでmerge resolveを開始した直後から`ResolveStarted`を受信するまでの単一起動待ち状態であり、Space/@によるキュー操作でDynamicQueueを変更してはならない（MUST NOT）。TUIは`ResolveWait`を`resolve wait`として表示し、操作対象外であることが明確でなければならない（MUST）。
+`MergeWait`は、リポジトリ状態（worktreeがarchive済みでbaseに未マージ）から冪等に復元される待機状態であり、Space/@によるキュー操作でDynamicQueueを変更してはならない（MUST NOT）。`ResolveWait`は、ユーザーが`M`キーでmerge resolveを開始した直後から`ResolveStarted`を受信するまでの単一起動待ち状態に限定される。TUIは`ResolveWait`を`resolve wait`として表示し、操作対象外であることが明確でなければならない（MUST）。
 
 #### Scenario: Unapproveによるキューからの削除
 - **WHEN** ユーザーが@キーでqueuedのchangeをunapprove
@@ -30,6 +30,12 @@
 - **THEN** the change status SHALL transition to `ResolveWait`
 - **AND** DynamicQueue SHALL NOT be modified for the change
 
+#### Scenario: MergeWaitでF5はresolve開始を優先する
+- **GIVEN** the cursor is on a change in `MergeWait`
+- **WHEN** the user presses `F5`
+- **THEN** the change SHALL transition to `ResolveWait` or `Resolving`
+- **AND** the change SHALL NOT be queued for apply/acceptance
+
 ### Requirement: Event-Driven State Updates
 TUI は 5 秒ごとの自動更新で `MergeWait` を評価し、以下のいずれかを満たす場合は `Queued` に戻さなければならない（MUST）。
 
@@ -38,7 +44,7 @@ TUI は 5 秒ごとの自動更新で `MergeWait` を評価し、以下のいず
 
 自動解除された change では `MergeWait` ではないため、`M` による merge resolve の操作ヒントや実行を行ってはならない（MUST NOT）。
 
-さらに、resolveがシリアライズされて待機状態となっているchangeは`ResolveWait`として保持され、自動更新で`NotQueued`に戻してはならない（MUST NOT）。
+さらに、resolveが別changeで進行中であり手動resolve開始直後に`ResolveWait`となったchangeは、自動更新で`NotQueued`に戻してはならない（MUST NOT）。
 
 #### Scenario: worktree がない場合は MergeWait を解除する
 - **GIVEN** change が `MergeWait` である
@@ -58,7 +64,7 @@ TUI は 5 秒ごとの自動更新で `MergeWait` を評価し、以下のいず
 - **WHEN** TUI のキー表示が描画される
 - **THEN** `M` による merge resolve のヒントは表示されない
 
-#### Scenario: ResolveWait は自動更新で保持される
+#### Scenario: ResolveWait は起動待ちの間保持される
 - **GIVEN** change が `ResolveWait` である
 - **AND** resolveが別changeで進行中である
 - **WHEN** 5秒ポーリングの自動更新が実行される
