@@ -198,6 +198,7 @@ impl SerialRunService {
         total_changes: usize,
         remaining_changes: usize,
         cancel_check: F,
+        operation_tracker: Option<std::sync::Arc<std::sync::RwLock<String>>>,
     ) -> Result<ChangeProcessResult>
     where
         F: Fn() -> bool,
@@ -239,6 +240,7 @@ impl SerialRunService {
                 total_changes,
                 remaining_changes,
                 apply_count,
+                operation_tracker,
             )
             .await
         } else {
@@ -253,6 +255,7 @@ impl SerialRunService {
                 remaining_changes,
                 apply_count,
                 &cancel_check,
+                operation_tracker,
             )
             .await
         }
@@ -270,8 +273,14 @@ impl SerialRunService {
         total_changes: usize,
         remaining_changes: usize,
         apply_count: u32,
+        operation_tracker: Option<std::sync::Arc<std::sync::RwLock<String>>>,
     ) -> Result<ChangeProcessResult> {
         info!("Change {} is complete, archiving...", change.id);
+
+        // Update operation to "archive" before running archive
+        if let Some(ref tracker) = operation_tracker {
+            *tracker.write().unwrap() = "archive".to_string();
+        }
 
         let archive_ctx = ArchiveContext::new(
             self.changes_processed,
@@ -349,6 +358,7 @@ impl SerialRunService {
         remaining_changes: usize,
         apply_count: u32,
         cancel_check: &F,
+        operation_tracker: Option<std::sync::Arc<std::sync::RwLock<String>>>,
     ) -> Result<ChangeProcessResult>
     where
         F: Fn() -> bool,
@@ -389,6 +399,11 @@ impl SerialRunService {
                         "Tasks complete for {}, running acceptance test...",
                         change.id
                     );
+
+                    // Update operation to "acceptance" before running acceptance test
+                    if let Some(ref tracker) = operation_tracker {
+                        *tracker.write().unwrap() = "acceptance".to_string();
+                    }
 
                     // Run acceptance test
                     match acceptance_test_streaming(

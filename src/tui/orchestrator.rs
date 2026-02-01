@@ -12,7 +12,7 @@ use crate::history::OutputCollector;
 use crate::openspec::Change;
 // Note: acceptance_test_streaming and related types are no longer imported here
 // as they are handled by SerialRunService internally.
-use crate::orchestration::output::{ChannelOutputHandler, OutputMessage};
+use crate::orchestration::output::{ChannelOutputHandler, ContextualOutputHandler, OutputMessage};
 use crate::serial_run_service::SerialRunService;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -747,13 +747,17 @@ pub async fn run_orchestrator(
         let apply_count_before = *apply_counts.get(&change_id).unwrap_or(&0);
 
         // Create output handler that forwards to TUI events
+        // Use Arc<RwLock<String>> to track current operation (apply/acceptance/archive/resolve)
         let tx_clone = tx.clone();
         let change_id_clone = change_id.clone();
         let apply_count_for_output = apply_count_before + 1; // Will be incremented in process_change
+        let current_operation = std::sync::Arc::new(std::sync::RwLock::new("apply".to_string()));
+        let current_operation_clone = current_operation.clone();
         let output = ChannelOutputHandler::new(move |msg: OutputMessage| {
             let tx = tx_clone.clone();
             let change_id = change_id_clone.clone();
             let apply_count = apply_count_for_output;
+            let operation = current_operation_clone.read().unwrap().clone();
             tokio::spawn(async move {
                 match msg {
                     OutputMessage::Stdout(s) => {
@@ -761,7 +765,7 @@ pub async fn run_orchestrator(
                             .send(OrchestratorEvent::Log(
                                 LogEntry::info(s)
                                     .with_change_id(&change_id)
-                                    .with_operation("apply")
+                                    .with_operation(&operation)
                                     .with_iteration(apply_count),
                             ))
                             .await;
@@ -771,7 +775,7 @@ pub async fn run_orchestrator(
                             .send(OrchestratorEvent::Log(
                                 LogEntry::warn(s)
                                     .with_change_id(&change_id)
-                                    .with_operation("apply")
+                                    .with_operation(&operation)
                                     .with_iteration(apply_count),
                             ))
                             .await;
@@ -781,7 +785,7 @@ pub async fn run_orchestrator(
                             .send(OrchestratorEvent::Log(
                                 LogEntry::info(s)
                                     .with_change_id(&change_id)
-                                    .with_operation("apply")
+                                    .with_operation(&operation)
                                     .with_iteration(apply_count),
                             ))
                             .await;
@@ -791,7 +795,7 @@ pub async fn run_orchestrator(
                             .send(OrchestratorEvent::Log(
                                 LogEntry::warn(s)
                                     .with_change_id(&change_id)
-                                    .with_operation("apply")
+                                    .with_operation(&operation)
                                     .with_iteration(apply_count),
                             ))
                             .await;
@@ -801,7 +805,7 @@ pub async fn run_orchestrator(
                             .send(OrchestratorEvent::Log(
                                 LogEntry::error(s)
                                     .with_change_id(&change_id)
-                                    .with_operation("apply")
+                                    .with_operation(&operation)
                                     .with_iteration(apply_count),
                             ))
                             .await;
@@ -811,7 +815,7 @@ pub async fn run_orchestrator(
                             .send(OrchestratorEvent::Log(
                                 LogEntry::success(s)
                                     .with_change_id(&change_id)
-                                    .with_operation("apply")
+                                    .with_operation(&operation)
                                     .with_iteration(apply_count),
                             ))
                             .await;
@@ -819,6 +823,9 @@ pub async fn run_orchestrator(
                 }
             });
         });
+
+        // Wrap output handler with ContextualOutputHandler to track operation
+        let output = ContextualOutputHandler::new(output, current_operation.clone());
 
         // Build expanded apply command for ApplyStarted event
         // This mirrors the logic in AgentRunner::run_apply_streaming_with_runner
@@ -865,6 +872,7 @@ pub async fn run_orchestrator(
                 total_changes,
                 remaining_changes,
                 cancel_check,
+                Some(current_operation.clone()),
             )
             .await;
 
@@ -910,8 +918,22 @@ pub async fn run_orchestrator(
                 }
 
                 // Send AcceptanceStarted event (acceptance ran and passed)
+                // Build acceptance command (simplified - actual command includes diff context)
+                let acceptance_command = {
+                    let template = agent
+                        .config()
+                        .get_acceptance_command()
+                        .unwrap_or("acceptance");
+                    let user_prompt = agent.config().get_acceptance_prompt();
+                    let history = agent.format_acceptance_history(&change_id);
+                    let prompt = format!("{}\n{}", user_prompt, history);
+                    let cmd = OrchestratorConfig::expand_change_id(template, &change_id);
+                    OrchestratorConfig::expand_prompt(&cmd, &prompt)
+                };
+
                 let acceptance_started_event = OrchestratorEvent::AcceptanceStarted {
                     change_id: change_id.clone(),
+                    command: acceptance_command,
                 };
                 let _ = tx.send(acceptance_started_event.clone()).await;
                 #[cfg(feature = "web-monitoring")]
@@ -981,8 +1003,20 @@ pub async fn run_orchestrator(
                 }
 
                 // Send AcceptanceStarted event (acceptance ran and returned Continue)
+                let acceptance_command = {
+                    let template = agent
+                        .config()
+                        .get_acceptance_command()
+                        .unwrap_or("acceptance");
+                    let user_prompt = agent.config().get_acceptance_prompt();
+                    let history = agent.format_acceptance_history(&change_id);
+                    let prompt = format!("{}\n{}", user_prompt, history);
+                    let cmd = OrchestratorConfig::expand_change_id(template, &change_id);
+                    OrchestratorConfig::expand_prompt(&cmd, &prompt)
+                };
                 let acceptance_started_event = OrchestratorEvent::AcceptanceStarted {
                     change_id: change_id.clone(),
+                    command: acceptance_command,
                 };
                 let _ = tx.send(acceptance_started_event.clone()).await;
                 #[cfg(feature = "web-monitoring")]
@@ -1020,8 +1054,20 @@ pub async fn run_orchestrator(
                 }
 
                 // Send AcceptanceStarted event (acceptance ran and exceeded continue limit)
+                let acceptance_command = {
+                    let template = agent
+                        .config()
+                        .get_acceptance_command()
+                        .unwrap_or("acceptance");
+                    let user_prompt = agent.config().get_acceptance_prompt();
+                    let history = agent.format_acceptance_history(&change_id);
+                    let prompt = format!("{}\n{}", user_prompt, history);
+                    let cmd = OrchestratorConfig::expand_change_id(template, &change_id);
+                    OrchestratorConfig::expand_prompt(&cmd, &prompt)
+                };
                 let acceptance_started_event = OrchestratorEvent::AcceptanceStarted {
                     change_id: change_id.clone(),
+                    command: acceptance_command,
                 };
                 let _ = tx.send(acceptance_started_event.clone()).await;
                 #[cfg(feature = "web-monitoring")]
@@ -1059,8 +1105,20 @@ pub async fn run_orchestrator(
                 }
 
                 // Send AcceptanceStarted event (acceptance ran and failed)
+                let acceptance_command = {
+                    let template = agent
+                        .config()
+                        .get_acceptance_command()
+                        .unwrap_or("acceptance");
+                    let user_prompt = agent.config().get_acceptance_prompt();
+                    let history = agent.format_acceptance_history(&change_id);
+                    let prompt = format!("{}\n{}", user_prompt, history);
+                    let cmd = OrchestratorConfig::expand_change_id(template, &change_id);
+                    OrchestratorConfig::expand_prompt(&cmd, &prompt)
+                };
                 let acceptance_started_event = OrchestratorEvent::AcceptanceStarted {
                     change_id: change_id.clone(),
+                    command: acceptance_command,
                 };
                 let _ = tx.send(acceptance_started_event.clone()).await;
                 #[cfg(feature = "web-monitoring")]
@@ -1098,8 +1156,20 @@ pub async fn run_orchestrator(
                 }
 
                 // Send AcceptanceStarted event (acceptance ran but command failed)
+                let acceptance_command = {
+                    let template = agent
+                        .config()
+                        .get_acceptance_command()
+                        .unwrap_or("acceptance");
+                    let user_prompt = agent.config().get_acceptance_prompt();
+                    let history = agent.format_acceptance_history(&change_id);
+                    let prompt = format!("{}\n{}", user_prompt, history);
+                    let cmd = OrchestratorConfig::expand_change_id(template, &change_id);
+                    OrchestratorConfig::expand_prompt(&cmd, &prompt)
+                };
                 let acceptance_started_event = OrchestratorEvent::AcceptanceStarted {
                     change_id: change_id.clone(),
+                    command: acceptance_command,
                 };
                 let _ = tx.send(acceptance_started_event.clone()).await;
                 #[cfg(feature = "web-monitoring")]

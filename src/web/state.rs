@@ -490,7 +490,7 @@ impl WebState {
                 }
 
                 // Acceptance events
-                ExecutionEvent::AcceptanceStarted { change_id } => {
+                ExecutionEvent::AcceptanceStarted { change_id, .. } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
                         change.queue_status = Some("accepting".to_string());
                         updated = true;
@@ -1054,6 +1054,7 @@ mod tests {
         web_state
             .apply_execution_event(&ExecutionEvent::AcceptanceStarted {
                 change_id: "change-a".to_string(),
+                command: "test command".to_string(),
             })
             .await;
 

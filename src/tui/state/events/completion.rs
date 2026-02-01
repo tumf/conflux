@@ -68,7 +68,7 @@ impl AppState {
     }
 
     /// Handle AcceptanceStarted event
-    pub(super) fn handle_acceptance_started(&mut self, change_id: String) {
+    pub(super) fn handle_acceptance_started(&mut self, change_id: String, command: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             if change.started_at.is_none() {
                 change.started_at = Some(Instant::now());
@@ -76,6 +76,7 @@ impl AppState {
             change.queue_status = QueueStatus::Accepting;
         }
         self.add_log(LogEntry::info(format!("Acceptance started: {}", change_id)));
+        self.add_log(LogEntry::info(format!("  Command: {}", command)));
     }
 
     /// Handle AcceptanceCompleted event
