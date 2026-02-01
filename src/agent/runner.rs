@@ -132,7 +132,7 @@ impl AgentRunner {
         let acceptance_tail = self.get_acceptance_tail_context_for_apply(change_id);
 
         // Then get immutable data
-        let template = self.config.get_apply_command();
+        let template = self.config.get_apply_command()?;
         let user_prompt = self.config.get_apply_prompt();
         let history_context = self.apply_history.format_context(change_id);
 
@@ -177,7 +177,7 @@ impl AgentRunner {
         let acceptance_tail = self.get_acceptance_tail_context_for_apply(change_id);
 
         // Then get immutable data
-        let template = self.config.get_apply_command();
+        let template = self.config.get_apply_command()?;
         let user_prompt = self.config.get_apply_prompt();
         let history_context = self.apply_history.format_context(change_id);
 
@@ -248,7 +248,7 @@ impl AgentRunner {
         cwd: Option<&Path>,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
         let start = Instant::now();
-        let template = self.config.get_archive_command();
+        let template = self.config.get_archive_command()?;
         let user_prompt = self.config.get_archive_prompt();
         let history_context = self.archive_history.format_context(change_id);
 
@@ -288,7 +288,7 @@ impl AgentRunner {
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant, String)> {
         use crate::ai_command_runner::OutputLine as AiOutputLine;
         let start = Instant::now();
-        let template = self.config.get_archive_command();
+        let template = self.config.get_archive_command()?;
         let user_prompt = self.config.get_archive_prompt();
         let history_context = self.archive_history.format_context(change_id);
 
@@ -340,7 +340,7 @@ impl AgentRunner {
         let acceptance_tail = self.get_acceptance_tail_context_for_apply(change_id);
 
         // Then get immutable data
-        let template = self.config.get_apply_command();
+        let template = self.config.get_apply_command()?;
         let user_prompt = self.config.get_apply_prompt();
         let history_context = self.apply_history.format_context(change_id);
 
@@ -388,7 +388,7 @@ impl AgentRunner {
         let acceptance_tail = self.get_acceptance_tail_context_for_apply(change_id);
 
         // Then get immutable data
-        let template = self.config.get_apply_command();
+        let template = self.config.get_apply_command()?;
         let user_prompt = self.config.get_apply_prompt();
         let history_context = self.apply_history.format_context(change_id);
 
@@ -516,9 +516,9 @@ impl AgentRunner {
         change_id: &str,
         cwd: Option<&Path>,
         base_branch: Option<&str>,
-    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant)> {
+    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant, String)> {
         let start = Instant::now();
-        let template = self.config.get_acceptance_command();
+        let template = self.config.get_acceptance_command()?;
         let user_prompt = self.config.get_acceptance_prompt();
         let history_context = self.acceptance_history.format_context(change_id);
 
@@ -556,7 +556,7 @@ impl AgentRunner {
             }
             None => self.execute_shell_command_streaming(&command).await?,
         };
-        Ok((child, rx, start))
+        Ok((child, rx, start, command))
     }
 
     /// Build acceptance diff context for all acceptance attempts.
@@ -728,7 +728,7 @@ impl AgentRunner {
     /// Run archive command for the given change ID (blocking, no streaming)
     #[allow(dead_code)] // Replaced by run_archive_with_runner in CLI/TUI flows
     pub async fn run_archive(&self, change_id: &str) -> Result<ExitStatus> {
-        let template = self.config.get_archive_command();
+        let template = self.config.get_archive_command()?;
         let prompt = self.config.get_archive_prompt();
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, prompt);
@@ -749,7 +749,7 @@ impl AgentRunner {
         change_id: &str,
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
     ) -> Result<ExitStatus> {
-        let template = self.config.get_archive_command();
+        let template = self.config.get_archive_command()?;
         let user_prompt = self.config.get_archive_prompt();
         let history_context = self.archive_history.format_context(change_id);
 
@@ -782,7 +782,7 @@ impl AgentRunner {
 
     /// Analyze dependencies using the configured analyze command (blocking)
     pub async fn analyze_dependencies(&self, prompt: &str) -> Result<String> {
-        let template = self.config.get_analyze_command();
+        let template = self.config.get_analyze_command()?;
         let command = OrchestratorConfig::expand_prompt(template, prompt);
         info!(
             module = module_path!(),
@@ -822,7 +822,7 @@ impl AgentRunner {
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
     ) -> Result<String> {
         use crate::ai_command_runner::OutputLine as AiOutputLine;
-        let template = self.config.get_analyze_command();
+        let template = self.config.get_analyze_command()?;
         let command = OrchestratorConfig::expand_prompt(template, prompt);
         info!(
             module = module_path!(),
@@ -879,7 +879,7 @@ impl AgentRunner {
         &self,
         prompt: &str,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
-        let template = self.config.get_analyze_command();
+        let template = self.config.get_analyze_command()?;
         let command = OrchestratorConfig::expand_prompt(template, prompt);
         info!(
             module = module_path!(),
@@ -896,7 +896,7 @@ impl AgentRunner {
         prompt: &str,
         cwd: &Path,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
-        let template = self.config.get_resolve_command();
+        let template = self.config.get_resolve_command()?;
         let command = OrchestratorConfig::expand_prompt(template, prompt);
         info!(
             module = module_path!(),
@@ -916,7 +916,7 @@ impl AgentRunner {
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
         use crate::ai_command_runner::OutputLine as AiOutputLine;
-        let template = self.config.get_resolve_command();
+        let template = self.config.get_resolve_command()?;
         let command = OrchestratorConfig::expand_prompt(template, prompt);
         info!(
             module = module_path!(),

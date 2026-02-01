@@ -99,3 +99,81 @@ If the branch does not exist or deletion fails, the worktree deletion MUST still
 - **WHEN** The worktree deletion process completes
 - **THEN** The worktree deletion is treated as successful
 - **AND** A warning log for the branch deletion failure is recorded
+
+### Requirement: worktree add のブランチ既存エラー分類
+
+システムは `git worktree add` が「a branch named ... already exists」相当の stderr を返した場合、原因を「ブランチ既存」として分類しなければならない（MUST）。
+
+#### Scenario: ブランチ既存エラーは分類される
+- **GIVEN** `git worktree add` が「a branch named 'x' already exists」相当の stderr を返す
+- **WHEN** worktree 作成に失敗する
+- **THEN** 原因は「ブランチ既存」として分類される
+
+### Requirement: ブランチ既存時の安全な worktree 再作成
+
+`git worktree add <path> -b <branch> <base>` がブランチ既存で失敗した場合、システムは当該ブランチが他の worktree にチェックアウトされていないことを確認できたときに限り、`git worktree add <path> <branch>` を 1 回だけ再試行しなければならない（MUST）。
+
+他の worktree にチェックアウト済みであることが確認できた場合、システムは再試行を行ってはならない（MUST NOT）。
+
+#### Scenario: ブランチ既存かつ未チェックアウトなら再試行で成功する
+- **GIVEN** `refs/heads/<branch>` は存在するが、どの worktree にもチェックアウトされていない
+- **AND** `git worktree add <path> -b <branch> <base>` がブランチ既存で失敗する
+- **WHEN** worktree 作成が再試行される
+- **THEN** `git worktree add <path> <branch>` が 1 回だけ実行される
+
+#### Scenario: ブランチ既存かつ他 worktree でチェックアウト済みなら再試行しない
+- **GIVEN** `refs/heads/<branch>` が他の worktree でチェックアウトされている
+- **AND** `git worktree add <path> -b <branch> <base>` がブランチ既存で失敗する
+- **WHEN** worktree 作成が失敗する
+- **THEN** 再試行は行われない
+
+### Requirement: Worktree add failure diagnostics and safe retry
+
+システムは `git worktree add` の失敗時に、stderr から代表的な原因を分類し、診断ログに含めなければならない（MUST）。
+
+分類対象には最低限以下を含めなければならない（MUST）。
+- 既存パス（worktree パスが既に存在）
+- ブランチ重複（他の worktree でチェックアウト済み）
+- 無効な参照（base commit / branch が存在しない）
+- 権限エラー
+
+`git worktree add` が既存パス起因で失敗した場合、システムは worktree 一覧に該当パスが存在しないことを確認できたときに限り、`git worktree prune` を実行し、1 回だけ再試行しなければならない（MUST）。
+
+再試行後も失敗した場合、システムは元のエラーと分類結果の両方をログに残さなければならない（MUST）。
+
+#### Scenario: 既存パスの失敗は分類される
+- **GIVEN** `git worktree add` が「path already exists」相当の stderr を返す
+- **WHEN** worktree 作成に失敗する
+- **THEN** 原因は「既存パス」として分類される
+- **AND** 分類結果が診断ログに含まれる
+
+#### Scenario: ブランチ重複の失敗は分類される
+- **GIVEN** `git worktree add` が「branch is already checked out」相当の stderr を返す
+- **WHEN** worktree 作成に失敗する
+- **THEN** 原因は「ブランチ重複」として分類される
+- **AND** 分類結果が診断ログに含まれる
+
+#### Scenario: 無効な参照の失敗は分類される
+- **GIVEN** `git worktree add` が「invalid reference」相当の stderr を返す
+- **WHEN** worktree 作成に失敗する
+- **THEN** 原因は「無効な参照」として分類される
+- **AND** 分類結果が診断ログに含まれる
+
+#### Scenario: 権限エラーの失敗は分類される
+- **GIVEN** `git worktree add` が「permission denied」相当の stderr を返す
+- **WHEN** worktree 作成に失敗する
+- **THEN** 原因は「権限エラー」として分類される
+- **AND** 分類結果が診断ログに含まれる
+
+#### Scenario: 既存パスで stale な worktree の場合は prune + 再試行
+- **GIVEN** worktree パスが存在するが `git worktree list` に登録されていない
+- **AND** `git worktree add` が既存パス起因で失敗する
+- **WHEN** worktree 作成が再試行される
+- **THEN** `git worktree prune` が実行される
+- **AND** `git worktree add` は 1 回だけ再試行される
+
+#### Scenario: 再試行が失敗した場合は元のエラーも保持する
+- **GIVEN** `git worktree add` が既存パス起因で失敗する
+- **AND** prune 後の再試行も失敗する
+- **WHEN** エラーが記録される
+- **THEN** 元のエラーと分類結果が両方ログに含まれる

@@ -79,17 +79,31 @@ impl OrchestratorError {
                 working_dir,
                 stderr,
                 stdout,
-            } => match backend {
-                VcsBackend::Git => OrchestratorError::GitCommand(message),
-                VcsBackend::Auto => OrchestratorError::Vcs(Box::new(VcsError::Command {
-                    backend,
-                    message,
-                    command,
-                    working_dir,
-                    stderr,
-                    stdout,
-                })),
-            },
+            } => {
+                // Use the Display implementation which includes full context
+                let full_message = format!(
+                    "{}",
+                    VcsError::Command {
+                        backend,
+                        message: message.clone(),
+                        command: command.clone(),
+                        working_dir: working_dir.clone(),
+                        stderr: stderr.clone(),
+                        stdout: stdout.clone(),
+                    }
+                );
+                match backend {
+                    VcsBackend::Git => OrchestratorError::GitCommand(full_message),
+                    VcsBackend::Auto => OrchestratorError::Vcs(Box::new(VcsError::Command {
+                        backend,
+                        message,
+                        command,
+                        working_dir,
+                        stderr,
+                        stdout,
+                    })),
+                }
+            }
             VcsError::Conflict { backend, details } => match backend {
                 VcsBackend::Git => OrchestratorError::GitConflict(details),
                 VcsBackend::Auto => {

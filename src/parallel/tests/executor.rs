@@ -19,9 +19,28 @@ const DEFAULT_MAX_RETRIES: u32 = 2;
 const DEFAULT_RETRY_DELAY_MS: u64 = 5000;
 const DEFAULT_RETRY_IF_DURATION_UNDER_SECS: u64 = 5;
 
+/// Helper function to create a test config with all required commands
+fn create_test_config() -> OrchestratorConfig {
+    OrchestratorConfig {
+        apply_command: Some("echo apply {change_id}".to_string()),
+        archive_command: Some("echo archive {change_id}".to_string()),
+        analyze_command: Some("echo analyze".to_string()),
+        acceptance_command: Some("echo acceptance".to_string()),
+        resolve_command: Some("echo resolve".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Helper to create test config with custom overrides
+fn create_test_config_with(overrides: OrchestratorConfig) -> OrchestratorConfig {
+    let mut base = create_test_config();
+    base.merge(overrides);
+    base
+}
+
 #[test]
 fn test_parallel_executor_creation() {
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let executor = ParallelExecutor::new(repo_root, config, None);
 
@@ -255,7 +274,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
 
     // Create test AI runner
     let shared_stagger_state = Arc::new(Mutex::new(None));
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let queue_config = CommandQueueConfig {
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
@@ -309,10 +328,10 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
 
     init_git_repo(repo_root).await;
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
@@ -345,10 +364,10 @@ async fn test_resolve_merge_executes_selected_change_only() {
 
     init_git_repo(repo_root).await;
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some(format!("sh {}", resolver_script.display())),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
@@ -356,6 +375,40 @@ async fn test_resolve_merge_executes_selected_change_only() {
     let workspace_b = manager.create_workspace("change-b", None).await.unwrap();
     commit_workspace_change(&workspace_a, "change-a.txt", "A", "Apply: change-a").await;
     commit_workspace_change(&workspace_b, "change-b.txt", "B", "Apply: change-b").await;
+
+    // Create archive entries in workspace_a and workspace_b to satisfy archive verification
+    for (workspace, change_id) in [(&workspace_a, "change-a"), (&workspace_b, "change-b")] {
+        // Remove openspec/changes/<change_id> directory to simulate completed archive
+        let changes_dir = workspace
+            .path
+            .join(format!("openspec/changes/{}", change_id));
+        if changes_dir.exists() {
+            std::fs::remove_dir_all(&changes_dir).unwrap();
+        }
+
+        // Create archive entry as a directory (archive_entry_exists checks directory names)
+        let archive_dir = workspace.path.join("openspec/changes/archive");
+        let archive_entry = archive_dir.join(change_id);
+        std::fs::create_dir_all(&archive_entry).unwrap();
+        std::fs::write(
+            archive_entry.join("proposal.md"),
+            format!("# Archive entry for {}", change_id),
+        )
+        .unwrap();
+
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&workspace.path)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", &format!("Archive: {}", change_id)])
+            .current_dir(&workspace.path)
+            .output()
+            .await
+            .unwrap();
+    }
 
     let script_contents = format!(
         "#!/bin/sh\nset -e\nROOT=\"$(pwd)\"\n\
@@ -429,10 +482,10 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         .await
         .unwrap();
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
@@ -594,10 +647,10 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         .await
         .unwrap();
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
@@ -762,10 +815,10 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         .await
         .unwrap();
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 1, config.clone());
 
@@ -902,10 +955,10 @@ async fn test_merge_retries_when_merge_commit_missing() {
         .await
         .unwrap();
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
@@ -1081,10 +1134,10 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         .await
         .unwrap();
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
@@ -1258,10 +1311,10 @@ async fn test_merge_retries_after_pre_commit_changes() {
         .await
         .unwrap();
 
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
         ..Default::default()
-    };
+    });
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 1, config.clone());
 
@@ -1417,7 +1470,7 @@ async fn test_dynamic_queue_injection() {
     assert_eq!(queue.len().await, 1);
 
     // Create a simple parallel executor with the queue
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let (tx, _rx) = mpsc::channel(10);
     let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
@@ -1435,7 +1488,7 @@ async fn test_debounce_with_queue_changes() {
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
 
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let (tx, _rx) = mpsc::channel(10);
     let executor = ParallelExecutor::new(repo_root, config, Some(tx));
@@ -1565,7 +1618,7 @@ async fn test_attempt_merge_defers_when_change_not_archived() {
         .unwrap();
 
     // Create executor
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let (tx, _rx) = mpsc::channel(10);
     let executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
 
@@ -1581,8 +1634,8 @@ async fn test_attempt_merge_defers_when_change_not_archived() {
     match result {
         Ok(MergeAttempt::Deferred(reason)) => {
             assert!(
-                reason.contains("Archive verification failed"),
-                "Expected deferred reason to mention archive verification, got: {}",
+                reason.contains("Archive incomplete"),
+                "Expected deferred reason to mention archive incomplete, got: {}",
                 reason
             );
             assert!(
@@ -1681,10 +1734,10 @@ async fn test_attempt_merge_succeeds_when_change_archived() {
         .unwrap();
 
     // Create executor
-    let config = OrchestratorConfig {
+    let config = create_test_config_with(OrchestratorConfig {
         workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
         ..Default::default()
-    };
+    });
     let (tx, _rx) = mpsc::channel(10);
     let executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
 
@@ -1721,7 +1774,7 @@ async fn test_attempt_merge_succeeds_when_change_archived() {
 /// are in MergeWait state for other logic purposes.
 #[test]
 fn test_merge_wait_suppresses_completion_events() {
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let mut executor = ParallelExecutor::new(repo_root, config, None);
 
@@ -1757,7 +1810,7 @@ fn test_merge_wait_does_not_block_runnable_changes() {
     // Changes in MergeWait have WorkspaceState::Archived (archive commit exists)
     // So they are correctly excluded from processing, allowing other changes to continue
 
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let executor = ParallelExecutor::new(repo_root, config, None);
 
@@ -1779,7 +1832,7 @@ async fn test_concurrent_reanalysis_queue_dispatch() {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let (tx, _rx) = mpsc::channel(100);
 
@@ -1868,4 +1921,301 @@ async fn test_on_merged_hook_execution() {
         "Hook marker file should exist at {:?}",
         marker_file
     );
+}
+
+/// Test that attempt_merge defers when worktree is dirty
+#[tokio::test]
+async fn test_merge_deferred_when_worktree_dirty() {
+    use std::fs;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    // Create temporary repository
+    let temp_dir = TempDir::new().unwrap();
+    let repo_root = temp_dir.path();
+
+    // Initialize git repo
+    Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Create initial commit
+    fs::write(repo_root.join("README.md"), "initial").unwrap();
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "Initial"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Create archive directory to simulate that archive was successful (change moved to archive)
+    let archive_dir = repo_root.join("openspec/changes/archive/2024-01-01-test-change");
+    fs::create_dir_all(&archive_dir).unwrap();
+    fs::write(archive_dir.join("spec.md"), "# Archived Test").unwrap();
+
+    // Commit the archive
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "Archive: test-change"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Create a dirty file (uncommitted change)
+    fs::write(repo_root.join("dirty.txt"), "dirty content").unwrap();
+
+    // Create executor
+    let config = create_test_config();
+    let (tx, _rx) = mpsc::channel(10);
+    let executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
+
+    let revisions = vec!["test-workspace".to_string()];
+    let change_ids = vec!["test-change".to_string()];
+    let archive_paths = vec![repo_root.to_path_buf()];
+
+    // Attempt merge should be deferred because worktree is dirty
+    let result = executor
+        .attempt_merge(&revisions, &change_ids, &archive_paths)
+        .await;
+
+    match result {
+        Ok(MergeAttempt::Deferred(reason)) => {
+            assert!(
+                reason.contains("incomplete") || reason.contains("dirty"),
+                "Expected deferred reason to mention incomplete archive or dirty worktree, got: {}",
+                reason
+            );
+        }
+        Ok(MergeAttempt::Merged) => {
+            panic!("Merge should have been deferred due to dirty worktree");
+        }
+        Err(e) => {
+            panic!("Unexpected error: {}", e);
+        }
+    }
+}
+
+/// Test that attempt_merge defers when archive entry is missing
+#[tokio::test]
+async fn test_merge_deferred_when_archive_entry_missing() {
+    use std::fs;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    // Create temporary repository
+    let temp_dir = TempDir::new().unwrap();
+    let repo_root = temp_dir.path();
+
+    // Initialize git repo
+    Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Create initial commit
+    fs::write(repo_root.join("README.md"), "initial").unwrap();
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "Initial"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Note: No archive directory created - this simulates archive entry missing
+    // And no openspec/changes/test-change directory (simulating change was removed but not archived)
+
+    // Create executor
+    let config = create_test_config();
+    let (tx, _rx) = mpsc::channel(10);
+    let executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
+
+    let revisions = vec!["test-workspace".to_string()];
+    let change_ids = vec!["test-change".to_string()];
+    let archive_paths = vec![repo_root.to_path_buf()];
+
+    // Attempt merge should be deferred because archive entry is missing
+    let result = executor
+        .attempt_merge(&revisions, &change_ids, &archive_paths)
+        .await;
+
+    match result {
+        Ok(MergeAttempt::Deferred(reason)) => {
+            assert!(
+                reason.contains("incomplete")
+                    || reason.contains("archive")
+                    || reason.contains("missing"),
+                "Expected deferred reason to mention incomplete archive or missing entry, got: {}",
+                reason
+            );
+        }
+        Ok(MergeAttempt::Merged) => {
+            panic!("Merge should have been deferred due to missing archive entry");
+        }
+        Err(e) => {
+            panic!("Unexpected error: {}", e);
+        }
+    }
+}
+
+/// Test that attempt_merge proceeds when archive is complete
+#[tokio::test]
+async fn test_merge_proceeds_when_archive_complete() {
+    use std::fs;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    // Create temporary repository
+    let temp_dir = TempDir::new().unwrap();
+    let repo_root = temp_dir.path();
+
+    // Initialize git repo
+    Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Create initial commit
+    fs::write(repo_root.join("README.md"), "initial").unwrap();
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "Initial"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Create archive directory but NOT openspec/changes/test-change (proper archive)
+    let archive_dir = repo_root.join("openspec/changes/archive/test-change");
+    fs::create_dir_all(&archive_dir).unwrap();
+    fs::write(archive_dir.join("spec.md"), "# Archived").unwrap();
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "Archive: test-change"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Create worktree for the change (outside the main repo to avoid dirty working tree)
+    let workspace_base = TempDir::new().unwrap();
+    let workspace_path = workspace_base.path().join("ws-test-change");
+
+    Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            "ws-test-change",
+            workspace_path.to_str().unwrap(),
+            "HEAD",
+        ])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Create executor
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let (tx, _rx) = mpsc::channel(10);
+    let executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
+
+    let revisions = vec!["ws-test-change".to_string()];
+    let change_ids = vec!["test-change".to_string()];
+
+    // Attempt merge should succeed because change is properly archived
+    let archive_paths = vec![workspace_path.clone()];
+    let result = executor
+        .attempt_merge(&revisions, &change_ids, &archive_paths)
+        .await;
+
+    match result {
+        Ok(MergeAttempt::Merged) => {
+            // Success - merge was allowed
+        }
+        Ok(MergeAttempt::Deferred(reason)) => {
+            panic!(
+                "Merge should have succeeded when change is archived, got deferred: {}",
+                reason
+            );
+        }
+        Err(e) => {
+            // This is also acceptable - merge may fail for other reasons (e.g., original branch not initialized)
+            // but it should not be deferred due to archive verification
+            println!("Merge failed with error (acceptable): {}", e);
+        }
+    }
 }

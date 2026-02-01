@@ -25,7 +25,13 @@ pub fn build_acceptance_tail_findings(
         .unwrap_or_else(|| ACCEPTANCE_OUTPUT_FALLBACK.to_string());
     let lines = selected
         .lines()
-        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            let trimmed = line.trim();
+            // Filter out empty lines, ACCEPTANCE: markers, and FINDINGS: lines
+            !trimmed.is_empty()
+                && !trimmed.starts_with("ACCEPTANCE:")
+                && !trimmed.starts_with("FINDINGS:")
+        })
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
     if lines.is_empty() {
@@ -85,7 +91,7 @@ pub async fn acceptance_test_streaming<O, F>(
     _config: &crate::config::OrchestratorConfig,
     output: &O,
     cancel_check: F,
-) -> Result<(AcceptanceResult, u32)>
+) -> Result<(AcceptanceResult, u32, String)>
 where
     O: OutputHandler,
     F: Fn() -> bool,
@@ -107,9 +113,13 @@ where
         .flatten(); // None if in detached HEAD or non-git repo
 
     // Execute acceptance command with streaming
-    let (mut child, mut output_rx, start_time) = agent
+    let (mut child, mut output_rx, start_time, command) = agent
         .run_acceptance_streaming(&change.id, None, base_branch.as_deref())
         .await?;
+
+    // Log acceptance started with command
+    output.on_info(&format!("Acceptance started: {}", change.id));
+    output.on_info(&format!("  Command: {}", command));
 
     // Create output collector for history and parsing
     let mut output_collector = OutputCollector::new();
@@ -123,7 +133,7 @@ where
             output.on_warn("Acceptance test cancelled");
             let _ = child.terminate();
             // Note: For cancellation, we don't record an attempt, so return 0
-            return Ok((AcceptanceResult::Cancelled, 0));
+            return Ok((AcceptanceResult::Cancelled, 0, command));
         }
 
         match line {
@@ -181,6 +191,7 @@ where
                 findings: tail_findings,
             },
             attempt_number,
+            command,
         ));
     }
 
@@ -193,10 +204,15 @@ where
             output.on_info("Acceptance test: PASS");
             (AcceptanceResult::Pass, true)
         }
-        crate::acceptance::AcceptanceResult::Fail { findings } => {
+        crate::acceptance::AcceptanceResult::Fail { .. } => {
             info!("Acceptance test failed for: {}", change.id);
             output.on_warn("Acceptance test: FAIL");
-            (AcceptanceResult::Fail { findings }, false)
+            (
+                AcceptanceResult::Fail {
+                    findings: tail_findings.clone(),
+                },
+                false,
+            )
         }
         crate::acceptance::AcceptanceResult::Continue => {
             info!("Acceptance requires continuation for: {}", change.id);
@@ -217,7 +233,7 @@ where
         commit_hash: commit_hash.clone(),
     };
     agent.record_acceptance_attempt(&change.id, attempt);
-    Ok((result, attempt_number))
+    Ok((result, attempt_number, command))
 }
 
 #[cfg(test)]
@@ -262,5 +278,35 @@ mod tests {
         }
         .is_pass());
         assert!(!AcceptanceResult::Cancelled.is_pass());
+    }
+
+    #[test]
+    fn test_build_acceptance_tail_findings_filters_acceptance_marker() {
+        let findings = build_acceptance_tail_findings(
+            Some("line 1\nACCEPTANCE: FAIL\nline 2".to_string()),
+            None,
+        );
+
+        assert_eq!(findings, vec!["line 1", "line 2"]);
+    }
+
+    #[test]
+    fn test_build_acceptance_tail_findings_filters_findings_line() {
+        let findings = build_acceptance_tail_findings(
+            Some("error 1\nFINDINGS:\n- item 1\n- item 2".to_string()),
+            None,
+        );
+
+        assert_eq!(findings, vec!["error 1", "- item 1", "- item 2"]);
+    }
+
+    #[test]
+    fn test_build_acceptance_tail_findings_filters_both_markers() {
+        let findings = build_acceptance_tail_findings(
+            Some("ACCEPTANCE: FAIL\nFINDINGS:\nactual error\nanother line".to_string()),
+            None,
+        );
+
+        assert_eq!(findings, vec!["actual error", "another line"]);
     }
 }

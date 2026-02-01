@@ -194,8 +194,15 @@ pub async fn handle_tui_command(
                     ctx.app.update_approval_status(&id, true);
                     if ctx.app.mode == AppMode::Select {
                         if let Some(change) = ctx.app.changes.iter_mut().find(|c| c.id == id) {
-                            change.selected = true;
-                            change.queue_status = QueueStatus::NotQueued;
+                            // In select mode, default to selecting approved changes.
+                            // However, wait states must preserve queue_status/selected semantics.
+                            if !matches!(
+                                change.queue_status,
+                                QueueStatus::MergeWait | QueueStatus::ResolveWait
+                            ) {
+                                change.selected = true;
+                                change.queue_status = QueueStatus::NotQueued;
+                            }
                         }
                     }
                     ctx.app
@@ -204,6 +211,30 @@ pub async fn handle_tui_command(
                 Err(e) => {
                     ctx.app.add_log(LogEntry::error(format!(
                         "Failed to approve '{}': {}",
+                        id, e
+                    )));
+                }
+            }
+        }
+        TuiCommand::UnapproveOnly(id) => {
+            // Unapprove without touching queue status or DynamicQueue.
+            // Intended for wait states like MergeWait/ResolveWait.
+            use crate::approval;
+
+            match approval::unapprove_change(&id) {
+                Ok(_) => {
+                    ctx.app.update_approval_status(&id, false);
+                    if let Some(change) = ctx.app.changes.iter_mut().find(|c| c.id == id) {
+                        change.selected = false;
+                    }
+                    ctx.app.add_log(LogEntry::info(format!(
+                        "Unapproved (no queue change): {}",
+                        id
+                    )));
+                }
+                Err(e) => {
+                    ctx.app.add_log(LogEntry::error(format!(
+                        "Failed to unapprove '{}': {}",
                         id, e
                     )));
                 }

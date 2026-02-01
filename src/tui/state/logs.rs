@@ -13,15 +13,45 @@ impl AppState {
     /// Add a log entry
     pub fn add_log(&mut self, entry: LogEntry) {
         // Send to tracing for debug file output (if --logs enabled)
+        // Include change_id, operation, iteration, and workspace_path in tracing output for context matching
+        let change_id = entry.change_id.as_deref().unwrap_or("-");
+        let operation = entry.operation.as_deref().unwrap_or("-");
+        let iteration = entry.iteration.unwrap_or(0);
+        let workspace_path = entry.workspace_path.as_deref().unwrap_or("-");
+
         match entry.level {
             LogLevel::Info | LogLevel::Success => {
-                info!(target: "tui_log", "{}", entry.message);
+                info!(
+                    target: "tui_log",
+                    change_id = change_id,
+                    operation = operation,
+                    iteration = iteration,
+                    workspace_path = workspace_path,
+                    "{}",
+                    entry.message
+                );
             }
             LogLevel::Warn => {
-                warn!(target: "tui_log", "{}", entry.message);
+                warn!(
+                    target: "tui_log",
+                    change_id = change_id,
+                    operation = operation,
+                    iteration = iteration,
+                    workspace_path = workspace_path,
+                    "{}",
+                    entry.message
+                );
             }
             LogLevel::Error => {
-                error!(target: "tui_log", "{}", entry.message);
+                error!(
+                    target: "tui_log",
+                    change_id = change_id,
+                    operation = operation,
+                    iteration = iteration,
+                    workspace_path = workspace_path,
+                    "{}",
+                    entry.message
+                );
             }
         }
 
@@ -105,6 +135,7 @@ mod tests {
             change_id: Some("test-change".to_string()),
             operation: Some("apply".to_string()),
             iteration: Some(1),
+            workspace_path: None,
             color: Color::Red,
         };
 
@@ -143,6 +174,7 @@ mod tests {
                 change_id: None,
                 operation: None,
                 iteration: None,
+                workspace_path: None,
                 color: ratatui::style::Color::White,
             };
 

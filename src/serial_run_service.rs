@@ -198,6 +198,7 @@ impl SerialRunService {
         total_changes: usize,
         remaining_changes: usize,
         cancel_check: F,
+        operation_tracker: Option<std::sync::Arc<std::sync::RwLock<String>>>,
     ) -> Result<ChangeProcessResult>
     where
         F: Fn() -> bool,
@@ -239,6 +240,7 @@ impl SerialRunService {
                 total_changes,
                 remaining_changes,
                 apply_count,
+                operation_tracker,
             )
             .await
         } else {
@@ -253,6 +255,7 @@ impl SerialRunService {
                 remaining_changes,
                 apply_count,
                 &cancel_check,
+                operation_tracker,
             )
             .await
         }
@@ -270,8 +273,14 @@ impl SerialRunService {
         total_changes: usize,
         remaining_changes: usize,
         apply_count: u32,
+        operation_tracker: Option<std::sync::Arc<std::sync::RwLock<String>>>,
     ) -> Result<ChangeProcessResult> {
         info!("Change {} is complete, archiving...", change.id);
+
+        // Update operation to "archive" before running archive
+        if let Some(ref tracker) = operation_tracker {
+            *tracker.write().unwrap() = "archive".to_string();
+        }
 
         let archive_ctx = ArchiveContext::new(
             self.changes_processed,
@@ -349,6 +358,7 @@ impl SerialRunService {
         remaining_changes: usize,
         apply_count: u32,
         cancel_check: &F,
+        operation_tracker: Option<std::sync::Arc<std::sync::RwLock<String>>>,
     ) -> Result<ChangeProcessResult>
     where
         F: Fn() -> bool,
@@ -390,6 +400,11 @@ impl SerialRunService {
                         change.id
                     );
 
+                    // Update operation to "acceptance" before running acceptance test
+                    if let Some(ref tracker) = operation_tracker {
+                        *tracker.write().unwrap() = "acceptance".to_string();
+                    }
+
                     // Run acceptance test
                     match acceptance_test_streaming(
                         &updated_change,
@@ -401,11 +416,11 @@ impl SerialRunService {
                     )
                     .await
                     {
-                        Ok((AcceptanceResult::Pass, _attempt_number)) => {
+                        Ok((AcceptanceResult::Pass, _attempt_number, _command)) => {
                             info!("Acceptance passed for {}, ready for archive", change.id);
                             Ok(ChangeProcessResult::AcceptancePassed)
                         }
-                        Ok((AcceptanceResult::Continue, _attempt_number)) => {
+                        Ok((AcceptanceResult::Continue, _attempt_number, _command)) => {
                             let continue_count =
                                 agent.count_consecutive_acceptance_continues(&change.id);
                             let max_continues = self.config.get_acceptance_max_continues();
@@ -424,9 +439,9 @@ impl SerialRunService {
                                 Ok(ChangeProcessResult::AcceptanceContinue)
                             }
                         }
-                        Ok((AcceptanceResult::Fail { findings }, _attempt_number)) => {
+                        Ok((AcceptanceResult::Fail { findings }, _attempt_number, _command)) => {
                             warn!(
-                                "Acceptance failed for {} with {} findings, will retry apply",
+                                "Acceptance failed for {} ({} tail lines), will retry apply",
                                 change.id,
                                 findings.len()
                             );
@@ -436,12 +451,13 @@ impl SerialRunService {
                         Ok((
                             AcceptanceResult::CommandFailed { error, findings: _ },
                             _attempt_number,
+                            _command,
                         )) => {
                             error!("Acceptance command failed for {}: {}", change.id, error);
                             // Note: tasks.md is now updated by the acceptance agent itself
                             Ok(ChangeProcessResult::AcceptanceCommandFailed { error })
                         }
-                        Ok((AcceptanceResult::Cancelled, _attempt_number)) => {
+                        Ok((AcceptanceResult::Cancelled, _attempt_number, _command)) => {
                             info!("Acceptance cancelled for {}", change.id);
                             Ok(ChangeProcessResult::Cancelled)
                         }

@@ -17,6 +17,8 @@ Defines the configuration file format, agent command templates, and settings for
 6. `propose_command` - （後方互換のため残り得る）提案作成コマンド
 7. `worktree_command` - TUIの `+` から起動される worktree 上の提案作成コマンド
 
+`apply_command`/`archive_command`/`analyze_command`/`acceptance_command`/`resolve_command` は、設定のマージ結果に必ず存在しなければならない (MUST)。未設定のまま実行に移ろうとした場合、設定エラーとして失敗しなければならない (MUST)。
+
 #### Scenario: worktree_command を設定できる
 
 - **GIVEN** `.cflx.jsonc` に以下の設定が存在する:
@@ -28,47 +30,74 @@ Defines the configuration file format, agent command templates, and settings for
 - **WHEN** ユーザーがTUIの `+` キーで提案作成フローを開始する
 - **THEN** `worktree_command` が使用される
 
+#### Scenario: 必須コマンドが欠落している場合は設定ロード時にエラーになる
+
+- **GIVEN** 設定のマージ結果に `archive_command` が存在しない
+- **WHEN** 設定をロードする
+- **THEN** 設定ロード時にエラーとして失敗する
+- **AND** エラーメッセージに欠落しているコマンド名が含まれる
+
 ### Requirement: 設定ファイルの優先順位
 
-オーケストレーターは以下の優先順位で設定ファイルを読み込まなければならない (MUST):
+オーケストレーターは以下の優先順位で設定ファイルを読み込み、項目ごとにマージしなければならない (MUST):
 
-1. **プロジェクト設定** (優先): `.cflx.jsonc` (プロジェクトルート)
-2. **XDG グローバル設定 (環境変数)**: `$XDG_CONFIG_HOME/cflx/config.jsonc`
-3. **XDG グローバル設定 (デフォルト)**: `~/.config/cflx/config.jsonc`
-4. **プラットフォーム標準のグローバル設定**: `dirs::config_dir()/cflx/config.jsonc`
+1. **カスタム設定**: `--config` で指定されたファイル
+2. **プロジェクト設定**: `.cflx.jsonc` (プロジェクトルート)
+3. **XDG グローバル設定 (環境変数)**: `$XDG_CONFIG_HOME/cflx/config.jsonc`
+4. **XDG グローバル設定 (デフォルト)**: `~/.config/cflx/config.jsonc`
+5. **プラットフォーム標準のグローバル設定**: `dirs::config_dir()/cflx/config.jsonc`
 
-プロジェクト設定が存在する場合はそちらを使用し、存在しない場合のみグローバル設定を使用する。
+同一キーが複数の設定に存在する場合は、より優先度が高い設定の値で上書きしなければならない (MUST)。
+優先度の高い設定に存在しないキーは、下位の設定の値を引き継がなければならない (MUST)。
 
-#### Scenario: XDG_CONFIG_HOME が設定されている場合は最優先で使用する
-- **GIVEN** 環境変数 `XDG_CONFIG_HOME=/custom/config` が設定されている
-- **AND** `/custom/config/cflx/config.jsonc` に:
+設定のマージ完了後、必須コマンド (`apply_command`/`archive_command`/`analyze_command`/`acceptance_command`/`resolve_command`) が欠落している場合は、設定ロード時にエラーとして失敗しなければならない (MUST)。
+
+`worktree_command` および `propose_command` は任意であり、未設定でもエラーにならない (MAY)。
+
+#### Scenario: 設定ロード時に必須コマンドの欠落を検出する
+- **GIVEN** 設定のマージ結果に `apply_command` が存在しない
+- **WHEN** 設定をロードする
+- **THEN** 設定ロード時にエラーとして失敗する
+- **AND** エラーメッセージに `apply_command` が欠落している旨が含まれる
+
+#### Scenario: プロジェクト設定が部分的でもグローバル設定を引き継ぐ
+- **GIVEN** `~/.config/cflx/config.jsonc` に:
   ```jsonc
-  { "apply_command": "xdg-agent apply {change_id}" }
+  { "archive_command": "global-archive {change_id}" }
   ```
-- **AND** `.cflx.jsonc` が存在しない
-- **WHEN** 変更 `fix-bug` を適用する
-- **THEN** `xdg-agent apply fix-bug` が実行される
-
-#### Scenario: XDG_CONFIG_HOME が未設定の場合は ~/.config を優先する
-- **GIVEN** `XDG_CONFIG_HOME` が未設定である
-- **AND** `~/.config/cflx/config.jsonc` に:
+- **AND** `.cflx.jsonc` に:
   ```jsonc
-  { "apply_command": "xdg-default apply {change_id}" }
+  { "hooks": { "on_start": "echo start" } }
   ```
-- **AND** `.cflx.jsonc` が存在しない
-- **WHEN** 変更 `fix-bug` を適用する
-- **THEN** `xdg-default apply fix-bug` が実行される
+- **WHEN** 設定を読み込む
+- **THEN** `archive_command` は `global-archive {change_id}` のまま保持される
+- **AND** `hooks.on_start` は `echo start` に設定される
 
-#### Scenario: XDG 設定が存在しない場合は platform 標準のグローバル設定を使用する
-- **GIVEN** `XDG_CONFIG_HOME` が未設定である
-- **AND** `~/.config/cflx/config.jsonc` が存在しない
-- **AND** platform 標準のグローバル設定に:
+#### Scenario: 同一キーは上位設定が優先される
+- **GIVEN** `~/.config/cflx/config.jsonc` に `apply_command` が存在する
+- **AND** `.cflx.jsonc` に別の `apply_command` が存在する
+- **WHEN** 設定を読み込む
+- **THEN** `.cflx.jsonc` の `apply_command` が使用される
+
+#### Scenario: カスタム設定は最優先で上書きされる
+- **GIVEN** `--config /tmp/custom.jsonc` が指定されている
+- **AND** `/tmp/custom.jsonc` に `resolve_command` が存在する
+- **AND** `.cflx.jsonc` に別の `resolve_command` が存在する
+- **WHEN** 設定を読み込む
+- **THEN** `/tmp/custom.jsonc` の `resolve_command` が使用される
+
+#### Scenario: hooks のディープマージ
+- **GIVEN** `~/.config/cflx/config.jsonc` に:
   ```jsonc
-  { "apply_command": "platform-default apply {change_id}" }
+  { "hooks": { "on_start": "echo global" } }
   ```
-- **AND** `.cflx.jsonc` が存在しない
-- **WHEN** 変更 `fix-bug` を適用する
-- **THEN** `platform-default apply fix-bug` が実行される
+- **AND** `.cflx.jsonc` に:
+  ```jsonc
+  { "hooks": { "pre_apply": "echo project" } }
+  ```
+- **WHEN** 設定を読み込む
+- **THEN** `hooks.on_start` は `echo global` のまま保持される
+- **AND** `hooks.pre_apply` は `echo project` に設定される
 
 ### Requirement: プレースホルダーの展開
 
@@ -120,10 +149,12 @@ Defines the configuration file format, agent command templates, and settings for
 - **AND** 依存関係分析が実行される
 - **THEN** `claude-code` にプロンプトが渡され、その出力が解析される
 
-#### Scenario: 分析コマンド未設定時のフォールバック
+#### Scenario: analyze_command が未設定の場合は設定エラーになる
 
-- **WHEN** `analyze_command` が設定されていない
-- **THEN** デフォルトの `opencode run --format json '{prompt}'` が使用される
+- **GIVEN** 設定のマージ結果に `analyze_command` が存在しない
+- **WHEN** 依存関係分析が実行される
+- **THEN** 設定エラーとして失敗する
+- **AND** エラーメッセージに `analyze_command` が欠落している旨が含まれる
 
 ### Requirement: JSONC 形式のサポート
 
@@ -460,7 +491,7 @@ The orchestrator SHALL support parallel execution configuration options in the c
 - **THEN** the default value is 3
 
 ### Requirement: Workspace Base Directory Configuration
-The orchestrator SHALL support configuring the base directory for git worktrees.
+オーケストレーターは git worktree のベースディレクトリを設定できなければならない (MUST)。
 
 #### Scenario: Configure workspace directory
 - **WHEN** config file contains "workspace_base_dir": "/var/tmp/openspec-ws"
@@ -469,10 +500,10 @@ The orchestrator SHALL support configuring the base directory for git worktrees.
 #### Scenario: Default workspace directory
 - **GIVEN** `workspace_base_dir` is not specified
 - **WHEN** the orchestrator resolves the default workspace directory
-- **THEN** macOS uses `${XDG_DATA_HOME}/conflux/worktrees/<project_slug>` when `XDG_DATA_HOME` is set
-- **AND** macOS falls back to `~/Library/Application Support/conflux/worktrees/<project_slug>` when `XDG_DATA_HOME` is not set
-- **AND** Linux uses `${XDG_DATA_HOME:-~/.local/share}/conflux/worktrees/<project_slug>`
-- **AND** Windows uses `%APPDATA%\Conflux\worktrees\<project_slug>`
+- **THEN** macOS uses `${XDG_DATA_HOME}/cflx/worktrees/<project_slug>` when `XDG_DATA_HOME` is set
+- **AND** macOS falls back to `~/.local/share/cflx/worktrees/<project_slug>` when `XDG_DATA_HOME` is not set
+- **AND** Linux uses `${XDG_DATA_HOME:-~/.local/share}/cflx/worktrees/<project_slug>`
+- **AND** Windows uses `%APPDATA%/cflx/worktrees/<project_slug>`
 - **AND** `<project_slug>` is derived from the repository name plus a short hash of the absolute repository path
 
 ### Requirement: Parallelization Analysis Prompt Configuration

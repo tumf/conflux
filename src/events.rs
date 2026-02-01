@@ -43,6 +43,8 @@ pub struct LogEntry {
     pub operation: Option<String>,
     /// Optional iteration number (for apply operations)
     pub iteration: Option<u32>,
+    /// Optional workspace path (for parallel mode logs with workspace context)
+    pub workspace_path: Option<String>,
 }
 
 fn ansi_csi_regex() -> &'static Regex {
@@ -77,6 +79,7 @@ impl LogEntry {
             change_id: None,
             operation: None,
             iteration: None,
+            workspace_path: None,
         }
     }
 
@@ -92,6 +95,7 @@ impl LogEntry {
             change_id: None,
             operation: None,
             iteration: None,
+            workspace_path: None,
         }
     }
 
@@ -107,6 +111,7 @@ impl LogEntry {
             change_id: None,
             operation: None,
             iteration: None,
+            workspace_path: None,
         }
     }
 
@@ -122,6 +127,7 @@ impl LogEntry {
             change_id: None,
             operation: None,
             iteration: None,
+            workspace_path: None,
         }
     }
 
@@ -141,6 +147,13 @@ impl LogEntry {
     /// Set iteration number (for apply operations)
     pub fn with_iteration(mut self, iteration: u32) -> Self {
         self.iteration = Some(iteration);
+        self
+    }
+
+    /// Set workspace path (for parallel mode logs with workspace context)
+    #[allow(dead_code)]
+    pub fn with_workspace_path(mut self, workspace_path: impl Into<String>) -> Self {
+        self.workspace_path = Some(workspace_path.into());
         self
     }
 }
@@ -198,7 +211,7 @@ pub enum ExecutionEvent {
 
     // Acceptance events
     /// Acceptance started for a change
-    AcceptanceStarted { change_id: String },
+    AcceptanceStarted { change_id: String, command: String },
     /// Acceptance completed for a change
     AcceptanceCompleted { change_id: String },
     /// Acceptance failed for a change
@@ -363,8 +376,8 @@ pub enum ExecutionEvent {
         worktree_paths: std::collections::HashMap<String, std::path::PathBuf>,
         /// Set of change_ids whose worktrees are NOT ahead of base (for auto-clearing MergeWait)
         worktree_not_ahead_ids: std::collections::HashSet<String>,
-        /// Set of change_ids in WorkspaceState::Archived (for ResolveWait)
-        resolve_wait_ids: std::collections::HashSet<String>,
+        /// Set of change_ids in WorkspaceState::Archived (for MergeWait restoration)
+        merge_wait_ids: std::collections::HashSet<String>,
     },
     /// Worktrees list refreshed (for worktree view)
     WorktreesRefreshed {
@@ -532,5 +545,41 @@ mod tests {
     fn test_log_level_equality() {
         assert_eq!(LogLevel::Info, LogLevel::Info);
         assert_ne!(LogLevel::Info, LogLevel::Error);
+    }
+
+    #[test]
+    fn test_acceptance_started_event_with_command() {
+        let event = ExecutionEvent::AcceptanceStarted {
+            change_id: "test-change".to_string(),
+            command: "claude --dangerously-skip-permissions acceptance test-change".to_string(),
+        };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("AcceptanceStarted"));
+        assert!(debug_str.contains("test-change"));
+        assert!(debug_str.contains("acceptance"));
+    }
+
+    #[test]
+    fn test_archive_started_event_with_command() {
+        let event = ExecutionEvent::ArchiveStarted {
+            change_id: "test-change".to_string(),
+            command: "claude --dangerously-skip-permissions archive test-change".to_string(),
+        };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("ArchiveStarted"));
+        assert!(debug_str.contains("test-change"));
+        assert!(debug_str.contains("archive"));
+    }
+
+    #[test]
+    fn test_resolve_started_event_with_command() {
+        let event = ExecutionEvent::ResolveStarted {
+            change_id: "test-change".to_string(),
+            command: "claude --dangerously-skip-permissions resolve test-change".to_string(),
+        };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("ResolveStarted"));
+        assert!(debug_str.contains("test-change"));
+        assert!(debug_str.contains("resolve"));
     }
 }
