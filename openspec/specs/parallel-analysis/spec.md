@@ -2,7 +2,6 @@
 
 ## Purpose
 TBD - created by archiving change pass-approved-changes-to-analyzer. Update Purpose after archive.
-
 ## Requirements
 ### Requirement: Parallel dependency analysis prompt
 
@@ -16,6 +15,8 @@ The prompt SHALL include:
 - Response instructions to return both `order` (recommended execution order after honoring dependencies) and `dependencies`
 - A statement that `dependencies` apply only when one change explicitly depends on the artifacts, specifications, or APIs of another and cannot be established without them
 - A statement that `order` is a recommended sequence based on priority or efficiency and is independent of dependencies
+
+プロンプト構築と出力解析は別関数に分割してもよい（MAY）。ただし、プロンプト内容と選別ルールは既存と同一でなければならない（MUST）。
 
 #### Scenario: Return dependencies only for mandatory conditions
 - **GIVEN** multiple changes are included in the dependency analysis
