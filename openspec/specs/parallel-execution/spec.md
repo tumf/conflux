@@ -14,6 +14,8 @@ Defines parallel change execution using jj workspaces or Git worktrees.
 - ParallelExecutor coordination
 - Archiving of completed changes
 
+ParallelRunService は、コミットツリーに存在しない change の除外と警告通知を CLI/TUI のどちらの経路でも同一ロジックで実行しなければならない（SHALL）。
+
 #### Scenario: CLI uses ParallelRunService
 - **WHEN** the CLI runs in parallel mode (`--parallel` flag)
 - **THEN** the CLI SHALL use `ParallelRunService` to execute changes
