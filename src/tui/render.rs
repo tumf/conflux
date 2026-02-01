@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use super::state::AppState;
 use super::types::{AppMode, QueueStatus};
-use super::utils::get_version_string;
+use super::utils::{get_version_string, truncate_to_display_width_with_suffix};
 
 /// Determine checkbox display and color for a change item
 ///
@@ -415,12 +415,9 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                         format!(" {} {}", relative_time, log.message)
                     };
 
-                    // Truncate if necessary
-                    let truncated = if preview_text.len() > available {
-                        format!("{}…", &preview_text[..available.saturating_sub(1)])
-                    } else {
-                        preview_text
-                    };
+                    // Truncate if necessary (Unicode-safe)
+                    let truncated =
+                        truncate_to_display_width_with_suffix(&preview_text, available, "…");
 
                     spans.push(Span::styled(
                         truncated,
@@ -715,12 +712,9 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                         format!(" {} {}", relative_time, log.message)
                     };
 
-                    // Truncate if necessary
-                    let truncated = if preview_text.len() > available {
-                        format!("{}…", &preview_text[..available.saturating_sub(1)])
-                    } else {
-                        preview_text
-                    };
+                    // Truncate if necessary (Unicode-safe)
+                    let truncated =
+                        truncate_to_display_width_with_suffix(&preview_text, available, "…");
 
                     spans.push(Span::styled(
                         truncated,
@@ -1928,5 +1922,42 @@ mod tests {
             "Header should show 'Running 1' (Resolving is in-flight), but got:\n{}",
             content
         );
+    }
+
+    #[test]
+    fn test_japanese_log_preview_truncation_no_panic() {
+        // Test that log preview with Japanese characters doesn't panic
+        // when truncated at character boundaries
+        use super::super::utils::truncate_to_display_width_with_suffix;
+
+        // Test the truncation function directly with Japanese text
+        let japanese_text = "日本語のログメッセージです。これは長いメッセージで切り詰められます。";
+
+        // This should not panic even with multi-byte UTF-8 characters
+        let truncated = truncate_to_display_width_with_suffix(japanese_text, 20, "…");
+
+        // Verify result contains ellipsis (was truncated) and doesn't panic
+        assert!(
+            truncated.contains("…"),
+            "Should be truncated with ellipsis, got: {}",
+            truncated
+        );
+
+        // Verify the truncated string is valid UTF-8 and can be used safely
+        assert_eq!(
+            truncated.chars().count(),
+            truncated.chars().count(), // This would panic if UTF-8 is broken
+            "Truncated string should be valid UTF-8"
+        );
+
+        // Test with various widths to ensure no panic at character boundaries
+        for width in 1..50 {
+            let result = truncate_to_display_width_with_suffix(japanese_text, width, "…");
+            assert!(
+                !result.is_empty(),
+                "Should never return empty string for width {}",
+                width
+            );
+        }
     }
 }
