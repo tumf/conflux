@@ -118,18 +118,8 @@ where
     .with_change(&change.id, change.completed_tasks, change.total_tasks)
     .with_apply_count(context.apply_count);
 
-    // Run on_change_complete hook
-    if let Err(e) = hooks.run_hook(HookType::OnChangeComplete, &hook_ctx).await {
-        output.on_warn(&format!("on_change_complete hook failed: {}", e));
-        // Hook failure propagates if continue_on_failure=false
-        return Err(e);
-    }
-
-    // Run pre_archive hook
-    if let Err(e) = hooks.run_hook(HookType::PreArchive, &hook_ctx).await {
-        output.on_warn(&format!("pre_archive hook failed: {}", e));
-        return Err(e);
-    }
+    // Run pre-archive hooks
+    run_pre_archive_hooks(hooks, &hook_ctx, output).await?;
 
     output.on_info(&format!("Archiving: {}", change.id));
 
@@ -179,42 +169,21 @@ where
             return Ok(ArchiveResult::Failed { error: error_msg });
         }
 
-        if is_git_repo {
-            if let Err(e) =
-                git_commands::create_archive_wip_commit(repo_root, &change.id, attempt).await
-            {
-                output.on_warn(&format!(
-                    "Failed to create WIP(archive) commit for {} (attempt {}): {}",
-                    change.id, attempt, e
-                ));
-            } else if stall_config.enabled {
-                match git_commands::is_head_empty_commit(repo_root).await {
-                    Ok(is_empty) => {
-                        if is_empty {
-                            empty_commit_streak = empty_commit_streak.saturating_add(1);
-                        } else {
-                            empty_commit_streak = 0;
-                        }
-                        if empty_commit_streak >= stall_config.threshold {
-                            let message = format!(
-                                "Stall detected for {} after {} empty WIP commits (archive)",
-                                change.id, empty_commit_streak
-                            );
-                            output.on_warn(&format!(
-                                "{} (threshold {})",
-                                message, stall_config.threshold
-                            ));
-                            return Ok(ArchiveResult::Stalled { error: message });
-                        }
-                    }
-                    Err(e) => {
-                        output.on_warn(&format!(
-                            "Failed to check WIP(archive) commit for {} (attempt {}): {}",
-                            change.id, attempt, e
-                        ));
-                    }
-                }
-            }
+        // Handle WIP commit creation and stall detection
+        if let Some(stall_message) = handle_archive_wip_and_stall(
+            is_git_repo,
+            repo_root,
+            &change.id,
+            attempt,
+            &mut empty_commit_streak,
+            stall_config,
+            output,
+        )
+        .await?
+        {
+            return Ok(ArchiveResult::Stalled {
+                error: stall_message,
+            });
         }
 
         // Verify archive was successful
@@ -267,11 +236,254 @@ where
         }
     }
 
-    // Clear apply and archive history for the archived change
-    agent.clear_apply_history(&change.id);
-    agent.clear_archive_history(&change.id);
+    // Clear apply and archive history
+    clear_archive_history(agent, &change.id);
 
-    // Run post_archive hook with updated context
+    // Run post_archive hook
+    run_post_archive_hook(hooks, context, change, output).await?;
+
+    info!("Successfully archived: {}", change.id);
+    output.on_success(&format!("Archived: {}", change.id));
+
+    Ok(ArchiveResult::Success)
+}
+
+/// Helper: Run pre-archive hooks and initial setup.
+///
+/// Runs on_change_complete and pre_archive hooks.
+async fn run_pre_archive_hooks<O>(
+    hooks: &HookRunner,
+    hook_ctx: &HookContext,
+    output: &O,
+) -> Result<()>
+where
+    O: OutputHandler,
+{
+    // Run on_change_complete hook
+    if let Err(e) = hooks.run_hook(HookType::OnChangeComplete, hook_ctx).await {
+        output.on_warn(&format!("on_change_complete hook failed: {}", e));
+        return Err(e);
+    }
+
+    // Run pre_archive hook
+    if let Err(e) = hooks.run_hook(HookType::PreArchive, hook_ctx).await {
+        output.on_warn(&format!("pre_archive hook failed: {}", e));
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+/// Helper: Execute archive command with streaming output.
+///
+/// Streams command output and collects it for history recording.
+/// Returns the exit status and output collector.
+async fn execute_archive_command_streaming<O, F>(
+    agent: &mut AgentRunner,
+    change_id: &str,
+    attempt: u32,
+    output: &O,
+    cancel_check: F,
+) -> Result<(
+    std::process::ExitStatus,
+    OutputCollector,
+    std::time::Instant,
+)>
+where
+    O: OutputHandler,
+    F: Fn() -> bool,
+{
+    use crate::agent::OutputLine;
+
+    // Execute archive command with streaming
+    let (mut child, mut output_rx, start) = agent.run_archive_streaming(change_id, None).await?;
+
+    // Create output collector for history
+    let mut output_collector = OutputCollector::new();
+
+    // Stream output
+    loop {
+        if cancel_check() {
+            let _ = child.terminate();
+            let _ = child.kill().await;
+            output.on_warn("Process killed due to cancellation");
+            return Err(OrchestratorError::AgentCommand(
+                "Archive command cancelled".to_string(),
+            ));
+        }
+
+        match output_rx.try_recv() {
+            Ok(OutputLine::Stdout(s)) => {
+                output_collector.add_stdout(&s);
+                output.on_stdout(&s);
+            }
+            Ok(OutputLine::Stderr(s)) => {
+                output_collector.add_stderr(&s);
+                output.on_stderr(&s);
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                // No data available, check if process is done
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+
+    // Wait for child process to complete
+    let status = child.wait().await.map_err(|e| {
+        OrchestratorError::AgentCommand(format!(
+            "Failed to wait for archive command for change '{}' (attempt {}): {}",
+            change_id, attempt, e
+        ))
+    })?;
+
+    Ok((status, output_collector, start))
+}
+
+/// Helper: Handle WIP commit creation and stall detection.
+///
+/// Creates a WIP commit for the archive attempt and checks for stall conditions.
+/// Returns Ok(Some(error)) if stalled, Ok(None) if continuing, Err on failure.
+async fn handle_archive_wip_and_stall<O>(
+    is_git_repo: bool,
+    repo_root: &Path,
+    change_id: &str,
+    attempt: u32,
+    empty_commit_streak: &mut u32,
+    stall_config: &StallDetectionConfig,
+    output: &O,
+) -> Result<Option<String>>
+where
+    O: OutputHandler,
+{
+    if !is_git_repo {
+        return Ok(None);
+    }
+
+    if let Err(e) = git_commands::create_archive_wip_commit(repo_root, change_id, attempt).await {
+        output.on_warn(&format!(
+            "Failed to create WIP(archive) commit for {} (attempt {}): {}",
+            change_id, attempt, e
+        ));
+        return Ok(None);
+    }
+
+    if !stall_config.enabled {
+        return Ok(None);
+    }
+
+    match git_commands::is_head_empty_commit(repo_root).await {
+        Ok(is_empty) => {
+            if is_empty {
+                *empty_commit_streak = empty_commit_streak.saturating_add(1);
+            } else {
+                *empty_commit_streak = 0;
+            }
+            if *empty_commit_streak >= stall_config.threshold {
+                let message = format!(
+                    "Stall detected for {} after {} empty WIP commits (archive)",
+                    change_id, *empty_commit_streak
+                );
+                output.on_warn(&format!(
+                    "{} (threshold {})",
+                    message, stall_config.threshold
+                ));
+                return Ok(Some(message));
+            }
+        }
+        Err(e) => {
+            output.on_warn(&format!(
+                "Failed to check WIP(archive) commit for {} (attempt {}): {}",
+                change_id, attempt, e
+            ));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Helper: Verify archive completion and record history.
+///
+/// Verifies that the archive completed successfully and records the attempt in history.
+/// Returns true if archive succeeded, false if it needs to be retried.
+#[allow(clippy::too_many_arguments)]
+fn verify_and_record_archive<O>(
+    agent: &mut AgentRunner,
+    change_id: &str,
+    status: &std::process::ExitStatus,
+    start: std::time::Instant,
+    output_collector: &OutputCollector,
+    base_path: Option<&Path>,
+    attempt: u32,
+    max_attempts: u32,
+    output: &O,
+) -> bool
+where
+    O: OutputHandler,
+{
+    use crate::execution::archive::{verify_archive_completion, ArchiveVerificationResult};
+
+    // Verify archive was successful
+    let verification_status = verify_archive_completion(change_id, base_path);
+    if verification_status.is_success() {
+        // Record successful archive attempt
+        agent.record_archive_attempt(
+            change_id,
+            status,
+            start,
+            None,
+            output_collector.stdout_tail(),
+            output_collector.stderr_tail(),
+        );
+        return true;
+    }
+
+    // Verification failed - record with reason
+    let verification_reason = match verification_status {
+        ArchiveVerificationResult::NotArchived { ref change_id } => {
+            format!("Change still exists at openspec/changes/{}", change_id)
+        }
+        _ => "Archive verification failed".to_string(),
+    };
+    agent.record_archive_attempt(
+        change_id,
+        status,
+        start,
+        Some(verification_reason.clone()),
+        output_collector.stdout_tail(),
+        output_collector.stderr_tail(),
+    );
+
+    if attempt < max_attempts {
+        output.on_warn(&format!(
+            "Archive verification failed for {} (attempt {}/{}): {}; retrying archive command",
+            change_id, attempt, max_attempts, verification_reason
+        ));
+    }
+
+    false
+}
+
+/// Helper: Clear history after successful archive.
+///
+/// Clears apply and archive history for the archived change.
+fn clear_archive_history(agent: &mut AgentRunner, change_id: &str) {
+    agent.clear_apply_history(change_id);
+    agent.clear_archive_history(change_id);
+}
+
+/// Helper: Run post-archive hook.
+///
+/// Runs the post_archive hook with updated context.
+async fn run_post_archive_hook<O>(
+    hooks: &HookRunner,
+    context: &ArchiveContext,
+    change: &Change,
+    output: &O,
+) -> Result<()>
+where
+    O: OutputHandler,
+{
     let post_ctx = HookContext::new(
         context.changes_processed + 1,
         context.total_changes,
@@ -286,10 +498,7 @@ where
         return Err(e);
     }
 
-    info!("Successfully archived: {}", change.id);
-    output.on_success(&format!("Archived: {}", change.id));
-
-    Ok(ArchiveResult::Success)
+    Ok(())
 }
 
 /// Archive a change with streaming output.
@@ -324,8 +533,6 @@ where
     O: OutputHandler,
     F: Fn() -> bool,
 {
-    use crate::agent::OutputLine;
-
     info!("Archiving change (streaming): {}", change.id);
 
     // Build hook context
@@ -338,23 +545,12 @@ where
     .with_change(&change.id, change.completed_tasks, change.total_tasks)
     .with_apply_count(context.apply_count);
 
-    // Run on_change_complete hook
-    if let Err(e) = hooks.run_hook(HookType::OnChangeComplete, &hook_ctx).await {
-        output.on_warn(&format!("on_change_complete hook failed: {}", e));
-        return Err(e);
-    }
-
-    // Run pre_archive hook
-    if let Err(e) = hooks.run_hook(HookType::PreArchive, &hook_ctx).await {
-        output.on_warn(&format!("pre_archive hook failed: {}", e));
-        return Err(e);
-    }
+    // Run pre-archive hooks
+    run_pre_archive_hooks(hooks, &hook_ctx, output).await?;
 
     output.on_info(&format!("Archiving: {}", change.id));
 
-    use crate::execution::archive::{
-        build_archive_error_message, verify_archive_completion, ARCHIVE_COMMAND_MAX_RETRIES,
-    };
+    use crate::execution::archive::{build_archive_error_message, ARCHIVE_COMMAND_MAX_RETRIES};
 
     let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
     let mut attempt: u32 = 0;
@@ -372,45 +568,24 @@ where
         attempt += 1;
 
         // Execute archive command with streaming
-        let (mut child, mut output_rx, start) =
-            agent.run_archive_streaming(&change.id, None).await?;
-
-        // Create output collector for history
-        let mut output_collector = OutputCollector::new();
-
-        // Stream output
-        loop {
-            if cancel_check() {
-                let _ = child.terminate();
-                let _ = child.kill().await;
-                output.on_warn("Process killed due to cancellation");
-                return Ok(ArchiveResult::Cancelled);
+        let (status, output_collector, start) = match execute_archive_command_streaming(
+            agent,
+            &change.id,
+            attempt,
+            output,
+            &cancel_check,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                // Cancellation or execution error
+                if e.to_string().contains("cancelled") {
+                    return Ok(ArchiveResult::Cancelled);
+                }
+                return Err(e);
             }
-
-            match output_rx.try_recv() {
-                Ok(OutputLine::Stdout(s)) => {
-                    output_collector.add_stdout(&s);
-                    output.on_stdout(&s);
-                }
-                Ok(OutputLine::Stderr(s)) => {
-                    output_collector.add_stderr(&s);
-                    output.on_stderr(&s);
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    // No data available, check if process is done
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-
-        // Wait for child process to complete
-        let status = child.wait().await.map_err(|e| {
-            OrchestratorError::AgentCommand(format!(
-                "Failed to wait for archive command for change '{}' (attempt {}): {}",
-                change.id, attempt, e
-            ))
-        })?;
+        };
 
         if !status.success() {
             let error_msg = format!(
@@ -438,86 +613,43 @@ where
             return Ok(ArchiveResult::Failed { error: error_msg });
         }
 
-        if is_git_repo {
-            if let Err(e) =
-                git_commands::create_archive_wip_commit(repo_root, &change.id, attempt).await
-            {
-                output.on_warn(&format!(
-                    "Failed to create WIP(archive) commit for {} (attempt {}): {}",
-                    change.id, attempt, e
-                ));
-            } else if stall_config.enabled {
-                match git_commands::is_head_empty_commit(repo_root).await {
-                    Ok(is_empty) => {
-                        if is_empty {
-                            empty_commit_streak = empty_commit_streak.saturating_add(1);
-                        } else {
-                            empty_commit_streak = 0;
-                        }
-                        if empty_commit_streak >= stall_config.threshold {
-                            let message = format!(
-                                "Stall detected for {} after {} empty WIP commits (archive)",
-                                change.id, empty_commit_streak
-                            );
-                            output.on_warn(&format!(
-                                "{} (threshold {})",
-                                message, stall_config.threshold
-                            ));
-                            return Ok(ArchiveResult::Stalled { error: message });
-                        }
-                    }
-                    Err(e) => {
-                        output.on_warn(&format!(
-                            "Failed to check WIP(archive) commit for {} (attempt {}): {}",
-                            change.id, attempt, e
-                        ));
-                    }
-                }
-            }
+        // Handle WIP commit creation and stall detection
+        if let Some(stall_message) = handle_archive_wip_and_stall(
+            is_git_repo,
+            repo_root,
+            &change.id,
+            attempt,
+            &mut empty_commit_streak,
+            stall_config,
+            output,
+        )
+        .await?
+        {
+            return Ok(ArchiveResult::Stalled {
+                error: stall_message,
+            });
         }
 
-        // Verify archive was successful
-        let verification_status = verify_archive_completion(&change.id, base_path);
-        if verification_status.is_success() {
-            // Record successful archive attempt
-            agent.record_archive_attempt(
-                &change.id,
-                &status,
-                start,
-                None,
-                output_collector.stdout_tail(),
-                output_collector.stderr_tail(),
-            );
-            break;
-        }
-
-        // Verification failed - record with reason
-        let verification_reason = match verification_status {
-            ArchiveVerificationResult::NotArchived { ref change_id } => {
-                format!("Change still exists at openspec/changes/{}", change_id)
-            }
-            _ => "Archive verification failed".to_string(),
-        };
-        agent.record_archive_attempt(
+        // Verify archive completion and record history
+        if verify_and_record_archive(
+            agent,
             &change.id,
             &status,
             start,
-            Some(verification_reason.clone()),
-            output_collector.stdout_tail(),
-            output_collector.stderr_tail(),
-        );
-
-        if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
-            output.on_warn(&format!(
-                "Archive verification failed for {} (attempt {}/{}): {}; retrying archive command",
-                change.id, attempt, max_attempts, verification_reason
-            ));
-            continue;
+            &output_collector,
+            base_path,
+            attempt,
+            max_attempts,
+            output,
+        ) {
+            break;
         }
 
-        let error_msg = build_archive_error_message(&change.id, None);
-        output.on_error(&error_msg);
-        return Ok(ArchiveResult::Failed { error: error_msg });
+        if attempt > ARCHIVE_COMMAND_MAX_RETRIES {
+            let error_msg = build_archive_error_message(&change.id, None);
+            output.on_error(&error_msg);
+            return Ok(ArchiveResult::Failed { error: error_msg });
+        }
     }
 
     if is_git_repo {
@@ -530,23 +662,10 @@ where
     }
 
     // Clear apply and archive history
-    agent.clear_apply_history(&change.id);
-    agent.clear_archive_history(&change.id);
+    clear_archive_history(agent, &change.id);
 
     // Run post_archive hook
-    let post_ctx = HookContext::new(
-        context.changes_processed + 1,
-        context.total_changes,
-        context.remaining_changes.saturating_sub(1),
-        false,
-    )
-    .with_change(&change.id, change.completed_tasks, change.total_tasks)
-    .with_apply_count(context.apply_count);
-
-    if let Err(e) = hooks.run_hook(HookType::PostArchive, &post_ctx).await {
-        output.on_warn(&format!("post_archive hook failed: {}", e));
-        return Err(e);
-    }
+    run_post_archive_hook(hooks, context, change, output).await?;
 
     info!("Successfully archived: {}", change.id);
     output.on_success(&format!("Archived: {}", change.id));
