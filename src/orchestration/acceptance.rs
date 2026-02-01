@@ -85,7 +85,7 @@ pub async fn acceptance_test_streaming<O, F>(
     _config: &crate::config::OrchestratorConfig,
     output: &O,
     cancel_check: F,
-) -> Result<(AcceptanceResult, u32)>
+) -> Result<(AcceptanceResult, u32, String)>
 where
     O: OutputHandler,
     F: Fn() -> bool,
@@ -107,9 +107,13 @@ where
         .flatten(); // None if in detached HEAD or non-git repo
 
     // Execute acceptance command with streaming
-    let (mut child, mut output_rx, start_time) = agent
+    let (mut child, mut output_rx, start_time, command) = agent
         .run_acceptance_streaming(&change.id, None, base_branch.as_deref())
         .await?;
+
+    // Log acceptance started with command
+    output.on_info(&format!("Acceptance started: {}", change.id));
+    output.on_info(&format!("  Command: {}", command));
 
     // Create output collector for history and parsing
     let mut output_collector = OutputCollector::new();
@@ -123,7 +127,7 @@ where
             output.on_warn("Acceptance test cancelled");
             let _ = child.terminate();
             // Note: For cancellation, we don't record an attempt, so return 0
-            return Ok((AcceptanceResult::Cancelled, 0));
+            return Ok((AcceptanceResult::Cancelled, 0, command));
         }
 
         match line {
@@ -181,6 +185,7 @@ where
                 findings: tail_findings,
             },
             attempt_number,
+            command,
         ));
     }
 
@@ -217,7 +222,7 @@ where
         commit_hash: commit_hash.clone(),
     };
     agent.record_acceptance_attempt(&change.id, attempt);
-    Ok((result, attempt_number))
+    Ok((result, attempt_number, command))
 }
 
 #[cfg(test)]
