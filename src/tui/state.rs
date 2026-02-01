@@ -117,8 +117,6 @@ pub struct AppState {
     pub warning_message: Option<String>,
     /// Warning popup content
     pub warning_popup: Option<WarningPopup>,
-    /// Pending worktree delete confirmation (change ID)
-    pub pending_worktree_delete: Option<String>,
     /// Current spinner animation frame
     pub spinner_frame: usize,
     /// Log scroll offset (0 = show most recent at bottom)
@@ -263,7 +261,6 @@ impl AppState {
             should_quit: false,
             warning_message: None,
             warning_popup: None,
-            pending_worktree_delete: None,
             spinner_frame: 0,
             log_scroll_offset: 0,
             log_auto_scroll: true,
@@ -829,53 +826,6 @@ impl AppState {
                 change_id, status_msg
             )));
         }
-    }
-
-    /// Request worktree deletion for the selected change.
-    #[allow(dead_code)]
-    pub fn request_worktree_delete(&mut self) {
-        if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
-            return;
-        }
-
-        let change = &self.changes[self.cursor_index];
-        if matches!(
-            change.queue_status,
-            QueueStatus::Applying | QueueStatus::Archiving | QueueStatus::Resolving
-        ) {
-            self.warning_popup = Some(WarningPopup {
-                title: "Worktree delete blocked".to_string(),
-                message: format!(
-                    "Change '{}' is currently running. Stop processing before deleting its worktree.",
-                    change.id
-                ),
-            });
-            return;
-        }
-
-        self.pending_worktree_delete = Some(change.id.clone());
-        self.mode = AppMode::ConfirmWorktreeDelete;
-    }
-
-    /// Confirm the pending worktree delete request.
-    #[allow(dead_code)]
-    pub fn confirm_worktree_delete(&mut self) -> Option<TuiCommand> {
-        let change_id = self.pending_worktree_delete.take()?;
-        self.mode = AppMode::Select;
-        Some(TuiCommand::DeleteWorktree(change_id))
-    }
-
-    /// Cancel worktree delete confirmation.
-    #[allow(dead_code)]
-    pub fn cancel_worktree_delete(&mut self) {
-        self.pending_worktree_delete = None;
-        self.mode = AppMode::Select;
-    }
-
-    /// Check if auto-refresh is due
-    #[allow(dead_code)]
-    pub fn should_refresh(&self) -> bool {
-        self.last_refresh.elapsed() >= Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS)
     }
 }
 

@@ -19,3 +19,6 @@
 - [x] `cargo build` でコンパイルが通ることを確認
 - [x] `cargo test` で既存のテストが通ることを確認
 - [x] TUI モジュール構成が仕様（`src/tui/*.rs`形式）に準拠していることを確認
+
+## Acceptance #3 Failure Follow-up
+- [x] `src/tui/state.rs:834-877` の `request_worktree_delete`/`confirm_worktree_delete`/`cancel_worktree_delete`/`should_refresh` が未使用のため、呼び出し経路へ統合するか削除する（削除完了: フィールド `pending_worktree_delete` と4つのメソッドを削除）
