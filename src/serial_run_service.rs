@@ -388,7 +388,7 @@ impl SerialRunService {
         let cancel_token = CancellationToken::new();
         let cancel_token_for_task = cancel_token.clone();
         let cancel_check_clone = cancel_check.clone();
-        let _cancel_task = tokio::spawn(async move {
+        let cancel_task = tokio::spawn(async move {
             loop {
                 if cancel_check_clone() {
                     cancel_token_for_task.cancel();
@@ -419,6 +419,9 @@ impl SerialRunService {
             },
         )
         .await?;
+
+        // Abort the background cancel monitoring task now that apply is complete
+        cancel_task.abort();
 
         // Check if apply loop completed successfully
         if apply_result.completed {
