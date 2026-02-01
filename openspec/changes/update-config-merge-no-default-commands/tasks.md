@@ -36,3 +36,11 @@
   - 検証完了: `cargo fmt` 実行済み、`cargo clippy -- -D warnings` でエラーなし
 - [x] 2.2 `cargo test` を実行して設定ロード関連のテストが通ることを確認する
   - 検証完了: 全 906 テストが成功
+
+## Acceptance #1 Failure Follow-up
+- [x] src/config/mod.rs: OrchestratorConfig::load() が必須コマンド (apply/archive/analyze/acceptance/resolve) の検証を行わずに Ok を返しているため、マージ後に欠落キーを含む ConfigLoad エラーを返す検証を追加する
+  - 実装: `validate_required_commands()` メソッドを追加し、`load()` の最後で呼び出す
+  - 検証: `test_validate_required_commands_*` テストで確認済み
+- [x] src/config/mod.rs: load() が get_xdg_config_path() の単一パスしか読まず、XDG_CONFIG_HOME と ~/.config の両方を優先度順にマージしていないため、XDG 環境変数パスとデフォルトパスを別段階で読み込むように修正する
+  - 実装: `get_xdg_env_config_path()` と `get_xdg_default_config_path()` を追加し、`load()` で両方を段階的にマージ
+  - 検証: `test_get_xdg_env_config_path` と `test_get_xdg_default_config_path` テストで確認済み
