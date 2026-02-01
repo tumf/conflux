@@ -133,7 +133,7 @@ pub async fn archive_single_change(
 
     // Build expanded archive command for ArchiveStarted event
     // This mirrors the logic in AgentRunner::run_archive_streaming_with_runner
-    let archive_template = agent.config().get_archive_command();
+    let archive_template = agent.config().get_archive_command()?;
     let archive_user_prompt = agent.config().get_archive_prompt();
     let archive_history_context = agent.format_archive_history(change_id);
     let archive_full_prompt =
@@ -824,7 +824,7 @@ pub async fn run_orchestrator(
         // This mirrors the logic in AgentRunner::run_apply_streaming_with_runner
         // Use peek method to avoid consuming the acceptance_tail_injected flag
         let acceptance_tail = agent.peek_acceptance_tail_context_for_apply(&change_id);
-        let apply_template = agent.config().get_apply_command();
+        let apply_template = agent.config().get_apply_command()?;
         let apply_user_prompt = agent.config().get_apply_prompt();
         let apply_history_context = agent.format_apply_history(&change_id);
         let apply_full_prompt = crate::agent::build_apply_prompt(

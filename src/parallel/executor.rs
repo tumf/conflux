@@ -1486,7 +1486,7 @@ pub async fn execute_acceptance_in_workspace(
     );
 
     // Expand change_id and prompt in command
-    let template = config.get_acceptance_command();
+    let template = config.get_acceptance_command()?;
     let command = OrchestratorConfig::expand_change_id(template, change_id);
     let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
 

@@ -5,6 +5,18 @@ use crate::parallel::ParallelExecutor;
 use std::sync::{atomic::AtomicUsize, Arc};
 use tempfile::TempDir;
 
+/// Helper function to create a test config with all required commands
+fn create_test_config() -> OrchestratorConfig {
+    OrchestratorConfig {
+        apply_command: Some("echo apply {change_id}".to_string()),
+        archive_command: Some("echo archive {change_id}".to_string()),
+        analyze_command: Some("echo analyze".to_string()),
+        acceptance_command: Some("echo acceptance".to_string()),
+        resolve_command: Some("echo resolve".to_string()),
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn test_manual_resolve_counter_reduces_available_slots() {
     // Create a temporary directory for the test repository
@@ -12,7 +24,7 @@ async fn test_manual_resolve_counter_reduces_available_slots() {
     let repo_root = temp_dir.path().to_path_buf();
 
     // Create a basic config
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
 
     // Create a manual resolve counter
     let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
@@ -62,7 +74,7 @@ async fn test_multiple_manual_resolves_consume_multiple_slots() {
     let repo_root = temp_dir.path().to_path_buf();
 
     // Create a basic config
-    let config = OrchestratorConfig::default();
+    let config = create_test_config();
 
     // Create a manual resolve counter
     let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
