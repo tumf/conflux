@@ -577,18 +577,9 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             let (spinner_prefix, status_text) = match &change.queue_status {
                 QueueStatus::Applying => {
                     let status = if let Some(iter) = change.iteration_number {
-                        format!(
-                            "[{}:{} {:>3.0}%]",
-                            change.queue_status.display(),
-                            iter,
-                            change.progress_percent()
-                        )
+                        format!("[{}:{}]", change.queue_status.display(), iter)
                     } else {
-                        format!(
-                            "[{} {:>3.0}%]",
-                            change.queue_status.display(),
-                            change.progress_percent()
-                        )
+                        format!("[{}]", change.queue_status.display())
                     };
                     (format!("{} ", spinner_char), status)
                 }
@@ -664,8 +655,20 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 ));
             }
 
+            // For Applying status, show progress as "completed/total(percent%)"
+            // For other statuses, show just "completed/total"
+            let tasks_text = if matches!(change.queue_status, QueueStatus::Applying) {
+                format!(
+                    "  {}/{}({:.0}%)",
+                    change.completed_tasks,
+                    change.total_tasks,
+                    change.progress_percent()
+                )
+            } else {
+                format!("  {}/{}", change.completed_tasks, change.total_tasks)
+            };
             spans.push(Span::styled(
-                format!("  {}/{}", change.completed_tasks, change.total_tasks),
+                tasks_text.clone(),
                 Style::default().fg(dim_color),
             ));
 
@@ -680,8 +683,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"
                 let uncommitted_badge_width = if show_uncommitted_badge { 11 } else { 0 }; // " UNCOMMITED"
 
-                // Use pre-calculated widths from above
-                let tasks_text = format!("  {}/{}", change.completed_tasks, change.total_tasks);
+                // Use the actual tasks_text that was already formatted above
                 let tasks_width = tasks_text.len();
                 let list_border_width = 2; // List widget border
 
