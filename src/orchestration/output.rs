@@ -164,6 +164,65 @@ where
     }
 }
 
+/// Wrapper that adds mutable operation context to another OutputHandler.
+///
+/// This allows the same underlying handler to be used for different operations
+/// (apply, acceptance, archive, resolve) with the operation being updateable.
+pub struct ContextualOutputHandler<H: OutputHandler> {
+    inner: H,
+    operation: std::sync::Arc<std::sync::RwLock<String>>,
+}
+
+impl<H: OutputHandler> ContextualOutputHandler<H> {
+    /// Create a new contextual output handler.
+    ///
+    /// # Arguments
+    ///
+    /// * `inner` - The underlying output handler
+    /// * `operation` - Shared operation tracker
+    pub fn new(inner: H, operation: std::sync::Arc<std::sync::RwLock<String>>) -> Self {
+        Self { inner, operation }
+    }
+
+    /// Update the current operation
+    #[allow(dead_code)]
+    pub fn set_operation(&self, operation: impl Into<String>) {
+        *self.operation.write().unwrap() = operation.into();
+    }
+
+    /// Get the current operation name
+    #[allow(dead_code)]
+    pub fn operation(&self) -> String {
+        self.operation.read().unwrap().clone()
+    }
+}
+
+impl<H: OutputHandler> OutputHandler for ContextualOutputHandler<H> {
+    fn on_stdout(&self, line: &str) {
+        self.inner.on_stdout(line);
+    }
+
+    fn on_stderr(&self, line: &str) {
+        self.inner.on_stderr(line);
+    }
+
+    fn on_info(&self, message: &str) {
+        self.inner.on_info(message);
+    }
+
+    fn on_warn(&self, message: &str) {
+        self.inner.on_warn(message);
+    }
+
+    fn on_error(&self, message: &str) {
+        self.inner.on_error(message);
+    }
+
+    fn on_success(&self, message: &str) {
+        self.inner.on_success(message);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
