@@ -277,3 +277,28 @@ fn test_resolve_merges_with_retry_args_clone() {
 
     assert_eq!(args2.target_branch, "main");
 }
+
+#[test]
+fn test_resolve_merges_prompt_contains_cleanup_instructions() {
+    // This test verifies that the resolve merges prompt includes the new cleanup instructions
+    // for removing resurrected openspec/changes directories before the final merge commit
+
+    let prompt_fragment = r#"2) Final merge into the target branch (in the repo root):
+                 - cd <repo_root>
+                 - git checkout <target_branch>
+                 - git merge --no-ff --no-commit <branch>
+                 - If a conflict occurs, resolve it and git add the resolved files.
+                 - BEFORE creating the merge commit:
+                   * If `openspec/changes/<change_id>/proposal.md` exists AND `openspec/changes/archive/` contains the same <change_id>, remove `openspec/changes/<change_id>` (the directory was resurrected by the merge and must be deleted).
+                   * Use `git rm -rf openspec/changes/<change_id>` to remove the resurrected directory.
+                 - Finally, run `git commit -m "Merge change: <change_id>"` to complete the merge."#;
+
+    // Verify key elements are present
+    assert!(prompt_fragment.contains("git merge --no-ff --no-commit"));
+    assert!(prompt_fragment.contains("BEFORE creating the merge commit"));
+    assert!(prompt_fragment.contains("openspec/changes/<change_id>/proposal.md"));
+    assert!(prompt_fragment.contains("openspec/changes/archive/"));
+    assert!(prompt_fragment.contains("git rm -rf openspec/changes/<change_id>"));
+    assert!(prompt_fragment.contains("resurrected"));
+    assert!(prompt_fragment.contains("Finally, run `git commit -m"));
+}
