@@ -370,10 +370,30 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
 
             // Add log preview if available
             if let Some(log) = app.get_latest_log_for_change(&change.id) {
-                // Calculate available width for log preview
-                // Fixed width elements: checkbox(3) + cursor(2) + id(25) + tasks(~12) + percent(8) = 50
-                // Leave some margin for badges and spacing
-                let base_width = 55;
+                // Calculate actual occupied width dynamically
+                let checkbox_cursor_text = format!("{} {} ", checkbox, cursor);
+                let checkbox_cursor_width = checkbox_cursor_text.len(); // Actual: "[x] ► " is 6 chars
+                let id_text = format!("{:<25}", change.id);
+                let id_width = id_text.len(); // max(25, change.id.len())
+                let worktree_badge_width = if change.has_worktree { 3 } else { 0 }; // " WT"
+                let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"
+                let uncommitted_badge_width = if show_uncommitted_badge { 11 } else { 0 }; // " UNCOMMITED"
+                let tasks_text =
+                    format!(" {}/{} tasks", change.completed_tasks, change.total_tasks);
+                let tasks_width = tasks_text.len();
+                let percent_text = format!("  {:>5.1}%", change.progress_percent());
+                let percent_width = percent_text.len();
+                let list_border_width = 2; // List widget border
+
+                let base_width = checkbox_cursor_width
+                    + id_width
+                    + worktree_badge_width
+                    + new_badge_width
+                    + uncommitted_badge_width
+                    + tasks_width
+                    + percent_width
+                    + list_border_width;
+
                 let available = (area.width as usize).saturating_sub(base_width);
 
                 // Only show preview if available width >= 10 chars
@@ -630,9 +650,32 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
             // Add log preview if available
             if let Some(log) = app.get_latest_log_for_change(&change.id) {
-                // Calculate available width for log preview
-                // Fixed width elements: checkbox(3) + cursor(2) + id(25) + status(18) + tasks(~7) + elapsed(9) = 64
-                let base_width = 70;
+                // Calculate actual occupied width dynamically
+                let checkbox_cursor_text = format!("{} {} ", checkbox, cursor);
+                let checkbox_cursor_width = checkbox_cursor_text.len(); // Actual: "[x] ► " is 6 chars
+                let id_text = format!("{:<25}", change.id);
+                let id_width = id_text.len(); // max(25, change.id.len())
+                let worktree_badge_width = if change.has_worktree { 3 } else { 0 }; // " WT"
+                let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"
+                let uncommitted_badge_width = if show_uncommitted_badge { 11 } else { 0 }; // " UNCOMMITED"
+                let status_text_formatted = format!(" {:>18}", status_text);
+                let status_width = status_text_formatted.len(); // max(19, 1 + status_text.len())
+                let tasks_text = format!("  {}/{}", change.completed_tasks, change.total_tasks);
+                let tasks_width = tasks_text.len();
+                let elapsed_text_formatted = format!("  {:>7}", elapsed_text);
+                let elapsed_width = elapsed_text_formatted.len();
+                let list_border_width = 2; // List widget border
+
+                let base_width = checkbox_cursor_width
+                    + id_width
+                    + worktree_badge_width
+                    + new_badge_width
+                    + uncommitted_badge_width
+                    + status_width
+                    + tasks_width
+                    + elapsed_width
+                    + list_border_width;
+
                 let available = (area.width as usize).saturating_sub(base_width);
 
                 // Only show preview if available width >= 10 chars
