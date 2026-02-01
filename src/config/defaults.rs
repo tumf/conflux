@@ -25,8 +25,7 @@ pub const DEFAULT_ARCHIVE_COMMAND: &str = "opencode run '/conflux:archive {chang
 /// Supports `{change_id}` and `{prompt}` placeholders
 /// Note: No longer used as fallback. Commands must be explicitly configured.
 #[allow(dead_code)]
-pub const DEFAULT_ACCEPTANCE_COMMAND: &str =
-    "opencode run '/conflux:acceptance {change_id} {prompt}'";
+pub const DEFAULT_ACCEPTANCE_COMMAND: &str = "opencode run '/cflx-accept {change_id} {prompt}'";
 
 /// Default resolve command template (OpenCode)
 /// Supports `{prompt}` placeholder for the resolve prompt
@@ -52,7 +51,9 @@ All file paths should be relative to the repository root.
 /// Default prompt for archive command - empty by default
 pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
 
-/// Hardcoded acceptance prompt - always prepended to user's acceptance_prompt
+/// Hardcoded acceptance prompt - used only when acceptance_prompt_mode is "full".
+/// This is a minimal fallback. The recommended approach is to use "context_only" mode
+/// with fixed acceptance instructions in .opencode/commands/cflx-accept.md.
 /// Contains `{change_id}` placeholder that must be expanded before use.
 pub const ACCEPTANCE_SYSTEM_PROMPT: &str = r###"
 You are reviewing the implementation for change: {change_id}
@@ -64,171 +65,9 @@ IMPORTANT: Only review the specific change "{change_id}".
 
 Do NOT review or report on other changes in openspec/changes/.
 
-Parallel verification strategy (sub-agent approach):
-- If the Task tool is available, split independent verification checks into parallel sub-agents for faster execution:
-  1. Launch sub-agents (using Task tool) for each independent verification check (e.g., git clean check, task completion check, integration check, regression check)
-  2. Each sub-agent MUST:
-     - Receive the full context (including change_id and scope constraints)
-     - Apply the SAME scope constraints (only review the specified change_id, do NOT review other changes)
-     - Return structured results in JSON format OR using clear headings with bullet-point findings (e.g., "## Check: <name>\nStatus: PASS/FAIL\nFindings:\n- <detail>")
-     - NOT output "ACCEPTANCE: PASS/FAIL/CONTINUE" (only the parent agent outputs the final verdict)
-  3. Parent agent (this prompt) MUST:
-     - Wait for all sub-agent results to complete
-     - Integrate all findings from sub-agents
-     - Output "ACCEPTANCE: PASS/FAIL/CONTINUE" exactly ONCE at the end based on the aggregated results
-- If the Task tool is NOT available, proceed with sequential verification (fallback mode):
-  1. Execute all verification checks sequentially in the order listed below
-  2. Collect all findings and output the final verdict once at the end
-
-Sub-agent output format requirements:
-- Each sub-agent MUST return results in a structured format for easy integration:
-  * Preferred: JSON with fields: `{"check": "<check_name>", "status": "PASS/FAIL", "findings": ["<finding1>", "<finding2>"]}`
-  * Alternative: Clear headings with bullet points:
-    ```
-    ## Check: <check_name>
-    Status: PASS/FAIL
-    Findings:
-    - <finding1 with file path and evidence>
-    - <finding2 with file path and evidence>
-    ```
-- Findings MUST include concrete evidence (file paths, function names, line numbers)
-- Findings MUST be actionable by the AI agent autonomously
-
-Review the implementation to verify it meets the specification requirements.
-
-External dependency policy (mock-first):
-- Any requirement that AI cannot resolve or verify autonomously is an external dependency
-- External dependencies that CAN be mocked/stubbed/fixtured MUST be mocked to enable verification without external credentials
-- Only truly non-mockable external dependencies (requiring real external systems, human decisions, or long-wait verification) may be moved to Out of Scope / Future Work (without checkboxes)
-- Missing secrets (API keys, credentials) MUST NOT be treated as a reason to output CONTINUE
-- If verification requires secrets and no mock exists, output FAIL with specific follow-up tasks:
-  * Implement mock/stub/fixture for the external dependency, OR
-  * Move to Out of Scope as non-mockable (remove checkbox)
-
-Diff-based review strategy (when <acceptance_diff_context> is provided):
-- The diff context shows files changed since the base branch (1st acceptance) or since the last acceptance check (2nd+ acceptances).
-- **Prioritize reviewing the changed files listed in the diff context** - these are the most relevant files for this verification.
-- Use the diff context to focus your verification effort:
-  - Start by examining the changed files to understand what was modified
-  - Verify that the changes address the spec requirements and any previous findings
-  - Check for integration: ensure changed files are properly connected to the rest of the codebase
-  - Then perform broader checks (git status, task completion, regression checks)
-- If previous findings are shown in the diff context, verify they have been addressed in the changed files.
-- The diff context helps you avoid redundant investigation - focus on what changed since the last check.
-
-Required checks:
-1. Git working tree clean check: run `git status --porcelain` and verify the output is empty.
-   - If `git status --porcelain` produces any output (uncommitted changes or untracked files), it is a FAIL.
-   - When FAIL due to dirty working tree, list ALL uncommitted changes and untracked files in FINDINGS with their file paths.
-   - Example FAIL output:
-     ```
-     ACCEPTANCE: FAIL
-     FINDINGS:
-     - Git working tree is dirty. Uncommitted changes and untracked files found:
-       - Modified: src/main.rs
-       - Modified: src/lib.rs
-       - Untracked: temp.txt
-       - Untracked: .env.local
-     ```
-2. All tasks in openspec/changes/{change_id}/tasks.md are completed (marked with [x]) or moved to Future Work section
-3. Checkbox removal check: If tasks are moved to "Future Work", "Out of Scope", or "Notes" sections, they MUST NOT have checkboxes (`- [ ]` or `- [x]`).
-   - These sections should contain plain list items (e.g., `- Task description`) or plain text, NOT checkbox items.
-   - If any checkbox (`- [ ]` or `- [x]`) is found in these sections, it is a FAIL.
-   - Rationale: Checkboxes in these sections prevent archive completion (100% task completion requirement).
-4. Implementation matches the specification in openspec/changes/{change_id}/specs/
-5. Integration check: confirm the feature is actually executed in the real flow.
-   - Identify the concrete call path(s) from entry point to the feature.
-   - If the feature is not referenced by production code paths, it is a FAIL.
-6. Dead code check: if code exists but is not invoked by the CLI/TUI/parallel flow described in spec, it is a FAIL.
-7. Regression check: verify that existing features unrelated to this change are not broken.
-   - If the change modifies shared code (e.g., common functions, traits, structs), check that other callers still work.
-   - If existing tests fail due to the change, it is a FAIL.
-   - If existing functionality is removed or altered without being part of the spec, it is a FAIL.
-8. Evidence: cite at least one file path + function/method where the integration happens.
-
-Do NOT include in FINDINGS:
-- Subjective quality assessments (e.g., "code quality could be better", "naming is unclear")
-- Test coverage opinions without specific missing test cases (e.g., "test coverage is low")
-- Suggestions for improvements not in the original spec (e.g., "consider adding feature X")
-- Tasks that require human judgment (e.g., "needs design review", "verify UX is acceptable")
-- Tasks that require external systems (e.g., "deploy to production", "configure CI/CD")
-- Tasks that require long-wait verification (e.g., "monitor for a week", "wait for user feedback")
-
-FINDINGS format requirements:
-- Each finding MUST include concrete evidence (file path, function name, line number if relevant)
-- Each finding MUST be actionable by the AI agent autonomously
-- Bad: "Integration is incomplete" (vague, no evidence)
-- Good: "src/orchestrator.rs: run_loop() does not call acceptance_test() - missing call at line 150"
-
-Verification strategy:
-- Perform thorough verification in a single session
-- Do NOT output ACCEPTANCE: until you have verified ALL aspects of the implementation
-- First: verify task completion and basic code existence
-- Second: trace integration paths from entry points to features
-- Third: check for regressions and state management completeness
-- After completing all verification, output exactly ONE final verdict
-
-Output format (output exactly ONCE at the end):
-- If all checks pass: Output "ACCEPTANCE: PASS"
-- If checks fail: Output "ACCEPTANCE: FAIL" followed by FINDINGS and tasks.md update
-- If verification cannot complete in this session (e.g., external dependency unavailable): Output "ACCEPTANCE: CONTINUE"
-
-IMPORTANT: Do NOT output multiple ACCEPTANCE: lines. Output exactly one ACCEPTANCE: line as your final verdict.
-
-CRITICAL - When outputting FAIL:
-1. List ALL issues discovered across all verification passes in the FINDINGS section
-2. Do not stop at the first issue - continue checking and report everything in one FAIL response
-3. After listing all findings, you MUST directly update openspec/changes/{change_id}/tasks.md:
-   - Determine the next acceptance attempt number (check existing "## Acceptance #N Failure Follow-up" sections)
-   - If an "## Acceptance #N Failure Follow-up" section already exists for this attempt number, append findings to that section
-   - If no section exists for this attempt number, create a new section: "## Acceptance #<attempt_number> Failure Follow-up"
-   - Add each finding as a separate unchecked task: "- [ ] <finding>"
-   - Do NOT add lines like "ACCEPTANCE: FAIL" or "FINDINGS:" to tasks.md
-   - Do NOT create a wrapper task like "Address acceptance findings"
-   - Each finding should be a direct, actionable task at the top level of the follow-up section
-
-Example of updating tasks.md on FAIL (if this is attempt #2):
-```
-(Read current tasks.md, find existing content, then append:)
-
-## Acceptance #2 Failure Follow-up
-- [ ] Task 2.3 "Add acceptance test integration" in tasks.md is marked [ ] but not implemented
-- [ ] src/orchestrator.rs: run_loop() (line 142-180) does not call acceptance_test_streaming() between apply and archive
-- [ ] src/parallel/executor.rs: execute_change() calls apply() at line 95 but never calls acceptance before archive() at line 120
-- [ ] src/web/state.rs: broadcast_snapshot() does not include app_mode field, violating state broadcast requirement
-- [ ] src/main.rs: ControlCommand::Stop handler does not update app_mode to "stopping" before orchestrator processes it
-```
-
-If you discover findings, you MUST:
-1. Output "ACCEPTANCE: FAIL"
-2. Output "FINDINGS:" followed by all issues
-3. Use the Edit or Write tool to update openspec/changes/{change_id}/tasks.md with the follow-up section
-4. Verify the update was successful
-
-Example of CONTINUE (only when session cannot complete verification):
-```
-ACCEPTANCE: CONTINUE
-Unable to complete verification in this session:
-- External service X is unavailable for integration test
-- Build environment issue prevents full test execution
-Will retry in next acceptance attempt.
-```
-
-Example of PASS:
-```
-ACCEPTANCE: PASS
-```
-
-Example of FAIL (with ALL issues and tasks.md update):
-```
-ACCEPTANCE: FAIL
-FINDINGS:
-- Task 2.3 "Add acceptance test integration" in tasks.md is marked [ ] but not implemented
-- src/orchestrator.rs: run_loop() (line 142-180) does not call acceptance_test_streaming() between apply and archive
-- src/parallel/executor.rs: execute_change() calls apply() at line 95 but never calls acceptance before archive() at line 120
-
-(Then use Edit tool to append to tasks.md)
-```
+NOTE: When using acceptance_prompt_mode "context_only" (recommended), the fixed acceptance
+instructions are provided by the command template (e.g., .opencode/commands/cflx-accept.md).
+This prompt is only used as a fallback when acceptance_prompt_mode is "full".
 "###;
 
 /// Default prompt for acceptance command - appended after hardcoded prompt
@@ -574,47 +413,21 @@ mod tests {
     }
 
     #[test]
-    fn test_acceptance_system_prompt_contains_mock_first_policy() {
-        // Test that ACCEPTANCE_SYSTEM_PROMPT contains key phrases for mock-first external dependency policy
+    fn test_acceptance_system_prompt_is_minimal() {
+        // After single-source refactoring, ACCEPTANCE_SYSTEM_PROMPT should be minimal
+        // and contain only basic context (used for "full" mode fallback).
+        // The detailed instructions are now in .opencode/commands/cflx-accept.md.
         assert!(
-            ACCEPTANCE_SYSTEM_PROMPT.contains("External dependency policy"),
-            "ACCEPTANCE_SYSTEM_PROMPT should contain 'External dependency policy'"
+            ACCEPTANCE_SYSTEM_PROMPT.contains("{change_id}"),
+            "ACCEPTANCE_SYSTEM_PROMPT should contain change_id placeholder"
         );
         assert!(
-            ACCEPTANCE_SYSTEM_PROMPT.contains("mock-first"),
-            "ACCEPTANCE_SYSTEM_PROMPT should contain 'mock-first'"
-        );
-    }
-
-    #[test]
-    fn test_acceptance_system_prompt_contains_missing_secret_fail_requirement() {
-        // Test that missing secrets should result in FAIL, not CONTINUE
-        assert!(
-            ACCEPTANCE_SYSTEM_PROMPT.contains("Missing secrets") && ACCEPTANCE_SYSTEM_PROMPT.contains("MUST NOT") && ACCEPTANCE_SYSTEM_PROMPT.contains("CONTINUE"),
-            "ACCEPTANCE_SYSTEM_PROMPT should specify that missing secrets MUST NOT be treated as a reason to CONTINUE"
+            ACCEPTANCE_SYSTEM_PROMPT.contains("openspec/changes/{change_id}"),
+            "ACCEPTANCE_SYSTEM_PROMPT should reference the change paths"
         );
         assert!(
-            ACCEPTANCE_SYSTEM_PROMPT.contains("output FAIL"),
-            "ACCEPTANCE_SYSTEM_PROMPT should specify to output FAIL when secrets are missing"
-        );
-    }
-
-    #[test]
-    fn test_acceptance_system_prompt_contains_mockable_dependency_requirement() {
-        // Test that mockable dependencies must be mocked
-        assert!(
-            ACCEPTANCE_SYSTEM_PROMPT.contains("CAN be mocked")
-                && ACCEPTANCE_SYSTEM_PROMPT.contains("MUST be mocked"),
-            "ACCEPTANCE_SYSTEM_PROMPT should specify that mockable dependencies MUST be mocked"
-        );
-    }
-
-    #[test]
-    fn test_acceptance_system_prompt_contains_non_mockable_out_of_scope() {
-        // Test that only non-mockable dependencies can be moved to Out of Scope
-        assert!(
-            ACCEPTANCE_SYSTEM_PROMPT.contains("non-mockable") && ACCEPTANCE_SYSTEM_PROMPT.contains("Out of Scope"),
-            "ACCEPTANCE_SYSTEM_PROMPT should specify handling of non-mockable dependencies as Out of Scope"
+            ACCEPTANCE_SYSTEM_PROMPT.contains("context_only"),
+            "ACCEPTANCE_SYSTEM_PROMPT should mention context_only mode as recommended"
         );
     }
 }

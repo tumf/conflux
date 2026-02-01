@@ -377,6 +377,33 @@ impl Orchestrator {
         LoopControl::Continue
     }
 
+    /// Check all loop control conditions (graceful stop, cancellation, max iterations).
+    /// Returns LoopControl indicating whether to continue or break.
+    async fn check_loop_controls(
+        &mut self,
+        graceful_stop_flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        previous_graceful_stop: &mut bool,
+        cancel_token: &tokio_util::sync::CancellationToken,
+    ) -> LoopControl {
+        // Check for graceful stop
+        match self
+            .check_graceful_stop(graceful_stop_flag, previous_graceful_stop)
+            .await
+        {
+            LoopControl::Continue => {}
+            break_control => return break_control,
+        }
+
+        // Check for cancellation
+        match self.check_cancellation(cancel_token).await {
+            LoopControl::Continue => {}
+            break_control => return break_control,
+        }
+
+        // Check max iterations
+        self.check_max_iterations()
+    }
+
     /// Update shared state with an execution event
     async fn update_shared_state(&self, event: ExecutionEvent) {
         self.shared_state
@@ -555,6 +582,89 @@ impl Orchestrator {
         }
     }
 
+    /// Initialize run loop state (shared state, progress display, serial service).
+    /// Returns (filtered_initial_changes, serial_service, total_changes).
+    async fn initialize_run_loop(
+        &mut self,
+        initial_changes: Vec<Change>,
+    ) -> Result<(Vec<Change>, SerialRunService, usize)> {
+        // Filter by target_changes if specified (early filtering)
+        // Both explicit targets and default mode require approval check
+        let filtered_initial = if let Some(targets) = &self.target_changes {
+            // Explicit targets specified via --change option
+            let mut found = Vec::new();
+            for target in targets {
+                let trimmed = target.trim();
+                if let Some(change) = initial_changes.iter().find(|c| c.id == trimmed) {
+                    // Check approval status even for explicitly specified changes
+                    if change.is_approved {
+                        found.push(change.clone());
+                    } else {
+                        warn!(
+                            "Skipping unapproved change '{}'. Approve it first with: cflx approve set {}",
+                            trimmed, trimmed
+                        );
+                    }
+                } else {
+                    warn!("Specified change '{}' not found, skipping", trimmed);
+                }
+            }
+            found
+        } else {
+            // No explicit target: filter to only approved changes
+            let (approved, unapproved): (Vec<_>, Vec<_>) =
+                initial_changes.into_iter().partition(|c| c.is_approved);
+
+            // Warn about unapproved changes
+            for change in &unapproved {
+                warn!(
+                    "Skipping unapproved change '{}'. Approve it first with: cflx approve set {}",
+                    change.id, change.id
+                );
+            }
+
+            if approved.is_empty() && !unapproved.is_empty() {
+                info!(
+                    "No approved changes found. {} change(s) are pending approval.",
+                    unapproved.len()
+                );
+            }
+
+            approved
+        };
+
+        if filtered_initial.is_empty() {
+            // Return empty result - caller will handle early exit
+            let repo_root = std::env::current_dir()?;
+            let serial_service = SerialRunService::new(repo_root, self.config.clone());
+            return Ok((filtered_initial, serial_service, 0));
+        }
+
+        // Store snapshot of change IDs (only the filtered ones)
+        let snapshot_ids: HashSet<String> = filtered_initial.iter().map(|c| c.id.clone()).collect();
+        info!(
+            "Captured snapshot of {} changes: {:?}",
+            snapshot_ids.len(),
+            snapshot_ids
+        );
+        self.initial_change_ids = Some(snapshot_ids.clone());
+
+        // Initialize shared orchestration state with filtered changes
+        let change_ids: Vec<String> = filtered_initial.iter().map(|c| c.id.clone()).collect();
+        *self.shared_state.write().await = OrchestratorState::new(change_ids, self.max_iterations);
+
+        // Initialize progress display
+        self.progress = Some(ProgressDisplay::new(filtered_initial.len()));
+
+        let total_changes = filtered_initial.len();
+
+        // Create serial run service for shared state and helpers
+        let repo_root = std::env::current_dir()?;
+        let serial_service = SerialRunService::new(repo_root, self.config.clone());
+
+        Ok((filtered_initial, serial_service, total_changes))
+    }
+
     /// Handle ChangeProcessResult and return LoopControl
     async fn handle_change_result(
         &mut self,
@@ -636,78 +746,14 @@ impl Orchestrator {
             return Ok(());
         }
 
-        // Filter by target_changes if specified (early filtering)
-        // Both explicit targets and default mode require approval check
-        let filtered_initial = if let Some(targets) = &self.target_changes {
-            // Explicit targets specified via --change option
-            let mut found = Vec::new();
-            for target in targets {
-                let trimmed = target.trim();
-                if let Some(change) = initial_changes.iter().find(|c| c.id == trimmed) {
-                    // Check approval status even for explicitly specified changes
-                    if change.is_approved {
-                        found.push(change.clone());
-                    } else {
-                        warn!(
-                            "Skipping unapproved change '{}'. Approve it first with: cflx approve set {}",
-                            trimmed, trimmed
-                        );
-                    }
-                } else {
-                    warn!("Specified change '{}' not found, skipping", trimmed);
-                }
-            }
-            found
-        } else {
-            // No explicit target: filter to only approved changes
-            let (approved, unapproved): (Vec<_>, Vec<_>) =
-                initial_changes.into_iter().partition(|c| c.is_approved);
-
-            // Warn about unapproved changes
-            for change in &unapproved {
-                warn!(
-                    "Skipping unapproved change '{}'. Approve it first with: cflx approve set {}",
-                    change.id, change.id
-                );
-            }
-
-            if approved.is_empty() && !unapproved.is_empty() {
-                info!(
-                    "No approved changes found. {} change(s) are pending approval.",
-                    unapproved.len()
-                );
-                return Ok(());
-            }
-
-            approved
-        };
+        // Initialize run loop state (shared state, progress display, serial service)
+        let (filtered_initial, mut serial_service, total_changes) =
+            self.initialize_run_loop(initial_changes).await?;
 
         if filtered_initial.is_empty() {
             info!("No changes found matching specified targets");
             return Ok(());
         }
-
-        // Store snapshot of change IDs (only the filtered ones)
-        let snapshot_ids: HashSet<String> = filtered_initial.iter().map(|c| c.id.clone()).collect();
-        info!(
-            "Captured snapshot of {} changes: {:?}",
-            snapshot_ids.len(),
-            snapshot_ids
-        );
-        self.initial_change_ids = Some(snapshot_ids.clone());
-
-        // Initialize shared orchestration state with filtered changes
-        let change_ids: Vec<String> = filtered_initial.iter().map(|c| c.id.clone()).collect();
-        *self.shared_state.write().await = OrchestratorState::new(change_ids, self.max_iterations);
-
-        // Initialize progress display
-        self.progress = Some(ProgressDisplay::new(filtered_initial.len()));
-
-        let total_changes = filtered_initial.len();
-
-        // Create serial run service for shared state and helpers
-        let repo_root = std::env::current_dir()?;
-        let mut serial_service = SerialRunService::new(repo_root, self.config.clone());
 
         // Run on_start hook
         let start_context = HookContext::new(0, total_changes, total_changes, false);
@@ -721,9 +767,13 @@ impl Orchestrator {
         let mut previous_graceful_stop = false;
 
         loop {
-            // Check for graceful stop
+            // Check all loop control conditions (graceful stop, cancellation, max iterations)
             match self
-                .check_graceful_stop(&graceful_stop_flag, &mut previous_graceful_stop)
+                .check_loop_controls(
+                    &graceful_stop_flag,
+                    &mut previous_graceful_stop,
+                    &cancel_token,
+                )
                 .await
             {
                 LoopControl::Continue => {}
@@ -735,72 +785,16 @@ impl Orchestrator {
                 }
             }
 
-            // Check for cancellation
-            match self.check_cancellation(&cancel_token).await {
-                LoopControl::Continue => {}
-                LoopControl::Break {
-                    finish_status: status,
-                } => {
-                    finish_status = status;
-                    break;
-                }
-            }
-
-            // Check max iterations
-            match self.check_max_iterations() {
-                LoopControl::Continue => {}
-                LoopControl::Break {
-                    finish_status: status,
-                } => {
-                    finish_status = status;
-                    break;
-                }
-            }
-
-            // List all changes from openspec (to get updated progress)
-            let changes = openspec::list_changes_native()?;
-
-            // Broadcast state update to web monitoring clients
-            self.broadcast_state_update(&changes).await;
-
-            // Filter to only include changes from initial snapshot
-            let snapshot_changes = self.filter_to_snapshot(&changes);
-
-            // Log any new changes that appeared after run started
-            self.log_new_changes(&changes);
-
-            if snapshot_changes.is_empty() {
-                info!("All changes from initial snapshot processed");
-                if let Some(progress) = &mut self.progress {
-                    progress.complete_all();
-                }
-                finish_status = "completed";
-                break;
-            }
-
-            let eligible_changes = self.filter_stalled_changes(&snapshot_changes);
-            let remaining_changes = eligible_changes.len();
-
-            if eligible_changes.is_empty() {
-                info!("All remaining changes are blocked by stalled dependencies");
-                if let Some(progress) = &mut self.progress {
-                    progress.complete_all();
-                }
-                finish_status = "stalled_dependencies";
-                break;
-            }
-
-            // Select next change to process using serial service
-            let next = serial_service
-                .select_next_change(&eligible_changes)
-                .ok_or_else(|| {
-                    OrchestratorError::AgentCommand("No eligible change found".to_string())
-                })?;
-            info!("Selected change: {}", next.id);
-
-            if let Some(progress) = &mut self.progress {
-                progress.update_change(next);
-            }
+            // Refetch and select next change to process
+            let (next, remaining_changes) =
+                match self.refetch_and_select_change(&mut serial_service).await? {
+                    Some(result) => result,
+                    None => {
+                        // All changes processed or stalled
+                        finish_status = "completed";
+                        break;
+                    }
+                };
 
             // Check if this is a new change (for state tracking)
             let is_new_change = self.current_change_id.as_ref() != Some(&next.id);
@@ -821,7 +815,7 @@ impl Orchestrator {
 
             let result = serial_service
                 .process_change(
-                    next,
+                    &next,
                     &mut self.agent,
                     &self.ai_runner,
                     &self.hooks,
@@ -835,7 +829,7 @@ impl Orchestrator {
 
             // Handle mode-specific concerns based on result
             match self
-                .handle_change_result(result, next, &mut serial_service)
+                .handle_change_result(result, &next, &mut serial_service)
                 .await?
             {
                 LoopControl::Continue => {}
@@ -1018,6 +1012,59 @@ impl Orchestrator {
         eligible
     }
 
+    /// Refetch and filter changes for the current iteration.
+    /// Returns None if loop should break (all changes processed or stalled).
+    /// Returns Some((next_change, remaining_count)) if a change was selected.
+    async fn refetch_and_select_change(
+        &mut self,
+        serial_service: &mut SerialRunService,
+    ) -> Result<Option<(Change, usize)>> {
+        // List all changes from openspec (to get updated progress)
+        let changes = openspec::list_changes_native()?;
+
+        // Broadcast state update to web monitoring clients
+        self.broadcast_state_update(&changes).await;
+
+        // Filter to only include changes from initial snapshot
+        let snapshot_changes = self.filter_to_snapshot(&changes);
+
+        // Log any new changes that appeared after run started
+        self.log_new_changes(&changes);
+
+        if snapshot_changes.is_empty() {
+            info!("All changes from initial snapshot processed");
+            if let Some(progress) = &mut self.progress {
+                progress.complete_all();
+            }
+            return Ok(None);
+        }
+
+        let eligible_changes = self.filter_stalled_changes(&snapshot_changes);
+        let remaining_changes = eligible_changes.len();
+
+        if eligible_changes.is_empty() {
+            info!("All remaining changes are blocked by stalled dependencies");
+            if let Some(progress) = &mut self.progress {
+                progress.complete_all();
+            }
+            return Ok(None);
+        }
+
+        // Select next change to process using serial service
+        let next = serial_service
+            .select_next_change(&eligible_changes)
+            .ok_or_else(|| {
+                OrchestratorError::AgentCommand("No eligible change found".to_string())
+            })?;
+        info!("Selected change: {}", next.id);
+
+        if let Some(progress) = &mut self.progress {
+            progress.update_change(next);
+        }
+
+        Ok(Some((next.clone(), remaining_changes)))
+    }
+
     fn mark_change_stalled(&mut self, change_id: &str, reason: &str) {
         self.stalled_change_ids.insert(change_id.to_string());
         self.apply_counts.remove(change_id);
@@ -1152,11 +1199,7 @@ impl Orchestrator {
         service.set_no_resume(self.no_resume);
 
         // Check if Git is available for true parallel execution
-        if !service.check_vcs_available().await? {
-            return Err(OrchestratorError::GitCommand(
-                "Git repository not available for parallel execution".to_string(),
-            ));
-        }
+        service.check_vcs_available().await?;
 
         info!("Git available, executing changes in parallel using worktrees");
 

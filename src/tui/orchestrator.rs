@@ -22,28 +22,6 @@ use tokio_util::sync::CancellationToken;
 use super::events::{LogEntry, OrchestratorEvent};
 use super::queue::DynamicQueue;
 
-/// Context for archive operations
-/// Note: This is legacy code from Phase 1 archive processing.
-/// It may be removed in the future as SerialRunService handles archiving.
-#[allow(dead_code)]
-pub struct ArchiveContext {
-    pub changes_processed: usize,
-    pub total_changes: usize,
-    pub remaining_changes: usize,
-    pub apply_count: u32,
-}
-
-/// Result of archive operation
-/// Note: This is legacy code from Phase 1 archive processing.
-/// It may be removed in the future as SerialRunService handles archiving.
-#[allow(dead_code)]
-#[derive(Debug)]
-pub enum ArchiveResult {
-    Success,
-    Failed,
-    Cancelled,
-}
-
 fn apply_pending_removals(
     pending_changes: &mut HashSet<String>,
     processed_change_ids: &mut Vec<String>,
@@ -777,6 +755,9 @@ pub async fn run_orchestrator_parallel(
 
     // Create ParallelRunService
     let service = ParallelRunService::new(repo_root.clone(), config.clone());
+
+    // Check if Git is available for parallel execution
+    service.check_vcs_available().await?;
 
     // Create shared queue change timestamp for debouncing
     let shared_queue_change = Arc::new(tokio::sync::Mutex::new(None::<std::time::Instant>));

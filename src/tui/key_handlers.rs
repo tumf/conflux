@@ -17,9 +17,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use super::runner::{
-    execute_worktree_command, load_worktrees_with_conflict_check, suspend_terminal_and_execute_sync,
-};
+use super::terminal::{execute_worktree_command, suspend_terminal_and_execute_sync};
+use super::worktrees::load_worktrees_with_conflict_check;
 
 /// Context for key event handling containing necessary state and channels
 pub struct KeyEventContext<'a> {
@@ -307,7 +306,7 @@ pub async fn handle_plus_key(ctx: &mut KeyEventContext<'_>) -> Result<()> {
         }
     };
 
-    if !super::runner::should_trigger_worktree_command(ctx.config, is_git_repo) {
+    if !super::worktrees::should_trigger_worktree_command(ctx.config, is_git_repo) {
         return Ok(());
     }
 
@@ -319,7 +318,7 @@ pub async fn handle_plus_key(ctx: &mut KeyEventContext<'_>) -> Result<()> {
         return Ok(());
     }
 
-    let worktree_path = super::runner::build_worktree_path(ctx.worktree_base_dir);
+    let worktree_path = super::worktrees::build_worktree_path(ctx.worktree_base_dir);
     let Some(worktree_path_str) = worktree_path.to_str() else {
         ctx.app.add_log(LogEntry::error(
             "Failed to resolve worktree path".to_string(),

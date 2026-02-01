@@ -118,8 +118,15 @@ impl ParallelRunService {
     }
 
     /// Check if git is available for parallel execution
-    pub async fn check_vcs_available(&self) -> Result<bool> {
-        Ok(crate::cli::check_parallel_available())
+    ///
+    /// Returns an error if git repository is not available for parallel execution.
+    pub async fn check_vcs_available(&self) -> Result<()> {
+        if !crate::cli::check_parallel_available() {
+            return Err(crate::error::OrchestratorError::GitCommand(
+                "Git repository not available for parallel execution".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Create a configured ParallelExecutor instance with optional shared queue change state.
@@ -192,6 +199,44 @@ impl ParallelRunService {
         Ok((committed, skipped))
     }
 
+    /// Prepare changes for parallel execution: filter committed changes and send warning event if needed.
+    ///
+    /// This helper consolidates the preparation logic shared across multiple execution paths:
+    /// 1. Filters changes to only include those committed to the repository
+    /// 2. Sends a warning event if uncommitted changes are skipped (before any state update)
+    /// 3. Returns the filtered changes, or None if no committed changes remain
+    ///
+    /// The event is sent synchronously before returning to maintain proper event ordering.
+    async fn prepare_parallel_execution(
+        &self,
+        changes: Vec<Change>,
+        event_tx: &mpsc::Sender<ParallelEvent>,
+    ) -> Result<Option<Vec<Change>>> {
+        let (changes, skipped) = self.filter_committed_changes(changes).await?;
+
+        // Send warning event BEFORE any state update to maintain event order
+        if !skipped.is_empty() {
+            let message = format!(
+                "Skipping uncommitted changes in parallel mode: {}",
+                skipped.join(", ")
+            );
+            warn!("{}", message);
+            let _ = event_tx
+                .send(ParallelEvent::Warning {
+                    title: "Uncommitted changes skipped".to_string(),
+                    message,
+                })
+                .await;
+        }
+
+        if changes.is_empty() {
+            info!("No committed changes available for parallel execution");
+            return Ok(None);
+        }
+
+        Ok(Some(changes))
+    }
+
     /// Run parallel execution with an event callback
     ///
     /// The event_handler receives ParallelEvents as they occur during execution.
@@ -209,32 +254,19 @@ impl ParallelRunService {
     where
         F: Fn(ParallelEvent) + Send + Sync + 'static,
     {
-        let (changes, skipped) = self.filter_committed_changes(changes).await?;
+        // Create event channel
+        let (event_tx, mut event_rx) = mpsc::channel::<ParallelEvent>(100);
 
-        if !skipped.is_empty() {
-            let message = format!(
-                "Skipping uncommitted changes in parallel mode: {}",
-                skipped.join(", ")
-            );
-            warn!("{}", message);
-            event_handler(ParallelEvent::Warning {
-                title: "Uncommitted changes skipped".to_string(),
-                message,
-            });
-        }
-
-        if changes.is_empty() {
-            info!("No committed changes available for parallel execution");
-            return Ok(());
-        }
+        // Prepare changes using the common helper (sends warning event if needed)
+        let changes = match self.prepare_parallel_execution(changes, &event_tx).await? {
+            Some(changes) => changes,
+            None => return Ok(()),
+        };
 
         info!(
             "Starting parallel execution with re-analysis for {} changes",
             changes.len()
         );
-
-        // Create event channel
-        let (event_tx, mut event_rx) = mpsc::channel::<ParallelEvent>(100);
 
         // Spawn event forwarding task
         let forward_handle = tokio::spawn(async move {
@@ -340,26 +372,11 @@ impl ParallelRunService {
         changes: Vec<Change>,
         event_tx: mpsc::Sender<ParallelEvent>,
     ) -> Result<()> {
-        let (changes, skipped) = self.filter_committed_changes(changes).await?;
-
-        if !skipped.is_empty() {
-            let message = format!(
-                "Skipping uncommitted changes in parallel mode: {}",
-                skipped.join(", ")
-            );
-            warn!("{}", message);
-            let _ = event_tx
-                .send(ParallelEvent::Warning {
-                    title: "Uncommitted changes skipped".to_string(),
-                    message,
-                })
-                .await;
-        }
-
-        if changes.is_empty() {
-            info!("No committed changes available for parallel execution");
-            return Ok(());
-        }
+        // Prepare changes using the common helper (sends warning event if needed)
+        let changes = match self.prepare_parallel_execution(changes, &event_tx).await? {
+            Some(changes) => changes,
+            None => return Ok(()),
+        };
 
         info!(
             "Starting order-based parallel execution with re-analysis for {} changes",
@@ -558,89 +575,6 @@ impl ParallelRunService {
             analyzer.analyze_groups(changes).await
         }
     }
-
-    /// Group changes by their declared dependencies (deterministic, no LLM)
-    ///
-    /// Returns groups in topological order where:
-    /// - Group 1: Changes with no dependencies
-    /// - Group 2: Changes that depend only on Group 1 changes
-    /// - And so on...
-    #[allow(dead_code)]
-    pub fn group_by_dependencies(changes: &[Change]) -> Vec<ParallelGroup> {
-        if changes.is_empty() {
-            return Vec::new();
-        }
-
-        // Build lookup maps with owned strings to avoid lifetime issues
-        let change_ids: HashSet<String> = changes.iter().map(|c| c.id.clone()).collect();
-        let mut remaining: HashSet<String> = change_ids.clone();
-        let mut completed_changes: HashSet<String> = HashSet::new();
-
-        // Map from change_id to its dependencies (filtered to only include changes in our set)
-        let deps_map: HashMap<String, Vec<String>> = changes
-            .iter()
-            .map(|c| {
-                let deps: Vec<String> = c
-                    .dependencies
-                    .iter()
-                    .filter(|d| change_ids.contains(*d))
-                    .cloned()
-                    .collect();
-                (c.id.clone(), deps)
-            })
-            .collect();
-
-        let mut groups: Vec<ParallelGroup> = Vec::new();
-        let mut group_id = 1u32;
-
-        // Iteratively find changes whose dependencies are all complete
-        while !remaining.is_empty() {
-            let mut current_group: Vec<String> = Vec::new();
-
-            for change_id in &remaining {
-                let deps = deps_map.get(change_id).map(|d| d.as_slice()).unwrap_or(&[]);
-                // A change can be in this group if all its dependencies are completed
-                if deps.iter().all(|d| completed_changes.contains(d)) {
-                    current_group.push(change_id.clone());
-                }
-            }
-
-            if current_group.is_empty() {
-                // Circular dependency or missing dependency - add remaining changes to last group
-                warn!(
-                    "Unable to resolve dependencies for: {:?}",
-                    remaining.iter().collect::<Vec<_>>()
-                );
-                current_group = remaining.iter().cloned().collect();
-            }
-
-            // Calculate depends_on (previous group if any)
-            let depends_on = if group_id > 1 {
-                vec![group_id - 1]
-            } else {
-                Vec::new()
-            };
-
-            // Remove completed changes from remaining
-            for change_id in &current_group {
-                remaining.remove(change_id);
-                completed_changes.insert(change_id.clone());
-            }
-
-            // Sort for deterministic output
-            current_group.sort();
-
-            groups.push(ParallelGroup {
-                id: group_id,
-                changes: current_group,
-                depends_on,
-            });
-
-            group_id += 1;
-        }
-
-        groups
-    }
 }
 
 #[cfg(test)]
@@ -687,79 +621,6 @@ mod tests {
             .await;
 
         true
-    }
-
-    #[test]
-    fn test_group_by_dependencies_empty() {
-        let changes: Vec<Change> = vec![];
-        let groups = ParallelRunService::group_by_dependencies(&changes);
-        assert!(groups.is_empty());
-    }
-
-    #[test]
-    fn test_group_by_dependencies_no_deps() {
-        let changes = vec![
-            create_test_change("a", vec![]),
-            create_test_change("b", vec![]),
-            create_test_change("c", vec![]),
-        ];
-
-        let groups = ParallelRunService::group_by_dependencies(&changes);
-
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].changes.len(), 3);
-        assert!(groups[0].depends_on.is_empty());
-    }
-
-    #[test]
-    fn test_group_by_dependencies_linear() {
-        let changes = vec![
-            create_test_change("a", vec![]),
-            create_test_change("b", vec!["a"]),
-            create_test_change("c", vec!["b"]),
-        ];
-
-        let groups = ParallelRunService::group_by_dependencies(&changes);
-
-        assert_eq!(groups.len(), 3);
-        assert_eq!(groups[0].changes, vec!["a"]);
-        assert_eq!(groups[1].changes, vec!["b"]);
-        assert_eq!(groups[2].changes, vec!["c"]);
-    }
-
-    #[test]
-    fn test_group_by_dependencies_diamond() {
-        // a -> b, c -> d (diamond pattern)
-        let changes = vec![
-            create_test_change("a", vec![]),
-            create_test_change("b", vec!["a"]),
-            create_test_change("c", vec!["a"]),
-            create_test_change("d", vec!["b", "c"]),
-        ];
-
-        let groups = ParallelRunService::group_by_dependencies(&changes);
-
-        assert_eq!(groups.len(), 3);
-        assert_eq!(groups[0].changes, vec!["a"]);
-        // b and c should be in the same group
-        assert!(groups[1].changes.contains(&"b".to_string()));
-        assert!(groups[1].changes.contains(&"c".to_string()));
-        assert_eq!(groups[2].changes, vec!["d"]);
-    }
-
-    #[test]
-    fn test_group_by_dependencies_filters_external() {
-        // b depends on "external" which is not in our change set
-        let changes = vec![
-            create_test_change("a", vec![]),
-            create_test_change("b", vec!["external"]),
-        ];
-
-        let groups = ParallelRunService::group_by_dependencies(&changes);
-
-        // Both should be in group 1 since "external" is filtered out
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].changes.len(), 2);
     }
 
     #[tokio::test]

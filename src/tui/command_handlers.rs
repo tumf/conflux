@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use super::runner::load_worktrees_with_conflict_check;
+use super::worktrees::load_worktrees_with_conflict_check;
 
 /// Context for TuiCommand handling
 pub struct TuiCommandContext<'a> {
@@ -121,7 +121,9 @@ pub async fn handle_start_processing_command(
                     )
                     .await
                 };
-                let _ = orch_tx.send(OrchestratorEvent::Stopped).await;
+                // NOTE: Do not send Stopped here unconditionally.
+                // The orchestrator already sends AllCompleted on normal completion
+                // or Stopped when explicitly stopped via graceful_stop_flag.
                 result
             }));
         }
@@ -293,42 +295,7 @@ pub async fn handle_tui_command(
                 }
             }
         }
-        TuiCommand::DeleteWorktree(id) => {
-            match crate::vcs::git::remove_worktrees_for_change(ctx.repo_root, &id).await {
-                Ok(removed) => {
-                    if removed == 0 {
-                        ctx.app.warning_popup = Some(crate::tui::state::WarningPopup {
-                            title: "Worktree not found".to_string(),
-                            message: format!("No worktree found for change '{}'.", id),
-                        });
-                        ctx.app.add_log(LogEntry::warn(format!(
-                            "No worktree to delete for '{}'",
-                            id
-                        )));
-                    } else {
-                        if let Some(change) =
-                            ctx.app.changes.iter_mut().find(|change| change.id == id)
-                        {
-                            change.has_worktree = false;
-                        }
-                        ctx.app.add_log(LogEntry::success(format!(
-                            "Deleted {} worktree(s) for '{}'",
-                            removed, id
-                        )));
-                    }
-                }
-                Err(e) => {
-                    ctx.app.warning_popup = Some(crate::tui::state::WarningPopup {
-                        title: "Worktree delete failed".to_string(),
-                        message: format!("Failed to delete worktrees for '{}': {}", id, e),
-                    });
-                    ctx.app.add_log(LogEntry::error(format!(
-                        "Worktree delete failed for '{}': {}",
-                        id, e
-                    )));
-                }
-            }
-        }
+
         TuiCommand::DeleteWorktreeByPath(path, branch_name) => {
             match crate::vcs::git::commands::worktree_remove(
                 ctx.repo_root,

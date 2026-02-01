@@ -17,7 +17,7 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id} {prompt}'",
 
   // Command to run acceptance tests after apply (supports {change_id} and {prompt} placeholders)
-  "acceptance_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/conflux:acceptance {change_id} {prompt}'",
+  "acceptance_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/cflx-accept {change_id} {prompt}'",
 
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p {prompt}",
@@ -98,7 +98,7 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   "archive_command": "opencode run '/conflux:archive {change_id} {prompt}'",
 
   // Command to run acceptance tests after apply (supports {change_id} and {prompt} placeholders)
-  "acceptance_command": "opencode run '/conflux:acceptance {change_id} {prompt}'",
+  "acceptance_command": "opencode run '/cflx-accept {change_id} {prompt}'",
 
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "opencode run {prompt}",
@@ -179,7 +179,7 @@ pub const CODEX_TEMPLATE: &str = r#"{
   "archive_command": "codex '/openspec:archive {change_id} {prompt}'",
 
   // Command to run acceptance tests after apply (supports {change_id} and {prompt} placeholders)
-  "acceptance_command": "codex '/conflux:acceptance {change_id} {prompt}'",
+  "acceptance_command": "codex '/cflx-accept {change_id} {prompt}'",
 
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "codex {prompt}",

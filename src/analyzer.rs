@@ -94,9 +94,34 @@ impl ParallelizationAnalyzer {
         }
         debug!("Analysis prompt: {}", prompt);
 
+        // Execute analysis command and collect output
+        let (full_output, status) = self
+            .execute_analysis_command(&prompt, changes, &mut on_output)
+            .await?;
+
+        // Parse and validate the output
+        let result = self.parse_and_validate_output(&full_output, &status, changes)?;
+
+        info!("Analysis complete: {} changes in order", result.order.len());
+        Ok(result)
+    }
+
+    /// Execute the analysis command with streaming output.
+    ///
+    /// Runs the AI command via AiCommandRunner, streams output to the callback,
+    /// and returns the full output string and exit status.
+    async fn execute_analysis_command<F>(
+        &self,
+        prompt: &str,
+        changes: &[Change],
+        on_output: &mut F,
+    ) -> Result<(String, std::process::ExitStatus)>
+    where
+        F: FnMut(String),
+    {
         // Call LLM for analysis with streaming output via AiCommandRunner
         let template = self.config.get_analyze_command()?;
-        let command = crate::config::OrchestratorConfig::expand_prompt(template, &prompt);
+        let command = crate::config::OrchestratorConfig::expand_prompt(template, prompt);
         let (mut child, mut rx) = self
             .ai_runner
             .execute_streaming_with_retry(&command, None)
@@ -123,8 +148,21 @@ impl ParallelizationAnalyzer {
             ))
         })?;
 
+        Ok((full_output, status))
+    }
+
+    /// Parse and validate the analysis output.
+    ///
+    /// Extracts JSON from stream-json format if applicable, validates the schema,
+    /// and checks the exit status. Returns the parsed AnalysisResult.
+    fn parse_and_validate_output(
+        &self,
+        full_output: &str,
+        status: &std::process::ExitStatus,
+        changes: &[Change],
+    ) -> Result<AnalysisResult> {
         // Extract result from stream-json format if applicable
-        let response = self.extract_stream_json_result(&full_output);
+        let response = self.extract_stream_json_result(full_output);
         debug!("LLM response: {}", response);
 
         // Parse JSON response with strict validation
@@ -150,7 +188,6 @@ impl ParallelizationAnalyzer {
             )));
         }
 
-        info!("Analysis complete: {} changes in order", result.order.len());
         Ok(result)
     }
 
@@ -233,8 +270,9 @@ impl ParallelizationAnalyzer {
 
     /// Build the prompt for parallelization analysis
     ///
-    /// Formats selected changes (with `is_approved = true`) as a list with:
-    /// - `[x]` marker to indicate selection status
+    /// Formats all changes with:
+    /// - `[x]` marker for approved changes (`is_approved = true`)
+    /// - `[ ]` marker for unapproved changes
     /// - Full proposal file path for each change (e.g., `openspec/changes/{id}/proposal.md`)
     ///
     /// This makes it clear to the LLM which changes need analysis and where
@@ -242,8 +280,13 @@ impl ParallelizationAnalyzer {
     fn build_parallelization_prompt(&self, changes: &[Change]) -> String {
         let change_list: String = changes
             .iter()
-            .filter(|c| c.is_approved) // Only selected/approved changes
-            .map(|c| format!("[x] {} (openspec/changes/{}/proposal.md)", c.id, c.id))
+            .map(|c| {
+                let marker = if c.is_approved { "[x]" } else { "[ ]" };
+                format!(
+                    "{} {} (openspec/changes/{}/proposal.md)",
+                    marker, c.id, c.id
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -600,44 +643,6 @@ Rules:
 
 /// Extract change-level dependencies from parallel groups.
 ///
-/// Converts group-level dependencies into change-level dependencies.
-/// When a group depends on another group, all changes in the dependent group
-/// are considered to depend on all changes in the prerequisite group.
-///
-/// # Arguments
-///
-/// * `groups` - The parallel execution groups from LLM analysis
-///
-/// # Returns
-///
-/// A HashMap where keys are change IDs and values are lists of change IDs
-/// that the key change depends on.
-#[allow(dead_code)] // Used by deprecated group-based analysis
-pub fn extract_change_dependencies(groups: &[ParallelGroup]) -> HashMap<String, Vec<String>> {
-    let mut deps: HashMap<String, Vec<String>> = HashMap::new();
-    let mut group_changes: HashMap<u32, Vec<String>> = HashMap::new();
-
-    // Collect changes by group ID
-    for group in groups {
-        group_changes.insert(group.id, group.changes.clone());
-    }
-
-    // For each group, map its dependencies to change-level dependencies
-    for group in groups {
-        for dep_group_id in &group.depends_on {
-            if let Some(dep_changes) = group_changes.get(dep_group_id) {
-                for change_id in &group.changes {
-                    deps.entry(change_id.clone())
-                        .or_default()
-                        .extend(dep_changes.iter().cloned());
-                }
-            }
-        }
-    }
-
-    deps
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,93 +792,6 @@ That's all."#;
     }
 
     #[test]
-    fn test_extract_change_dependencies_empty() {
-        let groups: Vec<ParallelGroup> = vec![];
-        let deps = extract_change_dependencies(&groups);
-        assert!(deps.is_empty());
-    }
-
-    #[test]
-    fn test_extract_change_dependencies_no_dependencies() {
-        let groups = vec![
-            ParallelGroup {
-                id: 1,
-                changes: vec!["a".to_string(), "b".to_string()],
-                depends_on: Vec::new(),
-            },
-            ParallelGroup {
-                id: 2,
-                changes: vec!["c".to_string()],
-                depends_on: Vec::new(),
-            },
-        ];
-        let deps = extract_change_dependencies(&groups);
-        // No group depends on another, so no change-level dependencies
-        assert!(deps.is_empty());
-    }
-
-    #[test]
-    fn test_extract_change_dependencies_simple() {
-        let groups = vec![
-            ParallelGroup {
-                id: 1,
-                changes: vec!["a".to_string(), "b".to_string()],
-                depends_on: Vec::new(),
-            },
-            ParallelGroup {
-                id: 2,
-                changes: vec!["c".to_string()],
-                depends_on: vec![1],
-            },
-        ];
-        let deps = extract_change_dependencies(&groups);
-
-        // "c" depends on "a" and "b" (all changes in group 1)
-        assert!(deps.contains_key("c"));
-        let c_deps = deps.get("c").unwrap();
-        assert!(c_deps.contains(&"a".to_string()));
-        assert!(c_deps.contains(&"b".to_string()));
-
-        // "a" and "b" have no dependencies
-        assert!(!deps.contains_key("a"));
-        assert!(!deps.contains_key("b"));
-    }
-
-    #[test]
-    fn test_extract_change_dependencies_chain() {
-        // Group 1 -> Group 2 -> Group 3
-        let groups = vec![
-            ParallelGroup {
-                id: 1,
-                changes: vec!["a".to_string()],
-                depends_on: Vec::new(),
-            },
-            ParallelGroup {
-                id: 2,
-                changes: vec!["b".to_string()],
-                depends_on: vec![1],
-            },
-            ParallelGroup {
-                id: 3,
-                changes: vec!["c".to_string()],
-                depends_on: vec![2],
-            },
-        ];
-        let deps = extract_change_dependencies(&groups);
-
-        // "b" depends on "a"
-        assert!(deps.contains_key("b"));
-        assert!(deps.get("b").unwrap().contains(&"a".to_string()));
-
-        // "c" depends on "b"
-        assert!(deps.contains_key("c"));
-        assert!(deps.get("c").unwrap().contains(&"b".to_string()));
-
-        // "a" has no dependencies
-        assert!(!deps.contains_key("a"));
-    }
-
-    #[test]
     fn test_build_prompt_with_selected_markers() {
         let analyzer = create_test_analyzer();
 
@@ -910,8 +828,8 @@ That's all."#;
         assert!(prompt.contains("[x] selected-a (openspec/changes/selected-a/proposal.md)"));
         assert!(prompt.contains("[x] selected-c (openspec/changes/selected-c/proposal.md)"));
 
-        // Check that unselected change is NOT included
-        assert!(!prompt.contains("unselected-b"));
+        // Check that unselected change IS included with [ ] marker
+        assert!(prompt.contains("[ ] unselected-b (openspec/changes/unselected-b/proposal.md)"));
 
         // Check that instruction mentions "marked with [x]"
         assert!(prompt.contains("marked with [x]"));
@@ -965,8 +883,8 @@ That's all."#;
 
         let prompt = analyzer.build_parallelization_prompt(&changes);
 
-        // No changes should be included
-        assert!(!prompt.contains("change-1"));
+        // Unselected change should be included with [ ] marker
+        assert!(prompt.contains("[ ] change-1 (openspec/changes/change-1/proposal.md)"));
 
         // But structure should still be there
         assert!(prompt.contains("Analyze ONLY the changes marked with [x]"));
