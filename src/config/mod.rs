@@ -181,6 +181,15 @@ pub struct OrchestratorConfig {
     #[serde(default)]
     pub acceptance_prompt: Option<String>,
 
+    /// Controls how the acceptance `{prompt}` is constructed.
+    /// - full: include hardcoded acceptance system prompt + diff/history context
+    /// - context_only: only include change metadata + diff/history context
+    ///
+    /// Use `context_only` when your `acceptance_command` uses `opencode run --command ... '{prompt}'`
+    /// and the fixed acceptance instructions live in the OpenCode command template.
+    #[serde(default)]
+    pub acceptance_prompt_mode: Option<AcceptancePromptMode>,
+
     /// System prompt for archive command.
     /// Injected into the `{prompt}` placeholder in archive_command.
     #[serde(default)]
@@ -297,6 +306,14 @@ pub struct OrchestratorConfig {
     /// Default: 2
     #[serde(default)]
     pub acceptance_max_continues: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptancePromptMode {
+    #[default]
+    Full,
+    ContextOnly,
 }
 
 impl OrchestratorConfig {
@@ -477,6 +494,10 @@ impl OrchestratorConfig {
         self.acceptance_prompt
             .as_deref()
             .unwrap_or(DEFAULT_ACCEPTANCE_PROMPT)
+    }
+
+    pub fn get_acceptance_prompt_mode(&self) -> AcceptancePromptMode {
+        self.acceptance_prompt_mode.clone().unwrap_or_default()
     }
 
     /// Get the hooks configuration, returning default (empty) if not set
