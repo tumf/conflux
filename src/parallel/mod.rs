@@ -179,8 +179,14 @@ impl ParallelExecutor {
         info!("Using workspace base directory: {:?}", base_dir);
 
         let max_concurrent = config.get_max_concurrent_workspaces();
-        let apply_command = config.get_apply_command().to_string();
-        let archive_command = config.get_archive_command().to_string();
+        let apply_command = config
+            .get_apply_command()
+            .expect("apply_command must be configured before creating ParallelExecutor")
+            .to_string();
+        let archive_command = config
+            .get_archive_command()
+            .expect("archive_command must be configured before creating ParallelExecutor")
+            .to_string();
 
         // Resolve the VCS backend (handle Auto)
         let resolved_backend = Self::resolve_backend(vcs_backend, &repo_root);
@@ -1401,7 +1407,7 @@ Requirements:\n\
 5) Do not use destructive commands like `git reset --hard`.",
                         change_id = change_id
                     );
-                    let resolve_template = self.config.get_resolve_command();
+                    let resolve_template = self.config.get_resolve_command()?;
                     let expanded_resolve_command =
                         OrchestratorConfig::expand_prompt(resolve_template, &resolve_prompt);
 
@@ -1776,7 +1782,7 @@ Requirements:\n\
 5) Do not use destructive commands like `git reset --hard`.",
                         change_id = change_id
                     );
-                    let resolve_template = self.config.get_resolve_command();
+                    let resolve_template = self.config.get_resolve_command()?;
                     let expanded_resolve_command =
                         OrchestratorConfig::expand_prompt(resolve_template, &resolve_prompt);
 
@@ -3773,7 +3779,7 @@ Requirements:\n\
         change_ids: &[String],
         archive_paths: &[PathBuf],
     ) -> Result<MergeAttempt> {
-        use crate::execution::archive::verify_archive_completion;
+        use crate::execution::archive::is_archive_commit_complete;
 
         let _merge_guard = global_merge_lock().lock().await;
         if let Some(reason) = merge::base_dirty_reason(&self.repo_root).await? {
@@ -3790,15 +3796,27 @@ Requirements:\n\
 
         // Verify that all changes are actually archived before attempting merge
         for (change_id, archive_path) in change_ids.iter().zip(archive_paths.iter()) {
-            let verification = verify_archive_completion(change_id, Some(archive_path));
-            if !verification.is_success() {
-                let reason = format!(
-                    "Archive verification failed for '{}': change directory still exists in openspec/changes/. \
-                     The change was not properly archived and cannot be merged.",
-                    change_id
-                );
-                warn!("{}", reason);
-                return Ok(MergeAttempt::Deferred(reason));
+            match is_archive_commit_complete(change_id, Some(archive_path)).await {
+                Ok(true) => {
+                    // Archive is complete, continue
+                }
+                Ok(false) => {
+                    // Archive is incomplete, defer merge with detailed reason
+                    let reason = format!(
+                        "Archive incomplete for '{}': worktree may be dirty, openspec/changes/{} may still exist, or archive entry may be missing",
+                        change_id, change_id
+                    );
+                    warn!("{}", reason);
+                    return Ok(MergeAttempt::Deferred(reason));
+                }
+                Err(e) => {
+                    let reason = format!(
+                        "Failed to verify archive completion for '{}': {}",
+                        change_id, e
+                    );
+                    warn!("{}", reason);
+                    return Ok(MergeAttempt::Deferred(reason));
+                }
             }
         }
 

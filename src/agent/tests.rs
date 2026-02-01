@@ -6,11 +6,14 @@ use crate::config::OrchestratorConfig;
 
 #[test]
 fn test_agent_runner_creation() {
-    let config = OrchestratorConfig::default();
+    let config = OrchestratorConfig {
+        apply_command: Some("test apply {change_id}".to_string()),
+        ..Default::default()
+    };
     let runner = AgentRunner::new(config);
     assert_eq!(
-        runner.config().get_apply_command(),
-        crate::config::DEFAULT_APPLY_COMMAND
+        runner.config().get_apply_command().unwrap(),
+        "test apply {change_id}"
     );
 }
 
@@ -24,11 +27,11 @@ fn test_agent_runner_with_custom_config() {
     };
     let runner = AgentRunner::new(config);
     assert_eq!(
-        runner.config().get_apply_command(),
+        runner.config().get_apply_command().unwrap(),
         "custom-agent apply {change_id}"
     );
     assert_eq!(
-        runner.config().get_archive_command(),
+        runner.config().get_archive_command().unwrap(),
         "custom-agent archive {change_id}"
     );
 }

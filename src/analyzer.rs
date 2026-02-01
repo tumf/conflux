@@ -95,7 +95,7 @@ impl ParallelizationAnalyzer {
         debug!("Analysis prompt: {}", prompt);
 
         // Call LLM for analysis with streaming output via AiCommandRunner
-        let template = self.config.get_analyze_command();
+        let template = self.config.get_analyze_command()?;
         let command = crate::config::OrchestratorConfig::expand_prompt(template, &prompt);
         let (mut child, mut rx) = self
             .ai_runner

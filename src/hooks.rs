@@ -226,6 +226,40 @@ pub struct HooksConfig {
 }
 
 impl HooksConfig {
+    /// Merge another HooksConfig into this one, with the other config taking priority
+    /// for fields that are `Some`. This enables deep merging of hook configurations.
+    pub fn merge(&mut self, other: Self) {
+        // Macro to reduce repetition
+        macro_rules! merge_hook {
+            ($field:ident) => {
+                if other.$field.is_some() {
+                    self.$field = other.$field;
+                }
+            };
+        }
+
+        // Run lifecycle
+        merge_hook!(on_start);
+        merge_hook!(on_finish);
+        merge_hook!(on_error);
+
+        // Change lifecycle
+        merge_hook!(on_change_start);
+        merge_hook!(pre_apply);
+        merge_hook!(post_apply);
+        merge_hook!(on_change_complete);
+        merge_hook!(pre_archive);
+        merge_hook!(post_archive);
+        merge_hook!(on_change_end);
+        merge_hook!(on_merged);
+
+        // User interaction (TUI only)
+        merge_hook!(on_queue_add);
+        merge_hook!(on_queue_remove);
+        merge_hook!(on_approve);
+        merge_hook!(on_unapprove);
+    }
+
     /// Get the hook configuration for a specific hook type
     pub fn get(&self, hook_type: HookType) -> Option<HookConfig> {
         let value = match hook_type {
