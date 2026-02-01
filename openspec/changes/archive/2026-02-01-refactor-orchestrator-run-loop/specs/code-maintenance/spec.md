@@ -2,7 +2,7 @@
 ### Requirement: Unified Orchestration Module
 The codebase SHALL have a unified orchestration module that contains shared logic between CLI and TUI modes, including a SerialRunService that owns the shared serial execution flow.
 
-オーケストレーションの entry ループ（`run` など）は、結果分岐・キャンセル判定・状態更新の責務をヘルパー関数へ分割してもよい（MAY）。ただし、serial/parallel の共有フローと挙動は維持しなければならない（MUST）。
+オーケストレーションの entry ループ（`run` など）は、初期化、停止/キャンセル判定、change の更新・選定、結果処理の責務をヘルパー関数へ分割してもよい（MAY）。ただし、serial/parallel の共有フローと挙動は維持しなければならない（MUST）。
 
 #### Scenario: Serial run is routed through a shared service
 - **WHEN** the orchestrator runs in CLI serial mode
