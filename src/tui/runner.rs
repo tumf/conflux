@@ -26,8 +26,8 @@ use super::queue::DynamicQueue;
 use super::render::{render, SPINNER_CHARS};
 use super::state::{AppState, AUTO_REFRESH_INTERVAL_SECS};
 // AppMode, QueueStatus, StopMode now used in handlers
-use super::terminal_helpers::restore_terminal;
-use super::worktree_helpers::load_worktrees_with_conflict_check;
+use super::terminal::restore_terminal;
+use super::worktrees::load_worktrees_with_conflict_check;
 
 /// Run the TUI application
 pub async fn run_tui(
