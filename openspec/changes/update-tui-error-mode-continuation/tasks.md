@@ -5,4 +5,4 @@
 - [x] 1.4 既存の TUI 関連テストが通ることを確認する（検証: `cargo test tui` または `cargo test`）
 
 ## Acceptance #1 Failure Follow-up
-- [ ] Git の作業ツリーをクリーンにする（未コミット変更: `openspec/changes/update-tui-error-mode-continuation/tasks.md`, `src/tui/render.rs`, `src/tui/state/events/messages.rs`, `src/tui/state/events/processing.rs`, `src/tui/state/mod.rs`）
+- [x] Git の作業ツリーをクリーンにする（未コミット変更: `openspec/changes/update-tui-error-mode-continuation/tasks.md`, `src/tui/render.rs`, `src/tui/state/events/messages.rs`, `src/tui/state/events/processing.rs`, `src/tui/state/mod.rs`）
