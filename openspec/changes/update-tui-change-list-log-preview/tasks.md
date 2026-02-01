@@ -12,5 +12,5 @@
 - [x] `src/tui/render.rs` の `render_changes_list_running` がプレビュー幅を固定値 `base_width = 70` で見積もっており、`WT`/`NEW`/`UNCOMMITED` バッジやステータス/タスク/経過時間の表示幅、リスト枠幅を考慮しないため、実際の利用可能幅が10文字未満でもプレビューが表示されるケースがある。各行の実際の占有幅に基づいてプレビュー幅を算出する
 
 ## Acceptance #3 Failure Follow-up
-- [ ] Git 作業ツリーが dirty のため、`openspec/changes/update-tui-change-list-log-preview/tasks.md` と `src/tui/render.rs` の未コミット変更を解消する
-- [ ] `src/tui/render.rs` の `render_changes_list_select` / `render_changes_list_running` で占有幅の算出が実表示より短く（例: `format!("{} {} ", checkbox, cursor)` は6文字だが `checkbox_cursor_width=5`、ステータスや change_id の実長が固定幅を超える場合がある）ため、実表示幅に基づいて `available` を計算し、実際の利用可能幅が10文字未満ならプレビューを表示しないよう修正する
+- [x] Git 作業ツリーが dirty のため、`openspec/changes/update-tui-change-list-log-preview/tasks.md` と `src/tui/render.rs` の未コミット変更を解消する
+- [x] `src/tui/render.rs` の `render_changes_list_select` / `render_changes_list_running` で占有幅の算出が実表示より短く（例: `format!("{} {} ", checkbox, cursor)` は6文字だが `checkbox_cursor_width=5`、ステータスや change_id の実長が固定幅を超える場合がある）ため、実表示幅に基づいて `available` を計算し、実際の利用可能幅が10文字未満ならプレビューを表示しないよう修正する
