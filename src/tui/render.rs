@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use super::state::AppState;
 use super::types::{AppMode, QueueStatus};
-use super::utils::get_version_string;
+use super::utils::{get_version_string, truncate_to_display_width_with_suffix};
 
 /// Determine checkbox display and color for a change item
 ///
@@ -398,8 +398,8 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
 
                 // Only show preview if available width >= 10 chars
                 if available >= 10 {
-                    // Format relative time
-                    let relative_time = format_relative_time(&log.created_at);
+                    // Format relative time with parentheses
+                    let relative_time = format!("({})", format_relative_time(&log.created_at));
 
                     // Build shortened header: [operation:iteration] or [operation]
                     let header = match (&log.operation, log.iteration) {
@@ -415,17 +415,18 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                         format!(" {} {}", relative_time, log.message)
                     };
 
-                    // Truncate if necessary
-                    let truncated = if preview_text.len() > available {
-                        format!("{}…", &preview_text[..available.saturating_sub(1)])
+                    // Truncate if necessary (Unicode-safe)
+                    let truncated =
+                        truncate_to_display_width_with_suffix(&preview_text, available, "…");
+
+                    // Use brighter color for selected row to ensure visibility on DarkGray background
+                    let preview_color = if is_selected_row {
+                        Color::Gray
                     } else {
-                        preview_text
+                        Color::DarkGray
                     };
 
-                    spans.push(Span::styled(
-                        truncated,
-                        Style::default().fg(Color::DarkGray),
-                    ));
+                    spans.push(Span::styled(truncated, Style::default().fg(preview_color)));
                 }
             }
 
@@ -562,49 +563,58 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 Color::Gray
             };
 
-            let status_text = match &change.queue_status {
-                QueueStatus::Applying => {
-                    if let Some(iter) = change.iteration_number {
-                        format!(
-                            "{} [{}:{} {:>3.0}%]",
-                            spinner_char,
-                            change.queue_status.display(),
-                            iter,
-                            change.progress_percent()
-                        )
-                    } else {
-                        format!(
-                            "{} [{} {:>3.0}%]",
-                            spinner_char,
-                            change.queue_status.display(),
-                            change.progress_percent()
-                        )
-                    }
-                }
-                QueueStatus::Archiving | QueueStatus::Resolving | QueueStatus::Accepting => {
-                    if let Some(iter) = change.iteration_number {
-                        format!(
-                            "{} [{}:{}]",
-                            spinner_char,
-                            change.queue_status.display(),
-                            iter
-                        )
-                    } else {
-                        format!("{} [{}]", spinner_char, change.queue_status.display())
-                    }
-                }
-                QueueStatus::Archived | QueueStatus::Merged | QueueStatus::Error(_) => {
-                    format!("[{}]", change.queue_status.display())
-                }
-                status => format!("[{}]", status.display()),
-            };
-
+            // Calculate elapsed time first
             let elapsed_text = if let Some(elapsed) = change.elapsed_time {
                 format_duration(elapsed)
             } else if let Some(started) = change.started_at {
                 format_duration(started.elapsed())
             } else {
                 "--".to_string()
+            };
+
+            // Build status text (without spinner for in-flight states)
+            // For in-flight states, spinner will be prepended separately with elapsed time
+            let (spinner_prefix, status_text) = match &change.queue_status {
+                QueueStatus::Applying => {
+                    let status = if let Some(iter) = change.iteration_number {
+                        format!(
+                            "[{}:{} {:>3.0}%]",
+                            change.queue_status.display(),
+                            iter,
+                            change.progress_percent()
+                        )
+                    } else {
+                        format!(
+                            "[{} {:>3.0}%]",
+                            change.queue_status.display(),
+                            change.progress_percent()
+                        )
+                    };
+                    (format!("{} ", spinner_char), status)
+                }
+                QueueStatus::Archiving | QueueStatus::Resolving | QueueStatus::Accepting => {
+                    let status = if let Some(iter) = change.iteration_number {
+                        format!("[{}:{}]", change.queue_status.display(), iter)
+                    } else {
+                        format!("[{}]", change.queue_status.display())
+                    };
+                    (format!("{} ", spinner_char), status)
+                }
+                QueueStatus::Archived | QueueStatus::Merged | QueueStatus::Error(_) => (
+                    String::new(),
+                    format!("[{}]", change.queue_status.display()),
+                ),
+                status => (String::new(), format!("[{}]", status.display())),
+            };
+
+            // Pre-calculate widths before moving values into Spans
+            let (spinner_elapsed_width, status_only_width) = if !spinner_prefix.is_empty() {
+                let spinner_elapsed_text =
+                    format!(" {}{:>7} ", spinner_prefix.trim(), elapsed_text);
+                (spinner_elapsed_text.len(), status_text.len())
+            } else {
+                let status_formatted = format!(" {:>18}", status_text);
+                (0, status_formatted.len())
             };
 
             let mut spans = vec![
@@ -634,19 +644,30 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
+            ];
+
+            // For in-flight states: spinner → elapsed → status
+            // For other states: status only
+            if !spinner_prefix.is_empty() {
+                spans.push(Span::styled(
+                    format!(" {}{:>7} ", spinner_prefix.trim(), elapsed_text),
+                    Style::default().fg(dim_color),
+                ));
+                spans.push(Span::styled(
+                    status_text,
+                    Style::default().fg(change.queue_status.color()),
+                ));
+            } else {
+                spans.push(Span::styled(
                     format!(" {:>18}", status_text),
                     Style::default().fg(change.queue_status.color()),
-                ),
-                Span::styled(
-                    format!("  {}/{}", change.completed_tasks, change.total_tasks),
-                    Style::default().fg(dim_color),
-                ),
-                Span::styled(
-                    format!("  {:>7}", elapsed_text),
-                    Style::default().fg(dim_color),
-                ),
-            ];
+                ));
+            }
+
+            spans.push(Span::styled(
+                format!("  {}/{}", change.completed_tasks, change.total_tasks),
+                Style::default().fg(dim_color),
+            ));
 
             // Add log preview if available
             if let Some(log) = app.get_latest_log_for_change(&change.id) {
@@ -658,12 +679,10 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 let worktree_badge_width = if change.has_worktree { 3 } else { 0 }; // " WT"
                 let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"
                 let uncommitted_badge_width = if show_uncommitted_badge { 11 } else { 0 }; // " UNCOMMITED"
-                let status_text_formatted = format!(" {:>18}", status_text);
-                let status_width = status_text_formatted.len(); // max(19, 1 + status_text.len())
+
+                // Use pre-calculated widths from above
                 let tasks_text = format!("  {}/{}", change.completed_tasks, change.total_tasks);
                 let tasks_width = tasks_text.len();
-                let elapsed_text_formatted = format!("  {:>7}", elapsed_text);
-                let elapsed_width = elapsed_text_formatted.len();
                 let list_border_width = 2; // List widget border
 
                 let base_width = checkbox_cursor_width
@@ -671,17 +690,17 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                     + worktree_badge_width
                     + new_badge_width
                     + uncommitted_badge_width
-                    + status_width
+                    + spinner_elapsed_width
+                    + status_only_width
                     + tasks_width
-                    + elapsed_width
                     + list_border_width;
 
                 let available = (area.width as usize).saturating_sub(base_width);
 
                 // Only show preview if available width >= 10 chars
                 if available >= 10 {
-                    // Format relative time
-                    let relative_time = format_relative_time(&log.created_at);
+                    // Format relative time with parentheses
+                    let relative_time = format!("({})", format_relative_time(&log.created_at));
 
                     // Build shortened header: [operation:iteration] or [operation]
                     let header = match (&log.operation, log.iteration) {
@@ -697,17 +716,18 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                         format!(" {} {}", relative_time, log.message)
                     };
 
-                    // Truncate if necessary
-                    let truncated = if preview_text.len() > available {
-                        format!("{}…", &preview_text[..available.saturating_sub(1)])
+                    // Truncate if necessary (Unicode-safe)
+                    let truncated =
+                        truncate_to_display_width_with_suffix(&preview_text, available, "…");
+
+                    // Use brighter color for selected row to ensure visibility on DarkGray background
+                    let preview_color = if is_selected_row {
+                        Color::Gray
                     } else {
-                        preview_text
+                        Color::DarkGray
                     };
 
-                    spans.push(Span::styled(
-                        truncated,
-                        Style::default().fg(Color::DarkGray),
-                    ));
+                    spans.push(Span::styled(truncated, Style::default().fg(preview_color)));
                 }
             }
 
@@ -1947,5 +1967,42 @@ mod tests {
             "Header should show 'Running 1' (Resolving is in-flight), but got:\n{}",
             content
         );
+    }
+
+    #[test]
+    fn test_japanese_log_preview_truncation_no_panic() {
+        // Test that log preview with Japanese characters doesn't panic
+        // when truncated at character boundaries
+        use super::super::utils::truncate_to_display_width_with_suffix;
+
+        // Test the truncation function directly with Japanese text
+        let japanese_text = "日本語のログメッセージです。これは長いメッセージで切り詰められます。";
+
+        // This should not panic even with multi-byte UTF-8 characters
+        let truncated = truncate_to_display_width_with_suffix(japanese_text, 20, "…");
+
+        // Verify result contains ellipsis (was truncated) and doesn't panic
+        assert!(
+            truncated.contains("…"),
+            "Should be truncated with ellipsis, got: {}",
+            truncated
+        );
+
+        // Verify the truncated string is valid UTF-8 and can be used safely
+        assert_eq!(
+            truncated.chars().count(),
+            truncated.chars().count(), // This would panic if UTF-8 is broken
+            "Truncated string should be valid UTF-8"
+        );
+
+        // Test with various widths to ensure no panic at character boundaries
+        for width in 1..50 {
+            let result = truncate_to_display_width_with_suffix(japanese_text, width, "…");
+            assert!(
+                !result.is_empty(),
+                "Should never return empty string for width {}",
+                width
+            );
+        }
     }
 }
