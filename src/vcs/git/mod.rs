@@ -452,57 +452,6 @@ pub async fn list_worktree_change_ids(repo_root: &Path) -> VcsResult<HashSet<Str
     Ok(change_ids)
 }
 
-/// Remove all worktrees associated with a change ID.
-///
-/// Returns the number of worktrees removed.
-pub async fn remove_worktrees_for_change(repo_root: &Path, change_id: &str) -> VcsResult<usize> {
-    let output = commands::run_git(&["worktree", "list", "--porcelain"], repo_root).await?;
-    let sanitized_change_id = change_id.replace(['/', '\\', ' '], "-");
-    let mut current_worktree_path: Option<PathBuf> = None;
-    let mut current_branch: Option<String> = None;
-    let mut removed = 0;
-
-    for line in output.lines() {
-        if let Some(worktree_path) = line.strip_prefix("worktree ") {
-            current_worktree_path = Some(PathBuf::from(worktree_path));
-        } else if let Some(branch_name) = line.strip_prefix("branch refs/heads/") {
-            current_branch = Some(branch_name.to_string());
-        } else if line.is_empty() {
-            if let (Some(path), Some(branch)) =
-                (current_worktree_path.take(), current_branch.take())
-            {
-                if let Some(extracted_change_id) =
-                    GitWorkspaceManager::extract_change_id_from_worktree_name(&branch)
-                {
-                    if extracted_change_id == sanitized_change_id {
-                        if path.exists() {
-                            commands::worktree_remove(repo_root, path.to_str().unwrap()).await?;
-                        }
-                        let _ = commands::branch_delete(repo_root, &branch).await;
-                        removed += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    if let (Some(path), Some(branch)) = (current_worktree_path, current_branch) {
-        if let Some(extracted_change_id) =
-            GitWorkspaceManager::extract_change_id_from_worktree_name(&branch)
-        {
-            if extracted_change_id == sanitized_change_id {
-                if path.exists() {
-                    commands::worktree_remove(repo_root, path.to_str().unwrap()).await?;
-                }
-                let _ = commands::branch_delete(repo_root, &branch).await;
-                removed += 1;
-            }
-        }
-    }
-
-    Ok(removed)
-}
-
 impl GitWorkspaceManager {
     /// Find a worktree by branch name (workspace name).
     async fn find_worktree_by_name(

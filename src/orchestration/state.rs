@@ -80,6 +80,9 @@ pub struct OrchestratorState {
     /// Apply counts per change (how many times each change has been applied).
     apply_counts: HashMap<String, u32>,
 
+    /// Task progress per change (completed_tasks, total_tasks).
+    task_progress: HashMap<String, (u32, u32)>,
+
     /// Number of changes processed (archived).
     changes_processed: usize,
 
@@ -109,6 +112,7 @@ impl OrchestratorState {
             pending_changes: pending_set,
             archived_changes: HashSet::new(),
             apply_counts: HashMap::new(),
+            task_progress: HashMap::new(),
             changes_processed: 0,
             total_changes: total,
             max_iterations,
@@ -165,6 +169,16 @@ impl OrchestratorState {
     /// Get the apply count for a specific change.
     pub fn apply_count(&self, change_id: &str) -> u32 {
         *self.apply_counts.get(change_id).unwrap_or(&0)
+    }
+
+    /// Get the task progress for a specific change (completed_tasks, total_tasks).
+    pub fn task_progress(&self, change_id: &str) -> (u32, u32) {
+        *self.task_progress.get(change_id).unwrap_or(&(0, 0))
+    }
+
+    /// Update task progress for a change.
+    pub fn set_task_progress(&mut self, change_id: String, completed: u32, total: u32) {
+        self.task_progress.insert(change_id, (completed, total));
     }
 
     /// Check if a change is in the initial snapshot.

@@ -280,6 +280,7 @@ impl AgentRunner {
     /// The prompt is constructed as: user_prompt + history_context
     /// - user_prompt: from config.archive_prompt (user-customizable)
     /// - history_context: previous archive attempts (if any)
+    #[allow(dead_code)]
     pub async fn run_archive_streaming_with_runner(
         &self,
         change_id: &str,
@@ -496,6 +497,7 @@ impl AgentRunner {
         self.apply_history.format_context(change_id)
     }
 
+    #[allow(dead_code)]
     pub fn format_archive_history(&self, change_id: &str) -> String {
         self.archive_history.format_context(change_id)
     }

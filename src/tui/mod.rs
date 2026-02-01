@@ -15,9 +15,12 @@ mod qr;
 pub mod queue;
 mod render;
 mod runner;
-pub mod state;
+mod state;
+mod terminal;
+mod type_impls;
 pub mod types;
 mod utils;
+mod worktrees;
 
 // Public API re-exports
 pub use runner::run_tui;
