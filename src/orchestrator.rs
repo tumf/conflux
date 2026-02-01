@@ -275,6 +275,14 @@ impl Orchestrator {
         })
     }
 
+    /// Update execution mode and broadcast state (helper for mode transitions)
+    #[cfg(feature = "web-monitoring")]
+    async fn update_execution_mode(&mut self, mode: &str) {
+        self.execution_mode = mode.to_string();
+        let current_changes = openspec::list_changes_native().unwrap_or_default();
+        self.broadcast_state_update(&current_changes).await;
+    }
+
     /// Check for graceful stop flag and update state accordingly
     /// Returns LoopControl indicating whether to continue or break
     async fn check_graceful_stop(
@@ -289,22 +297,14 @@ impl Orchestrator {
             if current_graceful_stop && !*previous_graceful_stop {
                 info!("Graceful stop requested, entering stopping state");
                 #[cfg(feature = "web-monitoring")]
-                {
-                    self.execution_mode = "stopping".to_string();
-                    let current_changes = openspec::list_changes_native().unwrap_or_default();
-                    self.broadcast_state_update(&current_changes).await;
-                }
+                self.update_execution_mode("stopping").await;
             }
 
             // Detect transition from true to false (cancel stop - resume running)
             if !current_graceful_stop && *previous_graceful_stop {
                 info!("Graceful stop cancelled, resuming running state");
                 #[cfg(feature = "web-monitoring")]
-                {
-                    self.execution_mode = "running".to_string();
-                    let current_changes = openspec::list_changes_native().unwrap_or_default();
-                    self.broadcast_state_update(&current_changes).await;
-                }
+                self.update_execution_mode("running").await;
             }
 
             *previous_graceful_stop = current_graceful_stop;
@@ -313,11 +313,7 @@ impl Orchestrator {
             if current_graceful_stop {
                 info!("Graceful stop: stopping after current change");
                 #[cfg(feature = "web-monitoring")]
-                {
-                    self.execution_mode = "stopped".to_string();
-                    let current_changes = openspec::list_changes_native().unwrap_or_default();
-                    self.broadcast_state_update(&current_changes).await;
-                }
+                self.update_execution_mode("stopped").await;
                 if let Some(progress) = &mut self.progress {
                     progress.complete_all();
                 }
@@ -338,11 +334,7 @@ impl Orchestrator {
         if cancel_token.is_cancelled() {
             info!("Cancellation requested, stopping orchestration");
             #[cfg(feature = "web-monitoring")]
-            {
-                self.execution_mode = "stopped".to_string();
-                let current_changes = openspec::list_changes_native().unwrap_or_default();
-                self.broadcast_state_update(&current_changes).await;
-            }
+            self.update_execution_mode("stopped").await;
             if let Some(progress) = &mut self.progress {
                 progress.complete_all();
             }
@@ -424,11 +416,7 @@ impl Orchestrator {
             progress.error(&format!("Failed: {}", next.id));
         }
         #[cfg(feature = "web-monitoring")]
-        {
-            self.execution_mode = "error".to_string();
-            let current_changes = openspec::list_changes_native().unwrap_or_default();
-            self.broadcast_state_update(&current_changes).await;
-        }
+        self.update_execution_mode("error").await;
         Err(OrchestratorError::AgentCommand(error.to_string()))
     }
 
@@ -510,11 +498,7 @@ impl Orchestrator {
             progress.error(&format!("Apply failed: {}", next.id));
         }
         #[cfg(feature = "web-monitoring")]
-        {
-            self.execution_mode = "error".to_string();
-            let current_changes = openspec::list_changes_native().unwrap_or_default();
-            self.broadcast_state_update(&current_changes).await;
-        }
+        self.update_execution_mode("error").await;
         Err(OrchestratorError::AgentCommand(error.to_string()))
     }
 
@@ -873,12 +857,7 @@ impl Orchestrator {
 
         // Set execution mode to stopped (for web monitoring)
         #[cfg(feature = "web-monitoring")]
-        {
-            self.execution_mode = "stopped".to_string();
-            // Broadcast mode change to web monitoring
-            let current_changes = openspec::list_changes_native().unwrap_or_default();
-            self.broadcast_state_update(&current_changes).await;
-        }
+        self.update_execution_mode("stopped").await;
 
         info!("Orchestration completed");
         Ok(())
