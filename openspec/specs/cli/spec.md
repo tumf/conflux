@@ -883,23 +883,23 @@ The TUI SHALL maintain a maximum limit on stored log entries to prevent unbounde
 
 ### Requirement: Log Entry Headers
 
-The TUI SHALL display structured headers for analysis and resolve operation logs to improve traceability.
+TUI は analysis と resolve の operation ログに対して構造化ヘッダを表示し、追跡性を向上させなければならない (SHALL)。
 
-#### Scenario: Analysis log header format
-- **WHEN** an analysis operation outputs a log message
-- **THEN** the log entry displays with header `[analysis:N]`
-- **AND** N represents the iteration number of the analysis operation
+#### Scenario: Analysis ログヘッダ形式
+- **WHEN** analysis operation がログメッセージを出力する
+- **THEN** ログエントリは `[analysis:N]` のヘッダで表示される
+- **AND** N は analysis operation の iteration number を表す
 
-#### Scenario: Resolve log header format
-- **WHEN** a resolve operation outputs a log message
-- **THEN** the log entry displays with header `[{change_id}:resolve:N]`
-- **AND** change_id identifies the change being resolved
-- **AND** N represents the iteration number of the resolve operation
+#### Scenario: Resolve ログヘッダ形式
+- **WHEN** resolve operation がログメッセージを出力する
+- **THEN** ログエントリは `[resolve:N]` のヘッダで表示される
+- **AND** N は resolve operation の iteration number を表す
+- **AND** ヘッダには change_id が表示されない
 
-#### Scenario: Log headers use consistent color coding
-- **WHEN** log entries with headers are displayed
-- **THEN** headers use color coding based on change_id hash
-- **AND** headers are displayed in bold text for visibility
+#### Scenario: ログヘッダのカラーリングは一貫している
+- **WHEN** ヘッダ付きログエントリが表示される
+- **THEN** change_id が利用可能な場合、ヘッダは change_id hash に基づいた色分けで表示される
+- **AND** 視認性のためヘッダは太字で表示される
 
 ### Requirement: TUI Status Transition on Apply Completion
 
