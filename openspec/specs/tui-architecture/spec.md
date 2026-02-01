@@ -5,7 +5,7 @@ Defines the TUI module structure and architectural patterns.
 ## Requirements
 ### Requirement: TUI Module Structure
 
-The TUI module SHALL be organized as a directory-based module tree under `src/tui/` with focused submodules. The TUI state layer MUST consume a shared orchestration state model for change progress and execution metadata, while UI-only fields (cursor, view modes, selection state) remain in TUI-owned state. 共有オーケストレーション状態から取り込むイテレーション番号は、既存のTUI表示より小さい値で上書きしてはならない（MUST NOT）。必要に応じてより大きい値を保持し、表示が巻き戻らないようにしなければならない（MUST）。
+The TUI module SHALL be organized as a directory-based module tree under `src/tui/` with focused submodules. The TUI state layer MUST consume a shared orchestration state model for change progress and execution metadata, while UI-only fields (cursor, view modes, selection state) remain in TUI-owned state. The iteration number imported from the shared orchestration state MUST NOT overwrite the TUI with a smaller value than what is already displayed. It MUST retain a larger value as needed so the displayed iteration does not regress.
 
 #### Scenario: Module directory exists
 - **WHEN** the project is compiled
@@ -267,36 +267,43 @@ In this case, the selection state, approval state, `queue_status`, and DynamicQu
 
 ### Requirement: Change List Log Preview
 
-TUI の変更一覧は、各 change の最新ログエントリを右側の空きスペースに単一行のプレビューとして表示しなければならない (MUST)。プレビューにはログの相対時刻（1分未満は `just now`、1分以上は `<n><unit> ago` 形式。例: `2m ago`, `3h ago`。相対時刻の値は切り捨てで丸める）と短縮ヘッダ形式 `[operation:{iteration}]` または `[operation]`、およびメッセージが含まれ、表示幅に収まるように折り返しなしで省略されなければならない。
+The TUI change list MUST display a single-line preview of the latest log entry for each change in the remaining space on the right side of the row. The preview MUST include the log relative time (`just now` for less than 1 minute; `<n><unit> ago` for 1 minute or more, e.g., `2m ago`, `3h ago`, with values truncated (no rounding up)), the shortened header format `[operation:{iteration}]` or `[operation]`, and the message. The preview MUST be truncated without wrapping to fit within the available display width. Truncation MUST NOT break Unicode character boundaries and MUST NOT panic, even when the message contains CJK characters or emoji.
 
-- 1分以上の相対時刻は最大 2 単位まで表示しなければならない (MUST)。使用する unit は `d` / `h` / `m` とし、表示形式は例として `1d 12h ago`、`3h 20m ago` のように空白区切りで並べる。値は切り捨てで丸める。
-- 該当 change にログエントリが存在しない場合、プレビューは表示してはならない (MUST NOT)。
-- プレビュー表示に利用可能な幅が 10 文字未満の場合、プレビューは表示してはならない (MUST NOT)。
-- 相対時刻の表示は、ログエントリの生成時刻と現在時刻から描画時に算出されなければならず (MUST)、表示は 1 秒単位で更新されなければならない (MUST)。
+- For relative times of 1 minute or more, the display MUST include up to 2 units. Units MUST be `d` / `h` / `m`, formatted as space-separated units such as `1d 12h ago` or `3h 20m ago`. Values MUST be truncated (no rounding up).
+- If no log entry exists for the change, the preview MUST NOT be displayed.
+- If the available width for the preview is less than 10 characters, the preview MUST NOT be displayed.
+- The relative time MUST be computed at render time from the log entry creation time and the current time, and the display MUST update at 1-second granularity.
 
-#### Scenario: 変更一覧に最新ログの相対時刻付きプレビューが表示される
-- **GIVEN** ある change に 2分前のログエントリ（`operation="resolve"`、`iteration=1`）が存在する
-- **WHEN** TUI が変更一覧を描画する
-- **THEN** change 行に `2m ago [resolve:1]` と最新ログメッセージが同じ行で表示される
+#### Scenario: Change list displays preview with relative time for latest log
+- **GIVEN** a change has a log entry from 2 minutes ago (`operation="resolve"`, `iteration=1`)
+- **WHEN** the TUI renders the change list
+- **THEN** the change row displays `2m ago [resolve:1]` and the latest log message on the same line
 
-#### Scenario: 変更一覧はログがない change にプレビューを表示しない
-- **GIVEN** ある change にログエントリが存在しない
-- **WHEN** TUI が変更一覧を描画する
-- **THEN** その change 行にはログプレビューが表示されない
+#### Scenario: Change list does not display preview when no logs exist
+- **GIVEN** a change has no log entries
+- **WHEN** the TUI renders the change list
+- **THEN** the change row does not display a log preview
 
-#### Scenario: 変更一覧はプレビュー幅が不足している場合にプレビューを表示しない
-- **GIVEN** ある端末幅ではログプレビュー表示に利用可能な幅が 10 文字未満である
-- **WHEN** TUI が変更一覧を描画する
-- **THEN** 変更一覧にはログプレビューが表示されない
+#### Scenario: Change list does not display preview when preview width is insufficient
+- **GIVEN** the available width for the log preview is less than 10 characters
+- **WHEN** the TUI renders the change list
+- **THEN** the change list does not display a log preview
 
-#### Scenario: 変更一覧は最大2単位の相対時刻を表示する
-- **GIVEN** ある change に 1日12時間前のログエントリ（`operation="apply"`、`iteration=3`）が存在する
-- **WHEN** TUI が変更一覧を描画する
-- **THEN** change 行に `1d 12h ago [apply:3]` と最新ログメッセージが同じ行で表示される
+#### Scenario: Change list displays up to two units for relative time
+- **GIVEN** a change has a log entry from 1 day and 12 hours ago (`operation="apply"`, `iteration=3`)
+- **WHEN** the TUI renders the change list
+- **THEN** the change row displays `1d 12h ago [apply:3]` and the latest log message on the same line
 
-#### Scenario: 相対時刻は経過に応じて更新される
-- **GIVEN** ある change に 59秒前のログエントリが存在する
-- **WHEN** TUI が変更一覧を描画する
-- **THEN** change 行の相対時刻は `just now` として表示される
-- **WHEN** その後 2 秒経過して TUI が変更一覧を再描画する
-- **THEN** change 行の相対時刻は `1m ago` として表示される
+#### Scenario: Relative time updates as time elapses
+- **GIVEN** a change has a log entry from 59 seconds ago
+- **WHEN** the TUI renders the change list
+- **THEN** the change row displays `just now` as the relative time
+- **WHEN** 2 seconds pass and the TUI re-renders the change list
+- **THEN** the change row displays `1m ago` as the relative time
+
+#### Scenario: Log preview truncation is Unicode-safe for Japanese text
+- **GIVEN** the latest log message for a change contains Japanese text (e.g., `追記済みです。`)
+- **AND** the available preview width is insufficient to display the full message
+- **WHEN** the TUI renders the change list
+- **THEN** the log preview is truncated without breaking Unicode character boundaries
+- **AND** the TUI continues rendering without panicking
