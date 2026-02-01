@@ -44,13 +44,10 @@ impl AppState {
                 change.elapsed_time = Some(started.elapsed());
             }
         }
-        // Record orchestration elapsed time on error
-        if let Some(started) = self.orchestration_started_at {
-            self.orchestration_elapsed = Some(started.elapsed());
-        }
         self.add_log(LogEntry::error(format!("Error in {}: {}", id, error)));
-        // Transition to Error mode
-        self.mode = AppMode::Error;
+        // ProcessingError does NOT transition to Error mode (change-level failure only)
+        // AppMode remains Running to allow processing continuation
+        // error_change_id is set to track which change failed, but mode stays Running
         self.error_change_id = Some(id.clone());
         self.current_change = None;
     }
@@ -102,5 +99,132 @@ impl AppState {
             }
         }
         self.add_log(LogEntry::warn("Processing stopped"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openspec::Change;
+
+    fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
+        Change {
+            id: id.to_string(),
+            completed_tasks: completed,
+            total_tasks: total,
+            last_modified: "now".to_string(),
+            is_approved: true,
+            dependencies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_processing_error_keeps_app_mode() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start in Running mode
+        app.mode = AppMode::Running;
+        app.current_change = Some("test-change".to_string());
+
+        // Receive ProcessingError
+        app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
+
+        // AppMode should remain Running (NOT transition to Error)
+        assert_eq!(app.mode, AppMode::Running);
+
+        // Change should be marked as Error
+        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
+        assert!(matches!(change.queue_status, QueueStatus::Error(_)));
+
+        // error_change_id should be set
+        assert_eq!(app.error_change_id, Some("test-change".to_string()));
+
+        // current_change should be cleared
+        assert_eq!(app.current_change, None);
+    }
+
+    #[test]
+    fn test_processing_error_from_select_mode() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start in Select mode
+        app.mode = AppMode::Select;
+
+        // Receive ProcessingError
+        app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
+
+        // AppMode should remain Select (NOT transition to Error)
+        assert_eq!(app.mode, AppMode::Select);
+
+        // Change should be marked as Error
+        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
+        assert!(matches!(change.queue_status, QueueStatus::Error(_)));
+    }
+
+    #[test]
+    fn test_processing_started_sets_state() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.handle_processing_started("test-change".to_string());
+
+        assert_eq!(app.current_change, Some("test-change".to_string()));
+        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
+        assert_eq!(change.queue_status, QueueStatus::Applying);
+        assert!(change.started_at.is_some());
+    }
+
+    #[test]
+    fn test_processing_completed_updates_status() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.handle_processing_completed("test-change".to_string());
+
+        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
+        assert_eq!(change.queue_status, QueueStatus::Archiving);
+    }
+
+    #[test]
+    fn test_all_completed_transitions_to_select() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Running;
+        app.handle_all_completed();
+
+        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.current_change, None);
+    }
+
+    #[test]
+    fn test_all_completed_preserves_error_mode() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Error;
+        app.handle_all_completed();
+
+        // Should remain in Error mode
+        assert_eq!(app.mode, AppMode::Error);
+    }
+
+    #[test]
+    fn test_stopped_resets_queue_status() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Set to Queued
+        app.changes[0].queue_status = QueueStatus::Queued;
+        app.changes[0].selected = true;
+
+        app.handle_stopped();
+
+        assert_eq!(app.mode, AppMode::Stopped);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+        // selected should be preserved
+        assert!(app.changes[0].selected);
     }
 }

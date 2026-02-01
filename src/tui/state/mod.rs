@@ -555,34 +555,50 @@ impl AppState {
         }
     }
 
-    /// Trigger merge resolution for the selected change when applicable.
-    pub fn resolve_merge(&mut self) -> Option<TuiCommand> {
+    /// Check if resolve operation is available for the current cursor position.
+    ///
+    /// This method centralizes the logic for determining if "M: resolve" should be shown
+    /// and if resolve_merge() can be executed.
+    pub fn is_resolve_available(&self) -> bool {
+        // Must have valid cursor position
         if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
-            return None;
+            return false;
         }
 
+        // Must be in correct mode
         if !matches!(
             self.mode,
             AppMode::Select | AppMode::Stopped | AppMode::Running
         ) {
-            return None;
+            return false;
         }
 
-        // Block M key during resolve execution
+        // Must not be currently resolving
         if self.is_resolving {
-            self.warning_message = Some("Cannot merge: resolve operation in progress".to_string());
+            return false;
+        }
+
+        // Current change must be in MergeWait status
+        let change = &self.changes[self.cursor_index];
+        matches!(change.queue_status, QueueStatus::MergeWait)
+    }
+
+    /// Trigger merge resolution for the selected change when applicable.
+    pub fn resolve_merge(&mut self) -> Option<TuiCommand> {
+        // Use centralized availability check
+        if !self.is_resolve_available() {
+            if self.is_resolving {
+                self.warning_message =
+                    Some("Cannot merge: resolve operation in progress".to_string());
+            }
             return None;
         }
 
         let change = &mut self.changes[self.cursor_index];
-        if matches!(change.queue_status, QueueStatus::MergeWait) {
-            let change_id = change.id.clone();
-            // Transition to ResolveWait immediately after M key press
-            change.queue_status = QueueStatus::ResolveWait;
-            Some(TuiCommand::ResolveMerge(change_id))
-        } else {
-            None
-        }
+        let change_id = change.id.clone();
+        // Transition to ResolveWait immediately after M key press
+        change.queue_status = QueueStatus::ResolveWait;
+        Some(TuiCommand::ResolveMerge(change_id))
     }
 
     /// Update parallel eligibility status for changes.
@@ -641,6 +657,7 @@ impl AppState {
         );
 
         // Block approval toggle for active (in-flight) changes
+        // MergeWait and ResolveWait allow approval toggle (without queue changes)
         if change.queue_status.is_active() {
             self.warning_message = Some(format!(
                 "Cannot change approval for change '{}' while it is {}",
@@ -2438,6 +2455,117 @@ mod tests {
 
         // Should return ResolveMerge command even in Running mode
         assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(_))));
+    }
+
+    // === Tests for update-tui-error-mode-continuation ===
+
+    #[test]
+    fn test_is_resolve_available_true_when_conditions_met() {
+        // Test that is_resolve_available returns true when all conditions are met
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set up conditions for resolve to be available
+        app.mode = AppMode::Select;
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = false;
+        app.cursor_index = 0;
+
+        assert!(app.is_resolve_available());
+    }
+
+    #[test]
+    fn test_is_resolve_available_false_when_resolving() {
+        // Test that is_resolve_available returns false during resolve operation
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Select;
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = true; // Resolving in progress
+        app.cursor_index = 0;
+
+        assert!(!app.is_resolve_available());
+    }
+
+    #[test]
+    fn test_is_resolve_available_false_when_not_merge_wait() {
+        // Test that is_resolve_available returns false for non-MergeWait changes
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Select;
+        app.changes[0].queue_status = QueueStatus::Queued; // Not MergeWait
+        app.is_resolving = false;
+        app.cursor_index = 0;
+
+        assert!(!app.is_resolve_available());
+    }
+
+    #[test]
+    fn test_is_resolve_available_false_in_error_mode() {
+        // Test that is_resolve_available returns false in Error mode
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Error; // Error mode
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = false;
+        app.cursor_index = 0;
+
+        assert!(!app.is_resolve_available());
+    }
+
+    #[test]
+    fn test_is_resolve_available_true_in_running_mode() {
+        // Test that is_resolve_available returns true in Running mode
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Running; // Running mode should allow resolve
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = false;
+        app.cursor_index = 0;
+
+        assert!(app.is_resolve_available());
+    }
+
+    #[test]
+    fn test_resolve_merge_uses_centralized_check() {
+        // Test that resolve_merge and is_resolve_available are consistent
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Select;
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = false;
+        app.cursor_index = 0;
+
+        // is_resolve_available should be true
+        assert!(app.is_resolve_available());
+
+        // resolve_merge should return a command
+        let cmd = app.resolve_merge();
+        assert!(cmd.is_some());
+    }
+
+    #[test]
+    fn test_resolve_merge_consistency_when_unavailable() {
+        // Test that when is_resolve_available is false, resolve_merge returns None
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Select;
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = true; // Make unavailable
+        app.cursor_index = 0;
+
+        // is_resolve_available should be false
+        assert!(!app.is_resolve_available());
+
+        // resolve_merge should return None
+        let cmd = app.resolve_merge();
+        assert!(cmd.is_none());
     }
 
     #[test]
