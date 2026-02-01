@@ -9,4 +9,5 @@
   - 完了確認: src/events.rsにAcceptanceStarted/ArchiveStarted/ResolveStartedイベントのテストを追加
 
 ## Acceptance #1 Failure Follow-up
-- [ ] Gitの作業ツリーがクリーンではありません。未コミットの変更を解消する（Modified: openspec/changes/update-tui-subcommand-command-logs/tasks.md, src/events.rs, src/orchestration/mod.rs, src/orchestration/output.rs, src/orchestrator.rs, src/parallel/executor.rs, src/serial_run_service.rs, src/tui/orchestrator.rs, src/tui/state/events/completion.rs, src/tui/state/events/mod.rs, src/web/state.rs）
+- [x] Gitの作業ツリーがクリーンではありません。未コミットの変更を解消する（Modified: openspec/changes/update-tui-subcommand-command-logs/tasks.md, src/events.rs, src/orchestration/mod.rs, src/orchestration/output.rs, src/orchestrator.rs, src/parallel/executor.rs, src/serial_run_service.rs, src/tui/orchestrator.rs, src/tui/state/events/completion.rs, src/tui/state/events/mod.rs, src/web/state.rs）
+  - 完了確認: すべての変更をコミットし、ビルドとテストが成功した（commit 0b33cfa1）
