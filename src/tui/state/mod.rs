@@ -555,34 +555,50 @@ impl AppState {
         }
     }
 
-    /// Trigger merge resolution for the selected change when applicable.
-    pub fn resolve_merge(&mut self) -> Option<TuiCommand> {
+    /// Check if resolve operation is available for the current cursor position.
+    ///
+    /// This method centralizes the logic for determining if "M: resolve" should be shown
+    /// and if resolve_merge() can be executed.
+    pub fn is_resolve_available(&self) -> bool {
+        // Must have valid cursor position
         if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
-            return None;
+            return false;
         }
 
+        // Must be in correct mode
         if !matches!(
             self.mode,
             AppMode::Select | AppMode::Stopped | AppMode::Running
         ) {
-            return None;
+            return false;
         }
 
-        // Block M key during resolve execution
+        // Must not be currently resolving
         if self.is_resolving {
-            self.warning_message = Some("Cannot merge: resolve operation in progress".to_string());
+            return false;
+        }
+
+        // Current change must be in MergeWait status
+        let change = &self.changes[self.cursor_index];
+        matches!(change.queue_status, QueueStatus::MergeWait)
+    }
+
+    /// Trigger merge resolution for the selected change when applicable.
+    pub fn resolve_merge(&mut self) -> Option<TuiCommand> {
+        // Use centralized availability check
+        if !self.is_resolve_available() {
+            if self.is_resolving {
+                self.warning_message =
+                    Some("Cannot merge: resolve operation in progress".to_string());
+            }
             return None;
         }
 
         let change = &mut self.changes[self.cursor_index];
-        if matches!(change.queue_status, QueueStatus::MergeWait) {
-            let change_id = change.id.clone();
-            // Transition to ResolveWait immediately after M key press
-            change.queue_status = QueueStatus::ResolveWait;
-            Some(TuiCommand::ResolveMerge(change_id))
-        } else {
-            None
-        }
+        let change_id = change.id.clone();
+        // Transition to ResolveWait immediately after M key press
+        change.queue_status = QueueStatus::ResolveWait;
+        Some(TuiCommand::ResolveMerge(change_id))
     }
 
     /// Update parallel eligibility status for changes.
@@ -640,16 +656,15 @@ impl AppState {
             change.id, change.queue_status, change.is_approved, self.mode
         );
 
-        // Block approval toggle for processing changes, resolve wait, and merge wait
-        if matches!(
-            change.queue_status,
-            QueueStatus::Applying
-                | QueueStatus::Resolving
-                | QueueStatus::ResolveWait
-                | QueueStatus::MergeWait
-        ) {
-            self.warning_message = Some("Cannot change approval for processing change".to_string());
-            debug!("toggle_approval: blocked by Processing/Resolving/ResolveWait/MergeWait status");
+        // Block approval toggle for active (in-flight) changes
+        // MergeWait and ResolveWait allow approval toggle (without queue changes)
+        if change.queue_status.is_active() {
+            self.warning_message = Some(format!(
+                "Cannot change approval for change '{}' while it is {}",
+                change.id,
+                change.queue_status.display()
+            ));
+            debug!("toggle_approval: blocked by is_active status");
             return None;
         }
 
@@ -2442,6 +2457,117 @@ mod tests {
         assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(_))));
     }
 
+    // === Tests for update-tui-error-mode-continuation ===
+
+    #[test]
+    fn test_is_resolve_available_true_when_conditions_met() {
+        // Test that is_resolve_available returns true when all conditions are met
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set up conditions for resolve to be available
+        app.mode = AppMode::Select;
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = false;
+        app.cursor_index = 0;
+
+        assert!(app.is_resolve_available());
+    }
+
+    #[test]
+    fn test_is_resolve_available_false_when_resolving() {
+        // Test that is_resolve_available returns false during resolve operation
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Select;
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = true; // Resolving in progress
+        app.cursor_index = 0;
+
+        assert!(!app.is_resolve_available());
+    }
+
+    #[test]
+    fn test_is_resolve_available_false_when_not_merge_wait() {
+        // Test that is_resolve_available returns false for non-MergeWait changes
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Select;
+        app.changes[0].queue_status = QueueStatus::Queued; // Not MergeWait
+        app.is_resolving = false;
+        app.cursor_index = 0;
+
+        assert!(!app.is_resolve_available());
+    }
+
+    #[test]
+    fn test_is_resolve_available_false_in_error_mode() {
+        // Test that is_resolve_available returns false in Error mode
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Error; // Error mode
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = false;
+        app.cursor_index = 0;
+
+        assert!(!app.is_resolve_available());
+    }
+
+    #[test]
+    fn test_is_resolve_available_true_in_running_mode() {
+        // Test that is_resolve_available returns true in Running mode
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Running; // Running mode should allow resolve
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = false;
+        app.cursor_index = 0;
+
+        assert!(app.is_resolve_available());
+    }
+
+    #[test]
+    fn test_resolve_merge_uses_centralized_check() {
+        // Test that resolve_merge and is_resolve_available are consistent
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Select;
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = false;
+        app.cursor_index = 0;
+
+        // is_resolve_available should be true
+        assert!(app.is_resolve_available());
+
+        // resolve_merge should return a command
+        let cmd = app.resolve_merge();
+        assert!(cmd.is_some());
+    }
+
+    #[test]
+    fn test_resolve_merge_consistency_when_unavailable() {
+        // Test that when is_resolve_available is false, resolve_merge returns None
+        let changes = vec![create_approved_change("change-a", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Select;
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = true; // Make unavailable
+        app.cursor_index = 0;
+
+        // is_resolve_available should be false
+        assert!(!app.is_resolve_available());
+
+        // resolve_merge should return None
+        let cmd = app.resolve_merge();
+        assert!(cmd.is_none());
+    }
+
     #[test]
     fn test_request_merge_worktree_branch_blocked_during_resolve() {
         // Test that M key is blocked during resolve operation in Worktrees view
@@ -2675,5 +2801,187 @@ mod tests {
         // ResolveWait change should still be retained
         assert_eq!(app.changes.len(), 1);
         assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+    }
+
+    // === Tests for is_active guard blocking Space/@ operations ===
+
+    #[test]
+    fn test_toggle_selection_blocked_when_applying() {
+        // Test that Space is blocked when change is Applying (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Applying;
+
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("applying"));
+    }
+
+    #[test]
+    fn test_toggle_selection_blocked_when_accepting() {
+        // Test that Space is blocked when change is Accepting (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Accepting;
+
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("accepting"));
+    }
+
+    #[test]
+    fn test_toggle_selection_blocked_when_archiving() {
+        // Test that Space is blocked when change is Archiving (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Archiving;
+
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("archiving"));
+    }
+
+    #[test]
+    fn test_toggle_selection_blocked_when_resolving() {
+        // Test that Space is blocked when change is Resolving (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Resolving;
+
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("resolving"));
+    }
+
+    #[test]
+    fn test_toggle_approval_blocked_when_applying() {
+        // Test that @ is blocked when change is Applying (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Applying;
+
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("applying"));
+    }
+
+    #[test]
+    fn test_toggle_approval_blocked_when_accepting() {
+        // Test that @ is blocked when change is Accepting (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Accepting;
+
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("accepting"));
+    }
+
+    #[test]
+    fn test_toggle_approval_blocked_when_archiving() {
+        // Test that @ is blocked when change is Archiving (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Archiving;
+
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("archiving"));
+    }
+
+    #[test]
+    fn test_toggle_approval_blocked_when_resolving() {
+        // Test that @ is blocked when change is Resolving (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Resolving;
+
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("resolving"));
+    }
+
+    #[test]
+    fn test_tui_iteration_refresh_monotonic() {
+        // Test that iteration_number in TUI is monotonically increasing
+        // and never decreases during auto-refresh
+        let changes = vec![create_approved_change("test-change", 0, 5)];
+        let mut app = AppState::new(changes);
+
+        // Create shared orchestration state
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::new(vec!["test-change".to_string()], 0),
+        ));
+        app.set_shared_state(shared_state.clone());
+
+        // Initial state: no iteration_number
+        assert_eq!(app.changes[0].iteration_number, None);
+
+        // Simulate first apply: set apply_count to 3
+        {
+            let mut guard = shared_state.blocking_write();
+            guard.increment_apply_count("test-change");
+            guard.increment_apply_count("test-change");
+            guard.increment_apply_count("test-change");
+        }
+
+        // First refresh: should update to 3
+        let fetched_changes = vec![create_approved_change("test-change", 1, 5)];
+        app.update_changes(fetched_changes);
+        assert_eq!(app.changes[0].iteration_number, Some(3));
+
+        // Simulate apply_count temporarily decreasing to 2 (e.g., due to stale shared state read)
+        {
+            let mut guard = shared_state.blocking_write();
+            // Reset to 2 (simulating a race condition or stale read)
+            *guard = crate::orchestration::state::OrchestratorState::new(
+                vec!["test-change".to_string()],
+                0,
+            );
+            guard.increment_apply_count("test-change");
+            guard.increment_apply_count("test-change");
+        }
+
+        // Second refresh with lower apply_count: iteration_number should NOT decrease
+        let fetched_changes = vec![create_approved_change("test-change", 2, 5)];
+        app.update_changes(fetched_changes);
+        // Should still be 3 (monotonic increase guarantee)
+        assert_eq!(app.changes[0].iteration_number, Some(3));
+
+        // Simulate apply_count increasing to 4
+        {
+            let mut guard = shared_state.blocking_write();
+            guard.increment_apply_count("test-change");
+            guard.increment_apply_count("test-change");
+        }
+
+        // Third refresh with higher apply_count: should update to 4
+        let fetched_changes = vec![create_approved_change("test-change", 3, 5)];
+        app.update_changes(fetched_changes);
+        assert_eq!(app.changes[0].iteration_number, Some(4));
     }
 }
