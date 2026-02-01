@@ -864,20 +864,99 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
     frame.render_widget(status, area);
 }
 
+/// Wrap a log message with proper indentation for continuation lines
+///
+/// The first line starts at column 0 (after timestamp+header prefix).
+/// Continuation lines are indented by `prefix_width` spaces to align with the first line.
+///
+/// `available_width` is the total width available after subtracting borders and timestamp.
+/// `header_width` is the width of the header (e.g., "[change-id:operation]").
+/// `prefix_width` is the total indentation width for continuation lines (timestamp + header).
+///
+/// Returns a vector of display lines (wrapped output).
+fn wrap_log_message(
+    message: &str,
+    available_width: usize,
+    header_width: usize,
+    prefix_width: usize,
+) -> Vec<String> {
+    if available_width == 0 {
+        return vec![message.to_string()];
+    }
+
+    let mut lines = Vec::new();
+    let mut remaining = message;
+
+    // First line: available_width - header_width (since line is [header][message])
+    let first_width = available_width.saturating_sub(header_width);
+    if first_width == 0 {
+        lines.push(remaining.to_string());
+        return lines;
+    }
+
+    if remaining.len() <= first_width {
+        // Entire message fits on first line
+        lines.push(remaining.to_string());
+        return lines;
+    }
+
+    // Split first line at character boundary
+    let mut split_point = first_width;
+    while split_point > 0 && !remaining.is_char_boundary(split_point) {
+        split_point -= 1;
+    }
+    if split_point == 0 {
+        split_point = first_width;
+    }
+
+    lines.push(remaining[..split_point].to_string());
+    remaining = &remaining[split_point..];
+
+    // Continuation lines: indent by prefix_width, use (available_width - header_width)
+    // Note: available_width already has timestamp subtracted, so we only subtract header_width
+    // to get the same message width as the first line
+    let indent = " ".repeat(prefix_width);
+    let continuation_width = available_width.saturating_sub(header_width);
+
+    while !remaining.is_empty() {
+        if continuation_width == 0 {
+            // No space for continuation, append as-is
+            lines.push(format!("{}{}", indent, remaining));
+            break;
+        }
+
+        if remaining.len() <= continuation_width {
+            // Remaining message fits on this line
+            lines.push(format!("{}{}", indent, remaining));
+            break;
+        }
+
+        // Split at character boundary
+        let mut split_point = continuation_width;
+        while split_point > 0 && !remaining.is_char_boundary(split_point) {
+            split_point -= 1;
+        }
+        if split_point == 0 {
+            split_point = continuation_width;
+        }
+
+        lines.push(format!("{}{}", indent, &remaining[..split_point]));
+        remaining = &remaining[split_point..];
+    }
+
+    lines
+}
+
 /// Render logs panel with scroll support
 fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
     // Calculate available width for message (subtract borders, timestamp, and padding)
     // Timestamp format: "HH:MM:SS " = 9 chars, borders = 2 chars
-    let available_width = (area.width as usize).saturating_sub(2 + 9 + 1);
+    let timestamp_width = 9; // "HH:MM:SS "
+    let border_width = 2;
+    let available_width = (area.width as usize).saturating_sub(border_width + timestamp_width);
 
     // Calculate visible area height (subtract borders)
     let visible_height = (area.height as usize).saturating_sub(2);
-    let total_logs = app.logs.len();
-
-    // Calculate the range of logs to display based on scroll offset
-    // scroll_offset = 0 means show the most recent logs at the bottom
-    let end_index = total_logs.saturating_sub(app.log_scroll_offset);
-    let start_index = end_index.saturating_sub(visible_height);
 
     // Colors for change_id prefixes (cycling through distinct colors)
     let change_colors = [
@@ -890,22 +969,27 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
         Color::LightCyan,
     ];
 
-    let log_items: Vec<Line> = app
+    // Pre-render all logs to calculate total display lines
+    // Each entry stores: (timestamp, header_spans, message_lines, color)
+    struct RenderedLog {
+        timestamp: String,
+        timestamp_style: Style,
+        header: String,
+        header_style: Style,
+        message_lines: Vec<String>,
+        message_style: Style,
+    }
+
+    let rendered_logs: Vec<RenderedLog> = app
         .logs
         .iter()
-        .skip(start_index)
-        .take(end_index - start_index)
         .map(|entry| {
-            let mut spans = vec![Span::styled(
-                format!("{} ", entry.timestamp),
-                Style::default().fg(Color::DarkGray),
-            )];
+            let timestamp = format!("{} ", entry.timestamp);
+            let timestamp_style = Style::default().fg(Color::DarkGray);
 
-            // Add header for Logs view: include change_id when present
-            // Format: [change_id:operation:iteration] or [change_id:operation] when change_id is present
-            // Format: [operation:iteration] or [operation] when change_id is absent
-            // Special rule: analysis logs must always include iteration
-            let _msg_width = if let Some(ref operation) = entry.operation {
+            // Build header and calculate prefix width
+            let (header, header_style, prefix_width) = if let Some(ref operation) = entry.operation
+            {
                 // Use hash of change_id (if present) to pick a consistent color
                 let color_index = if let Some(ref change_id) = entry.change_id {
                     change_id
@@ -918,7 +1002,6 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
                 let prefix_color = change_colors[color_index];
 
                 // Build header with change_id when present
-                // Note: analysis logs must always have iteration per spec
                 let header = match (&entry.change_id, entry.iteration) {
                     (Some(change_id), Some(iter)) => {
                         format!("[{}:{}:{}] ", change_id, operation, iter)
@@ -928,62 +1011,132 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
                     (None, None) => {
                         // Analysis logs must always have iteration
                         if operation == "analysis" {
-                            format!("[{}:1] ", operation) // Default to iteration 1
+                            format!("[{}:1] ", operation)
                         } else {
                             format!("[{}] ", operation)
                         }
                     }
                 };
 
-                let header_len = header.len();
-                spans.push(Span::styled(
-                    header,
-                    Style::default()
-                        .fg(prefix_color)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                // Reduce available width by prefix length
-                available_width.saturating_sub(header_len)
+                let prefix_width = timestamp.len() + header.len();
+                let header_style = Style::default()
+                    .fg(prefix_color)
+                    .add_modifier(Modifier::BOLD);
+
+                (header, header_style, prefix_width)
             } else {
-                available_width
+                let prefix_width = timestamp.len();
+                (String::new(), Style::default(), prefix_width)
             };
 
-            // Use full message without truncation - wrapping will handle overflow
-            // The message will be wrapped by the Paragraph widget's wrap setting
-            spans.push(Span::styled(
-                entry.message.clone(),
-                Style::default().fg(entry.color),
-            ));
+            // Wrap message with indentation
+            // available_width is already (total_width - border - timestamp)
+            // Pass header.len() separately to avoid double-subtraction in continuation lines
+            let message_lines =
+                wrap_log_message(&entry.message, available_width, header.len(), prefix_width);
+            let message_style = Style::default().fg(entry.color);
 
-            Line::from(spans)
+            RenderedLog {
+                timestamp,
+                timestamp_style,
+                header,
+                header_style,
+                message_lines,
+                message_style,
+            }
         })
         .collect();
 
+    // Calculate total display lines (sum of all wrapped lines)
+    let total_display_lines: usize = rendered_logs.iter().map(|r| r.message_lines.len()).sum();
+
+    // Convert log_scroll_offset (log-count-based) to display-line-based offset
+    // log_scroll_offset = 0 means show the most recent logs at the bottom
+    // log_scroll_offset = N means skip N logs from the bottom
+    let total_logs = rendered_logs.len();
+    let skipped_logs = app.log_scroll_offset.min(total_logs);
+
+    // Calculate display line offset by summing up the wrapped lines of the skipped logs
+    let display_line_offset: usize = rendered_logs
+        .iter()
+        .rev()
+        .take(skipped_logs)
+        .map(|r| r.message_lines.len())
+        .sum();
+
+    // Calculate visible range based on display lines
+    let end_line = total_display_lines.saturating_sub(display_line_offset);
+    let start_line = end_line.saturating_sub(visible_height);
+
+    // Convert line range to log entries and build Line widgets
+    let mut log_items: Vec<Line> = Vec::new();
+    let mut current_line = 0;
+
+    for rendered in &rendered_logs {
+        let entry_line_count = rendered.message_lines.len();
+        let entry_end = current_line + entry_line_count;
+
+        // Check if this entry overlaps with visible range
+        if entry_end > start_line && current_line < end_line {
+            // Determine which lines of this entry are visible
+            let visible_start_in_entry = start_line.saturating_sub(current_line);
+            let visible_end_in_entry = entry_line_count.min(end_line.saturating_sub(current_line));
+
+            for (line_idx, message_line) in rendered.message_lines.iter().enumerate() {
+                if line_idx >= visible_start_in_entry && line_idx < visible_end_in_entry {
+                    let mut spans = Vec::new();
+
+                    if line_idx == 0 {
+                        // First line: include timestamp and header
+                        spans.push(Span::styled(
+                            rendered.timestamp.clone(),
+                            rendered.timestamp_style,
+                        ));
+                        if !rendered.header.is_empty() {
+                            spans
+                                .push(Span::styled(rendered.header.clone(), rendered.header_style));
+                        }
+                        spans.push(Span::styled(message_line.clone(), rendered.message_style));
+                    } else {
+                        // Continuation line: message_line already has indentation
+                        spans.push(Span::styled(message_line.clone(), rendered.message_style));
+                    }
+
+                    log_items.push(Line::from(spans));
+                }
+            }
+        }
+
+        current_line = entry_end;
+    }
+
     // Build title with scroll position indicator and auto-scroll status
-    // Debug: show offset value to verify it's incrementing
     let auto_scroll_indicator = if app.log_auto_scroll { "▼" } else { "⏸" };
-    let title = if total_logs > visible_height {
-        let visible_start = start_index + 1;
-        let visible_end = end_index;
+    let title = if total_display_lines > visible_height {
+        let visible_start = start_line + 1;
+        let visible_end = end_line;
         format!(
-            " Logs [{}-{}/{}] off={} {} ",
-            visible_start, visible_end, total_logs, app.log_scroll_offset, auto_scroll_indicator
+            " Logs [{}-{}/{}] logs_off={} {} ",
+            visible_start,
+            visible_end,
+            total_display_lines,
+            app.log_scroll_offset,
+            auto_scroll_indicator
         )
     } else {
         format!(
-            " Logs off={} {} ",
+            " Logs logs_off={} {} ",
             app.log_scroll_offset, auto_scroll_indicator
         )
     };
 
-    let logs = Paragraph::new(log_items)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue)),
-        )
-        .wrap(ratatui::widgets::Wrap { trim: false });
+    // Do NOT use Paragraph::wrap - we handle wrapping manually
+    let logs = Paragraph::new(log_items).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Blue)),
+    );
 
     frame.render_widget(logs, area);
 }
@@ -2002,6 +2155,132 @@ mod tests {
                 !result.is_empty(),
                 "Should never return empty string for width {}",
                 width
+            );
+        }
+    }
+
+    // === Tests for fix-tui-logs-wrap ===
+
+    #[test]
+    fn test_logs_wrap_indents_continuation_lines() {
+        // Test that wrapped log lines maintain proper indentation
+        // First line starts at column 0 (after timestamp+header)
+        // Continuation lines are indented by prefix_width
+
+        let message = "This is a very long message that will definitely wrap across multiple lines when rendered in the logs view with a narrow width";
+        let available_width = 40;
+        let header_width = 0; // No header for this test
+        let prefix_width = 15; // e.g., "HH:MM:SS [op] " length
+
+        let wrapped = wrap_log_message(message, available_width, header_width, prefix_width);
+
+        // Should have multiple lines
+        assert!(wrapped.len() > 1, "Message should wrap to multiple lines");
+
+        // First line should NOT have indentation (starts at column 0)
+        assert!(
+            !wrapped[0].starts_with(' '),
+            "First line should not start with spaces, got: '{}'",
+            wrapped[0]
+        );
+
+        // Second and subsequent lines should have indentation
+        for (idx, line) in wrapped.iter().skip(1).enumerate() {
+            let expected_indent = " ".repeat(prefix_width);
+            assert!(
+                line.starts_with(&expected_indent),
+                "Continuation line {} should start with {} spaces, got: '{}'",
+                idx + 2,
+                prefix_width,
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn test_logs_visible_range_not_broken_by_wrapped_entry() {
+        // Test that visible range calculation works correctly with wrapped logs
+        // When logs wrap to multiple display lines, the visible range should
+        // show the correct portion based on display lines, not log count
+
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+
+        // Add a short log
+        app.add_log(LogEntry::info("Short log 1"));
+
+        // Add a very long log that will wrap (simulate 200+ char message)
+        let long_message = "A".repeat(200);
+        app.add_log(LogEntry::info(&long_message).with_operation("apply"));
+
+        // Add another short log
+        app.add_log(LogEntry::info("Short log 3"));
+
+        // Render with sufficient size (meet minimum 60x15 requirement)
+        // Use height=30 to give enough space for logs panel
+        let buffer = render_buffer(&mut app, 80, 30);
+        let content = buffer_to_string(&buffer);
+
+        // Verify that the latest log (Short log 3) is visible
+        // The bug would cause this to be scrolled off-screen due to incorrect range calculation
+        assert!(
+            content.contains("Short log 3"),
+            "Latest log should be visible in the rendered output, but got:\n{}",
+            content
+        );
+
+        // Verify that at least one continuation line from the long log is visible
+        // This confirms that wrapping is working
+        let a_count = content.matches('A').count();
+        assert!(
+            a_count > 0,
+            "Wrapped log should have continuation lines visible, but got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_wrap_log_message_handles_empty_message() {
+        let wrapped = wrap_log_message("", 40, 0, 10);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0], "");
+    }
+
+    #[test]
+    fn test_wrap_log_message_handles_zero_width() {
+        let wrapped = wrap_log_message("test message", 0, 0, 10);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0], "test message");
+    }
+
+    #[test]
+    fn test_wrap_log_message_no_wrap_needed() {
+        let message = "Short message";
+        let wrapped = wrap_log_message(message, 40, 0, 10);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0], message);
+    }
+
+    #[test]
+    fn test_wrap_log_message_unicode_boundaries() {
+        // Test with multi-byte UTF-8 characters (Japanese)
+        let message = "日本語のログメッセージです。これは長いメッセージで折り返されます。";
+        let wrapped = wrap_log_message(message, 30, 0, 10);
+
+        // Should wrap without panic
+        assert!(wrapped.len() > 1);
+
+        // All lines should be valid UTF-8
+        for line in &wrapped {
+            assert!(line.is_char_boundary(0));
+            assert!(line.is_char_boundary(line.len()));
+        }
+
+        // Continuation lines should have indentation
+        for line in wrapped.iter().skip(1) {
+            assert!(
+                line.starts_with("          "), // 10 spaces
+                "Continuation line should be indented, got: '{}'",
+                line
             );
         }
     }
