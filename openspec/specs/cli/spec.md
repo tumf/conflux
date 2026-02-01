@@ -152,10 +152,12 @@ When F5 key is pressed in selection mode, processing of selected changes SHALL b
 ### Requirement: Running Mode Dashboard
 
 TUI は Running モードでダッシュボード形式の UI を表示しなければならない（SHALL）。
+正常完了時は Ready 表示に戻り、停止要求がない限り Stopped へ遷移してはならない。
 
 #### Scenario: Display on processing completion
 - **WHEN** すべての queued change が処理完了する
 - **THEN** ヘッダーステータスが "Ready" に切り替わる
+- **AND** TUI は Select（Ready）モードに戻る
 - **AND** ステータスパネルは進捗と経過時間のみを表示する
 - **AND** `Ctrl+C` で終了できるよう表示を維持する
 
