@@ -107,9 +107,18 @@ pub fn validate_change_toggleable(
     is_approved: bool,
     is_parallel_eligible: bool,
     parallel_mode: bool,
-    _queue_status: &QueueStatus,
+    queue_status: &QueueStatus,
     change_id: &str,
 ) -> ToggleGuardResult {
+    // Cannot toggle active (in-flight) changes
+    if queue_status.is_active() {
+        return ToggleGuardResult::Blocked(format!(
+            "Cannot toggle change '{}' while it is {}",
+            change_id,
+            queue_status.display()
+        ));
+    }
+
     // Cannot select unapproved changes
     if !is_approved {
         return ToggleGuardResult::Blocked(format!(
@@ -540,5 +549,57 @@ mod tests {
         assert!(!change.selected);
         assert!(matches!(change.queue_status, QueueStatus::ResolveWait));
         assert!(matches!(result, ToggleActionResult::StateOnly(_)));
+    }
+
+    #[test]
+    fn test_validate_change_toggleable_blocked_applying() {
+        // Test that Applying status (is_active) blocks toggle
+        let result = validate_change_toggleable(
+            true,                   // is_approved
+            true,                   // is_parallel_eligible
+            false,                  // parallel_mode
+            &QueueStatus::Applying, // queue_status (blocked)
+            "test-change",          // change_id
+        );
+        assert!(matches!(result, ToggleGuardResult::Blocked(_)));
+    }
+
+    #[test]
+    fn test_validate_change_toggleable_blocked_accepting() {
+        // Test that Accepting status (is_active) blocks toggle
+        let result = validate_change_toggleable(
+            true,                    // is_approved
+            true,                    // is_parallel_eligible
+            false,                   // parallel_mode
+            &QueueStatus::Accepting, // queue_status (blocked)
+            "test-change",           // change_id
+        );
+        assert!(matches!(result, ToggleGuardResult::Blocked(_)));
+    }
+
+    #[test]
+    fn test_validate_change_toggleable_blocked_archiving() {
+        // Test that Archiving status (is_active) blocks toggle
+        let result = validate_change_toggleable(
+            true,                    // is_approved
+            true,                    // is_parallel_eligible
+            false,                   // parallel_mode
+            &QueueStatus::Archiving, // queue_status (blocked)
+            "test-change",           // change_id
+        );
+        assert!(matches!(result, ToggleGuardResult::Blocked(_)));
+    }
+
+    #[test]
+    fn test_validate_change_toggleable_blocked_resolving() {
+        // Test that Resolving status (is_active) blocks toggle
+        let result = validate_change_toggleable(
+            true,                    // is_approved
+            true,                    // is_parallel_eligible
+            false,                   // parallel_mode
+            &QueueStatus::Resolving, // queue_status (blocked)
+            "test-change",           // change_id
+        );
+        assert!(matches!(result, ToggleGuardResult::Blocked(_)));
     }
 }
