@@ -21,3 +21,8 @@
 ## Acceptance #3 Failure Follow-up
 - [x] src/tui/orchestrator.rs: AcceptanceContinue/AcceptanceFailed/AcceptanceCommandFailedで送信するAcceptanceStartedのcommandがuser_prompt+historyのみでbuild_acceptance_promptのdiff context/last outputを含まず、実際のacceptance実行コマンド（src/agent/runner.rsのrun_acceptance_streaming）と不一致になっているため、実行コマンドと一致する文字列を送信する
   - 完了確認: AcceptanceContinue/AcceptanceFailed/AcceptanceCommandFailedの処理から重複するAcceptanceStartedイベント送信を削除。acceptance_test_streaming内で実際のコマンド文字列（diff context/last output含む）がログ出力される
+
+## Acceptance #4 Failure Follow-up
+- [x] Gitの作業ツリーがクリーンではありません。未コミットの変更を解消する（Modified: openspec/changes/update-tui-subcommand-command-logs/tasks.md）
+- [x] src/tui/orchestrator.rs: ChangeProcessResult::AcceptanceContinueExceededでAcceptanceStartedのcommandをuser_prompt+historyのみで生成して送信しており、run_acceptance_streamingが生成するdiff context/last outputを含む実コマンドと一致しないため、実コマンドと一致するcommandを送信するか、重複するAcceptanceStarted送信を削除する
+  - 完了確認: AcceptanceContinueExceededの処理から重複するAcceptanceStartedイベント送信を削除（行1015-1035）。acceptance_test_streaming内で実際のコマンド文字列がログ出力される
