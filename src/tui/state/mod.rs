@@ -640,10 +640,10 @@ impl AppState {
         // Block approval toggle for processing changes and resolve wait
         if matches!(
             change.queue_status,
-            QueueStatus::Applying | QueueStatus::Resolving | QueueStatus::ResolveWait
+            QueueStatus::Applying | QueueStatus::Resolving
         ) {
             self.warning_message = Some("Cannot change approval for processing change".to_string());
-            debug!("toggle_approval: blocked by Processing/Resolving/ResolveWait status");
+            debug!("toggle_approval: blocked by Processing/Resolving status");
             return None;
         }
 
@@ -659,8 +659,16 @@ impl AppState {
                     // Unapproved → approved + selected (no auto-queue)
                     Some(TuiCommand::ApproveOnly(id))
                 } else {
-                    // Approved → unapproved (also deselects)
-                    Some(TuiCommand::UnapproveAndDequeue(id))
+                    // Approved → unapproved
+                    // For wait states, do not touch queue status or DynamicQueue.
+                    if matches!(
+                        change.queue_status,
+                        QueueStatus::MergeWait | QueueStatus::ResolveWait
+                    ) {
+                        Some(TuiCommand::UnapproveOnly(id))
+                    } else {
+                        Some(TuiCommand::UnapproveAndDequeue(id))
+                    }
                 }
             }
             AppMode::Running | AppMode::Stopped => {
@@ -672,8 +680,16 @@ impl AppState {
                     // Unapproved → approved only (no auto-queue)
                     Some(TuiCommand::ApproveOnly(id))
                 } else {
-                    // Approved → unapproved (also removes from queue if queued)
-                    Some(TuiCommand::UnapproveAndDequeue(id))
+                    // Approved → unapproved
+                    // For wait states, do not touch queue status or DynamicQueue.
+                    if matches!(
+                        change.queue_status,
+                        QueueStatus::MergeWait | QueueStatus::ResolveWait
+                    ) {
+                        Some(TuiCommand::UnapproveOnly(id))
+                    } else {
+                        Some(TuiCommand::UnapproveAndDequeue(id))
+                    }
                 }
             }
             AppMode::Stopping
@@ -2585,27 +2601,40 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle_approval_blocks_resolve_wait() {
-        // ResolveWait status should block @ key (toggle_approval)
+    fn test_toggle_approval_allows_resolve_wait_without_queue_change() {
+        // ResolveWait status should allow @ key to toggle approval without queue side effects
         let changes = vec![create_approved_change("resolve-wait-change", 5, 5)];
         let mut app = AppState::new(changes);
 
-        // Set change to ResolveWait status
+        app.mode = AppMode::Running;
         app.changes[0].queue_status = QueueStatus::ResolveWait;
 
         // Try to toggle approval
         let cmd = app.toggle_approval();
 
-        // Should be blocked
-        assert!(cmd.is_none());
-        assert!(app.warning_message.is_some());
-        assert!(app
-            .warning_message
-            .as_ref()
-            .unwrap()
-            .contains("Cannot change approval"));
-        // Approval status should remain unchanged
-        assert!(app.changes[0].is_approved);
+        assert!(
+            matches!(cmd, Some(TuiCommand::UnapproveOnly(ref id)) if id == "resolve-wait-change")
+        );
+        assert!(app.warning_message.is_none());
+        // AppState does not execute commands here; queue_status must remain ResolveWait.
+        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+    }
+
+    #[test]
+    fn test_toggle_approval_allows_merge_wait_without_queue_change() {
+        // MergeWait status should allow @ key to toggle approval without queue side effects
+        let changes = vec![create_approved_change("merge-wait-change", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+
+        let cmd = app.toggle_approval();
+        assert!(
+            matches!(cmd, Some(TuiCommand::UnapproveOnly(ref id)) if id == "merge-wait-change")
+        );
+        assert!(app.warning_message.is_none());
+        assert_eq!(app.changes[0].queue_status, QueueStatus::MergeWait);
     }
 
     #[test]

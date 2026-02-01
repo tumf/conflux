@@ -5,3 +5,8 @@
   - **Verify**: `src/tui/state/guards.rs`の`validate_change_toggleable`で`ResolveWait`のSpaceを許可しつつ、`QueueStatus`が変化しないことを確認する。
 - [x] 1.3 変更挙動に対応するユニットテストを追加/更新する。
   - **Verify**: `cargo test tui::state` または該当テストを実行し、`MergeWait`/`ResolveWait`のトグルが`selected`のみ変化することを確認する。
+
+- [x] 1.4 `MergeWait`/`ResolveWait`の@操作で承認状態のみトグルできるようにする（キュー状態とDynamicQueueは不変）。
+  - **Verify**: `src/tui/state/mod.rs`で`ResolveWait`をブロックしないこと、`src/tui/command_handlers.rs`でwait状態の承認/承認解除がキューへ副作用を持たないことを確認する。
+- [x] 1.5 変更挙動に対応するユニットテストを追加/更新する（wait状態の@操作）。
+  - **Verify**: `cargo test tui::state` で `ResolveWait`/`MergeWait`の@操作が `UnapproveOnly` を返すことを確認する。
