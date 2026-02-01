@@ -60,9 +60,6 @@ pub struct ChangeState {
     pub selected: bool,
     /// Whether this is a newly detected change
     pub is_new: bool,
-    /// Last modified timestamp
-    #[allow(dead_code)]
-    pub last_modified: String,
     /// Whether this change is approved for execution
     pub is_approved: bool,
     /// Whether this change is eligible for parallel execution
@@ -172,7 +169,6 @@ impl ChangeState {
             selected,
             is_new: false,
             queue_status: QueueStatus::NotQueued,
-            last_modified: change.last_modified.clone(),
             is_approved: change.is_approved,
             is_parallel_eligible: true,
             has_worktree: false,
@@ -188,21 +184,6 @@ impl ChangeState {
             return 0.0;
         }
         (self.completed_tasks as f32 / self.total_tasks as f32) * 100.0
-    }
-
-    /// Calculate progress ratio (0.0 to 1.0)
-    #[allow(dead_code)]
-    pub fn progress_ratio(&self) -> f64 {
-        if self.total_tasks == 0 {
-            return 0.0;
-        }
-        self.completed_tasks as f64 / self.total_tasks as f64
-    }
-
-    /// Check if all tasks are completed
-    #[allow(dead_code)]
-    pub fn is_complete(&self) -> bool {
-        self.completed_tasks == self.total_tasks && self.total_tasks > 0
     }
 }
 
@@ -2411,7 +2392,6 @@ mod tests {
             queue_status: QueueStatus::NotQueued,
             selected: false,
             is_new: false,
-            last_modified: "now".to_string(),
             is_approved: false,
             is_parallel_eligible: true,
             has_worktree: false,
@@ -2421,8 +2401,6 @@ mod tests {
         };
 
         assert_eq!(change.progress_percent(), 50.0);
-        assert_eq!(change.progress_ratio(), 0.5);
-        assert!(!change.is_complete());
     }
 
     #[test]
