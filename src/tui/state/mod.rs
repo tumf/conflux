@@ -2676,4 +2676,64 @@ mod tests {
         assert_eq!(app.changes.len(), 1);
         assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
     }
+
+    #[test]
+    fn test_tui_iteration_refresh_monotonic() {
+        // Test that iteration_number in TUI is monotonically increasing
+        // and never decreases during auto-refresh
+        let changes = vec![create_approved_change("test-change", 0, 5)];
+        let mut app = AppState::new(changes);
+
+        // Create shared orchestration state
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::new(vec!["test-change".to_string()], 0),
+        ));
+        app.set_shared_state(shared_state.clone());
+
+        // Initial state: no iteration_number
+        assert_eq!(app.changes[0].iteration_number, None);
+
+        // Simulate first apply: set apply_count to 3
+        {
+            let mut guard = shared_state.blocking_write();
+            guard.increment_apply_count("test-change");
+            guard.increment_apply_count("test-change");
+            guard.increment_apply_count("test-change");
+        }
+
+        // First refresh: should update to 3
+        let fetched_changes = vec![create_approved_change("test-change", 1, 5)];
+        app.update_changes(fetched_changes);
+        assert_eq!(app.changes[0].iteration_number, Some(3));
+
+        // Simulate apply_count temporarily decreasing to 2 (e.g., due to stale shared state read)
+        {
+            let mut guard = shared_state.blocking_write();
+            // Reset to 2 (simulating a race condition or stale read)
+            *guard = crate::orchestration::state::OrchestratorState::new(
+                vec!["test-change".to_string()],
+                0,
+            );
+            guard.increment_apply_count("test-change");
+            guard.increment_apply_count("test-change");
+        }
+
+        // Second refresh with lower apply_count: iteration_number should NOT decrease
+        let fetched_changes = vec![create_approved_change("test-change", 2, 5)];
+        app.update_changes(fetched_changes);
+        // Should still be 3 (monotonic increase guarantee)
+        assert_eq!(app.changes[0].iteration_number, Some(3));
+
+        // Simulate apply_count increasing to 4
+        {
+            let mut guard = shared_state.blocking_write();
+            guard.increment_apply_count("test-change");
+            guard.increment_apply_count("test-change");
+        }
+
+        // Third refresh with higher apply_count: should update to 4
+        let fetched_changes = vec![create_approved_change("test-change", 3, 5)];
+        app.update_changes(fetched_changes);
+        assert_eq!(app.changes[0].iteration_number, Some(4));
+    }
 }

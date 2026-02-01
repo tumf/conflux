@@ -5,7 +5,7 @@ Defines the TUI module structure and architectural patterns.
 ## Requirements
 ### Requirement: TUI Module Structure
 
-The TUI module SHALL be organized as a directory-based module tree under `src/tui/` with focused submodules. The TUI state layer MUST consume a shared orchestration state model for change progress and execution metadata, while UI-only fields (cursor, view modes, selection state) remain in TUI-owned state.
+The TUI module SHALL be organized as a directory-based module tree under `src/tui/` with focused submodules. The TUI state layer MUST consume a shared orchestration state model for change progress and execution metadata, while UI-only fields (cursor, view modes, selection state) remain in TUI-owned state. 共有オーケストレーション状態から取り込むイテレーション番号は、既存のTUI表示より小さい値で上書きしてはならない（MUST NOT）。必要に応じてより大きい値を保持し、表示が巻き戻らないようにしなければならない（MUST）。
 
 #### Scenario: Module directory exists
 - **WHEN** the project is compiled
@@ -28,6 +28,12 @@ The TUI module SHALL be organized as a directory-based module tree under `src/tu
 - **WHEN** change progress and execution metadata are required
 - **THEN** the data source is the shared orchestration state
 - **AND** UI-specific fields remain in TUI-owned state
+
+#### Scenario: Iteration number does not regress during refresh
+- **GIVEN** the TUI already displays `iteration_number=4` for a change
+- **AND** the shared orchestration state reports `apply_count=3`
+- **WHEN** the automatic refresh merges shared state into the TUI change list
+- **THEN** the TUI keeps `iteration_number=4`
 
 ### Requirement: Public API Stability
 
