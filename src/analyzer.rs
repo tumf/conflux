@@ -94,9 +94,34 @@ impl ParallelizationAnalyzer {
         }
         debug!("Analysis prompt: {}", prompt);
 
+        // Execute analysis command and collect output
+        let (full_output, status) = self
+            .execute_analysis_command(&prompt, changes, &mut on_output)
+            .await?;
+
+        // Parse and validate the output
+        let result = self.parse_and_validate_output(&full_output, &status, changes)?;
+
+        info!("Analysis complete: {} changes in order", result.order.len());
+        Ok(result)
+    }
+
+    /// Execute the analysis command with streaming output.
+    ///
+    /// Runs the AI command via AiCommandRunner, streams output to the callback,
+    /// and returns the full output string and exit status.
+    async fn execute_analysis_command<F>(
+        &self,
+        prompt: &str,
+        changes: &[Change],
+        on_output: &mut F,
+    ) -> Result<(String, std::process::ExitStatus)>
+    where
+        F: FnMut(String),
+    {
         // Call LLM for analysis with streaming output via AiCommandRunner
         let template = self.config.get_analyze_command()?;
-        let command = crate::config::OrchestratorConfig::expand_prompt(template, &prompt);
+        let command = crate::config::OrchestratorConfig::expand_prompt(template, prompt);
         let (mut child, mut rx) = self
             .ai_runner
             .execute_streaming_with_retry(&command, None)
@@ -123,8 +148,21 @@ impl ParallelizationAnalyzer {
             ))
         })?;
 
+        Ok((full_output, status))
+    }
+
+    /// Parse and validate the analysis output.
+    ///
+    /// Extracts JSON from stream-json format if applicable, validates the schema,
+    /// and checks the exit status. Returns the parsed AnalysisResult.
+    fn parse_and_validate_output(
+        &self,
+        full_output: &str,
+        status: &std::process::ExitStatus,
+        changes: &[Change],
+    ) -> Result<AnalysisResult> {
         // Extract result from stream-json format if applicable
-        let response = self.extract_stream_json_result(&full_output);
+        let response = self.extract_stream_json_result(full_output);
         debug!("LLM response: {}", response);
 
         // Parse JSON response with strict validation
@@ -150,7 +188,6 @@ impl ParallelizationAnalyzer {
             )));
         }
 
-        info!("Analysis complete: {} changes in order", result.order.len());
         Ok(result)
     }
 
