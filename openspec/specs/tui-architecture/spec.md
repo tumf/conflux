@@ -243,3 +243,24 @@ In auto-refresh processing, if 0/0 is returned from the active location, the arc
 - **WHEN** auto-refresh returns 0/0 from `parse_change_with_worktree_fallback`
 - **THEN** `parse_archived_change_with_worktree_fallback` is attempted
 - **AND** if still 0/0, the existing progress value is retained
+
+### Requirement: Active Change Input Lockout
+
+When `queue_status.is_active()` returns true for a change, Space (@/x) and @ operations MUST NOT be accepted.
+In this case, the selection state, approval state, `queue_status`, and DynamicQueue MUST NOT be modified.
+
+#### Scenario: Reject Space operation while is_active
+- **GIVEN** the TUI is in running mode
+- **AND** the cursor is on a change with `queue_status.is_active() == true`
+- **WHEN** the user presses Space
+- **THEN** the selection mark SHALL remain unchanged
+- **AND** the queue status SHALL remain unchanged
+- **AND** DynamicQueue SHALL NOT be modified
+
+#### Scenario: Reject @ operation while is_active
+- **GIVEN** the TUI is in running mode
+- **AND** the cursor is on a change with `queue_status.is_active() == true`
+- **WHEN** the user presses `@`
+- **THEN** the approval state SHALL remain unchanged
+- **AND** the queue status SHALL remain unchanged
+- **AND** DynamicQueue SHALL NOT be modified

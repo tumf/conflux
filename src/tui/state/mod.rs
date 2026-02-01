@@ -640,16 +640,14 @@ impl AppState {
             change.id, change.queue_status, change.is_approved, self.mode
         );
 
-        // Block approval toggle for processing changes, resolve wait, and merge wait
-        if matches!(
-            change.queue_status,
-            QueueStatus::Applying
-                | QueueStatus::Resolving
-                | QueueStatus::ResolveWait
-                | QueueStatus::MergeWait
-        ) {
-            self.warning_message = Some("Cannot change approval for processing change".to_string());
-            debug!("toggle_approval: blocked by Processing/Resolving/ResolveWait/MergeWait status");
+        // Block approval toggle for active (in-flight) changes
+        if change.queue_status.is_active() {
+            self.warning_message = Some(format!(
+                "Cannot change approval for change '{}' while it is {}",
+                change.id,
+                change.queue_status.display()
+            ));
+            debug!("toggle_approval: blocked by is_active status");
             return None;
         }
 
@@ -2675,6 +2673,128 @@ mod tests {
         // ResolveWait change should still be retained
         assert_eq!(app.changes.len(), 1);
         assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+    }
+
+    // === Tests for is_active guard blocking Space/@ operations ===
+
+    #[test]
+    fn test_toggle_selection_blocked_when_applying() {
+        // Test that Space is blocked when change is Applying (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Applying;
+
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("applying"));
+    }
+
+    #[test]
+    fn test_toggle_selection_blocked_when_accepting() {
+        // Test that Space is blocked when change is Accepting (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Accepting;
+
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("accepting"));
+    }
+
+    #[test]
+    fn test_toggle_selection_blocked_when_archiving() {
+        // Test that Space is blocked when change is Archiving (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Archiving;
+
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("archiving"));
+    }
+
+    #[test]
+    fn test_toggle_selection_blocked_when_resolving() {
+        // Test that Space is blocked when change is Resolving (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Resolving;
+
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("resolving"));
+    }
+
+    #[test]
+    fn test_toggle_approval_blocked_when_applying() {
+        // Test that @ is blocked when change is Applying (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Applying;
+
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("applying"));
+    }
+
+    #[test]
+    fn test_toggle_approval_blocked_when_accepting() {
+        // Test that @ is blocked when change is Accepting (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Accepting;
+
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("accepting"));
+    }
+
+    #[test]
+    fn test_toggle_approval_blocked_when_archiving() {
+        // Test that @ is blocked when change is Archiving (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Archiving;
+
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("archiving"));
+    }
+
+    #[test]
+    fn test_toggle_approval_blocked_when_resolving() {
+        // Test that @ is blocked when change is Resolving (is_active)
+        let changes = vec![create_approved_change("test", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.start_processing();
+        app.changes[0].queue_status = QueueStatus::Resolving;
+
+        let cmd = app.toggle_approval();
+        assert!(cmd.is_none());
+        assert!(app.warning_message.is_some());
+        assert!(app.warning_message.as_ref().unwrap().contains("resolving"));
     }
 
     #[test]
