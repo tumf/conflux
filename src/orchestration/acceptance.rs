@@ -25,7 +25,13 @@ pub fn build_acceptance_tail_findings(
         .unwrap_or_else(|| ACCEPTANCE_OUTPUT_FALLBACK.to_string());
     let lines = selected
         .lines()
-        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            let trimmed = line.trim();
+            // Filter out empty lines, ACCEPTANCE: markers, and FINDINGS: lines
+            !trimmed.is_empty()
+                && !trimmed.starts_with("ACCEPTANCE:")
+                && !trimmed.starts_with("FINDINGS:")
+        })
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
     if lines.is_empty() {
@@ -198,10 +204,15 @@ where
             output.on_info("Acceptance test: PASS");
             (AcceptanceResult::Pass, true)
         }
-        crate::acceptance::AcceptanceResult::Fail { findings } => {
+        crate::acceptance::AcceptanceResult::Fail { .. } => {
             info!("Acceptance test failed for: {}", change.id);
             output.on_warn("Acceptance test: FAIL");
-            (AcceptanceResult::Fail { findings }, false)
+            (
+                AcceptanceResult::Fail {
+                    findings: tail_findings.clone(),
+                },
+                false,
+            )
         }
         crate::acceptance::AcceptanceResult::Continue => {
             info!("Acceptance requires continuation for: {}", change.id);
@@ -267,5 +278,35 @@ mod tests {
         }
         .is_pass());
         assert!(!AcceptanceResult::Cancelled.is_pass());
+    }
+
+    #[test]
+    fn test_build_acceptance_tail_findings_filters_acceptance_marker() {
+        let findings = build_acceptance_tail_findings(
+            Some("line 1\nACCEPTANCE: FAIL\nline 2".to_string()),
+            None,
+        );
+
+        assert_eq!(findings, vec!["line 1", "line 2"]);
+    }
+
+    #[test]
+    fn test_build_acceptance_tail_findings_filters_findings_line() {
+        let findings = build_acceptance_tail_findings(
+            Some("error 1\nFINDINGS:\n- item 1\n- item 2".to_string()),
+            None,
+        );
+
+        assert_eq!(findings, vec!["error 1", "- item 1", "- item 2"]);
+    }
+
+    #[test]
+    fn test_build_acceptance_tail_findings_filters_both_markers() {
+        let findings = build_acceptance_tail_findings(
+            Some("ACCEPTANCE: FAIL\nFINDINGS:\nactual error\nanother line".to_string()),
+            None,
+        );
+
+        assert_eq!(findings, vec!["actual error", "another line"]);
     }
 }

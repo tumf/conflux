@@ -1694,7 +1694,7 @@ pub async fn execute_acceptance_in_workspace(
         ParseResult::Fail { .. } => {
             let findings_for_tasks = tail_findings.clone();
             info!(
-                "Acceptance failed for: {} with {} findings",
+                "Acceptance failed for: {} ({} tail lines)",
                 change_id,
                 findings_for_tasks.len()
             );
@@ -1719,7 +1719,7 @@ pub async fn execute_acceptance_in_workspace(
                 let _ = tx
                     .send(ParallelEvent::Log(
                         crate::events::LogEntry::warn(format!(
-                            "Acceptance test failed with {} findings",
+                            "Acceptance test failed ({} tail lines)",
                             findings_for_tasks.len()
                         ))
                         .with_change_id(change_id)
