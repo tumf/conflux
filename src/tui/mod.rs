@@ -15,7 +15,7 @@ mod qr;
 pub mod queue;
 mod render;
 mod runner;
-mod state;
+pub mod state;
 pub mod types;
 mod utils;
 
