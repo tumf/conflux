@@ -52,6 +52,50 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+/// Format a timestamp as relative time (e.g., "just now", "2m ago", "1d 12h ago")
+///
+/// - Less than 1 minute: "just now"
+/// - 1 minute or more: "<n><unit> ago" (e.g., "2m ago", "3h ago")
+/// - For times >= 1 minute: show up to 2 units (e.g., "1d 12h ago", "3h 20m ago")
+/// - Units are d (days), h (hours), m (minutes)
+/// - Values are truncated (no rounding up)
+fn format_relative_time(created_at: &chrono::DateTime<chrono::Utc>) -> String {
+    use chrono::Utc;
+
+    let now = Utc::now();
+    let duration = now.signed_duration_since(*created_at);
+    let total_seconds = duration.num_seconds();
+
+    // Less than 1 minute
+    if total_seconds < 60 {
+        return "just now".to_string();
+    }
+
+    let total_minutes = total_seconds / 60;
+    let total_hours = total_minutes / 60;
+    let total_days = total_hours / 24;
+
+    // Calculate up to 2 units
+    if total_days > 0 {
+        let remaining_hours = total_hours % 24;
+        if remaining_hours > 0 {
+            format!("{}d {}h ago", total_days, remaining_hours)
+        } else {
+            format!("{}d ago", total_days)
+        }
+    } else if total_hours > 0 {
+        let remaining_minutes = total_minutes % 60;
+        if remaining_minutes > 0 {
+            format!("{}h {}m ago", total_hours, remaining_minutes)
+        } else {
+            format!("{}h ago", total_hours)
+        }
+    } else {
+        // Only minutes
+        format!("{}m ago", total_minutes)
+    }
+}
+
 /// Spinner characters for processing animation (Braille dot pattern)
 pub const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -287,7 +331,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 Color::Gray
             };
 
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     format!("{} {} ", checkbox, cursor),
                     Style::default().fg(checkbox_color),
@@ -322,9 +366,50 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                     format!("  {:>5.1}%", change.progress_percent()),
                     Style::default().fg(Color::Cyan),
                 ),
-            ]);
+            ];
 
-            ListItem::new(line)
+            // Add log preview if available
+            if let Some(log) = app.get_latest_log_for_change(&change.id) {
+                // Calculate available width for log preview
+                // Fixed width elements: checkbox(3) + cursor(2) + id(25) + tasks(~12) + percent(8) = 50
+                // Leave some margin for badges and spacing
+                let base_width = 55;
+                let available = (area.width as usize).saturating_sub(base_width);
+
+                // Only show preview if available width >= 10 chars
+                if available >= 10 {
+                    // Format relative time
+                    let relative_time = format_relative_time(&log.created_at);
+
+                    // Build shortened header: [operation:iteration] or [operation]
+                    let header = match (&log.operation, log.iteration) {
+                        (Some(op), Some(iter)) => format!(" [{}:{}]", op, iter),
+                        (Some(op), None) => format!(" [{}]", op),
+                        (None, _) => String::new(),
+                    };
+
+                    // Combine relative time, header, and message
+                    let preview_text = if !header.is_empty() {
+                        format!(" {}{} {}", relative_time, header, log.message)
+                    } else {
+                        format!(" {} {}", relative_time, log.message)
+                    };
+
+                    // Truncate if necessary
+                    let truncated = if preview_text.len() > available {
+                        format!("{}…", &preview_text[..available.saturating_sub(1)])
+                    } else {
+                        preview_text
+                    };
+
+                    spans.push(Span::styled(
+                        truncated,
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
+
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -502,7 +587,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 "--".to_string()
             };
 
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     format!("{} {} ", checkbox, cursor),
                     Style::default().fg(checkbox_color),
@@ -541,9 +626,49 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                     format!("  {:>7}", elapsed_text),
                     Style::default().fg(dim_color),
                 ),
-            ]);
+            ];
 
-            ListItem::new(line)
+            // Add log preview if available
+            if let Some(log) = app.get_latest_log_for_change(&change.id) {
+                // Calculate available width for log preview
+                // Fixed width elements: checkbox(3) + cursor(2) + id(25) + status(18) + tasks(~7) + elapsed(9) = 64
+                let base_width = 70;
+                let available = (area.width as usize).saturating_sub(base_width);
+
+                // Only show preview if available width >= 10 chars
+                if available >= 10 {
+                    // Format relative time
+                    let relative_time = format_relative_time(&log.created_at);
+
+                    // Build shortened header: [operation:iteration] or [operation]
+                    let header = match (&log.operation, log.iteration) {
+                        (Some(op), Some(iter)) => format!(" [{}:{}]", op, iter),
+                        (Some(op), None) => format!(" [{}]", op),
+                        (None, _) => String::new(),
+                    };
+
+                    // Combine relative time, header, and message
+                    let preview_text = if !header.is_empty() {
+                        format!(" {}{} {}", relative_time, header, log.message)
+                    } else {
+                        format!(" {} {}", relative_time, log.message)
+                    };
+
+                    // Truncate if necessary
+                    let truncated = if preview_text.len() > available {
+                        format!("{}…", &preview_text[..available.saturating_sub(1)])
+                    } else {
+                        preview_text
+                    };
+
+                    spans.push(Span::styled(
+                        truncated,
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
+
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -713,38 +838,21 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             )];
 
-            // Add header with color if change_id or operation is present
-            // Format: [change_id:operation:iteration] or [change_id:operation] or [change_id]
-            //     or: [operation:iteration] or [operation] (when no change_id)
-            let _msg_width = if let Some(ref change_id) = entry.change_id {
-                // Use hash of change_id to pick a consistent color
-                let color_index = change_id
-                    .bytes()
-                    .fold(0usize, |acc, b| acc.wrapping_add(b as usize))
-                    % change_colors.len();
+            // Add header with shortened format (operation only, no change_id)
+            // Format: [operation:iteration] or [operation]
+            let _msg_width = if let Some(ref operation) = entry.operation {
+                // Use hash of change_id (if present) to pick a consistent color
+                let color_index = if let Some(ref change_id) = entry.change_id {
+                    change_id
+                        .bytes()
+                        .fold(0usize, |acc, b| acc.wrapping_add(b as usize))
+                        % change_colors.len()
+                } else {
+                    0
+                };
                 let prefix_color = change_colors[color_index];
 
-                // Build header with operation and iteration if present
-                let header = match (&entry.operation, entry.iteration) {
-                    (Some(op), Some(iter)) => format!("[{}:{}:{}] ", change_id, op, iter),
-                    (Some(op), None) => format!("[{}:{}] ", change_id, op),
-                    (None, _) => format!("[{}] ", change_id),
-                };
-
-                let header_len = header.len();
-                spans.push(Span::styled(
-                    header,
-                    Style::default()
-                        .fg(prefix_color)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                // Reduce available width by prefix length
-                available_width.saturating_sub(header_len)
-            } else if let Some(ref operation) = entry.operation {
-                // No change_id, but operation is present (e.g., analysis logs)
-                // Use a default color for operation-only headers
-                let prefix_color = Color::Cyan;
-
+                // Build shortened header with only operation and iteration
                 let header = match entry.iteration {
                     Some(iter) => format!("[{}:{}] ", operation, iter),
                     None => format!("[{}] ", operation),
@@ -1588,10 +1696,10 @@ mod tests {
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
 
-        // Should display [my-change:resolve:1] header
+        // Should display shortened [resolve:1] header (change_id omitted)
         assert!(
-            content.contains("[my-change:resolve:1]"),
-            "Buffer should contain '[my-change:resolve:1]' header, but got:\n{}",
+            content.contains("[resolve:1]"),
+            "Buffer should contain '[resolve:1]' header, but got:\n{}",
             content
         );
     }
@@ -1607,11 +1715,15 @@ mod tests {
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
 
-        // Should display [test-change] header
+        // Should display no header (change_id alone is not shown)
         assert!(
-            content.contains("[test-change]"),
-            "Buffer should contain '[test-change]' header, but got:\n{}",
-            content
+            content.contains("Processing change"),
+            "Buffer should contain log message"
+        );
+        // No header should be shown when there's no operation
+        assert!(
+            !content.contains("[test-change]"),
+            "Buffer should not contain header when only change_id is present"
         );
     }
 
@@ -1655,10 +1767,10 @@ mod tests {
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
 
-        // Should display [my-change:acceptance:3] header
+        // Should display shortened [acceptance:3] header (change_id omitted)
         assert!(
-            content.contains("[my-change:acceptance:3]"),
-            "Buffer should contain '[my-change:acceptance:3]' header, but got:\n{}",
+            content.contains("[acceptance:3]"),
+            "Buffer should contain '[acceptance:3]' header, but got:\n{}",
             content
         );
     }
@@ -1676,10 +1788,10 @@ mod tests {
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
 
-        // Should display [my-change:acceptance] header
+        // Should display shortened [acceptance] header (change_id omitted)
         assert!(
-            content.contains("[my-change:acceptance]"),
-            "Buffer should contain '[my-change:acceptance]' header, but got:\n{}",
+            content.contains("[acceptance]"),
+            "Buffer should contain '[acceptance]' header, but got:\n{}",
             content
         );
     }

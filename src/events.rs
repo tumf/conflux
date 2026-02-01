@@ -8,7 +8,7 @@
 
 use std::sync::OnceLock;
 
-use chrono::Local;
+use chrono::{Local, Utc};
 use ratatui::style::Color;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -28,8 +28,11 @@ pub enum LogLevel {
 /// Log entry for the TUI
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
-    /// Timestamp
+    /// Timestamp (formatted for display)
     pub timestamp: String,
+    /// Creation time (actual timestamp for relative time calculation)
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
     /// Log message
     pub message: String,
     /// Log level color (serialized as RGB string for web)
@@ -71,8 +74,11 @@ impl LogEntry {
     pub fn info(message: impl Into<String>) -> Self {
         let message = message.into();
         let message = sanitize_log_message(&message);
+        let now_local = Local::now();
+        let now_utc = Utc::now();
         Self {
-            timestamp: Local::now().format("%H:%M:%S").to_string(),
+            timestamp: now_local.format("%H:%M:%S").to_string(),
+            created_at: now_utc,
             message,
             color: Color::White,
             level: LogLevel::Info,
@@ -87,8 +93,11 @@ impl LogEntry {
     pub fn success(message: impl Into<String>) -> Self {
         let message = message.into();
         let message = sanitize_log_message(&message);
+        let now_local = Local::now();
+        let now_utc = Utc::now();
         Self {
-            timestamp: Local::now().format("%H:%M:%S").to_string(),
+            timestamp: now_local.format("%H:%M:%S").to_string(),
+            created_at: now_utc,
             message,
             color: Color::Green,
             level: LogLevel::Success,
@@ -103,8 +112,11 @@ impl LogEntry {
     pub fn warn(message: impl Into<String>) -> Self {
         let message = message.into();
         let message = sanitize_log_message(&message);
+        let now_local = Local::now();
+        let now_utc = Utc::now();
         Self {
-            timestamp: Local::now().format("%H:%M:%S").to_string(),
+            timestamp: now_local.format("%H:%M:%S").to_string(),
+            created_at: now_utc,
             message,
             color: Color::Yellow,
             level: LogLevel::Warn,
@@ -119,8 +131,11 @@ impl LogEntry {
     pub fn error(message: impl Into<String>) -> Self {
         let message = message.into();
         let message = sanitize_log_message(&message);
+        let now_local = Local::now();
+        let now_utc = Utc::now();
         Self {
-            timestamp: Local::now().format("%H:%M:%S").to_string(),
+            timestamp: now_local.format("%H:%M:%S").to_string(),
+            created_at: now_utc,
             message,
             color: Color::Red,
             level: LogLevel::Error,

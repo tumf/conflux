@@ -10,6 +10,17 @@ use tracing::{error, info, warn};
 pub const MAX_LOG_ENTRIES: usize = 1000;
 
 impl AppState {
+    /// Get the latest log entry for a specific change_id
+    ///
+    /// Returns the most recent log entry that matches the given change_id.
+    /// Used for displaying log previews in the change list.
+    pub fn get_latest_log_for_change(&self, change_id: &str) -> Option<&LogEntry> {
+        self.logs
+            .iter()
+            .rev()
+            .find(|entry| entry.change_id.as_deref() == Some(change_id))
+    }
+
     /// Add a log entry
     pub fn add_log(&mut self, entry: LogEntry) {
         // Send to tracing for debug file output (if --logs enabled)
@@ -128,8 +139,11 @@ mod tests {
                            rendered. This allows users to see all the diagnostic information \
                            without losing important details at the end of error messages.";
 
+        let now_local = chrono::Local::now();
+        let now_utc = chrono::Utc::now();
         let entry = LogEntry {
-            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+            timestamp: now_local.format("%H:%M:%S").to_string(),
+            created_at: now_utc,
             level: LogLevel::Error,
             message: long_message.to_string(),
             change_id: Some("test-change".to_string()),
@@ -167,8 +181,11 @@ mod tests {
                 )
             };
 
+            let now_local = chrono::Local::now();
+            let now_utc = chrono::Utc::now();
             let entry = LogEntry {
-                timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                timestamp: now_local.format("%H:%M:%S").to_string(),
+                created_at: now_utc,
                 level: LogLevel::Info,
                 message,
                 change_id: None,
