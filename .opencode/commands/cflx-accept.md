@@ -12,36 +12,6 @@ IMPORTANT:
 - Only review the specific change referenced by the provided change_id/paths.
 - Do NOT review or report on other changes in openspec/changes/.
 
-Parallel verification strategy (sub-agent approach):
-- If the Task tool is available, split independent verification checks into parallel sub-agents for faster execution:
-  1. Launch sub-agents (using Task tool) for each independent verification check (e.g., git clean check, task completion check, integration check, regression check)
-  2. Each sub-agent MUST:
-     - Receive the full context ($ARGUMENTS including change_id and paths)
-     - Apply the SAME scope constraints (only review the specified change_id/paths, do NOT review other changes)
-     - Return structured results in JSON format OR using clear headings with bullet-point findings (e.g., "## Check: <name>\nStatus: PASS/FAIL\nFindings:\n- <detail>")
-     - NOT output "ACCEPTANCE: PASS/FAIL/CONTINUE" (only the parent agent outputs the final verdict)
-  3. Parent agent (this prompt) MUST:
-     - Wait for all sub-agent results to complete
-     - Integrate all findings from sub-agents
-     - Output "ACCEPTANCE: PASS/FAIL/CONTINUE" exactly ONCE at the end based on the aggregated results
-- If the Task tool is NOT available, proceed with sequential verification (fallback mode):
-  1. Execute all verification checks sequentially in the order listed below
-  2. Collect all findings and output the final verdict once at the end
-
-Sub-agent output format requirements:
-- Each sub-agent MUST return results in a structured format for easy integration:
-  * Preferred: JSON with fields: `{"check": "<check_name>", "status": "PASS/FAIL", "findings": ["<finding1>", "<finding2>"]}`
-  * Alternative: Clear headings with bullet points:
-    ```
-    ## Check: <check_name>
-    Status: PASS/FAIL
-    Findings:
-    - <finding1 with file path and evidence>
-    - <finding2 with file path and evidence>
-    ```
-- Findings MUST include concrete evidence (file paths, function names, line numbers)
-- Findings MUST be actionable by the AI agent autonomously
-
 Review the implementation to verify it meets the specification requirements.
 
 External dependency policy (mock-first):
