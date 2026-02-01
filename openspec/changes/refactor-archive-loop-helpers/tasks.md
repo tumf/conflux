@@ -1,7 +1,23 @@
 ## 1. 実装
-- [ ] 1.1 archive ループのフック実行・コマンド実行・検証・履歴記録をヘルパー関数に分割する
-  - 検証: `src/execution/archive.rs` の `execute_archive_loop` がヘルパー関数を呼び出していることを確認する
-- [ ] 1.2 リトライ回数や履歴伝播が維持されていることを確認する
+- [x] 1.1 archive ループのフック実行・コマンド実行・検証・履歴記録をヘルパー関数に分割する
+  - 検証: `src/orchestration/archive.rs` の `archive_change_streaming` と `archive_change` がヘルパー関数を呼び出していることを確認する
+  - 完了: 以下のヘルパー関数を作成し、両方の関数から呼び出すよう変更した
+    - `run_pre_archive_hooks`: on_change_complete と pre_archive フックの実行
+    - `execute_archive_command_streaming`: ストリーミング出力を含むコマンド実行
+    - `handle_archive_wip_and_stall`: WIP コミット作成とストール検出
+    - `verify_and_record_archive`: アーカイブ完了の検証と履歴記録
+    - `clear_archive_history`: apply/archive 履歴のクリア
+    - `run_post_archive_hook`: post_archive フックの実行
+- [x] 1.2 リトライ回数や履歴伝播が維持されていることを確認する
   - 検証: `archive_change_streaming` の履歴が次回プロンプトに渡されるコード経路が残っていることを確認する
-- [ ] 1.3 リファクタリング後の挙動が維持されることを検証する
+  - 完了: 以下を確認した
+    - リトライロジックは `ARCHIVE_COMMAND_MAX_RETRIES` まで維持されている
+    - `agent.record_archive_attempt()` が全て同じパラメータ（change_id, status, start, error, stdout, stderr）で呼び出されている
+    - `clear_archive_history()` ヘルパーが `agent.clear_apply_history()` と `agent.clear_archive_history()` を呼び出している
+- [x] 1.3 リファクタリング後の挙動が維持されることを検証する
   - 検証: `cargo fmt && cargo clippy -- -D warnings && cargo test --bin cflx execution::archive::`
+  - 完了: 以下のコマンドを実行し、全て成功した
+    - `cargo fmt`: コードフォーマット完了
+    - `cargo clippy -- -D warnings`: 警告なしで成功
+    - `cargo test --bin cflx execution::archive::`: 28 テスト全て成功
+    - `cargo test --bin cflx orchestration::archive::`: 4 テスト全て成功
