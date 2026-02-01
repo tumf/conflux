@@ -130,6 +130,9 @@ This ensures quality gates are always enforced, even after interruptions.
 - The acceptance prompt for second and later attempts MUST include the updated file list (file paths only) since the previous acceptance attempt.
 - The acceptance prompt for second and later attempts MUST include the previous acceptance findings and instruct the agent to verify whether those findings are resolved.
 - The acceptance prompt for second and later attempts MUST instruct the agent to read relevant files as needed; it MUST NOT include diff content.
+- Acceptance failures SHALL record findings using stdout/stderr tail lines without parsing `FINDINGS:` structure.
+- Acceptance findings MUST exclude `ACCEPTANCE:` markers and the `FINDINGS:` header line from the recorded tail lines.
+- Acceptance FAIL logs MUST NOT label tail line counts as "findings"; if counts are shown, they MUST be labeled as tail lines.
 
 #### Scenario: Parallel acceptance retry narrows to updated files and prior findings
 - **GIVEN** a change completes an apply iteration successfully in parallel mode
@@ -138,6 +141,12 @@ This ensures quality gates are always enforced, even after interruptions.
 - **THEN** the acceptance prompt includes only the updated file list since the previous acceptance attempt (no diff content)
 - **AND** the acceptance prompt includes the prior acceptance findings for verification
 - **AND** the acceptance prompt instructs the agent to read files as needed to confirm fixes
+
+#### Scenario: Parallel acceptance failure logging uses tail lines
+- **GIVEN** acceptance output tail includes `ACCEPTANCE: FAIL` and `FINDINGS:` lines
+- **WHEN** the orchestrator records the acceptance failure
+- **THEN** the recorded findings exclude the acceptance markers and `FINDINGS:` header
+- **AND** logs do not report "N findings" based on tail line count
 
 ### Requirement: Parallel apply runs in worktree
 parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。
