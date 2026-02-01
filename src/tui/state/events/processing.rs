@@ -212,6 +212,18 @@ mod tests {
     }
 
     #[test]
+    fn test_all_completed_preserves_stopped_mode() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Stopped;
+        app.handle_all_completed();
+
+        // Should remain in Stopped mode (not transition to Select)
+        assert_eq!(app.mode, AppMode::Stopped);
+    }
+
+    #[test]
     fn test_stopped_resets_queue_status() {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
