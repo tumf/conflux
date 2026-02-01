@@ -574,9 +574,12 @@ impl AppState {
             return None;
         }
 
-        let change = &self.changes[self.cursor_index];
+        let change = &mut self.changes[self.cursor_index];
         if matches!(change.queue_status, QueueStatus::MergeWait) {
-            Some(TuiCommand::ResolveMerge(change.id.clone()))
+            let change_id = change.id.clone();
+            // Transition to ResolveWait immediately after M key press
+            change.queue_status = QueueStatus::ResolveWait;
+            Some(TuiCommand::ResolveMerge(change_id))
         } else {
             None
         }
@@ -637,13 +640,16 @@ impl AppState {
             change.id, change.queue_status, change.is_approved, self.mode
         );
 
-        // Block approval toggle for processing changes and resolve wait
+        // Block approval toggle for processing changes, resolve wait, and merge wait
         if matches!(
             change.queue_status,
-            QueueStatus::Applying | QueueStatus::Resolving
+            QueueStatus::Applying
+                | QueueStatus::Resolving
+                | QueueStatus::ResolveWait
+                | QueueStatus::MergeWait
         ) {
             self.warning_message = Some("Cannot change approval for processing change".to_string());
-            debug!("toggle_approval: blocked by Processing/Resolving status");
+            debug!("toggle_approval: blocked by Processing/Resolving/ResolveWait/MergeWait status");
             return None;
         }
 

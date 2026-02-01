@@ -71,10 +71,18 @@ impl AppState {
             return None;
         }
 
+        // Exclude MergeWait and ResolveWait from StartProcessing
+        // These changes require explicit resolve operation (M key)
         let selected: Vec<String> = self
             .changes
             .iter()
-            .filter(|c| c.selected)
+            .filter(|c| {
+                c.selected
+                    && !matches!(
+                        c.queue_status,
+                        QueueStatus::MergeWait | QueueStatus::ResolveWait
+                    )
+            })
             .map(|c| c.id.clone())
             .collect();
 
@@ -82,7 +90,14 @@ impl AppState {
             let ineligible: Vec<String> = self
                 .changes
                 .iter()
-                .filter(|c| c.selected && !c.is_parallel_eligible)
+                .filter(|c| {
+                    c.selected
+                        && !c.is_parallel_eligible
+                        && !matches!(
+                            c.queue_status,
+                            QueueStatus::MergeWait | QueueStatus::ResolveWait
+                        )
+                })
                 .map(|c| c.id.clone())
                 .collect();
             if !ineligible.is_empty() {
@@ -99,9 +114,14 @@ impl AppState {
             return None;
         }
 
-        // Mark selected changes as queued
+        // Mark selected changes as queued (excluding MergeWait/ResolveWait)
         for change in &mut self.changes {
-            if change.selected {
+            if change.selected
+                && !matches!(
+                    change.queue_status,
+                    QueueStatus::MergeWait | QueueStatus::ResolveWait
+                )
+            {
                 change.queue_status = QueueStatus::Queued;
             }
         }
