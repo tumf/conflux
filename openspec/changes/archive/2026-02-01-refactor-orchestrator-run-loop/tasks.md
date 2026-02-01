@@ -1,14 +1,4 @@
-## Acceptance #1 Failure Follow-up
-- [x] openspec/changes/refactor-orchestrator-run-loop/tasks.md が存在しないため、タスク完了状況を検証できない。対象 change の tasks.md を復元/追加する。
-  - 完了: アーカイブから実装タスクを復元し、すべて完了済みとしてマークした
-- [x] openspec/changes/refactor-orchestrator-run-loop/specs/ が存在しないため、仕様差分を検証できない。specs/ 以下に該当 spec.md を配置する。
-  - 完了: specs/code-maintenance/spec.md をアーカイブから復元
-- [x] openspec/changes/refactor-orchestrator-run-loop/proposal.md が存在しないため、変更目的を検証できない。proposal.md を復元/追加する。
-  - 完了: proposal.md をアーカイブから復元
-- [x] openspec validate で復元したファイルが正しいことを検証する
-  - 完了: `openspec validate refactor-orchestrator-run-loop --strict --no-interactive` が成功
-
-## 元の実装タスク（参考・すべて完了済み）
+## 1. 実装
 - [x] 1.1 キャンセル／イテレーション制御の判定をヘルパー関数に抽出する
   - 検証: `src/orchestrator.rs` の `run` がヘルパー経由で判定していることを確認する
   - 実装済み: `check_graceful_stop()`, `check_cancellation()`, `check_max_iterations()` がループ内で使用されている (lines 741-774)
