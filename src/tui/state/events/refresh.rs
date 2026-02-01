@@ -19,7 +19,7 @@ impl AppState {
         worktree_change_ids: HashSet<String>,
         worktree_paths: HashMap<String, PathBuf>,
         worktree_not_ahead_ids: HashSet<String>,
-        resolve_wait_ids: HashSet<String>,
+        merge_wait_ids: HashSet<String>,
     ) {
         self.worktree_paths = worktree_paths;
         self.update_changes(changes);
@@ -27,8 +27,8 @@ impl AppState {
         self.apply_worktree_status(&worktree_change_ids);
         // Auto-clear MergeWait for changes whose worktrees don't exist or are not ahead
         self.auto_clear_merge_wait(&worktree_change_ids, &worktree_not_ahead_ids);
-        // Apply ResolveWait status for archived changes waiting for resolve
-        self.apply_resolve_wait_status(&resolve_wait_ids);
+        // Apply MergeWait status for archived changes waiting for merge
+        self.apply_merge_wait_status(&merge_wait_ids);
     }
 
     /// Handle WorktreesRefreshed event
