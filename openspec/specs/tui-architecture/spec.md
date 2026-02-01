@@ -103,7 +103,7 @@ However, for `ResolveWait`/`MergeWait` rows, the following SHALL be satisfied:
 - Space operation SHALL toggle only the execution mark (`selected`) and MUST NOT modify `queue_status` or DynamicQueue.
 - @ operation SHALL toggle only the approval state (`is_approved`) and MUST NOT modify `queue_status` or DynamicQueue. If unapproval results in an unapproved state, `selected` MUST be cleared.
 
-The TUI MUST display `ResolveWait` as `resolve wait` to clearly indicate it is not a target for queue operations.
+The TUI MUST display `ResolveWait` as `resolve pending` to clearly indicate it is not a target for queue operations.
 
 #### Scenario: Remove from queue by unapprove
 - **WHEN** the user unapproves a queued change with the @ key

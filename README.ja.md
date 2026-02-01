@@ -63,7 +63,7 @@ TUIの機能:
 | `[queued]` | 実行待ち |
 | `[blocked]` | 依存関係待ち（解消するまで開始しない） |
 | `[merge wait]` | マージ待ち（Mでresolveをトリガー） |
-| `[resolve wait]` | resolve実行待ち（操作ロックされる） |
+| `[resolve pending]` | resolve実行開始待ち（操作ロックされる） |
 | `[applying]` | 適用中（スピナー表示 + 進捗% / iteration を併記） |
 | `[accepting]` | 受け入れ/テスト中（スピナー表示、iterationがあれば併記） |
 | `[archiving]` | アーカイブ中（スピナー表示、iterationがあれば併記） |
