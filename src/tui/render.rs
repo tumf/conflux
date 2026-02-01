@@ -398,8 +398,8 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
 
                 // Only show preview if available width >= 10 chars
                 if available >= 10 {
-                    // Format relative time
-                    let relative_time = format_relative_time(&log.created_at);
+                    // Format relative time with parentheses
+                    let relative_time = format!("({})", format_relative_time(&log.created_at));
 
                     // Build shortened header: [operation:iteration] or [operation]
                     let header = match (&log.operation, log.iteration) {
@@ -422,10 +422,14 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                         preview_text
                     };
 
-                    spans.push(Span::styled(
-                        truncated,
-                        Style::default().fg(Color::DarkGray),
-                    ));
+                    // Use brighter color for selected row to ensure visibility on DarkGray background
+                    let preview_color = if is_selected_row {
+                        Color::Gray
+                    } else {
+                        Color::DarkGray
+                    };
+
+                    spans.push(Span::styled(truncated, Style::default().fg(preview_color)));
                 }
             }
 
@@ -680,8 +684,8 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
                 // Only show preview if available width >= 10 chars
                 if available >= 10 {
-                    // Format relative time
-                    let relative_time = format_relative_time(&log.created_at);
+                    // Format relative time with parentheses
+                    let relative_time = format!("({})", format_relative_time(&log.created_at));
 
                     // Build shortened header: [operation:iteration] or [operation]
                     let header = match (&log.operation, log.iteration) {
@@ -704,10 +708,14 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                         preview_text
                     };
 
-                    spans.push(Span::styled(
-                        truncated,
-                        Style::default().fg(Color::DarkGray),
-                    ));
+                    // Use brighter color for selected row to ensure visibility on DarkGray background
+                    let preview_color = if is_selected_row {
+                        Color::Gray
+                    } else {
+                        Color::DarkGray
+                    };
+
+                    spans.push(Span::styled(truncated, Style::default().fg(preview_color)));
                 }
             }
 
