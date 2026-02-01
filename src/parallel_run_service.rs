@@ -192,6 +192,44 @@ impl ParallelRunService {
         Ok((committed, skipped))
     }
 
+    /// Prepare changes for parallel execution: filter committed changes and send warning event if needed.
+    ///
+    /// This helper consolidates the preparation logic shared across multiple execution paths:
+    /// 1. Filters changes to only include those committed to the repository
+    /// 2. Sends a warning event if uncommitted changes are skipped (before any state update)
+    /// 3. Returns the filtered changes, or None if no committed changes remain
+    ///
+    /// The event is sent synchronously before returning to maintain proper event ordering.
+    async fn prepare_parallel_execution(
+        &self,
+        changes: Vec<Change>,
+        event_tx: &mpsc::Sender<ParallelEvent>,
+    ) -> Result<Option<Vec<Change>>> {
+        let (changes, skipped) = self.filter_committed_changes(changes).await?;
+
+        // Send warning event BEFORE any state update to maintain event order
+        if !skipped.is_empty() {
+            let message = format!(
+                "Skipping uncommitted changes in parallel mode: {}",
+                skipped.join(", ")
+            );
+            warn!("{}", message);
+            let _ = event_tx
+                .send(ParallelEvent::Warning {
+                    title: "Uncommitted changes skipped".to_string(),
+                    message,
+                })
+                .await;
+        }
+
+        if changes.is_empty() {
+            info!("No committed changes available for parallel execution");
+            return Ok(None);
+        }
+
+        Ok(Some(changes))
+    }
+
     /// Run parallel execution with an event callback
     ///
     /// The event_handler receives ParallelEvents as they occur during execution.
@@ -209,32 +247,19 @@ impl ParallelRunService {
     where
         F: Fn(ParallelEvent) + Send + Sync + 'static,
     {
-        let (changes, skipped) = self.filter_committed_changes(changes).await?;
+        // Create event channel
+        let (event_tx, mut event_rx) = mpsc::channel::<ParallelEvent>(100);
 
-        if !skipped.is_empty() {
-            let message = format!(
-                "Skipping uncommitted changes in parallel mode: {}",
-                skipped.join(", ")
-            );
-            warn!("{}", message);
-            event_handler(ParallelEvent::Warning {
-                title: "Uncommitted changes skipped".to_string(),
-                message,
-            });
-        }
-
-        if changes.is_empty() {
-            info!("No committed changes available for parallel execution");
-            return Ok(());
-        }
+        // Prepare changes using the common helper (sends warning event if needed)
+        let changes = match self.prepare_parallel_execution(changes, &event_tx).await? {
+            Some(changes) => changes,
+            None => return Ok(()),
+        };
 
         info!(
             "Starting parallel execution with re-analysis for {} changes",
             changes.len()
         );
-
-        // Create event channel
-        let (event_tx, mut event_rx) = mpsc::channel::<ParallelEvent>(100);
 
         // Spawn event forwarding task
         let forward_handle = tokio::spawn(async move {
@@ -340,26 +365,11 @@ impl ParallelRunService {
         changes: Vec<Change>,
         event_tx: mpsc::Sender<ParallelEvent>,
     ) -> Result<()> {
-        let (changes, skipped) = self.filter_committed_changes(changes).await?;
-
-        if !skipped.is_empty() {
-            let message = format!(
-                "Skipping uncommitted changes in parallel mode: {}",
-                skipped.join(", ")
-            );
-            warn!("{}", message);
-            let _ = event_tx
-                .send(ParallelEvent::Warning {
-                    title: "Uncommitted changes skipped".to_string(),
-                    message,
-                })
-                .await;
-        }
-
-        if changes.is_empty() {
-            info!("No committed changes available for parallel execution");
-            return Ok(());
-        }
+        // Prepare changes using the common helper (sends warning event if needed)
+        let changes = match self.prepare_parallel_execution(changes, &event_tx).await? {
+            Some(changes) => changes,
+            None => return Ok(()),
+        };
 
         info!(
             "Starting order-based parallel execution with re-analysis for {} changes",
