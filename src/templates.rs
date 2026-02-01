@@ -33,6 +33,12 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // Note: A hardcoded acceptance prompt is always prepended before this value
   "acceptance_prompt": "",
 
+  // Controls how the acceptance `{prompt}` is constructed.
+  // - full: include hardcoded acceptance system prompt + diff/history context
+  // - context_only: only include change metadata + diff/history context
+  // Use context_only when the fixed acceptance instructions live in a separate command template.
+  "acceptance_prompt_mode": "context_only",
+
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
 
@@ -112,7 +118,7 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // - full: include hardcoded acceptance system prompt + diff/history context
   // - context_only: only include change metadata + diff/history context
   // Use context_only when the fixed acceptance instructions live in the OpenCode command template.
-  // "acceptance_prompt_mode": "full",
+  "acceptance_prompt_mode": "context_only",
 
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
@@ -188,6 +194,12 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // System prompt for acceptance command (injected into {prompt} placeholder)
   // Note: A hardcoded acceptance prompt is always prepended before this value
   "acceptance_prompt": "",
+
+  // Controls how the acceptance `{prompt}` is constructed.
+  // - full: include hardcoded acceptance system prompt + diff/history context
+  // - context_only: only include change metadata + diff/history context
+  // Use context_only when the fixed acceptance instructions live in a separate command template.
+  "acceptance_prompt_mode": "context_only",
 
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
