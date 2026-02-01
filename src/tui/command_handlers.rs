@@ -656,6 +656,16 @@ pub async fn handle_tui_command(
                     Ok(None) => {}
                 }
 
+                // Transition ResolveWait -> Resolving once the resolve task actually begins.
+                // We intentionally send a ResolveStarted event here so the TUI shows "resolving"
+                // immediately, even when the merge completes without conflicts (no AI resolve command).
+                let _ = resolve_tx
+                    .send(OrchestratorEvent::ResolveStarted {
+                        change_id: id.clone(),
+                        command: format!("resolve_deferred_merge {}", id),
+                    })
+                    .await;
+
                 match crate::parallel::resolve_deferred_merge(
                     resolve_repo_root.clone(),
                     resolve_config.clone(),

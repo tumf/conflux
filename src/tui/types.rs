@@ -90,7 +90,7 @@ impl QueueStatus {
             QueueStatus::Merged => "merged",
             QueueStatus::MergeWait => "merge wait",
             QueueStatus::Resolving => "resolving",
-            QueueStatus::ResolveWait => "resolve wait",
+            QueueStatus::ResolveWait => "resolve pending",
             QueueStatus::Error(_) => "error",
         }
     }
@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(QueueStatus::Merged.display(), "merged");
         assert_eq!(QueueStatus::MergeWait.display(), "merge wait");
         assert_eq!(QueueStatus::Resolving.display(), "resolving");
-        assert_eq!(QueueStatus::ResolveWait.display(), "resolve wait");
+        assert_eq!(QueueStatus::ResolveWait.display(), "resolve pending");
         assert_eq!(QueueStatus::Error("err".to_string()).display(), "error");
     }
 
