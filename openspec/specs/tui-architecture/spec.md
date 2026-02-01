@@ -22,6 +22,8 @@ The TUI module SHALL be organized as a directory-based module tree under `src/tu
 - **AND** `runner.rs` contains only the main TUI loop
 - **AND** `queue.rs` contains only DynamicQueue implementation
 - **AND** `utils.rs` contains only utility functions
+- **AND** `terminal.rs` contains only terminal execution helpers
+- **AND** `worktrees.rs` contains only worktree-related helpers
 
 #### Scenario: Change progress uses shared state
 - **GIVEN** the TUI state layer builds the change list for rendering
