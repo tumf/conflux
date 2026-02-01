@@ -59,35 +59,50 @@ TUIの機能:
 **キュー状態（Runningモードで表示）:**
 | 状態 | 説明 |
 |------|------|
-| `[Queued]` | 処理待ち |
-| `[Processing]` | 処理中 |
-| `[Completed]` | 全タスク完了 |
-| `[Archived]` | アーカイブ済み |
-| `[Error]` | 処理失敗 |
+| `[not queued]` | 実行キュー外（Running中に動的に外す/追加する対象） |
+| `[queued]` | 実行待ち |
+| `[blocked]` | 依存関係待ち（解消するまで開始しない） |
+| `[merge wait]` | マージ待ち（Mでresolveをトリガー） |
+| `[resolve wait]` | resolve実行待ち（操作ロックされる） |
+| `[applying]` | 適用中（スピナー表示 + 進捗% / iteration を併記） |
+| `[accepting]` | 受け入れ/テスト中（スピナー表示、iterationがあれば併記） |
+| `[archiving]` | アーカイブ中（スピナー表示、iterationがあれば併記） |
+| `[resolving]` | resolve中（スピナー表示、iterationがあれば併記） |
+| `[archived]` | アーカイブ完了 |
+| `[merged]` | mainにマージ済み（並列モードのみ） |
+| `[error]` | 処理失敗 |
 
 **ワークフロー:**
-1. **Selectモード**: `@`で変更を承認、`Space`で選択（予約）
-2. `F5`で処理開始 - 選択されたすべての変更が`[Queued]`になる
-3. **Runningモード**: Queued → Processing → Completed → Archived の進捗を監視
+1. **Selectモード（ヘッダーは`[Ready]`）**: `@`で承認、`Space`で実行マーク（selected）の切替（この時点では即時キュー投入しない）
+2. `F5`で処理開始 - 実行マークされた変更の`queue_status`が`queued`になる
+3. **Runningモード（ヘッダーは`[Running N]`）**: `queued` → `applying` → （必要に応じて`accepting`）→ `archiving` → `archived`（並列モードでは`merge wait`/`resolving`/`merged`も発生）
+
+#### ヘッダー表示
+
+| 表示 | 意味 |
+|------|------|
+| `[Ready]` | 選択操作中（`AppMode::Select`） |
+| `[Running N]` | 実行中（`applying`/`accepting`/`archiving`/`resolving` の件数が N） |
 
 #### TUIキーバインド
 
 **Changesビュー:**
 
-| キー | Selectモード | Runningモード |
-|------|--------------|---------------|
-| `↑/↓` または `j/k` | リスト移動 | リスト移動 |
-| `Tab` | Worktreesビューに切替 | Worktreesビューに切替 |
-| `Space` | 選択切替 | キュー追加/削除 |
-| `@` | 承認切替 | 承認切替 |
-| `e` | エディタを開く | エディタを開く |
-| `+` | 新規提案 | 新規提案 |
-| `w` | QRコード表示* | QRコード表示* |
-| `F5` | 処理開始 | - |
-| `=` | パラレルモード切替 | - |
-| `Esc` | - | 停止（穏やか/強制） |
-| `q` | 終了 | 終了 |
-| `PageUp/Down` | - | ログスクロール |
+| キー | Select（`[Ready]`） | Running（/Stopping） | Stopped（/Error） |
+|------|-------------------|--------------------|------------------|
+| `↑/↓` または `j/k` | リスト移動 | リスト移動 | リスト移動 |
+| `Tab` | Worktreesビューに切替 | Worktreesビューに切替 | Worktreesビューに切替 |
+| `Space` | 実行マーク（selected）切替のみ | 動的キュー追加/削除（`not queued`⇄`queued`） | `not queued` の項目のみ実行マーク切替 |
+| `@` | 承認切替 | 承認切替 | 承認切替 |
+| `e` | エディタを開く | エディタを開く | エディタを開く |
+| `w` | QRコード表示* | QRコード表示* | QRコード表示* |
+| `M` | `merge wait` の場合のみresolve | `merge wait` の場合のみresolve | `merge wait` の場合のみresolve |
+| `F5` | 処理開始 | （Stopping中は停止キャンセル） | 再開（Stopped）/リトライ（Error） |
+| `=` | パラレルモード切替 | - | パラレルモード切替 |
+| `Esc` | - | 停止（1回=穏やか、2回=強制） | - |
+| `PageUp/Down` | （ログ表示時）ログスクロール | ログスクロール | ログスクロール |
+| `Home/End` | （ログ表示時）先頭/末尾へ | 先頭/末尾へ | 先頭/末尾へ |
+| `Ctrl+C` | 終了 | 終了 | 終了 |
 
 **Worktreesビュー:**
 
@@ -99,17 +114,10 @@ TUIの機能:
 | `D` | worktreeを削除 | メイン以外・処理中でないworktreeを削除 |
 | `M` | ベースブランチにマージ | 現在のworktreeブランチをマージ（コンフリクトがない場合のみ） |
 | `e` | エディタを開く | worktreeディレクトリでエディタを開く |
-| `Enter` | シェルを開く | worktreeで`worktree_command`を実行 |
-| `q` | 終了 | アプリケーション終了 |
+| `Enter` | シェルを開く | `worktree_command`が設定されている場合のみ実行 |
+| `Ctrl+C` | 終了 | アプリケーション終了 |
 
 *QRコードはWeb監視が有効な場合のみ利用可能です（`--web`フラグ）。任意のキーでQRポップアップを閉じます。
-
-**Proposalモード:**
-
-| キー | アクション |
-|------|------------|
-| `Ctrl+S` | 提案を送信 |
-| `Esc` | キャンセルして戻る |
 
 ### TUI Worktreeビュー
 
