@@ -103,6 +103,8 @@ Context information MUST include:
 - Change ID (when the error is related to a specific change)
 - Workspace path or working directory (when available and relevant)
 - Failure reason or error details (when available)
+- 実行コマンド（program + args、利用可能な場合）
+- stderr/stdout（取得できた場合）
 
 #### Scenario: Apply Operation Failure with Context
 
@@ -125,6 +127,14 @@ Context information MUST include:
 - **WHEN** the internal error is recorded
 - **THEN** the error message includes the command that was being executed
 - **AND** the error message includes the working directory where the command was running
+
+#### Scenario: VCS command failure includes stderr and command
+
+- **GIVEN** a VCS command fails with stderr output
+- **WHEN** the orchestrator records the error
+- **THEN** the error message includes the full command (program + args)
+- **AND** the error message includes the working directory when available
+- **AND** the error message includes the captured stderr (and stdout if available)
 
 #### Scenario: TUI and Log Message Consistency
 

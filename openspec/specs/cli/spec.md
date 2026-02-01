@@ -1561,3 +1561,4 @@ TUIは選択中worktreeを削除する操作を提供し、削除前に確認を
 - **AND** worktree一覧が空である
 - **WHEN** WorktreesビューでDキーを押す
 - **THEN** 何も起こらない
+| `[resolve pending]` | resolve実行開始待ち（操作ロックされる） |
