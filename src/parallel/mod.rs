@@ -3861,7 +3861,7 @@ Requirements:\n\
         change_ids: &[String],
         archive_paths: &[PathBuf],
     ) -> Result<MergeAttempt> {
-        use crate::execution::archive::verify_archive_completion;
+        use crate::execution::archive::is_archive_commit_complete;
 
         let _merge_guard = global_merge_lock().lock().await;
         if let Some(reason) = merge::base_dirty_reason(&self.repo_root).await? {
@@ -3878,15 +3878,27 @@ Requirements:\n\
 
         // Verify that all changes are actually archived before attempting merge
         for (change_id, archive_path) in change_ids.iter().zip(archive_paths.iter()) {
-            let verification = verify_archive_completion(change_id, Some(archive_path));
-            if !verification.is_success() {
-                let reason = format!(
-                    "Archive verification failed for '{}': change directory still exists in openspec/changes/. \
-                     The change was not properly archived and cannot be merged.",
-                    change_id
-                );
-                warn!("{}", reason);
-                return Ok(MergeAttempt::Deferred(reason));
+            match is_archive_commit_complete(change_id, Some(archive_path)).await {
+                Ok(true) => {
+                    // Archive is complete, continue
+                }
+                Ok(false) => {
+                    // Archive is incomplete, defer merge with detailed reason
+                    let reason = format!(
+                        "Archive incomplete for '{}': worktree may be dirty, openspec/changes/{} may still exist, or archive entry may be missing",
+                        change_id, change_id
+                    );
+                    warn!("{}", reason);
+                    return Ok(MergeAttempt::Deferred(reason));
+                }
+                Err(e) => {
+                    let reason = format!(
+                        "Failed to verify archive completion for '{}': {}",
+                        change_id, e
+                    );
+                    warn!("{}", reason);
+                    return Ok(MergeAttempt::Deferred(reason));
+                }
             }
         }
 
