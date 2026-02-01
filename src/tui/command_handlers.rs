@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use super::runner::load_worktrees_with_conflict_check;
+use super::worktree_helpers::load_worktrees_with_conflict_check;
 
 /// Context for TuiCommand handling
 pub struct TuiCommandContext<'a> {
