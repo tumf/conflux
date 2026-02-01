@@ -85,6 +85,47 @@ pub fn launch_editor_in_dir(dir_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Truncate a string to fit within a specified display width with a custom suffix.
+///
+/// This function respects Unicode character display widths, where CJK characters
+/// (e.g., Japanese, Chinese) typically occupy 2 terminal columns, while ASCII
+/// characters occupy 1 column. It ensures that character boundaries are not broken,
+/// preventing panics on multi-byte UTF-8 characters.
+///
+/// # Arguments
+/// * `s` - The string to truncate
+/// * `max_width` - The maximum display width in terminal columns
+/// * `suffix` - The suffix to append if truncation occurred (e.g., "...", "…")
+///
+/// # Returns
+/// A truncated string with the custom suffix appended if truncation occurred
+pub fn truncate_to_display_width_with_suffix(s: &str, max_width: usize, suffix: &str) -> String {
+    let display_width = s.width();
+    if display_width <= max_width {
+        return s.to_string();
+    }
+
+    // Calculate suffix width
+    let suffix_width = suffix.width();
+
+    // Reserve space for suffix
+    let target_width = max_width.saturating_sub(suffix_width);
+    let mut result = String::new();
+    let mut current_width = 0;
+
+    for ch in s.chars() {
+        let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width + char_width > target_width {
+            break;
+        }
+        result.push(ch);
+        current_width += char_width;
+    }
+
+    result.push_str(suffix);
+    result
+}
+
 /// Truncate a string to fit within a specified display width.
 ///
 /// This function respects Unicode character display widths, where CJK characters
@@ -99,27 +140,7 @@ pub fn launch_editor_in_dir(dir_path: &str) -> Result<()> {
 /// A truncated string with "..." appended if truncation occurred
 #[allow(dead_code)]
 pub fn truncate_to_display_width(s: &str, max_width: usize) -> String {
-    let display_width = s.width();
-    if display_width <= max_width {
-        return s.to_string();
-    }
-
-    // Reserve space for "..." (3 columns)
-    let target_width = max_width.saturating_sub(3);
-    let mut result = String::new();
-    let mut current_width = 0;
-
-    for ch in s.chars() {
-        let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if current_width + char_width > target_width {
-            break;
-        }
-        result.push(ch);
-        current_width += char_width;
-    }
-
-    result.push_str("...");
-    result
+    truncate_to_display_width_with_suffix(s, max_width, "...")
 }
 
 /// Clear the terminal screen
