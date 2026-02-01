@@ -109,6 +109,15 @@ impl AppState {
         self.log_scroll_offset = 0;
         self.log_auto_scroll = true;
     }
+
+    /// Get the last log entry for a specific change
+    /// Returns the most recent log entry that has the given change_id
+    pub fn get_last_log_for_change(&self, change_id: &str) -> Option<&LogEntry> {
+        self.logs
+            .iter()
+            .rev()
+            .find(|entry| entry.change_id.as_deref() == Some(change_id))
+    }
 }
 
 #[cfg(test)]

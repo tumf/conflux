@@ -226,6 +226,12 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
 
 /// Render changes list in selection mode
 fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect) {
+    // Calculate available width for log preview (subtract borders)
+    let total_width = area.width.saturating_sub(2) as usize;
+    // Fixed width components: checkbox(3) + space + cursor(1) + space + name(25) + badges(~15) + tasks(~12) + progress(~8)
+    let fixed_width: usize = 3 + 1 + 1 + 1 + 25 + 15 + 12 + 8;
+    let log_preview_width = total_width.saturating_sub(fixed_width + 3); // +3 for " │ " separator
+
     let items: Vec<ListItem> = app
         .changes
         .iter()
@@ -287,6 +293,36 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 Color::Gray
             };
 
+            // Get last log for this change and format preview
+            let log_preview = if log_preview_width > 10 {
+                if let Some(log_entry) = app.get_last_log_for_change(&change.id) {
+                    // Format: "HH:MM:SS [op:iter] message" - shortened header without change_id
+                    let header = match (&log_entry.operation, log_entry.iteration) {
+                        (Some(op), Some(iter)) => format!("[{}:{}] ", op, iter),
+                        (Some(op), None) => format!("[{}] ", op),
+                        (None, _) => String::new(),
+                    };
+                    let log_text =
+                        format!("{} {}{}", log_entry.timestamp, header, log_entry.message);
+                    // Truncate to fit available width
+                    if log_text.chars().count() > log_preview_width {
+                        format!(
+                            " │ {}…",
+                            log_text
+                                .chars()
+                                .take(log_preview_width - 1)
+                                .collect::<String>()
+                        )
+                    } else {
+                        format!(" │ {}", log_text)
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
             let line = Line::from(vec![
                 Span::styled(
                     format!("{} {} ", checkbox, cursor),
@@ -322,6 +358,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                     format!("  {:>5.1}%", change.progress_percent()),
                     Style::default().fg(Color::Cyan),
                 ),
+                Span::styled(log_preview, Style::default().fg(Color::DarkGray)),
             ]);
 
             ListItem::new(line)
@@ -393,6 +430,12 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
 /// Render changes list in running mode
 fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect) {
     let spinner_char = SPINNER_CHARS[app.spinner_frame];
+
+    // Calculate available width for log preview (subtract borders)
+    let total_width = area.width.saturating_sub(2) as usize;
+    // Fixed width components: checkbox(3) + space + cursor(1) + space + name(25) + badges(~15) + status(~18) + tasks(~8) + elapsed(~9)
+    let fixed_width: usize = 3 + 1 + 1 + 1 + 25 + 15 + 18 + 8 + 9;
+    let log_preview_width = total_width.saturating_sub(fixed_width + 3); // +3 for " │ " separator
 
     let items: Vec<ListItem> = app
         .changes
@@ -502,6 +545,36 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 "--".to_string()
             };
 
+            // Get last log for this change and format preview
+            let log_preview = if log_preview_width > 10 {
+                if let Some(log_entry) = app.get_last_log_for_change(&change.id) {
+                    // Format: "HH:MM:SS [op:iter] message" - shortened header without change_id
+                    let header = match (&log_entry.operation, log_entry.iteration) {
+                        (Some(op), Some(iter)) => format!("[{}:{}] ", op, iter),
+                        (Some(op), None) => format!("[{}] ", op),
+                        (None, _) => String::new(),
+                    };
+                    let log_text =
+                        format!("{} {}{}", log_entry.timestamp, header, log_entry.message);
+                    // Truncate to fit available width
+                    if log_text.chars().count() > log_preview_width {
+                        format!(
+                            " │ {}…",
+                            log_text
+                                .chars()
+                                .take(log_preview_width - 1)
+                                .collect::<String>()
+                        )
+                    } else {
+                        format!(" │ {}", log_text)
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
             let line = Line::from(vec![
                 Span::styled(
                     format!("{} {} ", checkbox, cursor),
@@ -541,6 +614,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                     format!("  {:>7}", elapsed_text),
                     Style::default().fg(dim_color),
                 ),
+                Span::styled(log_preview, Style::default().fg(Color::DarkGray)),
             ]);
 
             ListItem::new(line)
