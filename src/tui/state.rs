@@ -160,17 +160,15 @@ pub struct AppState {
 impl ChangeState {
     /// Create a new ChangeState from a Change
     ///
-    /// Note: Currently takes task progress from the Change object directly.
-    /// According to the TUI architecture spec, this should be sourced from
-    /// shared orchestrator state (OrchestratorState::task_progress).
-    /// The Change object is populated from openspec CLI output and represents
-    /// the current state. For proper shared state integration, orchestrator
-    /// should call OrchestratorState::set_task_progress() when processing changes,
-    /// and TUI should query it via shared_orchestrator_state.task_progress().
+    /// Note: This method initializes state from the Change object. Task progress
+    /// is synchronized with shared orchestrator state in update_changes(), which
+    /// populates OrchestratorState::task_progress() from fetched changes and then
+    /// queries it back when updating UI state. This ensures consistency between
+    /// TUI and orchestrator for progress tracking.
     pub fn from_change(change: &Change, selected: bool) -> Self {
         Self {
             id: change.id.clone(),
-            // TODO: Query from shared_orchestrator_state.task_progress() instead
+            // Initial values from Change object; synchronized with shared state in update_changes()
             completed_tasks: change.completed_tasks,
             total_tasks: change.total_tasks,
             selected,
@@ -1912,11 +1910,27 @@ impl AppState {
     /// IMPORTANT: This method does NOT modify queue_status. In Stopped mode, task completion
     /// does not trigger auto-queue. Changes are only queued through explicit user action (Space key).
     ///
-    /// Note: Currently sources task progress from Change objects (fetched.completed_tasks/total_tasks).
-    /// According to TUI architecture spec, progress should be sourced from OrchestratorState::task_progress().
-    /// For full shared state integration, orchestrator should populate OrchestratorState with progress data,
-    /// and this method should query it instead of using Change fields directly.
+    /// Note: Task progress is synchronized with shared orchestration state.
+    /// When changes are fetched from openspec CLI, their task progress is written
+    /// to OrchestratorState::task_progress(). When updating UI state, progress is
+    /// read from shared state to ensure consistency across TUI and orchestrator.
     fn update_changes(&mut self, fetched_changes: Vec<Change>) {
+        // Populate shared orchestration state with task progress from fetched changes
+        // This ensures shared state reflects the current file-system state from openspec list
+        if let Some(shared_state) = &self.shared_orchestrator_state {
+            if let Ok(mut guard) = shared_state.try_write() {
+                for change in &fetched_changes {
+                    if change.total_tasks > 0 {
+                        guard.set_task_progress(
+                            change.id.clone(),
+                            change.completed_tasks,
+                            change.total_tasks,
+                        );
+                    }
+                }
+            }
+        }
+
         // Detect new changes
         let new_ids: Vec<String> = fetched_changes
             .iter()
@@ -1931,42 +1945,59 @@ impl AppState {
                 let is_merge_wait = existing.queue_status == QueueStatus::MergeWait;
                 let is_resolve_wait = existing.queue_status == QueueStatus::ResolveWait;
 
+                // Get task progress from shared state (with fallback to fetched data)
+                let (completed, total) = if let Some(shared_state) = &self.shared_orchestrator_state
+                {
+                    if let Ok(guard) = shared_state.try_read() {
+                        let progress = guard.task_progress(&fetched.id);
+                        if progress.1 > 0 {
+                            progress
+                        } else {
+                            (fetched.completed_tasks, fetched.total_tasks)
+                        }
+                    } else {
+                        (fetched.completed_tasks, fetched.total_tasks)
+                    }
+                } else {
+                    (fetched.completed_tasks, fetched.total_tasks)
+                };
+
                 if was_archived {
                     // If change still exists after archiving, it means archive failed
                     // Revert to NotQueued status
                     existing.queue_status = QueueStatus::NotQueued;
                     // Update progress for unarchived changes
-                    if fetched.total_tasks > 0 {
-                        existing.completed_tasks = fetched.completed_tasks;
-                        existing.total_tasks = fetched.total_tasks;
+                    if total > 0 {
+                        existing.completed_tasks = completed;
+                        existing.total_tasks = total;
                     }
-                    // If fetched.total_tasks == 0, preserve existing progress
+                    // If total == 0, preserve existing progress
                 } else if is_merge_wait {
                     // Preserve MergeWait status during auto-refresh
                     // MergeWait is a persistent state that requires explicit user action (M key)
                     // to transition to Resolving, and should not be cleared by progress updates
                     // Update progress for all states (including MergeWait)
-                    if fetched.total_tasks > 0 {
-                        existing.completed_tasks = fetched.completed_tasks;
-                        existing.total_tasks = fetched.total_tasks;
+                    if total > 0 {
+                        existing.completed_tasks = completed;
+                        existing.total_tasks = total;
                     }
-                    // If fetched.total_tasks == 0, preserve existing progress
+                    // If total == 0, preserve existing progress
                 } else if is_resolve_wait {
                     // Preserve ResolveWait status during auto-refresh
                     // ResolveWait is a persistent state indicating archive is complete
                     // and the change is waiting for resolve execution
                     // Update progress for ResolveWait changes
-                    if fetched.total_tasks > 0 {
-                        existing.completed_tasks = fetched.completed_tasks;
-                        existing.total_tasks = fetched.total_tasks;
+                    if total > 0 {
+                        existing.completed_tasks = completed;
+                        existing.total_tasks = total;
                     }
-                    // If fetched.total_tasks == 0, preserve existing progress
+                    // If total == 0, preserve existing progress
                 } else {
                     // Update progress for all other states when valid data is available
                     // Only update if total > 0 to avoid resetting progress on retrieval failure
-                    if fetched.total_tasks > 0 {
-                        existing.completed_tasks = fetched.completed_tasks;
-                        existing.total_tasks = fetched.total_tasks;
+                    if total > 0 {
+                        existing.completed_tasks = completed;
+                        existing.total_tasks = total;
                     } else {
                         // fetched.total_tasks == 0: Retrieval failed, preserve existing progress
                         // For archiving/resolving/archived/merged, try worktree fallback

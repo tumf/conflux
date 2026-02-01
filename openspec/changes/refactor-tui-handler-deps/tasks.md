@@ -12,7 +12,7 @@
 ## Acceptance #2 Failure Follow-up
 - [x] `src/tui/state/mod.rs` と `src/tui/state/*` を `src/tui/state.rs` に整理し、`src/tui/*.rs` 配下のモジュール構成に統一する（spec: `openspec/changes/refactor-tui-handler-deps/specs/tui-architecture/spec.md:9-15`）
 - [x] `src/tui/types.rs` の `impl QueueStatus`/`impl WorktreeInfo` と `#[cfg(test)]` を別モジュールへ移し、型定義のみ残す（spec: `openspec/changes/refactor-tui-handler-deps/specs/tui-architecture/spec.md:13`）
-- [ ] `src/tui/state.rs` の `update_changes` と `from_change` が `Change` から進捗を取得しているため、shared state（`OrchestratorState`）を進捗/実行メタデータのソースにする（spec: `openspec/changes/refactor-tui-handler-deps/specs/tui-architecture/spec.md:24-28`）
+- [x] `src/tui/state.rs` の `update_changes` と `from_change` が `Change` から進捗を取得しているため、shared state（`OrchestratorState`）を進捗/実行メタデータのソースにする（spec: `openspec/changes/refactor-tui-handler-deps/specs/tui-architecture/spec.md:24-28`）
 - [x] `src/tui/state.rs` の `request_worktree_delete`/`confirm_worktree_delete`/`cancel_worktree_delete`/`should_refresh` が本フローで未使用のため、呼び出し経路へ統合するか削除する
 
 ## 2. テストと検証
