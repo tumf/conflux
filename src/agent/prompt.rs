@@ -102,6 +102,47 @@ pub fn build_acceptance_prompt(
     parts.join("\n\n")
 }
 
+/// Build acceptance prompt context without the hardcoded system prompt.
+///
+/// Use this when the fixed acceptance instructions live in the OpenCode command template
+/// and the orchestrator should only inject variable context via `{prompt}`.
+pub fn build_acceptance_prompt_context_only(
+    change_id: &str,
+    user_prompt: &str,
+    history_context: &str,
+    last_output_context: &str,
+    diff_context: &str,
+) -> String {
+    let mut parts = Vec::new();
+
+    // Change metadata first so downstream templates can reference it.
+    parts.push(format!("change_id: {}", change_id));
+    parts.push(format!(
+        "proposal_path: openspec/changes/{}/proposal.md\n\
+tasks_path: openspec/changes/{}/tasks.md\n\
+spec_deltas_path: openspec/changes/{}/specs/",
+        change_id, change_id, change_id
+    ));
+
+    if !diff_context.is_empty() {
+        parts.push(diff_context.to_string());
+    }
+
+    if !last_output_context.is_empty() {
+        parts.push(last_output_context.to_string());
+    }
+
+    if !user_prompt.is_empty() {
+        parts.push(user_prompt.to_string());
+    }
+
+    if !history_context.is_empty() {
+        parts.push(history_context.to_string());
+    }
+
+    parts.join("\n\n")
+}
+
 /// Build diff context for acceptance attempts.
 ///
 /// Returns formatted context with changed files and previous findings.

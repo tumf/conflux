@@ -12,8 +12,8 @@ mod runner;
 // Re-export public types for backward compatibility
 pub use output::OutputLine;
 pub use prompt::{
-    build_acceptance_diff_context, build_acceptance_prompt, build_apply_prompt,
-    build_archive_prompt, build_last_acceptance_output_context,
+    build_acceptance_diff_context, build_acceptance_prompt, build_acceptance_prompt_context_only,
+    build_apply_prompt, build_archive_prompt, build_last_acceptance_output_context,
 };
 pub use runner::AgentRunner;
 

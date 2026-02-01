@@ -1459,14 +1459,25 @@ pub async fn execute_acceptance_in_workspace(
         stderr_tail.as_deref(),
     );
 
-    // Build full prompt: system_prompt + diff_context + last_output_context + user_prompt + history_context
-    let full_prompt = crate::agent::build_acceptance_prompt(
-        change_id,
-        user_prompt,
-        &history_context,
-        &last_output_context,
-        &diff_context,
-    );
+    // Build prompt injected into `{prompt}`
+    let full_prompt = match config.get_acceptance_prompt_mode() {
+        crate::config::AcceptancePromptMode::Full => crate::agent::build_acceptance_prompt(
+            change_id,
+            user_prompt,
+            &history_context,
+            &last_output_context,
+            &diff_context,
+        ),
+        crate::config::AcceptancePromptMode::ContextOnly => {
+            crate::agent::build_acceptance_prompt_context_only(
+                change_id,
+                user_prompt,
+                &history_context,
+                &last_output_context,
+                &diff_context,
+            )
+        }
+    };
 
     // Expand change_id and prompt in command
     let template = config.get_acceptance_command()?;

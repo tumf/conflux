@@ -108,6 +108,12 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // Note: A hardcoded acceptance prompt is always prepended before this value
   "acceptance_prompt": "",
 
+  // Controls how the acceptance `{prompt}` is constructed.
+  // - full: include hardcoded acceptance system prompt + diff/history context
+  // - context_only: only include change metadata + diff/history context
+  // Use context_only when the fixed acceptance instructions live in the OpenCode command template.
+  // "acceptance_prompt_mode": "full",
+
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
 

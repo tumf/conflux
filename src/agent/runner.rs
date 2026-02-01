@@ -534,14 +534,25 @@ impl AgentRunner {
         let last_output_context =
             build_last_acceptance_output_context(stdout_tail.as_deref(), stderr_tail.as_deref());
 
-        // Build full prompt: system_prompt (with change_id) + diff_context + last_output_context + user_prompt + history_context
-        let full_prompt = build_acceptance_prompt(
-            change_id,
-            user_prompt,
-            &history_context,
-            &last_output_context,
-            &diff_context,
-        );
+        // Build prompt injected into `{prompt}`
+        let full_prompt = match self.config.get_acceptance_prompt_mode() {
+            crate::config::AcceptancePromptMode::Full => build_acceptance_prompt(
+                change_id,
+                user_prompt,
+                &history_context,
+                &last_output_context,
+                &diff_context,
+            ),
+            crate::config::AcceptancePromptMode::ContextOnly => {
+                super::prompt::build_acceptance_prompt_context_only(
+                    change_id,
+                    user_prompt,
+                    &history_context,
+                    &last_output_context,
+                    &diff_context,
+                )
+            }
+        };
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
