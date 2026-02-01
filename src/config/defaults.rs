@@ -301,12 +301,12 @@ fn generate_project_slug(repo_root: &std::path::Path) -> String {
 
 /// Returns the default workspace base directory based on the OS and environment.
 ///
-/// - **macOS**: Uses `${XDG_DATA_HOME}/conflux/worktrees/<project_slug>` if `XDG_DATA_HOME` is set,
-///   otherwise falls back to `~/Library/Application Support/conflux/worktrees/<project_slug>`.
-/// - **Linux**: Uses `${XDG_DATA_HOME}/conflux/worktrees/<project_slug>` if set,
-///   otherwise `~/.local/share/conflux/worktrees/<project_slug>`.
-/// - **Windows**: Uses `%APPDATA%\Conflux\worktrees\<project_slug>`.
-/// - **Other**: Falls back to system temp directory with `conflux-workspaces-fallback/<project_slug>`.
+/// - **macOS**: Uses `${XDG_DATA_HOME}/cflx/worktrees/<project_slug>` if `XDG_DATA_HOME` is set,
+///   otherwise falls back to `~/.local/share/cflx/worktrees/<project_slug>`.
+/// - **Linux**: Uses `${XDG_DATA_HOME}/cflx/worktrees/<project_slug>` if set,
+///   otherwise `~/.local/share/cflx/worktrees/<project_slug>`.
+/// - **Windows**: Uses `%APPDATA%\cflx\worktrees\<project_slug>`.
+/// - **Other**: Falls back to system temp directory with `cflx-workspaces-fallback/<project_slug>`.
 ///
 /// If `repo_root` is provided, the path includes a project-specific slug to avoid conflicts.
 /// If `repo_root` is None, returns a generic path without project slug (for backwards compatibility).
@@ -318,20 +318,18 @@ pub fn default_workspace_base_dir(repo_root: Option<&std::path::Path>) -> PathBu
     {
         // Check XDG_DATA_HOME first
         if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
-            let mut path = PathBuf::from(xdg_data_home)
-                .join("conflux")
-                .join("worktrees");
+            let mut path = PathBuf::from(xdg_data_home).join("cflx").join("worktrees");
             if let Some(slug) = &project_slug {
                 path = path.join(slug);
             }
             return path;
         }
-        // Fall back to macOS standard Application Support
+        // Fall back to ~/.local/share (same as Linux)
         if let Some(home) = dirs::home_dir() {
             let mut path = home
-                .join("Library")
-                .join("Application Support")
-                .join("conflux")
+                .join(".local")
+                .join("share")
+                .join("cflx")
                 .join("worktrees");
             if let Some(slug) = &project_slug {
                 path = path.join(slug);
@@ -344,9 +342,7 @@ pub fn default_workspace_base_dir(repo_root: Option<&std::path::Path>) -> PathBu
     {
         // Use XDG_DATA_HOME or fall back to ~/.local/share
         if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
-            let mut path = PathBuf::from(xdg_data_home)
-                .join("conflux")
-                .join("worktrees");
+            let mut path = PathBuf::from(xdg_data_home).join("cflx").join("worktrees");
             if let Some(slug) = &project_slug {
                 path = path.join(slug);
             }
@@ -356,7 +352,7 @@ pub fn default_workspace_base_dir(repo_root: Option<&std::path::Path>) -> PathBu
             let mut path = home
                 .join(".local")
                 .join("share")
-                .join("conflux")
+                .join("cflx")
                 .join("worktrees");
             if let Some(slug) = &project_slug {
                 path = path.join(slug);
@@ -369,7 +365,7 @@ pub fn default_workspace_base_dir(repo_root: Option<&std::path::Path>) -> PathBu
     {
         // Use APPDATA directory
         if let Some(appdata) = dirs::data_dir() {
-            let mut path = appdata.join("Conflux").join("worktrees");
+            let mut path = appdata.join("cflx").join("worktrees");
             if let Some(slug) = &project_slug {
                 path = path.join(slug);
             }
@@ -378,7 +374,7 @@ pub fn default_workspace_base_dir(repo_root: Option<&std::path::Path>) -> PathBu
     }
 
     // Fallback for unsupported platforms or when home directory is not available
-    let mut path = std::env::temp_dir().join("conflux-workspaces-fallback");
+    let mut path = std::env::temp_dir().join("cflx-workspaces-fallback");
     if let Some(slug) = &project_slug {
         path = path.join(slug);
     }
@@ -396,18 +392,18 @@ mod tests {
     }
 
     #[test]
-    fn test_default_workspace_base_dir_contains_conflux() {
-        // Test that the path contains "conflux" or is the fallback
+    fn test_default_workspace_base_dir_contains_cflx() {
+        // Test that the path contains "cflx" or is the fallback
         let path = default_workspace_base_dir(None);
         let path_str = path.to_string_lossy();
 
-        // Should contain "conflux" (case-insensitive) or be the fallback
-        let is_conflux_path = path_str.to_lowercase().contains("conflux");
-        let is_fallback = path_str.contains("conflux-workspaces-fallback");
+        // Should contain "cflx" (case-insensitive) or be the fallback
+        let is_cflx_path = path_str.to_lowercase().contains("cflx");
+        let is_fallback = path_str.contains("cflx-workspaces-fallback");
 
         assert!(
-            is_conflux_path || is_fallback,
-            "Path should contain 'conflux' or be fallback: {:?}",
+            is_cflx_path || is_fallback,
+            "Path should contain 'cflx' or be fallback: {:?}",
             path
         );
     }
@@ -469,8 +465,8 @@ mod tests {
                 result
             );
             assert!(
-                result.to_string_lossy().contains("conflux/worktrees"),
-                "Expected path to contain conflux/worktrees, got {:?}",
+                result.to_string_lossy().contains("cflx/worktrees"),
+                "Expected path to contain cflx/worktrees, got {:?}",
                 result
             );
 
@@ -487,15 +483,15 @@ mod tests {
     fn test_default_workspace_base_dir_macos_fallback() {
         // NOTE: This test runs in parallel with other tests that may set XDG_DATA_HOME,
         // so we can't rely on environment isolation. We just verify the path contains
-        // expected components (conflux/worktrees) and project slug.
+        // expected components (cflx/worktrees) and project slug.
         let repo_root = PathBuf::from("/tmp/test-repo");
         let result = default_workspace_base_dir(Some(&repo_root));
         let path_str = result.to_string_lossy();
 
-        // Should contain conflux and worktrees (either from XDG_DATA_HOME or Application Support)
+        // Should contain cflx and worktrees (either from XDG_DATA_HOME or ~/.local/share)
         assert!(
-            path_str.contains("conflux") && path_str.contains("worktrees"),
-            "Expected path to contain 'conflux' and 'worktrees', got {:?}",
+            path_str.contains("cflx") && path_str.contains("worktrees"),
+            "Expected path to contain 'cflx' and 'worktrees', got {:?}",
             result
         );
 
@@ -512,15 +508,15 @@ mod tests {
     fn test_default_workspace_base_dir_linux_fallback() {
         // NOTE: This test may run in parallel with other tests that set XDG_DATA_HOME,
         // so we can't rely on environment isolation. We just check that the path
-        // contains the expected components (conflux/worktrees) and project slug.
+        // contains the expected components (cflx/worktrees) and project slug.
         let repo_root = PathBuf::from("/tmp/test-repo");
         let result = default_workspace_base_dir(Some(&repo_root));
         let path_str = result.to_string_lossy();
 
-        // Should contain conflux and worktrees
+        // Should contain cflx and worktrees
         assert!(
-            path_str.contains("conflux") && path_str.contains("worktrees"),
-            "Expected path to contain 'conflux' and 'worktrees', got {:?}",
+            path_str.contains("cflx") && path_str.contains("worktrees"),
+            "Expected path to contain 'cflx' and 'worktrees', got {:?}",
             result
         );
 
@@ -541,8 +537,8 @@ mod tests {
 
         // Should use APPDATA on Windows
         assert!(
-            path_str.contains("Conflux") && path_str.contains("worktrees"),
-            "Expected path to contain 'Conflux' and 'worktrees', got {:?}",
+            path_str.contains("cflx") && path_str.contains("worktrees"),
+            "Expected path to contain 'cflx' and 'worktrees', got {:?}",
             result
         );
     }

@@ -42,12 +42,12 @@ TUIはSelectモードで `+` キーを押したとき、以下の条件をすべ
 - **WHEN** ユーザーが `+` キーを押す
 - **THEN** 何も起こらない
 
-### Requirement: Runningモードでは提案作成不可
+### Requirement: Changesビューでは提案作成不可
 
-TUIはRunningモードで `+` キーを押した場合、何も起こしてはならない（SHALL NOT）。
+TUIはChangesビューで `+` キーを押した場合、何も起こしてはならない（SHALL NOT）。
 
-#### Scenario: Runningモードでは無操作
+#### Scenario: Changesビューでは無操作
 
-- **GIVEN** TUIがRunningモードである
+- **GIVEN** TUIがChangesビューである
 - **WHEN** ユーザーが `+` キーを押す
 - **THEN** 何も起こらない
