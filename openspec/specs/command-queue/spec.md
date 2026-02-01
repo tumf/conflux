@@ -49,6 +49,8 @@ TBD - created by archiving change add-command-execution-queue. Update Purpose af
 - 最大リトライ回数以内の場合、待機後に再実行
 - 最大リトライ回数を超えた場合、エラーを返却
 
+ストリーミング/非ストリーミングの実行経路は、同一のリトライ判定ロジックを共有しなければならない (MUST)。
+
 #### Scenario: エージェントクラッシュでの自動再実行
 
 - **GIVEN** 最大リトライ回数が2回に設定されている
