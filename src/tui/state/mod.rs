@@ -2499,27 +2499,89 @@ mod tests {
     // === Tests for ResolveWait status ===
 
     #[test]
-    fn test_toggle_selection_blocks_resolve_wait() {
-        // ResolveWait status should block Space key (toggle_selection)
+    fn test_toggle_selection_allows_resolve_wait() {
+        // ResolveWait status should now allow Space key (toggle execution mark only)
         let changes = vec![create_approved_change("resolve-wait-change", 5, 5)];
         let mut app = AppState::new(changes);
 
-        // Set change to ResolveWait status
+        // Set mode to Running and change to ResolveWait status
+        app.mode = AppMode::Running;
         app.changes[0].queue_status = QueueStatus::ResolveWait;
+        app.changes[0].selected = false;
 
-        // Try to toggle selection
+        // Toggle should change only selected, not queue_status
         let cmd = app.toggle_selection();
 
-        // Should be blocked
+        // Should not issue a command (StateOnly result)
         assert!(cmd.is_none());
-        assert!(app.warning_message.is_some());
-        assert!(app
-            .warning_message
-            .as_ref()
-            .unwrap()
-            .contains("resolve wait"));
-        // Status should remain unchanged
+        // No warning message
+        assert!(app.warning_message.is_none());
+        // Selected should be toggled
+        assert!(app.changes[0].selected);
+        // Queue status should remain unchanged
         assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+    }
+
+    #[test]
+    fn test_toggle_selection_allows_merge_wait() {
+        // MergeWait status should allow Space key (toggle execution mark only)
+        let changes = vec![create_approved_change("merge-wait-change", 5, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set mode to Running and change to MergeWait status
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].selected = true;
+
+        // Toggle should change only selected, not queue_status
+        let cmd = app.toggle_selection();
+
+        // Should not issue a command (StateOnly result)
+        assert!(cmd.is_none());
+        // No warning message
+        assert!(app.warning_message.is_none());
+        // Selected should be toggled to false
+        assert!(!app.changes[0].selected);
+        // Queue status should remain unchanged
+        assert_eq!(app.changes[0].queue_status, QueueStatus::MergeWait);
+    }
+
+    #[test]
+    fn test_toggle_selection_allows_resolve_wait_in_stopped_mode() {
+        // ResolveWait status should allow Space key in Stopped mode (toggle execution mark only)
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Enter Stopped mode and set ResolveWait
+        app.start_processing();
+        app.mode = AppMode::Stopped;
+        app.changes[0].queue_status = QueueStatus::ResolveWait;
+        app.changes[0].selected = false;
+
+        // Toggle selection
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none()); // No DynamicQueue command
+        assert!(app.changes[0].selected);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+    }
+
+    #[test]
+    fn test_toggle_selection_allows_merge_wait_in_stopped_mode() {
+        // MergeWait status should allow Space key in Stopped mode (toggle execution mark only)
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Enter Stopped mode and set MergeWait
+        app.start_processing();
+        app.mode = AppMode::Stopped;
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].selected = true;
+
+        // Toggle selection
+        let cmd = app.toggle_selection();
+        assert!(cmd.is_none()); // No DynamicQueue command
+        assert!(!app.changes[0].selected);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::MergeWait);
     }
 
     #[test]
