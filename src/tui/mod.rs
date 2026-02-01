@@ -17,6 +17,7 @@ mod render;
 mod runner;
 mod state;
 mod terminal;
+mod type_impls;
 pub mod types;
 mod utils;
 mod worktrees;
