@@ -13,20 +13,24 @@
 //! The actual orchestration loop remains in the orchestrators for now,
 //! as they have mode-specific concerns (WIP commits for CLI, DynamicQueue for TUI).
 
-use crate::agent::AgentRunner;
+use crate::agent::{AgentRunner, OutputLine};
 use crate::ai_command_runner::AiCommandRunner;
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
+use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::{
-    acceptance_test_streaming, apply_change_streaming, archive_change, AcceptanceResult,
-    ApplyContext, ApplyResult, ArchiveContext, ArchiveResult, OutputHandler,
+    acceptance_test_streaming, archive_change, AcceptanceResult, ArchiveContext, ArchiveResult,
+    OutputHandler,
 };
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser::TaskProgress;
+use crate::vcs::VcsBackend;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 /// Service for serial execution of changes.
@@ -104,6 +108,12 @@ impl SerialRunService {
     /// Get apply count for a change
     pub fn apply_count(&self, change_id: &str) -> u32 {
         *self.apply_counts.get(change_id).unwrap_or(&0)
+    }
+
+    /// Increment apply count for a change
+    fn increment_apply_count(&mut self, change_id: &str) {
+        let count = self.apply_counts.entry(change_id.to_string()).or_insert(0);
+        *count += 1;
     }
 
     /// Check if a change is stalled
@@ -201,7 +211,7 @@ impl SerialRunService {
         operation_tracker: Option<std::sync::Arc<std::sync::RwLock<String>>>,
     ) -> Result<ChangeProcessResult>
     where
-        F: Fn() -> bool,
+        F: Fn() -> bool + Clone + Send + 'static,
     {
         self.iteration += 1;
         let change_id = &change.id;
@@ -278,9 +288,7 @@ impl SerialRunService {
         info!("Change {} is complete, archiving...", change.id);
 
         // Update operation to "archive" before running archive
-        if let Some(ref tracker) = operation_tracker {
-            *tracker.write().unwrap() = "archive".to_string();
-        }
+        Self::update_operation_tracker(&operation_tracker, "archive");
 
         let archive_ctx = ArchiveContext::new(
             self.changes_processed,
@@ -356,178 +364,125 @@ impl SerialRunService {
         output: &O,
         total_changes: usize,
         remaining_changes: usize,
-        apply_count: u32,
+        _apply_count: u32,
         cancel_check: &F,
         operation_tracker: Option<std::sync::Arc<std::sync::RwLock<String>>>,
     ) -> Result<ChangeProcessResult>
     where
-        F: Fn() -> bool,
+        F: Fn() -> bool + Clone + Send + 'static,
     {
         info!("Applying change: {}", change.id);
 
-        // Increment apply count
-        let new_apply_count = apply_count + 1;
-        self.apply_counts.insert(change.id.clone(), new_apply_count);
+        // Create event handler for apply loop
+        let event_handler = SerialApplyEventHandler::new(output);
 
-        let apply_ctx = ApplyContext::new(
+        // Create hook context for apply loop
+        let hook_ctx = common_apply::ApplyLoopHookContext::serial(
             self.changes_processed,
             total_changes,
             remaining_changes,
-            new_apply_count,
         );
 
-        match apply_change_streaming(
-            change,
-            agent,
-            hooks,
-            &apply_ctx,
-            output,
-            ai_runner,
-            cancel_check,
-        )
-        .await
-        {
-            Ok(ApplyResult::Success) => {
-                // Re-fetch change to get updated task counts after apply
-                let updated_changes = openspec::list_changes_native().unwrap_or_default();
-                let updated_change = updated_changes.iter().find(|c| c.id == change.id).cloned();
-                let is_complete = updated_change.as_ref().is_some_and(|c| c.is_complete());
-
-                if is_complete {
-                    let updated_change = updated_change.unwrap(); // Safe: checked above
-                    info!(
-                        "Tasks complete for {}, running acceptance test...",
-                        change.id
-                    );
-
-                    // Update operation to "acceptance" before running acceptance test
-                    if let Some(ref tracker) = operation_tracker {
-                        *tracker.write().unwrap() = "acceptance".to_string();
-                    }
-
-                    // Run acceptance test
-                    match acceptance_test_streaming(
-                        &updated_change,
-                        agent,
-                        ai_runner,
-                        &self.config,
-                        output,
-                        cancel_check,
-                    )
-                    .await
-                    {
-                        Ok((AcceptanceResult::Pass, _attempt_number, _command)) => {
-                            info!("Acceptance passed for {}, ready for archive", change.id);
-                            Ok(ChangeProcessResult::AcceptancePassed)
-                        }
-                        Ok((AcceptanceResult::Continue, _attempt_number, _command)) => {
-                            let continue_count =
-                                agent.count_consecutive_acceptance_continues(&change.id);
-                            let max_continues = self.config.get_acceptance_max_continues();
-
-                            if continue_count >= max_continues {
-                                warn!(
-                                    "Acceptance CONTINUE limit ({}) exceeded for {}, treating as FAIL",
-                                    max_continues, change.id
-                                );
-                                Ok(ChangeProcessResult::AcceptanceContinueExceeded)
-                            } else {
-                                info!(
-                                    "Acceptance requires continuation for {} (attempt {}/{}), retrying...",
-                                    change.id, continue_count, max_continues
-                                );
-                                Ok(ChangeProcessResult::AcceptanceContinue)
-                            }
-                        }
-                        Ok((AcceptanceResult::Fail { findings }, _attempt_number, _command)) => {
-                            warn!(
-                                "Acceptance failed for {} ({} tail lines), will retry apply",
-                                change.id,
-                                findings.len()
-                            );
-                            // Note: tasks.md is now updated by the acceptance agent itself
-                            Ok(ChangeProcessResult::AcceptanceFailed { findings })
-                        }
-                        Ok((
-                            AcceptanceResult::CommandFailed { error, findings: _ },
-                            _attempt_number,
-                            _command,
-                        )) => {
-                            error!("Acceptance command failed for {}: {}", change.id, error);
-                            // Note: tasks.md is now updated by the acceptance agent itself
-                            Ok(ChangeProcessResult::AcceptanceCommandFailed { error })
-                        }
-                        Ok((AcceptanceResult::Cancelled, _attempt_number, _command)) => {
-                            info!("Acceptance cancelled for {}", change.id);
-                            Ok(ChangeProcessResult::Cancelled)
-                        }
-                        Err(e) => {
-                            error!("Acceptance error for {}: {}", change.id, e);
-                            Err(e)
-                        }
-                    }
-                } else {
-                    info!(
-                        "Apply completed for {}, but tasks not yet complete",
-                        change.id
-                    );
-                    Ok(ChangeProcessResult::ApplySuccessIncomplete)
+        // Create a cancellation token and spawn a background task to poll cancel_check
+        // This allows us to bridge the cancel_check closure to CancellationToken
+        let cancel_token = CancellationToken::new();
+        let cancel_token_for_task = cancel_token.clone();
+        let cancel_check_clone = cancel_check.clone();
+        let cancel_task = tokio::spawn(async move {
+            loop {
+                if cancel_check_clone() {
+                    cancel_token_for_task.cancel();
+                    break;
                 }
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
-            Ok(ApplyResult::Failed { error }) => {
-                error!("Apply failed for {}: {}", change.id, error);
-                Ok(ChangeProcessResult::ApplyFailed { error })
-            }
-            Ok(ApplyResult::Cancelled) => {
-                info!("Apply cancelled for {}", change.id);
-                Ok(ChangeProcessResult::Cancelled)
-            }
-            Err(e) => {
-                error!("Apply error for {}: {}", change.id, e);
-                Err(e)
-            }
-        }
-    }
+        });
 
-    /// Run on_start hook
-    #[allow(dead_code)] // Reserved for future TUI integration
-    pub async fn run_start_hook(&self, hooks: &HookRunner, total_changes: usize) -> Result<()> {
-        let start_context = HookContext::new(0, total_changes, total_changes, false);
-        hooks.run_hook(HookType::OnStart, &start_context).await
-    }
+        // Execute apply loop using common implementation
+        let apply_result = common_apply::execute_apply_loop(
+            &change.id,
+            &self.repo_root,
+            &self.config,
+            agent,
+            VcsBackend::Git,
+            None, // workspace_manager (None for serial mode)
+            Some(hooks),
+            &hook_ctx,
+            &event_handler,
+            Some(&cancel_token), // Pass cancel_token to enable apply loop cancellation
+            ai_runner,
+            |line| async move {
+                match &line {
+                    OutputLine::Stdout(s) => output.on_stdout(s),
+                    OutputLine::Stderr(s) => output.on_stderr(s),
+                }
+            },
+        )
+        .await?;
 
-    /// Run on_finish hook
-    #[allow(dead_code)] // Reserved for future TUI integration
-    pub async fn run_finish_hook(
-        &self,
-        hooks: &HookRunner,
-        total_changes: usize,
-        finish_status: &str,
-    ) -> Result<()> {
-        let finish_context = HookContext::new(self.changes_processed, total_changes, 0, false)
-            .with_status(finish_status);
-        hooks.run_hook(HookType::OnFinish, &finish_context).await
-    }
+        // Abort the background cancel monitoring task now that apply is complete
+        cancel_task.abort();
 
-    /// Check if max iterations limit is reached
-    #[allow(dead_code)] // Reserved for future TUI integration
-    pub fn check_iteration_limit(&self, max_iterations: u32) -> IterationLimitStatus {
-        if max_iterations == 0 {
-            return IterationLimitStatus::NoLimit;
-        }
+        // Check if apply loop completed successfully
+        if apply_result.completed {
+            info!(
+                "Apply loop completed for {} after {} iterations",
+                change.id, apply_result.iterations
+            );
 
-        let warning_threshold = (max_iterations as f32 * 0.8) as u32;
-        if self.iteration == warning_threshold {
-            IterationLimitStatus::Warning {
-                current: self.iteration,
-                max: max_iterations,
-            }
-        } else if self.iteration >= max_iterations {
-            IterationLimitStatus::Reached {
-                max: max_iterations,
+            // Increment apply count for this change
+            self.increment_apply_count(&change.id);
+
+            // Re-fetch change to get updated task counts after apply
+            let (updated_change, is_complete) = Self::refetch_change_after_apply(&change.id);
+
+            if is_complete {
+                let updated_change = updated_change.unwrap(); // Safe: checked above
+                info!(
+                    "Tasks complete for {}, running acceptance test...",
+                    change.id
+                );
+
+                // Update operation to "acceptance" before running acceptance test
+                Self::update_operation_tracker(&operation_tracker, "acceptance");
+
+                // Run acceptance test
+                match acceptance_test_streaming(
+                    &updated_change,
+                    agent,
+                    ai_runner,
+                    &self.config,
+                    output,
+                    cancel_check,
+                )
+                .await
+                {
+                    Ok((result, _attempt_number, _command)) => {
+                        Ok(self.process_acceptance_result(&change.id, agent, result))
+                    }
+                    Err(e) => {
+                        error!("Acceptance error for {}: {}", change.id, e);
+                        Err(e)
+                    }
+                }
+            } else {
+                info!(
+                    "Apply completed for {}, but tasks not yet complete",
+                    change.id
+                );
+                Ok(ChangeProcessResult::ApplySuccessIncomplete)
             }
         } else {
-            IterationLimitStatus::BelowLimit
+            error!(
+                "Apply loop did not complete for {} after {} iterations",
+                change.id, apply_result.iterations
+            );
+            Ok(ChangeProcessResult::ApplyFailed {
+                error: format!(
+                    "Apply loop did not complete after {} iterations",
+                    apply_result.iterations
+                ),
+            })
         }
     }
 
@@ -556,6 +511,82 @@ impl SerialRunService {
             }
         }
         None
+    }
+
+    /// Re-fetch change to get updated task counts after apply.
+    ///
+    /// Returns the updated change and whether it's complete.
+    fn refetch_change_after_apply(change_id: &str) -> (Option<Change>, bool) {
+        let updated_changes = openspec::list_changes_native().unwrap_or_default();
+        let updated_change = updated_changes.iter().find(|c| c.id == change_id).cloned();
+        let is_complete = updated_change.as_ref().is_some_and(|c| c.is_complete());
+        (updated_change, is_complete)
+    }
+
+    /// Process acceptance test result and determine outcome.
+    ///
+    /// Handles Pass, Continue, Fail, CommandFailed, and Cancelled results,
+    /// applying max_continues logic for Continue results.
+    fn process_acceptance_result(
+        &self,
+        change_id: &str,
+        agent: &AgentRunner,
+        acceptance_result: AcceptanceResult,
+    ) -> ChangeProcessResult {
+        match acceptance_result {
+            AcceptanceResult::Pass => {
+                info!("Acceptance passed for {}, ready for archive", change_id);
+                ChangeProcessResult::AcceptancePassed
+            }
+            AcceptanceResult::Continue => {
+                let continue_count = agent.count_consecutive_acceptance_continues(change_id);
+                let max_continues = self.config.get_acceptance_max_continues();
+
+                if continue_count >= max_continues {
+                    warn!(
+                        "Acceptance CONTINUE limit ({}) exceeded for {}, treating as FAIL",
+                        max_continues, change_id
+                    );
+                    ChangeProcessResult::AcceptanceContinueExceeded
+                } else {
+                    info!(
+                        "Acceptance requires continuation for {} (attempt {}/{}), retrying...",
+                        change_id, continue_count, max_continues
+                    );
+                    ChangeProcessResult::AcceptanceContinue
+                }
+            }
+            AcceptanceResult::Fail { findings } => {
+                warn!(
+                    "Acceptance failed for {} ({} tail lines), will retry apply",
+                    change_id,
+                    findings.len()
+                );
+                // Note: tasks.md is now updated by the acceptance agent itself
+                ChangeProcessResult::AcceptanceFailed { findings }
+            }
+            AcceptanceResult::CommandFailed { error, findings: _ } => {
+                error!("Acceptance command failed for {}: {}", change_id, error);
+                // Note: tasks.md is now updated by the acceptance agent itself
+                ChangeProcessResult::AcceptanceCommandFailed { error }
+            }
+            AcceptanceResult::Cancelled => {
+                info!("Acceptance cancelled for {}", change_id);
+                ChangeProcessResult::Cancelled
+            }
+        }
+    }
+
+    /// Update operation tracker with the current operation name.
+    ///
+    /// This is a helper to centralize tracker updates for both apply and acceptance flows.
+    fn update_operation_tracker(
+        operation_tracker: &Option<std::sync::Arc<std::sync::RwLock<String>>>,
+        operation: &str,
+    ) {
+        if let Some(ref tracker) = operation_tracker {
+            *tracker.write().unwrap() = operation.to_string();
+        }
     }
 }
 
@@ -587,23 +618,48 @@ pub enum ChangeProcessResult {
     AcceptanceContinueExceeded,
 }
 
-/// Status of iteration limit check
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Reserved for future use
-pub enum IterationLimitStatus {
-    /// No iteration limit configured
-    NoLimit,
-    /// Below warning threshold
-    BelowLimit,
-    /// At warning threshold (80%)
-    Warning { current: u32, max: u32 },
-    /// Iteration limit reached
-    Reached { max: u32 },
-}
-
 /// Helper function to check if progress is complete
 fn is_progress_complete(progress: &TaskProgress) -> bool {
     progress.total > 0 && progress.completed >= progress.total
+}
+
+/// Event handler for serial apply loop that delegates to OutputHandler
+struct SerialApplyEventHandler<'a, O: OutputHandler> {
+    #[allow(dead_code)] // Kept for type safety but not used since output is handled via closure
+    output: &'a O,
+}
+
+impl<'a, O: OutputHandler> SerialApplyEventHandler<'a, O> {
+    fn new(output: &'a O) -> Self {
+        Self { output }
+    }
+}
+
+impl<'a, O: OutputHandler> common_apply::ApplyEventHandler for SerialApplyEventHandler<'a, O> {
+    fn on_apply_started(&self, _change_id: &str, _command: &str) {
+        // No-op for serial mode - output is handled via output_handler closure
+    }
+
+    fn on_progress_updated(&self, _change_id: &str, _completed: u32, _total: u32) {
+        // No-op for serial mode - progress is logged in execute_apply_loop
+    }
+
+    fn on_hook_started(&self, _change_id: &str, _hook_type: &str) {
+        // No-op for serial mode - hooks log themselves
+    }
+
+    fn on_hook_completed(&self, _change_id: &str, _hook_type: &str) {
+        // No-op for serial mode - hooks log themselves
+    }
+
+    fn on_hook_failed(&self, _change_id: &str, _hook_type: &str, _error: &str) {
+        // No-op for serial mode - hooks log themselves
+    }
+
+    fn on_apply_output(&self, _change_id: &str, _line: &OutputLine, _iteration: u32) {
+        // No-op: Output is already handled by the output_handler closure passed to execute_apply_loop
+        // (lines 398-403). Having both would cause duplicate output.
+    }
 }
 
 #[cfg(test)]

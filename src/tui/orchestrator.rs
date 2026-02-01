@@ -47,12 +47,6 @@ fn apply_pending_removals(
 /// Run the orchestrator for selected changes
 /// Uses streaming output to send log entries in real-time
 /// Supports cancellation via CancellationToken for graceful shutdown
-///
-/// The orchestrator uses a two-phase loop:
-/// - Phase 1: Archive all complete changes before doing any apply
-/// - Phase 2: Apply one incomplete change
-///
-/// This ensures complete changes are never skipped.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_orchestrator(
     change_ids: Vec<String>,
@@ -377,7 +371,8 @@ pub async fn run_orchestrator(
 
         // Process the change using SerialRunService
         use crate::serial_run_service::ChangeProcessResult;
-        let cancel_check = || cancel_token.is_cancelled();
+        let cancel_token_clone = cancel_token.clone();
+        let cancel_check = move || cancel_token_clone.is_cancelled();
         let result = serial_service
             .process_change(
                 &change,
@@ -433,7 +428,20 @@ pub async fn run_orchestrator(
                     ws.apply_execution_event(&apply_completed_event).await;
                 }
 
-                // Note: AcceptanceStarted logging is handled by acceptance_test_streaming internally
+                // Send AcceptanceStarted event
+                let acceptance_started_event = OrchestratorEvent::AcceptanceStarted {
+                    change_id: change_id.clone(),
+                    command: format!("opencode acceptance {}", change_id),
+                };
+                let _ = tx.send(acceptance_started_event.clone()).await;
+                shared_state
+                    .write()
+                    .await
+                    .apply_execution_event(&acceptance_started_event);
+                #[cfg(feature = "web-monitoring")]
+                if let Some(ws) = &web_state {
+                    ws.apply_execution_event(&acceptance_started_event).await;
+                }
 
                 // Send AcceptanceCompleted event
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
@@ -634,6 +642,18 @@ pub async fn run_orchestrator(
                         change_id
                     ))))
                     .await;
+
+                // Send ChangeArchived event
+                let change_archived_event = OrchestratorEvent::ChangeArchived(change_id.clone());
+                let _ = tx.send(change_archived_event.clone()).await;
+                shared_state
+                    .write()
+                    .await
+                    .apply_execution_event(&change_archived_event);
+                #[cfg(feature = "web-monitoring")]
+                if let Some(ws) = &web_state {
+                    ws.apply_execution_event(&change_archived_event).await;
+                }
 
                 // Update local state tracking
                 archived_changes.insert(change_id.clone());

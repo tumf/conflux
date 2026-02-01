@@ -183,6 +183,8 @@ The orchestration module SHALL provide helper functions for building HookContext
 
 システムは、apply コマンドの反復実行を管理するための共通ロジックを提供しなければならない（SHALL）。このロジックは serial mode と parallel mode の両方で使用される。
 
+SerialRunService の apply 反復処理は、進捗再取得・acceptance 判定・履歴更新を個別のヘルパーに分割してもよい（MAY）。ただし実行順序と結果は既存と同一でなければならない（MUST）。
+
 #### Scenario: 単一 apply の実行
 
 - **GIVEN** change_id = "my-change" と apply コマンドが設定されている

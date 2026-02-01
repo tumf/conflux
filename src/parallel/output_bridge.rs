@@ -4,98 +4,22 @@
 //! traits, forwarding all output to a ParallelEvent channel for the TUI to display.
 
 use crate::agent::OutputLine;
-use crate::events::{ExecutionEvent as ParallelEvent, LogEntry};
+use crate::events::ExecutionEvent as ParallelEvent;
 use crate::execution::apply::ApplyEventHandler;
-use crate::orchestration::output::OutputHandler;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
-
-/// Output handler that sends events to a ParallelEvent channel.
-///
-/// This allows the common orchestration loops (which use OutputHandler)
-/// to work with parallel execution (which uses ParallelEvent channels).
-#[derive(Clone)]
-#[allow(dead_code)]
-pub struct ParallelOutputHandler {
-    change_id: String,
-    event_tx: Option<mpsc::Sender<ParallelEvent>>,
-}
-
-#[allow(dead_code)]
-impl ParallelOutputHandler {
-    /// Create a new parallel output handler.
-    ///
-    /// # Arguments
-    ///
-    /// * `change_id` - The change ID for event tagging
-    /// * `event_tx` - Optional event channel sender
-    pub fn new(change_id: String, event_tx: Option<mpsc::Sender<ParallelEvent>>) -> Self {
-        Self {
-            change_id,
-            event_tx,
-        }
-    }
-}
-
-impl OutputHandler for ParallelOutputHandler {
-    fn on_stdout(&self, line: &str) {
-        debug!(target: "parallel::output", "{}: {}", self.change_id, line);
-        // Stdout is not typically sent as events in parallel mode
-        // It's captured in apply/archive output events
-    }
-
-    fn on_stderr(&self, line: &str) {
-        warn!(target: "parallel::output", "{}: {}", self.change_id, line);
-        // Stderr is not typically sent as events in parallel mode
-        // It's captured in apply/archive output events
-    }
-
-    fn on_info(&self, message: &str) {
-        info!("{}", message);
-        if let Some(ref tx) = self.event_tx {
-            let log = LogEntry::info(message.to_string()).with_change_id(&self.change_id);
-            let _ = tx.try_send(ParallelEvent::Log(log));
-        }
-    }
-
-    fn on_warn(&self, message: &str) {
-        warn!("{}", message);
-        if let Some(ref tx) = self.event_tx {
-            let log = LogEntry::warn(message.to_string()).with_change_id(&self.change_id);
-            let _ = tx.try_send(ParallelEvent::Log(log));
-        }
-    }
-
-    fn on_error(&self, message: &str) {
-        error!("{}", message);
-        if let Some(ref tx) = self.event_tx {
-            let log = LogEntry::error(message.to_string()).with_change_id(&self.change_id);
-            let _ = tx.try_send(ParallelEvent::Log(log));
-        }
-    }
-
-    fn on_success(&self, message: &str) {
-        info!("{}", message);
-        if let Some(ref tx) = self.event_tx {
-            let log = LogEntry::success(message.to_string()).with_change_id(&self.change_id);
-            let _ = tx.try_send(ParallelEvent::Log(log));
-        }
-    }
-}
+use tracing::{debug, error, info};
 
 /// Apply event handler that sends events to a ParallelEvent channel.
 ///
 /// This allows the unified apply loop (which uses ApplyEventHandler)
 /// to work with parallel execution (which uses ParallelEvent channels).
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct ParallelApplyEventHandler {
     #[allow(dead_code)]
     change_id: String,
     event_tx: Option<mpsc::Sender<ParallelEvent>>,
 }
 
-#[allow(dead_code)]
 impl ParallelApplyEventHandler {
     /// Create a new parallel apply event handler.
     ///
@@ -184,35 +108,6 @@ impl ApplyEventHandler for ParallelApplyEventHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_parallel_output_handler_with_channel() {
-        let (tx, mut rx) = mpsc::channel(10);
-        let handler = ParallelOutputHandler::new("test-change".to_string(), Some(tx));
-
-        handler.on_info("info message");
-        handler.on_warn("warn message");
-        handler.on_error("error message");
-        handler.on_success("success message");
-
-        // Should receive 4 log events
-        for _ in 0..4 {
-            assert!(rx.try_recv().is_ok());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_parallel_output_handler_without_channel() {
-        let handler = ParallelOutputHandler::new("test-change".to_string(), None);
-
-        // Should not panic when no channel is provided
-        handler.on_info("info message");
-        handler.on_warn("warn message");
-        handler.on_error("error message");
-        handler.on_success("success message");
-        handler.on_stdout("stdout");
-        handler.on_stderr("stderr");
-    }
 
     #[tokio::test]
     async fn test_parallel_apply_event_handler_with_channel() {
