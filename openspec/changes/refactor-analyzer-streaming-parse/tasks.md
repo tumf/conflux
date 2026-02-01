@@ -12,3 +12,8 @@
 
 ## 3. Acceptance #2 Failure Follow-up
 - [x] 3.1 Git working tree をクリーンにする（検証: `git status --porcelain` が空であることを確認）
+
+## 4. Acceptance #3 Failure Follow-up
+- [x] 4.1 src/analyzer.rs:658-682 `extract_change_dependencies` とそのテスト（833-917行）を削除（検証: テストでのみ使用、廃止された group-based analysis の残骸）
+- [x] 4.2 src/parallel_run_service.rs:568-642 `group_by_dependencies` とそのテスト（693-763行）を削除（検証: テストでのみ使用、LLMベース解析に置換済み）
+- [x] 4.3 `cargo test` を実行して全テストが成功することを確認（検証: 1000 tests passed = 968 unit + 32 integration）
