@@ -1,9 +1,13 @@
 ## 1. 実装
-- [ ] 1.1 キャンセル／イテレーション制御の判定をヘルパー関数に抽出する
+- [x] 1.1 キャンセル／イテレーション制御の判定をヘルパー関数に抽出する
   - 検証: `src/orchestrator.rs` の `run` がヘルパー経由で判定していることを確認する
-- [ ] 1.2 `ChangeProcessResult` の分岐処理をヘルパー関数に抽出する
+  - 実装済み: `check_graceful_stop()`, `check_cancellation()`, `check_max_iterations()` がループ内で使用されている (lines 741-774)
+- [x] 1.2 `ChangeProcessResult` の分岐処理をヘルパー関数に抽出する
   - 検証: `run` の match 本体がヘルパー呼び出しに置き換わっていることを確認する
-- [ ] 1.3 重複する状態更新（共有状態／Web更新）を共通化する
+  - 実装済み: `handle_change_result()` が全ての分岐を処理し、各種ハンドラに委譲している (lines 575-617)
+- [x] 1.3 重複する状態更新（共有状態／Web更新）を共通化する
   - 検証: 重複していた更新処理が一箇所に集約されていることを確認する
-- [ ] 1.4 リファクタリング後の挙動が維持されることを検証する
+  - 実装済み: `update_execution_mode()` ヘルパーを追加し、execution mode の更新とブロードキャストを統合 (src/orchestrator.rs:278-282)
+- [x] 1.4 リファクタリング後の挙動が維持されることを検証する
   - 検証: `cargo fmt && cargo clippy -- -D warnings && cargo test --bin cflx orchestrator::`
+  - 確認済み: すべてのチェックが成功 (11 tests passed)
