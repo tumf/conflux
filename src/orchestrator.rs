@@ -1199,11 +1199,7 @@ impl Orchestrator {
         service.set_no_resume(self.no_resume);
 
         // Check if Git is available for true parallel execution
-        if !service.check_vcs_available().await? {
-            return Err(OrchestratorError::GitCommand(
-                "Git repository not available for parallel execution".to_string(),
-            ));
-        }
+        service.check_vcs_available().await?;
 
         info!("Git available, executing changes in parallel using worktrees");
 

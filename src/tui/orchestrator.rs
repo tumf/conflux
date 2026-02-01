@@ -1220,6 +1220,9 @@ pub async fn run_orchestrator_parallel(
     // Create ParallelRunService
     let service = ParallelRunService::new(repo_root.clone(), config.clone());
 
+    // Check if Git is available for parallel execution
+    service.check_vcs_available().await?;
+
     // Create shared queue change timestamp for debouncing
     let shared_queue_change = Arc::new(tokio::sync::Mutex::new(None::<std::time::Instant>));
 
