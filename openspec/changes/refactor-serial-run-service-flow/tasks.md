@@ -51,3 +51,10 @@
 - [x] 8.3 `src/tui/orchestrator.rs` の `archive_single_change` / `archive_all_complete_changes` が `#[allow(dead_code)]` のまま `run_orchestrator` から呼ばれておらず、`Phase 1 archive processing has been removed`（`src/tui/orchestrator.rs:94-96`）により未使用。削除するか新フローに統合して dead code を解消する（検証: dead code 関数を削除、関連する未使用 imports を削除、間接的に未使用になった `run_archive_streaming_with_runner` と `format_archive_history` に `#[allow(dead_code)]` を追加）
 - [x] 8.4 全テストの実行と確認（検証: `cargo test` が成功 - 1007 tests passed, 0 failed, 6 ignored）
 - [x] 8.5 `cargo fmt` と `cargo clippy` の実行（検証: フォーマットと lint が成功、警告なし）
+
+## 9. Acceptance #8 Failure Follow-up
+- [x] 9.1 `SerialRunService::apply_change_internal` のキャンセル監視タスクが apply 完了後も停止しないため、終了時にタスクを停止/abort する（検証: apply 完了後にバックグラウンドタスクが終了する）
+- [x] 9.2 `git status --porcelain` が空でないため、作業ツリーをクリーンにする（検証: 変更ファイルなし。現在: `openspec/changes/refactor-serial-run-service-flow/tasks.md` が変更中）
+
+## 10. Acceptance #9 Failure Follow-up
+- [ ] `src/tui/orchestrator.rs` の `ChangeProcessResult::AcceptanceContinue` / `AcceptanceFailed` / `AcceptanceCommandFailed` 分岐（例: `src/tui/orchestrator.rs:513-633`）では `OrchestratorEvent::AcceptanceStarted` を送出しておらず、`acceptance_test_streaming` も `OutputHandler::on_info` のみ（`src/orchestration/acceptance.rs:101-123`）。そのため `src/tui/state/events/completion.rs:70-88` の `handle_acceptance_started` が非Pass系で発火しない。Acceptance開始イベントを各分岐で送るか、`acceptance_test_streaming` 側で `AcceptanceStarted` を送出する。
