@@ -1,13 +1,12 @@
-# Change: Orchestrator の run ループ分割
+# Change: オーケストレーションrunループの分割
 
 ## Why
-`src/orchestrator.rs` の `run` が大規模で、状態更新や結果分岐が混在しています。責務ごとに分割して変更の安全性を高めます。
+`Orchestrator::run` が巨大で責務が混在しており、今後の保守や安全な変更が難しくなっています。
 
 ## What Changes
-- キャンセル／イテレーション制御の判定をヘルパー関数へ抽出する
-- `ChangeProcessResult` の分岐処理をヘルパー関数に分離する
-- 重複する状態更新処理を共通化する
+- run ループの初期化/停止判定/変更選定/結果処理を小さなヘルパーに分割する
+- 既存の挙動・イベント順序・ログ出力を維持する
 
 ## Impact
-- Affected specs: `code-maintenance`
-- Affected code: `src/orchestrator.rs`, `src/orchestration/state/*`（必要に応じて）
+- Affected specs: code-maintenance
+- Affected code: src/orchestrator.rs
