@@ -416,11 +416,11 @@ impl SerialRunService {
                     )
                     .await
                     {
-                        Ok((AcceptanceResult::Pass, _attempt_number)) => {
+                        Ok((AcceptanceResult::Pass, _attempt_number, _command)) => {
                             info!("Acceptance passed for {}, ready for archive", change.id);
                             Ok(ChangeProcessResult::AcceptancePassed)
                         }
-                        Ok((AcceptanceResult::Continue, _attempt_number)) => {
+                        Ok((AcceptanceResult::Continue, _attempt_number, _command)) => {
                             let continue_count =
                                 agent.count_consecutive_acceptance_continues(&change.id);
                             let max_continues = self.config.get_acceptance_max_continues();
@@ -439,7 +439,7 @@ impl SerialRunService {
                                 Ok(ChangeProcessResult::AcceptanceContinue)
                             }
                         }
-                        Ok((AcceptanceResult::Fail { findings }, _attempt_number)) => {
+                        Ok((AcceptanceResult::Fail { findings }, _attempt_number, _command)) => {
                             warn!(
                                 "Acceptance failed for {} with {} findings, will retry apply",
                                 change.id,
@@ -451,12 +451,13 @@ impl SerialRunService {
                         Ok((
                             AcceptanceResult::CommandFailed { error, findings: _ },
                             _attempt_number,
+                            _command,
                         )) => {
                             error!("Acceptance command failed for {}: {}", change.id, error);
                             // Note: tasks.md is now updated by the acceptance agent itself
                             Ok(ChangeProcessResult::AcceptanceCommandFailed { error })
                         }
-                        Ok((AcceptanceResult::Cancelled, _attempt_number)) => {
+                        Ok((AcceptanceResult::Cancelled, _attempt_number, _command)) => {
                             info!("Acceptance cancelled for {}", change.id);
                             Ok(ChangeProcessResult::Cancelled)
                         }

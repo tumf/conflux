@@ -75,8 +75,16 @@ impl AppState {
             }
             change.queue_status = QueueStatus::Accepting;
         }
-        self.add_log(LogEntry::info(format!("Acceptance started: {}", change_id)));
-        self.add_log(LogEntry::info(format!("  Command: {}", command)));
+        self.add_log(
+            LogEntry::info(format!("Acceptance started: {}", change_id))
+                .with_operation("acceptance")
+                .with_change_id(&change_id),
+        );
+        self.add_log(
+            LogEntry::info(format!("  Command: {}", command))
+                .with_operation("acceptance")
+                .with_change_id(&change_id),
+        );
     }
 
     /// Handle AcceptanceCompleted event

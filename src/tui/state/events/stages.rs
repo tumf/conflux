@@ -22,8 +22,16 @@ impl AppState {
             change.queue_status = QueueStatus::Applying;
             change.elapsed_time = None;
         }
-        self.add_log(LogEntry::info(format!("Apply started: {}", change_id)));
-        self.add_log(LogEntry::info(format!("  Command: {}", command)));
+        self.add_log(
+            LogEntry::info(format!("Apply started: {}", change_id))
+                .with_operation("apply")
+                .with_change_id(&change_id),
+        );
+        self.add_log(
+            LogEntry::info(format!("  Command: {}", command))
+                .with_operation("apply")
+                .with_change_id(&change_id),
+        );
     }
 
     /// Handle ArchiveStarted event
@@ -50,8 +58,16 @@ impl AppState {
                 }
             }
         }
-        self.add_log(LogEntry::info(format!("Archiving: {}", id)));
-        self.add_log(LogEntry::info(format!("  Command: {}", command)));
+        self.add_log(
+            LogEntry::info(format!("Archiving: {}", id))
+                .with_operation("archive")
+                .with_change_id(&id),
+        );
+        self.add_log(
+            LogEntry::info(format!("  Command: {}", command))
+                .with_operation("archive")
+                .with_change_id(&id),
+        );
     }
 
     /// Handle ChangeArchived event
@@ -92,11 +108,16 @@ impl AppState {
             change.queue_status = QueueStatus::Resolving;
             change.elapsed_time = None;
         }
-        self.add_log(LogEntry::info(format!(
-            "Resolving merge for '{}'",
-            change_id
-        )));
-        self.add_log(LogEntry::info(format!("  Command: {}", command)));
+        self.add_log(
+            LogEntry::info(format!("Resolving merge for '{}'", change_id))
+                .with_operation("resolve")
+                .with_change_id(&change_id),
+        );
+        self.add_log(
+            LogEntry::info(format!("  Command: {}", command))
+                .with_operation("resolve")
+                .with_change_id(&change_id),
+        );
     }
 
     /// Handle ResolveCompleted event

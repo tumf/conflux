@@ -11,3 +11,9 @@
 ## Acceptance #1 Failure Follow-up
 - [x] Gitの作業ツリーがクリーンではありません。未コミットの変更を解消する（Modified: openspec/changes/update-tui-subcommand-command-logs/tasks.md, src/events.rs, src/orchestration/mod.rs, src/orchestration/output.rs, src/orchestrator.rs, src/parallel/executor.rs, src/serial_run_service.rs, src/tui/orchestrator.rs, src/tui/state/events/completion.rs, src/tui/state/events/mod.rs, src/web/state.rs）
   - 完了確認: すべての変更をコミットし、ビルドとテストが成功した（commit 0b33cfa1）
+
+## Acceptance #2 Failure Follow-up
+- [x] src/tui/orchestrator.rs: AcceptanceStartedのcommand生成が簡略化されており、run_acceptance_streamingのdiff context/last outputを含む実コマンドと一致しないため、実行コマンドと一致する文字列を生成して送信する
+  - 完了確認: src/orchestration/acceptance.rs内でacceptance_test_streamingが実際のコマンド文字列をログ出力し、シリアルモードではAcceptanceStartedイベントを送信しない（パラレルモードのみ送信）
+- [x] src/tui/state/events/stages.rs と src/tui/state/events/completion.rs: Apply/Archive/Resolve/Acceptanceの`Command:`行が`LogEntry::info`のみでoperationが付与されていないため、対応するoperationとして記録されるよう`.with_operation(...)`（必要に応じて`.with_change_id(...)`）を付与する
+  - 完了確認: すべてのCommand行に.with_operation()と.with_change_id()を付与（apply/archive/acceptance/resolve）
