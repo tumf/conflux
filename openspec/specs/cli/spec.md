@@ -64,6 +64,9 @@ acceptance ループは change に対して `acceptance_command` を実行し、
 - acceptance prompt は FAIL 時に tasks.md の follow-up を更新する指示を含めなければならない（MUST）。
 - `Acceptance #<n> Failure Follow-up` セクションでは、各 finding を `- [ ] <finding>` の未完了タスクとして 1 行ずつ記録しなければならない（MUST）。番号付きの箇条書きを使用してはならない（MUST NOT）。
 - follow-up セクションに `Address acceptance findings:` のようなラッパー行やネストされた箇条書きを追加してはならない（MUST NOT）。
+- acceptance の findings として扱う内容は stdout/stderr の tail 行を用い、`ACCEPTANCE:` マーカーと `FINDINGS:` 行を除外しなければならない（MUST）。
+- findings の `- ` 箇条書き構造を解析して抽出してはならない（MUST NOT）。
+- ログで件数を表示する場合は findings ではなく tail 行数である旨を明示しなければならない（MUST）。曖昧な "N findings" 表現を使用してはならない（MUST NOT）。
 - apply ループは acceptance failure 後も同じ iteration カウンター値で再開しなければならない（MUST）。
 - 出力が CONTINUE を示す場合、オーケストレーターは `acceptance_max_continues` 回まで acceptance を再試行しなければならない（MUST）。
 - acceptance マーカーが存在しない場合、オーケストレーターは CONTINUE として扱い、`acceptance_max_continues` に従って再試行しなければならない（MUST）。
@@ -98,6 +101,12 @@ acceptance ループは change に対して `acceptance_command` を実行し、
 - **WHEN** オーケストレーターが acceptance ループを継続する
 - **THEN** 次の acceptance プロンプトに `<last_acceptance_output>` タグで囲まれた前回の stdout_tail/stderr_tail が含まれる
 - **AND** エージェントは前回の調査結果を参照して次の調査アクションを決定できる
+
+#### Scenario: Acceptance failure logging avoids misleading findings count
+- **GIVEN** acceptance output の tail に `ACCEPTANCE: FAIL` と `FINDINGS:` が含まれる
+- **WHEN** オーケストレーターが acceptance FAIL を記録する
+- **THEN** findings として保存される tail 行から `ACCEPTANCE:` マーカーと `FINDINGS:` 行が除外される
+- **AND** ログは "N findings" のような誤解を招く件数表現を出さない
 
 ### Requirement: Default TUI Launch
 
