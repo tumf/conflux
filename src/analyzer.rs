@@ -270,8 +270,9 @@ impl ParallelizationAnalyzer {
 
     /// Build the prompt for parallelization analysis
     ///
-    /// Formats selected changes (with `is_approved = true`) as a list with:
-    /// - `[x]` marker to indicate selection status
+    /// Formats all changes with:
+    /// - `[x]` marker for approved changes (`is_approved = true`)
+    /// - `[ ]` marker for unapproved changes
     /// - Full proposal file path for each change (e.g., `openspec/changes/{id}/proposal.md`)
     ///
     /// This makes it clear to the LLM which changes need analysis and where
@@ -279,8 +280,13 @@ impl ParallelizationAnalyzer {
     fn build_parallelization_prompt(&self, changes: &[Change]) -> String {
         let change_list: String = changes
             .iter()
-            .filter(|c| c.is_approved) // Only selected/approved changes
-            .map(|c| format!("[x] {} (openspec/changes/{}/proposal.md)", c.id, c.id))
+            .map(|c| {
+                let marker = if c.is_approved { "[x]" } else { "[ ]" };
+                format!(
+                    "{} {} (openspec/changes/{}/proposal.md)",
+                    marker, c.id, c.id
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -947,8 +953,8 @@ That's all."#;
         assert!(prompt.contains("[x] selected-a (openspec/changes/selected-a/proposal.md)"));
         assert!(prompt.contains("[x] selected-c (openspec/changes/selected-c/proposal.md)"));
 
-        // Check that unselected change is NOT included
-        assert!(!prompt.contains("unselected-b"));
+        // Check that unselected change IS included with [ ] marker
+        assert!(prompt.contains("[ ] unselected-b (openspec/changes/unselected-b/proposal.md)"));
 
         // Check that instruction mentions "marked with [x]"
         assert!(prompt.contains("marked with [x]"));
@@ -1002,8 +1008,8 @@ That's all."#;
 
         let prompt = analyzer.build_parallelization_prompt(&changes);
 
-        // No changes should be included
-        assert!(!prompt.contains("change-1"));
+        // Unselected change should be included with [ ] marker
+        assert!(prompt.contains("[ ] change-1 (openspec/changes/change-1/proposal.md)"));
 
         // But structure should still be there
         assert!(prompt.contains("Analyze ONLY the changes marked with [x]"));
