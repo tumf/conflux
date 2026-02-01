@@ -493,11 +493,15 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             - git merge --no-ff -m \"Pre-sync base into <change_id>\" <target_branch>\n\
             - If a conflict occurs, resolve it, git add, then git commit -m \"Pre-sync base into <change_id>\" to complete the merge.\n\
             - If the merge commit message is wrong, fix it with: git commit --amend -m \"Pre-sync base into <change_id>\".\n\
-         2) Final merge into the target branch (in the repo root):\n\
-            - cd <repo_root>\n\
-            - git checkout <target_branch>\n\
-            - git merge --no-ff -m \"Merge change: <change_id>\" <branch>\n\
-            - If a conflict occurs, resolve it, git add, then git commit -m \"Merge change: <change_id>\" to complete the merge.\n\
+             2) Final merge into the target branch (in the repo root):\n\
+                 - cd <repo_root>\n\
+                 - git checkout <target_branch>\n\
+                 - git merge --no-ff --no-commit <branch>\n\
+                 - If a conflict occurs, resolve it and git add the resolved files.\n\
+                 - BEFORE creating the merge commit:\n\
+                   * If `openspec/changes/<change_id>/proposal.md` exists AND `openspec/changes/archive/` contains the same <change_id>, remove `openspec/changes/<change_id>` (the directory was resurrected by the merge and must be deleted).\n\
+                   * Use `git rm -rf openspec/changes/<change_id>` to remove the resurrected directory.\n\
+                 - Finally, run `git commit -m \"Merge change: <change_id>\"` to complete the merge.\n\
          3) If a pre-commit hook modifies files and stops the commit, re-stage and re-run git commit with the same message.\n\
          4) Do not use destructive commands like reset --hard.\n\n\
          Current VCS status:\n{}\n\n\
@@ -565,10 +569,14 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                 - If a conflict occurs, resolve it, git add, then git commit -m \"Pre-sync base into <change_id>\" to complete the merge.\n\
                 - If the merge commit message is wrong, fix it with: git commit --amend -m \"Pre-sync base into <change_id>\".\n\
              2) Final merge into the target branch (in the repo root):\n\
-                - cd <repo_root>\n\
-                - git checkout <target_branch>\n\
-                - git merge --no-ff -m \"Merge change: <change_id>\" <branch>\n\
-                - If a conflict occurs, resolve it, git add, then git commit -m \"Merge change: <change_id>\" to complete the merge.\n\
+                 - cd <repo_root>\n\
+                 - git checkout <target_branch>\n\
+                 - git merge --no-ff --no-commit <branch>\n\
+                 - If a conflict occurs, resolve it and git add the resolved files.\n\
+                 - BEFORE creating the merge commit:\n\
+                   * If `openspec/changes/<change_id>/proposal.md` exists AND `openspec/changes/archive/` contains the same <change_id>, remove `openspec/changes/<change_id>` (the directory was resurrected by the merge and must be deleted).\n\
+                   * Use `git rm -rf openspec/changes/<change_id>` to remove the resurrected directory.\n\
+                 - Finally, run `git commit -m \"Merge change: <change_id>\"` to complete the merge.\n\
              3) If a pre-commit hook modifies files and stops the commit, re-stage and re-run git commit with the same message.\n\
              4) Do not use destructive commands like reset --hard.\n\n\
              Current VCS status:\n{}\n\n\
