@@ -187,7 +187,10 @@ pub fn handle_esc_key(ctx: &mut KeyEventContext<'_>) {
 }
 
 /// Handle F5 key: Start, resume, or retry processing; or cancel stop
+/// Prioritizes resolve for MergeWait changes over starting/resuming processing
 pub fn handle_f5_key(ctx: &mut KeyEventContext<'_>) -> Option<TuiCommand> {
+    use super::types::QueueStatus;
+
     // Handle F5 in Stopping mode to cancel graceful stop
     if ctx.app.mode == AppMode::Stopping {
         // Check if orchestrator is still running
@@ -209,6 +212,16 @@ pub fn handle_f5_key(ctx: &mut KeyEventContext<'_>) -> Option<TuiCommand> {
             ));
         }
         return None;
+    }
+
+    // Prioritize resolve for MergeWait changes
+    // Check if cursor is on a MergeWait change
+    if !ctx.app.changes.is_empty() && ctx.app.cursor_index < ctx.app.changes.len() {
+        let change = &ctx.app.changes[ctx.app.cursor_index];
+        if matches!(change.queue_status, QueueStatus::MergeWait) {
+            // F5 on MergeWait change triggers resolve, not start processing
+            return ctx.app.resolve_merge();
+        }
     }
 
     // Determine which command to use based on mode

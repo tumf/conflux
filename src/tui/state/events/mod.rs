@@ -101,14 +101,14 @@ impl AppState {
                 worktree_change_ids,
                 worktree_paths,
                 worktree_not_ahead_ids,
-                resolve_wait_ids,
+                merge_wait_ids,
             } => self.handle_changes_refreshed(
                 changes,
                 committed_change_ids,
                 worktree_change_ids,
                 worktree_paths,
                 worktree_not_ahead_ids,
-                resolve_wait_ids,
+                merge_wait_ids,
             ),
             OrchestratorEvent::WorktreesRefreshed { worktrees } => {
                 self.handle_worktrees_refreshed(worktrees)
