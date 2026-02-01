@@ -881,8 +881,10 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             )];
 
-            // Add header with shortened format (operation only, no change_id)
-            // Format: [operation:iteration] or [operation]
+            // Add header for Logs view: include change_id when present
+            // Format: [change_id:operation:iteration] or [change_id:operation] when change_id is present
+            // Format: [operation:iteration] or [operation] when change_id is absent
+            // Special rule: analysis logs must always include iteration
             let _msg_width = if let Some(ref operation) = entry.operation {
                 // Use hash of change_id (if present) to pick a consistent color
                 let color_index = if let Some(ref change_id) = entry.change_id {
@@ -895,10 +897,22 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
                 };
                 let prefix_color = change_colors[color_index];
 
-                // Build shortened header with only operation and iteration
-                let header = match entry.iteration {
-                    Some(iter) => format!("[{}:{}] ", operation, iter),
-                    None => format!("[{}] ", operation),
+                // Build header with change_id when present
+                // Note: analysis logs must always have iteration per spec
+                let header = match (&entry.change_id, entry.iteration) {
+                    (Some(change_id), Some(iter)) => {
+                        format!("[{}:{}:{}] ", change_id, operation, iter)
+                    }
+                    (Some(change_id), None) => format!("[{}:{}] ", change_id, operation),
+                    (None, Some(iter)) => format!("[{}:{}] ", operation, iter),
+                    (None, None) => {
+                        // Analysis logs must always have iteration
+                        if operation == "analysis" {
+                            format!("[{}:1] ", operation) // Default to iteration 1
+                        } else {
+                            format!("[{}] ", operation)
+                        }
+                    }
                 };
 
                 let header_len = header.len();
@@ -1710,17 +1724,18 @@ mod tests {
     fn test_log_header_analysis_without_iteration() {
         let mut app = create_test_app(vec![create_test_change("change-a", true)]);
 
-        // Add analysis log without iteration
+        // Add analysis log without iteration (edge case - should default to iteration 1)
         let entry = LogEntry::info("Starting analysis").with_operation("analysis");
         app.add_log(entry);
 
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
 
-        // Should display [analysis] header
+        // Per spec: analysis logs must always display with iteration number
+        // When iteration is missing, defaults to 1
         assert!(
-            content.contains("[analysis]"),
-            "Buffer should contain '[analysis]' header, but got:\n{}",
+            content.contains("[analysis:1]"),
+            "Buffer should contain '[analysis:1]' header (analysis logs must always show iteration), but got:\n{}",
             content
         );
     }
@@ -1739,10 +1754,10 @@ mod tests {
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
 
-        // Should display shortened [resolve:1] header (change_id omitted)
+        // Should display full [my-change:resolve:1] header in Logs view
         assert!(
-            content.contains("[resolve:1]"),
-            "Buffer should contain '[resolve:1]' header, but got:\n{}",
+            content.contains("[my-change:resolve:1]"),
+            "Buffer should contain '[my-change:resolve:1]' header, but got:\n{}",
             content
         );
     }
@@ -1810,10 +1825,10 @@ mod tests {
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
 
-        // Should display shortened [acceptance:3] header (change_id omitted)
+        // Should display full [my-change:acceptance:3] header in Logs view
         assert!(
-            content.contains("[acceptance:3]"),
-            "Buffer should contain '[acceptance:3]' header, but got:\n{}",
+            content.contains("[my-change:acceptance:3]"),
+            "Buffer should contain '[my-change:acceptance:3]' header, but got:\n{}",
             content
         );
     }
@@ -1831,10 +1846,32 @@ mod tests {
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
 
-        // Should display shortened [acceptance] header (change_id omitted)
+        // Should display full [my-change:acceptance] header in Logs view
         assert!(
-            content.contains("[acceptance]"),
-            "Buffer should contain '[acceptance]' header, but got:\n{}",
+            content.contains("[my-change:acceptance]"),
+            "Buffer should contain '[my-change:acceptance]' header, but got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_log_header_archive_with_change_id_and_iteration() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+
+        // Add archive log with change_id and iteration
+        let entry = LogEntry::info("Archiving change")
+            .with_change_id("test-change")
+            .with_operation("archive")
+            .with_iteration(2);
+        app.add_log(entry);
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        // Should display full [test-change:archive:2] header in Logs view
+        assert!(
+            content.contains("[test-change:archive:2]"),
+            "Buffer should contain '[test-change:archive:2]' header for retry identification, but got:\n{}",
             content
         );
     }
