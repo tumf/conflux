@@ -64,7 +64,7 @@ Changes have two independent states: **approval** and **selection/queue**.
 | `[queued]` | Waiting to be processed |
 | `[blocked]` | Blocked by unresolved dependencies |
 | `[merge wait]` | Waiting for merge resolution (use `M` to trigger resolve) |
-| `[resolve wait]` | Waiting to run resolve (UI actions are restricted) |
+| `[resolve pending]` | Resolve requested, waiting for execution to start (UI actions are restricted) |
 | `[applying]` | Applying (spinner + progress% / iteration when available) |
 | `[accepting]` | Acceptance/tests (spinner, iteration when available) |
 | `[archiving]` | Archiving (spinner, iteration when available) |
