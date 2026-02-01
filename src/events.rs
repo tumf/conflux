@@ -211,7 +211,7 @@ pub enum ExecutionEvent {
 
     // Acceptance events
     /// Acceptance started for a change
-    AcceptanceStarted { change_id: String },
+    AcceptanceStarted { change_id: String, command: String },
     /// Acceptance completed for a change
     AcceptanceCompleted { change_id: String },
     /// Acceptance failed for a change
@@ -545,5 +545,41 @@ mod tests {
     fn test_log_level_equality() {
         assert_eq!(LogLevel::Info, LogLevel::Info);
         assert_ne!(LogLevel::Info, LogLevel::Error);
+    }
+
+    #[test]
+    fn test_acceptance_started_event_with_command() {
+        let event = ExecutionEvent::AcceptanceStarted {
+            change_id: "test-change".to_string(),
+            command: "claude --dangerously-skip-permissions acceptance test-change".to_string(),
+        };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("AcceptanceStarted"));
+        assert!(debug_str.contains("test-change"));
+        assert!(debug_str.contains("acceptance"));
+    }
+
+    #[test]
+    fn test_archive_started_event_with_command() {
+        let event = ExecutionEvent::ArchiveStarted {
+            change_id: "test-change".to_string(),
+            command: "claude --dangerously-skip-permissions archive test-change".to_string(),
+        };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("ArchiveStarted"));
+        assert!(debug_str.contains("test-change"));
+        assert!(debug_str.contains("archive"));
+    }
+
+    #[test]
+    fn test_resolve_started_event_with_command() {
+        let event = ExecutionEvent::ResolveStarted {
+            change_id: "test-change".to_string(),
+            command: "claude --dangerously-skip-permissions resolve test-change".to_string(),
+        };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("ResolveStarted"));
+        assert!(debug_str.contains("test-change"));
+        assert!(debug_str.contains("resolve"));
     }
 }

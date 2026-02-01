@@ -31,6 +31,8 @@ pub use apply::{apply_change, apply_change_streaming, ApplyContext, ApplyResult}
 #[allow(unused_imports)]
 pub use archive::{archive_change, archive_change_streaming, ArchiveContext, ArchiveResult};
 #[allow(unused_imports)]
-pub use output::{ChannelOutputHandler, LogOutputHandler, OutputHandler, OutputMessage};
+pub use output::{
+    ChannelOutputHandler, ContextualOutputHandler, LogOutputHandler, OutputHandler, OutputMessage,
+};
 #[allow(unused_imports)]
 pub use state::OrchestratorState;

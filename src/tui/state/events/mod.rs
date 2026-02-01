@@ -84,8 +84,8 @@ impl AppState {
             OrchestratorEvent::MergeDeferred { change_id, reason } => {
                 self.handle_merge_deferred(change_id, reason)
             }
-            OrchestratorEvent::AcceptanceStarted { change_id } => {
-                self.handle_acceptance_started(change_id)
+            OrchestratorEvent::AcceptanceStarted { change_id, command } => {
+                self.handle_acceptance_started(change_id, command)
             }
             OrchestratorEvent::AcceptanceCompleted { change_id } => {
                 self.handle_acceptance_completed(change_id)
