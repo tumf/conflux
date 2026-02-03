@@ -307,11 +307,29 @@ This allows you to use different AI tools (Claude Code, OpenCode, Codex, etc.) w
   // Command to apply a change (supports {change_id} and {prompt} placeholders)
   "apply_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id} {prompt}'",
 
+  // Command to run acceptance tests after apply (supports {change_id} and {prompt} placeholders)
+  "acceptance_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:accept {change_id} {prompt}'",
+
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
   "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id} {prompt}'",
 
+  // Command to resolve merge conflicts (supports {prompt} placeholder)
+  "resolve_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
+
   // System prompt for apply command (injected into {prompt} placeholder)
   "apply_prompt": "スコープ外タスクは削除せよ。ユーザを待つもしくはユーザによるタスクは削除せよ。",
+
+  // System prompt for acceptance command (injected into {prompt} placeholder)
+  "acceptance_prompt": "",
+
+  // Controls how the acceptance {prompt} is constructed
+  // - "full": include hardcoded acceptance system prompt + diff/history context (default)
+  // - "context_only": only include change metadata + diff/history context
+  // Use "context_only" when your acceptance_command uses a command template with fixed instructions
+  "acceptance_prompt_mode": "full",
+
+  // Maximum number of acceptance CONTINUE retries before treating as FAIL (default: 10)
+  "acceptance_max_continues": 10,
 
   // System prompt for archive command (injected into {prompt} placeholder)
   "archive_prompt": "",
@@ -346,8 +364,8 @@ This allows you to use different AI tools (Claude Code, OpenCode, Codex, etc.) w
 
 | Placeholder | Description | Used in |
 |-------------|-------------|---------|
-| `{change_id}` | The change ID being processed | apply_command, archive_command |
-| `{prompt}` | System prompt for agent commands | apply_command, archive_command, analyze_command |
+| `{change_id}` | The change ID being processed | apply_command, acceptance_command, archive_command |
+| `{prompt}` | System prompt for agent commands | apply_command, acceptance_command, archive_command, resolve_command, analyze_command |
 | `{workspace_dir}` | New worktree path for proposals | worktree_command |
 | `{repo_root}` | Repository root path | worktree_command |
 
@@ -355,7 +373,8 @@ This allows you to use different AI tools (Claude Code, OpenCode, Codex, etc.) w
 
 | Config Key | Description | Default |
 |------------|-------------|---------|
-| `apply_prompt` | Prompt injected into apply_command's `{prompt}` | `スコープ外タスクは削除せよ。ユーザを待つもしくはユーザによるタスクは削除せよ。` |
+| `apply_prompt` | Prompt injected into apply_command's `{prompt}` | (includes path context) |
+| `acceptance_prompt` | Prompt injected into acceptance_command's `{prompt}` | (empty) |
 | `archive_prompt` | Prompt injected into archive_command's `{prompt}` | (empty) |
 
 **Quick start:**
