@@ -20,7 +20,7 @@ pub use basic::{
 };
 pub use commit::{
     add_and_commit, create_archive_wip_commit, has_changes_to_commit, list_changes_in_head,
-    squash_archive_wip_commits,
+    list_changes_with_uncommitted_files, squash_archive_wip_commits,
 };
 pub use merge::{
     check_merge_conflicts, first_parent_of, is_ancestor, is_merge_in_progress, merge, merge_branch,

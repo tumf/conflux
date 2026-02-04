@@ -184,14 +184,34 @@ impl ParallelRunService {
                 }
             };
 
+        // Get changes with uncommitted files under openspec/changes/<change_id>/
+        let uncommitted_file_change_ids: HashSet<String> =
+            match crate::vcs::git::commands::list_changes_with_uncommitted_files(&self.repo_root)
+                .await
+            {
+                Ok(ids) => ids.into_iter().collect(),
+                Err(err) => {
+                    warn!(
+                        "Failed to detect uncommitted files in changes; assuming no uncommitted files: {}",
+                        err
+                    );
+                    HashSet::new()
+                }
+            };
+
         let mut committed = Vec::new();
         let mut skipped = Vec::new();
 
         for change in changes {
-            if committed_change_ids.contains(&change.id) {
-                committed.push(change);
-            } else {
+            // Exclude if:
+            // 1. Not in HEAD commit tree, OR
+            // 2. Has uncommitted/untracked files under openspec/changes/<change_id>/
+            if !committed_change_ids.contains(&change.id)
+                || uncommitted_file_change_ids.contains(&change.id)
+            {
                 skipped.push(change.id);
+            } else {
+                committed.push(change);
             }
         }
 
@@ -693,5 +713,54 @@ mod tests {
         let committed_ids: Vec<String> = committed.into_iter().map(|change| change.id).collect();
         assert_eq!(committed_ids, vec!["change-a".to_string()]);
         assert_eq!(skipped, vec!["change-b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_filter_committed_changes_skips_partially_uncommitted() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        if !init_git_repo(&temp_dir).await {
+            return;
+        }
+
+        let base_dir = temp_dir.path().join("openspec/changes");
+
+        // Create and commit change-a
+        std::fs::create_dir_all(base_dir.join("change-a")).unwrap();
+        std::fs::write(base_dir.join("change-a/proposal.md"), "test").unwrap();
+
+        // Create and commit change-b
+        std::fs::create_dir_all(base_dir.join("change-b")).unwrap();
+        std::fs::write(base_dir.join("change-b/proposal.md"), "test").unwrap();
+
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "add changes"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Add uncommitted file to change-a
+        std::fs::write(base_dir.join("change-a/tasks.md"), "new task").unwrap();
+
+        let service =
+            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let changes = vec![
+            create_test_change("change-a", vec![]),
+            create_test_change("change-b", vec![]),
+        ];
+
+        let (committed, skipped) = service
+            .filter_committed_changes(changes)
+            .await
+            .expect("filter changes");
+
+        let committed_ids: Vec<String> = committed.into_iter().map(|change| change.id).collect();
+        // change-a should be skipped due to uncommitted files
+        assert_eq!(committed_ids, vec!["change-b".to_string()]);
+        assert_eq!(skipped, vec!["change-a".to_string()]);
     }
 }

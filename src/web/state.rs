@@ -598,8 +598,9 @@ impl WebState {
                 // Changes refresh events
                 ExecutionEvent::ChangesRefreshed {
                     changes,
-                    committed_change_ids,
-                    worktree_change_ids,
+                    committed_change_ids: _,
+                    uncommitted_file_change_ids: _,
+                    worktree_change_ids: _,
                     worktree_paths: _,
                     worktree_not_ahead_ids: _,
                     merge_wait_ids: _,
@@ -631,10 +632,6 @@ impl WebState {
                     state.changes = new_change_statuses;
                     refresh_summary(&mut state);
                     updated = true;
-
-                    // Store metadata for parallel eligibility tracking
-                    // (This would be used if we track parallel eligibility in web state)
-                    let _ = (committed_change_ids, worktree_change_ids);
                 }
 
                 // Worktree refresh events
@@ -1326,6 +1323,7 @@ mod tests {
                     dependencies: Vec::new(),
                 }],
                 committed_change_ids: HashSet::new(),
+                uncommitted_file_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
                 worktree_not_ahead_ids: HashSet::new(),
@@ -1356,6 +1354,7 @@ mod tests {
             .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
                 changes: vec![create_test_change("change-a", 9, 12)],
                 committed_change_ids: HashSet::new(),
+                uncommitted_file_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
                 worktree_not_ahead_ids: HashSet::new(),
@@ -1492,6 +1491,7 @@ mod tests {
             .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
                 changes: vec![create_test_change("change-a", 0, 0)],
                 committed_change_ids: HashSet::new(),
+                uncommitted_file_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
                 worktree_not_ahead_ids: HashSet::new(),
@@ -1535,6 +1535,7 @@ mod tests {
             .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
                 changes: vec![create_test_change("change-a", 0, 0)],
                 committed_change_ids: HashSet::new(),
+                uncommitted_file_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
                 worktree_not_ahead_ids: HashSet::new(),

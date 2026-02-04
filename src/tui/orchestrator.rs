@@ -780,6 +780,18 @@ pub async fn run_orchestrator_parallel(
             }
         };
 
+    let uncommitted_file_change_ids: HashSet<String> =
+        match crate::vcs::git::commands::list_changes_with_uncommitted_files(&repo_root).await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Failed to detect uncommitted files in changes for parallel start"
+                );
+                HashSet::new()
+            }
+        };
+
     // Filter to get only changes to process
     let changes_to_process: Vec<Change> = all_changes
         .iter()
@@ -793,6 +805,7 @@ pub async fn run_orchestrator_parallel(
         .send(OrchestratorEvent::ChangesRefreshed {
             changes: all_changes,
             committed_change_ids,
+            uncommitted_file_change_ids,
             worktree_change_ids: HashSet::new(),
             worktree_paths: HashMap::new(),
             worktree_not_ahead_ids: HashSet::new(),
