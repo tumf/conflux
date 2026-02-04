@@ -1769,8 +1769,11 @@ impl AppState {
     // Output event handlers
     fn handle_apply_output(&mut self, change_id: String, output: String, iteration: Option<u32>) {
         // Update iteration number in change state with monotonic guard
+        // Only update if the change is currently in Applying stage
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            change.update_iteration_monotonic(iteration);
+            if matches!(change.queue_status, QueueStatus::Applying) {
+                change.update_iteration_monotonic(iteration);
+            }
         }
 
         self.add_log(
@@ -1783,8 +1786,11 @@ impl AppState {
 
     fn handle_archive_output(&mut self, change_id: String, output: String, iteration: u32) {
         // Update iteration number in change state with monotonic guard
+        // Only update if the change is currently in Archiving stage
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            change.update_iteration_monotonic(Some(iteration));
+            if matches!(change.queue_status, QueueStatus::Archiving) {
+                change.update_iteration_monotonic(Some(iteration));
+            }
         }
 
         self.add_log(
@@ -1802,8 +1808,11 @@ impl AppState {
         iteration: Option<u32>,
     ) {
         // Update iteration number in change state with monotonic guard
+        // Only update if the change is currently in Accepting stage
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            change.update_iteration_monotonic(iteration);
+            if matches!(change.queue_status, QueueStatus::Accepting) {
+                change.update_iteration_monotonic(iteration);
+            }
         }
 
         self.add_log(
@@ -1824,8 +1833,11 @@ impl AppState {
 
     fn handle_resolve_output(&mut self, change_id: String, output: String, iteration: Option<u32>) {
         // Update iteration number in change state with monotonic guard
+        // Only update if the change is currently in Resolving stage
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            change.update_iteration_monotonic(iteration);
+            if matches!(change.queue_status, QueueStatus::Resolving) {
+                change.update_iteration_monotonic(iteration);
+            }
         }
 
         self.add_log(
@@ -2824,6 +2836,9 @@ mod tests {
         let changes = vec![create_approved_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
+        // Start apply stage first
+        app.handle_apply_started("test-change".to_string(), "mock".to_string());
+
         // Handle apply output with iteration 1
         app.handle_apply_output("test-change".to_string(), "output 1".to_string(), Some(1));
         assert_eq!(app.changes[0].iteration_number, Some(1));
@@ -2841,6 +2856,9 @@ mod tests {
     fn test_iteration_update_via_output_event_archive() {
         let changes = vec![create_approved_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
+
+        // Start archive stage first
+        app.handle_archive_started("test-change".to_string(), "mock".to_string());
 
         // Handle archive output with iteration 1
         app.handle_archive_output("test-change".to_string(), "output 1".to_string(), 1);
@@ -2877,7 +2895,7 @@ mod tests {
         // Old apply iteration 2 should not regress archive iteration
         // (though in practice this shouldn't happen, test defensive behavior)
         app.handle_apply_output("test-change".to_string(), "stale".to_string(), Some(2));
-        // Since we're in archive stage, the iteration should remain 1 (monotonic within stage)
-        assert_eq!(app.changes[0].iteration_number, Some(2)); // Actually updates because monotonic
+        // Since we're in archive stage, the apply output should be ignored and iteration should remain 1
+        assert_eq!(app.changes[0].iteration_number, Some(1));
     }
 }

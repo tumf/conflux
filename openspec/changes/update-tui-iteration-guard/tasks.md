@@ -5,3 +5,7 @@
 
 ## 2. Verification
 - [x] 2.1 `cargo test` を実行し、TUI の状態更新テストがすべて成功することを確認する
+
+## Acceptance #1 Failure Follow-up
+- [x] `src/tui/state.rs` の出力ハンドラで `queue_status` と一致するステージのみ iteration を更新するガードを追加し、別ステージの出力で上書きされないようにする
+- [x] `src/tui/state.rs` の `test_iteration_cross_stage_isolation` を修正し、ステージ外の出力が `iteration_number` を更新しないことを検証する
