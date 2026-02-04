@@ -307,7 +307,7 @@ impl ParallelRunService {
 
         // Use order-based execution (aligned with spec)
         let result = executor
-            .execute_with_order_based_reanalysis(changes, move |remaining, iteration| {
+            .execute_with_order_based_reanalysis(changes, move |remaining, in_flight_ids, iteration| {
                 let config = config.clone();
                 let repo_root = repo_root.clone();
                 let event_tx = event_tx.clone();
@@ -319,7 +319,7 @@ impl ParallelRunService {
                         shared_stagger_state,
                     );
                     service
-                        .analyze_order_with_sender(remaining, Some(&event_tx), iteration)
+                        .analyze_order_with_sender(remaining, in_flight_ids, Some(&event_tx), iteration)
                         .await
                 })
             })
@@ -389,7 +389,7 @@ impl ParallelRunService {
 
         // Use order-based execution
         executor
-            .execute_with_order_based_reanalysis(changes, move |remaining, iteration| {
+            .execute_with_order_based_reanalysis(changes, move |remaining, in_flight_ids, iteration| {
                 let config = config.clone();
                 let repo_root = repo_root.clone();
                 let event_tx = event_tx.clone();
@@ -401,7 +401,7 @@ impl ParallelRunService {
                         shared_stagger_state,
                     );
                     service
-                        .analyze_order_with_sender(remaining, Some(&event_tx), iteration)
+                        .analyze_order_with_sender(remaining, in_flight_ids, Some(&event_tx), iteration)
                         .await
                 })
             })
@@ -429,9 +429,16 @@ impl ParallelRunService {
     /// If `use_llm_analysis` is enabled (default), uses LLM to analyze dependencies.
     /// Otherwise, returns all changes in a single order (no dependency inference).
     /// When a sender is provided, AnalysisOutput events are sent for streaming output.
+    ///
+    /// # Arguments
+    /// * `changes` - Changes to analyze for execution order
+    /// * `in_flight_ids` - Currently executing change IDs (not selectable, but available as dependencies)
+    /// * `event_tx` - Optional event sender for streaming output
+    /// * `iteration` - Current iteration number
     async fn analyze_order_with_sender(
         &self,
         changes: &[Change],
+        in_flight_ids: &[String],
         event_tx: Option<&mpsc::Sender<ParallelEvent>>,
         iteration: u32,
     ) -> crate::analyzer::AnalysisResult {
@@ -439,7 +446,7 @@ impl ParallelRunService {
         if self.config.use_llm_analysis() {
             info!("Using LLM analysis for parallelization (analyze_command)");
             match self
-                .analyze_order_with_llm_streaming(changes, event_tx, iteration)
+                .analyze_order_with_llm_streaming(changes, in_flight_ids, event_tx, iteration)
                 .await
             {
                 Ok(result) => {
@@ -524,9 +531,16 @@ impl ParallelRunService {
     }
 
     /// Analyze changes using LLM and return raw analysis result (order + dependencies)
+    ///
+    /// # Arguments
+    /// * `changes` - Changes to analyze for execution order
+    /// * `in_flight_ids` - Currently executing change IDs (not selectable, but available as dependencies)
+    /// * `event_tx` - Optional event sender for streaming output
+    /// * `iteration` - Current iteration number
     async fn analyze_order_with_llm_streaming(
         &self,
         changes: &[Change],
+        in_flight_ids: &[String],
         event_tx: Option<&mpsc::Sender<ParallelEvent>>,
         iteration: u32,
     ) -> Result<crate::analyzer::AnalysisResult> {
@@ -535,7 +549,7 @@ impl ParallelRunService {
         if let Some(tx) = event_tx {
             let tx = tx.clone();
             analyzer
-                .analyze_with_callback(changes, move |output| {
+                .analyze_with_callback(changes, in_flight_ids, move |output| {
                     let _ = tx.try_send(ParallelEvent::AnalysisOutput {
                         output: output.clone(),
                         iteration,
@@ -543,7 +557,7 @@ impl ParallelRunService {
                 })
                 .await
         } else {
-            analyzer.analyze(changes).await
+            analyzer.analyze_with_inflight(changes, in_flight_ids).await
         }
     }
 
