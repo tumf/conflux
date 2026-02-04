@@ -670,11 +670,12 @@ impl ParallelExecutor {
         cleanup_guard: &mut WorkspaceCleanupGuard,
     ) -> Result<(bool, u32)>
     where
-        F: Fn(
-                &[crate::openspec::Change],
+        for<'a> F: Fn(
+                &'a [crate::openspec::Change],
+                &'a [String],
                 u32,
             ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + '_>,
+                Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>,
             > + Send
             + Sync,
     {
@@ -748,7 +749,9 @@ impl ParallelExecutor {
         )
         .await;
 
-        let analysis_result = analyzer(queued, iteration).await;
+        // Convert in_flight HashSet to Vec<String> for analyzer
+        let in_flight_ids: Vec<String> = in_flight.iter().cloned().collect();
+        let analysis_result = analyzer(queued, &in_flight_ids, iteration).await;
 
         if analysis_result.order.is_empty() {
             warn!("No order returned from analysis");
@@ -1009,17 +1012,21 @@ impl ParallelExecutor {
     /// # Arguments
     /// * `changes` - Initial list of changes to execute
     /// * `analyzer` - Async function that returns AnalysisResult (order + dependencies)
+    ///   - First parameter: queued changes to analyze
+    ///   - Second parameter: in-flight change IDs (currently executing)
+    ///   - Third parameter: iteration number
     pub async fn execute_with_order_based_reanalysis<F>(
         &mut self,
         changes: Vec<crate::openspec::Change>,
         analyzer: F,
     ) -> Result<()>
     where
-        F: Fn(
-                &[crate::openspec::Change],
+        for<'a> F: Fn(
+                &'a [crate::openspec::Change],
+                &'a [String],
                 u32,
             ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + '_>,
+                Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>,
             > + Send
             + Sync,
     {
