@@ -56,14 +56,34 @@ impl ParallelizationAnalyzer {
     /// Returns the analysis result containing:
     /// - `order`: Recommended execution sequence considering dependencies
     /// - `dependencies`: Change-level dependency constraints
+    #[allow(dead_code)]
     pub async fn analyze(&self, changes: &[Change]) -> Result<AnalysisResult> {
-        self.analyze_with_callback(changes, |_| {}).await
+        self.analyze_with_callback(changes, &[], |_| {}).await
+    }
+
+    /// Analyze changes with in-flight changes context.
+    ///
+    /// The `in_flight_ids` parameter specifies changes that are currently executing.
+    /// These changes are not selectable for the execution order but can be referenced
+    /// as dependencies by queued changes.
+    pub async fn analyze_with_inflight(
+        &self,
+        changes: &[Change],
+        in_flight_ids: &[String],
+    ) -> Result<AnalysisResult> {
+        self.analyze_with_callback(changes, in_flight_ids, |_| {})
+            .await
     }
 
     /// Analyze changes with output callback and return raw analysis result.
+    ///
+    /// The `in_flight_ids` parameter specifies changes that are currently executing.
+    /// These changes are not selectable for the execution order but can be referenced
+    /// as dependencies by queued changes.
     pub async fn analyze_with_callback<F>(
         &self,
         changes: &[Change],
+        in_flight_ids: &[String],
         mut on_output: F,
     ) -> Result<AnalysisResult>
     where
@@ -87,10 +107,20 @@ impl ParallelizationAnalyzer {
         }
 
         // Build prompt for LLM analysis
-        let prompt = self.build_parallelization_prompt(changes);
-        info!("Analyzing {} changes for parallelization", changes.len());
+        let prompt = self.build_parallelization_prompt(changes, in_flight_ids);
+        info!(
+            "Analyzing {} changes for parallelization (with {} in-flight)",
+            changes.len(),
+            in_flight_ids.len()
+        );
         for c in changes {
             info!("  - {}", c.id);
+        }
+        if !in_flight_ids.is_empty() {
+            info!("In-flight changes (executing):");
+            for id in in_flight_ids {
+                info!("  - {}", id);
+            }
         }
         debug!("Analysis prompt: {}", prompt);
 
@@ -220,8 +250,8 @@ impl ParallelizationAnalyzer {
     where
         F: FnMut(String),
     {
-        // Use the new analyze_with_callback and convert to groups
-        let result = self.analyze_with_callback(changes, on_output).await?;
+        // Use the new analyze_with_callback and convert to groups (no in-flight for deprecated method)
+        let result = self.analyze_with_callback(changes, &[], on_output).await?;
 
         if result.order.is_empty() {
             return Ok(Vec::new());
@@ -275,9 +305,12 @@ impl ParallelizationAnalyzer {
     /// - `[ ]` marker for unapproved changes
     /// - Full proposal file path for each change (e.g., `openspec/changes/{id}/proposal.md`)
     ///
+    /// Also includes in-flight changes (currently executing) for dependency analysis,
+    /// marked as not selectable but available as dependency targets.
+    ///
     /// This makes it clear to the LLM which changes need analysis and where
     /// to find their proposal files.
-    fn build_parallelization_prompt(&self, changes: &[Change]) -> String {
+    fn build_parallelization_prompt(&self, changes: &[Change], in_flight_ids: &[String]) -> String {
         let change_list: String = changes
             .iter()
             .map(|c| {
@@ -290,19 +323,38 @@ impl ParallelizationAnalyzer {
             .collect::<Vec<_>>()
             .join("\n");
 
+        let executing_section = if in_flight_ids.is_empty() {
+            String::new()
+        } else {
+            let executing_list: String = in_flight_ids
+                .iter()
+                .map(|id| format!("- {} (openspec/changes/{}/proposal.md)", id, id))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            format!(
+                r#"
+
+Currently executing changes (NOT selectable, but available as dependencies):
+{executing_list}
+"#
+            )
+        };
+
         format!(
             r#"You are planning the execution order for OpenSpec changes.
 
 Analyze ONLY the changes marked with [x] below.
 Read the proposal files at the specified paths to understand their dependencies:
 
-{change_list}
+{change_list}{executing_section}
 
 Your task:
 1. Read each change's proposal.md at the given path to understand what it does
 2. Identify dependencies between these changes
-3. Determine the recommended execution order (considering dependencies and priorities)
-4. Return execution order and dependencies
+3. Consider currently executing changes as potential dependencies (but DO NOT include them in the order)
+4. Determine the recommended execution order (considering dependencies and priorities)
+5. Return execution order and dependencies
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -316,12 +368,14 @@ Rules:
 - `order`: Array of change IDs in recommended execution sequence
   - This represents the RECOMMENDED execution order considering dependencies, priorities, and efficiency
   - Independent changes can be ordered by priority or logical flow
+  - DO NOT include currently executing changes in the order (they are already running)
 - `dependencies`: Object mapping change IDs to arrays of their REQUIRED dependency IDs
   - STRICT CRITERIA: Only include a dependency if one change REQUIRES the artifacts, specs, or APIs from another change to function
   - DO NOT include dependencies based on priority, preferred order, or efficiency alone
   - Example of REQUIRED dependency: "change-b implements a feature using the API defined in change-a"
   - Example of NOT a dependency: "change-a should ideally be done before change-b for efficiency"
-- Every change ID must appear exactly once in `order`
+  - Dependencies CAN reference currently executing changes if a queued change requires their output
+- Every change ID in the input list must appear exactly once in `order`
 - Dependencies are hard constraints: a change CANNOT start until all its dependencies are merged to base
 - Order preferences without required dependencies should be reflected in `order` only, not in `dependencies`
 - Return valid JSON only, no markdown, no explanation"#
@@ -822,7 +876,7 @@ That's all."#;
             },
         ];
 
-        let prompt = analyzer.build_parallelization_prompt(&changes);
+        let prompt = analyzer.build_parallelization_prompt(&changes, &[]);
 
         // Check that selected changes are marked with [x] and include proposal.md path
         assert!(prompt.contains("[x] selected-a (openspec/changes/selected-a/proposal.md)"));
@@ -861,7 +915,7 @@ That's all."#;
             },
         ];
 
-        let prompt = analyzer.build_parallelization_prompt(&changes);
+        let prompt = analyzer.build_parallelization_prompt(&changes, &[]);
 
         // All should be included with [x] marker and proposal.md path
         assert!(prompt.contains("[x] change-1 (openspec/changes/change-1/proposal.md)"));
@@ -881,7 +935,7 @@ That's all."#;
             dependencies: Vec::new(),
         }];
 
-        let prompt = analyzer.build_parallelization_prompt(&changes);
+        let prompt = analyzer.build_parallelization_prompt(&changes, &[]);
 
         // Unselected change should be included with [ ] marker
         assert!(prompt.contains("[ ] change-1 (openspec/changes/change-1/proposal.md)"));
@@ -895,7 +949,7 @@ That's all."#;
         let analyzer = create_test_analyzer();
 
         let changes = vec![create_test_change("a")];
-        let prompt = analyzer.build_parallelization_prompt(&changes);
+        let prompt = analyzer.build_parallelization_prompt(&changes, &[]);
 
         // Verify prompt clarifies that dependencies are REQUIRED relationships
         assert!(prompt.contains("REQUIRED"));
@@ -959,5 +1013,71 @@ That's all."#;
         // Should validate successfully - order is just a recommendation
         assert!(analyzer.validate_change_ids(&result, &changes).is_ok());
         assert!(analyzer.validate_dependency_graph(&result).is_ok());
+    }
+
+    #[test]
+    fn test_build_prompt_with_inflight_changes() {
+        let analyzer = create_test_analyzer();
+
+        let queued_changes = vec![
+            Change {
+                id: "queued-a".to_string(),
+                is_approved: true,
+                completed_tasks: 0,
+                total_tasks: 5,
+                last_modified: "now".to_string(),
+                dependencies: Vec::new(),
+            },
+            Change {
+                id: "queued-b".to_string(),
+                is_approved: true,
+                completed_tasks: 0,
+                total_tasks: 5,
+                last_modified: "now".to_string(),
+                dependencies: Vec::new(),
+            },
+        ];
+
+        let in_flight_ids = vec!["inflight-1".to_string(), "inflight-2".to_string()];
+
+        let prompt = analyzer.build_parallelization_prompt(&queued_changes, &in_flight_ids);
+
+        // Verify queued changes are in the main list
+        assert!(prompt.contains("[x] queued-a (openspec/changes/queued-a/proposal.md)"));
+        assert!(prompt.contains("[x] queued-b (openspec/changes/queued-b/proposal.md)"));
+
+        // Verify in-flight changes are in the executing section
+        assert!(prompt.contains("Currently executing changes"));
+        assert!(prompt.contains("- inflight-1 (openspec/changes/inflight-1/proposal.md)"));
+        assert!(prompt.contains("- inflight-2 (openspec/changes/inflight-2/proposal.md)"));
+
+        // Verify instructions about in-flight changes
+        assert!(prompt.contains("NOT selectable"));
+        assert!(prompt.contains("DO NOT include currently executing changes in the order"));
+        assert!(prompt.contains("Dependencies CAN reference currently executing changes"));
+    }
+
+    #[test]
+    fn test_build_prompt_without_inflight_changes() {
+        let analyzer = create_test_analyzer();
+
+        let queued_changes = vec![Change {
+            id: "queued-a".to_string(),
+            is_approved: true,
+            completed_tasks: 0,
+            total_tasks: 5,
+            last_modified: "now".to_string(),
+            dependencies: Vec::new(),
+        }];
+
+        let in_flight_ids: Vec<String> = vec![];
+
+        let prompt = analyzer.build_parallelization_prompt(&queued_changes, &in_flight_ids);
+
+        // Verify queued changes are in the main list
+        assert!(prompt.contains("[x] queued-a (openspec/changes/queued-a/proposal.md)"));
+
+        // Verify no executing section when in_flight_ids is empty
+        assert!(!prompt.contains("Currently executing changes"));
     }
 }
