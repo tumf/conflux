@@ -5,7 +5,9 @@ Defines the TUI module structure and architectural patterns.
 ## Requirements
 ### Requirement: TUI Module Structure
 
-The TUI module SHALL be organized as a directory-based module tree under `src/tui/` with focused submodules. The TUI state layer MUST consume a shared orchestration state model for change progress and execution metadata, while UI-only fields (cursor, view modes, selection state) remain in TUI-owned state. The iteration number imported from the shared orchestration state MUST NOT overwrite the TUI with a smaller value than what is already displayed. It MUST retain a larger value as needed so the displayed iteration does not regress.
+TUI モジュールは `src/tui/` 配下のディレクトリ構成で整理され、TUI state 層は共有オーケストレーション状態から change の進捗と実行メタデータを取得しなければならない（SHALL）。UI 固有の状態（カーソル、ビュー、選択状態など）は TUI 側で保持する。
+共有状態から取り込む iteration は、既に表示されている値より小さい場合に上書きしてはならない。表示された iteration が後退しないよう、より大きい値を維持しなければならない。
+さらに、出力イベントにより iteration を更新する際は、現在の `queue_status` に一致するステージのイベントのみを反映し、同一ステージ内で iteration が単調増加となるように更新しなければならない。ステージ開始時は iteration 表示をリセットし、前ステージの値を持ち越してはならない。この更新規則は MUST とする。
 
 #### Scenario: Module directory exists
 - **WHEN** the project is compiled
@@ -36,6 +38,21 @@ The TUI module SHALL be organized as a directory-based module tree under `src/tu
 - **AND** the shared orchestration state reports `apply_count=3`
 - **WHEN** the automatic refresh merges shared state into the TUI change list
 - **THEN** the TUI keeps `iteration_number=4`
+
+#### Scenario: Output events do not regress iteration within a stage
+- **GIVEN** the TUI displays `queue_status=Archiving` and `iteration_number=2`
+- **WHEN** an older `ArchiveOutput` event with `iteration=1` arrives
+- **THEN** the TUI keeps `iteration_number=2`
+
+#### Scenario: Output events from other stages do not overwrite iteration
+- **GIVEN** the TUI displays `queue_status=Resolving` and `iteration_number=2`
+- **WHEN** an `ApplyOutput` event arrives for the same change
+- **THEN** the TUI keeps `iteration_number=2`
+
+#### Scenario: Stage transition resets iteration display
+- **GIVEN** the TUI displays `queue_status=Applying` and `iteration_number=3`
+- **WHEN** `ArchiveStarted` is handled for the same change
+- **THEN** the TUI clears the iteration display for the new stage
 
 ### Requirement: Public API Stability
 
