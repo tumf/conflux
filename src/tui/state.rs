@@ -697,9 +697,19 @@ impl AppState {
     }
 
     /// Update parallel eligibility status for changes.
-    pub fn apply_parallel_eligibility(&mut self, committed_change_ids: &HashSet<String>) {
+    ///
+    /// A change is eligible for parallel execution if:
+    /// 1. It exists in HEAD's commit tree (committed_change_ids), AND
+    /// 2. It has no uncommitted or untracked files under openspec/changes/<change_id>/
+    pub fn apply_parallel_eligibility(
+        &mut self,
+        committed_change_ids: &HashSet<String>,
+        uncommitted_file_change_ids: &HashSet<String>,
+    ) {
         for change in &mut self.changes {
-            change.is_parallel_eligible = committed_change_ids.contains(&change.id);
+            // Eligible if committed AND no uncommitted files
+            change.is_parallel_eligible = committed_change_ids.contains(&change.id)
+                && !uncommitted_file_change_ids.contains(&change.id);
             if self.parallel_mode
                 && matches!(self.mode, AppMode::Select | AppMode::Stopped)
                 && !change.is_parallel_eligible
@@ -1240,6 +1250,7 @@ impl AppState {
             OrchestratorEvent::ChangesRefreshed {
                 changes,
                 committed_change_ids,
+                uncommitted_file_change_ids,
                 worktree_change_ids,
                 worktree_paths,
                 worktree_not_ahead_ids,
@@ -1247,6 +1258,7 @@ impl AppState {
             } => self.handle_changes_refreshed(
                 changes,
                 committed_change_ids,
+                uncommitted_file_change_ids,
                 worktree_change_ids,
                 worktree_paths,
                 worktree_not_ahead_ids,
@@ -1738,10 +1750,12 @@ impl AppState {
     }
 
     // Refresh event handlers
+    #[allow(clippy::too_many_arguments)]
     fn handle_changes_refreshed(
         &mut self,
         changes: Vec<Change>,
         committed_change_ids: HashSet<String>,
+        uncommitted_file_change_ids: HashSet<String>,
         worktree_change_ids: HashSet<String>,
         worktree_paths: HashMap<String, PathBuf>,
         worktree_not_ahead_ids: HashSet<String>,
@@ -1749,7 +1763,7 @@ impl AppState {
     ) {
         self.worktree_paths = worktree_paths;
         self.update_changes(changes);
-        self.apply_parallel_eligibility(&committed_change_ids);
+        self.apply_parallel_eligibility(&committed_change_ids, &uncommitted_file_change_ids);
         self.apply_worktree_status(&worktree_change_ids);
         // Auto-clear MergeWait for changes whose worktrees don't exist or are not ahead
         self.auto_clear_merge_wait(&worktree_change_ids, &worktree_not_ahead_ids);

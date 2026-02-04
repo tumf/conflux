@@ -386,6 +386,8 @@ pub enum ExecutionEvent {
     ChangesRefreshed {
         changes: Vec<crate::openspec::Change>,
         committed_change_ids: std::collections::HashSet<String>,
+        /// Set of change_ids with uncommitted or untracked files under openspec/changes/<change_id>/
+        uncommitted_file_change_ids: std::collections::HashSet<String>,
         worktree_change_ids: std::collections::HashSet<String>,
         /// Map of change_id to worktree path for active worktrees
         worktree_paths: std::collections::HashMap<String, std::path::PathBuf>,

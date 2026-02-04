@@ -104,6 +104,80 @@ pub async fn has_changes_to_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
     Ok(!output.is_empty())
 }
 
+/// List change IDs that have uncommitted or untracked files under `openspec/changes/<change_id>/`.
+///
+/// This function detects changes with:
+/// - Staged changes (added, modified, deleted)
+/// - Unstaged changes (modified, deleted)
+/// - Untracked files
+///
+/// Returns a sorted vector of change IDs that have uncommitted modifications.
+pub async fn list_changes_with_uncommitted_files<P: AsRef<Path>>(cwd: P) -> VcsResult<Vec<String>> {
+    let cwd_ref = cwd.as_ref();
+
+    // Get all files with uncommitted changes or untracked status
+    // Use -u to show individual untracked files instead of just directories
+    let output = run_git(&["status", "--porcelain", "-u"], cwd_ref).await?;
+
+    let mut change_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Parse porcelain format: "XY path" where X is index status, Y is worktree status
+        // We need at least 3 chars: "XY " + path
+        if line.len() < 3 {
+            continue;
+        }
+
+        let path = &line[3..]; // Skip "XY " prefix
+
+        // Check if path is under openspec/changes/<change_id>/
+        if let Some(change_id) = extract_change_id_from_path(path) {
+            change_ids.insert(change_id);
+        }
+    }
+
+    let mut result: Vec<String> = change_ids.into_iter().collect();
+    result.sort();
+    Ok(result)
+}
+
+/// Extract change_id from a file path if it matches `openspec/changes/<change_id>/...`
+///
+/// Returns None if the path doesn't match the expected pattern or refers to the archive directory.
+fn extract_change_id_from_path(path: &str) -> Option<String> {
+    // Normalize path separators for cross-platform compatibility
+    let normalized_path = path.replace('\\', "/");
+
+    // Expected pattern: openspec/changes/<change_id>/...
+    let prefix = "openspec/changes/";
+    if !normalized_path.starts_with(prefix) {
+        return None;
+    }
+
+    // Extract the part after "openspec/changes/"
+    let remainder = &normalized_path[prefix.len()..];
+
+    // Find the first path separator to get the change_id
+    let change_id = if let Some(pos) = remainder.find('/') {
+        &remainder[..pos]
+    } else {
+        // Path is exactly "openspec/changes/<change_id>" (no trailing slash)
+        remainder
+    };
+
+    // Filter out special directories
+    if change_id.is_empty() || change_id == "archive" || change_id.starts_with('.') {
+        return None;
+    }
+
+    Some(change_id.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +319,153 @@ mod tests {
         assert_eq!(
             changes,
             vec!["change-a".to_string(), "change-c".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_changes_with_uncommitted_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let init_result = Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init_result.is_err() {
+            return; // Skip if git not available
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        let base_dir = temp_dir.path().join("openspec/changes");
+
+        // Create change-a and commit it
+        std::fs::create_dir_all(base_dir.join("change-a")).unwrap();
+        std::fs::write(base_dir.join("change-a").join("proposal.md"), "test").unwrap();
+
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "add change-a"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create change-b with uncommitted files
+        std::fs::create_dir_all(base_dir.join("change-b")).unwrap();
+        std::fs::write(base_dir.join("change-b").join("proposal.md"), "uncommitted").unwrap();
+
+        // Modify change-a after commit (staged change)
+        std::fs::write(base_dir.join("change-a").join("tasks.md"), "new task").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "openspec/changes/change-a/tasks.md"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        let uncommitted_changes = list_changes_with_uncommitted_files(temp_dir.path())
+            .await
+            .unwrap();
+
+        // Should include both change-a (staged) and change-b (untracked)
+        assert_eq!(
+            uncommitted_changes,
+            vec!["change-a".to_string(), "change-b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_changes_with_uncommitted_files_filters_archive() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let init_result = Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init_result.is_err() {
+            return; // Skip if git not available
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        let base_dir = temp_dir.path().join("openspec/changes");
+
+        // Create initial commit to establish git repository
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::write(temp_dir.path().join("README.md"), "test").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create archive directory with uncommitted files (should be ignored)
+        std::fs::create_dir_all(base_dir.join("archive")).unwrap();
+        std::fs::write(base_dir.join("archive").join("old.md"), "archived").unwrap();
+
+        // Create regular change with uncommitted files
+        std::fs::create_dir_all(base_dir.join("change-c")).unwrap();
+        std::fs::write(base_dir.join("change-c").join("proposal.md"), "test").unwrap();
+
+        let uncommitted_changes = list_changes_with_uncommitted_files(temp_dir.path())
+            .await
+            .unwrap();
+
+        // Should only include change-c, not archive
+        assert_eq!(uncommitted_changes, vec!["change-c".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_change_id_from_path() {
+        assert_eq!(
+            extract_change_id_from_path("openspec/changes/my-change/proposal.md"),
+            Some("my-change".to_string())
+        );
+        assert_eq!(
+            extract_change_id_from_path("openspec/changes/my-change/specs/auth/spec.md"),
+            Some("my-change".to_string())
+        );
+        assert_eq!(
+            extract_change_id_from_path("openspec/changes/archive/old.md"),
+            None
+        );
+        assert_eq!(
+            extract_change_id_from_path("openspec/changes/.hidden/file.md"),
+            None
+        );
+        assert_eq!(extract_change_id_from_path("src/main.rs"), None);
+        assert_eq!(
+            extract_change_id_from_path("openspec/specs/auth/spec.md"),
+            None
         );
     }
 }

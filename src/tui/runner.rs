@@ -87,6 +87,14 @@ async fn run_tui_loop(
                     .collect()
             }
         };
+    let uncommitted_file_change_ids: HashSet<String> =
+        match crate::vcs::git::commands::list_changes_with_uncommitted_files(&repo_root).await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(err) => {
+                warn!("Failed to detect uncommitted files in changes: {}", err);
+                HashSet::new()
+            }
+        };
     let worktree_base_dir = config
         .get_workspace_base_dir()
         .map(PathBuf::from)
@@ -143,7 +151,7 @@ async fn run_tui_loop(
     }
     app.parallel_available = parallel_available;
     app.parallel_mode = parallel_mode;
-    app.apply_parallel_eligibility(&committed_change_ids);
+    app.apply_parallel_eligibility(&committed_change_ids, &uncommitted_file_change_ids);
     app.apply_worktree_status(&worktree_change_ids);
     app.max_concurrent = config.get_max_concurrent_workspaces();
     app.web_url = web_url;
@@ -270,6 +278,14 @@ async fn run_tui_loop(
                                         changes.iter().map(|change| change.id.clone()).collect()
                                     }
                                 };
+                            let uncommitted_file_change_ids: HashSet<String> =
+                                match crate::vcs::git::commands::list_changes_with_uncommitted_files(&refresh_repo_root).await {
+                                    Ok(ids) => ids.into_iter().collect(),
+                                    Err(err) => {
+                                        warn!("Failed to refresh uncommitted files snapshot: {}", err);
+                                        HashSet::new()
+                                    }
+                                };
                             let worktree_change_ids: HashSet<String> =
                                 match worktree_manager.list_worktree_change_ids().await {
                                     Ok(ids) => ids,
@@ -374,6 +390,7 @@ async fn run_tui_loop(
                                 .send(OrchestratorEvent::ChangesRefreshed {
                                     changes,
                                     committed_change_ids,
+                                    uncommitted_file_change_ids,
                                     worktree_change_ids,
                                     worktree_paths,
                                     worktree_not_ahead_ids,
