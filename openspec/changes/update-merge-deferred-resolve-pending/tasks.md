@@ -21,3 +21,6 @@
 - [x] 3.1 変更後の待ち状態が TUI と Web で一致することを確認する
   - 完了条件: TUI と Web のステータス語彙に `resolve pending` が含まれ、表示が一致する
   - 検証方法: `cargo test` を実行し、該当テストがパスする
+
+## Acceptance #1 Failure Follow-up
+- [x] WebState の `apply_execution_event` に `ExecutionEvent::MergeDeferred` の分岐がなく、`resolve pending`/`merge wait` が設定されないため Web UI が要件の待ち状態を表示できない（`src/web/state.rs` の `apply_execution_event`）。
