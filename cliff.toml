@@ -28,13 +28,13 @@ body = """
 footer = """
 """
 # Remove leading/trailing whitespace
-trim = true
+trim = false
 
 [git]
 # Parse conventional commits
 conventional_commits = true
-# Filter out conventional commits
-filter_unconventional = false
+# Filter out unconventional commits
+filter_unconventional = true
 # Process each line of a commit as an individual commit
 split_commits = false
 # Regex for preprocessing commit messages
@@ -44,6 +44,11 @@ commit_preprocessors = [
 ]
 # Commit parsers
 commit_parsers = [
+    # Drop noisy release/version commits
+    { message = "^[0-9]+\\.[0-9]+\\.[0-9]+$", skip = true },
+    { message = "^v[0-9]+\\.[0-9]+\\.[0-9]+$", skip = true },
+    { message = "(?i)(^|: )update-[A-Za-z0-9-]+", skip = true },
+    { message = "apply#\\d+", skip = true },
     # Skip certain commit types
     { message = "^chore\\(release\\)", skip = true },
     { message = "^chore\\(deps\\)", skip = true },
@@ -52,22 +57,13 @@ commit_parsers = [
     # Conventional commits
     { message = "^feat", group = "Features" },
     { message = "^fix", group = "Bug Fixes" },
-    { message = "^doc", group = "Documentation" },
+    { message = "^docs", group = "Documentation" },
     { message = "^perf", group = "Performance" },
     { message = "^refactor", group = "Refactoring" },
     { message = "^style", group = "Styling" },
     { message = "^test", group = "Testing" },
     { message = "^chore", group = "Miscellaneous" },
     { message = "^ci", group = "CI/CD" },
-    # Natural language patterns (non-conventional)
-    { message = "^[Aa]dd", group = "Features" },
-    { message = "^[Ii]mplement", group = "Features" },
-    { message = "^[Ff]ix", group = "Bug Fixes" },
-    { message = "^[Rr]esolve", group = "Bug Fixes" },
-    { message = "^[Uu]pdate.*[Dd]oc", group = "Documentation" },
-    { message = "^[Rr]efactor", group = "Refactoring" },
-    # Default category
-    { message = ".*", group = "Other" },
 ]
 # Filter commits by path
 filter_commits = false

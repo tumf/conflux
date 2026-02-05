@@ -1,6 +1,6 @@
 [package]
 name = "conflux"
-version = "0.4.17"
+version = "0.4.18"
 edition = "2021"
 
 [[bin]]
@@ -52,17 +52,3 @@ windows = { version = "0.58", features = ["Win32_System_JobObjects", "Win32_Foun
 
 [build-dependencies]
 chrono = "0.4"
-
-[package.metadata.release]
-# Publish to crates.io (disabled by default - use manual publish)
-publish = false
-# Create and push git tag
-tag = true
-# Push changes to remote
-push = true
-# Sign git tags with GPG
-sign-tag = false
-# Pre-release commit message
-pre-release-commit-message = "chore: release {{version}}"
-# Enable/disable pre-release checks
-verify = true

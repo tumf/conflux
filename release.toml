@@ -18,4 +18,4 @@ sign-commit = false
 sign-tag = false
 
 # Pre-release hook to generate changelog
-pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "v{{version}}"]
+pre-release-hook = ["git", "cliff", "--config", "cliff.toml", "-o", "CHANGELOG.md", "--tag", "v{{version}}"]
