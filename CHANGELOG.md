@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.15] - 2026-02-05
+
+### Documentation
+
+- Update release documentation and workflow
+- **openspec**: Add change for resolve pending MergeDeferred
+
+### Miscellaneous
+
+- Add cargo-release config and changelog
+- Improve Makefile with cargo-release integration
+
+### Other
+
+- Update-merge-deferred-resolve-pending
+- Update-merge-deferred-resolve-pending (7/7 tasks, apply#1)
+- Update-merge-deferred-resolve-pending
+
 ## [0.4.14] - 2026-02-05
 
 ### Documentation
