@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.4.15] - 2026-02-05
+## [0.4.16] - 2026-02-05
 
 ### Documentation
 
@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
 
 - Add cargo-release config and changelog
 - Improve Makefile with cargo-release integration
+- Update project version to 0.4.15 and enhance release workflow
+- Update release configuration metadata in Cargo.toml
 
 ### Other
 
