@@ -6,6 +6,11 @@ This document describes how to create releases for Conflux.
 
 ### Required Tools
 
+- **cargo-release**: Version bumping and release automation
+  ```bash
+  cargo install cargo-release
+  ```
+
 - **git-cliff**: Changelog generator
   ```bash
   cargo install git-cliff
@@ -15,6 +20,11 @@ This document describes how to create releases for Conflux.
   ```bash
   rustup update stable
   ```
+
+Or install all at once:
+```bash
+make setup
+```
 
 ### Repository Secrets (for maintainers)
 
@@ -31,38 +41,63 @@ To create `HOMEBREW_TAP_TOKEN`:
 
 ## Quick Release
 
-Use the release script for automated releases:
+### Recommended: Using Makefile (cargo-release)
+
+The simplest way to release is using the Makefile targets:
 
 ```bash
 # Patch release (0.1.0 → 0.1.1)
-./scripts/release.sh patch
+make bump-patch
 
 # Minor release (0.1.0 → 0.2.0)
-./scripts/release.sh minor
+make bump-minor
 
 # Major release (0.1.0 → 1.0.0)
-./scripts/release.sh major
-
-# Dry run (show what would happen)
-./scripts/release.sh --dry-run patch
+make bump-major
 ```
 
-The script will:
+This will:
 1. Validate you're on main/master branch with clean working tree
-2. Run pre-release checks (fmt, clippy, test)
-3. Update version in Cargo.toml
-4. Generate CHANGELOG.md
-5. Create commit and tag
-6. Push to origin
+2. Update version in Cargo.toml and Cargo.lock
+3. Generate CHANGELOG.md with git-cliff
+4. Create commit with message `chore(release): release vX.Y.Z`
+5. Create annotated git tag `vX.Y.Z`
+6. Push commit and tag to origin
 
 GitHub Actions will then automatically:
 1. Build binaries for all platforms
 2. Create GitHub Release with artifacts
 3. Update Homebrew formula (if token configured)
 
+### Alternative: Direct cargo-release
+
+You can also use cargo-release directly:
+
+```bash
+# Dry run (preview changes)
+cargo release patch --no-publish
+
+# Execute release
+cargo release patch --execute --no-confirm --no-publish
+```
+
+### Legacy: Using release script
+
+The `./scripts/release.sh` script is still available but less recommended:
+
+```bash
+# Patch release
+./scripts/release.sh patch
+
+# Dry run
+./scripts/release.sh --dry-run patch
+```
+
+Note: The script performs similar operations but doesn't use cargo-release's standardized workflow.
+
 ## Manual Release
 
-If you need to release manually:
+If you need to release manually without cargo-release:
 
 ### 1. Update Version
 
@@ -93,6 +128,8 @@ git tag -a vX.Y.Z -m "Release vX.Y.Z"
 git push origin main
 git push origin vX.Y.Z
 ```
+
+Note: Using `make bump-*` or `cargo release` is strongly recommended over manual releases to avoid errors.
 
 ## Version Numbering
 
