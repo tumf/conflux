@@ -63,7 +63,7 @@ pub struct ChangeStatus {
     pub dependencies: Vec<String>,
     /// Queue status (for parallel/serial execution tracking)
     /// Aligned with TUI QueueStatus display values: "not queued", "queued", "blocked", "processing",
-    /// "accepting", "archiving", "archived", "merged", "merge wait", "resolving", "error"
+    /// "accepting", "archiving", "archived", "merged", "merge wait", "resolving", "resolve pending", "error"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_status: Option<String>,
     /// Current iteration number for apply/archive loops
@@ -116,6 +116,8 @@ pub struct OrchestratorStateSnapshot {
     pub worktrees: Vec<WorktreeInfo>,
     /// Application mode (e.g., "select", "running", "stopped")
     pub app_mode: String,
+    /// Whether resolve is currently running
+    pub is_resolving: bool,
 }
 
 impl OrchestratorStateSnapshot {
@@ -186,6 +188,7 @@ impl OrchestratorStateSnapshot {
             logs: Vec::new(),
             worktrees: Vec::new(),
             app_mode: "select".to_string(),
+            is_resolving: false,
         }
     }
 }
@@ -326,14 +329,19 @@ impl WebState {
         drop(shared_state_data); // Drop guard before awaiting
         drop(shared_state_opt); // Drop read lock
 
-        // Preserve progress, queue_status, and app_mode from existing state
-        let (old_changes, old_app_mode) = {
+        // Preserve progress, queue_status, app_mode, and is_resolving from existing state
+        let (old_changes, old_app_mode, old_is_resolving) = {
             let old_state = self.state.read().await;
-            (old_state.changes.clone(), old_state.app_mode.clone())
+            (
+                old_state.changes.clone(),
+                old_state.app_mode.clone(),
+                old_state.is_resolving,
+            )
         };
 
-        // Preserve app_mode to prevent overwriting runtime state during refresh
+        // Preserve app_mode and is_resolving to prevent overwriting runtime state during refresh
         new_state.app_mode = old_app_mode.clone();
+        new_state.is_resolving = old_is_resolving;
 
         for new_change in &mut new_state.changes {
             if let Some(existing) = old_changes.iter().find(|c| c.id == new_change.id) {
@@ -384,11 +392,18 @@ impl WebState {
         // Override app_mode from orchestrator execution state
         new_state.app_mode = app_mode.to_string();
 
-        // Preserve progress and queue_status from existing state
-        let (old_changes, old_app_mode) = {
+        // Preserve progress, queue_status, and is_resolving from existing state
+        let (old_changes, old_app_mode, old_is_resolving) = {
             let old_state = self.state.read().await;
-            (old_state.changes.clone(), old_state.app_mode.clone())
+            (
+                old_state.changes.clone(),
+                old_state.app_mode.clone(),
+                old_state.is_resolving,
+            )
         };
+
+        // Preserve is_resolving to prevent overwriting runtime state
+        new_state.is_resolving = old_is_resolving;
 
         for new_change in &mut new_state.changes {
             if let Some(existing) = old_changes.iter().find(|c| c.id == new_change.id) {
@@ -563,12 +578,14 @@ impl WebState {
                     change_id,
                     command: _,
                 } => {
+                    state.is_resolving = true;
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
                         change.queue_status = Some("resolving".to_string());
                         updated = true;
                     }
                 }
                 ExecutionEvent::ResolveCompleted { change_id, .. } => {
+                    state.is_resolving = false;
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
                         change.queue_status = Some("archiving".to_string());
                         updated = true;
@@ -578,8 +595,26 @@ impl WebState {
                     change_id,
                     error: _,
                 } => {
+                    state.is_resolving = false;
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
                         change.queue_status = Some("error".to_string());
+                        updated = true;
+                    }
+                }
+                ExecutionEvent::MergeDeferred {
+                    change_id,
+                    reason: _,
+                } => {
+                    // Read is_resolving before mutable borrow
+                    let is_resolving = state.is_resolving;
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        // If resolve is running, transition to resolve pending
+                        // Otherwise, maintain merge wait
+                        change.queue_status = if is_resolving {
+                            Some("resolve pending".to_string())
+                        } else {
+                            Some("merge wait".to_string())
+                        };
                         updated = true;
                     }
                 }
@@ -1558,5 +1593,137 @@ mod tests {
             Some("resolving".to_string()),
             "queue_status should be preserved"
         );
+    }
+
+    // === Tests for update-merge-deferred-resolve-pending ===
+
+    #[tokio::test]
+    async fn test_merge_deferred_during_resolve_sets_resolve_pending() {
+        let changes = vec![create_test_change("change-a", 5, 10)];
+        let web_state = WebState::new(&changes);
+
+        // Start resolve to set is_resolving = true
+        web_state
+            .apply_execution_event(&ExecutionEvent::ResolveStarted {
+                change_id: "change-a".to_string(),
+                command: "test command".to_string(),
+            })
+            .await;
+
+        // Verify is_resolving is true
+        let state = web_state.get_state().await;
+        assert!(state.is_resolving, "is_resolving should be true");
+
+        // Send MergeDeferred event
+        web_state
+            .apply_execution_event(&ExecutionEvent::MergeDeferred {
+                change_id: "change-a".to_string(),
+                reason: "test reason".to_string(),
+            })
+            .await;
+
+        // Verify queue_status is "resolve pending"
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].queue_status,
+            Some("resolve pending".to_string()),
+            "queue_status should be 'resolve pending' when resolve is running"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_deferred_not_resolving_sets_merge_wait() {
+        let changes = vec![create_test_change("change-a", 5, 10)];
+        let web_state = WebState::new(&changes);
+
+        // Send MergeDeferred event without starting resolve
+        web_state
+            .apply_execution_event(&ExecutionEvent::MergeDeferred {
+                change_id: "change-a".to_string(),
+                reason: "test reason".to_string(),
+            })
+            .await;
+
+        // Verify queue_status is "merge wait"
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].queue_status,
+            Some("merge wait".to_string()),
+            "queue_status should be 'merge wait' when resolve is not running"
+        );
+        assert!(!state.is_resolving, "is_resolving should be false");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_started_sets_is_resolving() {
+        let changes = vec![create_test_change("change-a", 5, 10)];
+        let web_state = WebState::new(&changes);
+
+        // Send ResolveStarted event
+        web_state
+            .apply_execution_event(&ExecutionEvent::ResolveStarted {
+                change_id: "change-a".to_string(),
+                command: "test command".to_string(),
+            })
+            .await;
+
+        // Verify is_resolving is true
+        let state = web_state.get_state().await;
+        assert!(state.is_resolving, "is_resolving should be true");
+        assert_eq!(state.changes[0].queue_status, Some("resolving".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_completed_clears_is_resolving() {
+        let changes = vec![create_test_change("change-a", 5, 10)];
+        let web_state = WebState::new(&changes);
+
+        // Start resolve
+        web_state
+            .apply_execution_event(&ExecutionEvent::ResolveStarted {
+                change_id: "change-a".to_string(),
+                command: "test command".to_string(),
+            })
+            .await;
+
+        // Complete resolve
+        web_state
+            .apply_execution_event(&ExecutionEvent::ResolveCompleted {
+                change_id: "change-a".to_string(),
+                worktree_change_ids: None,
+            })
+            .await;
+
+        // Verify is_resolving is false
+        let state = web_state.get_state().await;
+        assert!(!state.is_resolving, "is_resolving should be false");
+        assert_eq!(state.changes[0].queue_status, Some("archiving".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_failed_clears_is_resolving() {
+        let changes = vec![create_test_change("change-a", 5, 10)];
+        let web_state = WebState::new(&changes);
+
+        // Start resolve
+        web_state
+            .apply_execution_event(&ExecutionEvent::ResolveStarted {
+                change_id: "change-a".to_string(),
+                command: "test command".to_string(),
+            })
+            .await;
+
+        // Fail resolve
+        web_state
+            .apply_execution_event(&ExecutionEvent::ResolveFailed {
+                change_id: "change-a".to_string(),
+                error: "test error".to_string(),
+            })
+            .await;
+
+        // Verify is_resolving is false
+        let state = web_state.get_state().await;
+        assert!(!state.is_resolving, "is_resolving should be false");
+        assert_eq!(state.changes[0].queue_status, Some("error".to_string()));
     }
 }
