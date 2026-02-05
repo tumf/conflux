@@ -20,7 +20,7 @@ use crate::tui::events::{LogEntry, LogLevel, OrchestratorEvent, TuiCommand};
 use crate::tui::types::{AppMode, QueueStatus, StopMode, ViewMode, WorktreeAction, WorktreeInfo};
 use crate::vcs::GitWorkspaceManager;
 use ratatui::widgets::ListState;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -146,6 +146,10 @@ pub struct AppState {
     /// TUI can query this for pending/archived status, apply counts, etc.
     pub shared_orchestrator_state:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>>,
+    /// Manual resolve queue (FIFO) for sequential resolve processing
+    pub resolve_queue: VecDeque<String>,
+    /// Set of change IDs in the resolve queue for duplicate prevention
+    pub resolve_queue_set: HashSet<String>,
 }
 
 // ============================================================================
@@ -282,6 +286,8 @@ impl AppState {
             is_resolving: false,
             worktree_paths: HashMap::new(),
             shared_orchestrator_state: None,
+            resolve_queue: VecDeque::new(),
+            resolve_queue_set: HashSet::new(),
         }
     }
 
@@ -679,21 +685,83 @@ impl AppState {
     }
 
     /// Trigger merge resolution for the selected change when applicable.
+    ///
+    /// If resolve is already running, the change is added to the resolve queue
+    /// and transitioned to ResolveWait instead of starting immediately.
     pub fn resolve_merge(&mut self) -> Option<TuiCommand> {
-        // Use centralized availability check
-        if !self.is_resolve_available() {
-            if self.is_resolving {
-                self.warning_message =
-                    Some("Cannot merge: resolve operation in progress".to_string());
-            }
+        // Must have valid cursor position
+        if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
             return None;
         }
 
-        let change = &mut self.changes[self.cursor_index];
-        let change_id = change.id.clone();
-        // Transition to ResolveWait immediately after M key press
-        change.queue_status = QueueStatus::ResolveWait;
-        Some(TuiCommand::ResolveMerge(change_id))
+        // Must be in correct mode
+        if !matches!(
+            self.mode,
+            AppMode::Select | AppMode::Stopped | AppMode::Running
+        ) {
+            return None;
+        }
+
+        // Check current change status and get change_id
+        let change_id = {
+            let change = &self.changes[self.cursor_index];
+            if !matches!(change.queue_status, QueueStatus::MergeWait) {
+                return None;
+            }
+            change.id.clone()
+        };
+
+        if self.is_resolving {
+            // Resolve is running: add to queue and transition to ResolveWait
+            if self.add_to_resolve_queue(&change_id) {
+                self.changes[self.cursor_index].queue_status = QueueStatus::ResolveWait;
+                self.add_log(LogEntry::info(format!(
+                    "Queued '{}' for resolve (position: {})",
+                    change_id,
+                    self.resolve_queue.len()
+                )));
+            } else {
+                self.warning_message = Some(format!(
+                    "Change '{}' is already queued for resolve",
+                    change_id
+                ));
+            }
+            None
+        } else {
+            // Resolve is not running: start immediately
+            self.changes[self.cursor_index].queue_status = QueueStatus::ResolveWait;
+            Some(TuiCommand::ResolveMerge(change_id))
+        }
+    }
+
+    /// Add a change to the resolve queue (with duplicate prevention).
+    ///
+    /// Returns true if the change was added, false if it was already in the queue.
+    pub fn add_to_resolve_queue(&mut self, change_id: &str) -> bool {
+        if self.resolve_queue_set.contains(change_id) {
+            false
+        } else {
+            self.resolve_queue.push_back(change_id.to_string());
+            self.resolve_queue_set.insert(change_id.to_string());
+            true
+        }
+    }
+
+    /// Pop the next change from the resolve queue.
+    ///
+    /// Returns the change ID if the queue is not empty, otherwise None.
+    pub fn pop_from_resolve_queue(&mut self) -> Option<String> {
+        if let Some(change_id) = self.resolve_queue.pop_front() {
+            self.resolve_queue_set.remove(&change_id);
+            Some(change_id)
+        } else {
+            None
+        }
+    }
+
+    /// Check if there are queued resolves waiting.
+    pub fn has_queued_resolves(&self) -> bool {
+        !self.resolve_queue.is_empty()
     }
 
     /// Update parallel eligibility status for changes.
@@ -1179,7 +1247,8 @@ impl AppState {
     /// Handle an event from the orchestrator
     ///
     /// This is the main entry point for event handling, dispatching to specialized handlers.
-    pub fn handle_orchestrator_event(&mut self, event: OrchestratorEvent) {
+    /// Returns an optional TuiCommand that should be executed (e.g., for auto-starting next resolve).
+    pub fn handle_orchestrator_event(&mut self, event: OrchestratorEvent) -> Option<TuiCommand> {
         match event {
             // Processing lifecycle events
             OrchestratorEvent::ProcessingStarted(id) => self.handle_processing_started(id),
@@ -1211,7 +1280,7 @@ impl AppState {
             OrchestratorEvent::ResolveCompleted {
                 change_id,
                 worktree_change_ids,
-            } => self.handle_resolve_completed(change_id, worktree_change_ids),
+            } => return self.handle_resolve_completed(change_id, worktree_change_ids),
             OrchestratorEvent::MergeCompleted {
                 change_id,
                 revision: _,
@@ -1314,6 +1383,7 @@ impl AppState {
                 // and don't need to be displayed in the log
             }
         }
+        None
     }
 
     // Processing lifecycle event handlers
@@ -1532,7 +1602,7 @@ impl AppState {
         &mut self,
         change_id: String,
         worktree_change_ids: Option<HashSet<String>>,
-    ) {
+    ) -> Option<TuiCommand> {
         self.is_resolving = false;
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.queue_status = QueueStatus::Merged;
@@ -1563,6 +1633,21 @@ impl AppState {
             "Merge resolved for '{}'",
             change_id
         )));
+
+        // Auto-start next resolve from queue if available
+        if let Some(next_change_id) = self.pop_from_resolve_queue() {
+            self.add_log(LogEntry::info(format!(
+                "Auto-starting resolve for '{}' from queue",
+                next_change_id
+            )));
+            // Transition from ResolveWait to about-to-start
+            if let Some(change) = self.changes.iter_mut().find(|c| c.id == next_change_id) {
+                change.queue_status = QueueStatus::ResolveWait;
+            }
+            Some(TuiCommand::ResolveMerge(next_change_id))
+        } else {
+            None
+        }
     }
 
     fn handle_merge_completed(&mut self, change_id: String) {
@@ -2911,5 +2996,134 @@ mod tests {
         app.handle_apply_output("test-change".to_string(), "stale".to_string(), Some(2));
         // Since we're in archive stage, the apply output should be ignored and iteration should remain 1
         assert_eq!(app.changes[0].iteration_number, Some(1));
+    }
+
+    #[test]
+    fn test_resolve_queue_fifo_order() {
+        let changes = vec![
+            create_approved_change("change-a", 0, 1),
+            create_approved_change("change-b", 0, 1),
+            create_approved_change("change-c", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Add changes to resolve queue
+        assert!(app.add_to_resolve_queue("change-a"));
+        assert!(app.add_to_resolve_queue("change-b"));
+        assert!(app.add_to_resolve_queue("change-c"));
+
+        // Pop in FIFO order
+        assert_eq!(app.pop_from_resolve_queue(), Some("change-a".to_string()));
+        assert_eq!(app.pop_from_resolve_queue(), Some("change-b".to_string()));
+        assert_eq!(app.pop_from_resolve_queue(), Some("change-c".to_string()));
+        assert_eq!(app.pop_from_resolve_queue(), None);
+    }
+
+    #[test]
+    fn test_resolve_queue_duplicate_prevention() {
+        let changes = vec![create_approved_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Add change-a once
+        assert!(app.add_to_resolve_queue("change-a"));
+        // Try to add change-a again - should be blocked
+        assert!(!app.add_to_resolve_queue("change-a"));
+
+        // Queue should only have one entry
+        assert_eq!(app.pop_from_resolve_queue(), Some("change-a".to_string()));
+        assert_eq!(app.pop_from_resolve_queue(), None);
+    }
+
+    #[test]
+    fn test_resolve_queue_auto_start_on_completion() {
+        let changes = vec![
+            create_approved_change("change-a", 0, 1),
+            create_approved_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Set change-a to Resolving
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.is_resolving = true;
+
+        // Queue change-b for resolve
+        app.add_to_resolve_queue("change-b");
+        app.changes[1].queue_status = QueueStatus::ResolveWait;
+
+        // Simulate resolve completion for change-a
+        let cmd = app.handle_resolve_completed("change-a".to_string(), None);
+
+        // Should return command to start change-b
+        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-b"));
+        // is_resolving should be cleared
+        assert!(!app.is_resolving);
+        // Queue should be empty
+        assert!(!app.has_queued_resolves());
+    }
+
+    #[test]
+    fn test_resolve_queue_no_auto_start_when_queue_empty() {
+        let changes = vec![create_approved_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Set change-a to Resolving
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.is_resolving = true;
+
+        // Simulate resolve completion with empty queue
+        let cmd = app.handle_resolve_completed("change-a".to_string(), None);
+
+        // Should NOT return a command
+        assert!(cmd.is_none());
+        // is_resolving should be cleared
+        assert!(!app.is_resolving);
+    }
+
+    #[test]
+    fn test_resolve_merge_queues_when_resolving() {
+        let changes = vec![
+            create_approved_change("change-a", 0, 1),
+            create_approved_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Set up: change-a is currently resolving
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.is_resolving = true;
+
+        // Set up: change-b is in MergeWait
+        app.changes[1].queue_status = QueueStatus::MergeWait;
+        app.cursor_index = 1;
+        app.mode = AppMode::Running;
+
+        // Call resolve_merge on change-b (should queue it)
+        let cmd = app.resolve_merge();
+
+        // Should NOT return a command (queued instead)
+        assert!(cmd.is_none());
+        // change-b should transition to ResolveWait
+        assert_eq!(app.changes[1].queue_status, QueueStatus::ResolveWait);
+        // change-b should be in the queue
+        assert!(app.has_queued_resolves());
+    }
+
+    #[test]
+    fn test_resolve_merge_starts_immediately_when_not_resolving() {
+        let changes = vec![create_approved_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Set up: change-a is in MergeWait, no resolve in progress
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.cursor_index = 0;
+        app.mode = AppMode::Running;
+        app.is_resolving = false;
+
+        // Call resolve_merge
+        let cmd = app.resolve_merge();
+
+        // Should return a command to start resolve
+        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
+        // change-a should transition to ResolveWait
+        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
     }
 }

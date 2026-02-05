@@ -456,9 +456,20 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             "@: approve"
         });
         keys.push("e: edit");
-        // Use centralized resolve availability check
-        if app.is_resolve_available() {
-            keys.push("M: resolve");
+        // Show M key hint based on resolve state (only in Select, Running, Stopped modes)
+        // - When resolve is NOT running and current item is MergeWait: "M: resolve"
+        // - When resolve IS running and current item is MergeWait: "M: queue resolve"
+        if matches!(item.queue_status, QueueStatus::MergeWait)
+            && matches!(
+                app.mode,
+                AppMode::Select | AppMode::Running | AppMode::Stopped
+            )
+        {
+            if app.is_resolving {
+                keys.push("M: queue resolve");
+            } else {
+                keys.push("M: resolve");
+            }
         }
     }
     if has_queue {
@@ -758,9 +769,20 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             "@: approve"
         });
         keys.push("e: edit");
-        // Use centralized resolve availability check
-        if app.is_resolve_available() {
-            keys.push("M: resolve");
+        // Show M key hint based on resolve state (only in Select, Running, Stopped modes)
+        // - When resolve is NOT running and current item is MergeWait: "M: resolve"
+        // - When resolve IS running and current item is MergeWait: "M: queue resolve"
+        if matches!(item.queue_status, QueueStatus::MergeWait)
+            && matches!(
+                app.mode,
+                AppMode::Select | AppMode::Running | AppMode::Stopped
+            )
+        {
+            if app.is_resolving {
+                keys.push("M: queue resolve");
+            } else {
+                keys.push("M: resolve");
+            }
         }
     }
     keys.push("Tab: worktrees");
@@ -1772,18 +1794,22 @@ mod tests {
 
     #[test]
     fn test_render_consistency_with_resolve_availability() {
-        // Test that whenever M: resolve is shown, resolve_merge() would succeed
+        // Test that M key hint is shown correctly based on resolve state
+        // - When resolve is NOT running and queue_status is MergeWait: "M: resolve"
+        // - When resolve IS running and queue_status is MergeWait: "M: queue resolve"
         let test_cases = vec![
-            // (mode, queue_status, is_resolving, should_be_available)
-            (AppMode::Select, QueueStatus::MergeWait, false, true),
-            (AppMode::Select, QueueStatus::MergeWait, true, false),
-            (AppMode::Running, QueueStatus::MergeWait, false, true),
-            (AppMode::Running, QueueStatus::MergeWait, true, false),
-            (AppMode::Error, QueueStatus::MergeWait, false, false),
-            (AppMode::Select, QueueStatus::Queued, false, false),
+            // (mode, queue_status, is_resolving, should_show_resolve, should_show_queue_resolve)
+            (AppMode::Select, QueueStatus::MergeWait, false, true, false),
+            (AppMode::Select, QueueStatus::MergeWait, true, false, true),
+            (AppMode::Running, QueueStatus::MergeWait, false, true, false),
+            (AppMode::Running, QueueStatus::MergeWait, true, false, true),
+            (AppMode::Error, QueueStatus::MergeWait, false, false, false),
+            (AppMode::Select, QueueStatus::Queued, false, false, false),
         ];
 
-        for (mode, queue_status, is_resolving, should_be_available) in test_cases {
+        for (mode, queue_status, is_resolving, should_show_resolve, should_show_queue_resolve) in
+            test_cases
+        {
             let mut app = create_test_app(vec![create_test_change("change-a", true)]);
             app.mode = mode.clone();
             app.changes[0].queue_status = queue_status.clone();
@@ -1793,19 +1819,19 @@ mod tests {
                 app.add_log(LogEntry::info("log")); // Ensure logs exist for running mode
             }
 
-            let is_available = app.is_resolve_available();
             let buffer = render_buffer(&mut app, 100, 24);
             let content = buffer_to_string(&buffer);
-            let shows_hint = content.contains("M: resolve");
+            let shows_resolve = content.contains("M: resolve");
+            let shows_queue_resolve = content.contains("M: queue resolve");
 
             assert_eq!(
-                is_available, should_be_available,
-                "is_resolve_available mismatch for mode={:?}, queue_status={:?}, is_resolving={}",
+                shows_resolve, should_show_resolve,
+                "Render 'M: resolve' hint mismatch for mode={:?}, queue_status={:?}, is_resolving={}",
                 mode, queue_status, is_resolving
             );
             assert_eq!(
-                shows_hint, should_be_available,
-                "Render hint mismatch for mode={:?}, queue_status={:?}, is_resolving={}",
+                shows_queue_resolve, should_show_queue_resolve,
+                "Render 'M: queue resolve' hint mismatch for mode={:?}, queue_status={:?}, is_resolving={}",
                 mode, queue_status, is_resolving
             );
         }

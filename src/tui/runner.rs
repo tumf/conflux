@@ -530,7 +530,10 @@ async fn run_tui_loop(
                 }
             }
 
-            app.handle_orchestrator_event(event);
+            if let Some(cmd) = app.handle_orchestrator_event(event) {
+                // Event triggered a command (e.g., auto-start next resolve)
+                let _ = cmd_tx.send(cmd).await;
+            }
         }
 
         // Handle dynamic queue additions and removals
