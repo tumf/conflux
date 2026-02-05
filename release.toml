@@ -1,0 +1,21 @@
+# cargo-release configuration
+# https://github.com/crate-ci/cargo-release
+
+# Branch restrictions
+allow-branch = ["main", "master"]
+
+# Publishing (disabled until ready for crates.io)
+publish = false
+
+# Git settings
+push-remote = "origin"
+tag-name = "v{{version}}"
+tag-message = "Release v{{version}}"
+pre-release-commit-message = "chore(release): release v{{version}}"
+
+# Signing (disabled by default, enable when needed)
+sign-commit = false
+sign-tag = false
+
+# Pre-release hook to generate changelog
+pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "v{{version}}"]
