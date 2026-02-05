@@ -1,4 +1,4 @@
-.PHONY: install build bump-minor bump-patch bump-major index index-full
+.PHONY: install build bump-minor bump-patch bump-major index index-full setup fmt lint test check
 
 # Build the project
 build:
@@ -31,45 +31,48 @@ index-full:
 		echo "Full index creation complete!" \
 	)
 
-# Bump minor version (0.x.0 -> 0.x+1.0) with git commit
-bump-minor:
-	@VERSION=$$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'); \
-	MAJOR=$$(echo $$VERSION | cut -d. -f1); \
-	MINOR=$$(echo $$VERSION | cut -d. -f2); \
-	PATCH=$$(echo $$VERSION | cut -d. -f3); \
-	NEW_MINOR=$$((MINOR + 1)); \
-	NEW_VERSION="$$MAJOR.$$NEW_MINOR.0"; \
-	sed -i '' "s/^version = \"$$VERSION\"/version = \"$$NEW_VERSION\"/" Cargo.toml; \
-	cargo update -p conflux; \
-	git add Cargo.toml Cargo.lock; \
-	git commit -m "$$NEW_VERSION"; \
-	git tag "v$$NEW_VERSION"; \
-	echo "Bumped version: $$VERSION -> $$NEW_VERSION"
+# Setup development environment
+setup:
+	@echo "Setting up development environment..."
+	@command -v rustfmt >/dev/null 2>&1 || rustup component add rustfmt
+	@command -v clippy >/dev/null 2>&1 || rustup component add clippy
+	@command -v cargo-release >/dev/null 2>&1 || cargo install cargo-release
+	@command -v git-cliff >/dev/null 2>&1 || cargo install git-cliff
+	@echo "Development environment setup complete!"
 
-# Bump patch version (0.0.x -> 0.0.x+1) with git commit
+# Format code
+fmt:
+	@echo "Formatting code..."
+	cargo fmt
+
+# Run linter
+lint:
+	@echo "Running clippy..."
+	cargo clippy -- -D warnings
+
+# Run tests
+test:
+	@echo "Running tests..."
+	cargo test
+
+# Run all checks (format, lint, test)
+check: fmt lint test
+	@echo "All checks passed!"
+
+# Bump patch version (0.0.x -> 0.0.x+1) using cargo-release
 bump-patch:
-	@VERSION=$$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'); \
-	MAJOR=$$(echo $$VERSION | cut -d. -f1); \
-	MINOR=$$(echo $$VERSION | cut -d. -f2); \
-	PATCH=$$(echo $$VERSION | cut -d. -f3); \
-	NEW_PATCH=$$((PATCH + 1)); \
-	NEW_VERSION="$$MAJOR.$$MINOR.$$NEW_PATCH"; \
-	sed -i '' "s/^version = \"$$VERSION\"/version = \"$$NEW_VERSION\"/" Cargo.toml; \
-	cargo update -p conflux; \
-	git add Cargo.toml Cargo.lock; \
-	git commit -m "$$NEW_VERSION"; \
-	git tag "v$$NEW_VERSION"; \
-	echo "Bumped version: $$VERSION -> $$NEW_VERSION"
+	@echo "Bumping patch version..."
+	cargo release patch --execute --no-confirm --no-publish
+	@echo "Patch version bumped and tagged successfully"
 
-# Bump major version (x.0.0 -> x+1.0.0) with git commit
+# Bump minor version (0.x.0 -> 0.x+1.0) using cargo-release
+bump-minor:
+	@echo "Bumping minor version..."
+	cargo release minor --execute --no-confirm --no-publish
+	@echo "Minor version bumped and tagged successfully"
+
+# Bump major version (x.0.0 -> x+1.0.0) using cargo-release
 bump-major:
-	@VERSION=$$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'); \
-	MAJOR=$$(echo $$VERSION | cut -d. -f1); \
-	NEW_MAJOR=$$((MAJOR + 1)); \
-	NEW_VERSION="$$NEW_MAJOR.0.0"; \
-	sed -i '' "s/^version = \"$$VERSION\"/version = \"$$NEW_VERSION\"/" Cargo.toml; \
-	cargo update -p conflux; \
-	git add Cargo.toml Cargo.lock; \
-	git commit -m "$$NEW_VERSION"; \
-	git tag "v$$NEW_VERSION"; \
-	echo "Bumped version: $$VERSION -> $$NEW_VERSION"
+	@echo "Bumping major version..."
+	cargo release major --execute --no-confirm --no-publish
+	@echo "Major version bumped and tagged successfully"
