@@ -15,21 +15,24 @@ NC='\033[0m' # No Color
 info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+error() {
+	echo -e "${RED}[ERROR]${NC} $1"
+	exit 1
+}
 
 # Show usage
 usage() {
-    echo "Usage: $0 [patch|minor|major]"
-    echo ""
-    echo "Arguments:"
-    echo "  patch  - Increment patch version (0.1.0 -> 0.1.1)"
-    echo "  minor  - Increment minor version (0.1.0 -> 0.2.0)"
-    echo "  major  - Increment major version (0.1.0 -> 1.0.0)"
-    echo ""
-    echo "Options:"
-    echo "  -h, --help    Show this help message"
-    echo "  -n, --dry-run Show what would be done without making changes"
-    exit 0
+	echo "Usage: $0 [patch|minor|major]"
+	echo ""
+	echo "Arguments:"
+	echo "  patch  - Increment patch version (0.1.0 -> 0.1.1)"
+	echo "  minor  - Increment minor version (0.1.0 -> 0.2.0)"
+	echo "  major  - Increment major version (0.1.0 -> 1.0.0)"
+	echo ""
+	echo "Options:"
+	echo "  -h, --help    Show this help message"
+	echo "  -n, --dry-run Show what would be done without making changes"
+	exit 0
 }
 
 # Parse arguments
@@ -37,26 +40,26 @@ DRY_RUN=false
 RELEASE_TYPE=""
 
 while [[ $# -gt 0 ]]; do
-    case $1 in
-        -h|--help)
-            usage
-            ;;
-        -n|--dry-run)
-            DRY_RUN=true
-            shift
-            ;;
-        patch|minor|major)
-            RELEASE_TYPE="$1"
-            shift
-            ;;
-        *)
-            error "Unknown argument: $1"
-            ;;
-    esac
+	case $1 in
+	-h | --help)
+		usage
+		;;
+	-n | --dry-run)
+		DRY_RUN=true
+		shift
+		;;
+	patch | minor | major)
+		RELEASE_TYPE="$1"
+		shift
+		;;
+	*)
+		error "Unknown argument: $1"
+		;;
+	esac
 done
 
 if [[ -z "$RELEASE_TYPE" ]]; then
-    error "Release type required. Use: $0 [patch|minor|major]"
+	error "Release type required. Use: $0 [patch|minor|major]"
 fi
 
 info "Starting release process (type: $RELEASE_TYPE)"
@@ -67,16 +70,15 @@ info "Validating environment..."
 # Check if on main branch
 CURRENT_BRANCH=$(git branch --show-current)
 if [[ "$CURRENT_BRANCH" != "main" && "$CURRENT_BRANCH" != "master" ]]; then
-    error "Must be on main or master branch (current: $CURRENT_BRANCH)"
+	error "Must be on main or master branch (current: $CURRENT_BRANCH)"
 fi
 
 # Check for clean working tree
 if [[ -n $(git status --porcelain) ]]; then
-    error "Working tree is not clean. Commit or stash changes first."
+	error "Working tree is not clean. Commit or stash changes first."
 fi
 
 # Check required tools
-command -v git-cliff >/dev/null 2>&1 || error "git-cliff not found. Install: cargo install git-cliff"
 command -v cargo >/dev/null 2>&1 || error "cargo not found"
 
 success "Environment validated"
@@ -84,44 +86,43 @@ success "Environment validated"
 # Get current version from Cargo.toml
 CARGO_TOML="Cargo.toml"
 if [[ ! -f "$CARGO_TOML" ]]; then
-    error "Cargo.toml not found"
+	error "Cargo.toml not found"
 fi
 
 CURRENT_VERSION=$(grep -E '^version\s*=' "$CARGO_TOML" | head -1 | sed 's/.*"\(.*\)".*/\1/')
 if [[ -z "$CURRENT_VERSION" ]]; then
-    error "Could not determine current version from Cargo.toml"
+	error "Could not determine current version from Cargo.toml"
 fi
 
 info "Current version: $CURRENT_VERSION"
 
 # Calculate new version
-IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+IFS='.' read -r MAJOR MINOR PATCH <<<"$CURRENT_VERSION"
 
 case $RELEASE_TYPE in
-    patch)
-        NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
-        ;;
-    minor)
-        NEW_VERSION="$MAJOR.$((MINOR + 1)).0"
-        ;;
-    major)
-        NEW_VERSION="$((MAJOR + 1)).0.0"
-        ;;
+patch)
+	NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+	;;
+minor)
+	NEW_VERSION="$MAJOR.$((MINOR + 1)).0"
+	;;
+major)
+	NEW_VERSION="$((MAJOR + 1)).0.0"
+	;;
 esac
 
 info "New version: $NEW_VERSION"
 
 if $DRY_RUN; then
-    warn "Dry run mode - no changes will be made"
-    echo ""
-    echo "Would perform the following:"
-    echo "  1. Run pre-release checks (fmt, clippy, test)"
-    echo "  2. Update version in Cargo.toml to $NEW_VERSION"
-    echo "  3. Generate CHANGELOG.md"
-    echo "  4. Commit changes"
-    echo "  5. Create tag v$NEW_VERSION"
-    echo "  6. Push to origin with tags"
-    exit 0
+	warn "Dry run mode - no changes will be made"
+	echo ""
+	echo "Would perform the following:"
+	echo "  1. Run pre-release checks (fmt, clippy, test)"
+	echo "  2. Update version in Cargo.toml to $NEW_VERSION"
+	echo "  3. Commit changes"
+	echo "  4. Create tag v$NEW_VERSION"
+	echo "  5. Push to origin with tags"
+	exit 0
 fi
 
 # Pre-release checks
@@ -147,15 +148,11 @@ rm -f "${CARGO_TOML}.bak"
 info "Updating Cargo.lock..."
 cargo check --quiet
 
-# Generate changelog
-info "Generating CHANGELOG.md..."
-git-cliff --tag "v$NEW_VERSION" -o CHANGELOG.md
-
 success "Files updated"
 
 # Git operations
 info "Creating git commit..."
-git add Cargo.toml Cargo.lock CHANGELOG.md
+git add Cargo.toml Cargo.lock
 git commit -m "chore(release): release v$NEW_VERSION"
 
 info "Creating git tag..."

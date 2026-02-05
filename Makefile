@@ -37,7 +37,6 @@ setup:
 	@command -v rustfmt >/dev/null 2>&1 || rustup component add rustfmt
 	@command -v clippy >/dev/null 2>&1 || rustup component add clippy
 	@command -v cargo-release >/dev/null 2>&1 || cargo install cargo-release
-	@command -v git-cliff >/dev/null 2>&1 || cargo install git-cliff
 	@echo "Development environment setup complete!"
 
 # Format code

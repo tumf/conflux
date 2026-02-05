@@ -11,11 +11,6 @@ This document describes how to create releases for Conflux.
   cargo install cargo-release
   ```
 
-- **git-cliff**: Changelog generator
-  ```bash
-  cargo install git-cliff
-  ```
-
 - **Rust toolchain**: For pre-release checks
   ```bash
   rustup update stable
@@ -59,10 +54,9 @@ make bump-major
 This will:
 1. Validate you're on main/master branch with clean working tree
 2. Update version in Cargo.toml and Cargo.lock
-3. Generate CHANGELOG.md with git-cliff
-4. Create commit with message `chore(release): release vX.Y.Z`
-5. Create annotated git tag `vX.Y.Z`
-6. Push commit and tag to origin
+3. Create commit with message `chore(release): release vX.Y.Z`
+4. Create annotated git tag `vX.Y.Z`
+5. Push commit and tag to origin
 
 GitHub Actions will then automatically:
 1. Build binaries for all platforms
@@ -113,16 +107,10 @@ version = "X.Y.Z"
 cargo check
 ```
 
-### 3. Generate Changelog
+### 3. Commit and Tag
 
 ```bash
-git-cliff --tag vX.Y.Z -o CHANGELOG.md
-```
-
-### 4. Commit and Tag
-
-```bash
-git add Cargo.toml Cargo.lock CHANGELOG.md
+git add Cargo.toml Cargo.lock
 git commit -m "chore(release): release vX.Y.Z"
 git tag -a vX.Y.Z -m "Release vX.Y.Z"
 git push origin main
