@@ -179,6 +179,14 @@ For auto-released changes that are no longer `MergeWait`, merge resolve operatio
 
 Furthermore, changes that are serialized and in a waiting state for resolve SHALL be retained as `ResolveWait` and MUST NOT be returned to `NotQueued` by auto-refresh.
 
+The TUI SHALL maintain a FIFO resolve wait queue for manual resolve operations triggered while another resolve is in progress.
+
+When the user presses `M` on a `MergeWait` change while resolve is in progress, the change SHALL transition to `ResolveWait` and be enqueued (deduplicated).
+
+When `ResolveCompleted` is received and the resolve wait queue is not empty, the TUI SHALL dequeue the next change and start its resolve immediately.
+
+When `ResolveFailed` is received, the TUI SHALL NOT auto-start the next resolve; queued changes remain in `ResolveWait` until user action resumes.
+
 #### Scenario: Release MergeWait when worktree does not exist
 - **GIVEN** a change is in `MergeWait`
 - **AND** the corresponding worktree does not exist
@@ -209,6 +217,25 @@ Furthermore, changes that are serialized and in a waiting state for resolve SHAL
 - **WHEN** the TUI auto-refresh is executed
 - **THEN** the change status is displayed as `ResolveWait`
 - **AND** queue operations via Space/@ keys are not accepted
+
+#### Scenario: resolve 実行中の `M` は待ち行列へ追加される
+- **GIVEN** a resolve operation is in progress
+- **AND** the user presses `M` on a change in `MergeWait`
+- **WHEN** the TUI processes the key event
+- **THEN** the change status SHALL transition to `ResolveWait`
+- **AND** the change_id SHALL be enqueued for resolve
+
+#### Scenario: ResolveCompleted は次の待ち行列を開始する
+- **GIVEN** the resolve wait queue has at least one change_id
+- **AND** a resolve operation completes
+- **WHEN** `ResolveCompleted` is processed
+- **THEN** the next change_id SHALL be dequeued and its resolve started
+
+#### Scenario: ResolveFailed は自動開始しない
+- **GIVEN** the resolve wait queue has at least one change_id
+- **AND** a resolve operation fails
+- **WHEN** `ResolveFailed` is processed
+- **THEN** the next resolve SHALL NOT start automatically
 
 ### Requirement: Log Entry Structure and Display
 
