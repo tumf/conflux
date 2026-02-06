@@ -164,6 +164,28 @@ pub async fn start_server(
             "/api/control/retry",
             axum::routing::post(api::control_retry),
         )
+        // Worktree API routes
+        .route("/api/worktrees", get(api::list_worktrees))
+        .route(
+            "/api/worktrees/refresh",
+            axum::routing::post(api::refresh_worktrees),
+        )
+        .route(
+            "/api/worktrees/create",
+            axum::routing::post(api::create_worktree),
+        )
+        .route(
+            "/api/worktrees/delete",
+            axum::routing::post(api::delete_worktree),
+        )
+        .route(
+            "/api/worktrees/merge",
+            axum::routing::post(api::merge_worktree),
+        )
+        .route(
+            "/api/worktrees/command",
+            axum::routing::post(api::execute_worktree_command),
+        )
         // WebSocket route
         .route("/ws", get(websocket::ws_handler))
         .layer(cors)
@@ -263,6 +285,28 @@ pub async fn spawn_server_with_url(
         .route(
             "/api/control/retry",
             axum::routing::post(api::control_retry),
+        )
+        // Worktree API routes
+        .route("/api/worktrees", get(api::list_worktrees))
+        .route(
+            "/api/worktrees/refresh",
+            axum::routing::post(api::refresh_worktrees),
+        )
+        .route(
+            "/api/worktrees/create",
+            axum::routing::post(api::create_worktree),
+        )
+        .route(
+            "/api/worktrees/delete",
+            axum::routing::post(api::delete_worktree),
+        )
+        .route(
+            "/api/worktrees/merge",
+            axum::routing::post(api::merge_worktree),
+        )
+        .route(
+            "/api/worktrees/command",
+            axum::routing::post(api::execute_worktree_command),
         )
         // WebSocket route
         .route("/ws", get(websocket::ws_handler))

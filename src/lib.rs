@@ -44,3 +44,4 @@ mod stall;
 mod task_parser;
 mod templates;
 mod vcs;
+pub mod worktree_ops;

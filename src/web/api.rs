@@ -1,6 +1,7 @@
 //! REST API handlers for web monitoring.
 
 use super::state::{ChangeStatus, ControlCommand, WebState};
+use crate::worktree_ops;
 use axum::{
     extract::{Path, State},
     http::{header, StatusCode},
@@ -532,6 +533,833 @@ pub async fn control_retry(
             }),
         )),
     }
+}
+
+// ===== Worktree API Endpoints =====
+/// Get list of all worktrees
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        get,
+        path = "/api/worktrees",
+        tag = "worktrees",
+        responses(
+            (status = 200, description = "List of worktrees", body = Vec<crate::tui::types::WorktreeInfo>)
+        )
+    )
+)]
+pub async fn list_worktrees(
+) -> Result<Json<Vec<crate::tui::types::WorktreeInfo>>, (StatusCode, Json<ErrorResponse>)> {
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use tracing::error;
+
+    let start = Instant::now();
+    let request_id = format!(
+        "list_wt_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+    );
+
+    let repo_root = std::env::current_dir().map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "list_worktrees",
+            worktree_name = "<all>",
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to get current directory"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to get current directory: {}", e),
+            }),
+        )
+    })?;
+
+    let worktrees = worktree_ops::get_worktrees(&repo_root).await.map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "list_worktrees",
+            worktree_name = "<all>",
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to list worktrees"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to list worktrees: {}", e),
+            }),
+        )
+    })?;
+
+    let duration_ms = start.elapsed().as_millis();
+    tracing::debug!(
+        request_id = %request_id,
+        operation = "list_worktrees",
+        worktree_name = "<all>",
+        worktree_count = worktrees.len(),
+        duration_ms = duration_ms,
+        "Listed worktrees successfully"
+    );
+
+    Ok(Json(worktrees))
+}
+
+/// Refresh worktrees (re-scan)
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        post,
+        path = "/api/worktrees/refresh",
+        tag = "worktrees",
+        responses(
+            (status = 200, description = "Worktrees refreshed", body = Vec<crate::tui::types::WorktreeInfo>)
+        )
+    )
+)]
+pub async fn refresh_worktrees(
+) -> Result<Json<Vec<crate::tui::types::WorktreeInfo>>, (StatusCode, Json<ErrorResponse>)> {
+    // Refresh is the same as list for worktrees (always fresh from git)
+    list_worktrees().await
+}
+
+/// Request body for worktree creation
+#[derive(Debug, serde::Deserialize)]
+#[cfg_attr(feature = "web-monitoring", derive(utoipa::ToSchema))]
+pub struct CreateWorktreeRequest {
+    pub change_id: String,
+    #[serde(default)]
+    pub base_commit: Option<String>,
+}
+
+/// Create a new worktree
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        post,
+        path = "/api/worktrees/create",
+        tag = "worktrees",
+        request_body = CreateWorktreeRequest,
+        responses(
+            (status = 200, description = "Worktree created", body = crate::tui::types::WorktreeInfo),
+            (status = 409, description = "Worktree already exists", body = ErrorResponse),
+            (status = 500, description = "Failed to create worktree", body = ErrorResponse)
+        )
+    )
+)]
+pub async fn create_worktree(
+    Json(req): Json<CreateWorktreeRequest>,
+) -> Result<Json<crate::tui::types::WorktreeInfo>, (StatusCode, Json<ErrorResponse>)> {
+    use crate::vcs::git::commands;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use tracing::error;
+
+    let start = Instant::now();
+    let request_id = format!(
+        "create_wt_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+    );
+    let worktree_name = req.change_id.clone();
+
+    let repo_root = std::env::current_dir().map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "create_worktree",
+            worktree_name = %worktree_name,
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to get current directory"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to get current directory: {}", e),
+            }),
+        )
+    })?;
+
+    // Check if worktree already exists
+    let exists = worktree_ops::worktree_exists(&repo_root, &req.change_id)
+        .await
+        .map_err(|e| {
+            let duration_ms = start.elapsed().as_millis();
+            error!(
+                request_id = %request_id,
+                operation = "create_worktree",
+                worktree_name = %worktree_name,
+                error = %e,
+                duration_ms = duration_ms,
+                "Failed to check worktree existence"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to check worktree existence: {}", e),
+                }),
+            )
+        })?;
+
+    if exists {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "create_worktree",
+            worktree_name = %worktree_name,
+            error = "Worktree already exists",
+            duration_ms = duration_ms,
+            "Worktree creation failed - already exists"
+        );
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("Worktree for '{}' already exists", req.change_id),
+            }),
+        ));
+    }
+
+    // Get workspace base directory
+    let config = crate::config::OrchestratorConfig::load(None).map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "create_worktree",
+            worktree_name = %worktree_name,
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to load config"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to load config: {}", e),
+            }),
+        )
+    })?;
+
+    let workspace_base_dir = config
+        .get_workspace_base_dir()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| crate::config::defaults::default_workspace_base_dir(Some(&repo_root)));
+
+    // Sanitize change_id for branch name
+    let branch_name = req.change_id.replace(['/', '\\', ' '], "-");
+    let worktree_path = workspace_base_dir.join(&branch_name);
+
+    // Ensure base directory exists
+    std::fs::create_dir_all(&workspace_base_dir).map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "create_worktree",
+            worktree_name = %worktree_name,
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to create workspace directory"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to create workspace directory: {}", e),
+            }),
+        )
+    })?;
+
+    // Get base commit (use HEAD if not specified)
+    let base_commit = match req.base_commit {
+        Some(commit) => commit,
+        None => commands::get_current_commit(&repo_root)
+            .await
+            .map_err(|e| {
+                let duration_ms = start.elapsed().as_millis();
+                error!(
+                    request_id = %request_id,
+                    operation = "create_worktree",
+                    worktree_name = %worktree_name,
+                    error = %e,
+                    duration_ms = duration_ms,
+                    "Failed to get current commit"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to get current commit: {}", e),
+                    }),
+                )
+            })?,
+    };
+
+    // Create worktree
+    commands::worktree_add(
+        &repo_root,
+        worktree_path.to_str().unwrap(),
+        &branch_name,
+        &base_commit,
+    )
+    .await
+    .map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "create_worktree",
+            worktree_name = %worktree_name,
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to create worktree"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to create worktree: {}", e),
+            }),
+        )
+    })?;
+
+    // Execute setup script if it exists
+    let _ = commands::run_worktree_setup(&repo_root, &worktree_path).await;
+
+    let duration_ms = start.elapsed().as_millis();
+    tracing::info!(
+        request_id = %request_id,
+        operation = "create_worktree",
+        worktree_name = %worktree_name,
+        duration_ms = duration_ms,
+        "Worktree created successfully"
+    );
+
+    // Return the created worktree info
+    Ok(Json(crate::tui::types::WorktreeInfo {
+        path: worktree_path,
+        head: base_commit[..8.min(base_commit.len())].to_string(),
+        branch: branch_name,
+        is_detached: false,
+        is_main: false,
+        merge_conflict: None,
+        has_commits_ahead: false,
+        is_merging: false,
+    }))
+}
+
+/// Request body for worktree deletion
+#[derive(Debug, serde::Deserialize)]
+#[cfg_attr(feature = "web-monitoring", derive(utoipa::ToSchema))]
+pub struct DeleteWorktreeRequest {
+    pub branch_name: String,
+}
+
+/// Delete a worktree
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        post,
+        path = "/api/worktrees/delete",
+        tag = "worktrees",
+        request_body = DeleteWorktreeRequest,
+        responses(
+            (status = 200, description = "Worktree deleted", body = ControlResponse),
+            (status = 404, description = "Worktree not found", body = ErrorResponse),
+            (status = 409, description = "Cannot delete worktree (validation failed)", body = ErrorResponse),
+            (status = 500, description = "Failed to delete worktree", body = ErrorResponse)
+        )
+    )
+)]
+pub async fn delete_worktree(
+    Json(req): Json<DeleteWorktreeRequest>,
+) -> Result<Json<ControlResponse>, (StatusCode, Json<ErrorResponse>)> {
+    use crate::vcs::git::commands;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use tracing::error;
+
+    let start = Instant::now();
+    let request_id = format!(
+        "delete_wt_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+    );
+    let worktree_name = req.branch_name.clone();
+
+    let repo_root = std::env::current_dir().map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "delete_worktree",
+            worktree_name = %worktree_name,
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to get current directory"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to get current directory: {}", e),
+            }),
+        )
+    })?;
+
+    // Get worktree list to find the target
+    let worktrees = worktree_ops::get_worktrees(&repo_root).await.map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "delete_worktree",
+            worktree_name = %worktree_name,
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to list worktrees"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to list worktrees: {}", e),
+            }),
+        )
+    })?;
+
+    let worktree = worktrees
+        .iter()
+        .find(|wt| wt.branch == req.branch_name)
+        .ok_or_else(|| {
+            let duration_ms = start.elapsed().as_millis();
+            error!(
+                request_id = %request_id,
+                operation = "delete_worktree",
+                worktree_name = %worktree_name,
+                error = "Worktree not found",
+                duration_ms = duration_ms,
+                "Worktree deletion failed - not found"
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Worktree '{}' not found", req.branch_name),
+                }),
+            )
+        })?;
+
+    // Validate deletion
+    let (can_delete, reason) = worktree_ops::can_delete_worktree(worktree).await;
+    if !can_delete {
+        let duration_ms = start.elapsed().as_millis();
+        let error_msg = reason.unwrap_or_else(|| "Cannot delete worktree".to_string());
+        error!(
+            request_id = %request_id,
+            operation = "delete_worktree",
+            worktree_name = %worktree_name,
+            error = %error_msg,
+            duration_ms = duration_ms,
+            "Worktree deletion failed - validation failed"
+        );
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse { error: error_msg }),
+        ));
+    }
+
+    // Delete worktree
+    commands::worktree_remove(&repo_root, worktree.path.to_str().unwrap())
+        .await
+        .map_err(|e| {
+            let duration_ms = start.elapsed().as_millis();
+            error!(
+                request_id = %request_id,
+                operation = "delete_worktree",
+                worktree_name = %worktree_name,
+                error = %e,
+                duration_ms = duration_ms,
+                "Failed to remove worktree"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to remove worktree: {}", e),
+                }),
+            )
+        })?;
+
+    // Delete branch
+    let _ = commands::branch_delete(&repo_root, &req.branch_name).await;
+
+    let duration_ms = start.elapsed().as_millis();
+    tracing::info!(
+        request_id = %request_id,
+        operation = "delete_worktree",
+        worktree_name = %worktree_name,
+        duration_ms = duration_ms,
+        "Worktree deleted successfully"
+    );
+
+    Ok(Json(ControlResponse {
+        success: true,
+        message: format!("Worktree '{}' deleted successfully", req.branch_name),
+    }))
+}
+
+/// Request body for worktree merge
+#[derive(Debug, serde::Deserialize)]
+#[cfg_attr(feature = "web-monitoring", derive(utoipa::ToSchema))]
+pub struct MergeWorktreeRequest {
+    pub branch_name: String,
+}
+
+/// Merge a worktree branch into the base branch
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        post,
+        path = "/api/worktrees/merge",
+        tag = "worktrees",
+        request_body = MergeWorktreeRequest,
+        responses(
+            (status = 200, description = "Worktree merged", body = ControlResponse),
+            (status = 404, description = "Worktree not found", body = ErrorResponse),
+            (status = 409, description = "Cannot merge worktree (validation failed)", body = ErrorResponse),
+            (status = 500, description = "Failed to merge worktree", body = ErrorResponse)
+        )
+    )
+)]
+pub async fn merge_worktree(
+    Json(req): Json<MergeWorktreeRequest>,
+) -> Result<Json<ControlResponse>, (StatusCode, Json<ErrorResponse>)> {
+    use crate::vcs::git::commands;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use tracing::error;
+
+    let start = Instant::now();
+    let request_id = format!(
+        "merge_wt_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+    );
+    let worktree_name = req.branch_name.clone();
+
+    let repo_root = std::env::current_dir().map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "merge_worktree",
+            worktree_name = %worktree_name,
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to get current directory"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to get current directory: {}", e),
+            }),
+        )
+    })?;
+
+    // Get worktree list to find the target
+    let worktrees = worktree_ops::get_worktrees(&repo_root).await.map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "merge_worktree",
+            worktree_name = %worktree_name,
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to list worktrees"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to list worktrees: {}", e),
+            }),
+        )
+    })?;
+
+    let worktree = worktrees
+        .iter()
+        .find(|wt| wt.branch == req.branch_name)
+        .ok_or_else(|| {
+            let duration_ms = start.elapsed().as_millis();
+            error!(
+                request_id = %request_id,
+                operation = "merge_worktree",
+                worktree_name = %worktree_name,
+                error = "Worktree not found",
+                duration_ms = duration_ms,
+                "Worktree merge failed - not found"
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Worktree '{}' not found", req.branch_name),
+                }),
+            )
+        })?;
+
+    // Validate merge
+    let (can_merge, reason) = worktree_ops::can_merge_worktree(worktree);
+    if !can_merge {
+        let duration_ms = start.elapsed().as_millis();
+        let error_msg = reason.unwrap_or_else(|| "Cannot merge worktree".to_string());
+        error!(
+            request_id = %request_id,
+            operation = "merge_worktree",
+            worktree_name = %worktree_name,
+            error = %error_msg,
+            duration_ms = duration_ms,
+            "Worktree merge failed - validation failed"
+        );
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse { error: error_msg }),
+        ));
+    }
+
+    // Get base branch name
+    let base_branch = worktrees
+        .iter()
+        .find(|wt| wt.is_main)
+        .map(|wt| wt.branch.clone())
+        .ok_or_else(|| {
+            let duration_ms = start.elapsed().as_millis();
+            error!(
+                request_id = %request_id,
+                operation = "merge_worktree",
+                worktree_name = %worktree_name,
+                error = "Failed to determine base branch",
+                duration_ms = duration_ms,
+                "Worktree merge failed - no base branch found"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Failed to determine base branch".to_string(),
+                }),
+            )
+        })?;
+
+    // Checkout base branch
+    commands::checkout(&repo_root, &base_branch)
+        .await
+        .map_err(|e| {
+            let duration_ms = start.elapsed().as_millis();
+            error!(
+                request_id = %request_id,
+                operation = "merge_worktree",
+                worktree_name = %worktree_name,
+                error = %e,
+                duration_ms = duration_ms,
+                "Failed to checkout base branch"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to checkout base branch: {}", e),
+                }),
+            )
+        })?;
+
+    // Merge branch
+    commands::merge(&repo_root, &req.branch_name)
+        .await
+        .map_err(|e| {
+            let duration_ms = start.elapsed().as_millis();
+            error!(
+                request_id = %request_id,
+                operation = "merge_worktree",
+                worktree_name = %worktree_name,
+                error = %e,
+                duration_ms = duration_ms,
+                "Failed to merge branch"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to merge branch: {}", e),
+                }),
+            )
+        })?;
+
+    let duration_ms = start.elapsed().as_millis();
+    tracing::info!(
+        request_id = %request_id,
+        operation = "merge_worktree",
+        worktree_name = %worktree_name,
+        duration_ms = duration_ms,
+        "Worktree merged successfully"
+    );
+
+    Ok(Json(ControlResponse {
+        success: true,
+        message: format!(
+            "Branch '{}' merged into '{}' successfully",
+            req.branch_name, base_branch
+        ),
+    }))
+}
+
+/// Request body for worktree command execution
+#[derive(Debug, serde::Deserialize)]
+#[cfg_attr(feature = "web-monitoring", derive(utoipa::ToSchema))]
+pub struct WorktreeCommandRequest {
+    pub branch_name: String,
+    pub command: String,
+}
+
+/// Execute a command in a worktree
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        post,
+        path = "/api/worktrees/command",
+        tag = "worktrees",
+        request_body = WorktreeCommandRequest,
+        responses(
+            (status = 200, description = "Command executed", body = ControlResponse),
+            (status = 404, description = "Worktree not found", body = ErrorResponse),
+            (status = 500, description = "Command execution failed", body = ErrorResponse)
+        )
+    )
+)]
+pub async fn execute_worktree_command(
+    Json(req): Json<WorktreeCommandRequest>,
+) -> Result<Json<ControlResponse>, (StatusCode, Json<ErrorResponse>)> {
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use tracing::error;
+
+    let start = Instant::now();
+    let request_id = format!(
+        "cmd_wt_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+    );
+    let worktree_name = req.branch_name.clone();
+
+    let repo_root = std::env::current_dir().map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "command",
+            worktree_name = %worktree_name,
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to get current directory"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to get current directory: {}", e),
+            }),
+        )
+    })?;
+
+    // Get worktree list to find the target
+    let worktrees = worktree_ops::get_worktrees(&repo_root).await.map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "command",
+            worktree_name = %worktree_name,
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to list worktrees"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to list worktrees: {}", e),
+            }),
+        )
+    })?;
+
+    let worktree = worktrees
+        .iter()
+        .find(|wt| wt.branch == req.branch_name)
+        .ok_or_else(|| {
+            let duration_ms = start.elapsed().as_millis();
+            error!(
+                request_id = %request_id,
+                operation = "command",
+                worktree_name = %worktree_name,
+                error = "Worktree not found",
+                duration_ms = duration_ms,
+                "Command execution failed - worktree not found"
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Worktree '{}' not found", req.branch_name),
+                }),
+            )
+        })?;
+
+    // Execute command in worktree directory
+    let output = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&req.command)
+        .current_dir(&worktree.path)
+        .output()
+        .await
+        .map_err(|e| {
+            let duration_ms = start.elapsed().as_millis();
+            error!(
+                request_id = %request_id,
+                operation = "command",
+                worktree_name = %worktree_name,
+                error = %e,
+                duration_ms = duration_ms,
+                "Failed to execute command"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to execute command: {}", e),
+                }),
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "command",
+            worktree_name = %worktree_name,
+            error = %stderr,
+            duration_ms = duration_ms,
+            "Command failed"
+        );
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Command failed: {}", stderr),
+            }),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let duration_ms = start.elapsed().as_millis();
+    tracing::info!(
+        request_id = %request_id,
+        operation = "command",
+        worktree_name = %worktree_name,
+        duration_ms = duration_ms,
+        "Command executed successfully"
+    );
+
+    Ok(Json(ControlResponse {
+        success: true,
+        message: format!("Command executed successfully:\n{}", stdout),
+    }))
 }
 
 #[cfg(test)]

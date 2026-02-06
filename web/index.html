@@ -57,6 +57,11 @@
             </div>
         </section>
 
+        <section class="tabs" id="tabs" aria-label="View Tabs">
+            <button class="tab-btn active" id="tab-changes" data-tab="changes" aria-label="View changes">Changes</button>
+            <button class="tab-btn" id="tab-worktrees" data-tab="worktrees" aria-label="View worktrees">Worktrees</button>
+        </section>
+
         <section class="control-bar" id="control-bar" aria-label="Execution Controls">
             <button id="btn-run" class="control-btn control-btn-primary" aria-label="Start or resume processing">
                 <span class="btn-icon">▶</span>
@@ -80,7 +85,7 @@
             </button>
         </section>
 
-        <main id="changes-container" role="main">
+        <main id="changes-container" role="main" class="tab-content">
             <div class="loading" id="loading" aria-busy="true">
                 <div class="spinner" aria-hidden="true"></div>
                 <p>Loading changes...</p>
@@ -88,6 +93,13 @@
             <div class="changes-list" id="changes-list" role="list"></div>
             <div class="empty-state" id="empty-state" style="display: none;">
                 <p>No changes found.</p>
+            </div>
+        </main>
+
+        <main id="worktrees-container" role="main" class="tab-content" style="display: none;">
+            <div class="worktrees-list" id="worktrees-list" role="list"></div>
+            <div class="empty-state" id="worktrees-empty-state" style="display: none;">
+                <p>No worktrees found.</p>
             </div>
         </main>
 

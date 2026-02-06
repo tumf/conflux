@@ -748,10 +748,10 @@ impl WebState {
     }
 
     async fn broadcast_snapshot(&self, changes: Vec<ChangeStatus>) {
-        // Read current app_mode from state
-        let current_app_mode = {
+        // Read current app_mode and worktrees from state
+        let (current_app_mode, current_worktrees) = {
             let state = self.state.read().await;
-            state.app_mode.clone()
+            (state.app_mode.clone(), state.worktrees.clone())
         };
 
         let update = StateUpdate {
@@ -759,7 +759,7 @@ impl WebState {
             timestamp: chrono::Utc::now().to_rfc3339(),
             changes,
             logs: None,
-            worktrees: None,
+            worktrees: Some(current_worktrees),
             app_mode: Some(current_app_mode),
         };
 
@@ -843,6 +843,15 @@ impl WebState {
             }
         }
 
+        // Retrieve worktrees for TUI/Web parity
+        let worktrees = match crate::worktree_ops::get_worktrees(&repo_root).await {
+            Ok(wts) => wts,
+            Err(e) => {
+                tracing::debug!("Failed to retrieve worktrees: {}", e);
+                Vec::new()
+            }
+        };
+
         // Preserve existing app_mode (don't overwrite runtime state with "select" default)
         let current_app_mode = {
             let state = self.state.read().await;
@@ -851,6 +860,27 @@ impl WebState {
 
         // Update state with refreshed changes, preserving app_mode
         self.update_with_mode(&changes, &current_app_mode).await;
+
+        // Update worktrees in state and broadcast
+        let worktrees_changed = {
+            let mut state = self.state.write().await;
+            let changed = state.worktrees != worktrees;
+            state.worktrees = worktrees.clone();
+            changed
+        };
+
+        // Broadcast worktrees update if changed
+        if worktrees_changed {
+            let update = StateUpdate {
+                msg_type: "state_update".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                changes: self.state.read().await.changes.clone(),
+                logs: None,
+                worktrees: Some(worktrees),
+                app_mode: None,
+            };
+            let _ = self.tx.send(update);
+        }
 
         Ok(())
     }
