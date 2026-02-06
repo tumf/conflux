@@ -15,8 +15,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::debug;
 
+#[cfg(feature = "web-monitoring")]
+use utoipa::ToSchema;
+
 /// Log level for TUI logs
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "web-monitoring", derive(ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Info,
@@ -27,6 +31,7 @@ pub enum LogLevel {
 
 /// Log entry for the TUI
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "web-monitoring", derive(ToSchema))]
 pub struct LogEntry {
     /// Timestamp (formatted for display)
     pub timestamp: String,
@@ -37,6 +42,7 @@ pub struct LogEntry {
     pub message: String,
     /// Log level color (serialized as RGB string for web)
     #[serde(skip)]
+    #[cfg_attr(feature = "web-monitoring", schema(ignore = true))]
     pub color: Color,
     /// Log level
     pub level: LogLevel,

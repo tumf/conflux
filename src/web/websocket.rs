@@ -12,7 +12,38 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 
-/// WebSocket connection handler
+/// WebSocket connection handler for real-time state updates
+///
+/// This endpoint upgrades the HTTP connection to a WebSocket connection
+/// and streams state updates to the client in real-time.
+///
+/// # Protocol
+/// - Upon connection, the server sends an initial state message
+/// - Subsequently, the server broadcasts state updates as they occur
+/// - The client can send ping frames to keep the connection alive
+/// - The server responds with pong frames automatically
+///
+/// # Message Format
+/// All messages are JSON-encoded with the following structure:
+/// ```json
+/// {
+///   "type": "initial_state" | "state_update",
+///   "timestamp": "ISO 8601 timestamp",
+///   "state": { ... }  // OrchestratorStateSnapshot
+/// }
+/// ```
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        get,
+        path = "/ws",
+        tag = "websocket",
+        responses(
+            (status = 101, description = "Switching Protocols - WebSocket connection established"),
+            (status = 400, description = "Bad Request - Not a valid WebSocket upgrade request")
+        )
+    )
+)]
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<WebState>>,

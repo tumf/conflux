@@ -3,13 +3,22 @@ name = "conflux"
 version = "0.4.22"
 edition = "2021"
 
+[lib]
+name = "conflux"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cflx"
 path = "src/main.rs"
 
+[[bin]]
+name = "openapi-gen"
+path = "src/bin/openapi_gen.rs"
+required-features = ["web-monitoring"]
+
 [features]
 default = ["web-monitoring"]
-web-monitoring = ["axum", "tower", "tower-http", "qrcode", "local-ip-address"]
+web-monitoring = ["axum", "tower", "tower-http", "qrcode", "local-ip-address", "utoipa", "utoipa-swagger-ui"]
 
 [dependencies]
 tokio = { version = "1", features = ["full", "process"] }
@@ -17,6 +26,7 @@ tokio-util = "0.7"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -42,6 +52,8 @@ tower = { version = "0.5", optional = true }
 tower-http = { version = "0.6", features = ["cors", "trace"], optional = true }
 qrcode = { version = "0.14", optional = true }
 local-ip-address = { version = "0.6", optional = true }
+utoipa = { version = "5", features = ["axum_extras", "chrono"], optional = true }
+utoipa-swagger-ui = { version = "8", features = ["axum"], optional = true }
 
 # Process management dependencies (platform-specific)
 [target.'cfg(unix)'.dependencies]

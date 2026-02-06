@@ -1,4 +1,4 @@
-.PHONY: install build bump-minor bump-patch bump-major index index-full setup fmt lint test check
+.PHONY: install build bump-minor bump-patch bump-major index index-full setup fmt lint test check openapi check-openapi
 
 # Build the project
 build:
@@ -75,3 +75,25 @@ bump-major:
 	@echo "Bumping major version..."
 	cargo release major --execute --no-confirm --no-publish
 	@echo "Major version bumped and tagged successfully"
+
+# Generate OpenAPI specification
+openapi:
+	@echo "Generating OpenAPI specification..."
+	@mkdir -p docs
+	cargo run --bin openapi-gen --features web-monitoring > docs/openapi.yaml
+	@echo "OpenAPI specification generated at docs/openapi.yaml"
+
+# Check if OpenAPI specification is up to date
+check-openapi:
+	@echo "Checking OpenAPI specification..."
+	@mkdir -p docs
+	@cargo run --bin openapi-gen --features web-monitoring > /tmp/openapi-check.yaml
+	@if ! diff -q docs/openapi.yaml /tmp/openapi-check.yaml > /dev/null 2>&1; then \
+		echo "ERROR: OpenAPI specification is out of date. Run 'make openapi' to update."; \
+		diff docs/openapi.yaml /tmp/openapi-check.yaml || true; \
+		rm /tmp/openapi-check.yaml; \
+		exit 1; \
+	else \
+		echo "OpenAPI specification is up to date."; \
+		rm /tmp/openapi-check.yaml; \
+	fi

@@ -10,14 +10,29 @@ use axum::{
 use serde::Serialize;
 use std::sync::Arc;
 
+#[cfg(feature = "web-monitoring")]
+use utoipa::ToSchema;
+
 /// Health check response
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web-monitoring", derive(ToSchema))]
 pub struct HealthResponse {
     pub status: &'static str,
     pub version: String,
 }
 
 /// Health check endpoint
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        get,
+        path = "/api/health",
+        tag = "health",
+        responses(
+            (status = 200, description = "Health check successful", body = HealthResponse)
+        )
+    )
+)]
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
@@ -26,6 +41,17 @@ pub async fn health() -> Json<HealthResponse> {
 }
 
 /// Get full orchestrator state
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        get,
+        path = "/api/state",
+        tag = "state",
+        responses(
+            (status = 200, description = "Current orchestrator state", body = crate::web::state::OrchestratorStateSnapshot)
+        )
+    )
+)]
 pub async fn get_state(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     // Refresh state from disk to ensure latest data
     let _ = state.refresh_from_disk().await;
@@ -35,6 +61,17 @@ pub async fn get_state(State(state): State<Arc<WebState>>) -> impl IntoResponse 
 }
 
 /// List all changes
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        get,
+        path = "/api/changes",
+        tag = "changes",
+        responses(
+            (status = 200, description = "List of all changes", body = Vec<ChangeStatus>)
+        )
+    )
+)]
 pub async fn list_changes(State(state): State<Arc<WebState>>) -> Json<Vec<ChangeStatus>> {
     // Refresh state from disk to ensure latest data
     let _ = state.refresh_from_disk().await;
@@ -44,6 +81,7 @@ pub async fn list_changes(State(state): State<Arc<WebState>>) -> Json<Vec<Change
 
 /// Error response for API errors
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web-monitoring", derive(ToSchema))]
 pub struct ErrorResponse {
     pub error: String,
 }
@@ -79,6 +117,21 @@ pub fn not_found_response(change_id: &str) -> (StatusCode, Json<ErrorResponse>) 
 }
 
 /// Get a specific change by ID
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        get,
+        path = "/api/changes/{id}",
+        tag = "changes",
+        params(
+            ("id" = String, Path, description = "Change ID")
+        ),
+        responses(
+            (status = 200, description = "Change found", body = ChangeStatus),
+            (status = 404, description = "Change not found", body = ErrorResponse)
+        )
+    )
+)]
 pub async fn get_change(
     State(state): State<Arc<WebState>>,
     Path(id): Path<String>,
@@ -101,6 +154,22 @@ pub async fn get_change(
 /// - 200 OK with updated change status on success
 /// - 404 Not Found if change doesn't exist
 /// - 500 Internal Server Error if approval operation fails
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        post,
+        path = "/api/changes/{id}/approve",
+        tag = "changes",
+        params(
+            ("id" = String, Path, description = "Change ID")
+        ),
+        responses(
+            (status = 200, description = "Change approved", body = ChangeStatus),
+            (status = 404, description = "Change not found", body = ErrorResponse),
+            (status = 500, description = "Approval failed", body = ErrorResponse)
+        )
+    )
+)]
 pub async fn approve_change(
     State(state): State<Arc<WebState>>,
     Path(id): Path<String>,
@@ -131,6 +200,22 @@ pub async fn approve_change(
 /// - 200 OK with updated change status on success
 /// - 404 Not Found if change doesn't exist
 /// - 500 Internal Server Error if unapproval operation fails
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        post,
+        path = "/api/changes/{id}/unapprove",
+        tag = "changes",
+        params(
+            ("id" = String, Path, description = "Change ID")
+        ),
+        responses(
+            (status = 200, description = "Change unapproved", body = ChangeStatus),
+            (status = 404, description = "Change not found", body = ErrorResponse),
+            (status = 500, description = "Unapproval failed", body = ErrorResponse)
+        )
+    )
+)]
 pub async fn unapprove_change(
     State(state): State<Arc<WebState>>,
     Path(id): Path<String>,
@@ -154,6 +239,7 @@ pub async fn unapprove_change(
 
 /// Success response for control operations
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web-monitoring", derive(ToSchema))]
 pub struct ControlResponse {
     pub success: bool,
     pub message: String,
@@ -168,6 +254,19 @@ pub struct ControlResponse {
 /// - 200 OK if start/resume is successful
 /// - 409 Conflict if already running or stopping
 /// - 500 Internal Server Error if control channel not available
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        post,
+        path = "/api/control/start",
+        tag = "control",
+        responses(
+            (status = 200, description = "Processing started", body = ControlResponse),
+            (status = 409, description = "Already running or stopping", body = ErrorResponse),
+            (status = 500, description = "Control channel error", body = ErrorResponse)
+        )
+    )
+)]
 pub async fn control_start(
     State(state): State<Arc<WebState>>,
 ) -> Result<Json<ControlResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -211,6 +310,19 @@ pub async fn control_start(
 /// - 200 OK if stop is initiated
 /// - 409 Conflict if not running
 /// - 500 Internal Server Error if control channel not available
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        post,
+        path = "/api/control/stop",
+        tag = "control",
+        responses(
+            (status = 200, description = "Stop initiated", body = ControlResponse),
+            (status = 409, description = "Not running", body = ErrorResponse),
+            (status = 500, description = "Control channel error", body = ErrorResponse)
+        )
+    )
+)]
 pub async fn control_stop(
     State(state): State<Arc<WebState>>,
 ) -> Result<Json<ControlResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -254,6 +366,19 @@ pub async fn control_stop(
 /// - 200 OK if stop is canceled
 /// - 409 Conflict if not in stopping mode
 /// - 500 Internal Server Error if control channel not available
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        post,
+        path = "/api/control/cancel-stop",
+        tag = "control",
+        responses(
+            (status = 200, description = "Stop canceled", body = ControlResponse),
+            (status = 409, description = "Not in stopping mode", body = ErrorResponse),
+            (status = 500, description = "Control channel error", body = ErrorResponse)
+        )
+    )
+)]
 pub async fn control_cancel_stop(
     State(state): State<Arc<WebState>>,
 ) -> Result<Json<ControlResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -300,6 +425,19 @@ pub async fn control_cancel_stop(
 /// - 200 OK if force stop is initiated
 /// - 409 Conflict if not running or stopping
 /// - 500 Internal Server Error if control channel not available
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        post,
+        path = "/api/control/force-stop",
+        tag = "control",
+        responses(
+            (status = 200, description = "Force stop initiated", body = ControlResponse),
+            (status = 409, description = "Not running or stopping", body = ErrorResponse),
+            (status = 500, description = "Control channel error", body = ErrorResponse)
+        )
+    )
+)]
 pub async fn control_force_stop(
     State(state): State<Arc<WebState>>,
 ) -> Result<Json<ControlResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -346,6 +484,19 @@ pub async fn control_force_stop(
 /// - 200 OK if retry is initiated
 /// - 409 Conflict if not in error mode
 /// - 500 Internal Server Error if control channel not available
+#[cfg_attr(
+    feature = "web-monitoring",
+    utoipa::path(
+        post,
+        path = "/api/control/retry",
+        tag = "control",
+        responses(
+            (status = 200, description = "Retry initiated", body = ControlResponse),
+            (status = 409, description = "Not in error mode", body = ErrorResponse),
+            (status = 500, description = "Control channel error", body = ErrorResponse)
+        )
+    )
+)]
 pub async fn control_retry(
     State(state): State<Arc<WebState>>,
 ) -> Result<Json<ControlResponse>, (StatusCode, Json<ErrorResponse>)> {
