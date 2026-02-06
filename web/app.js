@@ -741,7 +741,187 @@ function debounce(func, wait) {
     };
 }
 
+// Tab switching
+function initTabs() {
+    const tabButtons = document.querySelectorAll('.tab-btn');
+    const changesContainer = document.getElementById('changes-container');
+    const worktreesContainer = document.getElementById('worktrees-container');
+
+    tabButtons.forEach(btn => {
+        btn.addEventListener('click', () => {
+            const tab = btn.dataset.tab;
+
+            // Update active tab
+            tabButtons.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+
+            // Show corresponding content
+            if (tab === 'changes') {
+                changesContainer.style.display = 'block';
+                worktreesContainer.style.display = 'none';
+            } else if (tab === 'worktrees') {
+                changesContainer.style.display = 'none';
+                worktreesContainer.style.display = 'block';
+                // Refresh worktrees when tab is shown
+                fetchWorktrees();
+            }
+        });
+    });
+}
+
+// Fetch and render worktrees
+async function fetchWorktrees() {
+    try {
+        const response = await fetch('/api/worktrees');
+        if (!response.ok) throw new Error('Failed to fetch worktrees');
+
+        const worktrees = await response.json();
+        renderWorktrees(worktrees);
+    } catch (error) {
+        console.error('Error fetching worktrees:', error);
+        showToast('Failed to fetch worktrees', 'error');
+    }
+}
+
+// Render worktrees list
+function renderWorktrees(worktrees) {
+    const container = document.getElementById('worktrees-list');
+    const emptyState = document.getElementById('worktrees-empty-state');
+
+    if (!worktrees || worktrees.length === 0) {
+        container.innerHTML = '';
+        emptyState.style.display = 'block';
+        return;
+    }
+
+    emptyState.style.display = 'none';
+    container.innerHTML = worktrees.map(wt => {
+        const badges = [];
+        if (wt.is_main) badges.push('<span class="worktree-badge main">Main</span>');
+        if (wt.has_commits_ahead) badges.push('<span class="worktree-badge ahead">Ahead</span>');
+        if (wt.merge_conflict) badges.push('<span class="worktree-badge conflict">Conflict</span>');
+
+        const canDelete = !wt.is_main && !wt.has_commits_ahead;
+        const canMerge = !wt.is_main && wt.has_commits_ahead && !wt.merge_conflict;
+
+        return `
+            <div class="worktree-card">
+                <div class="worktree-header">
+                    <div class="worktree-branch">${escapeHtml(wt.branch)}</div>
+                    <div>${badges.join(' ')}</div>
+                </div>
+                <div class="worktree-info">
+                    <div>HEAD: ${escapeHtml(wt.head)}</div>
+                    <div>Path: ${escapeHtml(wt.path)}</div>
+                </div>
+                <div class="worktree-actions">
+                    <button class="worktree-btn merge"
+                            data-branch="${escapeHtml(wt.branch)}"
+                            ${canMerge ? '' : 'disabled'}>
+                        Merge
+                    </button>
+                    <button class="worktree-btn delete"
+                            data-branch="${escapeHtml(wt.branch)}"
+                            ${canDelete ? '' : 'disabled'}>
+                        Delete
+                    </button>
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    // Add event listeners
+    container.querySelectorAll('.worktree-btn.merge').forEach(btn => {
+        btn.addEventListener('click', () => mergeWorktree(btn.dataset.branch));
+    });
+
+    container.querySelectorAll('.worktree-btn.delete').forEach(btn => {
+        btn.addEventListener('click', () => confirmDeleteWorktree(btn.dataset.branch));
+    });
+}
+
+// Merge worktree
+async function mergeWorktree(branch) {
+    try {
+        const response = await fetch('/api/worktrees/merge', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ branch_name: branch })
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Merge failed');
+        }
+
+        showToast(`Merged ${branch} successfully`, 'success');
+        fetchWorktrees();
+    } catch (error) {
+        console.error('Merge error:', error);
+        showToast(error.message, 'error');
+    }
+}
+
+// Confirm and delete worktree
+function confirmDeleteWorktree(branch) {
+    const overlay = document.createElement('div');
+    overlay.className = 'dialog-overlay';
+    overlay.innerHTML = `
+        <div class="dialog">
+            <div class="dialog-title">Delete Worktree</div>
+            <div class="dialog-message">
+                Are you sure you want to delete the worktree for branch "${escapeHtml(branch)}"?
+            </div>
+            <div class="dialog-actions">
+                <button class="dialog-btn cancel">Cancel</button>
+                <button class="dialog-btn confirm">Delete</button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(overlay);
+
+    overlay.querySelector('.cancel').addEventListener('click', () => {
+        document.body.removeChild(overlay);
+    });
+
+    overlay.querySelector('.confirm').addEventListener('click', async () => {
+        document.body.removeChild(overlay);
+        await deleteWorktree(branch);
+    });
+}
+
+// Delete worktree
+async function deleteWorktree(branch) {
+    try {
+        const response = await fetch('/api/worktrees/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ branch_name: branch })
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Delete failed');
+        }
+
+        showToast(`Deleted ${branch} successfully`, 'success');
+        fetchWorktrees();
+    } catch (error) {
+        console.error('Delete error:', error);
+        showToast(error.message, 'error');
+    }
+}
+
+// HTML escape utility
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', () => {
     window.monitor = new WebMonitor();
+    initTabs();
 });

@@ -126,7 +126,8 @@ pub async fn get_worktrees(
 ///
 /// A worktree can be deleted if:
 /// - It is not the main worktree
-/// - It has no uncommitted changes OR has no commits ahead of base
+/// - It has no uncommitted changes
+/// - It has no unmerged commits (not ahead of base branch)
 ///
 /// Returns (can_delete, reason_if_not)
 pub async fn can_delete_worktree(
@@ -146,6 +147,14 @@ pub async fn can_delete_worktree(
             // Allow deletion on error (fail-open for cleanup)
         }
         _ => {}
+    }
+
+    // Check if worktree has unmerged commits ahead of base
+    if worktree.has_commits_ahead {
+        return (
+            false,
+            Some("Worktree has unmerged commits ahead of base branch".to_string()),
+        );
     }
 
     (true, None)

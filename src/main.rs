@@ -31,6 +31,7 @@ mod tui;
 mod vcs;
 #[cfg(feature = "web-monitoring")]
 mod web;
+mod worktree_ops;
 
 use clap::Parser;
 use cli::{ApproveAction, Cli, Commands, TuiArgs};
