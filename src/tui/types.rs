@@ -6,6 +6,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[cfg(feature = "web-monitoring")]
+use utoipa::ToSchema;
+
 /// View mode for TUI navigation
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum ViewMode {
@@ -78,8 +81,10 @@ pub enum QueueStatus {
 
 /// Information about a git worktree
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "web-monitoring", derive(ToSchema))]
 pub struct WorktreeInfo {
     /// Path to the worktree
+    #[cfg_attr(feature = "web-monitoring", schema(value_type = String))]
     pub path: PathBuf,
     /// Current HEAD commit (short hash or symbolic ref)
     pub head: String,
@@ -99,6 +104,7 @@ pub struct WorktreeInfo {
 
 /// Merge conflict information for a worktree
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "web-monitoring", derive(ToSchema))]
 pub struct MergeConflictInfo {
     /// List of files with merge conflicts
     pub conflict_files: Vec<String>,

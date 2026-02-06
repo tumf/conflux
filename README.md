@@ -759,7 +759,7 @@ The actual bound address is logged when the server starts.
 | `/api/changes/{id}/approve` | POST | Approve a change |
 | `/api/changes/{id}/unapprove` | POST | Unapprove a change |
 
-For complete API specifications, see the [OpenAPI documentation](docs/web-api.openapi.yaml).
+For complete API specifications, see the [OpenAPI documentation](docs/openapi.yaml).
 
 **WebSocket:**
 

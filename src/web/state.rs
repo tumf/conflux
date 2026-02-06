@@ -8,6 +8,9 @@ use crate::tui::types::WorktreeInfo;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 
+#[cfg(feature = "web-monitoring")]
+use utoipa::ToSchema;
+
 /// Control commands that can be sent from Web UI to orchestrator
 #[derive(Debug, Clone)]
 pub enum ControlCommand {
@@ -25,6 +28,7 @@ pub enum ControlCommand {
 
 /// State update message sent to WebSocket clients
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "web-monitoring", derive(ToSchema))]
 pub struct StateUpdate {
     /// Type of update message
     #[serde(rename = "type")]
@@ -46,6 +50,7 @@ pub struct StateUpdate {
 
 /// Change status for WebSocket updates
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "web-monitoring", derive(ToSchema))]
 pub struct ChangeStatus {
     /// Change ID
     pub id: String,
@@ -97,6 +102,7 @@ impl From<&Change> for ChangeStatus {
 
 /// Full orchestrator state snapshot for REST API
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "web-monitoring", derive(ToSchema))]
 pub struct OrchestratorStateSnapshot {
     /// List of all changes
     pub changes: Vec<ChangeStatus>,
