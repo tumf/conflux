@@ -1,15 +1,16 @@
-# Change: Web Worktree機能のTUIパリティ追加
+# Change: Web WorktreesのTUIパリティ統合
 
 ## Why
-Web監視機能にはTUIのWorktrees Viewと同等の取得・操作機能がなく、ブラウザ経由の運用でワークツリーの状態確認と保守作業が完結しません。
+Web監視ではWorktreeの一覧確認と運用操作をTUIに依存しており、Web UI/APIだけで完結した保守運用ができません。重複した2つの提案を統合し、仕様と実装方針を単一の変更として明確化します。
 
 ## What Changes
-- `GET /api/worktrees` を追加し、TUIと同じ粒度のワークツリー一覧情報を返す
-- Worktree操作エンドポイント（create/delete/merge）を追加し、TUIと同等の制約で実行する
-- WebSocket `state_update` に `worktrees` の同期スナップショットを含め、状態差分をなくす
-- WebダッシュボードにWorktreesパネルを追加し、一覧表示と操作を提供する
-- fail-fast + structured logging方針を導入し、失敗を隠蔽せず診断可能なログを必須化する
+- `GET /api/worktrees` を追加し、TUIと同等語彙の一覧スナップショットを返す
+- 操作APIとして `refresh`, `create`, `delete`, `merge`, `command` エンドポイントを追加する
+- fail-fast方針を適用し、`409`/`404`/`500` の拒否条件を明示する
+- 構造化ログに `request_id`, `operation`, `worktree_name`, `error`, `duration_ms` を必須化する
+- `state_update.worktrees` と `/api/state` の整合を必須にし、REST/WSの状態差分をなくす
+- WebダッシュボードにWorktrees Viewを追加し、操作ガードと削除確認を実装する
 
 ## Impact
-- Affected specs: `web-monitoring`, `tui-worktree-view`, `vcs-worktree-operations`
-- Affected code: `src/web/server.rs`, `src/web/websocket.rs`, `src/web/state.rs`, `src/vcs/git/`, `web/`
+- Affected specs: `web-monitoring`
+- Affected code: `src/web/server.rs`, `src/web/state.rs`, `src/web/websocket.rs`, `src/tui/runner.rs`, `src/vcs/`, `web/`, `openapi`, `README`
