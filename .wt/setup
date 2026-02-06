@@ -50,6 +50,7 @@ else
 fi
 EOF
     chmod +x "${hooks_dir}/pre-commit"
+
   else
     echo "pre-commit not found; skipping hook install"
   fi

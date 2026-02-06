@@ -1,3 +1,5 @@
+default_install_hook_types: [pre-commit]
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -21,3 +23,10 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
+      - id: openapi-generate
+        name: openapi-generate
+        entry: bash -c 'make openapi && git add docs/openapi.yaml'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]

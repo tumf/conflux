@@ -161,6 +161,14 @@ cargo clippy
 cargo fmt --check && cargo clippy -- -D warnings && cargo test
 ```
 
+Install the pre-commit Git hook:
+
+```bash
+pre-commit install --hook-type pre-commit
+```
+
+The pre-commit hook auto-runs `make openapi` and stages `docs/openapi.yaml`.
+
 ## Adding New Features
 
 ### Adding a new hook
