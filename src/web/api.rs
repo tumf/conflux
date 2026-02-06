@@ -567,6 +567,7 @@ pub async fn list_worktrees(
         error!(
             request_id = %request_id,
             operation = "list_worktrees",
+            worktree_name = "<all>",
             error = %e,
             duration_ms = duration_ms,
             "Failed to get current directory"
@@ -584,6 +585,7 @@ pub async fn list_worktrees(
         error!(
             request_id = %request_id,
             operation = "list_worktrees",
+            worktree_name = "<all>",
             error = %e,
             duration_ms = duration_ms,
             "Failed to list worktrees"

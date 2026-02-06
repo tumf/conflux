@@ -21,3 +21,6 @@
 - [x] `src/web/api.rs::create_worktree` の `std::fs::create_dir_all` 失敗時に、`request_id`, `operation`, `worktree_name`, `error`, `duration_ms` を含む構造化ログが出力されない。
 - [x] `src/web/api.rs::delete_worktree` の `worktree_ops::get_worktrees` 失敗時に、`request_id`, `operation`, `worktree_name`, `error`, `duration_ms` を含む構造化ログが出力されない。
 - [x] `src/web/api.rs::execute_worktree_command` のコマンド起動失敗時（`tokio::process::Command::output` の `map_err`）に、`request_id`, `operation`, `worktree_name`, `error`, `duration_ms` を含む構造化ログが出力されない。
+
+## Acceptance #3 Failure Follow-up
+- [x] `src/web/api.rs::list_worktrees` のエラーログ（`std::env::current_dir`/`worktree_ops::get_worktrees` 失敗時）に `worktree_name` が含まれておらず、要件のログ項目（`request_id`, `operation`, `worktree_name`, `error`, `duration_ms`）を満たしていない（`src/web/api.rs`）。
