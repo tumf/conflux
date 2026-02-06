@@ -1,0 +1,12 @@
+## 1. Implementation
+- [ ] 1.1 worktree一覧取得と衝突/先行チェックの共有ロジックを切り出し、TUIとWebで同一関数を使用する
+  - Verify: `src/tui/` と `src/web/` の両方が同じヘルパー関数を参照していることを確認する
+- [ ] 1.2 `/api/worktrees`系REST API（list/refresh/create/delete/merge/command）を実装し、入力不正・状態不整合をHTTP 400/409で返す
+  - Verify: `cargo run -- tui --web` を起動し、`curl http://127.0.0.1:<port>/api/worktrees` が200を返す
+  - Verify: 削除禁止条件で `POST /api/worktrees/delete` が409を返す
+- [ ] 1.3 `/api/state`の応答前にworktreeを再取得して`worktrees`へ反映し、`WorktreesRefreshed`/`BranchMerge*`をWebStateへ転送する
+  - Verify: `src/web/state.rs`にworktree再取得の処理があり、`src/tui/runner.rs`にイベント転送があることを確認する
+- [ ] 1.4 Web UIにWorktreesタブを追加し、一覧表示とCreate/Merge/Delete/Run操作を実装する
+  - Verify: `web/index.html` にタブが追加され、`web/app.js` でworktree一覧の描画とAPI呼び出しが行われる
+- [ ] 1.5 APIハンドラのテストを追加し、temp git repoでcreate/delete/merge/commandの主要経路を検証する
+  - Verify: `cargo test web_worktrees`（新規テスト名）でテストが通る
