@@ -894,6 +894,35 @@ This will build and install the orchestrator to your Cargo bin directory (typica
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for build instructions, testing, and project structure.
 
+### Git Hooks
+
+This project uses [prek](https://prek.j178.dev/) for managing Git hooks (a Rust-based alternative to pre-commit).
+
+**Setup:**
+
+```bash
+# Install prek
+brew install prek
+
+# Install hooks
+prek install
+```
+
+**Usage:**
+
+```bash
+# Run all hooks on all files
+prek run --all-files
+
+# Run specific hooks
+prek run rustfmt clippy
+
+# List available hooks
+prek list
+```
+
+The configuration is defined in `.pre-commit-config.yaml` (prek is fully compatible with pre-commit configuration format).
+
 ## Future Enhancements
 
 - [ ] State persistence for recovery and resumption

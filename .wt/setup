@@ -33,26 +33,11 @@ if [ -n "$hooks_dir" ]; then
        ;;
   esac
 
-  if command -v pre-commit >/dev/null 2>&1; then
-    echo "Generating worktree pre-commit hook..."
-    mkdir -p "$hooks_dir"
-    cat >"${hooks_dir}/pre-commit" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-HERE="$(cd "$(dirname "$0")" && pwd)"
-
-if command -v pre-commit >/dev/null 2>&1; then
-  exec pre-commit hook-impl --config=.pre-commit-config.yaml --hook-type=pre-commit --hook-dir "$HERE" -- "$@"
-else
-  echo 'pre-commit not found; skipping hook' 1>&2
-  exit 1
-fi
-EOF
-    chmod +x "${hooks_dir}/pre-commit"
-
+  if command -v prek >/dev/null 2>&1; then
+    echo "Installing prek hooks in worktree..."
+    prek install
   else
-    echo "pre-commit not found; skipping hook install"
+    echo "prek not found; skipping hook install"
   fi
 fi
 
