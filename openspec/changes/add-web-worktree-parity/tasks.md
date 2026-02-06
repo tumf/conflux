@@ -15,3 +15,9 @@
 - [x] Worktree操作の構造化ログが全経路で `request_id`, `operation`, `worktree_name`, `error`, `duration_ms` を満たすように整理する（`src/web/api.rs::list_worktrees` など）。
 - [x] Worktree操作失敗時のログ欠落を解消する（`src/web/api.rs::create_worktree` の設定/基準コミット取得失敗、`merge_worktree` の404/409/checkout失敗、`execute_worktree_command` の404など）。
 - [x] `state_update.worktrees` が `/api/state` と同期されるよう、`src/web/state.rs::refresh_from_disk` の更新・ブロードキャスト順序を修正する。
+
+## Acceptance #2 Failure Follow-up
+- [x] `src/web/api.rs::list_worktrees` の構造化ログに `worktree_name` が含まれておらず、要件のログ項目（`request_id`, `operation`, `worktree_name`, `error`, `duration_ms`）を満たしていない。
+- [x] `src/web/api.rs::create_worktree` の `std::fs::create_dir_all` 失敗時に、`request_id`, `operation`, `worktree_name`, `error`, `duration_ms` を含む構造化ログが出力されない。
+- [x] `src/web/api.rs::delete_worktree` の `worktree_ops::get_worktrees` 失敗時に、`request_id`, `operation`, `worktree_name`, `error`, `duration_ms` を含む構造化ログが出力されない。
+- [x] `src/web/api.rs::execute_worktree_command` のコマンド起動失敗時（`tokio::process::Command::output` の `map_err`）に、`request_id`, `operation`, `worktree_name`, `error`, `duration_ms` を含む構造化ログが出力されない。

@@ -600,6 +600,7 @@ pub async fn list_worktrees(
     tracing::debug!(
         request_id = %request_id,
         operation = "list_worktrees",
+        worktree_name = "<all>",
         worktree_count = worktrees.len(),
         duration_ms = duration_ms,
         "Listed worktrees successfully"
@@ -754,6 +755,15 @@ pub async fn create_worktree(
 
     // Ensure base directory exists
     std::fs::create_dir_all(&workspace_base_dir).map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "create_worktree",
+            worktree_name = %worktree_name,
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to create workspace directory"
+        );
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -897,6 +907,15 @@ pub async fn delete_worktree(
 
     // Get worktree list to find the target
     let worktrees = worktree_ops::get_worktrees(&repo_root).await.map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "delete_worktree",
+            worktree_name = %worktree_name,
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to list worktrees"
+        );
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -1289,6 +1308,15 @@ pub async fn execute_worktree_command(
         .output()
         .await
         .map_err(|e| {
+            let duration_ms = start.elapsed().as_millis();
+            error!(
+                request_id = %request_id,
+                operation = "command",
+                worktree_name = %worktree_name,
+                error = %e,
+                duration_ms = duration_ms,
+                "Failed to execute command"
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
