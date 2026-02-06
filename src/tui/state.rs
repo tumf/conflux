@@ -1719,20 +1719,34 @@ impl AppState {
 
     fn handle_merge_deferred(&mut self, change_id: String, reason: String) {
         if self.is_resolving {
-            // Resolve is running: transition to ResolveWait and add to resolve queue
-            if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-                change.queue_status = QueueStatus::ResolveWait;
-            }
-            if self.add_to_resolve_queue(&change_id) {
+            // Check if this is the currently resolving change
+            let is_current_resolving = self
+                .changes
+                .iter()
+                .any(|c| c.id == change_id && c.queue_status == QueueStatus::Resolving);
+
+            if is_current_resolving {
+                // Don't queue the currently resolving change - keep it Resolving
                 self.add_log(LogEntry::warn(format!(
-                    "Merge deferred for '{}' (queued for resolve): {}",
+                    "Merge deferred for '{}' (currently resolving, not queued): {}",
                     change_id, reason
                 )));
             } else {
-                self.add_log(LogEntry::warn(format!(
-                    "Merge deferred for '{}' (already queued): {}",
-                    change_id, reason
-                )));
+                // Different change: transition to ResolveWait and add to resolve queue
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+                    change.queue_status = QueueStatus::ResolveWait;
+                }
+                if self.add_to_resolve_queue(&change_id) {
+                    self.add_log(LogEntry::warn(format!(
+                        "Merge deferred for '{}' (queued for resolve): {}",
+                        change_id, reason
+                    )));
+                } else {
+                    self.add_log(LogEntry::warn(format!(
+                        "Merge deferred for '{}' (already queued): {}",
+                        change_id, reason
+                    )));
+                }
             }
         } else {
             // Resolve is not running: maintain MergeWait
@@ -3149,6 +3163,68 @@ mod tests {
         assert!(
             app.resolve_queue_set.contains("change-b"),
             "Change should be added to resolve queue"
+        );
+    }
+
+    #[test]
+    fn test_merge_deferred_does_not_queue_current_resolving_change() {
+        let changes = vec![create_approved_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Set up: change-a is currently resolving
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.is_resolving = true;
+
+        // Simulate MergeDeferred event for change-a (the currently resolving change)
+        app.handle_merge_deferred(
+            "change-a".to_string(),
+            "Base branch has uncommitted changes".to_string(),
+        );
+
+        // change-a should remain Resolving (not transition to ResolveWait)
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::Resolving,
+            "Currently resolving change should remain Resolving"
+        );
+        // change-a should NOT be added to resolve queue
+        assert!(
+            !app.resolve_queue_set.contains("change-a"),
+            "Currently resolving change should not be queued"
+        );
+    }
+
+    #[test]
+    fn test_merge_deferred_queues_other_change_while_resolving() {
+        let changes = vec![
+            create_approved_change("change-a", 0, 1),
+            create_approved_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Set up: change-a is currently resolving
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.is_resolving = true;
+
+        // change-b is archived (typical state before merge deferred)
+        app.changes[1].queue_status = QueueStatus::Archived;
+
+        // Simulate MergeDeferred event for change-b (different from resolving change)
+        app.handle_merge_deferred(
+            "change-b".to_string(),
+            "Base branch has uncommitted changes".to_string(),
+        );
+
+        // change-b should transition to ResolveWait
+        assert_eq!(
+            app.changes[1].queue_status,
+            QueueStatus::ResolveWait,
+            "Other change should transition to ResolveWait"
+        );
+        // change-b should be added to resolve queue
+        assert!(
+            app.resolve_queue_set.contains("change-b"),
+            "Other change should be added to resolve queue"
         );
     }
 
