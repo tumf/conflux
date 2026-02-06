@@ -28,6 +28,7 @@ use utoipa::OpenApi;
         conflux::web::api::control_cancel_stop,
         conflux::web::api::control_force_stop,
         conflux::web::api::control_retry,
+        conflux::web::websocket::ws_handler,
     ),
     components(
         schemas(
@@ -47,7 +48,8 @@ use utoipa::OpenApi;
         (name = "health", description = "Health check endpoints"),
         (name = "state", description = "State management endpoints"),
         (name = "changes", description = "Change management endpoints"),
-        (name = "control", description = "Orchestrator control endpoints")
+        (name = "control", description = "Orchestrator control endpoints"),
+        (name = "websocket", description = "WebSocket endpoints for real-time updates")
     )
 )]
 struct ApiDoc;

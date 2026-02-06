@@ -321,6 +321,36 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/OrchestratorStateSnapshot'
+  /ws:
+    get:
+      tags:
+      - websocket
+      summary: WebSocket connection handler for real-time state updates
+      description: |-
+        This endpoint upgrades the HTTP connection to a WebSocket connection
+        and streams state updates to the client in real-time.
+
+        # Protocol
+        - Upon connection, the server sends an initial state message
+        - Subsequently, the server broadcasts state updates as they occur
+        - The client can send ping frames to keep the connection alive
+        - The server responds with pong frames automatically
+
+        # Message Format
+        All messages are JSON-encoded with the following structure:
+        ```json
+        {
+          "type": "initial_state" | "state_update",
+          "timestamp": "ISO 8601 timestamp",
+          "state": { ... }  // OrchestratorStateSnapshot
+        }
+        ```
+      operationId: ws_handler
+      responses:
+        '101':
+          description: Switching Protocols - WebSocket connection established
+        '400':
+          description: Bad Request - Not a valid WebSocket upgrade request
 components:
   schemas:
     ChangeStatus:
@@ -611,4 +641,6 @@ tags:
   description: Change management endpoints
 - name: control
   description: Orchestrator control endpoints
+- name: websocket
+  description: WebSocket endpoints for real-time updates
 

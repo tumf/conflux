@@ -5,3 +5,6 @@
 - [x] 1.4 `make openapi` と `make check-openapi` を追加する
 - [x] 1.5 CI で `make check-openapi` を実行して差分を検知する
 - [x] 1.6 README/README.ja の OpenAPI 参照パスを更新する
+
+## Acceptance #1 Failure Follow-up
+- [x] OpenAPI 仕様に WebSocket `/ws` を含める（`src/bin/openapi_gen.rs` と `docs/openapi.yaml` に反映されること）
