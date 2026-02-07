@@ -188,19 +188,18 @@ fn render_running_mode(frame: &mut Frame, app: &mut AppState, area: Rect) {
 
 /// Render header
 fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
+    let active_count = app
+        .changes
+        .iter()
+        .filter(|c| c.queue_status.is_active())
+        .count();
+
     // Per spec (update-tui-status-display):
     // - Ready: when in Select mode
     // - Running <count>: when changes are processing (count > 0)
     // - No status: in Stopped and Error modes
     let (mode_text, mode_color, show_status) = match app.mode {
-        AppMode::Select => ("Ready".to_string(), Color::Cyan, true),
-        AppMode::Running | AppMode::Stopping => {
-            // Count changes that are currently active (queued, processing, accepting, archiving, resolving)
-            let active_count = app
-                .changes
-                .iter()
-                .filter(|c| c.queue_status.is_active())
-                .count();
+        AppMode::Select | AppMode::Running | AppMode::Stopping => {
             if active_count > 0 {
                 (format!("Running {}", active_count), Color::Yellow, true)
             } else {
@@ -2137,6 +2136,32 @@ mod tests {
         assert!(
             content.contains("[Running 1]"),
             "Header should show 'Running 1' (Resolving is in-flight), but got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_select_mode_shows_running_when_resolving() {
+        let mut app = create_test_app(vec![
+            create_test_change("change-a", true),
+            create_test_change("change-b", true),
+        ]);
+
+        app.mode = AppMode::Select;
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[1].queue_status = QueueStatus::Queued;
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        assert!(
+            content.contains("[Running 1]"),
+            "Header should show 'Running 1' in Select mode when resolving, but got:\n{}",
+            content
+        );
+        assert!(
+            !content.contains("[Ready]"),
+            "Header should not show '[Ready]' while resolving, but got:\n{}",
             content
         );
     }
