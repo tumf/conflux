@@ -529,11 +529,11 @@ impl Orchestrator {
         Err(OrchestratorError::AgentCommand(error.to_string()))
     }
 
-    /// Handle acceptance-related results (Passed, Continue, ContinueExceeded, Failed, CommandFailed)
+    /// Handle acceptance-related results (Passed, Continue, ContinueExceeded, Failed, CommandFailed, Blocked)
     async fn handle_acceptance_result(
         &mut self,
         next: &Change,
-        serial_service: &SerialRunService,
+        serial_service: &mut SerialRunService,
         result: &crate::serial_run_service::ChangeProcessResult,
     ) {
         use crate::serial_run_service::ChangeProcessResult;
@@ -567,9 +567,13 @@ impl Orchestrator {
             }
             ChangeProcessResult::AcceptanceBlocked => {
                 warn!(
-                    "Acceptance blocked for {} - implementation blocker detected, stopping apply loop",
+                    "Acceptance blocked for {} - implementation blocker detected, marking as stalled",
                     next.id
                 );
+                // Mark change as stalled to prevent re-selection and archive
+                let reason = "Implementation blocker detected - requires manual intervention";
+                self.mark_change_stalled(&next.id, reason);
+                serial_service.mark_stalled(&next.id, reason);
             }
             ChangeProcessResult::AcceptanceFailed { .. } => {
                 info!("Acceptance failed for {}, will retry apply", next.id);

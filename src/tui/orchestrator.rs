@@ -582,6 +582,11 @@ pub async fn run_orchestrator(
                     )))
                     .await;
 
+                // Mark as stalled in SerialRunService and remove from pending to prevent re-selection and archive
+                let reason = "Implementation blocker detected - requires manual intervention";
+                serial_service.mark_stalled(&change_id, reason);
+                pending_changes.remove(&change_id);
+
                 // Update local state tracking
                 apply_counts.insert(change_id.clone(), apply_count);
             }
