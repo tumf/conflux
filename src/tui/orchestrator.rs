@@ -549,6 +549,42 @@ pub async fn run_orchestrator(
                 // Update local state tracking
                 apply_counts.insert(change_id.clone(), apply_count);
             }
+            Ok(ChangeProcessResult::AcceptanceBlocked) => {
+                // Send ApplyCompleted event
+                let apply_completed_event = OrchestratorEvent::ApplyCompleted {
+                    change_id: change_id.clone(),
+                    revision: String::new(),
+                };
+                let _ = tx.send(apply_completed_event.clone()).await;
+                shared_state
+                    .write()
+                    .await
+                    .apply_execution_event(&apply_completed_event);
+                #[cfg(feature = "web-monitoring")]
+                if let Some(ws) = &web_state {
+                    ws.apply_execution_event(&apply_completed_event).await;
+                }
+
+                // Send AcceptanceCompleted event
+                let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
+                    change_id: change_id.clone(),
+                };
+                let _ = tx.send(acceptance_completed_event.clone()).await;
+                #[cfg(feature = "web-monitoring")]
+                if let Some(ws) = &web_state {
+                    ws.apply_execution_event(&acceptance_completed_event).await;
+                }
+
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::warn(
+                        "Acceptance blocked - implementation blocker detected, stopping apply loop"
+                            .to_string(),
+                    )))
+                    .await;
+
+                // Update local state tracking
+                apply_counts.insert(change_id.clone(), apply_count);
+            }
             Ok(ChangeProcessResult::AcceptanceFailed { .. }) => {
                 // Send ApplyCompleted event
                 let apply_completed_event = OrchestratorEvent::ApplyCompleted {

@@ -23,7 +23,20 @@ External dependency policy (mock-first):
   * Implement mock/stub/fixture for the external dependency, OR
   * Move to Out of Scope as non-mockable (remove checkbox)
 
-Required checks:
+Implementation Blocker review:
+1. Check if tasks.md contains any "## Implementation Blocker #N" sections
+2. If Implementation Blocker(s) exist:
+   a. Review each blocker's Category, Root Cause, Evidence, Impact, and Resolution Required
+   b. Verify the blocker is legitimate (spec contradiction or truly non-mockable external constraint)
+   c. If blocker is valid:
+      - Output "ACCEPTANCE: BLOCKED"
+      - Do NOT output FINDINGS or update tasks.md
+      - The orchestrator will stop the apply loop and preserve the workspace
+   d. If blocker is NOT valid (issue is mockable or solvable autonomously):
+      - Treat as acceptance FAIL
+      - Add finding: "Implementation Blocker #N is not valid: [reason]. Agent must [specific action]."
+
+Required checks (only run if no valid Implementation Blocker exists):
 1. Git working tree clean check: run `git status --porcelain` and verify the output is empty.
    - If `git status --porcelain` produces any output (uncommitted changes or untracked files), it is a FAIL.
    - When FAIL due to dirty working tree, list ALL uncommitted changes and untracked files in FINDINGS with their file paths.
@@ -40,6 +53,7 @@ FINDINGS format requirements:
 - Each finding MUST be actionable by the AI agent autonomously
 
 Output format (output exactly ONCE at the end):
+- If valid Implementation Blocker exists: Output "ACCEPTANCE: BLOCKED"
 - If all checks pass: Output "ACCEPTANCE: PASS"
 - If checks fail: Output "ACCEPTANCE: FAIL" followed by FINDINGS and tasks.md update
 - If verification cannot complete in this session: Output "ACCEPTANCE: CONTINUE"

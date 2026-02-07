@@ -1806,6 +1806,49 @@ Requirements:\n\
                             continue;
                         }
                         Ok((
+                            crate::orchestration::AcceptanceResult::Blocked,
+                            acceptance_iteration,
+                        )) => {
+                            let error_msg = format!(
+                                "Acceptance blocked for {} in archiving state - implementation blocker detected. Workspace preserved for manual follow-up.",
+                                change_id
+                            );
+                            warn!("{}", error_msg);
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::Log(
+                                    LogEntry::warn(&error_msg)
+                                        .with_change_id(change_id)
+                                        .with_operation("acceptance")
+                                        .with_iteration(acceptance_iteration),
+                                ),
+                            )
+                            .await;
+
+                            // Mark as failed and preserve workspace
+                            cleanup_guard.preserve(&workspace.name);
+                            self.failed_tracker.mark_failed(change_id);
+
+                            // Emit WorkspacePreserved event
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::WorkspacePreserved {
+                                    change_id: change_id.clone(),
+                                    workspace_name: workspace.name.clone(),
+                                },
+                            )
+                            .await;
+
+                            // Add to results as failed
+                            archived_results.push(WorkspaceResult {
+                                change_id: change_id.clone(),
+                                workspace_name: workspace.name.clone(),
+                                final_revision: None,
+                                error: Some(error_msg),
+                            });
+                            continue;
+                        }
+                        Ok((
                             crate::orchestration::AcceptanceResult::Cancelled,
                             _acceptance_iteration,
                         )) => {
@@ -2631,6 +2674,26 @@ Requirements:\n\
                             error: Some(format!("Acceptance command failed: {}", error)),
                         };
                     }
+                    Ok((crate::orchestration::AcceptanceResult::Blocked, acceptance_iteration)) => {
+                        warn!("Acceptance blocked for {} - implementation blocker detected", change_id);
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::Log(
+                                    LogEntry::warn("Acceptance blocked - implementation blocker detected, workspace preserved for manual follow-up")
+                                        .with_change_id(&change_id)
+                                        .with_operation("acceptance")
+                                        .with_iteration(acceptance_iteration),
+                                ))
+                                .await;
+                        }
+                        // Stop apply loop and preserve workspace
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: Some("Implementation blocker detected - workspace preserved".to_string()),
+                        };
+                    }
                     Ok((crate::orchestration::AcceptanceResult::Cancelled, _acceptance_iteration)) => {
                         info!("Acceptance cancelled for {}", change_id);
                         return WorkspaceResult {
@@ -3129,6 +3192,26 @@ Requirements:\n\
                             error: Some(format!("Acceptance command failed: {}", error)),
                         };
 
+                        }
+                        Ok((crate::orchestration::AcceptanceResult::Blocked, acceptance_iteration)) => {
+                            warn!("Acceptance blocked for {} - implementation blocker detected", change_id);
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::Log(
+                                        LogEntry::warn("Acceptance blocked - implementation blocker detected, workspace preserved for manual follow-up")
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
+                                    ))
+                                    .await;
+                            }
+                            // Stop apply loop and preserve workspace
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name,
+                                final_revision: None,
+                                error: Some("Implementation blocker detected - workspace preserved".to_string()),
+                            };
                         }
                         Ok((crate::orchestration::AcceptanceResult::Cancelled, _acceptance_iteration)) => {
                             info!("Acceptance cancelled for {}", change_id);
@@ -3744,6 +3827,26 @@ Requirements:\n\
                                                                             workspace_name: workspace.name,
                                                                             final_revision: None,
                                                                             error: Some(format!("Acceptance command failed: {}", error)),
+                                                                        };
+                                                                    }
+                                                                    Ok((crate::orchestration::AcceptanceResult::Blocked, acceptance_iteration)) => {
+                                                                        warn!("Acceptance blocked for {} - implementation blocker detected", change_id);
+                                                                        if let Some(ref tx) = event_tx {
+                                                                            let _ = tx
+                                                                                .send(ParallelEvent::Log(
+                                                                                    LogEntry::warn("Acceptance blocked - implementation blocker detected, workspace preserved for manual follow-up")
+                                                                                        .with_change_id(&change_id)
+                                                                                        .with_operation("acceptance")
+                                                                                        .with_iteration(acceptance_iteration),
+                                                                                ))
+                                                                                .await;
+                                                                        }
+                                                                        // Stop apply loop and preserve workspace
+                                                                        return WorkspaceResult {
+                                                                            change_id,
+                                                                            workspace_name,
+                                                                            final_revision: None,
+                                                                            error: Some("Implementation blocker detected - workspace preserved".to_string()),
                                                                         };
                                                                     }
                                                                     Ok((crate::orchestration::AcceptanceResult::Cancelled, _acceptance_iteration)) => {

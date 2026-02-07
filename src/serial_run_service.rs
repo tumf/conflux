@@ -556,6 +556,10 @@ impl SerialRunService {
                     ChangeProcessResult::AcceptanceContinue
                 }
             }
+            AcceptanceResult::Blocked => {
+                warn!("Acceptance blocked for {} - implementation blocker detected", change_id);
+                ChangeProcessResult::AcceptanceBlocked
+            }
             AcceptanceResult::Fail { findings } => {
                 warn!(
                     "Acceptance failed for {} ({} tail lines), will retry apply",
@@ -616,6 +620,8 @@ pub enum ChangeProcessResult {
     AcceptanceContinue,
     /// Acceptance CONTINUE limit exceeded
     AcceptanceContinueExceeded,
+    /// Acceptance blocked due to implementation blocker
+    AcceptanceBlocked,
 }
 
 /// Helper function to check if progress is complete

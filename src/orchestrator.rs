@@ -565,6 +565,12 @@ impl Orchestrator {
                     next.id
                 );
             }
+            ChangeProcessResult::AcceptanceBlocked => {
+                warn!(
+                    "Acceptance blocked for {} - implementation blocker detected, stopping apply loop",
+                    next.id
+                );
+            }
             ChangeProcessResult::AcceptanceFailed { .. } => {
                 info!("Acceptance failed for {}, will retry apply", next.id);
             }
@@ -702,7 +708,8 @@ impl Orchestrator {
             | ChangeProcessResult::AcceptanceContinue
             | ChangeProcessResult::AcceptanceContinueExceeded
             | ChangeProcessResult::AcceptanceFailed { .. }
-            | ChangeProcessResult::AcceptanceCommandFailed { .. } => {
+            | ChangeProcessResult::AcceptanceCommandFailed { .. }
+            | ChangeProcessResult::AcceptanceBlocked => {
                 self.handle_acceptance_result(next, serial_service, &result)
                     .await;
                 Ok(LoopControl::Continue)

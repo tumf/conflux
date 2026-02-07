@@ -50,6 +50,8 @@ pub enum AcceptanceResult {
     Fail { findings: Vec<String> },
     /// Acceptance requires more investigation - retry acceptance.
     Continue,
+    /// Acceptance blocked due to implementation blocker - stop apply loop.
+    Blocked,
     /// Acceptance command execution failed (non-zero exit).
     CommandFailed {
         error: String,
@@ -219,6 +221,11 @@ where
             output.on_info("Acceptance test: CONTINUE");
             (AcceptanceResult::Continue, false)
         }
+        crate::acceptance::AcceptanceResult::Blocked => {
+            info!("Acceptance blocked for: {}", change.id);
+            output.on_warn("Acceptance test: BLOCKED");
+            (AcceptanceResult::Blocked, false)
+        }
     };
 
     let attempt_number = agent.next_acceptance_attempt_number(&change.id);
@@ -278,6 +285,7 @@ mod tests {
         }
         .is_pass());
         assert!(!AcceptanceResult::Cancelled.is_pass());
+        assert!(!AcceptanceResult::Blocked.is_pass());
     }
 
     #[test]

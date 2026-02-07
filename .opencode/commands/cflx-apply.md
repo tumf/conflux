@@ -69,6 +69,44 @@ Manual verification rule:
   * If truly non-mockable: move to Out of Scope / Future Work (without checkboxes) with clear justification
 - Do NOT defer tasks to Future Work based on missing credentials if mocking is possible
 
+**Implementation Blocker escalation**:
+When you determine that implementation is impossible due to:
+- Specification contradictions (conflicting requirements that cannot be resolved autonomously)
+- Non-mockable external constraints (external systems/services required but not mockable)
+
+You MUST record an Implementation Blocker and escalate to acceptance review:
+
+1. Add a new section to tasks.md with sequential numbering:
+```markdown
+## Implementation Blocker #N
+
+**Category**: [SpecContradiction | ExternalConstraint]
+
+**Root Cause**:
+[Clear explanation of why implementation cannot proceed]
+
+**Evidence**:
+- [Specific file/requirement references]
+- [Code/spec excerpts demonstrating the issue]
+
+**Impact**:
+- Affected tasks: [list task IDs]
+- Scope: [what functionality cannot be implemented]
+
+**Resolution Required**:
+[What action would unblock implementation - e.g., spec clarification, external system access, requirement change]
+```
+
+2. Output to stdout immediately after recording:
+```
+IMPLEMENTATION_BLOCKER:
+Category: [SpecContradiction | ExternalConstraint]
+Summary: [One-line description]
+See tasks.md ## Implementation Blocker #N for details
+```
+
+3. After outputting the blocker, you MAY continue working on other unblocked tasks if any remain, or output normal completion if all actionable tasks are done.
+
 Do NOT move to Future Work:
 - **Difficult or complex tasks** - agent must attempt them
 - **Tests** (unit/integration/e2e) - agent can write and run them
