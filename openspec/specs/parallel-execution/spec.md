@@ -116,7 +116,7 @@ These helpers SHALL be pure functions where possible, enabling unit testing.
 
 ### Requirement: Parallel execution acceptance loop
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
-The acceptance loop SHALL parse stdout to determine pass/fail, and MUST NOT use exit code to determine acceptance verdict.
+The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 The acceptance prompt MUST include a hardcoded acceptance prompt followed by configured `acceptance_prompt`.
 When resuming a workspace that has not completed archive, the orchestrator SHALL re-run acceptance before starting archive, even if tasks are already complete.
 
@@ -135,6 +135,8 @@ This ensures quality gates are always enforced, even after interruptions.
 - Acceptance failures SHALL record findings using stdout/stderr tail lines without parsing `FINDINGS:` structure.
 - Acceptance findings MUST exclude `ACCEPTANCE:` markers and the `FINDINGS:` header line from the recorded tail lines.
 - Acceptance FAIL logs MUST NOT label tail line counts as "findings"; if counts are shown, they MUST be labeled as tail lines.
+- If acceptance output is BLOCKED, the orchestrator MUST stop apply retries for the change and preserve the workspace for manual follow-up.
+- If acceptance output is BLOCKED, the change MUST be recorded as a terminal failure for dependency skipping in the current run.
 
 #### Scenario: Parallel acceptance retry narrows to updated files and prior findings
 - **GIVEN** a change completes an apply iteration successfully in parallel mode
@@ -149,6 +151,12 @@ This ensures quality gates are always enforced, even after interruptions.
 - **WHEN** the orchestrator records the acceptance failure
 - **THEN** the recorded findings exclude the acceptance markers and `FINDINGS:` header
 - **AND** logs do not report "N findings" based on tail line count
+
+#### Scenario: Acceptance blocked preserves workspace and stops apply
+- **GIVEN** acceptance output indicates `ACCEPTANCE: BLOCKED`
+- **WHEN** the orchestrator processes the acceptance result
+- **THEN** the workspace is preserved for manual follow-up
+- **AND** apply retries for the change are stopped in the current run
 
 ### Requirement: Parallel apply runs in worktree
 parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。

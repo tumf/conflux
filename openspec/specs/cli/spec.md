@@ -52,10 +52,10 @@ The `run` subcommand SHALL execute the OpenSpec change workflow orchestration lo
 ### Requirement: Orchestration loop runs apply and archive
 `run` サブコマンドは OpenSpec change workflow のオーケストレーションループを実行しなければならない（SHALL）。
 オーケストレーターは apply 成功後に acceptance ループを実行し、archive 開始前に結果を判定しなければならない（SHALL）。
-acceptance ループは change に対して `acceptance_command` を実行し、出力テキストから pass/fail/continue を判定して処理を分岐しなければならない（SHALL）。
+acceptance ループは change に対して `acceptance_command` を実行し、出力テキストから pass/fail/continue/blocked を判定して処理を分岐しなければならない（SHALL）。
 - exit code はコマンド実行成否のみを示し、acceptance 判定には使用しない。
 - acceptance prompt はハードコードされた acceptance prompt の後に設定値の `acceptance_prompt` を連結しなければならない（MUST）。
-- acceptance verdict parsing は PASS/FAIL/CONTINUE マーカーが非意味的な装飾（Markdown 強調など）を伴っていても認識しなければならない（MUST）。
+- acceptance verdict parsing は PASS/FAIL/CONTINUE/BLOCKED マーカーが非意味的な装飾（Markdown 強調など）を伴っていても認識しなければならない（MUST）。
 - acceptance が FAIL の場合、apply ループへ戻る前に tasks.md を更新しなければならない（MUST）。
 - tasks.md の更新は、acceptance の失敗回数に対応する `## Acceptance #<n> Failure Follow-up` セクションを末尾に追加するか、既存の関連タスクを未完了に戻す形で行わなければならない（MUST）。
 - `Acceptance #<n> Failure Follow-up` の `<n>` は当該 acceptance 試行の 1 始まりの試行番号と一致しなければならない（MUST）。
@@ -79,6 +79,8 @@ acceptance ループは change に対して `acceptance_command` を実行し、
 - 2 回目以降の acceptance prompt は、必要に応じて関連ファイルを読むよう指示し、diff 内容を含めてはならない（MUST NOT）。
 - 2 回目以降の acceptance prompt は、前回の acceptance コマンド出力（stdout_tail/stderr_tail）を `<last_acceptance_output>` タグで囲んで含めなければならない（MUST）。
 - acceptance コマンド出力は `AcceptanceHistory` に既に保存されているため、新規フィールド追加なしで参照可能でなければならない（MUST）。
+- acceptance が BLOCKED の場合、オーケストレーターは当該 change の apply ループを停止し、再試行してはならない（MUST NOT）。
+- acceptance が BLOCKED の場合、当該 change は停止状態として記録し、次の change 処理へ進まなければならない（MUST）。
 
 #### Scenario: Acceptance retry narrows to updated files and prior findings
 - **GIVEN** change が apply iteration を正常完了する
@@ -107,6 +109,12 @@ acceptance ループは change に対して `acceptance_command` を実行し、
 - **WHEN** オーケストレーターが acceptance FAIL を記録する
 - **THEN** findings として保存される tail 行から `ACCEPTANCE:` マーカーと `FINDINGS:` 行が除外される
 - **AND** ログは "N findings" のような誤解を招く件数表現を出さない
+
+#### Scenario: Acceptance blocked stops apply loop
+- **GIVEN** acceptance output が `ACCEPTANCE: BLOCKED` を示す
+- **WHEN** オーケストレーターが acceptance 結果を処理する
+- **THEN** 当該 change の apply ループは停止する
+- **AND** 同一 change の apply は再試行されない
 
 ### Requirement: Default TUI Launch
 

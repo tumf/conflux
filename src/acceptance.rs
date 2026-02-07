@@ -12,14 +12,17 @@ pub enum AcceptanceResult {
     Fail { findings: Vec<String> },
     /// Acceptance requires more investigation - continue later
     Continue,
+    /// Acceptance blocked due to implementation blocker
+    Blocked,
 }
 
-/// Parse acceptance output text and determine pass/fail/continue status.
+/// Parse acceptance output text and determine pass/fail/continue/blocked status.
 ///
 /// Expected format:
 /// - PASS: `ACCEPTANCE: PASS` (with optional markdown decorations like `**ACCEPTANCE: PASS**`)
 /// - FAIL: `ACCEPTANCE: FAIL` followed by `FINDINGS:` and items prefixed with `- `
 /// - CONTINUE: `ACCEPTANCE: CONTINUE`
+/// - BLOCKED: `ACCEPTANCE: BLOCKED`
 ///
 /// # Examples
 ///
@@ -41,11 +44,14 @@ pub enum AcceptanceResult {
 ///
 /// let continue_output = "ACCEPTANCE: CONTINUE\n";
 /// assert_eq!(parse_acceptance_output(continue_output), AcceptanceResult::Continue);
+///
+/// let blocked_output = "ACCEPTANCE: BLOCKED\n";
+/// assert_eq!(parse_acceptance_output(blocked_output), AcceptanceResult::Blocked);
 /// ```
 pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
     let lines: Vec<&str> = output.lines().collect();
 
-    // Look for ACCEPTANCE: PASS, ACCEPTANCE: FAIL, or ACCEPTANCE: CONTINUE
+    // Look for ACCEPTANCE: PASS, ACCEPTANCE: FAIL, ACCEPTANCE: CONTINUE, or ACCEPTANCE: BLOCKED
     // Skip code blocks (delimited by ```) to avoid matching examples in prompts
     let mut acceptance_status = None;
     let mut in_code_block = false;
@@ -75,12 +81,16 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
         } else if normalized == "ACCEPTANCE: CONTINUE" {
             acceptance_status = Some("continue");
             break;
+        } else if normalized == "ACCEPTANCE: BLOCKED" {
+            acceptance_status = Some("blocked");
+            break;
         }
     }
 
     match acceptance_status {
         Some("pass") => AcceptanceResult::Pass,
         Some("continue") => AcceptanceResult::Continue,
+        Some("blocked") => AcceptanceResult::Blocked,
         Some("fail") => {
             // Parse findings
             let findings = parse_findings(output);
@@ -372,5 +382,23 @@ ACCEPTANCE: PASS
 "#;
         // Both are inside unclosed code block, default to Continue
         assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_blocked() {
+        let output = "ACCEPTANCE: BLOCKED\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Blocked);
+    }
+
+    #[test]
+    fn test_parse_blocked_with_extra_output() {
+        let output = "Some debug output\nACCEPTANCE: BLOCKED\nMore output\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Blocked);
+    }
+
+    #[test]
+    fn test_parse_blocked_with_bold_decoration() {
+        let output = "**ACCEPTANCE: BLOCKED**\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Blocked);
     }
 }

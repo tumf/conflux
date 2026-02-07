@@ -1017,6 +1017,48 @@ pub async fn execute_acceptance_in_workspace(
                 attempt_number,
             ))
         }
+        ParseResult::Blocked => {
+            info!("Acceptance blocked for: {}", change_id);
+            let attempt_number = agent.next_acceptance_attempt_number(change_id);
+            let attempt = crate::history::AcceptanceAttempt {
+                attempt: attempt_number,
+                passed: false,
+                duration: start_time.elapsed(),
+                findings: Some(vec!["Implementation blocker detected".to_string()]),
+                exit_code: status.code(),
+                stdout_tail: stdout_tail.clone(),
+                stderr_tail: stderr_tail.clone(),
+                commit_hash: commit_hash.clone(),
+            };
+            // Record to both agent history (local) and shared acceptance history
+            agent.record_acceptance_attempt(change_id, attempt.clone());
+            acceptance_history.lock().await.record(change_id, attempt);
+            // Reset acceptance tail injection flag so next apply can receive new output
+            acceptance_tail_injected.lock().await.remove(change_id);
+
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::Log(
+                        crate::events::LogEntry::warn(
+                            "Acceptance blocked - implementation blocker detected",
+                        )
+                        .with_change_id(change_id)
+                        .with_operation("acceptance")
+                        .with_iteration(attempt_number),
+                    ))
+                    .await;
+                let _ = tx
+                    .send(ParallelEvent::AcceptanceCompleted {
+                        change_id: change_id.to_string(),
+                    })
+                    .await;
+            }
+
+            Ok((
+                crate::orchestration::AcceptanceResult::Blocked,
+                attempt_number,
+            ))
+        }
         ParseResult::Fail { .. } => {
             let findings_for_tasks = tail_findings.clone();
             info!(

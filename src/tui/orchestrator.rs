@@ -549,6 +549,47 @@ pub async fn run_orchestrator(
                 // Update local state tracking
                 apply_counts.insert(change_id.clone(), apply_count);
             }
+            Ok(ChangeProcessResult::AcceptanceBlocked) => {
+                // Send ApplyCompleted event
+                let apply_completed_event = OrchestratorEvent::ApplyCompleted {
+                    change_id: change_id.clone(),
+                    revision: String::new(),
+                };
+                let _ = tx.send(apply_completed_event.clone()).await;
+                shared_state
+                    .write()
+                    .await
+                    .apply_execution_event(&apply_completed_event);
+                #[cfg(feature = "web-monitoring")]
+                if let Some(ws) = &web_state {
+                    ws.apply_execution_event(&apply_completed_event).await;
+                }
+
+                // Send AcceptanceCompleted event
+                let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
+                    change_id: change_id.clone(),
+                };
+                let _ = tx.send(acceptance_completed_event.clone()).await;
+                #[cfg(feature = "web-monitoring")]
+                if let Some(ws) = &web_state {
+                    ws.apply_execution_event(&acceptance_completed_event).await;
+                }
+
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::warn(
+                        "Acceptance blocked - implementation blocker detected, stopping apply loop"
+                            .to_string(),
+                    )))
+                    .await;
+
+                // Mark as stalled in SerialRunService and remove from pending to prevent re-selection and archive
+                let reason = "Implementation blocker detected - requires manual intervention";
+                serial_service.mark_stalled(&change_id, reason);
+                pending_changes.remove(&change_id);
+
+                // Update local state tracking
+                apply_counts.insert(change_id.clone(), apply_count);
+            }
             Ok(ChangeProcessResult::AcceptanceFailed { .. }) => {
                 // Send ApplyCompleted event
                 let apply_completed_event = OrchestratorEvent::ApplyCompleted {
@@ -1059,5 +1100,47 @@ mod tests {
         // If archive exists, the archive is considered successful
         let archive_ok = archive_path.exists();
         assert!(archive_ok);
+    }
+
+    /// Test that AcceptanceBlocked prevents re-selection and archive in TUI serial mode.
+    /// Verifies that:
+    /// 1. The blocked change is marked as stalled in SerialRunService
+    /// 2. The blocked change is removed from pending_changes
+    /// 3. Blocked change cannot be re-selected through pending_changes filtering
+    #[tokio::test]
+    async fn test_tui_acceptance_blocked_prevents_reselection_and_archive() {
+        use crate::serial_run_service::SerialRunService;
+        use std::collections::HashSet;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = crate::config::OrchestratorConfig::default();
+        let mut serial_service = SerialRunService::new(temp_dir.path().to_path_buf(), config);
+
+        let blocked_change_id = "blocked-change";
+        let other_change_id = "other-change";
+
+        // Simulate pending changes before blocking
+        let mut pending_changes: HashSet<String> =
+            vec![blocked_change_id.to_string(), other_change_id.to_string()]
+                .into_iter()
+                .collect();
+
+        // Simulate AcceptanceBlocked processing
+        let reason = "Implementation blocker detected - requires manual intervention";
+        serial_service.mark_stalled(blocked_change_id, reason);
+        pending_changes.remove(blocked_change_id);
+
+        // Verify the blocked change is no longer in pending
+        assert!(!pending_changes.contains(blocked_change_id));
+        assert!(pending_changes.contains(other_change_id));
+
+        // Verify the blocked change is marked as stalled
+        assert!(serial_service.is_stalled(blocked_change_id));
+        assert!(!serial_service.is_stalled(other_change_id));
+
+        // Verify that only the non-blocked change remains selectable
+        assert_eq!(pending_changes.len(), 1);
+        assert!(pending_changes.contains(other_change_id));
     }
 }

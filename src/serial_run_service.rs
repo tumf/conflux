@@ -556,6 +556,13 @@ impl SerialRunService {
                     ChangeProcessResult::AcceptanceContinue
                 }
             }
+            AcceptanceResult::Blocked => {
+                warn!(
+                    "Acceptance blocked for {} - implementation blocker detected",
+                    change_id
+                );
+                ChangeProcessResult::AcceptanceBlocked
+            }
             AcceptanceResult::Fail { findings } => {
                 warn!(
                     "Acceptance failed for {} ({} tail lines), will retry apply",
@@ -616,6 +623,8 @@ pub enum ChangeProcessResult {
     AcceptanceContinue,
     /// Acceptance CONTINUE limit exceeded
     AcceptanceContinueExceeded,
+    /// Acceptance blocked due to implementation blocker
+    AcceptanceBlocked,
 }
 
 /// Helper function to check if progress is complete
@@ -729,5 +738,49 @@ mod tests {
         // but select_next_change returns the first match which would be 'b' if it's complete)
         // Actually, reading the implementation, it prioritizes incomplete first, so should be 'a'
         assert_eq!(next.map(|c| c.id.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn test_process_acceptance_result_blocked_returns_correct_variant() {
+        use crate::agent::AgentRunner;
+        use crate::orchestration::AcceptanceResult;
+
+        let temp_dir = TempDir::new().unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+
+        let result =
+            service.process_acceptance_result("test-change", &agent, AcceptanceResult::Blocked);
+
+        assert!(matches!(result, ChangeProcessResult::AcceptanceBlocked));
+    }
+
+    #[test]
+    fn test_mark_stalled_prevents_reselection() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+
+        let changes = vec![
+            create_test_change("a", 5, 10, true),
+            create_test_change("b", 8, 10, true), // Highest progress
+        ];
+
+        // Initially, highest progress change should be selected
+        let next = service.select_next_change(&changes);
+        assert_eq!(next.map(|c| c.id.as_str()), Some("b"));
+
+        // Mark 'b' as stalled (simulating BLOCKED acceptance)
+        service.mark_stalled("b", "Implementation blocker detected");
+
+        // After marking as stalled, 'b' should not be selected
+        let next = service.select_next_change(&changes);
+        assert_eq!(next.map(|c| c.id.as_str()), Some("a"));
+
+        // Verify 'b' is marked as stalled
+        assert!(service.is_stalled("b"));
+        assert!(!service.is_stalled("a"));
     }
 }
