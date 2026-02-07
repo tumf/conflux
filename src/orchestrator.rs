@@ -1509,4 +1509,43 @@ mod tests {
             ])
         );
     }
+
+    #[tokio::test]
+    async fn test_acceptance_blocked_prevents_reapply_and_archive() {
+        use crate::serial_run_service::ChangeProcessResult;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = OrchestratorConfig::default();
+        let mut orchestrator = Orchestrator::with_config(None, config.clone()).unwrap();
+        let mut serial_service = SerialRunService::new(temp_dir.path().to_path_buf(), config);
+
+        let blocked_change = create_test_change("blocked-change", 3, 5);
+
+        // Simulate AcceptanceBlocked result
+        let result = ChangeProcessResult::AcceptanceBlocked;
+
+        // Process the result through handle_change_result
+        orchestrator
+            .handle_change_result(result, &blocked_change, &mut serial_service)
+            .await
+            .unwrap();
+
+        // Verify the change is marked as stalled in orchestrator
+        assert!(orchestrator.stalled_change_ids.contains(&blocked_change.id));
+
+        // Verify the change is marked as stalled in serial service
+        assert!(serial_service.is_stalled(&blocked_change.id));
+
+        // Create a list with the blocked change and another eligible change
+        let changes = vec![
+            blocked_change.clone(),
+            create_test_change("other-change", 2, 5),
+        ];
+
+        // Filter should exclude the blocked change
+        let eligible = orchestrator.filter_stalled_changes(&changes);
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].id, "other-change");
+    }
 }

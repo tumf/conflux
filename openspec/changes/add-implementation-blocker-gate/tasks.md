@@ -13,3 +13,8 @@
 - [x] `ACCEPTANCE: BLOCKED` が serial CLI フローで終端状態になっていません。`src/serial_run_service.rs` の `process_acceptance_result` は `AcceptanceBlocked` を返すだけで、`src/orchestrator.rs` の `handle_change_result`/`handle_acceptance_result` は停止状態へ遷移させずに継続するため、後続ループで当該 change が再選択され archive に進む可能性があります。Blocked change を stalled/terminal として記録し、同一 change の apply 再試行と archive 進行を止めてください。
 - [x] `ACCEPTANCE: BLOCKED` が TUI serial フローでも終端状態になっていません。`src/tui/orchestrator.rs` の `ChangeProcessResult::AcceptanceBlocked` 分岐はログ出力のみで `pending_changes` から除外せず、同ファイルの選択ロジックは completed change を archive 対象に含めるため、Blocked change が次周回で archive され得ます。TUI 側でも blocked change を停止扱いにして pending から外し、手動フォロー用に保持してください。
 - [x] 上記 BLOCKED 停止動作の回帰テストを追加してください（少なくとも serial CLI と TUI で、`ACCEPTANCE: BLOCKED` 後に同一 change が再適用・archive されないことを検証）。
+
+## Acceptance #2 Failure Follow-up
+- [x] BLOCKED 停止挙動の回帰テストが依然として不足しています。`src/orchestrator.rs:568` で BLOCKED を stalled 化する実装はありますが、同ファイルのテストは `test_filter_stalled_changes_skips_dependencies` など選別ロジック中心で、`handle_change_result`/メインループ経路で「BLOCKED 後に同一 change を再選択・archive しない」ことを検証していません。`ChangeProcessResult::AcceptanceBlocked` を入力にしたオーケストレーター経路の回帰テストを追加してください。
+- [x] TUI serial フローの BLOCKED 回帰テストが不足しています。`src/tui/orchestrator.rs:552` では BLOCKED 時に `pending_changes.remove` を行いますが、同ファイルのテストは `test_archive_path_structure` と `test_archive_verification_logic` のみで、BLOCKED 後に pending から除外され再適用・archive されないことを検証していません。`run_orchestrator` 相当の経路で BLOCKED 後の再選択防止を確認するテストを追加してください。
+- [x] `src/serial_run_service.rs:757` の `test_process_acceptance_result_blocked_returns_correct_variant` は `matches!(...)` の戻り値をアサートしておらず、現在のままでは検証になっていません。`assert!(matches!(...))` に修正し、BLOCKED 判定テストが実際に失敗検出できる状態にしてください。

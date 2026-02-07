@@ -1039,10 +1039,12 @@ pub async fn execute_acceptance_in_workspace(
             if let Some(ref tx) = event_tx {
                 let _ = tx
                     .send(ParallelEvent::Log(
-                        crate::events::LogEntry::warn("Acceptance blocked - implementation blocker detected")
-                            .with_change_id(change_id)
-                            .with_operation("acceptance")
-                            .with_iteration(attempt_number),
+                        crate::events::LogEntry::warn(
+                            "Acceptance blocked - implementation blocker detected",
+                        )
+                        .with_change_id(change_id)
+                        .with_operation("acceptance")
+                        .with_iteration(attempt_number),
                     ))
                     .await;
                 let _ = tx

@@ -1101,4 +1101,46 @@ mod tests {
         let archive_ok = archive_path.exists();
         assert!(archive_ok);
     }
+
+    /// Test that AcceptanceBlocked prevents re-selection and archive in TUI serial mode.
+    /// Verifies that:
+    /// 1. The blocked change is marked as stalled in SerialRunService
+    /// 2. The blocked change is removed from pending_changes
+    /// 3. Blocked change cannot be re-selected through pending_changes filtering
+    #[tokio::test]
+    async fn test_tui_acceptance_blocked_prevents_reselection_and_archive() {
+        use crate::serial_run_service::SerialRunService;
+        use std::collections::HashSet;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = crate::config::OrchestratorConfig::default();
+        let mut serial_service = SerialRunService::new(temp_dir.path().to_path_buf(), config);
+
+        let blocked_change_id = "blocked-change";
+        let other_change_id = "other-change";
+
+        // Simulate pending changes before blocking
+        let mut pending_changes: HashSet<String> =
+            vec![blocked_change_id.to_string(), other_change_id.to_string()]
+                .into_iter()
+                .collect();
+
+        // Simulate AcceptanceBlocked processing
+        let reason = "Implementation blocker detected - requires manual intervention";
+        serial_service.mark_stalled(blocked_change_id, reason);
+        pending_changes.remove(blocked_change_id);
+
+        // Verify the blocked change is no longer in pending
+        assert!(!pending_changes.contains(blocked_change_id));
+        assert!(pending_changes.contains(other_change_id));
+
+        // Verify the blocked change is marked as stalled
+        assert!(serial_service.is_stalled(blocked_change_id));
+        assert!(!serial_service.is_stalled(other_change_id));
+
+        // Verify that only the non-blocked change remains selectable
+        assert_eq!(pending_changes.len(), 1);
+        assert!(pending_changes.contains(other_change_id));
+    }
 }

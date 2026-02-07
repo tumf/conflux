@@ -557,7 +557,10 @@ impl SerialRunService {
                 }
             }
             AcceptanceResult::Blocked => {
-                warn!("Acceptance blocked for {} - implementation blocker detected", change_id);
+                warn!(
+                    "Acceptance blocked for {} - implementation blocker detected",
+                    change_id
+                );
                 ChangeProcessResult::AcceptanceBlocked
             }
             AcceptanceResult::Fail { findings } => {
@@ -739,8 +742,8 @@ mod tests {
 
     #[test]
     fn test_process_acceptance_result_blocked_returns_correct_variant() {
-        use crate::orchestration::AcceptanceResult;
         use crate::agent::AgentRunner;
+        use crate::orchestration::AcceptanceResult;
 
         let temp_dir = TempDir::new().unwrap();
         let service =
@@ -748,13 +751,10 @@ mod tests {
 
         let agent = AgentRunner::new(OrchestratorConfig::default());
 
-        let result = service.process_acceptance_result(
-            "test-change",
-            &agent,
-            AcceptanceResult::Blocked,
-        );
+        let result =
+            service.process_acceptance_result("test-change", &agent, AcceptanceResult::Blocked);
 
-        matches!(result, ChangeProcessResult::AcceptanceBlocked);
+        assert!(matches!(result, ChangeProcessResult::AcceptanceBlocked));
     }
 
     #[test]
