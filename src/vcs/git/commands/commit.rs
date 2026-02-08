@@ -122,18 +122,28 @@ pub async fn list_changes_with_uncommitted_files<P: AsRef<Path>>(cwd: P) -> VcsR
     let mut change_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for line in output.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+        if line.trim().is_empty() {
             continue;
         }
 
-        // Parse porcelain format: "XY path" where X is index status, Y is worktree status
-        // We need at least 3 chars: "XY " + path
-        if line.len() < 3 {
+        // Parse porcelain format path field.
+        // Normal: "XY <path>" (2 status columns + separator)
+        // Fallback: "Y <path>" for first line when run_git() trimmed a leading space.
+        let bytes = line.as_bytes();
+        let path_field = if bytes.len() >= 3 && bytes[2] == b' ' {
+            &line[3..]
+        } else if bytes.len() >= 2 && bytes[1] == b' ' {
+            &line[2..]
+        } else {
             continue;
-        }
+        };
 
-        let path = &line[3..]; // Skip "XY " prefix
+        // Handle rename format: "old/path -> new/path". Use destination path.
+        let path = path_field
+            .split_once(" -> ")
+            .map(|(_, new_path)| new_path)
+            .unwrap_or(path_field)
+            .trim();
 
         // Check if path is under openspec/changes/<change_id>/
         if let Some(change_id) = extract_change_id_from_path(path) {
@@ -442,6 +452,58 @@ mod tests {
 
         // Should only include change-c, not archive
         assert_eq!(uncommitted_changes, vec!["change-c".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_list_changes_with_uncommitted_files_detects_unstaged_modified_first_line() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let init_result = Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init_result.is_err() {
+            return; // Skip if git not available
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        let change_dir = temp_dir.path().join("openspec/changes/change-a");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("proposal.md"), "test").unwrap();
+        std::fs::write(change_dir.join("tasks.md"), "- [ ] task").unwrap();
+
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "add change-a"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create unstaged modification. Status line is typically " M ...",
+        // and the leading space can be trimmed by run_git() for the first line.
+        std::fs::write(change_dir.join("tasks.md"), "- [x] task").unwrap();
+
+        let uncommitted_changes = list_changes_with_uncommitted_files(temp_dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(uncommitted_changes, vec!["change-a".to_string()]);
     }
 
     #[test]
