@@ -223,6 +223,12 @@ pub fn handle_f5_key(ctx: &mut KeyEventContext<'_>) -> Option<TuiCommand> {
         }
     }
 
+    if ctx.app.is_resolving {
+        ctx.app.warning_message =
+            Some("Cannot start processing while merge resolve is in progress".to_string());
+        return None;
+    }
+
     // Determine which command to use based on mode
     if ctx.app.mode == AppMode::Error {
         ctx.app.retry_error_changes()

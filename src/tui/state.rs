@@ -952,6 +952,12 @@ impl AppState {
             return None;
         }
 
+        if self.is_resolving {
+            self.warning_message =
+                Some("Cannot start processing while merge resolve is in progress".to_string());
+            return None;
+        }
+
         // Exclude MergeWait and ResolveWait from StartProcessing
         // These changes require explicit resolve operation (M key)
         let selected: Vec<String> = self
@@ -1024,6 +1030,12 @@ impl AppState {
             return None;
         }
 
+        if self.is_resolving {
+            self.warning_message =
+                Some("Cannot resume processing while merge resolve is in progress".to_string());
+            return None;
+        }
+
         // Find execution-marked changes (selected=true, queue_status=NotQueued)
         let marked_ids: Vec<String> = self
             .changes
@@ -1058,6 +1070,12 @@ impl AppState {
     /// Returns None if not in Error mode or no error changes found
     pub fn retry_error_changes(&mut self) -> Option<TuiCommand> {
         if self.mode != AppMode::Error {
+            return None;
+        }
+
+        if self.is_resolving {
+            self.warning_message =
+                Some("Cannot retry while merge resolve is in progress".to_string());
             return None;
         }
 
@@ -2629,6 +2647,51 @@ mod tests {
 
         app.toggle_selection();
         assert!(app.changes[0].selected);
+    }
+
+    #[test]
+    fn test_start_processing_blocked_while_resolving() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.is_resolving = true;
+
+        let command = app.start_processing();
+        assert!(command.is_none());
+        assert_eq!(
+            app.warning_message,
+            Some("Cannot start processing while merge resolve is in progress".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resume_processing_blocked_while_resolving() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Stopped;
+        app.is_resolving = true;
+
+        let command = app.resume_processing();
+        assert!(command.is_none());
+        assert_eq!(
+            app.warning_message,
+            Some("Cannot resume processing while merge resolve is in progress".to_string())
+        );
+    }
+
+    #[test]
+    fn test_retry_error_changes_blocked_while_resolving() {
+        let changes = vec![create_approved_change("a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Error;
+        app.changes[0].queue_status = QueueStatus::Error("boom".to_string());
+        app.is_resolving = true;
+
+        let command = app.retry_error_changes();
+        assert!(command.is_none());
+        assert_eq!(
+            app.warning_message,
+            Some("Cannot retry while merge resolve is in progress".to_string())
+        );
     }
 
     #[test]

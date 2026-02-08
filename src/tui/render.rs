@@ -471,7 +471,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             }
         }
     }
-    if has_queue {
+    if has_queue && !app.is_resolving {
         keys.push("F5: run");
     }
     keys.push("Tab: worktrees");
@@ -1722,6 +1722,18 @@ mod tests {
             !content.contains("M: resolve"),
             "Should NOT show M key hint when resolve is in progress"
         );
+    }
+
+    #[test]
+    fn test_render_hides_f5_run_hint_while_resolving() {
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.mode = AppMode::Select;
+        app.is_resolving = true;
+        app.cursor_index = 0;
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(!content.contains("F5: run"));
     }
 
     // === Tests for update-tui-error-mode-continuation ===
