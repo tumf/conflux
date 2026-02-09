@@ -535,6 +535,13 @@ pub async fn handle_key_event(
                 ctx.app.show_qr_popup();
             }
         }
+        (KeyCode::Char('l'), _) => {
+            // Toggle log panel visibility (only in Changes view)
+            use crate::tui::types::ViewMode;
+            if ctx.app.view_mode == ViewMode::Changes {
+                ctx.app.toggle_logs_panel();
+            }
+        }
         _ => {}
     }
 
