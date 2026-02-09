@@ -165,13 +165,23 @@ fn render_select_mode(frame: &mut Frame, app: &mut AppState, area: Rect) {
 
 /// Render running mode
 fn render_running_mode(frame: &mut Frame, app: &mut AppState, area: Rect) {
-    let chunks = Layout::vertical([
-        Constraint::Length(3),  // Header
-        Constraint::Min(5),     // Changes list
-        Constraint::Length(3),  // Status
-        Constraint::Length(20), // Logs (2x height for better visibility)
-    ])
-    .split(area);
+    // Show logs panel only if logs_panel_enabled is true
+    let chunks = if app.logs_panel_enabled {
+        Layout::vertical([
+            Constraint::Length(3),  // Header
+            Constraint::Min(5),     // Changes list
+            Constraint::Length(3),  // Status
+            Constraint::Length(20), // Logs (2x height for better visibility)
+        ])
+        .split(area)
+    } else {
+        Layout::vertical([
+            Constraint::Length(3), // Header
+            Constraint::Min(5),    // Changes list
+            Constraint::Length(3), // Status
+        ])
+        .split(area)
+    };
 
     // Header
     render_header(frame, app, chunks[0]);
@@ -182,8 +192,10 @@ fn render_running_mode(frame: &mut Frame, app: &mut AppState, area: Rect) {
     // Status
     render_status(frame, app, chunks[2]);
 
-    // Logs
-    render_logs(frame, app, chunks[3]);
+    // Logs (only if enabled)
+    if app.logs_panel_enabled && chunks.len() > 3 {
+        render_logs(frame, app, chunks[3]);
+    }
 }
 
 /// Render header
@@ -487,6 +499,8 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
     if app.web_url.is_some() {
         keys.push("w: QR");
     }
+    // Show log panel toggle hint
+    keys.push("l: logs");
 
     let title = format!(" Changes ({}) ", keys.join(", "));
 
@@ -789,6 +803,8 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
     if app.web_url.is_some() {
         keys.push("w: QR");
     }
+    // Show log panel toggle hint
+    keys.push("l: logs");
 
     let title = format!(" Changes ({}) ", keys.join(", "));
 
@@ -2175,6 +2191,76 @@ mod tests {
             !content.contains("[Ready]"),
             "Header should not show '[Ready]' while resolving, but got:\n{}",
             content
+        );
+    }
+
+    #[test]
+    fn test_log_panel_toggle_hides_logs() {
+        // Test that logs can be hidden when logs_panel_enabled is false
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.add_log(LogEntry::info("Test log message"));
+
+        // Logs panel should be visible by default
+        assert!(app.logs_panel_enabled);
+
+        // Disable logs panel
+        app.logs_panel_enabled = false;
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+
+        // The log message should not be visible when panel is disabled
+        assert!(
+            !content.contains("Test log message"),
+            "Log message should not be visible when logs panel is disabled"
+        );
+
+        // Status panel should still be visible
+        assert!(
+            content.contains("Status"),
+            "Status panel should be visible even when logs are hidden"
+        );
+    }
+
+    #[test]
+    fn test_log_panel_toggle_shows_logs_when_enabled() {
+        // Test that logs are shown when logs_panel_enabled is true
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        app.add_log(LogEntry::info("Test log message"));
+
+        // Logs panel is enabled by default
+        assert!(app.logs_panel_enabled);
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+
+        // The log message should be visible
+        assert!(
+            content.contains("Test log message"),
+            "Log message should be visible when logs panel is enabled"
+        );
+    }
+
+    #[test]
+    fn test_log_panel_key_hint_always_shows() {
+        // Test that 'l: logs' key hint is always shown in Changes view
+        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+
+        // Test in select mode (no logs)
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            content.contains("l: logs"),
+            "Key hint 'l: logs' should be visible in select mode"
+        );
+
+        // Test in running mode (with logs)
+        app.add_log(LogEntry::info("Test log"));
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            content.contains("l: logs"),
+            "Key hint 'l: logs' should be visible in running mode"
         );
     }
 

@@ -150,6 +150,8 @@ pub struct AppState {
     pub resolve_queue: VecDeque<String>,
     /// Set of change IDs in the resolve queue for duplicate prevention
     pub resolve_queue_set: HashSet<String>,
+    /// Whether the log panel is visible in Changes view
+    pub logs_panel_enabled: bool,
 }
 
 // ============================================================================
@@ -288,6 +290,7 @@ impl AppState {
             shared_orchestrator_state: None,
             resolve_queue: VecDeque::new(),
             resolve_queue_set: HashSet::new(),
+            logs_panel_enabled: true, // Default: logs panel visible
         }
     }
 
@@ -1226,6 +1229,11 @@ impl AppState {
     pub fn scroll_logs_to_bottom(&mut self) {
         self.log_scroll_offset = 0;
         self.log_auto_scroll = true;
+    }
+
+    /// Toggle log panel visibility
+    pub fn toggle_logs_panel(&mut self) {
+        self.logs_panel_enabled = !self.logs_panel_enabled;
     }
 }
 
