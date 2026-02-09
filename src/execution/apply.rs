@@ -710,6 +710,31 @@ where
             output_collector.stderr_tail(),
         );
 
+        // Check for permission auto-reject before other error handling
+        if let Some(reject) = crate::permission::detect_permission_reject(
+            output_collector.stdout_tail().as_deref(),
+            output_collector.stderr_tail().as_deref(),
+        ) {
+            let error_msg = reject.format_error_message();
+            warn!(
+                "Permission auto-reject detected for {}: {}",
+                change_id, reject.denied_path
+            );
+
+            // Run on_error hook
+            if let Some(hook_runner) = hooks {
+                let error_ctx = hook_ctx
+                    .build_hook_context(change_id, progress.completed, progress.total, iteration)
+                    .with_error(&error_msg);
+                let _ = hook_runner.run_hook(HookType::OnError, &error_ctx).await;
+            }
+
+            return Err(OrchestratorError::PermissionBlocked {
+                denied_path: reject.denied_path,
+                guidance: error_msg,
+            });
+        }
+
         if !status.success() {
             let error_msg = format!("Apply command failed with exit code: {:?}", status.code());
 

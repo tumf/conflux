@@ -399,7 +399,7 @@ impl SerialRunService {
         });
 
         // Execute apply loop using common implementation
-        let apply_result = common_apply::execute_apply_loop(
+        let apply_result = match common_apply::execute_apply_loop(
             &change.id,
             &self.repo_root,
             &self.config,
@@ -418,7 +418,32 @@ impl SerialRunService {
                 }
             },
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result,
+            Err(crate::error::OrchestratorError::PermissionBlocked {
+                denied_path,
+                guidance,
+            }) => {
+                // Abort the background cancel monitoring task
+                cancel_task.abort();
+
+                // Mark as stalled with permission guidance
+                let error_message = format!(
+                    "Permission auto-rejected for: {}\n{}",
+                    denied_path, guidance
+                );
+                self.mark_stalled(&change.id, &error_message);
+                return Ok(ChangeProcessResult::Stalled {
+                    error: error_message,
+                });
+            }
+            Err(e) => {
+                // Abort the background cancel monitoring task
+                cancel_task.abort();
+                return Err(e);
+            }
+        };
 
         // Abort the background cancel monitoring task now that apply is complete
         cancel_task.abort();
