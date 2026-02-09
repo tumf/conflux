@@ -174,3 +174,16 @@ resolve 実行中に `M` が押された場合、対象 change は `ResolveWait`
 - **THEN** the row SHALL be grayed out
 - **AND** the row SHALL NOT display a checkbox
 - **AND** the row SHALL display the `UNCOMMITED` badge
+
+### Requirement: Log Panel Toggle Hint
+Changes ビューのChangesパネルはログパネルの切り替え操作として `l: logs` を表示しなければならない（SHALL）。
+
+#### Scenario: Select mode shows log toggle hint
+- **GIVEN** TUI is in select mode
+- **WHEN** Changes panel is rendered
+- **THEN** key hints include "l: logs"
+
+#### Scenario: Running mode shows log toggle hint
+- **GIVEN** TUI is in running mode
+- **WHEN** Changes panel is rendered
+- **THEN** key hints include "l: logs"
