@@ -753,38 +753,30 @@ where
             iteration, new_progress.completed, new_progress.total
         );
 
-        // Permission auto-reject is handled as a task-level block.
-        // If task state changed (e.g., blocked task moved to Future Work, or other tasks advanced),
-        // keep going. If no task state changed, fail with permission guidance.
+        // Permission auto-reject is handled as a soft error.
+        // Log the error and continue the loop to give the agent another iteration.
+        // The stall detector will catch repeated failures if no progress is made.
         if let Some(reject) = permission_reject {
             let task_state_changed =
                 new_progress.completed > progress.completed || new_progress.total != progress.total;
 
             if !task_state_changed {
-                let error_msg = reject.format_error_message();
-
-                // Run on_error hook
-                if let Some(hook_runner) = hooks {
-                    let error_ctx = hook_ctx
-                        .build_hook_context(
-                            change_id,
-                            new_progress.completed,
-                            new_progress.total,
-                            iteration,
-                        )
-                        .with_error(&error_msg);
-                    let _ = hook_runner.run_hook(HookType::OnError, &error_ctx).await;
-                }
-
-                return Err(OrchestratorError::PermissionBlocked {
-                    denied_path: reject.denied_path,
-                    guidance: error_msg,
-                });
+                warn!(
+                    "Permission auto-reject detected for {} but task state unchanged; continuing to next iteration",
+                    change_id
+                );
+                warn!("Denied path: {}", reject.denied_path);
+                warn!("Guidance: {}", reject.format_error_message());
+            } else {
+                info!(
+                    "Permission auto-reject detected for {} but task state changed; continuing",
+                    change_id
+                );
             }
 
             if !status.success() {
                 warn!(
-                    "Apply command for {} exited non-zero but task state changed after permission auto-reject; continuing",
+                    "Apply command for {} exited non-zero after permission auto-reject; continuing to next iteration",
                     change_id
                 );
             }
