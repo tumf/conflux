@@ -404,6 +404,12 @@ pub async fn run_orchestrator(
             dynamic_queue_clone.try_is_stopped(&change_id_for_cancel)
         };
 
+        // Create a closure that only checks single-change stop
+        let dynamic_queue_clone2 = dynamic_queue.clone();
+        let change_id_for_single_stop = change_id.clone();
+        let is_single_change_stopped =
+            move || dynamic_queue_clone2.try_is_stopped(&change_id_for_single_stop);
+
         let result = serial_service
             .process_change(
                 &change,
@@ -414,6 +420,7 @@ pub async fn run_orchestrator(
                 total_changes,
                 remaining_changes,
                 cancel_check,
+                is_single_change_stopped,
                 Some(current_operation.clone()),
             )
             .await;
@@ -442,6 +449,23 @@ pub async fn run_orchestrator(
                     .await;
                 pending_changes.clear();
                 break;
+            }
+            Ok(ChangeProcessResult::ChangeStopped) => {
+                // Send ChangeStopped event to move the change to not queued
+                let _ = tx
+                    .send(OrchestratorEvent::ChangeStopped {
+                        change_id: change_id.clone(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                        "Change {} stopped, continuing with other queued changes",
+                        change_id
+                    ))))
+                    .await;
+                // Remove this change from pending but continue processing others
+                pending_changes.retain(|id| id != &change_id);
+                continue;
             }
             Ok(ChangeProcessResult::AcceptancePassed) => {
                 // Send ApplyCompleted event

@@ -700,6 +700,14 @@ impl Orchestrator {
                     finish_status: "cancelled",
                 })
             }
+            ChangeProcessResult::ChangeStopped => {
+                // In CLI mode, single-change stop is not applicable (no TUI queue)
+                // Treat it as a global cancel
+                info!("Change {} stopped", next.id);
+                Ok(LoopControl::Break {
+                    finish_status: "stopped",
+                })
+            }
             ChangeProcessResult::ApplySuccessIncomplete => Ok(self
                 .handle_apply_success_incomplete(next, serial_service)
                 .await),
@@ -823,6 +831,7 @@ impl Orchestrator {
             // Process the change through SerialRunService
             let output = LogOutputHandler::new();
             let cancel_check = || false; // No cancellation in CLI mode
+            let is_single_change_stopped = || false; // No single-change stop in CLI mode
 
             let result = serial_service
                 .process_change(
@@ -834,6 +843,7 @@ impl Orchestrator {
                     total_changes,
                     remaining_changes,
                     cancel_check,
+                    is_single_change_stopped,
                     None, // No operation tracker in CLI mode
                 )
                 .await?;
