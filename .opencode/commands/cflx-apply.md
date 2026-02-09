@@ -52,6 +52,36 @@ CRITICAL OPERATIONAL CONSTRAINTS:
 - The only valid reason to move a task to Future Work is if it is ALREADY marked with '(future work)' explicitly
 </system-reminder>
 
+**Permission Error Handling**:
+When you encounter a permission error (e.g., "permission requested: read (...); auto-rejecting"):
+1. Identify the specific task that requires the blocked file/operation
+2. Move ONLY that task to a "## Future Work" section in tasks.md with explanation:
+   ```markdown
+   ## Future Work
+   - Task N: [original task description]
+     - Reason: Permission denied for file: [file path]
+     - Required action: Configure Claude permissions in .claude/claude.jsonc:
+       ```jsonc
+       {
+         "permission": {
+           "read": {
+             "[file pattern]": "allow"
+           }
+         }
+       }
+       ```
+   ```
+3. Remove the checkbox from the moved task (convert `- [ ]` to plain text or bullet)
+4. CONTINUE working on remaining tasks that do not require the blocked resource
+5. If ALL remaining tasks require the blocked resource, output completion with partial progress
+
+Example scenario:
+- Task 1: Edit .env.template (permission denied) → Move to Future Work
+- Task 2: Remove ray imports (no permission needed) → Continue and complete
+- Task 3: Update tests (no permission needed) → Continue and complete
+
+CRITICAL: Permission errors are NOT a reason to stop all work. Only defer the specific blocked task and continue with unblocked tasks.
+
 Move tasks to Future Work ONLY if they meet ONE of these criteria:
 1. **Human work**: Requires human decision-making, judgment, or manual intervention (e.g., 'Ask user for design preference', 'Manual code review', 'Manual TUI verification')
 2. **External system work**: Requires external system deployment, approval, or configuration changes outside this repository (e.g., 'Deploy to production', 'Configure external API', 'Update cloud infrastructure')
