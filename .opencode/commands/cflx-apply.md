@@ -54,24 +54,47 @@ CRITICAL OPERATIONAL CONSTRAINTS:
 
 **Permission Error Handling**:
 When you encounter a permission error (e.g., "permission requested: read (...); auto-rejecting"):
-1. Identify the specific task that requires the blocked file/operation.
-2. Move ONLY that task to a `## Future Work` section in tasks.md.
-3. Remove the checkbox from the moved task.
-4. Include an actionable reason:
-   - Reason: Permission denied for [operation/file path]
-   - Required action: Update orchestrator permission config (for example `.cflx.jsonc`) to allow the specific operation.
-5. CONTINUE working on remaining tasks that do not require the blocked resource.
-6. If ALL remaining unchecked tasks are blocked by permission errors, stop with an error (do not report successful completion).
 
-Example scenario:
-- Task 1: Edit .env.template (permission denied) → Move to Future Work
-- Task 2: Remove ray imports (no permission needed) → Continue and complete
-- Task 3: Update tests (no permission needed) → Continue and complete
+**CRITICAL**: Do NOT exit immediately. Complete these steps BEFORE finishing:
 
-All-blocked scenario:
-- If Task 1..N all require blocked permission and no further actionable task remains, terminate apply as error with a concise permission-blocked summary.
+1. **Catch the error**: Note which file/operation was denied.
+2. **Update tasks.md IMMEDIATELY**:
+   - Identify the specific task that requires the blocked file/operation
+   - Move ONLY that task to a `## Future Work` section
+   - Remove the checkbox from the moved task
+   - Add explanation:
+     ```markdown
+     ## Future Work
+     - Task N: [original task description]
+       - Reason: Permission denied for [operation/file path]
+       - Required action: Update orchestrator permission config (`.cflx.jsonc`) to allow the operation
+     ```
+3. **Continue with remaining tasks**: Work on tasks that don't require the blocked resource.
+4. **Exit strategy**:
+   - If other tasks were completed: Exit with success (partial progress)
+   - If NO other tasks can proceed: Exit with error and permission-blocked summary
 
-CRITICAL: Permission errors are NOT a reason to stop all work. Only defer the specific blocked task and continue with unblocked tasks.
+Example workflow:
+```
+Task 1: Edit .env.template
+  → Permission denied
+  → Move Task 1 to Future Work in tasks.md
+  → Mark as complete: NO
+
+Task 2: Remove ray imports
+  → No permission needed
+  → Execute and complete
+  → Mark as complete: YES
+
+Task 3: Update tests
+  → No permission needed
+  → Execute and complete
+  → Mark as complete: YES
+
+Result: Exit with success (2/3 tasks done, 1 in Future Work)
+```
+
+**DO NOT** let permission errors stop you from updating tasks.md and continuing with other work.
 
 Move tasks to Future Work ONLY if they meet ONE of these criteria:
 1. **Human work**: Requires human decision-making, judgment, or manual intervention (e.g., 'Ask user for design preference', 'Manual code review', 'Manual TUI verification')

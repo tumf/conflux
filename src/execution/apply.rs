@@ -710,32 +710,19 @@ where
             output_collector.stderr_tail(),
         );
 
-        // Check for permission auto-reject before other error handling
-        if let Some(reject) = crate::permission::detect_permission_reject(
+        let permission_reject = crate::permission::detect_permission_reject(
             output_collector.stdout_tail().as_deref(),
             output_collector.stderr_tail().as_deref(),
-        ) {
-            let error_msg = reject.format_error_message();
+        );
+
+        if let Some(reject) = &permission_reject {
             warn!(
                 "Permission auto-reject detected for {}: {}",
                 change_id, reject.denied_path
             );
-
-            // Run on_error hook
-            if let Some(hook_runner) = hooks {
-                let error_ctx = hook_ctx
-                    .build_hook_context(change_id, progress.completed, progress.total, iteration)
-                    .with_error(&error_msg);
-                let _ = hook_runner.run_hook(HookType::OnError, &error_ctx).await;
-            }
-
-            return Err(OrchestratorError::PermissionBlocked {
-                denied_path: reject.denied_path,
-                guidance: error_msg,
-            });
         }
 
-        if !status.success() {
+        if !status.success() && permission_reject.is_none() {
             let error_msg = format!("Apply command failed with exit code: {:?}", status.code());
 
             // Run on_error hook
@@ -765,6 +752,43 @@ where
             "After apply #{}: {}/{} tasks complete",
             iteration, new_progress.completed, new_progress.total
         );
+
+        // Permission auto-reject is handled as a task-level block.
+        // If task state changed (e.g., blocked task moved to Future Work, or other tasks advanced),
+        // keep going. If no task state changed, fail with permission guidance.
+        if let Some(reject) = permission_reject {
+            let task_state_changed =
+                new_progress.completed > progress.completed || new_progress.total != progress.total;
+
+            if !task_state_changed {
+                let error_msg = reject.format_error_message();
+
+                // Run on_error hook
+                if let Some(hook_runner) = hooks {
+                    let error_ctx = hook_ctx
+                        .build_hook_context(
+                            change_id,
+                            new_progress.completed,
+                            new_progress.total,
+                            iteration,
+                        )
+                        .with_error(&error_msg);
+                    let _ = hook_runner.run_hook(HookType::OnError, &error_ctx).await;
+                }
+
+                return Err(OrchestratorError::PermissionBlocked {
+                    denied_path: reject.denied_path,
+                    guidance: error_msg,
+                });
+            }
+
+            if !status.success() {
+                warn!(
+                    "Apply command for {} exited non-zero but task state changed after permission auto-reject; continuing",
+                    change_id
+                );
+            }
+        }
 
         // Run post_apply hook
         if let Some(hook_runner) = hooks {
