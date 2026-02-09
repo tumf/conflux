@@ -643,4 +643,3 @@ tags:
   description: Orchestrator control endpoints
 - name: websocket
   description: WebSocket endpoints for real-time updates
-
