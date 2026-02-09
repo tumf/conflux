@@ -132,6 +132,17 @@ impl DynamicQueue {
         let mut stopped = self.stopped.lock().await;
         stopped.remove(id)
     }
+
+    /// Try to check if a change ID is marked as stopped (non-blocking)
+    /// Returns true if stopped, false if not stopped or lock is busy
+    /// This is used for synchronous cancel checks during execution
+    pub fn try_is_stopped(&self, id: &str) -> bool {
+        if let Ok(stopped) = self.stopped.try_lock() {
+            stopped.contains(id)
+        } else {
+            false
+        }
+    }
 }
 
 impl Default for DynamicQueue {

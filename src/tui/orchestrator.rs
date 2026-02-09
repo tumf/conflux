@@ -391,7 +391,19 @@ pub async fn run_orchestrator(
         // Process the change using SerialRunService
         use crate::serial_run_service::ChangeProcessResult;
         let cancel_token_clone = cancel_token.clone();
-        let cancel_check = move || cancel_token_clone.is_cancelled();
+
+        // Create a cancel_check that monitors both global cancel AND single-change stop
+        let dynamic_queue_clone = dynamic_queue.clone();
+        let change_id_for_cancel = change_id.clone();
+        let cancel_check = move || {
+            // Check global cancellation
+            if cancel_token_clone.is_cancelled() {
+                return true;
+            }
+            // Check single-change stop (non-blocking check)
+            dynamic_queue_clone.try_is_stopped(&change_id_for_cancel)
+        };
+
         let result = serial_service
             .process_change(
                 &change,
@@ -747,17 +759,39 @@ pub async fn run_orchestrator(
                 }
             }
             Err(e) => {
-                let error_msg = format!("Processing error for {}: {}", change_id, e);
-                let processing_error_event = OrchestratorEvent::ProcessingError {
-                    id: change_id.clone(),
-                    error: error_msg,
-                };
-                let _ = tx.send(processing_error_event.clone()).await;
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&processing_error_event).await;
+                // Check if this was a single-change stop (error message contains "Cancelled")
+                let error_str = e.to_string();
+                if error_str.contains("Cancelled") && dynamic_queue.try_is_stopped(&change_id) {
+                    // Clear the stop flag and send ChangeStopped event
+                    dynamic_queue.clear_stopped(&change_id).await;
+                    pending_changes.remove(&change_id);
+                    total_changes = total_changes.saturating_sub(1);
+                    let _ = tx
+                        .send(OrchestratorEvent::ChangeStopped {
+                            change_id: change_id.clone(),
+                        })
+                        .await;
+                    let _ = tx
+                        .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                            "Change stopped during execution: {}",
+                            change_id
+                        ))))
+                        .await;
+                    continue;
+                } else {
+                    // Regular error - treat as before
+                    let error_msg = format!("Processing error for {}: {}", change_id, e);
+                    let processing_error_event = OrchestratorEvent::ProcessingError {
+                        id: change_id.clone(),
+                        error: error_msg,
+                    };
+                    let _ = tx.send(processing_error_event.clone()).await;
+                    #[cfg(feature = "web-monitoring")]
+                    if let Some(ws) = &web_state {
+                        ws.apply_execution_event(&processing_error_event).await;
+                    }
+                    break;
                 }
-                break;
             }
         }
     }
