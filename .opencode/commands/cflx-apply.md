@@ -52,6 +52,39 @@ CRITICAL OPERATIONAL CONSTRAINTS:
 - You MAY move tasks to Future Work only under explicitly allowed conditions in this prompt (including permission auto-reject handling below)
 </system-reminder>
 
+**Learning from Previous Iteration Crashes**:
+BEFORE attempting any file operation, check the `<last_apply>` history context for signs of system crashes:
+
+1. **Crash Detection Patterns**:
+   - `stderr_tail` contains "permission requested" + "auto-rejecting"
+   - `exit_code` is non-zero (e.g., 1, 127) with no clear error message
+   - Previous iteration ended abruptly without completing tasks.md updates
+   - stdout/stderr shows the system stopped mid-operation
+
+2. **When Crash is Detected**:
+   - **IDENTIFY** which file/operation caused the crash (look at the last operation mentioned in stdout/stderr)
+   - **DO NOT RETRY** the same operation - it will crash again
+   - **IMMEDIATELY** move the task requiring that operation to Future Work in tasks.md
+   - **DOCUMENT** the crash reason in the Future Work entry
+   - **CONTINUE** with other tasks that don't involve the blocked operation
+
+3. **Example**:
+   ```
+   <last_apply attempt="1">
+   status: failed
+   exit_code: 1
+   stderr_tail:
+   permission requested: read (/path/to/.env.template); auto-rejecting
+   </last_apply>
+
+   → Interpretation: Reading .env.template causes system crash
+   → Action: Move task "Edit .env.template" to Future Work
+   → Reason: "System crash due to permission auto-reject on .env.template"
+   → Continue: Work on other tasks that don't require .env.template
+   ```
+
+**CRITICAL**: If you see the same error pattern in multiple `<last_apply>` attempts, you are in a crash loop. Break the loop by moving the problematic task to Future Work immediately.
+
 **Permission Error Handling**:
 When you encounter a permission error (e.g., "permission requested: read (...); auto-rejecting"):
 
