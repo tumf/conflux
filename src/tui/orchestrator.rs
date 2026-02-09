@@ -238,6 +238,25 @@ pub async fn run_orchestrator(
         let change_id = change.id.clone();
         let change = change.clone();
 
+        // Check if this change has been stopped (single-change stop)
+        if dynamic_queue.is_stopped(&change_id).await {
+            dynamic_queue.clear_stopped(&change_id).await;
+            pending_changes.remove(&change_id);
+            total_changes = total_changes.saturating_sub(1);
+            let _ = tx
+                .send(OrchestratorEvent::ChangeStopped {
+                    change_id: change_id.clone(),
+                })
+                .await;
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                    "Change stopped: {}",
+                    change_id
+                ))))
+                .await;
+            continue;
+        }
+
         // Notify processing started
         let processing_started_event = OrchestratorEvent::ProcessingStarted(change_id.clone());
         let _ = tx.send(processing_started_event.clone()).await;
@@ -372,7 +391,25 @@ pub async fn run_orchestrator(
         // Process the change using SerialRunService
         use crate::serial_run_service::ChangeProcessResult;
         let cancel_token_clone = cancel_token.clone();
-        let cancel_check = move || cancel_token_clone.is_cancelled();
+
+        // Create a cancel_check that monitors both global cancel AND single-change stop
+        let dynamic_queue_clone = dynamic_queue.clone();
+        let change_id_for_cancel = change_id.clone();
+        let cancel_check = move || {
+            // Check global cancellation
+            if cancel_token_clone.is_cancelled() {
+                return true;
+            }
+            // Check single-change stop (non-blocking check)
+            dynamic_queue_clone.try_is_stopped(&change_id_for_cancel)
+        };
+
+        // Create a closure that only checks single-change stop
+        let dynamic_queue_clone2 = dynamic_queue.clone();
+        let change_id_for_single_stop = change_id.clone();
+        let is_single_change_stopped =
+            move || dynamic_queue_clone2.try_is_stopped(&change_id_for_single_stop);
+
         let result = serial_service
             .process_change(
                 &change,
@@ -383,6 +420,7 @@ pub async fn run_orchestrator(
                 total_changes,
                 remaining_changes,
                 cancel_check,
+                is_single_change_stopped,
                 Some(current_operation.clone()),
             )
             .await;
@@ -411,6 +449,25 @@ pub async fn run_orchestrator(
                     .await;
                 pending_changes.clear();
                 break;
+            }
+            Ok(ChangeProcessResult::ChangeStopped) => {
+                // Clear the stopped flag to allow re-queueing
+                dynamic_queue.clear_stopped(&change_id).await;
+                // Send ChangeStopped event to move the change to not queued
+                let _ = tx
+                    .send(OrchestratorEvent::ChangeStopped {
+                        change_id: change_id.clone(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                        "Change {} stopped, continuing with other queued changes",
+                        change_id
+                    ))))
+                    .await;
+                // Remove this change from pending but continue processing others
+                pending_changes.retain(|id| id != &change_id);
+                continue;
             }
             Ok(ChangeProcessResult::AcceptancePassed) => {
                 // Send ApplyCompleted event
@@ -728,17 +785,39 @@ pub async fn run_orchestrator(
                 }
             }
             Err(e) => {
-                let error_msg = format!("Processing error for {}: {}", change_id, e);
-                let processing_error_event = OrchestratorEvent::ProcessingError {
-                    id: change_id.clone(),
-                    error: error_msg,
-                };
-                let _ = tx.send(processing_error_event.clone()).await;
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&processing_error_event).await;
+                // Check if this was a single-change stop (error message contains "Cancelled")
+                let error_str = e.to_string();
+                if error_str.contains("Cancelled") && dynamic_queue.try_is_stopped(&change_id) {
+                    // Clear the stop flag and send ChangeStopped event
+                    dynamic_queue.clear_stopped(&change_id).await;
+                    pending_changes.remove(&change_id);
+                    total_changes = total_changes.saturating_sub(1);
+                    let _ = tx
+                        .send(OrchestratorEvent::ChangeStopped {
+                            change_id: change_id.clone(),
+                        })
+                        .await;
+                    let _ = tx
+                        .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                            "Change stopped during execution: {}",
+                            change_id
+                        ))))
+                        .await;
+                    continue;
+                } else {
+                    // Regular error - treat as before
+                    let error_msg = format!("Processing error for {}: {}", change_id, e);
+                    let processing_error_event = OrchestratorEvent::ProcessingError {
+                        id: change_id.clone(),
+                        error: error_msg,
+                    };
+                    let _ = tx.send(processing_error_event.clone()).await;
+                    #[cfg(feature = "web-monitoring")]
+                    if let Some(ws) = &web_state {
+                        ws.apply_execution_event(&processing_error_event).await;
+                    }
+                    break;
                 }
-                break;
             }
         }
     }

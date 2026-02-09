@@ -198,7 +198,7 @@ impl SerialRunService {
     /// Returns `Ok(ChangeProcessResult)` indicating the outcome.
     /// Callers should handle the result and decide whether to continue the loop.
     #[allow(clippy::too_many_arguments)]
-    pub async fn process_change<O: OutputHandler, F>(
+    pub async fn process_change<O: OutputHandler, F, G>(
         &mut self,
         change: &Change,
         agent: &mut AgentRunner,
@@ -208,10 +208,12 @@ impl SerialRunService {
         total_changes: usize,
         remaining_changes: usize,
         cancel_check: F,
+        is_single_change_stopped: G,
         operation_tracker: Option<std::sync::Arc<std::sync::RwLock<String>>>,
     ) -> Result<ChangeProcessResult>
     where
         F: Fn() -> bool + Clone + Send + 'static,
+        G: Fn() -> bool + Clone,
     {
         self.iteration += 1;
         let change_id = &change.id;
@@ -265,6 +267,7 @@ impl SerialRunService {
                 remaining_changes,
                 apply_count,
                 &cancel_check,
+                &is_single_change_stopped,
                 operation_tracker,
             )
             .await
@@ -355,7 +358,7 @@ impl SerialRunService {
 
     /// Internal method to apply a change
     #[allow(clippy::too_many_arguments)]
-    async fn apply_change_internal<O: OutputHandler, F>(
+    async fn apply_change_internal<O: OutputHandler, F, G>(
         &mut self,
         change: &Change,
         agent: &mut AgentRunner,
@@ -366,10 +369,12 @@ impl SerialRunService {
         remaining_changes: usize,
         _apply_count: u32,
         cancel_check: &F,
+        is_single_change_stopped: &G,
         operation_tracker: Option<std::sync::Arc<std::sync::RwLock<String>>>,
     ) -> Result<ChangeProcessResult>
     where
         F: Fn() -> bool + Clone + Send + 'static,
+        G: Fn() -> bool + Clone,
     {
         info!("Applying change: {}", change.id);
 
@@ -482,9 +487,12 @@ impl SerialRunService {
                 )
                 .await
                 {
-                    Ok((result, _attempt_number, _command)) => {
-                        Ok(self.process_acceptance_result(&change.id, agent, result))
-                    }
+                    Ok((result, _attempt_number, _command)) => Ok(self.process_acceptance_result(
+                        &change.id,
+                        agent,
+                        result,
+                        is_single_change_stopped,
+                    )),
                     Err(e) => {
                         error!("Acceptance error for {}: {}", change.id, e);
                         Err(e)
@@ -552,12 +560,16 @@ impl SerialRunService {
     ///
     /// Handles Pass, Continue, Fail, CommandFailed, and Cancelled results,
     /// applying max_continues logic for Continue results.
-    fn process_acceptance_result(
+    fn process_acceptance_result<F>(
         &self,
         change_id: &str,
         agent: &AgentRunner,
         acceptance_result: AcceptanceResult,
-    ) -> ChangeProcessResult {
+        is_single_change_stopped: F,
+    ) -> ChangeProcessResult
+    where
+        F: Fn() -> bool,
+    {
         match acceptance_result {
             AcceptanceResult::Pass => {
                 info!("Acceptance passed for {}, ready for archive", change_id);
@@ -603,8 +615,14 @@ impl SerialRunService {
                 ChangeProcessResult::AcceptanceCommandFailed { error }
             }
             AcceptanceResult::Cancelled => {
-                info!("Acceptance cancelled for {}", change_id);
-                ChangeProcessResult::Cancelled
+                // Check if this is a single-change stop or global cancel
+                if is_single_change_stopped() {
+                    info!("Single change {} stopped during acceptance", change_id);
+                    ChangeProcessResult::ChangeStopped
+                } else {
+                    info!("Acceptance cancelled for {} (global cancel)", change_id);
+                    ChangeProcessResult::Cancelled
+                }
             }
         }
     }
@@ -632,8 +650,10 @@ pub enum ChangeProcessResult {
     Stalled { error: String },
     /// Archive or apply failed
     Failed { error: String },
-    /// Operation was cancelled
+    /// Operation was cancelled (global stop)
     Cancelled,
+    /// Single change was stopped (not a global cancel)
+    ChangeStopped,
     /// Apply succeeded but tasks not yet complete
     ApplySuccessIncomplete,
     /// Apply failed
@@ -776,8 +796,12 @@ mod tests {
 
         let agent = AgentRunner::new(OrchestratorConfig::default());
 
-        let result =
-            service.process_acceptance_result("test-change", &agent, AcceptanceResult::Blocked);
+        let result = service.process_acceptance_result(
+            "test-change",
+            &agent,
+            AcceptanceResult::Blocked,
+            || false, // Not a single-change stop
+        );
 
         assert!(matches!(result, ChangeProcessResult::AcceptanceBlocked));
     }

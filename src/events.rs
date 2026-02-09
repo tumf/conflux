@@ -412,6 +412,11 @@ pub enum ExecutionEvent {
     BranchMergeCompleted { branch_name: String },
     /// Branch merge failed (TUI worktree view)
     BranchMergeFailed { branch_name: String, error: String },
+    /// Change stopped successfully (single-change stop)
+    ChangeStopped { change_id: String },
+    /// Change stop failed (single-change stop)
+    #[allow(dead_code)]
+    ChangeStopFailed { change_id: String, error: String },
 }
 
 /// Helper to send events through the channel.

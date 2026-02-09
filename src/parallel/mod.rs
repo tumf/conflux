@@ -2398,6 +2398,27 @@ Requirements:\n\
         in_flight: &mut HashSet<String>,
         cleanup_guard: &mut WorkspaceCleanupGuard,
     ) -> Result<()> {
+        // Check if this change has been stopped (single-change stop)
+        if let Some(ref queue) = self.dynamic_queue {
+            if queue.is_stopped(&change_id).await {
+                queue.clear_stopped(&change_id).await;
+                info!("Change '{}' stopped before dispatch", change_id);
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::ChangeStopped {
+                        change_id: change_id.clone(),
+                    },
+                )
+                .await;
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::info(format!("Change stopped: {}", change_id))),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
         // Check if already in-flight (avoid duplicate dispatch)
         if in_flight.contains(&change_id) {
             warn!(
@@ -2444,6 +2465,7 @@ Requirements:\n\
         let cancel_token = self.cancel_token.clone();
         let shared_stagger_state = self.shared_stagger_state.clone();
         let base_branch = self.workspace_manager.original_branch();
+        let dynamic_queue = self.dynamic_queue.clone();
 
         // Spawn apply + acceptance + archive task
         join_set.spawn(async move {
@@ -2457,14 +2479,73 @@ Requirements:\n\
             let mut cycle_count = 0u32;
             let mut cumulative_iteration = 0u32; // Track total apply iterations across all cycles
 
+            // Create a per-change cancel token that monitors both global cancel and single-change stop
+            let per_change_cancel = CancellationToken::new();
+            let monitor_cancel = per_change_cancel.clone();
+            let monitor_global = cancel_token.clone();
+            let monitor_queue = dynamic_queue.clone();
+            let monitor_change_id = change_id.clone();
+
+            // Spawn a background task to monitor both cancellation sources
+            let cancel_monitor = tokio::spawn(async move {
+                loop {
+                    // Check global cancellation
+                    if let Some(ref token) = monitor_global {
+                        if token.is_cancelled() {
+                            monitor_cancel.cancel();
+                            break;
+                        }
+                    }
+
+                    // Check single-change stop
+                    if let Some(ref queue) = monitor_queue {
+                        if queue.is_stopped(&monitor_change_id).await {
+                            monitor_cancel.cancel();
+                            break;
+                        }
+                    }
+
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            });
+
             // Apply+Acceptance loop: retry apply when acceptance fails
             let _apply_revision = loop {
+                // Check if this change has been stopped (single-change stop)
+                if let Some(ref queue) = dynamic_queue {
+                    if queue.is_stopped(&change_id).await {
+                        queue.clear_stopped(&change_id).await;
+                        info!("Change '{}' stopped during execution", change_id);
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::ChangeStopped {
+                                    change_id: change_id.clone(),
+                                })
+                                .await;
+                            let _ = tx
+                                .send(ParallelEvent::Log(LogEntry::info(format!(
+                                    "Change stopped: {}",
+                                    change_id
+                                ))))
+                                .await;
+                        }
+                        cancel_monitor.abort();
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: None, // No error - intentionally stopped
+                        };
+                    }
+                }
+
                 cycle_count += 1;
                 if cycle_count > MAX_APPLY_ACCEPTANCE_CYCLES {
                     error!(
                         "Max apply+acceptance cycles ({}) reached for {}",
                         MAX_APPLY_ACCEPTANCE_CYCLES, change_id
                     );
+                    cancel_monitor.abort();
                     return WorkspaceResult {
                         change_id,
                         workspace_name: workspace.name,
@@ -2477,6 +2558,7 @@ Requirements:\n\
                 }
 
                 // Step 1: Execute apply with cumulative iteration count
+                // Use per-change cancel token that monitors both global and single-change stop
                 let apply_result = execute_apply_in_workspace(
                     &change_id,
                     &workspace.path,
@@ -2486,7 +2568,7 @@ Requirements:\n\
                     vcs_backend,
                     None, // hooks
                     None, // parallel_ctx
-                    cancel_token.as_ref(),
+                    Some(&per_change_cancel),
                     &ai_runner,
                     &repo_root,
                     &apply_history,
@@ -2499,7 +2581,38 @@ Requirements:\n\
                 let (revision, final_iteration) = match apply_result {
                     Ok((rev, iter)) => (rev, iter),
                     Err(e) => {
+                        // Check if this was a single-change stop
+                        let error_str = e.to_string();
+                        if error_str.contains("Cancelled") {
+                            if let Some(ref queue) = dynamic_queue {
+                                if queue.is_stopped(&change_id).await {
+                                    queue.clear_stopped(&change_id).await;
+                                    info!("Change '{}' stopped during apply", change_id);
+                                    if let Some(ref tx) = event_tx {
+                                        let _ = tx
+                                            .send(ParallelEvent::ChangeStopped {
+                                                change_id: change_id.clone(),
+                                            })
+                                            .await;
+                                        let _ = tx
+                                            .send(ParallelEvent::Log(LogEntry::info(format!(
+                                                "Change stopped: {}",
+                                                change_id
+                                            ))))
+                                            .await;
+                                    }
+                                    cancel_monitor.abort();
+                                    return WorkspaceResult {
+                                        change_id,
+                                        workspace_name: workspace.name,
+                                        final_revision: None,
+                                        error: None, // No error - intentionally stopped
+                                    };
+                                }
+                            }
+                        }
                         // Apply failed - return error immediately
+                        cancel_monitor.abort();
                         return WorkspaceResult {
                             change_id,
                             workspace_name: workspace.name,
@@ -2546,7 +2659,7 @@ Requirements:\n\
                     &workspace.path,
                     &mut agent,
                     event_tx.clone(),
-                    cancel_token.as_ref(),
+                    Some(&per_change_cancel),
                     &ai_runner,
                     &config,
                     &acceptance_tail_injected,
@@ -2695,7 +2808,36 @@ Requirements:\n\
                         };
                     }
                     Ok((crate::orchestration::AcceptanceResult::Cancelled, _acceptance_iteration)) => {
+                        // Check if this was a single-change stop
+                        if let Some(ref queue) = dynamic_queue {
+                            if queue.is_stopped(&change_id).await {
+                                queue.clear_stopped(&change_id).await;
+                                info!("Change '{}' stopped during acceptance", change_id);
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::ChangeStopped {
+                                            change_id: change_id.clone(),
+                                        })
+                                        .await;
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(LogEntry::info(format!(
+                                            "Change stopped: {}",
+                                            change_id
+                                        ))))
+                                        .await;
+                                }
+                                cancel_monitor.abort();
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name: workspace.name,
+                                    final_revision: None,
+                                    error: None, // No error - intentionally stopped
+                                };
+                            }
+                        }
+                        // Global cancellation
                         info!("Acceptance cancelled for {}", change_id);
+                        cancel_monitor.abort();
                         return WorkspaceResult {
                             change_id,
                             workspace_name: workspace.name,
@@ -2704,7 +2846,38 @@ Requirements:\n\
                         };
                     }
                     Err(e) => {
+                        // Check if this was a single-change stop (error contains "Cancelled")
+                        let error_str = e.to_string();
+                        if error_str.contains("Cancelled") {
+                            if let Some(ref queue) = dynamic_queue {
+                                if queue.is_stopped(&change_id).await {
+                                    queue.clear_stopped(&change_id).await;
+                                    info!("Change '{}' stopped during acceptance", change_id);
+                                    if let Some(ref tx) = event_tx {
+                                        let _ = tx
+                                            .send(ParallelEvent::ChangeStopped {
+                                                change_id: change_id.clone(),
+                                            })
+                                            .await;
+                                        let _ = tx
+                                            .send(ParallelEvent::Log(LogEntry::info(format!(
+                                                "Change stopped: {}",
+                                                change_id
+                                            ))))
+                                            .await;
+                                    }
+                                    cancel_monitor.abort();
+                                    return WorkspaceResult {
+                                        change_id,
+                                        workspace_name: workspace.name,
+                                        final_revision: None,
+                                        error: None, // No error - intentionally stopped
+                                    };
+                                }
+                            }
+                        }
                         error!("Acceptance error for {}: {}", change_id, e);
+                        cancel_monitor.abort();
                         return WorkspaceResult {
                             change_id,
                             workspace_name: workspace.name,
@@ -2736,7 +2909,7 @@ Requirements:\n\
                 vcs_backend,
                 None, // hooks
                 None, // parallel_ctx
-                cancel_token.as_ref(),
+                Some(&per_change_cancel),
                 &ai_runner,
                 &archive_history,
                 &apply_history,
@@ -2754,6 +2927,7 @@ Requirements:\n\
                             .send(ParallelEvent::ChangeArchived(change_id.clone()))
                             .await;
                     }
+                    cancel_monitor.abort();
                     WorkspaceResult {
                         change_id,
                         workspace_name: workspace.name,
@@ -2762,6 +2936,36 @@ Requirements:\n\
                     }
                 }
                 Err(e) => {
+                    // Check if this was a single-change stop (error contains "Cancelled")
+                    let error_str = e.to_string();
+                    if error_str.contains("Cancelled") {
+                        if let Some(ref queue) = dynamic_queue {
+                            if queue.is_stopped(&change_id).await {
+                                queue.clear_stopped(&change_id).await;
+                                info!("Change '{}' stopped during archive", change_id);
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::ChangeStopped {
+                                            change_id: change_id.clone(),
+                                        })
+                                        .await;
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(LogEntry::info(format!(
+                                            "Change stopped: {}",
+                                            change_id
+                                        ))))
+                                        .await;
+                                }
+                                cancel_monitor.abort();
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name: workspace.name,
+                                    final_revision: None,
+                                    error: None, // No error - intentionally stopped
+                                };
+                            }
+                        }
+                    }
                     warn!("Archive failed for {}: {}", change_id, e);
                     if let Some(ref tx) = event_tx {
                         let _ = tx
@@ -2771,6 +2975,7 @@ Requirements:\n\
                             })
                             .await;
                     }
+                    cancel_monitor.abort();
                     // Archive failed - do not merge unarchived changes
                     WorkspaceResult {
                         change_id,

@@ -47,4 +47,6 @@ pub enum TuiCommand {
         worktree_path: PathBuf,
         branch_name: String,
     },
+    /// Stop a single active change (during Running mode)
+    StopChange(String),
 }
