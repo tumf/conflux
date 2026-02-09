@@ -36,6 +36,7 @@ mod orchestration;
 mod orchestrator;
 mod parallel;
 mod parallel_run_service;
+mod permission;
 mod process_manager;
 mod progress;
 mod serial_run_service;

@@ -134,6 +134,9 @@ pub async fn execute_apply_in_workspace(
     // Create AgentRunner for execute_apply_loop
     let mut agent = AgentRunner::new(config.clone());
 
+    // Clone event_tx for permission error handling before moving it to event_handler
+    let event_tx_for_permission = event_tx.clone();
+
     // Create event handler for apply loop
     let event_handler = ParallelApplyEventHandler::new(change_id.to_string(), event_tx);
 
@@ -162,7 +165,7 @@ pub async fn execute_apply_in_workspace(
     );
 
     // Execute apply loop using common implementation
-    let apply_result = common_apply::execute_apply_loop(
+    let apply_result = match common_apply::execute_apply_loop(
         change_id,
         workspace_path,
         config,
@@ -178,7 +181,40 @@ pub async fn execute_apply_in_workspace(
             // Output is handled by event_handler
         },
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result,
+        Err(crate::error::OrchestratorError::PermissionBlocked {
+            denied_path,
+            guidance,
+        }) => {
+            // Permission blocked - emit event and return error with guidance
+            use tracing::warn;
+            warn!(
+                "Permission auto-rejected for {} in workspace {}: {}",
+                change_id,
+                workspace_path.display(),
+                denied_path
+            );
+
+            // Send event if event_tx is available
+            if let Some(ref tx) = event_tx_for_permission {
+                use crate::parallel::ParallelEvent;
+                let _ = tx
+                    .send(ParallelEvent::ApplyFailed {
+                        change_id: change_id.to_string(),
+                        error: format!("Permission auto-rejected: {}\n{}", denied_path, guidance),
+                    })
+                    .await;
+            }
+
+            return Err(crate::error::OrchestratorError::PermissionBlocked {
+                denied_path,
+                guidance,
+            });
+        }
+        Err(e) => return Err(e),
+    };
 
     // Return revision and iteration count
     Ok((apply_result.revision, apply_result.iterations))

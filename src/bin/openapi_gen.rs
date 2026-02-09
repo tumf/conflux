@@ -58,5 +58,8 @@ fn main() {
     let openapi = ApiDoc::openapi();
     let yaml = serde_yaml::to_string(&openapi).expect("Failed to serialize OpenAPI spec to YAML");
 
-    println!("{}", yaml);
+    // Print YAML without trailing newline, then add exactly one newline
+    // This ensures compatibility with end-of-file-fixer pre-commit hook
+    print!("{}", yaml.trim_end());
+    println!();
 }

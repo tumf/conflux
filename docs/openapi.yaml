@@ -7,7 +7,7 @@ info:
     url: https://github.com/anomalyco/conflux
   license:
     name: ''
-  version: 0.4.27
+  version: 0.4.28
 paths:
   /api/changes:
     get:
@@ -643,4 +643,3 @@ tags:
   description: Orchestrator control endpoints
 - name: websocket
   description: WebSocket endpoints for real-time updates
-
