@@ -456,11 +456,16 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
 
     let mut keys = vec!["↑↓/jk: move"];
     if let Some(item) = current_item {
-        keys.push(if item.selected {
-            "Space: unqueue"
+        // Show "Space: stop" for active changes, otherwise "Space: queue/unqueue"
+        if item.queue_status.is_active() {
+            keys.push("Space: stop");
         } else {
-            "Space: queue"
-        });
+            keys.push(if item.selected {
+                "Space: unqueue"
+            } else {
+                "Space: queue"
+            });
+        }
         keys.push(if item.is_approved {
             "@: unapprove"
         } else {
@@ -771,11 +776,16 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
     let mut keys = vec!["↑↓/jk: move"];
     if let Some(item) = current_item {
-        keys.push(if item.selected {
-            "Space: unqueue"
+        // Show "Space: stop" for active changes, otherwise "Space: queue/unqueue"
+        if item.queue_status.is_active() {
+            keys.push("Space: stop");
         } else {
-            "Space: queue"
-        });
+            keys.push(if item.selected {
+                "Space: unqueue"
+            } else {
+                "Space: queue"
+            });
+        }
         keys.push(if item.is_approved {
             "@: unapprove"
         } else {

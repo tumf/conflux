@@ -20,6 +20,8 @@ use tokio::sync::{Mutex, Notify};
 pub struct DynamicQueue {
     inner: Arc<Mutex<VecDeque<String>>>,
     removed: Arc<Mutex<HashSet<String>>>,
+    /// Set of change IDs that have been stopped
+    stopped: Arc<Mutex<HashSet<String>>>,
     /// Notification for queue changes (used to wake up re-analysis loop)
     notify: Arc<Notify>,
 }
@@ -30,6 +32,7 @@ impl DynamicQueue {
         Self {
             inner: Arc::new(Mutex::new(VecDeque::new())),
             removed: Arc::new(Mutex::new(HashSet::new())),
+            stopped: Arc::new(Mutex::new(HashSet::new())),
             notify: Arc::new(Notify::new()),
         }
     }
@@ -109,6 +112,25 @@ impl DynamicQueue {
     /// This is used by the re-analysis loop to wake up when new items are added
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
+    }
+
+    /// Mark a change ID as stopped (single-change stop)
+    /// Returns true if the ID was newly marked for stopping
+    pub async fn mark_stopped(&self, id: String) -> bool {
+        let mut stopped = self.stopped.lock().await;
+        stopped.insert(id)
+    }
+
+    /// Check if a change ID is marked as stopped
+    pub async fn is_stopped(&self, id: &str) -> bool {
+        let stopped = self.stopped.lock().await;
+        stopped.contains(id)
+    }
+
+    /// Clear the stopped marker for a change ID (e.g., after stop completion)
+    pub async fn clear_stopped(&self, id: &str) -> bool {
+        let mut stopped = self.stopped.lock().await;
+        stopped.remove(id)
     }
 }
 

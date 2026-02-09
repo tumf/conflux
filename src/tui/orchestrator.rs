@@ -238,6 +238,25 @@ pub async fn run_orchestrator(
         let change_id = change.id.clone();
         let change = change.clone();
 
+        // Check if this change has been stopped (single-change stop)
+        if dynamic_queue.is_stopped(&change_id).await {
+            dynamic_queue.clear_stopped(&change_id).await;
+            pending_changes.remove(&change_id);
+            total_changes = total_changes.saturating_sub(1);
+            let _ = tx
+                .send(OrchestratorEvent::ChangeStopped {
+                    change_id: change_id.clone(),
+                })
+                .await;
+            let _ = tx
+                .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                    "Change stopped: {}",
+                    change_id
+                ))))
+                .await;
+            continue;
+        }
+
         // Notify processing started
         let processing_started_event = OrchestratorEvent::ProcessingStarted(change_id.clone());
         let _ = tx.send(processing_started_event.clone()).await;

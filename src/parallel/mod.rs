@@ -2398,6 +2398,27 @@ Requirements:\n\
         in_flight: &mut HashSet<String>,
         cleanup_guard: &mut WorkspaceCleanupGuard,
     ) -> Result<()> {
+        // Check if this change has been stopped (single-change stop)
+        if let Some(ref queue) = self.dynamic_queue {
+            if queue.is_stopped(&change_id).await {
+                queue.clear_stopped(&change_id).await;
+                info!("Change '{}' stopped before dispatch", change_id);
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::ChangeStopped {
+                        change_id: change_id.clone(),
+                    },
+                )
+                .await;
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::info(format!("Change stopped: {}", change_id))),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
         // Check if already in-flight (avoid duplicate dispatch)
         if in_flight.contains(&change_id) {
             warn!(
@@ -2444,6 +2465,7 @@ Requirements:\n\
         let cancel_token = self.cancel_token.clone();
         let shared_stagger_state = self.shared_stagger_state.clone();
         let base_branch = self.workspace_manager.original_branch();
+        let dynamic_queue = self.dynamic_queue.clone();
 
         // Spawn apply + acceptance + archive task
         join_set.spawn(async move {
@@ -2459,6 +2481,33 @@ Requirements:\n\
 
             // Apply+Acceptance loop: retry apply when acceptance fails
             let _apply_revision = loop {
+                // Check if this change has been stopped (single-change stop)
+                if let Some(ref queue) = dynamic_queue {
+                    if queue.is_stopped(&change_id).await {
+                        queue.clear_stopped(&change_id).await;
+                        info!("Change '{}' stopped during execution", change_id);
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::ChangeStopped {
+                                    change_id: change_id.clone(),
+                                })
+                                .await;
+                            let _ = tx
+                                .send(ParallelEvent::Log(LogEntry::info(format!(
+                                    "Change stopped: {}",
+                                    change_id
+                                ))))
+                                .await;
+                        }
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: None, // No error - intentionally stopped
+                        };
+                    }
+                }
+
                 cycle_count += 1;
                 if cycle_count > MAX_APPLY_ACCEPTANCE_CYCLES {
                     error!(

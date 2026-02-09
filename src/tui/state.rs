@@ -1313,6 +1313,12 @@ impl AppState {
                 self.handle_branch_merge_failed(branch_name, error)
             }
 
+            // Single-change stop events
+            OrchestratorEvent::ChangeStopped { change_id } => self.handle_change_stopped(change_id),
+            OrchestratorEvent::ChangeStopFailed { change_id, error } => {
+                self.handle_change_stop_failed(change_id, error)
+            }
+
             // Refresh events
             OrchestratorEvent::ChangesRefreshed {
                 changes,
@@ -1840,6 +1846,27 @@ impl AppState {
         if let Some(wt) = self.worktrees.iter_mut().find(|w| w.branch == branch_name) {
             wt.is_merging = false;
         }
+    }
+
+    fn handle_change_stopped(&mut self, change_id: String) {
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            // Transition to NotQueued and clear execution mark
+            change.queue_status = QueueStatus::NotQueued;
+            change.selected = false;
+            // Record elapsed time
+            if let Some(started) = change.started_at {
+                change.elapsed_time = Some(started.elapsed());
+            }
+        }
+        self.add_log(LogEntry::info(format!("Stopped: {}", change_id)));
+    }
+
+    fn handle_change_stop_failed(&mut self, change_id: String, error: String) {
+        // Keep the change in its current state on stop failure
+        self.add_log(LogEntry::error(format!(
+            "Failed to stop {}: {}",
+            change_id, error
+        )));
     }
 
     fn handle_dependency_blocked(&mut self, change_id: String) {
@@ -2389,25 +2416,20 @@ mod guards {
         queue_status: &QueueStatus,
         change_id: &str,
     ) -> ToggleGuardResult {
-        // Cannot toggle active (in-flight) changes
-        if queue_status.is_active() {
-            return ToggleGuardResult::Blocked(format!(
-                "Cannot toggle change '{}' while it is {}",
-                change_id,
-                queue_status.display()
-            ));
-        }
+        // Active (in-flight) changes can be stopped via Space key in Running mode
+        // This is allowed and handled by handle_toggle_running_mode
+        // No need to block here
 
-        // Cannot select unapproved changes
-        if !is_approved {
+        // Cannot select unapproved changes (only applies to non-active states)
+        if !is_approved && !queue_status.is_active() {
             return ToggleGuardResult::Blocked(format!(
                 "Cannot queue unapproved change '{}'. Press @ to approve first.",
                 change_id
             ));
         }
 
-        // Cannot select uncommitted changes in parallel mode
-        if parallel_mode && !is_parallel_eligible {
+        // Cannot select uncommitted changes in parallel mode (only applies to non-active states)
+        if parallel_mode && !is_parallel_eligible && !queue_status.is_active() {
             return ToggleGuardResult::Blocked(format!(
                 "Cannot queue uncommitted change '{}' in parallel mode. Commit it first.",
                 change_id
@@ -2487,7 +2509,17 @@ mod guards {
                 };
                 ToggleActionResult::StateOnly(Some(log_msg))
             }
-            // Processing, Completed, Archived, Error - cannot change status
+            QueueStatus::Applying
+            | QueueStatus::Accepting
+            | QueueStatus::Archiving
+            | QueueStatus::Resolving => {
+                // Active (in-flight) changes: issue stop request
+                // State transition happens when ChangeStopped event is received
+                let id = change.id.clone();
+                let log_msg = format!("Stop requested: {}", id);
+                ToggleActionResult::Command(TuiCommand::StopChange(id), Some(log_msg))
+            }
+            // Completed, Archived, Merged, Blocked, Error - cannot change status
             _ => ToggleActionResult::None,
         }
     }

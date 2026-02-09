@@ -585,6 +585,15 @@ pub async fn handle_tui_command(
                 }
             });
         }
+        TuiCommand::StopChange(id) => {
+            // Stop a single active change (serial/parallel modes)
+            // For serial mode: set a flag that orchestrator checks before each operation
+            // For parallel mode: cancel the workspace task for this change
+            ctx.app
+                .add_log(LogEntry::info(format!("Stop request received for: {}", id)));
+            // The actual cancellation is handled by the orchestrator via dynamic_queue.mark_stopped()
+            ctx.dynamic_queue.mark_stopped(id.clone()).await;
+        }
         TuiCommand::ResolveMerge(id) => {
             let resolve_tx = ctx.tx.clone();
             let resolve_repo_root = ctx.repo_root.to_path_buf();
