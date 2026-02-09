@@ -1,0 +1,11 @@
+## 1. Implementation
+- [ ] 1.1 TUIの単体停止コマンド追加（`TuiCommand::StopChange`）と入力分岐の実装。active changeでSpaceを押した場合に停止要求を送る。キーヒントはactive行で`Space: stop`を表示する。
+  - Verify: `src/tui/events.rs`, `src/tui/key_handlers.rs`, `src/tui/render.rs` を確認し、active行のSpaceが停止要求へ分岐していること
+- [ ] 1.2 停止完了/失敗イベント（`ChangeStopped`/`ChangeStopFailed`）の追加と、停止完了時の`not queued`遷移・実行マーク解除の反映。
+  - Verify: `src/tui/state.rs` のイベント処理に追加され、`selected=false`/`queue_status=NotQueued`になることを確認
+- [ ] 1.3 Serial実行の単体キャンセル経路を追加し、停止対象のみ中断して残りのqueuedを継続する。
+  - Verify: `src/tui/orchestrator.rs` または `src/serial_run_service.rs` でchange単位のキャンセル判定が行われ、停止対象のみが除外されることを確認
+- [ ] 1.4 Parallel実行でchange単位のキャンセルを導入し、in-flightから除外後に再分析が走るようにする。
+  - Verify: `src/parallel/mod.rs` にキャンセル受付と`needs_reanalysis`の更新が入り、queuedが残る場合に再分析が走ることを確認
+- [ ] 1.5 仕様差分の作成と検証。
+  - Verify: `npx @fission-ai/openspec@latest validate add-single-change-stop --strict --no-interactive`
