@@ -60,6 +60,12 @@ pub enum OrchestratorError {
     #[error("No VCS backend available for parallel execution")]
     #[allow(dead_code)] // Reserved for future use when git is unavailable
     NoVcsBackend,
+
+    #[error("Permission auto-rejected: {denied_path}\n{guidance}")]
+    PermissionBlocked {
+        denied_path: String,
+        guidance: String,
+    },
 }
 
 #[allow(dead_code)] // Legacy API helpers, kept for backward compatibility
