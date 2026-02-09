@@ -451,6 +451,8 @@ pub async fn run_orchestrator(
                 break;
             }
             Ok(ChangeProcessResult::ChangeStopped) => {
+                // Clear the stopped flag to allow re-queueing
+                dynamic_queue.clear_stopped(&change_id).await;
                 // Send ChangeStopped event to move the change to not queued
                 let _ = tx
                     .send(OrchestratorEvent::ChangeStopped {
