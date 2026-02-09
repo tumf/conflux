@@ -49,36 +49,27 @@ CRITICAL OPERATIONAL CONSTRAINTS:
 - You CANNOT ask questions to the user or request clarification during apply operations
 - You MUST continue working until MaxIteration is reached, making your best autonomous decisions
 - You MUST NOT defer tasks to Future Work based on difficulty, complexity, or perceived regression risk
-- The only valid reason to move a task to Future Work is if it is ALREADY marked with '(future work)' explicitly
+- You MAY move tasks to Future Work only under explicitly allowed conditions in this prompt (including permission auto-reject handling below)
 </system-reminder>
 
 **Permission Error Handling**:
 When you encounter a permission error (e.g., "permission requested: read (...); auto-rejecting"):
-1. Identify the specific task that requires the blocked file/operation
-2. Move ONLY that task to a "## Future Work" section in tasks.md with explanation:
-   ```markdown
-   ## Future Work
-   - Task N: [original task description]
-     - Reason: Permission denied for file: [file path]
-     - Required action: Configure Claude permissions in .claude/claude.jsonc:
-       ```jsonc
-       {
-         "permission": {
-           "read": {
-             "[file pattern]": "allow"
-           }
-         }
-       }
-       ```
-   ```
-3. Remove the checkbox from the moved task (convert `- [ ]` to plain text or bullet)
-4. CONTINUE working on remaining tasks that do not require the blocked resource
-5. If ALL remaining tasks require the blocked resource, output completion with partial progress
+1. Identify the specific task that requires the blocked file/operation.
+2. Move ONLY that task to a `## Future Work` section in tasks.md.
+3. Remove the checkbox from the moved task.
+4. Include an actionable reason:
+   - Reason: Permission denied for [operation/file path]
+   - Required action: Update orchestrator permission config (for example `.cflx.jsonc`) to allow the specific operation.
+5. CONTINUE working on remaining tasks that do not require the blocked resource.
+6. If ALL remaining unchecked tasks are blocked by permission errors, stop with an error (do not report successful completion).
 
 Example scenario:
 - Task 1: Edit .env.template (permission denied) → Move to Future Work
 - Task 2: Remove ray imports (no permission needed) → Continue and complete
 - Task 3: Update tests (no permission needed) → Continue and complete
+
+All-blocked scenario:
+- If Task 1..N all require blocked permission and no further actionable task remains, terminate apply as error with a concise permission-blocked summary.
 
 CRITICAL: Permission errors are NOT a reason to stop all work. Only defer the specific blocked task and continue with unblocked tasks.
 
@@ -86,6 +77,7 @@ Move tasks to Future Work ONLY if they meet ONE of these criteria:
 1. **Human work**: Requires human decision-making, judgment, or manual intervention (e.g., 'Ask user for design preference', 'Manual code review', 'Manual TUI verification')
 2. **External system work**: Requires external system deployment, approval, or configuration changes outside this repository (e.g., 'Deploy to production', 'Configure external API', 'Update cloud infrastructure')
 3. **Long-wait verification**: Requires extended waiting periods for validation (e.g., 'Monitor performance for one week', 'Wait for stakeholder approval')
+4. **Permission auto-reject**: The specific task requires an operation/file currently denied by runtime permission policy
 
 Manual verification rule:
 - Any task that explicitly requires manual verification (e.g., "手動確認", "manual verification", "manual check") MUST be moved to Future Work as Human work.
@@ -146,18 +138,18 @@ Do NOT move to Future Work:
 - **Any task the agent can execute autonomously** - agent must complete it
 
 CRITICAL: If a task is automatable but difficult, you MUST attempt it.
-Future Work is ONLY for tasks requiring human action, external systems, or long waiting periods.
+Future Work is ONLY for tasks requiring human action, external systems, long waiting periods, or permission auto-reject blocking a specific operation/file.
 
 Every remaining unchecked task MUST be immediately actionable in this repo and have objective pass/fail criteria.
 If you find a non-actionable task (abstract, subjective, or human-only), rewrite it into one or more actionable tasks with concrete commands and clear acceptance criteria while preserving intent.
-Only when a task truly requires human decision or external action, mark it as '(future work)', move it to a "Future work" section, and remove the checkbox.
+Only when a task truly requires human decision/external action OR is specifically blocked by permission auto-reject, mark it as '(future work)', move it to a "Future work" section, and remove the checkbox.
 Do not allow apply to finish successfully with non-actionable unchecked tasks; normalize tasks until all remaining unchecked tasks are actionable or moved to Future work.
 
 Special handling for 'future work' tasks:
 - If a task is already marked '(future work)', move it to a "Future work" section and remove the checkbox
 - This indicates deferred work, not current implementation scope
-- Do NOT add new '(future work)' markers yourself unless the task meets the strict criteria above (human work, external systems, or long-wait verification)
-- When moving a task to Future Work, verify it truly requires human action, external systems, or long waiting periods
+- Do NOT add new '(future work)' markers yourself unless the task meets the strict criteria above (human work, external systems, long-wait verification, or permission auto-reject)
+- When moving a task to Future Work, verify it truly requires human action, external systems, long waiting periods, or permission auto-reject
 
 CRITICAL: Checkbox removal when moving tasks to excluded sections:
 - When moving tasks to "Future Work", "Out of Scope", or "Notes" sections, you MUST remove the checkbox (`- [ ]` or `- [x]`)

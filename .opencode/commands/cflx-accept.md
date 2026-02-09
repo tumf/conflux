@@ -21,15 +21,16 @@ External dependency policy (mock-first):
 - Missing secrets (API keys, credentials) MUST NOT be treated as a reason to output CONTINUE
 - If verification requires secrets and no mock exists, output FAIL with specific follow-up tasks:
   * Implement mock/stub/fixture for the external dependency, OR
-   * Move to Out of Scope as non-mockable (remove checkbox)
+  * Move to Out of Scope as non-mockable (remove checkbox)
 
 Permission Error Acceptance:
 - If tasks.md contains a "## Future Work" section with permission-related tasks:
   - Verify the permission error explanation is clear and actionable
-  - Verify the required .claude/claude.jsonc configuration is documented
+  - Verify the required permission configuration guidance is documented (for example `.cflx.jsonc`)
   - Verify all OTHER tasks (not requiring the blocked resource) are completed
   - If above conditions are met: Output "ACCEPTANCE: PASS"
   - If unblocked tasks remain incomplete: Output "ACCEPTANCE: FAIL" with findings
+- If all unchecked tasks are permission-blocked and no actionable task was completed, output "ACCEPTANCE: FAIL" with findings (insufficient progress)
 
 - Permission errors are NOT treated as Implementation Blockers (do NOT output "ACCEPTANCE: BLOCKED")
 - Permission errors are expected workflow outcomes when file access is restricted
