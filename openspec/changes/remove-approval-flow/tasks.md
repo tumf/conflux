@@ -1,0 +1,16 @@
+## 1. Implementation
+- [ ] 1.1 承認データモデルと approved ファイル処理を削除する
+  - 対象: `src/approval.rs`, `src/openspec.rs`, `src/orchestrator.rs`, `src/web/state.rs`
+  - 完了確認: `rg "approved|is_approved" src` で承認フローの参照が残っていないこと
+- [ ] 1.2 CLI/TUI の承認操作と初期選択の挙動を更新する
+  - 対象: `src/cli.rs`, `src/main.rs`, `src/tui/key_handlers.rs`, `src/tui/state.rs`, `src/tui/render.rs`
+  - 完了確認: `cflx --help` に approve が出ないこと、`cflx tui --help` に @ が出ないこと
+- [ ] 1.3 Web 承認 API と UI を削除する
+  - 対象: `src/web/api.rs`, `src/web/mod.rs`, `src/web/state.rs`, `src/web/*`
+  - 完了確認: `rg "approve|unapprove" src/web` で API/ボタンが残っていないこと
+- [ ] 1.4 Git の approved 除外自動追加を削除する
+  - 対象: `src/vcs/git/mod.rs`, `src/vcs/git/commands/basic.rs` と関連テスト
+  - 完了確認: `rg "openspec/changes/\*/approved" src` で参照が残っていないこと
+- [ ] 1.5 テストを更新し、承認前提のテストを置き換える
+  - 対象: `src/approval.rs` のテスト群、TUI/CLI/Web の承認関連テスト
+  - 完了確認: `cargo test` が成功すること
