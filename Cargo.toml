@@ -2,6 +2,7 @@
 name = "conflux"
 version = "0.4.33"
 edition = "2021"
+default-run = "cflx"
 
 [lib]
 name = "conflux"
