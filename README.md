@@ -890,9 +890,20 @@ cargo install --path .
 
 This will build and install the orchestrator to your Cargo bin directory (typically `~/.cargo/bin`).
 
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Usage Examples](docs/guides/USAGE.md) | Quick start and usage examples |
+| [Development Guide](docs/guides/DEVELOPMENT.md) | Build instructions and project structure |
+| [Release Guide](docs/guides/RELEASE.md) | How to create releases |
+| [API Specification](docs/openapi.yaml) | OpenAPI spec for web monitoring |
+
+Internal documentation (parallel execution audit) is available in `docs/audit/`.
+
 ## Development
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) for build instructions, testing, and project structure.
+See [Development Guide](docs/guides/DEVELOPMENT.md) for build instructions, testing, and project structure.
 
 ### Git Hooks
 
