@@ -898,6 +898,14 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for build instructions, testing, and projec
 
 This project uses [prek](https://prek.j178.dev/) for managing Git hooks (a Rust-based alternative to pre-commit).
 
+**Migration from pre-commit:**
+
+If you were previously using pre-commit, uninstall it first:
+
+```bash
+pre-commit uninstall
+```
+
 **Setup:**
 
 ```bash
@@ -921,7 +929,7 @@ prek run rustfmt clippy
 prek list
 ```
 
-The configuration is defined in `.pre-commit-config.yaml` (prek is fully compatible with pre-commit configuration format).
+The configuration is defined in `.pre-commit-config.yaml` (prek is fully compatible with pre-commit configuration format). The `prek run --all-files` command also auto-runs `make openapi` and stages `docs/openapi.yaml`.
 
 ## Future Enhancements
 

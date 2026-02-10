@@ -4,3 +4,4 @@ error.log
 .leann/
 openspec/changes/*/approved
 .opencode/opencode.jsonc
+.cflx.jsonc
