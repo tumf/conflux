@@ -161,13 +161,27 @@ cargo clippy
 cargo fmt --check && cargo clippy -- -D warnings && cargo test
 ```
 
-Install the pre-commit Git hook:
+Install the Git hook using prek:
+
+**Migration from pre-commit:**
+
+If you were previously using pre-commit, uninstall it first:
 
 ```bash
-pre-commit install --hook-type pre-commit
+pre-commit uninstall
 ```
 
-The pre-commit hook auto-runs `make openapi` and stages `docs/openapi.yaml`.
+**Setup prek:**
+
+```bash
+# Install prek
+brew install prek
+
+# Install hooks
+prek install
+```
+
+The prek hook configuration is defined in `.pre-commit-config.yaml` (prek is fully compatible with pre-commit configuration format). When you run `prek run --all-files`, it auto-runs `make openapi` and stages `docs/openapi.yaml`.
 
 ## Adding New Features
 

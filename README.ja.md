@@ -850,6 +850,43 @@ cargo install --path .
 
 ビルド手順、テスト、プロジェクト構造については [DEVELOPMENT.md](DEVELOPMENT.md) を参照してください。
 
+### Git Hooks
+
+このプロジェクトでは、Git hooksの管理に[prek](https://prek.j178.dev/)を使用しています（pre-commitのRust版代替ツール）。
+
+**pre-commitからの移行:**
+
+以前にpre-commitを使用していた場合は、まずアンインストールしてください:
+
+```bash
+pre-commit uninstall
+```
+
+**セットアップ:**
+
+```bash
+# prekをインストール
+brew install prek
+
+# hooksをインストール
+prek install
+```
+
+**使用方法:**
+
+```bash
+# すべてのファイルに対してすべてのhooksを実行
+prek run --all-files
+
+# 特定のhooksを実行
+prek run rustfmt clippy
+
+# 利用可能なhooksをリスト
+prek list
+```
+
+設定は `.pre-commit-config.yaml` で定義されています（prekはpre-commit設定フォーマットと完全互換です）。`prek run --all-files` コマンドは `make openapi` を自動実行し、`docs/openapi.yaml` をステージングします。
+
 ## 今後の機能強化
 
 - [ ] リカバリと再開のための状態永続化
