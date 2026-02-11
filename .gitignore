@@ -1,7 +1,5 @@
 /target
 error.log
-.tldr/
-.leann/
-openspec/changes/*/approved
-.opencode/opencode.jsonc
-.cflx.jsonc
+/src/.tldr/
+/.tldr/
+/.leann/
