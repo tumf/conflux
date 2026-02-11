@@ -12,7 +12,8 @@ install:
 index:
 	@echo "Starting parallel index creation..."
 	@( \
-		(echo "[LEANN] Creating index..." && leann build openspec-spec --docs ./src --force && echo "[LEANN] ✓ Complete" || echo "[LEANN] ✗ Failed") & \
+		(echo "[Serena] Creating index..." && uvx --from git+https://github.com/oraios/serena serena project index && echo "[Serena] ✓ Complete" || echo "[Serena] ✗ Failed") & \
+		(echo "[LEANN] Creating index..." && leann build openspec-spec --docs ./openspec/specs --force && echo "[LEANN] ✓ Complete" || echo "[LEANN] ✗ Failed") & \
 		(echo "[TLDR] Warming cache..." && tldr warm . --lang rust && echo "[TLDR] ✓ Complete" || echo "[TLDR] ✗ Failed") & \
 		wait; \
 		echo ""; \
@@ -23,7 +24,8 @@ index:
 index-full:
 	@echo "Starting parallel full index creation..."
 	@( \
-		(echo "[LEANN] Creating index..." && leann build openspec-spec --docs ./src --force && echo "[LEANN] ✓ Complete" || echo "[LEANN] ✗ Failed") & \
+		(echo "[Serena] Creating index..." && uvx --from git+https://github.com/oraios/serena serena project index && echo "[Serena] ✓ Complete" || echo "[Serena] ✗ Failed") & \
+		(echo "[LEANN] Creating index..." && leann build openspec-spec --docs ./openspec/specs --force && echo "[LEANN] ✓ Complete" || echo "[LEANN] ✗ Failed") & \
 		(echo "[TLDR] Warming cache..." && tldr warm . --lang rust && echo "[TLDR warm] ✓ Complete" || echo "[TLDR warm] ✗ Failed") & \
 		(echo "[TLDR] Creating semantic index (this may take a while)..." && tldr semantic index . --lang rust && echo "[TLDR semantic] ✓ Complete" || echo "[TLDR semantic] ✗ Failed") & \
 		wait; \
