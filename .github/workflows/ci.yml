@@ -41,6 +41,9 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
       - name: Run pre-commit/prek hooks (all files)
         run: |
           python -m pip install --upgrade pip
