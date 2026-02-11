@@ -249,6 +249,118 @@ pub fn default_workspace_base_dir(repo_root: Option<&std::path::Path>) -> PathBu
     }
     path
 }
+
+/// Generates log file path using XDG_STATE_HOME with project_slug and date.
+/// Format: `{XDG_STATE_HOME}/cflx/logs/<project_slug>/<YYYY-MM-DD>.log`
+///
+/// - **All platforms**: Uses `${XDG_STATE_HOME}/cflx/logs/<project_slug>/<YYYY-MM-DD>.log` if set,
+///   otherwise falls back to `~/.local/state/cflx/logs/<project_slug>/<YYYY-MM-DD>.log`.
+/// - Fallback: system temp directory with `cflx-logs-fallback/<project_slug>/<YYYY-MM-DD>.log`.
+///
+/// If `repo_root` is provided, the path includes a project-specific slug to avoid conflicts.
+pub fn get_log_file_path(repo_root: Option<&std::path::Path>) -> PathBuf {
+    use chrono::Local;
+
+    // Generate project slug if repo_root is provided
+    let project_slug = repo_root
+        .map(generate_project_slug)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Get current date in YYYY-MM-DD format
+    let date_str = Local::now().format("%Y-%m-%d").to_string();
+    let log_filename = format!("{}.log", date_str);
+
+    // Check XDG_STATE_HOME first
+    if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME") {
+        return PathBuf::from(xdg_state_home)
+            .join("cflx")
+            .join("logs")
+            .join(&project_slug)
+            .join(&log_filename);
+    }
+
+    // Fall back to ~/.local/state
+    if let Some(home) = dirs::home_dir() {
+        return home
+            .join(".local")
+            .join("state")
+            .join("cflx")
+            .join("logs")
+            .join(&project_slug)
+            .join(&log_filename);
+    }
+
+    // Fallback for unsupported platforms or when home directory is not available
+    std::env::temp_dir()
+        .join("cflx-logs-fallback")
+        .join(&project_slug)
+        .join(&log_filename)
+}
+
+/// Cleans up old log files, retaining only the last N days.
+/// Returns the number of files deleted.
+pub fn cleanup_old_logs(
+    repo_root: Option<&std::path::Path>,
+    retain_days: u32,
+) -> std::io::Result<usize> {
+    use chrono::{Duration, Local};
+
+    let project_slug = repo_root
+        .map(generate_project_slug)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Determine log directory
+    let log_dir = if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME") {
+        PathBuf::from(xdg_state_home)
+            .join("cflx")
+            .join("logs")
+            .join(&project_slug)
+    } else if let Some(home) = dirs::home_dir() {
+        home.join(".local")
+            .join("state")
+            .join("cflx")
+            .join("logs")
+            .join(&project_slug)
+    } else {
+        std::env::temp_dir()
+            .join("cflx-logs-fallback")
+            .join(&project_slug)
+    };
+
+    // If log directory doesn't exist, nothing to clean
+    if !log_dir.exists() {
+        return Ok(0);
+    }
+
+    // Calculate cutoff date
+    let cutoff_date = Local::now() - Duration::days(i64::from(retain_days));
+    let cutoff_str = cutoff_date.format("%Y-%m-%d").to_string();
+
+    let mut deleted_count = 0;
+
+    // Iterate over files in log directory
+    for entry in std::fs::read_dir(&log_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        // Only process .log files
+        if path.extension().and_then(|s| s.to_str()) != Some("log") {
+            continue;
+        }
+
+        // Extract date from filename (YYYY-MM-DD.log)
+        if let Some(filename) = path.file_stem().and_then(|s| s.to_str()) {
+            // Compare filename (date) with cutoff
+            if filename < cutoff_str.as_str() {
+                std::fs::remove_file(&path)?;
+                deleted_count += 1;
+            }
+        }
+    }
+
+    Ok(deleted_count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +541,42 @@ mod tests {
             ACCEPTANCE_SYSTEM_PROMPT.contains("context_only"),
             "ACCEPTANCE_SYSTEM_PROMPT should mention context_only mode as recommended"
         );
+    }
+
+    #[test]
+    fn test_get_log_file_path_format() {
+        let repo_root = PathBuf::from("/tmp/test-repo");
+        let log_path = get_log_file_path(Some(&repo_root));
+        let path_str = log_path.to_string_lossy();
+
+        // Should contain cflx/logs
+        assert!(
+            path_str.contains("cflx") && path_str.contains("logs"),
+            "Expected path to contain 'cflx/logs', got {:?}",
+            log_path
+        );
+
+        // Should contain project slug
+        assert!(
+            path_str.contains("test-repo-"),
+            "Expected path to contain project slug 'test-repo-', got {:?}",
+            log_path
+        );
+
+        // Should end with .log
+        assert!(
+            path_str.ends_with(".log"),
+            "Expected path to end with '.log', got {:?}",
+            log_path
+        );
+    }
+
+    #[test]
+    fn test_cleanup_old_logs_with_nonexistent_directory() {
+        // Should return Ok(0) for non-existent directory
+        let repo_root = PathBuf::from("/tmp/nonexistent-repo-for-test");
+        let result = cleanup_old_logs(Some(&repo_root), 7);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
     }
 }
