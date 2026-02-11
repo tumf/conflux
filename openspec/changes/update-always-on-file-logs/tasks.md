@@ -13,3 +13,7 @@
   - Reason: Environment constraints (build timeout >120s, disk space exhaustion)
   - Required action: Execute in environment with adequate resources and longer timeout limits
   - Note: Unit tests for log functions exist and implementation has been verified by code review
+
+## Acceptance #1 Failure Follow-up
+- [x] Fix off-by-one retention logic in `src/config/defaults.rs::cleanup_old_logs` so `retain_days = 7` keeps exactly the latest 7 dated log files (today + previous 6), not 8; current cutoff/date comparison at `src/config/defaults.rs:336` and `src/config/defaults.rs:354` over-retains one day.
+- [x] Add a deterministic unit test for log retention in `src/config/defaults.rs` that creates dated `.log` fixtures in a temp `XDG_STATE_HOME` project log directory, runs `cleanup_old_logs(..., 7)`, and asserts only 7 newest files remain and current-day log is preserved.
