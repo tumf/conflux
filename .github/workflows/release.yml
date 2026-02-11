@@ -11,7 +11,11 @@ on:
   push:
     tags:
       - 'v*.*.*'
-  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   # Target platforms for cargo-dist
