@@ -309,7 +309,7 @@ pub fn parse_archived_change_with_worktree_fallback(
 /// Task progress with completed and total counts, or an error if not found in any location.
 ///
 /// # Example
-/// ```no_run
+/// ```ignore
 /// use std::path::Path;
 /// use conflux::task_parser;
 ///

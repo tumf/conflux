@@ -21,8 +21,6 @@ use utoipa::OpenApi;
         conflux::web::api::get_state,
         conflux::web::api::list_changes,
         conflux::web::api::get_change,
-        conflux::web::api::approve_change,
-        conflux::web::api::unapprove_change,
         conflux::web::api::control_start,
         conflux::web::api::control_stop,
         conflux::web::api::control_cancel_stop,

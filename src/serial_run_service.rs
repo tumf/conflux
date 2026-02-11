@@ -722,13 +722,12 @@ mod tests {
     use crate::config::OrchestratorConfig;
     use tempfile::TempDir;
 
-    fn create_test_change(id: &str, completed: u32, total: u32, is_approved: bool) -> Change {
+    fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
             id: id.to_string(),
             completed_tasks: completed,
             total_tasks: total,
             last_modified: "1m ago".to_string(),
-            is_approved,
             dependencies: Vec::new(),
         }
     }
@@ -740,9 +739,9 @@ mod tests {
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
 
         let changes = vec![
-            create_test_change("a", 1, 10, true), // 10% progress
-            create_test_change("b", 5, 10, true), // 50% progress
-            create_test_change("c", 8, 10, true), // 80% progress (highest)
+            create_test_change("a", 1, 10), // 10% progress
+            create_test_change("b", 5, 10), // 50% progress
+            create_test_change("c", 8, 10), // 80% progress (highest)
         ];
 
         let next = service.select_next_change(&changes);
@@ -758,9 +757,9 @@ mod tests {
         service.mark_stalled("b", "test");
 
         let changes = vec![
-            create_test_change("a", 1, 10, true),
-            create_test_change("b", 8, 10, true), // Highest progress but stalled
-            create_test_change("c", 5, 10, true),
+            create_test_change("a", 1, 10),
+            create_test_change("b", 8, 10), // Highest progress but stalled
+            create_test_change("c", 5, 10),
         ];
 
         let next = service.select_next_change(&changes);
@@ -774,8 +773,8 @@ mod tests {
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
 
         let changes = vec![
-            create_test_change("a", 5, 10, true), // 50% progress, incomplete
-            create_test_change("b", 10, 10, true), // 100% complete
+            create_test_change("a", 5, 10),  // 50% progress, incomplete
+            create_test_change("b", 10, 10), // 100% complete
         ];
 
         let next = service.select_next_change(&changes);
@@ -813,8 +812,8 @@ mod tests {
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
 
         let changes = vec![
-            create_test_change("a", 5, 10, true),
-            create_test_change("b", 8, 10, true), // Highest progress
+            create_test_change("a", 5, 10),
+            create_test_change("b", 8, 10), // Highest progress
         ];
 
         // Initially, highest progress change should be selected

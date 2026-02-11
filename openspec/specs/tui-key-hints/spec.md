@@ -54,57 +54,22 @@ App-level control keys (Esc, Ctrl+C) SHALL be shown in Status panel title instea
 
 ### Requirement: Approval State Transition in Select Mode
 
-The TUI SHALL transition change state correctly when pressing `@` key in select mode.
+The TUI SHALL ignore `@` key presses and SHALL NOT change any selection or queue state.
 
-#### Scenario: Approve unapproved change adds to queue
-
+#### Scenario: @ key does nothing in select mode
 - **GIVEN** the TUI is in select mode
-- **AND** the cursor is on an unapproved change showing `[ ]`
 - **WHEN** the user presses `@`
-- **THEN** the change SHALL become approved AND queued showing `[x]`
-- **AND** a log message "Approved and queued: {id}" SHALL appear
-- **AND** the logs panel SHALL become visible
-
-#### Scenario: Unapprove approved change removes from queue
-
-- **GIVEN** the TUI is in select mode
-- **AND** the cursor is on an approved+queued change showing `[x]`
-- **WHEN** the user presses `@`
-- **THEN** the change SHALL become unapproved showing `[ ]`
-- **AND** the change SHALL be removed from the queue
-- **AND** a log message SHALL appear
+- **THEN** the change state remains unchanged
+- **AND** no approval-related log message is shown
 
 ### Requirement: Approval State Transition in Running Mode
 
-The TUI SHALL allow approval without auto-queuing in running mode.
+The TUI SHALL ignore `@` key presses and SHALL NOT change any selection or queue state.
 
-#### Scenario: Approve unapproved change without queuing
-
+#### Scenario: @ key does nothing in running mode
 - **GIVEN** the TUI is in running mode
-- **AND** the cursor is on an unapproved change showing `[ ]`
 - **WHEN** the user presses `@`
-- **THEN** the change SHALL become approved but NOT queued showing `[@]`
-- **AND** a log message "Approved (not queued): {id}" SHALL appear
-
-Runningモードで`MergeWait`のchangeが選択中の場合、`M`によるmerge resolveを開始できなければならない（SHALL）。
-
-resolve 実行中の場合は、`M` により対象 change を `ResolveWait` に遷移し、resolve 待ちとしてキューに追加しなければならない（SHALL）。
-
-#### Scenario: RunningモードでMergeWaitのchangeをresolveできる
-- **GIVEN** the TUI is in running mode
-- **AND** the cursor is on a change in `MergeWait` status
-- **AND** a resolve operation is not in progress
-- **WHEN** the user presses `M`
-- **THEN** the resolve command SHALL be triggered for the selected change
-- **AND** the change status SHALL transition to `resolving` while the resolve runs
-
-#### Scenario: resolve 実行中の `M` は待ち行列へ追加する
-- **GIVEN** the TUI is in running mode
-- **AND** the cursor is on a change in `MergeWait` status
-- **AND** a resolve operation is in progress
-- **WHEN** the user presses `M`
-- **THEN** the change status SHALL transition to `ResolveWait`
-- **AND** the resolve command SHALL NOT be triggered immediately
+- **THEN** the change state remains unchanged
 
 ### Requirement: App Control Keys in Status Panel Title
 
@@ -141,13 +106,14 @@ resolve 実行中に `M` が押された場合、対象 change は `ResolveWait`
 - **AND** the resolve command SHALL NOT be triggered immediately
 
 ### Requirement: 未コミット change の操作ヒントを非表示にする
-並列モードで未コミットの change が選択中の場合、Changes パネルのキーヒントは選択・承認に関する操作を表示してはならない（SHALL）。
+
+並列モードで未コミットの change が選択中の場合、Changes パネルのキーヒントは選択に関する操作を表示してはならない（SHALL）。
 
 #### Scenario: 未コミット change は選択ヒントを表示しない
 - **GIVEN** TUI が並列モードで表示されている
 - **AND** カーソルが未コミットの change にある
 - **WHEN** Changes パネルを描画する
-- **THEN** "Space: queue" と "@: approve" のキーヒントは表示されない
+- **THEN** "Space: queue" のキーヒントは表示されない
 
 ### Requirement: 未コミット change は操作不可として表示する
 

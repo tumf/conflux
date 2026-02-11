@@ -7,7 +7,7 @@ info:
     url: https://github.com/anomalyco/conflux
   license:
     name: ''
-  version: 0.4.34
+  version: 0.4.37
 paths:
   /api/changes:
     get:
@@ -46,86 +46,6 @@ paths:
                 $ref: '#/components/schemas/ChangeStatus'
         '404':
           description: Change not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-  /api/changes/{id}/approve:
-    post:
-      tags:
-      - changes
-      summary: Approve a change by ID
-      description: |-
-        # Endpoint
-        POST /api/changes/{id}/approve
-
-        # Returns
-        - 200 OK with updated change status on success
-        - 404 Not Found if change doesn't exist
-        - 500 Internal Server Error if approval operation fails
-      operationId: approve_change
-      parameters:
-      - name: id
-        in: path
-        description: Change ID
-        required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Change approved
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ChangeStatus'
-        '404':
-          description: Change not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '500':
-          description: Approval failed
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-  /api/changes/{id}/unapprove:
-    post:
-      tags:
-      - changes
-      summary: Unapprove a change by ID
-      description: |-
-        # Endpoint
-        POST /api/changes/{id}/unapprove
-
-        # Returns
-        - 200 OK with updated change status on success
-        - 404 Not Found if change doesn't exist
-        - 500 Internal Server Error if unapproval operation fails
-      operationId: unapprove_change
-      parameters:
-      - name: id
-        in: path
-        description: Change ID
-        required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Change unapproved
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ChangeStatus'
-        '404':
-          description: Change not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '500':
-          description: Unapproval failed
           content:
             application/json:
               schema:
@@ -362,7 +282,6 @@ components:
       - total_tasks
       - progress_percent
       - status
-      - is_approved
       - dependencies
       properties:
         completed_tasks:
@@ -378,9 +297,6 @@ components:
         id:
           type: string
           description: Change ID
-        is_approved:
-          type: boolean
-          description: Whether the change is approved
         iteration_number:
           type:
           - integer

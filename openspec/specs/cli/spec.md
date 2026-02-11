@@ -232,45 +232,34 @@ TUI SHALL periodically auto-refresh the change list.
 When auto-refresh detects new changes, they SHALL be displayed appropriately.
 
 #### Scenario: New change detection
-
 - **WHEN** auto-refresh detects a new change
 - **THEN** the new change is added to the change list
 - **AND** a "NEW" badge is displayed
 - **AND** "Discovered new change: <id>" is logged
 
 #### Scenario: Default state of new changes
-
 - **WHEN** a new change is detected
 - **THEN** it is unselected by default (`[ ]`)
 - **AND** the new count in the footer is updated
 
 #### Scenario: NEW badge display
-
 - **WHEN** a change is newly detected
 - **THEN** a "NEW" badge is displayed next to the change name
 - **AND** the badge is displayed in a visually prominent color
 
 #### Scenario: NEW badge cleared on selection
-
 - **WHEN** user toggles selection on a change with NEW badge in Select mode
 - **THEN** the NEW badge is removed
 - **AND** the new count in the footer is decremented
 
-#### Scenario: NEW badge cleared on approval
-
-- **WHEN** user approves a change with NEW badge (via @ key)
-- **THEN** the NEW badge is removed
-- **AND** the new count in the footer is decremented
-
 #### Scenario: NEW badge cleared on queue addition
-
 - **WHEN** user adds a change with NEW badge to the queue (Running/Stopped mode)
 - **THEN** the NEW badge is removed
 - **AND** the new count in the footer is decremented
 
 ### Requirement: Dynamic Execution Queue
 Running 中に queued change を外した場合、当該 change がまだ Processing を開始していないなら、オーケストレータはその change を実行対象から除外しなければならない（MUST）。
-Applying/Accepting/Archiving/Resolving の change は `Space` による単体停止要求のみ許可し、`@` による承認変更は受け付けてはならない（MUST NOT）。
+Applying/Accepting/Archiving/Resolving の change は `Space` による単体停止要求のみ許可し、`@` は状態変更を行わない（MUST NOT）。
 
 #### Scenario: Running 中に queued change を外す
 - **WHEN** TUI が Running モードである
@@ -290,7 +279,7 @@ Applying/Accepting/Archiving/Resolving の change は `Space` による単体停
 #### Scenario: Processing 中の change で @ は無効
 - **GIVEN** change の queue_status が Applying/Accepting/Archiving/Resolving のいずれかである
 - **WHEN** ユーザーが `@` キーを押す
-- **THEN** 承認状態と queue_status は変更されない
+- **THEN** queue_status と選択状態は変更されない
 
 ### Requirement: Error State Display
 
@@ -764,139 +753,44 @@ The TUI log panel SHALL support scrolling to view older log entries.
 
 ### Requirement: approve Subcommand
 
-The CLI SHALL provide an `approve` subcommand to manage change approval status.
+The CLI SHALL NOT provide an `approve` subcommand.
 
-#### Scenario: Approve a change with set action
-
+#### Scenario: Approve subcommand is rejected
 - **WHEN** user runs `cflx approve set {change_id}`
-- **AND** the change directory `openspec/changes/{change_id}/` exists
-- **THEN** an `approved` file is created in the change directory
-- **AND** the file contains MD5 checksums of all `.md` files (except `tasks.md`)
-- **AND** a success message is displayed
-
-#### Scenario: Approve a change that doesn't exist
-
-- **WHEN** user runs `cflx approve set {change_id}`
-- **AND** the change directory does not exist
-- **THEN** an error message is displayed
+- **THEN** CLI reports an unknown subcommand error
 - **AND** exit code is non-zero
-
-#### Scenario: Unapprove a change with unset action
-
-- **WHEN** user runs `cflx approve unset {change_id}`
-- **AND** the `approved` file exists
-- **THEN** the `approved` file is deleted
-- **AND** a success message is displayed
-
-#### Scenario: Unapprove a change that is not approved
-
-- **WHEN** user runs `cflx approve unset {change_id}`
-- **AND** the `approved` file does not exist
-- **THEN** a message indicates the change was not approved
-- **AND** exit code is zero (no-op)
-
-#### Scenario: Check approval status
-
-- **WHEN** user runs `cflx approve status {change_id}`
-- **THEN** the approval status is displayed
-- **AND** if approved, shows "approved" with file count
-- **AND** if not approved, shows reason (file missing, hash mismatch, etc.)
 
 ### Requirement: TUI Approval Toggle
 
-The TUI SHALL allow users to toggle approval status using the `@` key, with different auto-queue behavior based on orchestrator state.
+The TUI SHALL ignore approval toggles and SHALL NOT change any state on `@` key presses.
 
-#### Scenario: Approve unapproved change in Running mode (approve only)
-
-- **WHEN** TUI is in Running mode (orchestrator actively processing)
-- **AND** user presses `@` key on an unapproved change (`[ ]`)
-- **THEN** the change becomes approved but NOT queued (`[@]`)
-- **AND** checkbox transitions from `[ ]` to `[@]`
-- **AND** log message indicates approval only
-
-#### Scenario: Approve unapproved change in Select mode adds to queue automatically
-
-- **WHEN** TUI is in Select mode (orchestrator stopped)
-- **AND** user presses `@` key on an unapproved change (`[ ]`)
-- **THEN** the change becomes approved AND queued (`[x]`)
-- **AND** checkbox transitions directly from `[ ]` to `[x]`
-- **AND** log message indicates both approval and queue addition
-
-#### Scenario: Approve unapproved change in Completed mode adds to queue automatically
-
-- **WHEN** TUI is in Completed mode (orchestrator stopped, all queued changes done)
-- **AND** user presses `@` key on an unapproved change (`[ ]`)
-- **THEN** the change becomes approved AND queued (`[x]`)
-- **AND** checkbox transitions directly from `[ ]` to `[x]`
-- **AND** log message indicates both approval and queue addition
-
-#### Scenario: Unapprove approved-but-not-queued change
-
-- **WHEN** TUI is in any mode (Select, Running, or Completed)
-- **AND** user presses `@` key on an approved but not queued change (`[@]`)
-- **THEN** the change becomes unapproved (`[ ]`)
-- **AND** checkbox transitions from `[@]` to `[ ]`
-
-#### Scenario: Unapprove queued change removes from queue
-
-- **WHEN** TUI is in any mode (Select, Running, or Completed)
-- **AND** user presses `@` key on a queued change (`[x]`) that is NOT processing
-- **THEN** the change becomes unapproved AND removed from queue (`[ ]`)
-- **AND** checkbox transitions from `[x]` to `[ ]`
-- **AND** log message indicates both unapproval and queue removal
-
-#### Scenario: Toggle approval blocked for processing change
-
-- **WHEN** TUI is in Running mode
-- **AND** user presses `@` key
-- **AND** highlighted change is in `Processing` state
-- **THEN** approval status is NOT changed
-- **AND** a warning message is displayed: "Cannot change approval for processing change"
+#### Scenario: @ key does nothing
+- **WHEN** user presses `@` key in any TUI mode
+- **THEN** selection and queue status are unchanged
+- **AND** no approval state is created or stored
 
 ### Requirement: Auto-Queue Approved Changes on TUI Startup
 
-The TUI SHALL automatically queue approved changes when starting in TUI mode.
+The TUI SHALL start with all changes unselected and SHALL NOT auto-queue any change.
 
-#### Scenario: TUI startup with approved changes
-
+#### Scenario: TUI startup clears execution marks
 - **WHEN** user starts the TUI
-- **AND** one or more changes have valid `approved` files
-- **THEN** those changes are automatically selected and queued
-- **AND** a log message indicates "Auto-queued N approved changes"
-
-#### Scenario: TUI startup with no approved changes
-
-- **WHEN** user starts the TUI
-- **AND** no changes have valid `approved` files
-- **THEN** no changes are automatically queued
-- **AND** the user can manually select and approve changes
+- **THEN** all changes are unselected by default
+- **AND** no changes are automatically queued
 
 ### Requirement: Unapproved Changes Cannot Be Queued
 
-The system SHALL prevent unapproved changes from being added to the execution queue.
+The system SHALL allow changes to be queued regardless of approval state.
 
-#### Scenario: Attempt to queue unapproved change in TUI
-
+#### Scenario: TUI can queue any change
 - **WHEN** TUI is in selection mode
-- **AND** user presses Space to select an unapproved change
-- **THEN** the change can be selected for viewing
-- **AND** pressing F5 with only unapproved changes selected shows warning
-- **AND** the warning suggests approving changes first
+- **AND** user presses Space to select a change
+- **THEN** the change is queued without approval checks
 
-#### Scenario: CLI run with unapproved change
-
+#### Scenario: CLI run includes specified change
 - **WHEN** user runs `cflx run --change {change_id}`
-- **AND** the change is not approved
-- **THEN** a warning message is displayed
-- **AND** the change is NOT added to the queue
-- **AND** processing continues with any remaining approved changes
-
-#### Scenario: CLI run with mixed approved/unapproved changes
-
-- **WHEN** user runs `cflx run --change a,b,c`
-- **AND** change `a` is approved, `b` is not approved, `c` is approved
-- **THEN** warning is displayed for change `b`
-- **AND** only changes `a` and `c` are processed
+- **THEN** the change is added to the queue
+- **AND** no approval warning is displayed
 
 ### Requirement: Log Entry Limit
 
@@ -1190,11 +1084,9 @@ CLI SHALL allow explicit VCS backend selection via `--vcs` flag.
 ### Requirement: Git Uncommitted Changes Error Message
 
 Git backend で未コミット変更がある場合、CLI は詳細なエラーメッセージを表示しなければならない（SHALL）。
-あわせて未追跡ファイルの判定前に `.git/info/exclude` に `openspec/changes/*/approved` が存在しない場合は追加しなければならない（MUST）。
 未追跡ファイルの判定では `.gitignore` と `.git/info/exclude` の除外を適用しなければならない（MUST）。
 
 #### Scenario: Error message format
-
 - **WHEN** parallel execution is attempted with Git backend
 - **AND** uncommitted changes exist
 - **THEN** the error message includes:
@@ -1203,17 +1095,10 @@ Git backend で未コミット変更がある場合、CLI は詳細なエラー�
   - Specific command examples
 
 #### Scenario: Untracked files also trigger error
-
 - **WHEN** parallel execution is attempted with Git backend
 - **AND** only untracked files exist
 - **THEN** the same error message is displayed
 - **AND** files in `.gitignore` と `.git/info/exclude` は除外される
-
-#### Scenario: Missing local exclude entry is appended
-
-- **GIVEN** `.git/info/exclude` に `openspec/changes/*/approved` が存在しない
-- **WHEN** 未追跡ファイルの判定が行われる
-- **THEN** `.git/info/exclude` に `openspec/changes/*/approved` が 1 行だけ追加される
 
 ### Requirement: Archived 状態の checkbox 表示
 
@@ -1500,22 +1385,19 @@ resolve コンテキストは、人間とAIが読みやすい形式で構造化�
 The CLI SHALL provide comprehensive help output that includes all subcommands, key options, and usage examples.
 
 #### Scenario: Main help shows all subcommands
-
 - **WHEN** user runs `cflx --help`
-- **THEN** help output includes list of all subcommands: run, tui, init, approve
+- **THEN** help output includes list of all subcommands: run, tui, init
 - **AND** help output includes key options: --parallel, --max-concurrent, --dry-run, --vcs, --web, --web-port, --web-bind
 
 #### Scenario: Run subcommand help shows detailed options
-
 - **WHEN** user runs `cflx run --help`
 - **THEN** help output includes detailed description of run subcommand
 - **AND** help output includes examples of parallel execution
 - **AND** help output includes examples of web monitoring
 
 #### Scenario: TUI subcommand help shows keybindings
-
 - **WHEN** user runs `cflx tui --help`
-- **THEN** help output includes TUI key bindings (Space, F5, @, Esc, Tab, q)
+- **THEN** help output includes TUI key bindings (Space, F5, Esc, Tab, q)
 - **AND** help output includes description of TUI features
 - **AND** help output includes web monitoring options
 
@@ -1641,3 +1523,12 @@ TUI は Changes ビューで `l` キーによりログパネルの表示/非表�
 - **GIVEN** ログパネルが無効である
 - **WHEN** ユーザーが `l` キーを押す
 - **THEN** ログが存在する場合、ログパネルが表示される
+
+### Requirement: TUIログファイルの常時出力
+
+TUI のログファイル出力は常時有効でなければならず（MUST）、`tui --logs` オプションは提供してはならない（MUST NOT）。
+
+#### Scenario: `tui --logs` は無効
+- **WHEN** ユーザーが `cflx tui --logs /tmp/debug.log` を実行する
+- **THEN** CLI は不明なオプションとしてエラーを表示する
+- **AND** 終了コードは非0である

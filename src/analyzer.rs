@@ -301,8 +301,6 @@ impl ParallelizationAnalyzer {
     /// Build the prompt for parallelization analysis
     ///
     /// Formats all changes with:
-    /// - `[x]` marker for approved changes (`is_approved = true`)
-    /// - `[ ]` marker for unapproved changes
     /// - Full proposal file path for each change (e.g., `openspec/changes/{id}/proposal.md`)
     ///
     /// Also includes in-flight changes (currently executing) for dependency analysis,
@@ -313,13 +311,7 @@ impl ParallelizationAnalyzer {
     fn build_parallelization_prompt(&self, changes: &[Change], in_flight_ids: &[String]) -> String {
         let change_list: String = changes
             .iter()
-            .map(|c| {
-                let marker = if c.is_approved { "[x]" } else { "[ ]" };
-                format!(
-                    "{} {} (openspec/changes/{}/proposal.md)",
-                    marker, c.id, c.id
-                )
-            })
+            .map(|c| format!("- {} (openspec/changes/{}/proposal.md)", c.id, c.id))
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -712,7 +704,6 @@ mod tests {
             completed_tasks: 0,
             total_tasks: 5,
             last_modified: "now".to_string(),
-            is_approved: true,
             dependencies: Vec::new(),
         }
     }
@@ -852,7 +843,6 @@ That's all."#;
         let changes = vec![
             Change {
                 id: "selected-a".to_string(),
-                is_approved: true,
                 completed_tasks: 0,
                 total_tasks: 5,
                 last_modified: "now".to_string(),
@@ -860,7 +850,6 @@ That's all."#;
             },
             Change {
                 id: "unselected-b".to_string(),
-                is_approved: false,
                 completed_tasks: 0,
                 total_tasks: 5,
                 last_modified: "now".to_string(),
@@ -868,7 +857,6 @@ That's all."#;
             },
             Change {
                 id: "selected-c".to_string(),
-                is_approved: true,
                 completed_tasks: 0,
                 total_tasks: 5,
                 last_modified: "now".to_string(),
@@ -878,15 +866,10 @@ That's all."#;
 
         let prompt = analyzer.build_parallelization_prompt(&changes, &[]);
 
-        // Check that selected changes are marked with [x] and include proposal.md path
-        assert!(prompt.contains("[x] selected-a (openspec/changes/selected-a/proposal.md)"));
-        assert!(prompt.contains("[x] selected-c (openspec/changes/selected-c/proposal.md)"));
-
-        // Check that unselected change IS included with [ ] marker
-        assert!(prompt.contains("[ ] unselected-b (openspec/changes/unselected-b/proposal.md)"));
-
-        // Check that instruction mentions "marked with [x]"
-        assert!(prompt.contains("marked with [x]"));
+        // All changes should be included with proposal.md path (no approval markers)
+        assert!(prompt.contains("- selected-a (openspec/changes/selected-a/proposal.md)"));
+        assert!(prompt.contains("- selected-c (openspec/changes/selected-c/proposal.md)"));
+        assert!(prompt.contains("- unselected-b (openspec/changes/unselected-b/proposal.md)"));
 
         // Check that instruction mentions reading proposal files
         assert!(prompt.contains("Read the proposal files at the specified paths"));
@@ -899,7 +882,6 @@ That's all."#;
         let changes = vec![
             Change {
                 id: "change-1".to_string(),
-                is_approved: true,
                 completed_tasks: 0,
                 total_tasks: 5,
                 last_modified: "now".to_string(),
@@ -907,7 +889,6 @@ That's all."#;
             },
             Change {
                 id: "change-2".to_string(),
-                is_approved: true,
                 completed_tasks: 0,
                 total_tasks: 5,
                 last_modified: "now".to_string(),
@@ -917,9 +898,9 @@ That's all."#;
 
         let prompt = analyzer.build_parallelization_prompt(&changes, &[]);
 
-        // All should be included with [x] marker and proposal.md path
-        assert!(prompt.contains("[x] change-1 (openspec/changes/change-1/proposal.md)"));
-        assert!(prompt.contains("[x] change-2 (openspec/changes/change-2/proposal.md)"));
+        // All should be included with proposal.md path (no approval markers)
+        assert!(prompt.contains("- change-1 (openspec/changes/change-1/proposal.md)"));
+        assert!(prompt.contains("- change-2 (openspec/changes/change-2/proposal.md)"));
     }
 
     #[test]
@@ -928,7 +909,6 @@ That's all."#;
 
         let changes = vec![Change {
             id: "change-1".to_string(),
-            is_approved: false,
             completed_tasks: 0,
             total_tasks: 5,
             last_modified: "now".to_string(),
@@ -937,10 +917,10 @@ That's all."#;
 
         let prompt = analyzer.build_parallelization_prompt(&changes, &[]);
 
-        // Unselected change should be included with [ ] marker
-        assert!(prompt.contains("[ ] change-1 (openspec/changes/change-1/proposal.md)"));
+        // All changes should be included with proposal.md path (no approval markers)
+        assert!(prompt.contains("- change-1 (openspec/changes/change-1/proposal.md)"));
 
-        // But structure should still be there
+        // Check that prompt structure is still there
         assert!(prompt.contains("Analyze ONLY the changes marked with [x]"));
     }
 
@@ -1022,7 +1002,6 @@ That's all."#;
         let queued_changes = vec![
             Change {
                 id: "queued-a".to_string(),
-                is_approved: true,
                 completed_tasks: 0,
                 total_tasks: 5,
                 last_modified: "now".to_string(),
@@ -1030,7 +1009,6 @@ That's all."#;
             },
             Change {
                 id: "queued-b".to_string(),
-                is_approved: true,
                 completed_tasks: 0,
                 total_tasks: 5,
                 last_modified: "now".to_string(),
@@ -1042,9 +1020,9 @@ That's all."#;
 
         let prompt = analyzer.build_parallelization_prompt(&queued_changes, &in_flight_ids);
 
-        // Verify queued changes are in the main list
-        assert!(prompt.contains("[x] queued-a (openspec/changes/queued-a/proposal.md)"));
-        assert!(prompt.contains("[x] queued-b (openspec/changes/queued-b/proposal.md)"));
+        // Verify queued changes are in the main list (no approval markers)
+        assert!(prompt.contains("- queued-a (openspec/changes/queued-a/proposal.md)"));
+        assert!(prompt.contains("- queued-b (openspec/changes/queued-b/proposal.md)"));
 
         // Verify in-flight changes are in the executing section
         assert!(prompt.contains("Currently executing changes"));
@@ -1063,7 +1041,6 @@ That's all."#;
 
         let queued_changes = vec![Change {
             id: "queued-a".to_string(),
-            is_approved: true,
             completed_tasks: 0,
             total_tasks: 5,
             last_modified: "now".to_string(),
@@ -1074,8 +1051,8 @@ That's all."#;
 
         let prompt = analyzer.build_parallelization_prompt(&queued_changes, &in_flight_ids);
 
-        // Verify queued changes are in the main list
-        assert!(prompt.contains("[x] queued-a (openspec/changes/queued-a/proposal.md)"));
+        // Verify queued changes are in the main list (no approval markers)
+        assert!(prompt.contains("- queued-a (openspec/changes/queued-a/proposal.md)"));
 
         // Verify no executing section when in_flight_ids is empty
         assert!(!prompt.contains("Currently executing changes"));
