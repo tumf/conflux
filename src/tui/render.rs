@@ -448,9 +448,11 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
     let mut keys = vec!["↑↓/jk: move"];
     if let Some(item) = current_item {
         // Show "Space: stop" for active changes, otherwise "Space: queue/unqueue"
+        // In parallel mode, don't show Space hints for uncommitted changes
+        let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible;
         if item.queue_status.is_active() {
             keys.push("Space: stop");
-        } else {
+        } else if !is_parallel_blocked {
             keys.push(if item.selected {
                 "Space: unqueue"
             } else {
@@ -760,9 +762,11 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
     let mut keys = vec!["↑↓/jk: move"];
     if let Some(item) = current_item {
         // Show "Space: stop" for active changes, otherwise "Space: queue/unqueue"
+        // In parallel mode, don't show Space hints for uncommitted changes
+        let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible;
         if item.queue_status.is_active() {
             keys.push("Space: stop");
-        } else {
+        } else if !is_parallel_blocked {
             keys.push(if item.selected {
                 "Space: unqueue"
             } else {
@@ -2407,5 +2411,115 @@ mod tests {
                 line
             );
         }
+    }
+
+    #[test]
+    fn test_parallel_mode_uncommitted_change_no_space_hint() {
+        use crate::openspec::Change;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // Create a mock backend with sufficient size
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Create app state with an uncommitted change
+        let changes = vec![Change {
+            id: "test-change".to_string(),
+            completed_tasks: 0,
+            total_tasks: 5,
+            is_parallel_eligible: false, // Uncommitted change
+        }];
+        let mut app = AppState::new(changes);
+        app.parallel_mode = true;
+        app.parallel_available = true;
+
+        // Ensure the change is not selected and not queued
+        app.changes[0].selected = false;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+
+        // Render the frame
+        terminal
+            .draw(|f| {
+                super::render(f, &mut app);
+            })
+            .unwrap();
+
+        // Get the rendered buffer content
+        let buffer = terminal.backend().buffer().clone();
+        let content = buffer
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        // Verify that Space hints are NOT shown for uncommitted changes in parallel mode
+        assert!(
+            !content.contains("Space: queue"),
+            "Space: queue should not be shown for uncommitted changes in parallel mode"
+        );
+        assert!(
+            !content.contains("Space: unqueue"),
+            "Space: unqueue should not be shown for uncommitted changes in parallel mode"
+        );
+
+        // Verify that UNCOMMITED badge is shown
+        assert!(
+            content.contains("UNCOMMITED"),
+            "UNCOMMITED badge should be shown"
+        );
+    }
+
+    #[test]
+    fn test_parallel_mode_committed_change_shows_space_hint() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // Create a mock backend with sufficient size
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Create app state with parallel mode enabled
+        let mut app = AppState::new(false, false, false, false);
+        app.parallel_mode = true;
+        app.parallel_available = true;
+
+        // Add a committed change (parallel eligible)
+        app.changes.push(super::super::state::ChangeItem {
+            id: "test-change".to_string(),
+            selected: false,
+            queue_status: QueueStatus::NotQueued,
+            completed_tasks: 0,
+            total_tasks: 5,
+            has_worktree: false,
+            is_new: false,
+            started_at: None,
+            elapsed_time: None,
+            iteration_number: None,
+            is_parallel_eligible: true, // Committed change
+        });
+
+        // Render the frame
+        terminal
+            .draw(|f| {
+                super::render(f, &mut app);
+            })
+            .unwrap();
+
+        // Get the rendered buffer content
+        let buffer = terminal.backend().buffer().clone();
+        let content = buffer
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        // Verify that Space hints ARE shown for committed changes in parallel mode
+        assert!(
+            content.contains("Space: queue"),
+            "Space: queue should be shown for committed changes in parallel mode"
+        );
     }
 }

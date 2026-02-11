@@ -20,3 +20,7 @@
 - [x] Web ダッシュボードから承認 UI と承認 API 呼び出しを削除し、`is_approved` 前提の描画を廃止する（`web/app.js` の `handleApprovalClick` / `toggleApproval` / `updateChangeInUI` とカード描画内の approval セクション、`web/style.css` の `.badge-approved` / `.badge-unapproved` / `.approval-*` スタイル）。
 - [x] 承認フロー廃止後に未使用となっている承認用フックヘルパーを削除する（`src/orchestration/hooks.rs` の `build_approve_context` と `test_build_approve_context`）。
 - [x] 失敗している回帰テストを修正し、`cargo test` を全件成功させる（失敗: `analyzer::tests::test_build_prompt_all_selected`, `analyzer::tests::test_build_prompt_none_selected`, `analyzer::tests::test_build_prompt_with_inflight_changes`, `analyzer::tests::test_build_prompt_with_selected_markers`, `analyzer::tests::test_build_prompt_without_inflight_changes`, `tui::render::tests::test_render_select_mode_footer_message`）。
+
+## Acceptance #2 Failure Follow-up
+- [ ] 並列モードで未コミット change を選択中のとき、Changes パネルのキーヒントから選択操作（`Space: queue` / `Space: unqueue`）を表示しないように修正する（`src/tui/render.rs` の `render_changes_list_select` と `render_changes_list_running` のキー表示ロジックに `app.parallel_mode && !item.is_parallel_eligible` 条件を反映し、回帰テストを追加）。
+- [ ] `cargo test` が成功するよう doctest 失敗を解消する（現状失敗: `src/web/api.rs` の `not_found_response` ドキュメント例、`src/acceptance.rs`、`src/orchestration/state.rs`、`src/task_parser.rs`。`cargo test --doc` で再確認）。
