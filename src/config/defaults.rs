@@ -333,7 +333,9 @@ pub fn cleanup_old_logs(
     }
 
     // Calculate cutoff date
-    let cutoff_date = Local::now() - Duration::days(i64::from(retain_days));
+    // retain_days = 7 means keep today + previous 6 days (7 total)
+    // So cutoff is (retain_days - 1) days ago
+    let cutoff_date = Local::now() - Duration::days(i64::from(retain_days - 1));
     let cutoff_str = cutoff_date.format("%Y-%m-%d").to_string();
 
     let mut deleted_count = 0;
@@ -578,5 +580,93 @@ mod tests {
         let result = cleanup_old_logs(Some(&repo_root), 7);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_old_logs_retains_exactly_n_days() {
+        use chrono::Local;
+        use std::env;
+        use std::fs;
+        use tempfile::TempDir;
+
+        // Create temporary XDG_STATE_HOME
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let temp_state_home = temp_dir.path().join("state");
+        fs::create_dir(&temp_state_home).expect("Failed to create state dir");
+
+        // Save original XDG_STATE_HOME and set to temp
+        let original_state_home = env::var("XDG_STATE_HOME").ok();
+        env::set_var("XDG_STATE_HOME", &temp_state_home);
+
+        // Create repo root and get project slug
+        let repo_root = PathBuf::from("/tmp/test-retention-repo");
+        let project_slug = generate_project_slug(&repo_root);
+
+        // Create log directory
+        let log_dir = temp_state_home
+            .join("cflx")
+            .join("logs")
+            .join(&project_slug);
+        fs::create_dir_all(&log_dir).expect("Failed to create log dir");
+
+        // Create dated log files: today - 9, today - 8, ..., today - 1, today
+        let today = Local::now();
+        let mut expected_files = Vec::new();
+
+        for days_ago in (0..=9).rev() {
+            let date = today - chrono::Duration::days(days_ago);
+            let filename = format!("{}.log", date.format("%Y-%m-%d"));
+            let file_path = log_dir.join(&filename);
+            fs::write(&file_path, "test log content").expect("Failed to write log file");
+
+            // Files within retain_days (7) should be kept: today, today-1, ..., today-6
+            if days_ago < 7 {
+                expected_files.push(filename);
+            }
+        }
+
+        // Run cleanup with retain_days = 7
+        let deleted_count = cleanup_old_logs(Some(&repo_root), 7).expect("cleanup_old_logs failed");
+
+        // Should delete exactly 3 files (today-9, today-8, today-7)
+        assert_eq!(deleted_count, 3, "Expected to delete 3 files");
+
+        // Verify exactly 7 files remain
+        let remaining: Vec<_> = fs::read_dir(&log_dir)
+            .expect("Failed to read log dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("log"))
+            .map(|e| e.path().file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(
+            remaining.len(),
+            7,
+            "Expected exactly 7 log files to remain, found: {:?}",
+            remaining
+        );
+
+        // Verify today's log is preserved
+        let today_filename = format!("{}.log", today.format("%Y-%m-%d"));
+        assert!(
+            remaining.contains(&today_filename),
+            "Today's log file should be preserved: {}",
+            today_filename
+        );
+
+        // Verify all expected files are present
+        for expected in &expected_files {
+            assert!(
+                remaining.contains(expected),
+                "Expected file {} should be present",
+                expected
+            );
+        }
+
+        // Restore original XDG_STATE_HOME
+        match original_state_home {
+            Some(val) => env::set_var("XDG_STATE_HOME", val),
+            None => env::remove_var("XDG_STATE_HOME"),
+        }
     }
 }
