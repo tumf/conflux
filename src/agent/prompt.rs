@@ -1,7 +1,5 @@
 //! Prompt building functions for agent commands.
 
-use crate::config::defaults::ACCEPTANCE_SYSTEM_PROMPT;
-
 /// Legacy hardcoded system prompt for apply commands.
 /// Kept only for compatibility in tests; actual prompt is sourced from OpenCode command files.
 pub const APPLY_SYSTEM_PROMPT: &str = "";

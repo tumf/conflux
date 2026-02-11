@@ -1355,7 +1355,7 @@ mod tests {
         }
 
         // Should have at least 2 logs: command execution + output
-        assert!(log_messages.len() >= 1, "Expected at least 1 log message");
+        assert!(!log_messages.is_empty(), "Expected at least 1 log message");
 
         // First log should be the command
         assert!(

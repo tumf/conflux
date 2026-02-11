@@ -54,6 +54,7 @@ pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
 /// Acceptance system prompt - now empty to enforce template-only approach.
 /// All acceptance instructions must come from the command template (e.g., .opencode/commands/cflx-accept.md).
 /// The acceptance_prompt_mode "full" is now deprecated and behaves identically to "context_only".
+#[allow(dead_code)]
 pub const ACCEPTANCE_SYSTEM_PROMPT: &str = "";
 
 /// Default prompt for acceptance command - appended after hardcoded prompt
