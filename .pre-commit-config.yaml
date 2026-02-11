@@ -15,14 +15,14 @@ repos:
         name: rustfmt
         entry: cargo fmt --all
         language: system
-        types: [rust]
         pass_filenames: false
+        always_run: true
       - id: clippy
         name: clippy
         entry: cargo clippy --all-targets --all-features -- -D warnings
         language: system
-        types: [rust]
         pass_filenames: false
+        always_run: true
       - id: openapi-generate
         name: openapi-generate
         entry: bash -c 'make openapi && git add docs/openapi.yaml'
