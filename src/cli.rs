@@ -175,16 +175,11 @@ WEB MONITORING:
 
 EXAMPLES:
   cflx tui                    # Launch TUI (default when no subcommand)
-  cflx tui --logs debug.log   # TUI with file logging
   cflx tui --web              # TUI with web monitoring enabled")]
 pub struct TuiArgs {
     /// Path to custom configuration file (JSONC format)
     #[arg(long, short = 'c')]
     pub config: Option<PathBuf>,
-
-    /// Write debug logs to the specified file (e.g., --logs debug.log)
-    #[arg(long)]
-    pub logs: Option<PathBuf>,
 
     /// Enable web monitoring server for remote status viewing
     #[arg(long)]
@@ -524,30 +519,6 @@ mod tests {
                 assert!(args.dry_run);
             }
             _ => panic!("Expected Run subcommand"),
-        }
-    }
-
-    #[test]
-    fn test_tui_subcommand_logs_option() {
-        let cli = Cli::parse_from(["cflx", "tui", "--logs", "debug.log"]);
-
-        match cli.command {
-            Some(Commands::Tui(args)) => {
-                assert_eq!(args.logs, Some(PathBuf::from("debug.log")));
-            }
-            _ => panic!("Expected Tui subcommand"),
-        }
-    }
-
-    #[test]
-    fn test_tui_subcommand_no_logs_option() {
-        let cli = Cli::parse_from(["cflx", "tui"]);
-
-        match cli.command {
-            Some(Commands::Tui(args)) => {
-                assert!(args.logs.is_none());
-            }
-            _ => panic!("Expected Tui subcommand"),
         }
     }
 

@@ -182,11 +182,11 @@ pub struct OrchestratorConfig {
     pub acceptance_prompt: Option<String>,
 
     /// Controls how the acceptance `{prompt}` is constructed.
-    /// - full: include hardcoded acceptance system prompt + diff/history context
+    /// - full: DEPRECATED - now behaves identically to context_only (no embedded system prompt)
     /// - context_only: only include change metadata + diff/history context
     ///
-    /// Use `context_only` when your `acceptance_command` uses `opencode run --command ... '{prompt}'`
-    /// and the fixed acceptance instructions live in the OpenCode command template.
+    /// The "full" mode is now deprecated and unified with "context_only".
+    /// All acceptance instructions must come from the command template.
     #[serde(default)]
     pub acceptance_prompt_mode: Option<AcceptancePromptMode>,
 
@@ -308,11 +308,17 @@ pub struct OrchestratorConfig {
     pub acceptance_max_continues: Option<u32>,
 }
 
+/// Acceptance prompt mode.
+/// Full is deprecated and now behaves identically to ContextOnly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AcceptancePromptMode {
+    /// DEPRECATED: Now behaves identically to ContextOnly.
+    /// Kept for backward compatibility.
     #[default]
     Full,
+    /// Only inject variable context (change metadata, diff, history).
+    /// Fixed acceptance instructions come from the command template.
     ContextOnly,
 }
 

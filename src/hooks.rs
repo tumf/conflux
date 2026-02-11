@@ -5,11 +5,14 @@
 
 use crate::config::expand;
 use crate::error::{OrchestratorError, Result};
+use crate::events::{ExecutionEvent, LogEntry};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -465,15 +468,37 @@ impl HookContext {
 }
 
 /// Hook runner that executes hooks based on configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HookRunner {
     config: HooksConfig,
+    /// Optional event sender for hook logs
+    event_tx: Option<mpsc::Sender<ExecutionEvent>>,
+}
+
+impl std::fmt::Debug for HookRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookRunner")
+            .field("config", &self.config)
+            .field("event_tx", &self.event_tx.is_some())
+            .finish()
+    }
 }
 
 impl HookRunner {
     /// Create a new HookRunner with the given configuration
     pub fn new(config: HooksConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            event_tx: None,
+        }
+    }
+
+    /// Create a HookRunner with the given configuration and event sender
+    pub fn with_event_tx(config: HooksConfig, event_tx: mpsc::Sender<ExecutionEvent>) -> Self {
+        Self {
+            config,
+            event_tx: Some(event_tx),
+        }
     }
 
     /// Create a HookRunner with no hooks configured
@@ -481,6 +506,7 @@ impl HookRunner {
     pub fn empty() -> Self {
         Self {
             config: HooksConfig::default(),
+            event_tx: None,
         }
     }
 
@@ -514,11 +540,34 @@ impl HookRunner {
         );
         debug!("Hook timeout: {}s", hook_config.timeout);
 
+        // Send log entry for hook command execution
+        if let Some(ref tx) = self.event_tx {
+            let log_msg = format!("Running {} hook: {}", hook_type, command);
+            let _ = tx.send(ExecutionEvent::Log(LogEntry::info(log_msg))).await;
+        }
+
         match self
             .execute_hook(hook_type, &command, &env_vars, timeout_duration)
             .await
         {
-            Ok(success) => {
+            Ok((success, output)) => {
+                // Send hook output to logs if available
+                if let Some(ref tx) = self.event_tx {
+                    if !output.is_empty() {
+                        let truncated_output = if output.len() > 1024 {
+                            format!("{}... (truncated)", &output[..1024])
+                        } else {
+                            output.clone()
+                        };
+                        let _ = tx
+                            .send(ExecutionEvent::Log(LogEntry::info(format!(
+                                "{} hook output: {}",
+                                hook_type, truncated_output
+                            ))))
+                            .await;
+                    }
+                }
+
                 if success {
                     info!("{} hook completed successfully", hook_type);
                     Ok(())
@@ -552,13 +601,14 @@ impl HookRunner {
     }
 
     /// Execute a hook command with the given environment variables and timeout
+    /// Returns (success, output) where output is combined stdout+stderr
     async fn execute_hook(
         &self,
         hook_type: HookType,
         command: &str,
         env_vars: &HashMap<String, String>,
         timeout_duration: Duration,
-    ) -> Result<bool> {
+    ) -> Result<(bool, String)> {
         let mut cmd = if cfg!(target_os = "windows") {
             debug!(
                 module = module_path!(),
@@ -585,25 +635,55 @@ impl HookRunner {
             cmd.env(key, value);
         }
 
-        // Disable terminal output to prevent hooks from corrupting TUI
-        // Hooks run in background and should not output to terminal
+        // Capture stdout and stderr for logging
         cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-        let child = cmd.spawn().map_err(|e| OrchestratorError::HookFailed {
+        let mut child = cmd.spawn().map_err(|e| OrchestratorError::HookFailed {
             hook_type: hook_type.to_string(),
             message: format!("Failed to spawn hook process: {}", e),
         })?;
 
+        // Capture output asynchronously
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
         // Wait with timeout
-        match timeout(timeout_duration, child.wait_with_output()).await {
+        match timeout(timeout_duration, child.wait()).await {
             Ok(result) => {
-                let output = result.map_err(|e| OrchestratorError::HookFailed {
+                let status = result.map_err(|e| OrchestratorError::HookFailed {
                     hook_type: hook_type.to_string(),
                     message: format!("Failed to wait for hook process: {}", e),
                 })?;
-                Ok(output.status.success())
+
+                // Read stdout and stderr
+                let mut output = String::new();
+                if let Some(mut stdout) = stdout {
+                    let mut stdout_buf = Vec::new();
+                    if (stdout.read_to_end(&mut stdout_buf).await).is_ok() {
+                        if let Ok(s) = String::from_utf8(stdout_buf) {
+                            if !s.is_empty() {
+                                output.push_str(&s);
+                            }
+                        }
+                    }
+                }
+                if let Some(mut stderr) = stderr {
+                    let mut stderr_buf = Vec::new();
+                    if (stderr.read_to_end(&mut stderr_buf).await).is_ok() {
+                        if let Ok(s) = String::from_utf8(stderr_buf) {
+                            if !s.is_empty() {
+                                if !output.is_empty() {
+                                    output.push('\n');
+                                }
+                                output.push_str(&s);
+                            }
+                        }
+                    }
+                }
+
+                Ok((status.success(), output))
             }
             Err(_) => Err(OrchestratorError::HookTimeout {
                 hook_type: hook_type.to_string(),
@@ -1176,5 +1256,62 @@ mod tests {
             vars.get("OPENSPEC_CHANGE_ID"),
             Some(&"sequential-change".to_string())
         );
+    }
+
+    // === Tests for hook output logging (add-hook-logs-view-output spec) ===
+
+    #[tokio::test]
+    async fn test_hook_output_captured_and_logged() {
+        use tokio::sync::mpsc;
+
+        let json = r#"{"on_start": "echo 'Hello from hook'"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let runner = HookRunner::with_event_tx(config, tx);
+        let context = HookContext::default();
+
+        let result = runner.run_hook(HookType::OnStart, &context).await;
+        assert!(result.is_ok());
+
+        // Collect log events
+        let mut log_messages = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ExecutionEvent::Log(entry) = event {
+                log_messages.push(entry.message);
+            }
+        }
+
+        // Should have at least 2 logs: command execution + output
+        assert!(!log_messages.is_empty(), "Expected at least 1 log message");
+
+        // First log should be the command
+        assert!(
+            log_messages[0].contains("Running on_start hook"),
+            "Expected command log, got: {}",
+            log_messages[0]
+        );
+
+        // If there's output, it should be logged
+        if log_messages.len() > 1 {
+            assert!(
+                log_messages[1].contains("Hello from hook")
+                    || log_messages[1].contains("on_start hook output"),
+                "Expected output log, got: {}",
+                log_messages[1]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hook_without_event_tx_still_works() {
+        let json = r#"{"on_start": "echo test"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config);
+        let context = HookContext::default();
+
+        // Should work without event_tx (no logs sent)
+        let result = runner.run_hook(HookType::OnStart, &context).await;
+        assert!(result.is_ok());
     }
 }

@@ -43,18 +43,48 @@ use std::path::Path;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::prelude::*;
 
-/// Initialize file-based logging for TUI mode
-fn init_file_logging(log_path: &Path) -> Result<()> {
-    use std::fs::File;
+/// Initialize file-based logging with automatic log rotation and cleanup.
+/// Logs are written to XDG_STATE_HOME/cflx/logs/<project_slug>/<YYYY-MM-DD>.log
+/// Old logs are automatically cleaned up (7-day retention).
+fn init_file_logging() -> Result<()> {
+    use config::defaults::{cleanup_old_logs, get_log_file_path};
+    use std::fs::{create_dir_all, File};
     use tracing_subscriber::fmt::writer::MakeWriterExt;
 
-    let file = File::create(log_path).map_err(|e| {
-        error::OrchestratorError::Io(std::io::Error::other(format!(
-            "Failed to create log file '{}': {}",
-            log_path.display(),
-            e
-        )))
-    })?;
+    // Get current directory as repo root
+    let repo_root = std::env::current_dir().ok();
+
+    // Get log file path
+    let log_path = get_log_file_path(repo_root.as_deref());
+
+    // Create parent directory if it doesn't exist
+    if let Some(parent) = log_path.parent() {
+        create_dir_all(parent).map_err(|e| {
+            error::OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to create log directory '{}': {}",
+                parent.display(),
+                e
+            )))
+        })?;
+    }
+
+    // Clean up old logs (7-day retention)
+    if let Err(e) = cleanup_old_logs(repo_root.as_deref(), 7) {
+        tracing::warn!("Failed to clean up old logs: {}", e);
+    }
+
+    // Create or append to log file
+    let file = File::options()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| {
+            error::OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to open log file '{}': {}",
+                log_path.display(),
+                e
+            )))
+        })?;
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(file.with_max_level(Level::DEBUG))
@@ -76,10 +106,12 @@ async fn main() -> Result<()> {
     match cli.command {
         // No subcommand: launch TUI (default behavior)
         None => {
+            // Initialize file logging (always enabled)
+            init_file_logging()?;
+
             // Build TuiArgs from global flags
             let tui_args = TuiArgs {
                 config: cli.config,
-                logs: None,
                 web: cli.web,
                 web_port: cli.web_port,
                 web_bind: cli.web_bind,
@@ -132,10 +164,8 @@ async fn main() -> Result<()> {
 
         // Explicit TUI subcommand
         Some(Commands::Tui(args)) => {
-            // Initialize file logging if --logs is specified
-            if let Some(log_path) = &args.logs {
-                init_file_logging(log_path)?;
-            }
+            // Initialize file logging (always enabled)
+            init_file_logging()?;
 
             // Load config
             let config = OrchestratorConfig::load(args.config.as_deref())?;
@@ -183,8 +213,8 @@ async fn main() -> Result<()> {
 
         // Run subcommand: non-interactive orchestration
         Some(Commands::Run(args)) => {
-            // Initialize tracing for non-interactive mode
-            tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+            // Initialize file logging (always enabled)
+            init_file_logging()?;
 
             // Start web monitoring server if enabled
             #[cfg(feature = "web-monitoring")]

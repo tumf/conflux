@@ -1007,7 +1007,7 @@ impl AppState {
 
     /// Add a log entry
     pub fn add_log(&mut self, entry: LogEntry) {
-        // Send to tracing for debug file output (if --logs enabled)
+        // Send to tracing for debug file output (always enabled)
         // Include change_id, operation, iteration, and workspace_path in tracing output for context matching
         let change_id = entry.change_id.as_deref().unwrap_or("-");
         let operation = entry.operation.as_deref().unwrap_or("-");
