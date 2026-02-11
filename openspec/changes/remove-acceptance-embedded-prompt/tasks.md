@@ -1,9 +1,9 @@
 ## 1. Implementation
-- [ ] 1.1 acceptance の埋め込みプロンプト定数を空にし、テンプレート単一ソース前提のコメントへ更新する
+- [x] 1.1 acceptance の埋め込みプロンプト定数を空にし、テンプレート単一ソース前提のコメントへ更新する
   - 検証: src/config/defaults.rs に埋め込み本文が存在しないことを確認する
-- [ ] 1.2 acceptance プロンプト生成を context_only 相当に統一し、固定手順を注入しない
+- [x] 1.2 acceptance プロンプト生成を context_only 相当に統一し、固定手順を注入しない
   - 検証: src/agent/prompt.rs の build_acceptance_prompt が context_only と同等の構築を行うことを確認する
-- [ ] 1.3 acceptance_prompt_mode の full を互換エイリアスとして扱い、実際の生成結果が変わらないことを明記する
+- [x] 1.3 acceptance_prompt_mode の full を互換エイリアスとして扱い、実際の生成結果が変わらないことを明記する
   - 検証: src/config/mod.rs の AcceptancePromptMode と関連コメントを確認する
 - [ ] 1.4 既存テストを新挙動に合わせて更新する
   - 検証: src/agent/prompt.rs と src/config/defaults.rs の該当テストが新要件に一致する

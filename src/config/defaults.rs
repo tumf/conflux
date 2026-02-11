@@ -51,24 +51,10 @@ All file paths should be relative to the repository root.
 /// Default prompt for archive command - empty by default
 pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
 
-/// Hardcoded acceptance prompt - used only when acceptance_prompt_mode is "full".
-/// This is a minimal fallback. The recommended approach is to use "context_only" mode
-/// with fixed acceptance instructions in .opencode/commands/cflx-accept.md.
-/// Contains `{change_id}` placeholder that must be expanded before use.
-pub const ACCEPTANCE_SYSTEM_PROMPT: &str = r###"
-You are reviewing the implementation for change: {change_id}
-
-IMPORTANT: Only review the specific change "{change_id}".
-- Proposal: openspec/changes/{change_id}/proposal.md
-- Tasks: openspec/changes/{change_id}/tasks.md
-- Spec deltas: openspec/changes/{change_id}/specs/
-
-Do NOT review or report on other changes in openspec/changes/.
-
-NOTE: When using acceptance_prompt_mode "context_only" (recommended), the fixed acceptance
-instructions are provided by the command template (e.g., .opencode/commands/cflx-accept.md).
-This prompt is only used as a fallback when acceptance_prompt_mode is "full".
-"###;
+/// Acceptance system prompt - now empty to enforce template-only approach.
+/// All acceptance instructions must come from the command template (e.g., .opencode/commands/cflx-accept.md).
+/// The acceptance_prompt_mode "full" is now deprecated and behaves identically to "context_only".
+pub const ACCEPTANCE_SYSTEM_PROMPT: &str = "";
 
 /// Default prompt for acceptance command - appended after hardcoded prompt
 pub const DEFAULT_ACCEPTANCE_PROMPT: &str = "";
@@ -413,21 +399,12 @@ mod tests {
     }
 
     #[test]
-    fn test_acceptance_system_prompt_is_minimal() {
-        // After single-source refactoring, ACCEPTANCE_SYSTEM_PROMPT should be minimal
-        // and contain only basic context (used for "full" mode fallback).
-        // The detailed instructions are now in .opencode/commands/cflx-accept.md.
+    fn test_acceptance_system_prompt_is_empty() {
+        // After template-only refactoring, ACCEPTANCE_SYSTEM_PROMPT should be empty.
+        // All acceptance instructions must come from the command template.
         assert!(
-            ACCEPTANCE_SYSTEM_PROMPT.contains("{change_id}"),
-            "ACCEPTANCE_SYSTEM_PROMPT should contain change_id placeholder"
-        );
-        assert!(
-            ACCEPTANCE_SYSTEM_PROMPT.contains("openspec/changes/{change_id}"),
-            "ACCEPTANCE_SYSTEM_PROMPT should reference the change paths"
-        );
-        assert!(
-            ACCEPTANCE_SYSTEM_PROMPT.contains("context_only"),
-            "ACCEPTANCE_SYSTEM_PROMPT should mention context_only mode as recommended"
+            ACCEPTANCE_SYSTEM_PROMPT.is_empty(),
+            "ACCEPTANCE_SYSTEM_PROMPT should be empty to enforce template-only approach"
         );
     }
 }
