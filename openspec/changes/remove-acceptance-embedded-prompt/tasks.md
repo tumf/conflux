@@ -11,4 +11,4 @@
   - 検証: acceptance コマンド組み立てのログが change_id / path / diff などの可変コンテキストのみを含むことを確認する（例: src/agent/runner.rs か src/parallel/executor.rs）
 
 ## Acceptance #1 Failure Follow-up
-- [ ] `git status --porcelain` が空になるまでワーキングツリーをクリーンにする（未コミット変更: `openspec/changes/remove-acceptance-embedded-prompt/tasks.md`, `src/agent/prompt.rs`, `src/config/defaults.rs`）。
+- [x] `git status --porcelain` が空になるまでワーキングツリーをクリーンにする（未コミット変更: `openspec/changes/remove-acceptance-embedded-prompt/tasks.md`, `src/agent/prompt.rs`, `src/config/defaults.rs`）。
