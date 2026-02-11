@@ -101,7 +101,7 @@ DynamicQueue SHALL support the following operations:
 - **THEN** the change ID is added to DynamicQueue and will be executed in the next processing cycle
 
 #### Scenario: Remove from queue during execution
-- **WHEN** the user changes a [x] change to [@] with Space or @ key in Running mode
+- **WHEN** the user changes a [x] change to [ ] with the Space key in Running mode
 - **THEN** the corresponding change ID is removed from DynamicQueue and will not be executed
 
 #### Scenario: Prevent duplicate additions
@@ -116,17 +116,13 @@ DynamicQueue SHALL support the following operations:
 
 The system SHALL always synchronize the queue state displayed in the UI with the DynamicQueue state.
 
-`ResolveWait` is a state waiting for resolve completion, and Space/@ queue operations MUST NOT modify DynamicQueue. `MergeWait` similarly MUST NOT be a target for queue operations.
+`ResolveWait` is a state waiting for resolve completion, and Space queue operations MUST NOT modify DynamicQueue. `MergeWait` similarly MUST NOT be a target for queue operations.
 
 However, for `ResolveWait`/`MergeWait` rows, the following SHALL be satisfied:
 - Space operation SHALL toggle only the execution mark (`selected`) and MUST NOT modify `queue_status` or DynamicQueue.
-- @ operation SHALL toggle only the approval state (`is_approved`) and MUST NOT modify `queue_status` or DynamicQueue. If unapproval results in an unapproved state, `selected` MUST be cleared.
+- @ operation SHALL be ignored and MUST NOT modify any state.
 
 The TUI MUST display `ResolveWait` as `resolve pending` to clearly indicate it is not a target for queue operations.
-
-#### Scenario: Remove from queue by unapprove
-- **WHEN** the user unapproves a queued change with the @ key
-- **THEN** the status changes to `QueueStatus::NotQueued` and is removed from DynamicQueue
 
 #### Scenario: Remove from queue with Space key
 - **WHEN** the user dequeues a [x] change with the Space key in Running mode
@@ -144,29 +140,13 @@ The TUI MUST display `ResolveWait` as `resolve pending` to clearly indicate it i
 - **AND** DynamicQueue SHALL NOT be modified for the change
 - **AND** Space operation toggles only the execution mark
 
-#### Scenario: @ operation during ResolveWait changes only approval state
-- **GIVEN** the TUI is in running mode
-- **AND** the cursor is on a change in `ResolveWait`
-- **WHEN** the user presses `@`
-- **THEN** the change status SHALL remain `ResolveWait`
-- **AND** DynamicQueue SHALL NOT be modified for the change
-- **AND** only the approval state is toggled
-
 #### Scenario: Cannot change queue state during MergeWait
 - **GIVEN** the TUI is in running mode
 - **AND** the cursor is on a change in `MergeWait`
-- **WHEN** the user presses Space
+- **WHEN** the user presses Space or `@`
 - **THEN** the change status SHALL remain `MergeWait`
 - **AND** DynamicQueue SHALL NOT be modified for the change
 - **AND** Space operation toggles only the execution mark
-
-#### Scenario: @ operation during MergeWait changes only approval state
-- **GIVEN** the TUI is in running mode
-- **AND** the cursor is on a change in `MergeWait`
-- **WHEN** the user presses `@`
-- **THEN** the change status SHALL remain `MergeWait`
-- **AND** DynamicQueue SHALL NOT be modified for the change
-- **AND** only the approval state is toggled
 
 ### Requirement: Event-Driven State Updates
 
