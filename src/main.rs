@@ -2,7 +2,7 @@ mod acceptance;
 mod agent;
 mod ai_command_runner;
 mod analyzer;
-mod approval;
+
 mod cli;
 mod command_queue;
 mod config;
@@ -35,7 +35,7 @@ mod web;
 mod worktree_ops;
 
 use clap::Parser;
-use cli::{ApproveAction, Cli, Commands, TuiArgs};
+use cli::{Cli, Commands, TuiArgs};
 use config::OrchestratorConfig;
 use error::Result;
 use orchestrator::Orchestrator;
@@ -544,68 +544,6 @@ async fn main() -> Result<()> {
                 args.template
             );
         }
-
-        // Approve subcommand: manage change approval status
-        Some(Commands::Approve(args)) => match args.action {
-            ApproveAction::Set { change_id } => {
-                // Check if change exists
-                let change_dir = Path::new("openspec/changes").join(&change_id);
-                if !change_dir.exists() {
-                    eprintln!("Error: Change '{}' does not exist.", change_id);
-                    std::process::exit(1);
-                }
-
-                match approval::approve_change(&change_id) {
-                    Ok(_) => {
-                        println!("Approved change '{}'.", change_id);
-                    }
-                    Err(e) => {
-                        eprintln!("Error approving change '{}': {}", change_id, e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            ApproveAction::Unset { change_id } => {
-                // Check if change exists
-                let change_dir = Path::new("openspec/changes").join(&change_id);
-                if !change_dir.exists() {
-                    eprintln!("Error: Change '{}' does not exist.", change_id);
-                    std::process::exit(1);
-                }
-
-                match approval::unapprove_change(&change_id) {
-                    Ok(_) => {
-                        println!("Unapproved change '{}'.", change_id);
-                    }
-                    Err(e) => {
-                        eprintln!("Error unapproving change '{}': {}", change_id, e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            ApproveAction::Status { change_id } => {
-                // Check if change exists
-                let change_dir = Path::new("openspec/changes").join(&change_id);
-                if !change_dir.exists() {
-                    eprintln!("Error: Change '{}' does not exist.", change_id);
-                    std::process::exit(1);
-                }
-
-                match approval::check_approval(&change_id) {
-                    Ok(approved) => {
-                        if approved {
-                            println!("Change '{}' is approved.", change_id);
-                        } else {
-                            println!("Change '{}' is not approved.", change_id);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Error checking approval status for '{}': {}", change_id, e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-        },
 
         // CheckConflicts subcommand: detect conflicts between spec delta files
         Some(Commands::CheckConflicts(args)) => {

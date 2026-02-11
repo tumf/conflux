@@ -51,10 +51,6 @@ pub enum HookType {
     OnQueueAdd,
     /// Triggered when user removes a change from queue (Space key)
     OnQueueRemove,
-    /// Triggered when user approves a change (@ key)
-    OnApprove,
-    /// Triggered when user removes approval from a change (@ key)
-    OnUnapprove,
 }
 
 impl HookType {
@@ -77,8 +73,6 @@ impl HookType {
             // User interaction (TUI only)
             HookType::OnQueueAdd => "on_queue_add",
             HookType::OnQueueRemove => "on_queue_remove",
-            HookType::OnApprove => "on_approve",
-            HookType::OnUnapprove => "on_unapprove",
         }
     }
 }
@@ -219,10 +213,6 @@ pub struct HooksConfig {
     pub on_queue_add: Option<HookConfigValue>,
     #[serde(default)]
     pub on_queue_remove: Option<HookConfigValue>,
-    #[serde(default)]
-    pub on_approve: Option<HookConfigValue>,
-    #[serde(default)]
-    pub on_unapprove: Option<HookConfigValue>,
 }
 
 impl HooksConfig {
@@ -256,8 +246,6 @@ impl HooksConfig {
         // User interaction (TUI only)
         merge_hook!(on_queue_add);
         merge_hook!(on_queue_remove);
-        merge_hook!(on_approve);
-        merge_hook!(on_unapprove);
     }
 
     /// Get the hook configuration for a specific hook type
@@ -279,8 +267,6 @@ impl HooksConfig {
             // User interaction (TUI only)
             HookType::OnQueueAdd => self.on_queue_add.clone(),
             HookType::OnQueueRemove => self.on_queue_remove.clone(),
-            HookType::OnApprove => self.on_approve.clone(),
-            HookType::OnUnapprove => self.on_unapprove.clone(),
         };
         value.map(|v| v.into_hook_config())
     }
@@ -301,8 +287,6 @@ impl HooksConfig {
             || self.on_merged.is_some()
             || self.on_queue_add.is_some()
             || self.on_queue_remove.is_some()
-            || self.on_approve.is_some()
-            || self.on_unapprove.is_some()
     }
 }
 
@@ -880,58 +864,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // === Tests for on_approve hook (hooks spec 2.3) ===
-
-    #[test]
-    fn test_hooks_config_on_approve() {
-        let json = r#"{"on_approve": "echo 'Approved {change_id}'"}"#;
-        let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let hook = config.get(HookType::OnApprove).unwrap();
-        assert_eq!(hook.command, "echo 'Approved {change_id}'");
-    }
-
-    #[tokio::test]
-    async fn test_on_approve_hook_execution_with_context() {
-        let json = r#"{"on_approve": "echo approved"}"#;
-        let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
-        // on_approve receives change context including completed_tasks/total_tasks
-        let context = HookContext::new(0, 5, 5, false).with_change("my-change", 2, 5);
-
-        let result = runner.run_hook(HookType::OnApprove, &context).await;
-        assert!(result.is_ok());
-
-        // Verify context has the expected values
-        let vars = context.to_env_vars();
-        assert_eq!(
-            vars.get("OPENSPEC_CHANGE_ID"),
-            Some(&"my-change".to_string())
-        );
-        assert_eq!(vars.get("OPENSPEC_COMPLETED_TASKS"), Some(&"2".to_string()));
-        assert_eq!(vars.get("OPENSPEC_TOTAL_TASKS"), Some(&"5".to_string()));
-    }
-
-    // === Tests for on_unapprove hook (hooks spec 2.4) ===
-
-    #[test]
-    fn test_hooks_config_on_unapprove() {
-        let json = r#"{"on_unapprove": "echo 'Unapproved {change_id}'"}"#;
-        let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let hook = config.get(HookType::OnUnapprove).unwrap();
-        assert_eq!(hook.command, "echo 'Unapproved {change_id}'");
-    }
-
-    #[tokio::test]
-    async fn test_on_unapprove_hook_execution() {
-        let json = r#"{"on_unapprove": "echo unapproved"}"#;
-        let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
-        let context = HookContext::new(0, 5, 5, false).with_change("my-change", 0, 3);
-
-        let result = runner.run_hook(HookType::OnUnapprove, &context).await;
-        assert!(result.is_ok());
-    }
-
     // === Tests for on_change_start hook (hooks spec 2.5) ===
 
     #[test]
@@ -1151,9 +1083,7 @@ mod tests {
             "on_change_end": "echo change_end",
             "on_merged": "echo merged",
             "on_queue_add": "echo queue_add",
-            "on_queue_remove": "echo queue_remove",
-            "on_approve": "echo approve",
-            "on_unapprove": "echo unapprove"
+            "on_queue_remove": "echo queue_remove"
         }"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
         let runner = HookRunner::new(config);
@@ -1172,8 +1102,6 @@ mod tests {
         assert!(runner.has_hook(HookType::OnMerged));
         assert!(runner.has_hook(HookType::OnQueueAdd));
         assert!(runner.has_hook(HookType::OnQueueRemove));
-        assert!(runner.has_hook(HookType::OnApprove));
-        assert!(runner.has_hook(HookType::OnUnapprove));
     }
 
     // === Tests for parallel mode context (add-parallel-hooks spec) ===

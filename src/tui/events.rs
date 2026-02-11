@@ -20,14 +20,6 @@ pub enum TuiCommand {
     AddToQueue(String),
     /// Remove a change from the queue dynamically
     RemoveFromQueue(String),
-    /// Approve a change without adding to queue (select/running/stopped modes)
-    ApproveOnly(String),
-    /// Unapprove a change and remove it from the queue (used in running/completed mode)
-    UnapproveAndDequeue(String),
-    /// Unapprove a change without touching queue status or DynamicQueue
-    ///
-    /// Used for wait states like MergeWait/ResolveWait where queue modifications are not allowed.
-    UnapproveOnly(String),
     /// Stop processing (graceful shutdown)
     #[allow(dead_code)]
     Stop,

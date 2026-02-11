@@ -639,7 +639,6 @@ mod tests {
             completed_tasks: 0,
             total_tasks: 5,
             last_modified: "1m ago".to_string(),
-            is_approved: true,
             dependencies: dependencies.into_iter().map(String::from).collect(),
         }
     }

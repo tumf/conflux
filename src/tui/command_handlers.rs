@@ -8,7 +8,7 @@ use crate::tui::events::{LogEntry, OrchestratorEvent, TuiCommand};
 use crate::tui::orchestrator::{run_orchestrator, run_orchestrator_parallel};
 use crate::tui::queue::DynamicQueue;
 use crate::tui::state::AppState;
-use crate::tui::types::{AppMode, QueueStatus, StopMode};
+use crate::tui::types::{AppMode, StopMode};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -187,115 +187,6 @@ pub async fn handle_tui_command(
                 id, suffix
             )));
         }
-        TuiCommand::ApproveOnly(id) => {
-            // Approve without adding to queue (select/running/stopped modes)
-            use crate::approval;
-
-            match approval::approve_change(&id) {
-                Ok(_) => {
-                    ctx.app.update_approval_status(&id, true);
-                    if ctx.app.mode == AppMode::Select {
-                        if let Some(change) = ctx.app.changes.iter_mut().find(|c| c.id == id) {
-                            // In select mode, default to selecting approved changes.
-                            // However, wait states must preserve queue_status/selected semantics.
-                            if !matches!(
-                                change.queue_status,
-                                QueueStatus::MergeWait | QueueStatus::ResolveWait
-                            ) {
-                                change.selected = true;
-                                change.queue_status = QueueStatus::NotQueued;
-                            }
-                        }
-                    }
-                    ctx.app
-                        .add_log(LogEntry::info(format!("Approved (not queued): {}", id)));
-                }
-                Err(e) => {
-                    ctx.app.add_log(LogEntry::error(format!(
-                        "Failed to approve '{}': {}",
-                        id, e
-                    )));
-                }
-            }
-        }
-        TuiCommand::UnapproveOnly(id) => {
-            // Unapprove without touching queue status or DynamicQueue.
-            // Intended for wait states like MergeWait/ResolveWait.
-            use crate::approval;
-
-            match approval::unapprove_change(&id) {
-                Ok(_) => {
-                    ctx.app.update_approval_status(&id, false);
-                    if let Some(change) = ctx.app.changes.iter_mut().find(|c| c.id == id) {
-                        change.selected = false;
-                    }
-                    ctx.app.add_log(LogEntry::info(format!(
-                        "Unapproved (no queue change): {}",
-                        id
-                    )));
-                }
-                Err(e) => {
-                    ctx.app.add_log(LogEntry::error(format!(
-                        "Failed to unapprove '{}': {}",
-                        id, e
-                    )));
-                }
-            }
-        }
-        TuiCommand::UnapproveAndDequeue(id) => {
-            // Unapprove and remove from queue (used in running/completed mode)
-            use crate::approval;
-
-            // First check if queued
-            let was_queued = ctx
-                .app
-                .changes
-                .iter()
-                .find(|c| c.id == id)
-                .map(|c| matches!(c.queue_status, QueueStatus::Queued))
-                .unwrap_or(false);
-
-            match approval::unapprove_change(&id) {
-                Ok(_) => {
-                    ctx.app.update_approval_status(&id, false);
-                    // Also remove from queue if queued
-                    if let Some(change) = ctx.app.changes.iter_mut().find(|c| c.id == id) {
-                        if matches!(change.queue_status, QueueStatus::Queued) {
-                            change.queue_status = QueueStatus::NotQueued;
-                        }
-                        change.selected = false;
-                    }
-                    // Remove from dynamic queue so orchestrator won't process it
-                    let removed_from_dynamic = ctx.dynamic_queue.remove(&id).await;
-                    let removed_from_pending = ctx.dynamic_queue.mark_removed(id.clone()).await;
-                    let mut details = Vec::new();
-                    if removed_from_dynamic {
-                        details.push("also removed from dynamic queue");
-                    }
-                    if removed_from_pending {
-                        details.push("removed from pending");
-                    }
-                    let suffix = if details.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", details.join(", "))
-                    };
-                    let msg = if was_queued {
-                        format!("Unapproved and removed from queue: {}{}", id, suffix)
-                    } else {
-                        format!("Unapproved: {}{}", id, suffix)
-                    };
-                    ctx.app.add_log(LogEntry::info(msg));
-                }
-                Err(e) => {
-                    ctx.app.add_log(LogEntry::error(format!(
-                        "Failed to unapprove '{}': {}",
-                        id, e
-                    )));
-                }
-            }
-        }
-
         TuiCommand::DeleteWorktreeByPath(path, branch_name) => {
             match crate::vcs::git::commands::worktree_remove(
                 ctx.repo_root,

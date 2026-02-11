@@ -30,7 +30,6 @@ SUBCOMMANDS:
   run      Execute orchestration loop (non-interactive)
   tui      Launch interactive TUI dashboard (default)
   init     Generate configuration template
-  approve  Manage change approval status
 
 KEY OPTIONS:
   --parallel            Enable parallel execution using git worktrees
@@ -75,9 +74,6 @@ pub enum Commands {
     /// Initialize a new configuration file
     Init(InitArgs),
 
-    /// Manage change approval status
-    Approve(ApproveArgs),
-
     /// Check for conflicts between spec delta files across changes
     CheckConflicts(CheckConflictsArgs),
 }
@@ -99,7 +95,7 @@ WEB MONITORING:
   while orchestration runs in background.
 
 EXAMPLES:
-  cflx run                           # Process all approved changes
+  cflx run                           # Process all changes
   cflx run --change my-feature       # Process specific change
   cflx run --parallel --max-concurrent 5  # Parallel with 5 workers
   cflx run --parallel --dry-run      # Preview parallelization plan
@@ -161,14 +157,13 @@ The TUI provides real-time visualization of change processing with:
   • Change selection and queue management
   • Live progress tracking with task completion percentages
   • Streaming logs from AI agent execution
-  • Approval management (@key to approve/unapprove)
+
   • Git worktree visualization and management
   • Parallel execution monitoring
 
 KEY BINDINGS:
   Space     Toggle change selection/queue status
   F5        Start/resume processing
-  @         Toggle approval status
   Esc       Stop processing (press twice to force)
   Tab       Switch between Changes/Worktrees view
   q         Quit
@@ -226,41 +221,12 @@ pub struct InitArgs {
     pub force: bool,
 }
 
-/// Arguments for the approve subcommand
-#[derive(Parser, Debug)]
-pub struct ApproveArgs {
-    #[command(subcommand)]
-    pub action: ApproveAction,
-}
-
 /// Arguments for the check-conflicts subcommand
 #[derive(Parser, Debug)]
 pub struct CheckConflictsArgs {
     /// Output results in JSON format
     #[arg(long, short = 'j')]
     pub json: bool,
-}
-
-/// Approve subcommand actions
-#[derive(Subcommand, Debug)]
-pub enum ApproveAction {
-    /// Approve a change (create approved file with checksums)
-    Set {
-        /// The change ID to approve
-        change_id: String,
-    },
-
-    /// Unapprove a change (remove approved file)
-    Unset {
-        /// The change ID to unapprove
-        change_id: String,
-    },
-
-    /// Check approval status of a change
-    Status {
-        /// The change ID to check
-        change_id: String,
-    },
 }
 
 /// Check if git directory exists

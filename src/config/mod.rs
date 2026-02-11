@@ -1405,9 +1405,7 @@ mod tests {
                 "post_archive": "echo post_archive",
                 "on_change_end": "echo change_end",
                 "on_queue_add": "echo queue_add",
-                "on_queue_remove": "echo queue_remove",
-                "on_approve": "echo approve",
-                "on_unapprove": "echo unapprove"
+                "on_queue_remove": "echo queue_remove"
             }
         }"#;
         let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
@@ -1426,8 +1424,6 @@ mod tests {
         assert!(hooks.get(HookType::OnChangeEnd).is_some());
         assert!(hooks.get(HookType::OnQueueAdd).is_some());
         assert!(hooks.get(HookType::OnQueueRemove).is_some());
-        assert!(hooks.get(HookType::OnApprove).is_some());
-        assert!(hooks.get(HookType::OnUnapprove).is_some());
     }
 
     #[test]

@@ -1,4 +1,3 @@
-use crate::approval;
 use crate::error::{OrchestratorError, Result};
 use crate::task_parser;
 use crate::tui::log_deduplicator;
@@ -14,8 +13,6 @@ pub struct Change {
     pub total_tasks: u32,
     #[allow(dead_code)]
     pub last_modified: String,
-    /// Whether this change has been approved for execution
-    pub is_approved: bool,
     /// Dependencies on other changes (parsed from proposal.md)
     pub dependencies: Vec<String>,
 }
@@ -185,9 +182,6 @@ pub fn list_changes_native() -> Result<Vec<Change>> {
             }
         };
 
-        // Check approval status
-        let is_approved = approval::check_approval(dir_name).unwrap_or(false);
-
         // Parse dependencies from proposal.md
         let dependencies = parse_dependencies(dir_name);
 
@@ -196,7 +190,6 @@ pub fn list_changes_native() -> Result<Vec<Change>> {
             completed_tasks,
             total_tasks,
             last_modified: String::new(), // Not used in native implementation
-            is_approved,
             dependencies,
         });
     }
@@ -230,7 +223,6 @@ mod tests {
             completed_tasks: 0,
             total_tasks: 0,
             last_modified: "now".to_string(),
-            is_approved: false,
             dependencies: Vec::new(),
         };
         assert_eq!(change.progress_percent(), 0.0);
@@ -244,7 +236,6 @@ mod tests {
             completed_tasks: 5,
             total_tasks: 5,
             last_modified: "now".to_string(),
-            is_approved: false,
             dependencies: Vec::new(),
         };
         assert_eq!(change.progress_percent(), 100.0);
@@ -391,14 +382,11 @@ mod tests {
         let _ = list_changes_native();
 
         let should_log_progress = log_deduplicator::should_log_task_progress("sample-change", 0, 1);
-        let should_log_approval =
-            log_deduplicator::should_log_approval_status("sample-change", false);
         let should_log_count = log_deduplicator::should_log_change_count(1);
 
         env::set_current_dir(original_dir).unwrap();
 
         assert!(!should_log_progress);
-        assert!(!should_log_approval);
         assert!(!should_log_count);
     }
 }

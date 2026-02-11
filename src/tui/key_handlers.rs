@@ -467,22 +467,7 @@ pub async fn handle_key_event(
                 let _ = ctx.cmd_tx.send(cmd).await;
             }
         }
-        (KeyCode::Char('@'), _) => {
-            // Toggle approval status
-            debug!(
-                "@ key pressed: mode={:?}, view_mode={:?}, cursor_index={}, changes_len={}",
-                ctx.app.mode,
-                ctx.app.view_mode,
-                ctx.app.cursor_index,
-                ctx.app.changes.len()
-            );
-            if let Some(cmd) = ctx.app.toggle_approval() {
-                debug!("toggle_approval returned: {:?}", cmd);
-                let _ = ctx.cmd_tx.send(cmd).await;
-            } else {
-                debug!("toggle_approval returned None");
-            }
-        }
+
         (KeyCode::Char('e'), _) => {
             handle_editor_launch(ctx).await?;
         }

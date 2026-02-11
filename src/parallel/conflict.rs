@@ -6,8 +6,7 @@ use crate::history::{ResolveAttempt, ResolveContext};
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{VcsBackend, WorkspaceManager};
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -59,35 +58,6 @@ pub async fn get_vcs_log_for_revisions(
         .get_log_for_revisions(revisions)
         .await
         .map_err(OrchestratorError::from)
-}
-
-fn cleanup_approved_only_changes(repo_root: &Path, change_ids: &[String]) -> Result<Vec<String>> {
-    let changes_root = repo_root.join("openspec").join("changes");
-    let mut removed = Vec::new();
-
-    for change_id in change_ids {
-        let change_dir = changes_root.join(change_id);
-        if !change_dir.exists() || !change_dir.is_dir() {
-            continue;
-        }
-
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(&change_dir)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            entries.push((name, entry.path()));
-        }
-
-        if entries.len() == 1 {
-            let (name, path) = &entries[0];
-            if name == "approved" && path.is_file() {
-                fs::remove_dir_all(&change_dir)?;
-                removed.push(change_id.clone());
-            }
-        }
-    }
-
-    Ok(removed)
 }
 
 /// Attempt to resolve conflicts with retries using the configured resolve command.
@@ -911,22 +881,6 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         stderr_tail: output_collector.stderr_tail(),
                     });
                     continue;
-                }
-
-                let removed_changes = cleanup_approved_only_changes(repo_root, change_ids)?;
-                if !removed_changes.is_empty() {
-                    send_event(
-                        event_tx,
-                        ParallelEvent::ResolveOutput {
-                            change_id: combined_change_id.clone(),
-                            output: format!(
-                                "Removed approved-only change directories: {}",
-                                removed_changes.join(", ")
-                            ),
-                            iteration: Some(attempt),
-                        },
-                    )
-                    .await;
                 }
             }
 

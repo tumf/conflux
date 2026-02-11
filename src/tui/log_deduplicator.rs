@@ -9,7 +9,6 @@ use tracing::info;
 pub struct ChangeStateSnapshot {
     pub completed_tasks: u32,
     pub total_tasks: u32,
-    pub is_approved: bool,
 }
 
 /// Tracks log state to suppress repetitive debug messages.
@@ -49,7 +48,7 @@ impl LogDeduplicator {
         completed_tasks: u32,
         total_tasks: u32,
     ) -> bool {
-        let updated = self
+        let _updated = self
             .change_states
             .get(change_id)
             .cloned()
@@ -57,21 +56,6 @@ impl LogDeduplicator {
         let snapshot = ChangeStateSnapshot {
             completed_tasks,
             total_tasks,
-            is_approved: updated.is_approved,
-        };
-        self.should_log(change_id, snapshot)
-    }
-
-    pub fn should_log_approval_status(&mut self, change_id: &str, is_approved: bool) -> bool {
-        let updated = self
-            .change_states
-            .get(change_id)
-            .cloned()
-            .unwrap_or_default();
-        let snapshot = ChangeStateSnapshot {
-            completed_tasks: updated.completed_tasks,
-            total_tasks: updated.total_tasks,
-            is_approved,
         };
         self.should_log(change_id, snapshot)
     }
@@ -98,8 +82,8 @@ impl LogDeduplicator {
         info!("Status summary: {} changes tracked", entries.len());
         for (change_id, state) in entries {
             info!(
-                "  - {}: {}/{} tasks, approved={}",
-                change_id, state.completed_tasks, state.total_tasks, state.is_approved
+                "  - {}: {}/{} tasks",
+                change_id, state.completed_tasks, state.total_tasks
             );
         }
 
@@ -134,12 +118,6 @@ pub fn should_log_task_progress(change_id: &str, completed_tasks: u32, total_tas
     })
 }
 
-pub fn should_log_approval_status(change_id: &str, is_approved: bool) -> bool {
-    with_deduplicator(|deduplicator| {
-        deduplicator.should_log_approval_status(change_id, is_approved)
-    })
-}
-
 pub fn should_log_change_count(change_count: usize) -> bool {
     with_deduplicator(|deduplicator| deduplicator.should_log_change_count(change_count))
 }
@@ -165,7 +143,6 @@ mod tests {
         let snapshot = ChangeStateSnapshot {
             completed_tasks: 0,
             total_tasks: 10,
-            is_approved: false,
         };
 
         assert!(deduplicator.should_log("change-a", snapshot.clone()));
@@ -173,7 +150,6 @@ mod tests {
         let updated = ChangeStateSnapshot {
             completed_tasks: 1,
             total_tasks: 10,
-            is_approved: false,
         };
         assert!(deduplicator.should_log("change-a", updated));
     }

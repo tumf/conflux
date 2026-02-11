@@ -35,7 +35,7 @@ Handles all keyboard input:
 Handles all TuiCommand variants:
 - `handle_start_processing_command()`: Spawn orchestrator tasks
 - `handle_tui_command()`: Main TuiCommand dispatcher
-- Processes commands: AddToQueue, RemoveFromQueue, ApproveOnly, UnapproveAndDequeue, DeleteWorktree, DeleteWorktreeByPath, Stop, CancelStop, ForceStop, Retry, MergeWorktreeBranch, ResolveMerge
+- Processes commands: AddToQueue, RemoveFromQueue, DeleteWorktree, DeleteWorktreeByPath, Stop, CancelStop, ForceStop, Retry, MergeWorktreeBranch, ResolveMerge
 
 ### Integration Status
 

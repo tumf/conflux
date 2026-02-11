@@ -599,48 +599,21 @@ impl Orchestrator {
         initial_changes: Vec<Change>,
     ) -> Result<(Vec<Change>, SerialRunService, usize)> {
         // Filter by target_changes if specified (early filtering)
-        // Both explicit targets and default mode require approval check
         let filtered_initial = if let Some(targets) = &self.target_changes {
             // Explicit targets specified via --change option
             let mut found = Vec::new();
             for target in targets {
                 let trimmed = target.trim();
                 if let Some(change) = initial_changes.iter().find(|c| c.id == trimmed) {
-                    // Check approval status even for explicitly specified changes
-                    if change.is_approved {
-                        found.push(change.clone());
-                    } else {
-                        warn!(
-                            "Skipping unapproved change '{}'. Approve it first with: cflx approve set {}",
-                            trimmed, trimmed
-                        );
-                    }
+                    found.push(change.clone());
                 } else {
                     warn!("Specified change '{}' not found, skipping", trimmed);
                 }
             }
             found
         } else {
-            // No explicit target: filter to only approved changes
-            let (approved, unapproved): (Vec<_>, Vec<_>) =
-                initial_changes.into_iter().partition(|c| c.is_approved);
-
-            // Warn about unapproved changes
-            for change in &unapproved {
-                warn!(
-                    "Skipping unapproved change '{}'. Approve it first with: cflx approve set {}",
-                    change.id, change.id
-                );
-            }
-
-            if approved.is_empty() && !unapproved.is_empty() {
-                info!(
-                    "No approved changes found. {} change(s) are pending approval.",
-                    unapproved.len()
-                );
-            }
-
-            approved
+            // No explicit target: return all changes
+            initial_changes
         };
 
         if filtered_initial.is_empty() {
@@ -1138,34 +1111,25 @@ impl Orchestrator {
     async fn run_parallel_dry_run(&self, changes: &[Change]) -> Result<()> {
         info!("Running parallel mode dry run (preview only)");
 
-        // Filter to approved changes only
-        let approved: Vec<_> = changes.iter().filter(|c| c.is_approved).cloned().collect();
-
-        if approved.is_empty() {
-            println!("No approved changes found for parallel execution.");
-            for change in changes {
-                println!(
-                    "  - {} (unapproved) - use: cflx approve set {}",
-                    change.id, change.id
-                );
-            }
+        if changes.is_empty() {
+            println!("No changes found for parallel execution.");
             return Ok(());
         }
 
         // Use ParallelRunService to analyze groups (uses LLM if enabled)
         let repo_root = std::env::current_dir()?;
         let service = ParallelRunService::new(repo_root, self.config.clone());
-        let groups = service.analyze_and_group_public(&approved).await;
+        let groups = service.analyze_and_group_public(changes).await;
 
         // Display parallelization groups
         println!("\n=== Parallel Execution Plan (Dry Run) ===\n");
-        println!("Total changes: {}", approved.len());
+        println!("Total changes: {}", changes.len());
         println!("Parallelization groups: {}\n", groups.len());
 
         for group in &groups {
             println!("Group {} (can run in parallel):", group.id);
             for change_id in &group.changes {
-                let change = approved.iter().find(|c| c.id == *change_id);
+                let change = changes.iter().find(|c| c.id == *change_id);
                 if let Some(c) = change {
                     println!(
                         "  - {} ({}/{} tasks, {:.1}%)",
@@ -1202,16 +1166,13 @@ impl Orchestrator {
     ) -> Result<()> {
         info!("Running parallel execution mode");
 
-        // Filter to approved changes only
-        let approved: Vec<_> = changes.iter().filter(|c| c.is_approved).cloned().collect();
-
-        if approved.is_empty() {
-            info!("No approved changes found for parallel execution");
+        if changes.is_empty() {
+            info!("No changes found for parallel execution");
             return Ok(());
         }
 
         // Store snapshot of change IDs
-        let snapshot_ids: HashSet<String> = approved.iter().map(|c| c.id.clone()).collect();
+        let snapshot_ids: HashSet<String> = changes.iter().map(|c| c.id.clone()).collect();
         self.initial_change_ids = Some(snapshot_ids);
 
         // Use ParallelRunService for the common parallel execution flow
@@ -1266,7 +1227,7 @@ impl Orchestrator {
 
         // Run with a simple logging event handler for CLI mode
         let result = service
-            .run_parallel(approved, Some(cancel_token), move |event| {
+            .run_parallel(changes.to_vec(), Some(cancel_token), move |event| {
                 // Log events for CLI mode (no TUI)
                 use crate::parallel::ParallelEvent;
                 #[cfg(feature = "web-monitoring")]
@@ -1319,7 +1280,6 @@ mod tests {
             completed_tasks: completed,
             total_tasks: total,
             last_modified: "1m ago".to_string(),
-            is_approved: false,
             dependencies: Vec::new(),
         }
     }
@@ -1443,7 +1403,6 @@ mod tests {
                 completed_tasks: 0,
                 total_tasks: 3,
                 last_modified: "now".to_string(),
-                is_approved: true,
                 dependencies: Vec::new(),
             },
             Change {
@@ -1451,7 +1410,6 @@ mod tests {
                 completed_tasks: 0,
                 total_tasks: 3,
                 last_modified: "now".to_string(),
-                is_approved: true,
                 dependencies: vec!["change-a".to_string()],
             },
             Change {
@@ -1459,7 +1417,6 @@ mod tests {
                 completed_tasks: 0,
                 total_tasks: 3,
                 last_modified: "now".to_string(),
-                is_approved: true,
                 dependencies: Vec::new(),
             },
         ];

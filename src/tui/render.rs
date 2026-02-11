@@ -20,19 +20,13 @@ use super::utils::{get_version_string, truncate_to_display_width_with_suffix};
 /// Returns (checkbox_text, checkbox_color) based on the change's status.
 /// Archived changes are always shown as gray "[x]" to indicate they are
 /// no longer actionable.
-fn get_checkbox_display(
-    queue_status: &QueueStatus,
-    is_approved: bool,
-    is_selected: bool,
-) -> (&'static str, Color) {
+fn get_checkbox_display(queue_status: &QueueStatus, is_selected: bool) -> (&'static str, Color) {
     if matches!(queue_status, QueueStatus::Archived | QueueStatus::Merged) {
         ("[x]", Color::DarkGray) // Archived - grayed out
-    } else if !is_approved {
-        ("[ ]", Color::Gray) // Unapproved
     } else if is_selected {
         ("[x]", Color::Green) // Selected/In queue
     } else {
-        ("[@]", Color::Yellow) // Approved but not selected
+        ("[ ]", Color::Gray) // Not selected
     }
 }
 
@@ -287,8 +281,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
         .enumerate()
         .map(|(i, change)| {
             // Checkbox display (Select mode):
-            // [ ] - unapproved (cannot be selected)
-            // [@] - approved but not selected (ready to select)
+            // [ ] - not selected (ready to select)
             // [x] - selected (will become Queued when F5 is pressed)
             // [x] (gray) - archived (processing complete, no longer actionable)
             // Note: 'selected' field indicates selection for next run
@@ -307,7 +300,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             let (checkbox, checkbox_color) = if is_parallel_blocked {
                 ("[ ]", Color::DarkGray)
             } else {
-                get_checkbox_display(&change.queue_status, change.is_approved, change.selected)
+                get_checkbox_display(&change.queue_status, change.selected)
             };
 
             let cursor = if i == app.cursor_index { "►" } else { " " };
@@ -336,10 +329,8 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
 
             let name_color = if is_parallel_blocked {
                 Color::DarkGray
-            } else if change.is_approved {
-                Color::White
             } else {
-                Color::Gray
+                Color::White
             };
 
             let mut spans = vec![
@@ -466,11 +457,6 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 "Space: queue"
             });
         }
-        keys.push(if item.is_approved {
-            "@: unapprove"
-        } else {
-            "@: approve"
-        });
         keys.push("e: edit");
         // Show M key hint based on resolve state (only in Select, Running, Stopped modes)
         // - When resolve is NOT running and current item is MergeWait: "M: resolve"
@@ -535,8 +521,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
         .enumerate()
         .map(|(i, change)| {
             // Checkbox display (Running/Stopped mode):
-            // [ ] - unapproved (cannot be added to queue)
-            // [@] - approved but not in queue / not marked
+            // [ ] - not in queue / not marked
             // [x] - in queue OR marked for execution (Stopped mode)
             // [x] (gray) - archived (processing complete, no longer actionable)
             // Note: Display is driven by 'selected' field, which serves dual purpose:
@@ -557,7 +542,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             let (checkbox, checkbox_color) = if is_parallel_blocked {
                 ("[ ]", Color::DarkGray)
             } else {
-                get_checkbox_display(&change.queue_status, change.is_approved, change.selected)
+                get_checkbox_display(&change.queue_status, change.selected)
             };
 
             let cursor = if i == app.cursor_index { "►" } else { " " };
@@ -586,10 +571,8 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
             let name_color = if is_parallel_blocked {
                 Color::DarkGray
-            } else if change.is_approved {
-                Color::White
             } else {
-                Color::Gray
+                Color::White
             };
 
             // Calculate elapsed time first
@@ -786,11 +769,6 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 "Space: queue"
             });
         }
-        keys.push(if item.is_approved {
-            "@: unapprove"
-        } else {
-            "@: approve"
-        });
         keys.push("e: edit");
         // Show M key hint based on resolve state (only in Select, Running, Stopped modes)
         // - When resolve is NOT running and current item is MergeWait: "M: resolve"
@@ -1584,13 +1562,12 @@ mod tests {
     use ratatui::Terminal;
     use std::collections::HashSet;
 
-    fn create_test_change(id: &str, is_approved: bool) -> Change {
+    fn create_test_change(id: &str) -> Change {
         Change {
             id: id.to_string(),
             completed_tasks: 0,
             total_tasks: 3,
             last_modified: "now".to_string(),
-            is_approved,
             dependencies: Vec::new(),
         }
     }
@@ -1626,58 +1603,51 @@ mod tests {
     #[test]
     fn test_get_checkbox_display_archived_always_gray() {
         // Archived status should always result in gray checkbox,
-        // regardless of is_approved or is_selected values
-        let (text, color) = get_checkbox_display(&QueueStatus::Archived, true, true);
+        // regardless of is_selected value
+        let (text, color) = get_checkbox_display(&QueueStatus::Archived, true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::DarkGray);
 
-        let (text, color) = get_checkbox_display(&QueueStatus::Archived, true, false);
-        assert_eq!(text, "[x]");
-        assert_eq!(color, Color::DarkGray);
-
-        let (text, color) = get_checkbox_display(&QueueStatus::Archived, false, true);
-        assert_eq!(text, "[x]");
-        assert_eq!(color, Color::DarkGray);
-
-        let (text, color) = get_checkbox_display(&QueueStatus::Archived, false, false);
+        let (text, color) = get_checkbox_display(&QueueStatus::Archived, false);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::DarkGray);
     }
 
     #[test]
-    fn test_get_checkbox_display_unapproved() {
-        let (text, color) = get_checkbox_display(&QueueStatus::NotQueued, false, false);
+    fn test_get_checkbox_display_not_selected() {
+        let (text, color) = get_checkbox_display(&QueueStatus::NotQueued, false);
         assert_eq!(text, "[ ]");
         assert_eq!(color, Color::Gray);
     }
 
     #[test]
-    fn test_get_checkbox_display_approved_selected() {
-        let (text, color) = get_checkbox_display(&QueueStatus::NotQueued, true, true);
+    fn test_get_checkbox_display_selected() {
+        let (text, color) = get_checkbox_display(&QueueStatus::NotQueued, true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
 
-        let (text, color) = get_checkbox_display(&QueueStatus::Queued, true, true);
+        let (text, color) = get_checkbox_display(&QueueStatus::Queued, true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
     }
 
     #[test]
-    fn test_get_checkbox_display_approved_not_selected() {
-        let (text, color) = get_checkbox_display(&QueueStatus::NotQueued, true, false);
-        assert_eq!(text, "[@]");
-        assert_eq!(color, Color::Yellow);
+    fn test_get_checkbox_display_marked_not_queued() {
+        // When selected but not queued, show [@] marker
+        let (text, color) = get_checkbox_display(&QueueStatus::NotQueued, true);
+        assert_eq!(text, "[x]");
+        assert_eq!(color, Color::Green);
     }
 
     #[test]
     fn test_get_checkbox_display_processing_states() {
         // Applying state should show green when selected
-        let (text, color) = get_checkbox_display(&QueueStatus::Applying, true, true);
+        let (text, color) = get_checkbox_display(&QueueStatus::Applying, true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
 
         // Archiving state should show green when selected
-        let (text, color) = get_checkbox_display(&QueueStatus::Archiving, true, true);
+        let (text, color) = get_checkbox_display(&QueueStatus::Archiving, true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
     }
@@ -1692,7 +1662,7 @@ mod tests {
 
     #[test]
     fn test_render_shows_worktree_badge() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.changes[0].has_worktree = true;
 
         let buffer = render_buffer(&mut app, 80, 20);
@@ -1702,7 +1672,7 @@ mod tests {
 
     #[test]
     fn test_render_resolving_status_shows_label() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.changes[0].queue_status = QueueStatus::Resolving;
         app.add_log(LogEntry::info("log"));
 
@@ -1713,7 +1683,7 @@ mod tests {
 
     #[test]
     fn test_render_merge_wait_status_shows_label() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.changes[0].queue_status = QueueStatus::MergeWait;
         app.add_log(LogEntry::info("log"));
 
@@ -1724,7 +1694,7 @@ mod tests {
 
     #[test]
     fn test_render_merge_wait_shows_resolve_key_hint() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.changes[0].queue_status = QueueStatus::MergeWait;
         app.is_resolving = false; // Not currently resolving
 
@@ -1738,7 +1708,7 @@ mod tests {
 
     #[test]
     fn test_render_merge_wait_hides_resolve_key_hint_when_resolving() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.changes[0].queue_status = QueueStatus::MergeWait;
         app.is_resolving = true; // Currently resolving
 
@@ -1752,7 +1722,7 @@ mod tests {
 
     #[test]
     fn test_render_hides_f5_run_hint_while_resolving() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Select;
         app.is_resolving = true;
         app.cursor_index = 0;
@@ -1767,7 +1737,7 @@ mod tests {
     #[test]
     fn test_render_uses_centralized_resolve_check_in_select_mode() {
         // Verify that render shows M: resolve in Select mode with MergeWait
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Select;
         app.changes[0].queue_status = QueueStatus::MergeWait;
         app.is_resolving = false;
@@ -1785,7 +1755,7 @@ mod tests {
     #[test]
     fn test_render_hides_resolve_in_error_mode() {
         // Verify that render does NOT show M: resolve in Error mode
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Error; // Error mode
         app.changes[0].queue_status = QueueStatus::MergeWait;
         app.is_resolving = false;
@@ -1804,7 +1774,7 @@ mod tests {
     #[test]
     fn test_render_shows_resolve_in_running_mode() {
         // Verify that render shows M: resolve in Running mode for MergeWait
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Running;
         app.changes[0].queue_status = QueueStatus::MergeWait;
         app.is_resolving = false;
@@ -1838,7 +1808,7 @@ mod tests {
         for (mode, queue_status, is_resolving, should_show_resolve, should_show_queue_resolve) in
             test_cases
         {
-            let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+            let mut app = create_test_app(vec![create_test_change("change-a")]);
             app.mode = mode.clone();
             app.changes[0].queue_status = queue_status.clone();
             app.is_resolving = is_resolving;
@@ -1869,7 +1839,7 @@ mod tests {
     fn test_render_shows_worktree_delete_confirm_modal() {
         use crate::tui::types::WorktreeAction;
 
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.pending_worktree_action =
             Some(("/path/to/worktree".to_string(), WorktreeAction::Delete));
         app.mode = AppMode::ConfirmWorktreeDelete;
@@ -1882,7 +1852,7 @@ mod tests {
 
     #[test]
     fn test_render_parallel_archived_row_does_not_show_uncommited_badge() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.parallel_mode = true;
         app.changes[0].queue_status = QueueStatus::Archived;
         app.changes[0].is_parallel_eligible = false;
@@ -1896,7 +1866,7 @@ mod tests {
 
     #[test]
     fn test_render_parallel_uncommitted_queueable_row_shows_uncommited_badge() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.parallel_mode = true;
         app.changes[0].queue_status = QueueStatus::NotQueued;
         app.changes[0].is_parallel_eligible = false;
@@ -1909,7 +1879,9 @@ mod tests {
 
     #[test]
     fn test_render_select_mode_footer_message() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        // Select the change to trigger "Press F5 to start processing" message
+        app.changes[0].selected = true;
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
         assert!(content.contains("Conflux"));
@@ -1918,7 +1890,7 @@ mod tests {
 
     #[test]
     fn test_render_shows_uncommitted_badge() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.parallel_available = true;
         app.parallel_mode = true;
         app.apply_parallel_eligibility(&HashSet::new(), &HashSet::new());
@@ -1930,7 +1902,7 @@ mod tests {
 
     #[test]
     fn test_log_header_analysis_with_iteration() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
 
         // Add analysis log with iteration
         let entry = LogEntry::info("Analyzing dependencies")
@@ -1951,7 +1923,7 @@ mod tests {
 
     #[test]
     fn test_log_header_analysis_without_iteration() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
 
         // Add analysis log without iteration (edge case - should default to iteration 1)
         let entry = LogEntry::info("Starting analysis").with_operation("analysis");
@@ -1971,7 +1943,7 @@ mod tests {
 
     #[test]
     fn test_log_header_resolve_with_change_id_and_iteration() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
 
         // Add resolve log with change_id and iteration
         let entry = LogEntry::info("Resolving conflicts")
@@ -1993,7 +1965,7 @@ mod tests {
 
     #[test]
     fn test_log_header_with_change_id_only() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
 
         // Add log with only change_id (no operation or iteration)
         let entry = LogEntry::info("Processing change").with_change_id("test-change");
@@ -2016,7 +1988,7 @@ mod tests {
 
     #[test]
     fn test_log_no_header_when_no_change_id_or_operation() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
 
         // Add plain log with no change_id or operation
         let entry = LogEntry::info("Regular log message");
@@ -2042,7 +2014,7 @@ mod tests {
 
     #[test]
     fn test_log_header_acceptance_with_iteration() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
 
         // Add acceptance log with change_id and iteration
         let entry = LogEntry::info("Running acceptance test")
@@ -2064,7 +2036,7 @@ mod tests {
 
     #[test]
     fn test_log_header_acceptance_without_iteration() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
 
         // Add acceptance log with change_id but no iteration
         let entry = LogEntry::info("Acceptance test starting")
@@ -2085,7 +2057,7 @@ mod tests {
 
     #[test]
     fn test_log_header_archive_with_change_id_and_iteration() {
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
 
         // Add archive log with change_id and iteration
         let entry = LogEntry::info("Archiving change")
@@ -2109,10 +2081,10 @@ mod tests {
     fn test_running_header_counts_only_in_flight_changes() {
         // Test that Running header only counts in-flight changes (not queued)
         let mut app = create_test_app(vec![
-            create_test_change("change-a", true),
-            create_test_change("change-b", true),
-            create_test_change("change-c", true),
-            create_test_change("change-d", true),
+            create_test_change("change-a"),
+            create_test_change("change-b"),
+            create_test_change("change-c"),
+            create_test_change("change-d"),
         ]);
 
         // Set mode to Running
@@ -2153,8 +2125,8 @@ mod tests {
     fn test_running_header_counts_resolving_as_in_flight() {
         // Test that Resolving status is counted as in-flight
         let mut app = create_test_app(vec![
-            create_test_change("change-a", true),
-            create_test_change("change-b", true),
+            create_test_change("change-a"),
+            create_test_change("change-b"),
         ]);
 
         // Set mode to Running
@@ -2181,8 +2153,8 @@ mod tests {
     #[test]
     fn test_select_mode_shows_running_when_resolving() {
         let mut app = create_test_app(vec![
-            create_test_change("change-a", true),
-            create_test_change("change-b", true),
+            create_test_change("change-a"),
+            create_test_change("change-b"),
         ]);
 
         app.mode = AppMode::Select;
@@ -2207,7 +2179,7 @@ mod tests {
     #[test]
     fn test_log_panel_toggle_hides_logs() {
         // Test that logs can be hidden when logs_panel_enabled is false
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.add_log(LogEntry::info("Test log message"));
 
         // Logs panel should be visible by default
@@ -2235,7 +2207,7 @@ mod tests {
     #[test]
     fn test_log_panel_toggle_shows_logs_when_enabled() {
         // Test that logs are shown when logs_panel_enabled is true
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.add_log(LogEntry::info("Test log message"));
 
         // Logs panel is enabled by default
@@ -2254,7 +2226,7 @@ mod tests {
     #[test]
     fn test_log_panel_key_hint_always_shows() {
         // Test that 'l: logs' key hint is always shown in Changes view
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
 
         // Test in select mode (no logs)
         let buffer = render_buffer(&mut app, 100, 24);
@@ -2355,7 +2327,7 @@ mod tests {
         // When logs wrap to multiple display lines, the visible range should
         // show the correct portion based on display lines, not log count
 
-        let mut app = create_test_app(vec![create_test_change("change-a", true)]);
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
 
         // Add a short log
         app.add_log(LogEntry::info("Short log 1"));

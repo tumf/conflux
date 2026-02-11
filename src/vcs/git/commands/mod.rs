@@ -14,9 +14,9 @@ pub mod worktree;
 
 // Re-export all public functions from submodules for backward compatibility
 pub use basic::{
-    branch_delete, branch_exists, check_git_repo, checkout, ensure_git_info_exclude_pattern,
-    generate_unique_branch_name, get_changed_files, get_conflict_files, get_current_branch,
-    get_current_commit, get_status, has_uncommitted_changes, is_head_empty_commit, run_git,
+    branch_delete, branch_exists, check_git_repo, checkout, generate_unique_branch_name,
+    get_changed_files, get_conflict_files, get_current_branch, get_current_commit, get_status,
+    has_uncommitted_changes, is_head_empty_commit, run_git,
 };
 pub use commit::{
     add_and_commit, create_archive_wip_commit, has_changes_to_commit, list_changes_in_head,

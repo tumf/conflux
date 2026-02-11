@@ -60,8 +60,6 @@ pub struct ChangeState {
     pub selected: bool,
     /// Whether this is a newly detected change
     pub is_new: bool,
-    /// Whether this change is approved for execution
-    pub is_approved: bool,
     /// Whether this change is eligible for parallel execution
     pub is_parallel_eligible: bool,
     /// Whether a worktree exists for this change
@@ -166,16 +164,15 @@ impl ChangeState {
     /// populates OrchestratorState::task_progress() from fetched changes and then
     /// queries it back when updating UI state. This ensures consistency between
     /// TUI and orchestrator for progress tracking.
-    pub fn from_change(change: &Change, selected: bool) -> Self {
+    pub fn from_change(change: &Change) -> Self {
         Self {
             id: change.id.clone(),
             // Initial values from Change object; synchronized with shared state in update_changes()
             completed_tasks: change.completed_tasks,
             total_tasks: change.total_tasks,
-            selected,
+            selected: false, // Always start unselected
             is_new: false,
             queue_status: QueueStatus::NotQueued,
-            is_approved: change.is_approved,
             is_parallel_eligible: true,
             has_worktree: false,
             started_at: None,
@@ -225,32 +222,18 @@ impl ChangeState {
 impl AppState {
     /// Create a new AppState with initial changes
     ///
-    /// Only approved changes are auto-selected on startup.
-    /// Unapproved changes start unselected.
+    /// All changes start unselected on startup.
+    /// Users must explicitly select changes to process.
     pub fn new(changes: Vec<Change>) -> Self {
         let known_ids: HashSet<String> = changes.iter().map(|c| c.id.clone()).collect();
 
-        // Auto-select only approved changes
-        let change_states: Vec<ChangeState> = changes
-            .iter()
-            .map(|c| ChangeState::from_change(c, c.is_approved))
-            .collect();
-
-        // Count auto-queued approved changes
-        let approved_count = change_states.iter().filter(|c| c.is_approved).count();
+        // All changes start unselected
+        let change_states: Vec<ChangeState> =
+            changes.iter().map(ChangeState::from_change).collect();
 
         let mut list_state = ListState::default();
         if !change_states.is_empty() {
             list_state.select(Some(0));
-        }
-
-        // Create initial log entries for auto-queued changes
-        let mut logs = Vec::new();
-        if approved_count > 0 {
-            logs.push(LogEntry::info(format!(
-                "Auto-queued {} approved change(s)",
-                approved_count
-            )));
         }
 
         Self {
@@ -266,7 +249,7 @@ impl AppState {
             pending_worktree_branch: None,
             current_change: None,
             error_change_id: None,
-            logs,
+            logs: Vec::new(),
             last_refresh: Instant::now(),
             new_change_count: 0,
             known_change_ids: known_ids,
@@ -565,7 +548,7 @@ impl AppState {
         let path = worktree.path.clone();
         let branch_name = worktree.branch.clone();
 
-        debug!("Merge approved: creating TuiCommand::MergeWorktreeBranch");
+        debug!("Merge initiated: creating TuiCommand::MergeWorktreeBranch");
         Some(TuiCommand::MergeWorktreeBranch {
             worktree_path: path,
             branch_name,
@@ -575,11 +558,10 @@ impl AppState {
     /// Toggle selection of the current change
     ///
     /// In Select mode:
-    /// - Unapproved changes cannot be selected (shows warning)
-    /// - Approved changes can be toggled between selected/unselected
+    /// - Changes can be toggled between selected/unselected
     ///
     /// In Running/Completed mode:
-    /// - Only approved changes can be added to queue
+    /// - Changes can be added to or removed from the queue
     pub fn toggle_selection(&mut self) -> Option<TuiCommand> {
         if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
             return None;
@@ -589,7 +571,6 @@ impl AppState {
 
         // Validate that the change can be toggled
         if let guards::ToggleGuardResult::Blocked(msg) = guards::validate_change_toggleable(
-            change.is_approved,
             change.is_parallel_eligible,
             self.parallel_mode,
             &change.queue_status,
@@ -778,113 +759,6 @@ impl AppState {
     /// Get the number of selected changes
     pub fn selected_count(&self) -> usize {
         self.changes.iter().filter(|c| c.selected).count()
-    }
-
-    /// Toggle approval status for the current change
-    ///
-    /// Only available in Select mode. Returns a TuiCommand::ToggleApproval
-    /// to be processed by the main loop.
-    pub fn toggle_approval(&mut self) -> Option<TuiCommand> {
-        if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
-            debug!(
-                "toggle_approval: early return - changes.is_empty={}, cursor_index={}, changes.len={}",
-                self.changes.is_empty(),
-                self.cursor_index,
-                self.changes.len()
-            );
-            return None;
-        }
-
-        let change = &self.changes[self.cursor_index];
-
-        debug!(
-            "toggle_approval: change_id={}, queue_status={:?}, is_approved={}, mode={:?}",
-            change.id, change.queue_status, change.is_approved, self.mode
-        );
-
-        // Block approval toggle for active (in-flight) changes
-        // MergeWait and ResolveWait allow approval toggle (without queue changes)
-        if change.queue_status.is_active() {
-            self.warning_message = Some(format!(
-                "Cannot change approval for change '{}' while it is {}",
-                change.id,
-                change.queue_status.display()
-            ));
-            debug!("toggle_approval: blocked by is_active status");
-            return None;
-        }
-
-        let id = change.id.clone();
-        let is_approved = change.is_approved;
-
-        match self.mode {
-            AppMode::Select => {
-                // In select mode:
-                // [ ] (unapproved) → @ → [x] (approved + selected, NOT queued)
-                // [x] (approved + selected) → @ → [ ] (unapproved + not selected)
-                if !is_approved {
-                    // Unapproved → approved + selected (no auto-queue)
-                    Some(TuiCommand::ApproveOnly(id))
-                } else {
-                    // Approved → unapproved
-                    // For wait states, do not touch queue status or DynamicQueue.
-                    if matches!(
-                        change.queue_status,
-                        QueueStatus::MergeWait | QueueStatus::ResolveWait
-                    ) {
-                        Some(TuiCommand::UnapproveOnly(id))
-                    } else {
-                        Some(TuiCommand::UnapproveAndDequeue(id))
-                    }
-                }
-            }
-            AppMode::Running | AppMode::Stopped => {
-                // In running/stopped mode:
-                // [ ] (unapproved) → @ → [@] (approved only, NOT queued)
-                // [@] (approved, not queued) → @ → [ ] (unapproved)
-                // [x] (queued, not processing) → @ → [ ] (unapproved + removed from queue)
-                if !is_approved {
-                    // Unapproved → approved only (no auto-queue)
-                    Some(TuiCommand::ApproveOnly(id))
-                } else {
-                    // Approved → unapproved
-                    // For wait states, do not touch queue status or DynamicQueue.
-                    if matches!(
-                        change.queue_status,
-                        QueueStatus::MergeWait | QueueStatus::ResolveWait
-                    ) {
-                        Some(TuiCommand::UnapproveOnly(id))
-                    } else {
-                        Some(TuiCommand::UnapproveAndDequeue(id))
-                    }
-                }
-            }
-            AppMode::Stopping
-            | AppMode::Error
-            | AppMode::ConfirmWorktreeDelete
-            | AppMode::QrPopup => None,
-        }
-    }
-
-    /// Update approval status for a specific change
-    pub fn update_approval_status(&mut self, change_id: &str, is_approved: bool) {
-        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            change.is_approved = is_approved;
-            // Clear NEW flag when user approves/unapproves the change
-            if change.is_new {
-                change.is_new = false;
-                self.new_change_count = self.new_change_count.saturating_sub(1);
-            }
-            let status_msg = if is_approved {
-                "approved"
-            } else {
-                "unapproved"
-            };
-            self.add_log(LogEntry::info(format!(
-                "Change '{}' {}",
-                change_id, status_msg
-            )));
-        }
     }
 }
 
@@ -2168,7 +2042,7 @@ impl AppState {
         // Add new changes
         for id in &new_ids {
             if let Some(fetched) = fetched_changes.iter().find(|c| &c.id == id) {
-                let mut new_state = ChangeState::from_change(fetched, false); // New changes are not selected
+                let mut new_state = ChangeState::from_change(fetched);
                 new_state.is_new = true;
                 self.changes.push(new_state);
             }
@@ -2410,7 +2284,6 @@ mod guards {
 
     /// Validates that a change can be toggled for selection
     pub fn validate_change_toggleable(
-        is_approved: bool,
         is_parallel_eligible: bool,
         parallel_mode: bool,
         queue_status: &QueueStatus,
@@ -2419,14 +2292,6 @@ mod guards {
         // Active (in-flight) changes can be stopped via Space key in Running mode
         // This is allowed and handled by handle_toggle_running_mode
         // No need to block here
-
-        // Cannot select unapproved changes (only applies to non-active states)
-        if !is_approved && !queue_status.is_active() {
-            return ToggleGuardResult::Blocked(format!(
-                "Cannot queue unapproved change '{}'. Press @ to approve first.",
-                change_id
-            ));
-        }
 
         // Cannot select uncommitted changes in parallel mode (only applies to non-active states)
         if parallel_mode && !is_parallel_eligible && !queue_status.is_active() {
@@ -2574,18 +2439,6 @@ mod tests {
             completed_tasks: completed,
             total_tasks: total,
             last_modified: "now".to_string(),
-            is_approved: false,
-            dependencies: Vec::new(),
-        }
-    }
-
-    fn create_approved_change(id: &str, completed: u32, total: u32) -> Change {
-        Change {
-            id: id.to_string(),
-            completed_tasks: completed,
-            total_tasks: total,
-            last_modified: "now".to_string(),
-            is_approved: true,
             dependencies: Vec::new(),
         }
     }
@@ -2599,7 +2452,6 @@ mod tests {
             queue_status: QueueStatus::NotQueued,
             selected: false,
             is_new: false,
-            is_approved: false,
             is_parallel_eligible: true,
             has_worktree: false,
             started_at: None,
@@ -2611,8 +2463,8 @@ mod tests {
     }
 
     #[test]
-    fn test_app_state_new_unapproved_not_selected() {
-        // Unapproved changes should NOT be selected on startup
+    fn test_app_state_new_all_not_selected() {
+        // All changes should start unselected on startup
         let changes = vec![
             create_test_change("change-a", 2, 5),
             create_test_change("change-b", 0, 3),
@@ -2623,26 +2475,26 @@ mod tests {
         assert_eq!(app.mode, AppMode::Select);
         assert_eq!(app.changes.len(), 2);
         assert_eq!(app.cursor_index, 0);
-        assert!(!app.changes[0].selected); // Unapproved = not selected
-        assert!(!app.changes[1].selected); // Unapproved = not selected
+        assert!(!app.changes[0].selected);
+        assert!(!app.changes[1].selected);
     }
 
     #[test]
-    fn test_app_state_new_approved_auto_selected() {
-        // Approved changes should be auto-selected on startup
+    fn test_app_state_no_auto_selection() {
+        // Changes should NOT be auto-selected on startup
         let changes = vec![
-            create_approved_change("change-a", 2, 5),
-            create_test_change("change-b", 0, 3), // Unapproved
+            create_test_change("change-a", 2, 5),
+            create_test_change("change-b", 0, 3),
         ];
 
         let app = AppState::new(changes);
 
         assert_eq!(app.mode, AppMode::Select);
         assert_eq!(app.changes.len(), 2);
-        assert!(app.changes[0].selected); // Approved = selected
-        assert!(!app.changes[1].selected); // Unapproved = not selected
-                                           // Should have log entry for auto-queued changes
-        assert!(app
+        assert!(!app.changes[0].selected);
+        assert!(!app.changes[1].selected);
+        // Should NOT have log entry for auto-queued changes
+        assert!(!app
             .logs
             .iter()
             .any(|log| log.message.contains("Auto-queued")));
@@ -2675,23 +2527,23 @@ mod tests {
 
     #[test]
     fn test_toggle_selection() {
-        // Use approved change so it starts selected
-        let changes = vec![create_approved_change("a", 0, 1)];
+        // Changes start unselected
+        let changes = vec![create_test_change("a", 0, 1)];
 
         let mut app = AppState::new(changes);
 
-        assert!(app.changes[0].selected);
-
-        app.toggle_selection();
         assert!(!app.changes[0].selected);
 
         app.toggle_selection();
         assert!(app.changes[0].selected);
+
+        app.toggle_selection();
+        assert!(!app.changes[0].selected);
     }
 
     #[test]
     fn test_start_processing_blocked_while_resolving() {
-        let changes = vec![create_approved_change("a", 0, 1)];
+        let changes = vec![create_test_change("a", 0, 1)];
         let mut app = AppState::new(changes);
         app.is_resolving = true;
 
@@ -2705,7 +2557,7 @@ mod tests {
 
     #[test]
     fn test_resume_processing_blocked_while_resolving() {
-        let changes = vec![create_approved_change("a", 0, 1)];
+        let changes = vec![create_test_change("a", 0, 1)];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Stopped;
         app.is_resolving = true;
@@ -2720,7 +2572,7 @@ mod tests {
 
     #[test]
     fn test_retry_error_changes_blocked_while_resolving() {
-        let changes = vec![create_approved_change("a", 0, 1)];
+        let changes = vec![create_test_change("a", 0, 1)];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Error;
         app.changes[0].queue_status = QueueStatus::Error("boom".to_string());
@@ -2736,19 +2588,19 @@ mod tests {
 
     #[test]
     fn test_selected_count() {
-        // Use approved changes so they start selected
+        // Changes start unselected
         let changes = vec![
-            create_approved_change("a", 0, 1),
-            create_approved_change("b", 0, 1),
-            create_approved_change("c", 0, 1),
+            create_test_change("a", 0, 1),
+            create_test_change("b", 0, 1),
+            create_test_change("c", 0, 1),
         ];
 
         let mut app = AppState::new(changes);
 
-        assert_eq!(app.selected_count(), 3);
+        assert_eq!(app.selected_count(), 0);
 
-        app.toggle_selection(); // Deselect first
-        assert_eq!(app.selected_count(), 2);
+        app.toggle_selection(); // Select first
+        assert_eq!(app.selected_count(), 1);
     }
 
     #[test]
@@ -2774,7 +2626,7 @@ mod tests {
 
     #[test]
     fn test_processing_error_keeps_app_mode() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Start in Running mode
@@ -2800,7 +2652,7 @@ mod tests {
 
     #[test]
     fn test_processing_error_from_select_mode() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Start in Select mode
@@ -2819,7 +2671,7 @@ mod tests {
 
     #[test]
     fn test_processing_started_sets_state() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         app.handle_processing_started("test-change".to_string());
@@ -2832,7 +2684,7 @@ mod tests {
 
     #[test]
     fn test_processing_completed_updates_status() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         app.handle_processing_completed("test-change".to_string());
@@ -2843,7 +2695,7 @@ mod tests {
 
     #[test]
     fn test_all_completed_transitions_to_select() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         app.mode = AppMode::Running;
@@ -2855,7 +2707,7 @@ mod tests {
 
     #[test]
     fn test_all_completed_preserves_error_mode() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         app.mode = AppMode::Error;
@@ -2867,7 +2719,7 @@ mod tests {
 
     #[test]
     fn test_all_completed_preserves_stopped_mode() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         app.mode = AppMode::Stopped;
@@ -2879,7 +2731,7 @@ mod tests {
 
     #[test]
     fn test_stopped_resets_queue_status() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Set to Queued
@@ -2905,7 +2757,6 @@ mod tests {
             queue_status: QueueStatus::Applying,
             selected: false,
             is_new: false,
-            is_approved: true,
             is_parallel_eligible: true,
             has_worktree: false,
             started_at: None,
@@ -2931,7 +2782,6 @@ mod tests {
             queue_status: QueueStatus::Applying,
             selected: false,
             is_new: false,
-            is_approved: true,
             is_parallel_eligible: true,
             has_worktree: false,
             started_at: None,
@@ -2961,7 +2811,6 @@ mod tests {
             queue_status: QueueStatus::Applying,
             selected: false,
             is_new: false,
-            is_approved: true,
             is_parallel_eligible: true,
             has_worktree: false,
             started_at: None,
@@ -2976,7 +2825,7 @@ mod tests {
 
     #[test]
     fn test_iteration_reset_on_stage_change_apply() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Set iteration to 3
@@ -2992,7 +2841,7 @@ mod tests {
 
     #[test]
     fn test_iteration_reset_on_stage_change_archive() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Set iteration to 5
@@ -3008,7 +2857,7 @@ mod tests {
 
     #[test]
     fn test_iteration_reset_on_stage_change_resolve() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Set iteration to 2
@@ -3024,7 +2873,7 @@ mod tests {
 
     #[test]
     fn test_iteration_reset_on_stage_change_acceptance() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Set iteration to 4
@@ -3040,7 +2889,7 @@ mod tests {
 
     #[test]
     fn test_iteration_update_via_output_event_apply() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Start apply stage first
@@ -3061,7 +2910,7 @@ mod tests {
 
     #[test]
     fn test_iteration_update_via_output_event_archive() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Start archive stage first
@@ -3082,7 +2931,7 @@ mod tests {
 
     #[test]
     fn test_iteration_cross_stage_isolation() {
-        let changes = vec![create_approved_change("test-change", 0, 1)];
+        let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Simulate apply stage with iteration 5
@@ -3109,9 +2958,9 @@ mod tests {
     #[test]
     fn test_resolve_queue_fifo_order() {
         let changes = vec![
-            create_approved_change("change-a", 0, 1),
-            create_approved_change("change-b", 0, 1),
-            create_approved_change("change-c", 0, 1),
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+            create_test_change("change-c", 0, 1),
         ];
         let mut app = AppState::new(changes);
 
@@ -3129,7 +2978,7 @@ mod tests {
 
     #[test]
     fn test_resolve_queue_duplicate_prevention() {
-        let changes = vec![create_approved_change("change-a", 0, 1)];
+        let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Add change-a once
@@ -3145,8 +2994,8 @@ mod tests {
     #[test]
     fn test_resolve_queue_auto_start_on_completion() {
         let changes = vec![
-            create_approved_change("change-a", 0, 1),
-            create_approved_change("change-b", 0, 1),
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
         ];
         let mut app = AppState::new(changes);
 
@@ -3171,7 +3020,7 @@ mod tests {
 
     #[test]
     fn test_resolve_queue_no_auto_start_when_queue_empty() {
-        let changes = vec![create_approved_change("change-a", 0, 1)];
+        let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Set change-a to Resolving
@@ -3190,8 +3039,8 @@ mod tests {
     #[test]
     fn test_resolve_merge_queues_when_resolving() {
         let changes = vec![
-            create_approved_change("change-a", 0, 1),
-            create_approved_change("change-b", 0, 1),
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
         ];
         let mut app = AppState::new(changes);
 
@@ -3217,7 +3066,7 @@ mod tests {
 
     #[test]
     fn test_resolve_merge_starts_immediately_when_not_resolving() {
-        let changes = vec![create_approved_change("change-a", 0, 1)];
+        let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Set up: change-a is in MergeWait, no resolve in progress
@@ -3238,8 +3087,8 @@ mod tests {
     #[test]
     fn test_merge_deferred_transitions_to_resolve_wait_when_resolving() {
         let changes = vec![
-            create_approved_change("change-a", 0, 1),
-            create_approved_change("change-b", 0, 1),
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
         ];
         let mut app = AppState::new(changes);
 
@@ -3271,7 +3120,7 @@ mod tests {
 
     #[test]
     fn test_merge_deferred_does_not_queue_current_resolving_change() {
-        let changes = vec![create_approved_change("change-a", 0, 1)];
+        let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Set up: change-a is currently resolving
@@ -3300,8 +3149,8 @@ mod tests {
     #[test]
     fn test_merge_deferred_queues_other_change_while_resolving() {
         let changes = vec![
-            create_approved_change("change-a", 0, 1),
-            create_approved_change("change-b", 0, 1),
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
         ];
         let mut app = AppState::new(changes);
 
@@ -3333,7 +3182,7 @@ mod tests {
 
     #[test]
     fn test_merge_deferred_maintains_merge_wait_when_not_resolving() {
-        let changes = vec![create_approved_change("change-a", 0, 1)];
+        let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Set up: no resolve in progress
