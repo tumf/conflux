@@ -62,7 +62,7 @@ pub async fn run_orchestrator(
     use crate::hooks::{HookContext, HookRunner, HookType};
     use crate::openspec;
 
-    let hooks = HookRunner::new(config.get_hooks());
+    let hooks = HookRunner::with_event_tx(config.get_hooks(), tx.clone());
     let max_iterations = config.get_max_iterations();
     // Note: acceptance_max_continues is now handled by SerialRunService
     let mut agent = AgentRunner::new(config.clone());

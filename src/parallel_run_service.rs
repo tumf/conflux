@@ -142,6 +142,14 @@ impl ParallelRunService {
         manual_resolve_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     ) -> ParallelExecutor {
         let vcs_backend = self.config.get_vcs_backend();
+
+        // Create hooks before moving event_tx
+        let hooks = if let Some(ref tx) = event_tx {
+            HookRunner::with_event_tx(self.config.get_hooks(), tx.clone())
+        } else {
+            HookRunner::new(self.config.get_hooks())
+        };
+
         let mut executor = ParallelExecutor::with_backend_and_queue_and_stagger(
             self.repo_root.clone(),
             self.config.clone(),
@@ -152,8 +160,6 @@ impl ParallelRunService {
         );
         executor.set_no_resume(self.no_resume);
 
-        // Set hooks from config
-        let hooks = HookRunner::new(self.config.get_hooks());
         executor.set_hooks(hooks);
 
         if let Some(token) = cancel_token {
@@ -312,7 +318,7 @@ impl ParallelRunService {
         executor.set_no_resume(self.no_resume);
 
         // Set hooks from config
-        let hooks = HookRunner::new(self.config.get_hooks());
+        let hooks = HookRunner::with_event_tx(self.config.get_hooks(), event_tx.clone());
         executor.set_hooks(hooks);
 
         // Set cancel token if provided
