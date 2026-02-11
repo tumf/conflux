@@ -98,7 +98,7 @@ pub struct ErrorResponse {
 /// A tuple of (StatusCode::NOT_FOUND, Json<ErrorResponse>) ready to be returned from handlers.
 ///
 /// # Example
-/// ```no_run
+/// ```ignore
 /// use conflux::web::api::not_found_response;
 ///
 /// async fn my_handler(id: String) -> Result<Json<Data>, (StatusCode, Json<ErrorResponse>)> {

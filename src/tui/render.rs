@@ -2428,13 +2428,15 @@ mod tests {
             id: "test-change".to_string(),
             completed_tasks: 0,
             total_tasks: 5,
-            is_parallel_eligible: false, // Uncommitted change
+            last_modified: "2024-01-01".to_string(),
+            dependencies: vec![],
         }];
         let mut app = AppState::new(changes);
         app.parallel_mode = true;
         app.parallel_available = true;
 
-        // Ensure the change is not selected and not queued
+        // Mark the change as uncommitted (not parallel eligible)
+        app.changes[0].is_parallel_eligible = false;
         app.changes[0].selected = false;
         app.changes[0].queue_status = QueueStatus::NotQueued;
 
@@ -2473,6 +2475,7 @@ mod tests {
 
     #[test]
     fn test_parallel_mode_committed_change_shows_space_hint() {
+        use crate::openspec::Change;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -2480,25 +2483,22 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        // Create app state with parallel mode enabled
-        let mut app = AppState::new(false, false, false, false);
+        // Create app state with a committed change
+        let changes = vec![Change {
+            id: "test-change".to_string(),
+            completed_tasks: 0,
+            total_tasks: 5,
+            last_modified: "2024-01-01".to_string(),
+            dependencies: vec![],
+        }];
+        let mut app = AppState::new(changes);
         app.parallel_mode = true;
         app.parallel_available = true;
 
-        // Add a committed change (parallel eligible)
-        app.changes.push(super::super::state::ChangeItem {
-            id: "test-change".to_string(),
-            selected: false,
-            queue_status: QueueStatus::NotQueued,
-            completed_tasks: 0,
-            total_tasks: 5,
-            has_worktree: false,
-            is_new: false,
-            started_at: None,
-            elapsed_time: None,
-            iteration_number: None,
-            is_parallel_eligible: true, // Committed change
-        });
+        // Mark the change as committed (parallel eligible) - this is the default
+        app.changes[0].is_parallel_eligible = true;
+        app.changes[0].selected = false;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
 
         // Render the frame
         terminal
