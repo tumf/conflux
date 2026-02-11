@@ -69,6 +69,8 @@ pub enum Commands {
     Run(RunArgs),
 
     /// Launch the interactive TUI dashboard
+    ///
+    /// Key bindings: Space (select), F5 (start), Esc (stop), Tab (switch view), q (quit)
     Tui(TuiArgs),
 
     /// Initialize a new configuration file
@@ -716,5 +718,37 @@ mod tests {
                 panic!("Expected successful parse: {}", e);
             }
         }
+    }
+
+    #[test]
+    fn test_tui_help_displays_key_bindings() {
+        // Regression test: Ensure TUI help output contains key bindings
+        use clap::CommandFactory;
+
+        let app = Cli::command();
+        let tui_subcommand = app
+            .find_subcommand("tui")
+            .expect("tui subcommand should exist");
+
+        // Get the long help text
+        let mut help_output = Vec::new();
+        tui_subcommand
+            .clone()
+            .write_long_help(&mut help_output)
+            .unwrap();
+        let help_text = String::from_utf8(help_output).unwrap();
+
+        // Verify key bindings are documented
+        assert!(help_text.contains("Space"), "Help should mention Space key");
+        assert!(help_text.contains("F5"), "Help should mention F5 key");
+        assert!(help_text.contains("Esc"), "Help should mention Esc key");
+        assert!(help_text.contains("Tab"), "Help should mention Tab key");
+        assert!(help_text.contains("q"), "Help should mention q key");
+
+        // Verify the key binding section is present
+        assert!(
+            help_text.contains("Key bindings"),
+            "Help should have 'Key bindings' section"
+        );
     }
 }

@@ -24,3 +24,7 @@
 ## Acceptance #2 Failure Follow-up
 - [x] 並列モードで未コミット change を選択中のとき、Changes パネルのキーヒントから選択操作（`Space: queue` / `Space: unqueue`）を表示しないように修正する（`src/tui/render.rs` の `render_changes_list_select` と `render_changes_list_running` のキー表示ロジックに `app.parallel_mode && !item.is_parallel_eligible` 条件を反映し、回帰テストを追加）。
 - [x] `cargo test` が成功するよう doctest 失敗を解消する（現状失敗: `src/web/api.rs` の `not_found_response` ドキュメント例、`src/acceptance.rs`、`src/orchestration/state.rs`、`src/task_parser.rs`。`cargo test --doc` で再確認）。
+
+## Acceptance #3 Failure Follow-up
+- [x] `cargo test`（デフォルト並列実行）が安定して成功するように `tests/e2e_tests.rs` のモックスクリプト実行で発生する `Text file busy` レースを解消する（失敗箇所: `test_opencode_apply_failure`、`test_mid_apply_completion_detection`、`test_partial_failure_continues_with_others`）。
+- [x] `cflx tui --help` が仕様どおりキーバインド（Space/F5/Esc/Tab/q）を表示するように `src/cli.rs` の TUI ヘルプ定義を修正し、ヘルプ出力の回帰テストを追加する。
