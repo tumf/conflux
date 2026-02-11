@@ -20,7 +20,16 @@ The specification covers:
 
 apply/archive/resolveのAIエージェントコマンドは、`{change_id}`、`{prompt}`、`{conflict_files}`などのプレースホルダーを展開した完全なコマンド文字列を、実行前にTUI Logs Viewへ表示しなければならない（MUST）。このログはユーザー向けの`info`相当ログとして扱う（SHALL）。
 
+hookコマンドは、実行前にコマンド文字列をTUI Logs Viewへ表示しなければならない（MUST）。
+hookコマンドのstdout/stderrは取得可能な範囲でTUI Logs Viewへ表示しなければならない（MUST）。
+
 **変更**: TUI Logs Viewに表示されるすべてのログエントリーは、常にデバッグログファイルにも出力されなければならない（MUST）。出力先は `XDG_STATE_HOME` が設定されていれば `XDG_STATE_HOME/cflx/logs/<project_slug>/<YYYY-MM-DD>.log`、未設定時は `~/.local/state/cflx/logs/<project_slug>/<YYYY-MM-DD>.log` とする（MUST）。ログは日付単位で分割し、`project_slug` ごとに最新7日分のみ保持しなければならない（MUST）。
+
+#### Scenario: hook実行のコマンドと出力がLogs Viewに表示される
+- **GIVEN** `hooks.pre_apply` が `echo 'hello'` に設定されている
+- **WHEN** pre_apply hook が実行される
+- **THEN** Logs View に `Running pre_apply hook: echo 'hello'` が表示される
+- **AND** Logs View に `hello` が表示される
 
 #### Scenario: VCSコマンドの実行ログ
 - **GIVEN** git worktreeを作成する

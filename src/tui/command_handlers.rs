@@ -511,7 +511,10 @@ pub async fn handle_tui_command(
                         {
                             // Create hook runner from config
                             let hooks_config = merge_config.get_hooks();
-                            let hooks = crate::hooks::HookRunner::new(hooks_config);
+                            let hooks = crate::hooks::HookRunner::with_event_tx(
+                                hooks_config,
+                                merge_tx.clone(),
+                            );
 
                             // Fetch actual task counts from change data
                             let (completed_tasks, total_tasks) =
