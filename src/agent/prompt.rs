@@ -1,7 +1,5 @@
 //! Prompt building functions for agent commands.
 
-use crate::config::defaults::ACCEPTANCE_SYSTEM_PROMPT;
-
 /// Legacy hardcoded system prompt for apply commands.
 /// Kept only for compatibility in tests; actual prompt is sourced from OpenCode command files.
 pub const APPLY_SYSTEM_PROMPT: &str = "";
@@ -63,8 +61,11 @@ pub fn build_archive_prompt(user_prompt: &str, history_context: &str) -> String 
 
 /// Build acceptance prompt from user prompt and history context
 ///
+/// Now unified with context_only mode - no embedded system prompt.
+/// All fixed instructions must come from the command template.
+///
 /// The prompt is constructed as:
-/// 1. ACCEPTANCE_SYSTEM_PROMPT with {change_id} expanded (always included)
+/// 1. change metadata (change_id and paths)
 /// 2. diff_context (if not empty) - changed files context for all acceptance attempts
 /// 3. last_output_context (if not empty) - previous acceptance stdout/stderr tail for 2nd+ attempts
 /// 4. user_prompt (if not empty)
@@ -76,30 +77,14 @@ pub fn build_acceptance_prompt(
     last_output_context: &str,
     diff_context: &str,
 ) -> String {
-    let mut parts = Vec::new();
-
-    // System prompt is always included first, with change_id expanded
-    let system_prompt = ACCEPTANCE_SYSTEM_PROMPT.replace("{change_id}", change_id);
-    parts.push(system_prompt);
-
-    // Diff context comes right after system prompt
-    if !diff_context.is_empty() {
-        parts.push(diff_context.to_string());
-    }
-
-    if !last_output_context.is_empty() {
-        parts.push(last_output_context.to_string());
-    }
-
-    if !user_prompt.is_empty() {
-        parts.push(user_prompt.to_string());
-    }
-
-    if !history_context.is_empty() {
-        parts.push(history_context.to_string());
-    }
-
-    parts.join("\n\n")
+    // Delegate to context_only implementation - "full" mode is now deprecated
+    build_acceptance_prompt_context_only(
+        change_id,
+        user_prompt,
+        history_context,
+        last_output_context,
+        diff_context,
+    )
 }
 
 /// Build acceptance prompt context without the hardcoded system prompt.
@@ -289,7 +274,7 @@ mod tests {
     #[test]
     fn test_build_acceptance_prompt_insertion_order() {
         // Test that the prompt components are inserted in the correct order:
-        // 1. system_prompt
+        // 1. change metadata (change_id, paths)
         // 2. diff_context
         // 3. last_output_context
         // 4. user_prompt
@@ -312,9 +297,9 @@ mod tests {
         );
 
         // Find positions of each marker
-        let system_pos = result
-            .find("You are reviewing the implementation")
-            .expect("System prompt should be present");
+        let metadata_pos = result
+            .find("change_id: test-change")
+            .expect("Change metadata should be present");
         let diff_pos = result
             .find("DIFF_CONTEXT_MARKER")
             .expect("Diff context should be present");
@@ -328,10 +313,10 @@ mod tests {
             .find("HISTORY_CONTEXT_MARKER")
             .expect("History context should be present");
 
-        // Verify order: system < diff < last_output < user < history
+        // Verify order: metadata < diff < last_output < user < history
         assert!(
-            system_pos < diff_pos,
-            "System prompt should come before diff context"
+            metadata_pos < diff_pos,
+            "Change metadata should come before diff context"
         );
         assert!(
             diff_pos < last_output_pos,
@@ -364,13 +349,12 @@ mod tests {
             diff_context,
         );
 
-        // Should contain system prompt and user prompt
-        assert!(result.contains("You are reviewing the implementation"));
+        // Should contain change metadata and user prompt
+        assert!(result.contains("change_id: test-change"));
+        assert!(result.contains("proposal_path: openspec/changes/test-change/proposal.md"));
         assert!(result.contains("USER_PROMPT"));
 
         // Should NOT contain diff context section with actual content
-        // (Note: The ACCEPTANCE_SYSTEM_PROMPT mentions <acceptance_diff_context> in instructions,
-        // but we should not have a separate block with actual file listings)
         assert!(!result.contains("Files changed since last acceptance check:"));
         assert!(!result.contains("Previous acceptance findings:"));
     }

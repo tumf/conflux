@@ -537,6 +537,8 @@ impl AgentRunner {
             build_last_acceptance_output_context(stdout_tail.as_deref(), stderr_tail.as_deref());
 
         // Build prompt injected into `{prompt}`
+        // NOTE: Full and ContextOnly modes now behave identically (no embedded system prompt).
+        // The match is kept for clarity, but both branches produce the same result.
         let full_prompt = match self.config.get_acceptance_prompt_mode() {
             crate::config::AcceptancePromptMode::Full => build_acceptance_prompt(
                 change_id,
