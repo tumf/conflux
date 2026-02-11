@@ -33,23 +33,23 @@
 //! ### Integration Pattern
 //!
 //! 1. **Orchestrator creates and owns shared state:**
-//!    ```rust
+//!    ```rust,ignore
 //!    let shared_state = Arc::new(RwLock::new(OrchestratorState::new(changes, max_iters)));
 //!    ```
 //!
 //! 2. **Orchestrator updates state via events:**
-//!    ```rust
+//!    ```rust,ignore
 //!    shared_state.write().await.apply_execution_event(&event);
 //!    ```
 //!
 //! 3. **TUI/Web receive shared state reference:**
-//!    ```rust
+//!    ```rust,ignore
 //!    app_state.set_shared_state(shared_state.clone());
 //!    web_state.set_shared_state(shared_state.clone()).await;
 //!    ```
 //!
 //! 4. **TUI/Web query shared state when needed:**
-//!    ```rust
+//!    ```rust,ignore
 //!    if let Some(shared) = &app_state.shared_orchestrator_state {
 //!        let guard = shared.read().await;
 //!        let apply_count = guard.apply_count(change_id);

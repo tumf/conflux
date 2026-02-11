@@ -150,7 +150,6 @@ mod tests {
             completed_tasks: completed,
             total_tasks: total,
             last_modified: "1m ago".to_string(),
-            is_approved: true,
             dependencies: Vec::new(),
         }
     }

@@ -62,8 +62,6 @@ pub struct ChangeStatus {
     pub progress_percent: f32,
     /// Current status: "pending", "in_progress", "complete"
     pub status: String,
-    /// Whether the change is approved
-    pub is_approved: bool,
     /// Dependencies on other changes
     pub dependencies: Vec<String>,
     /// Queue status (for parallel/serial execution tracking)
@@ -92,7 +90,6 @@ impl From<&Change> for ChangeStatus {
             total_tasks: change.total_tasks,
             progress_percent: change.progress_percent(),
             status: status.to_string(),
-            is_approved: change.is_approved,
             dependencies: change.dependencies.clone(),
             queue_status: None, // Set by event handlers based on execution state
             iteration_number: None, // Set by event handlers during apply/archive loops
@@ -900,94 +897,6 @@ impl WebState {
     pub async fn list_changes(&self) -> Vec<ChangeStatus> {
         self.state.read().await.changes.clone()
     }
-
-    /// Approve a change and broadcast the update to WebSocket clients
-    ///
-    /// # Arguments
-    /// * `id` - The ID of the change to approve
-    ///
-    /// # Returns
-    /// The updated change status, or an error if the change is not found
-    pub async fn approve_change(
-        &self,
-        id: &str,
-    ) -> Result<ChangeStatus, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::approval;
-
-        // Verify change exists in state
-        let change_exists = {
-            let state = self.state.read().await;
-            state.changes.iter().any(|c| c.id == id)
-        };
-
-        if !change_exists {
-            return Err(format!("Change '{}' not found", id).into());
-        }
-
-        // Perform approval operation
-        approval::approve_change(id)?;
-
-        // Update the approval status in state and get the updated change
-        let (updated_change, changes_snapshot) = {
-            let mut state = self.state.write().await;
-            if let Some(index) = state.changes.iter().position(|c| c.id == id) {
-                state.changes[index].is_approved = true;
-                refresh_summary(&mut state);
-                (state.changes[index].clone(), state.changes.clone())
-            } else {
-                return Err(format!("Change '{}' not found after approval", id).into());
-            }
-        };
-
-        // Broadcast the update
-        self.broadcast_snapshot(changes_snapshot).await;
-
-        Ok(updated_change)
-    }
-
-    /// Unapprove a change and broadcast the update to WebSocket clients
-    ///
-    /// # Arguments
-    /// * `id` - The ID of the change to unapprove
-    ///
-    /// # Returns
-    /// The updated change status, or an error if the change is not found
-    pub async fn unapprove_change(
-        &self,
-        id: &str,
-    ) -> Result<ChangeStatus, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::approval;
-
-        // Verify change exists in state
-        let change_exists = {
-            let state = self.state.read().await;
-            state.changes.iter().any(|c| c.id == id)
-        };
-
-        if !change_exists {
-            return Err(format!("Change '{}' not found", id).into());
-        }
-
-        // Perform unapproval operation
-        approval::unapprove_change(id)?;
-
-        // Update the approval status in state and get the updated change
-        let (updated_change, changes_snapshot) = {
-            let mut state = self.state.write().await;
-            if let Some(index) = state.changes.iter().position(|c| c.id == id) {
-                state.changes[index].is_approved = false;
-                refresh_summary(&mut state);
-                (state.changes[index].clone(), state.changes.clone())
-            } else {
-                return Err(format!("Change '{}' not found after unapproval", id).into());
-            }
-        };
-
-        // Broadcast the update
-        self.broadcast_snapshot(changes_snapshot).await;
-
-        Ok(updated_change)
-    }
 }
 
 impl Default for WebState {
@@ -1006,7 +915,6 @@ mod tests {
             completed_tasks: completed,
             total_tasks: total,
             last_modified: "1m ago".to_string(),
-            is_approved: true,
             dependencies: Vec::new(),
         }
     }
@@ -1022,7 +930,6 @@ mod tests {
         // Use approximate comparison for floating point
         assert!((status.progress_percent - 60.0).abs() < 0.01);
         assert_eq!(status.status, "in_progress");
-        assert!(status.is_approved);
     }
 
     #[test]
@@ -1333,7 +1240,6 @@ mod tests {
             completed_tasks: 0,
             total_tasks: 0,
             last_modified: "now".to_string(),
-            is_approved: true,
             dependencies: Vec::new(),
         }];
         web_state.update(&updated).await;
@@ -1390,7 +1296,6 @@ mod tests {
                     completed_tasks: 0,
                     total_tasks: 0,
                     last_modified: "now".to_string(),
-                    is_approved: true,
                     dependencies: Vec::new(),
                 }],
                 committed_change_ids: HashSet::new(),

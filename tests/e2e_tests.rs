@@ -56,6 +56,9 @@ esac
     file.sync_all().unwrap();
     drop(file);
 
+    // Small delay to ensure the file is fully written and executable
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
     script_path.to_string_lossy().to_string()
 }
 
@@ -86,6 +89,9 @@ fn create_mock_opencode(temp_dir: &Path, behavior: &str) -> String {
     file.write_all(script_content.as_bytes()).unwrap();
     file.sync_all().unwrap();
     drop(file);
+
+    // Small delay to ensure the file is fully written and executable
+    std::thread::sleep(std::time::Duration::from_millis(10));
 
     script_path.to_string_lossy().to_string()
 }
@@ -282,6 +288,9 @@ exit 1
     file.write_all(script_content.as_bytes()).unwrap();
     file.sync_all().unwrap();
     drop(file);
+
+    // Small delay to ensure the file is fully written and executable
+    std::thread::sleep(std::time::Duration::from_millis(10));
 
     // Verify the failure
     let output = Command::new(&script_path).arg("list").output().unwrap();
@@ -562,6 +571,9 @@ esac
     file.sync_all().unwrap();
     drop(file);
 
+    // Small delay to ensure the file is fully written and executable
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
     // Verify the complete change (5/5) appears in list
     let output = Command::new(&script_path).arg("list").output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -687,6 +699,9 @@ esac
     file.write_all(script_content.as_bytes()).unwrap();
     file.sync_all().unwrap();
     drop(file);
+
+    // Small delay to ensure the file is fully written and executable
+    std::thread::sleep(std::time::Duration::from_millis(10));
 
     // Initial list - both incomplete
     let output = Command::new(&script_path).arg("list").output().unwrap();

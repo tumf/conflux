@@ -118,20 +118,6 @@ pub fn build_queue_context(
     )
 }
 
-/// Build a hook context for approve/unapprove (TUI only).
-pub fn build_approve_context(
-    change: &Change,
-    changes_processed: usize,
-    total_changes: usize,
-    remaining_changes: usize,
-) -> HookContext {
-    HookContext::new(changes_processed, total_changes, remaining_changes, false).with_change(
-        &change.id,
-        change.completed_tasks,
-        change.total_tasks,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,7 +128,6 @@ mod tests {
             completed_tasks: completed,
             total_tasks: total,
             last_modified: "1m ago".to_string(),
-            is_approved: true,
             dependencies: Vec::new(),
         }
     }
@@ -215,15 +200,5 @@ mod tests {
 
         assert_eq!(ctx.change_id, Some("my-change".to_string()));
         assert_eq!(ctx.apply_count, 0); // Queue operations don't have apply count
-    }
-
-    #[test]
-    fn test_build_approve_context() {
-        let change = test_change("my-change", 2, 5);
-        let ctx = build_approve_context(&change, 0, 5, 5);
-
-        assert_eq!(ctx.change_id, Some("my-change".to_string()));
-        assert_eq!(ctx.completed_tasks, Some(2));
-        assert_eq!(ctx.total_tasks, Some(5));
     }
 }

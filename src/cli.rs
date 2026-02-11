@@ -30,7 +30,6 @@ SUBCOMMANDS:
   run      Execute orchestration loop (non-interactive)
   tui      Launch interactive TUI dashboard (default)
   init     Generate configuration template
-  approve  Manage change approval status
 
 KEY OPTIONS:
   --parallel            Enable parallel execution using git worktrees
@@ -70,13 +69,12 @@ pub enum Commands {
     Run(RunArgs),
 
     /// Launch the interactive TUI dashboard
+    ///
+    /// Key bindings: Space (select), F5 (start), Esc (stop), Tab (switch view), q (quit)
     Tui(TuiArgs),
 
     /// Initialize a new configuration file
     Init(InitArgs),
-
-    /// Manage change approval status
-    Approve(ApproveArgs),
 
     /// Check for conflicts between spec delta files across changes
     CheckConflicts(CheckConflictsArgs),
@@ -99,7 +97,7 @@ WEB MONITORING:
   while orchestration runs in background.
 
 EXAMPLES:
-  cflx run                           # Process all approved changes
+  cflx run                           # Process all changes
   cflx run --change my-feature       # Process specific change
   cflx run --parallel --max-concurrent 5  # Parallel with 5 workers
   cflx run --parallel --dry-run      # Preview parallelization plan
@@ -161,14 +159,13 @@ The TUI provides real-time visualization of change processing with:
   • Change selection and queue management
   • Live progress tracking with task completion percentages
   • Streaming logs from AI agent execution
-  • Approval management (@key to approve/unapprove)
+
   • Git worktree visualization and management
   • Parallel execution monitoring
 
 KEY BINDINGS:
   Space     Toggle change selection/queue status
   F5        Start/resume processing
-  @         Toggle approval status
   Esc       Stop processing (press twice to force)
   Tab       Switch between Changes/Worktrees view
   q         Quit
@@ -221,41 +218,12 @@ pub struct InitArgs {
     pub force: bool,
 }
 
-/// Arguments for the approve subcommand
-#[derive(Parser, Debug)]
-pub struct ApproveArgs {
-    #[command(subcommand)]
-    pub action: ApproveAction,
-}
-
 /// Arguments for the check-conflicts subcommand
 #[derive(Parser, Debug)]
 pub struct CheckConflictsArgs {
     /// Output results in JSON format
     #[arg(long, short = 'j')]
     pub json: bool,
-}
-
-/// Approve subcommand actions
-#[derive(Subcommand, Debug)]
-pub enum ApproveAction {
-    /// Approve a change (create approved file with checksums)
-    Set {
-        /// The change ID to approve
-        change_id: String,
-    },
-
-    /// Unapprove a change (remove approved file)
-    Unset {
-        /// The change ID to unapprove
-        change_id: String,
-    },
-
-    /// Check approval status of a change
-    Status {
-        /// The change ID to check
-        change_id: String,
-    },
 }
 
 /// Check if git directory exists
@@ -721,5 +689,37 @@ mod tests {
                 panic!("Expected successful parse: {}", e);
             }
         }
+    }
+
+    #[test]
+    fn test_tui_help_displays_key_bindings() {
+        // Regression test: Ensure TUI help output contains key bindings
+        use clap::CommandFactory;
+
+        let app = Cli::command();
+        let tui_subcommand = app
+            .find_subcommand("tui")
+            .expect("tui subcommand should exist");
+
+        // Get the long help text
+        let mut help_output = Vec::new();
+        tui_subcommand
+            .clone()
+            .write_long_help(&mut help_output)
+            .unwrap();
+        let help_text = String::from_utf8(help_output).unwrap();
+
+        // Verify key bindings are documented
+        assert!(help_text.contains("Space"), "Help should mention Space key");
+        assert!(help_text.contains("F5"), "Help should mention F5 key");
+        assert!(help_text.contains("Esc"), "Help should mention Esc key");
+        assert!(help_text.contains("Tab"), "Help should mention Tab key");
+        assert!(help_text.contains("q"), "Help should mention q key");
+
+        // Verify the key binding section is present
+        assert!(
+            help_text.contains("Key bindings"),
+            "Help should have 'Key bindings' section"
+        );
     }
 }

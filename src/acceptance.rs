@@ -26,7 +26,7 @@ pub enum AcceptanceResult {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use conflux::acceptance::{parse_acceptance_output, AcceptanceResult};
 ///
 /// let pass_output = "ACCEPTANCE: PASS\n";

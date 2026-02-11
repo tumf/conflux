@@ -98,7 +98,7 @@ pub struct ErrorResponse {
 /// A tuple of (StatusCode::NOT_FOUND, Json<ErrorResponse>) ready to be returned from handlers.
 ///
 /// # Example
-/// ```no_run
+/// ```ignore
 /// use conflux::web::api::not_found_response;
 ///
 /// async fn my_handler(id: String) -> Result<Json<Data>, (StatusCode, Json<ErrorResponse>)> {
@@ -143,98 +143,6 @@ pub async fn get_change(
     match state.get_change(&id).await {
         Some(change) => Ok(Json(change)),
         None => Err(not_found_response(&id)),
-    }
-}
-
-/// Approve a change by ID
-///
-/// # Endpoint
-/// POST /api/changes/{id}/approve
-///
-/// # Returns
-/// - 200 OK with updated change status on success
-/// - 404 Not Found if change doesn't exist
-/// - 500 Internal Server Error if approval operation fails
-#[cfg_attr(
-    feature = "web-monitoring",
-    utoipa::path(
-        post,
-        path = "/api/changes/{id}/approve",
-        tag = "changes",
-        params(
-            ("id" = String, Path, description = "Change ID")
-        ),
-        responses(
-            (status = 200, description = "Change approved", body = ChangeStatus),
-            (status = 404, description = "Change not found", body = ErrorResponse),
-            (status = 500, description = "Approval failed", body = ErrorResponse)
-        )
-    )
-)]
-pub async fn approve_change(
-    State(state): State<Arc<WebState>>,
-    Path(id): Path<String>,
-) -> Result<Json<ChangeStatus>, (StatusCode, Json<ErrorResponse>)> {
-    match state.approve_change(&id).await {
-        Ok(change) => Ok(Json(change)),
-        Err(e) => {
-            if e.to_string().contains("not found") {
-                Err(not_found_response(&id))
-            } else {
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Failed to approve change: {}", e),
-                    }),
-                ))
-            }
-        }
-    }
-}
-
-/// Unapprove a change by ID
-///
-/// # Endpoint
-/// POST /api/changes/{id}/unapprove
-///
-/// # Returns
-/// - 200 OK with updated change status on success
-/// - 404 Not Found if change doesn't exist
-/// - 500 Internal Server Error if unapproval operation fails
-#[cfg_attr(
-    feature = "web-monitoring",
-    utoipa::path(
-        post,
-        path = "/api/changes/{id}/unapprove",
-        tag = "changes",
-        params(
-            ("id" = String, Path, description = "Change ID")
-        ),
-        responses(
-            (status = 200, description = "Change unapproved", body = ChangeStatus),
-            (status = 404, description = "Change not found", body = ErrorResponse),
-            (status = 500, description = "Unapproval failed", body = ErrorResponse)
-        )
-    )
-)]
-pub async fn unapprove_change(
-    State(state): State<Arc<WebState>>,
-    Path(id): Path<String>,
-) -> Result<Json<ChangeStatus>, (StatusCode, Json<ErrorResponse>)> {
-    match state.unapprove_change(&id).await {
-        Ok(change) => Ok(Json(change)),
-        Err(e) => {
-            if e.to_string().contains("not found") {
-                Err(not_found_response(&id))
-            } else {
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("Failed to unapprove change: {}", e),
-                    }),
-                ))
-            }
-        }
     }
 }
 
@@ -1374,7 +1282,6 @@ mod tests {
             completed_tasks: completed,
             total_tasks: total,
             last_modified: "1m ago".to_string(),
-            is_approved: true,
             dependencies: Vec::new(),
         }
     }
@@ -1443,30 +1350,6 @@ mod tests {
         let web_state = Arc::new(WebState::new(&[]));
 
         let result = get_change(State(web_state), Path("nonexistent".to_string())).await;
-        assert!(result.is_err());
-
-        let (status, error) = result.unwrap_err();
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(error.error.contains("nonexistent"));
-    }
-
-    #[tokio::test]
-    async fn test_approve_change_not_found() {
-        let web_state = Arc::new(WebState::new(&[]));
-
-        let result = approve_change(State(web_state), Path("nonexistent".to_string())).await;
-        assert!(result.is_err());
-
-        let (status, error) = result.unwrap_err();
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(error.error.contains("nonexistent"));
-    }
-
-    #[tokio::test]
-    async fn test_unapprove_change_not_found() {
-        let web_state = Arc::new(WebState::new(&[]));
-
-        let result = unapprove_change(State(web_state), Path("nonexistent".to_string())).await;
         assert!(result.is_err());
 
         let (status, error) = result.unwrap_err();

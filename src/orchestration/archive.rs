@@ -774,7 +774,6 @@ mv "$base_dir/openspec/changes/$1" "$base_dir/openspec/changes/archive/$1"
             completed_tasks: 1,
             total_tasks: 1,
             last_modified: "".to_string(),
-            is_approved: true,
             dependencies: Vec::new(),
         };
 

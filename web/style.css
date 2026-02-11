@@ -542,16 +542,6 @@ main {
     background-color: var(--accent-red);
 }
 
-.badge-approved {
-    background-color: var(--accent-green);
-    color: var(--bg-primary);
-}
-
-.badge-unapproved {
-    background-color: var(--accent-red);
-    color: var(--text-primary);
-}
-
 /* Progress Bar - Touch optimized */
 .progress-container {
     margin-bottom: var(--space-sm);
@@ -583,57 +573,6 @@ main {
     margin-top: var(--space-sm);
     min-height: var(--touch-target);
     align-items: center;
-}
-
-/* Approval Section (inside collapsible details) */
-.approval-section {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: var(--space-md);
-    padding-bottom: var(--space-md);
-    border-bottom: 1px solid var(--border-color);
-}
-
-/* Approval Actions */
-.approval-actions {
-    display: flex;
-    justify-content: flex-end;
-}
-
-.approval-button {
-    min-height: var(--touch-target);
-    padding: var(--space-sm) var(--space-lg);
-    background-color: var(--accent-blue);
-    color: var(--text-primary);
-    border: none;
-    border-radius: 8px;
-    font-size: 0.875rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: transform 0.15s ease-out, box-shadow 0.15s ease-out, background-color 0.15s ease-out;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: var(--space-xs);
-}
-
-.approval-button:hover {
-    background-color: var(--accent-green);
-    transform: translateY(-1px);
-    box-shadow: 0 2px 8px rgba(6, 214, 160, 0.3);
-}
-
-.approval-button:active {
-    transform: translateY(0);
-}
-
-.approval-button.approved {
-    background-color: var(--accent-green);
-}
-
-.approval-button.approved:hover {
-    background-color: var(--accent-red);
 }
 
 /* Change Details - Collapsible on mobile */

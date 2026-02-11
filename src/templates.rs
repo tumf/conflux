@@ -56,7 +56,7 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // Available hooks:
   //   Run lifecycle: on_start, on_finish, on_error
   //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end, on_merged
-  //   TUI interaction: on_queue_add, on_queue_remove, on_approve, on_unapprove
+  //   TUI interaction: on_queue_add, on_queue_remove
   // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}, {completed_tasks}, {total_tasks}
   "hooks": {
     // Run lifecycle
@@ -76,9 +76,7 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
 
     // TUI interaction
     // "on_queue_add": "echo '[on_queue_add] change={change_id} tasks={completed_tasks}/{total_tasks}'",
-    // "on_queue_remove": "echo '[on_queue_remove] change={change_id} tasks={completed_tasks}/{total_tasks}'",
-    // "on_approve": "echo '[on_approve] change={change_id} tasks={completed_tasks}/{total_tasks}'",
-    // "on_unapprove": "echo '[on_unapprove] change={change_id} tasks={completed_tasks}/{total_tasks}'"
+    // "on_queue_remove": "echo '[on_queue_remove] change={change_id} tasks={completed_tasks}/{total_tasks}'"
   }
 }
 "#;
@@ -137,7 +135,7 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // Available hooks:
   //   Run lifecycle: on_start, on_finish, on_error
   //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end, on_merged
-  //   TUI interaction: on_queue_add, on_queue_remove, on_approve, on_unapprove
+  //   TUI interaction: on_queue_add, on_queue_remove
   // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}, {completed_tasks}, {total_tasks}
   "hooks": {
     // Run lifecycle
@@ -157,9 +155,7 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
 
     // TUI interaction
     // "on_queue_add": "echo '[on_queue_add] change={change_id} tasks={completed_tasks}/{total_tasks}'",
-    // "on_queue_remove": "echo '[on_queue_remove] change={change_id} tasks={completed_tasks}/{total_tasks}'",
-    // "on_approve": "echo '[on_approve] change={change_id} tasks={completed_tasks}/{total_tasks}'",
-    // "on_unapprove": "echo '[on_unapprove] change={change_id} tasks={completed_tasks}/{total_tasks}'"
+    // "on_queue_remove": "echo '[on_queue_remove] change={change_id} tasks={completed_tasks}/{total_tasks}'"
   }
 }
 "#;
@@ -218,7 +214,7 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // Available hooks:
   //   Run lifecycle: on_start, on_finish, on_error
   //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end, on_merged
-  //   TUI interaction: on_queue_add, on_queue_remove, on_approve, on_unapprove
+  //   TUI interaction: on_queue_add, on_queue_remove
   // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}, {completed_tasks}, {total_tasks}
   "hooks": {
     // Run lifecycle
@@ -238,9 +234,7 @@ pub const CODEX_TEMPLATE: &str = r#"{
 
     // TUI interaction
     // "on_queue_add": "echo '[on_queue_add] change={change_id} tasks={completed_tasks}/{total_tasks}'",
-    // "on_queue_remove": "echo '[on_queue_remove] change={change_id} tasks={completed_tasks}/{total_tasks}'",
-    // "on_approve": "echo '[on_approve] change={change_id} tasks={completed_tasks}/{total_tasks}'",
-    // "on_unapprove": "echo '[on_unapprove] change={change_id} tasks={completed_tasks}/{total_tasks}'"
+    // "on_queue_remove": "echo '[on_queue_remove] change={change_id} tasks={completed_tasks}/{total_tasks}'"
   }
 }
 "#;

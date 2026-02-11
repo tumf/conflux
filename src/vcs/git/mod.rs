@@ -91,13 +91,6 @@ impl GitWorkspaceManager {
     ///
     /// Returns a warning message if there are uncommitted changes, or None if clean.
     pub async fn check_clean_working_directory(&self) -> VcsResult<Option<VcsWarning>> {
-        // Ensure .git/info/exclude contains the approved pattern before checking status
-        let _ = commands::ensure_git_info_exclude_pattern(
-            &self.repo_root,
-            "openspec/changes/*/approved",
-        )
-        .await?;
-
         let (has_changes, status) = commands::has_uncommitted_changes(&self.repo_root).await?;
 
         if has_changes {
