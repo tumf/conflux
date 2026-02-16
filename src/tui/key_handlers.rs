@@ -467,6 +467,13 @@ pub async fn handle_key_event(
                 let _ = ctx.cmd_tx.send(cmd).await;
             }
         }
+        (KeyCode::Char('x'), _) => {
+            // Toggle all marks (only in Select or Stopped mode)
+            use crate::tui::types::ViewMode;
+            if ctx.app.view_mode == ViewMode::Changes {
+                ctx.app.toggle_all_marks();
+            }
+        }
 
         (KeyCode::Char('e'), _) => {
             handle_editor_launch(ctx).await?;

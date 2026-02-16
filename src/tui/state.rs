@@ -639,6 +639,73 @@ impl AppState {
             | AppMode::QrPopup => None,
         }
     }
+
+    /// Toggle all marks (select/unselect all eligible changes)
+    ///
+    /// In Select/Stopped modes:
+    /// - If any unmarked change exists, mark all eligible changes
+    /// - Otherwise, unmark all changes
+    ///
+    /// Only eligible changes can be toggled:
+    /// - In parallel mode, uncommitted changes are excluded
+    /// - MergeWait and ResolveWait changes can be marked but won't affect queue
+    pub fn toggle_all_marks(&mut self) {
+        // Only allow in Select or Stopped mode
+        if !matches!(self.mode, AppMode::Select | AppMode::Stopped) {
+            return;
+        }
+
+        // Determine if we should mark all or unmark all
+        // If any eligible unmarked change exists, we mark all; otherwise unmark all
+        let has_unmarked = self.changes.iter().any(|change| {
+            !change.selected
+                && guards::validate_change_toggleable(
+                    change.is_parallel_eligible,
+                    self.parallel_mode,
+                    &change.queue_status,
+                    &change.id,
+                )
+                .is_allowed()
+        });
+
+        let target_state = has_unmarked;
+
+        // Toggle all eligible changes to the target state
+        for change in &mut self.changes {
+            // Check if this change can be toggled
+            if guards::validate_change_toggleable(
+                change.is_parallel_eligible,
+                self.parallel_mode,
+                &change.queue_status,
+                &change.id,
+            )
+            .is_allowed()
+            {
+                // Only update if different from target state
+                if change.selected != target_state {
+                    change.selected = target_state;
+                    // Clear NEW flag when user interacts with the change
+                    if change.is_new {
+                        change.is_new = false;
+                        self.new_change_count = self.new_change_count.saturating_sub(1);
+                    }
+                }
+            }
+        }
+
+        // Log the action
+        let action = if target_state { "marked" } else { "unmarked" };
+        let count = self
+            .changes
+            .iter()
+            .filter(|c| c.selected == target_state)
+            .count();
+        self.add_log(LogEntry::info(format!(
+            "Toggled all: {} {} change(s)",
+            count, action
+        )));
+    }
+
     /// Trigger merge resolution for the selected change when applicable.
     ///
     /// If resolve is already running, the change is added to the resolve queue
@@ -2282,6 +2349,13 @@ mod guards {
         Blocked(String),
     }
 
+    impl ToggleGuardResult {
+        /// Check if the operation is allowed
+        pub fn is_allowed(&self) -> bool {
+            matches!(self, ToggleGuardResult::Allowed)
+        }
+    }
+
     /// Validates that a change can be toggled for selection
     pub fn validate_change_toggleable(
         is_parallel_eligible: bool,
@@ -2539,6 +2613,124 @@ mod tests {
 
         app.toggle_selection();
         assert!(!app.changes[0].selected);
+    }
+
+    #[test]
+    fn test_toggle_all_marks_select_mode() {
+        // Test toggle all in Select mode - mark all then unmark all
+        let changes = vec![
+            create_test_change("a", 0, 1),
+            create_test_change("b", 0, 1),
+            create_test_change("c", 0, 1),
+        ];
+
+        let mut app = AppState::new(changes);
+        assert_eq!(app.mode, AppMode::Select);
+
+        // All start unselected
+        assert!(!app.changes[0].selected);
+        assert!(!app.changes[1].selected);
+        assert!(!app.changes[2].selected);
+
+        // First toggle: should mark all
+        app.toggle_all_marks();
+        assert!(app.changes[0].selected);
+        assert!(app.changes[1].selected);
+        assert!(app.changes[2].selected);
+
+        // Second toggle: should unmark all
+        app.toggle_all_marks();
+        assert!(!app.changes[0].selected);
+        assert!(!app.changes[1].selected);
+        assert!(!app.changes[2].selected);
+    }
+
+    #[test]
+    fn test_toggle_all_marks_stopped_mode() {
+        // Test toggle all in Stopped mode
+        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
+
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Stopped;
+
+        // First toggle: should mark all
+        app.toggle_all_marks();
+        assert!(app.changes[0].selected);
+        assert!(app.changes[1].selected);
+
+        // Second toggle: should unmark all
+        app.toggle_all_marks();
+        assert!(!app.changes[0].selected);
+        assert!(!app.changes[1].selected);
+    }
+
+    #[test]
+    fn test_toggle_all_marks_parallel_mode_excludes_uncommitted() {
+        // Test that toggle all respects parallel mode restrictions
+        let changes = vec![
+            create_test_change("committed", 0, 1),
+            create_test_change("uncommitted", 0, 1),
+        ];
+
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Select;
+        app.parallel_mode = true;
+        app.parallel_available = true;
+
+        // Mark first as committed, second as uncommitted
+        app.changes[0].is_parallel_eligible = true;
+        app.changes[1].is_parallel_eligible = false;
+
+        // Toggle all should only mark the committed change
+        app.toggle_all_marks();
+        assert!(app.changes[0].selected);
+        assert!(!app.changes[1].selected); // Excluded due to parallel mode
+
+        // Toggle all again should unmark
+        app.toggle_all_marks();
+        assert!(!app.changes[0].selected);
+        assert!(!app.changes[1].selected);
+    }
+
+    #[test]
+    fn test_toggle_all_marks_partial_selection() {
+        // Test that if any unmarked change exists, toggle marks all
+        let changes = vec![
+            create_test_change("a", 0, 1),
+            create_test_change("b", 0, 1),
+            create_test_change("c", 0, 1),
+        ];
+
+        let mut app = AppState::new(changes);
+
+        // Manually select one change
+        app.changes[0].selected = true;
+
+        // Toggle all should mark the rest (because unmarked changes exist)
+        app.toggle_all_marks();
+        assert!(app.changes[0].selected);
+        assert!(app.changes[1].selected);
+        assert!(app.changes[2].selected);
+
+        // Toggle all again should unmark all
+        app.toggle_all_marks();
+        assert!(!app.changes[0].selected);
+        assert!(!app.changes[1].selected);
+        assert!(!app.changes[2].selected);
+    }
+
+    #[test]
+    fn test_toggle_all_marks_running_mode_does_nothing() {
+        // Test that toggle all does nothing in Running mode
+        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
+
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+
+        // Toggle all should do nothing in Running mode
+        app.toggle_all_marks();
+        assert!(!app.changes[0].selected);
+        assert!(!app.changes[1].selected);
     }
 
     #[test]
