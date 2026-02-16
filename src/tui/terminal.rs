@@ -48,7 +48,7 @@ pub async fn execute_worktree_command(
 
         // Execute via AiCommandRunner (with stagger and retry)
         let exec_result = ai_runner_clone
-            .execute_streaming_with_retry(&command_clone, Some(&worktree_path_clone))
+            .execute_streaming_with_retry(&command_clone, Some(&worktree_path_clone), None, None)
             .await;
 
         match exec_result {

@@ -54,6 +54,8 @@ impl AgentRunner {
             retry_if_duration_under_secs: config
                 .command_queue_retry_if_duration_under_secs
                 .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+            inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
+            inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
         };
 
         Self {
@@ -100,6 +102,8 @@ impl AgentRunner {
             retry_if_duration_under_secs: config
                 .command_queue_retry_if_duration_under_secs
                 .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+            inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
+            inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
         };
 
         Self {
@@ -147,10 +151,18 @@ impl AgentRunner {
         );
         let (child, rx) = match cwd {
             Some(dir) => {
-                self.execute_shell_command_streaming_in_dir(&command, dir)
+                self.execute_shell_command_streaming_in_dir(
+                    &command,
+                    dir,
+                    Some("apply"),
+                    Some(change_id),
+                )
+                .await?
+            }
+            None => {
+                self.execute_shell_command_streaming(&command, Some("apply"), Some(change_id))
                     .await?
             }
-            None => self.execute_shell_command_streaming(&command).await?,
         };
         Ok((child, rx, start))
     }
@@ -193,7 +205,7 @@ impl AgentRunner {
 
         // Execute via AiCommandRunner (with shared stagger state)
         let (child, ai_rx) = ai_runner
-            .execute_streaming_with_retry(&command, cwd)
+            .execute_streaming_with_retry(&command, cwd, Some("apply"), Some(change_id))
             .await?;
 
         // Convert AiCommandRunner output to AgentRunner output format
@@ -263,10 +275,18 @@ impl AgentRunner {
         );
         let (child, rx) = match cwd {
             Some(dir) => {
-                self.execute_shell_command_streaming_in_dir(&command, dir)
+                self.execute_shell_command_streaming_in_dir(
+                    &command,
+                    dir,
+                    Some("archive"),
+                    Some(change_id),
+                )
+                .await?
+            }
+            None => {
+                self.execute_shell_command_streaming(&command, Some("archive"), Some(change_id))
                     .await?
             }
-            None => self.execute_shell_command_streaming(&command).await?,
         };
         Ok((child, rx, start))
     }
@@ -305,7 +325,7 @@ impl AgentRunner {
 
         // Execute via AiCommandRunner (with shared stagger state)
         let (child, ai_rx) = ai_runner
-            .execute_streaming_with_retry(&command, cwd)
+            .execute_streaming_with_retry(&command, cwd, Some("archive"), Some(change_id))
             .await?;
 
         // Convert AiCommandRunner output to AgentRunner output format
@@ -405,7 +425,7 @@ impl AgentRunner {
 
         // Execute via AiCommandRunner (with shared stagger state)
         let (mut child, mut output_rx) = ai_runner
-            .execute_streaming_with_retry(&command, None)
+            .execute_streaming_with_retry(&command, None, Some("apply"), Some(change_id))
             .await?;
 
         // Collect output for history recording
@@ -566,10 +586,18 @@ impl AgentRunner {
         );
         let (child, rx) = match cwd {
             Some(dir) => {
-                self.execute_shell_command_streaming_in_dir(&command, dir)
+                self.execute_shell_command_streaming_in_dir(
+                    &command,
+                    dir,
+                    Some("acceptance"),
+                    Some(change_id),
+                )
+                .await?
+            }
+            None => {
+                self.execute_shell_command_streaming(&command, Some("acceptance"), Some(change_id))
                     .await?
             }
-            None => self.execute_shell_command_streaming(&command).await?,
         };
         Ok((child, rx, start, command))
     }
@@ -780,7 +808,7 @@ impl AgentRunner {
 
         // Execute via AiCommandRunner (with shared stagger state)
         let (mut child, mut output_rx) = ai_runner
-            .execute_streaming_with_retry(&command, None)
+            .execute_streaming_with_retry(&command, None, Some("archive"), Some(change_id))
             .await?;
 
         // Drain output (not needed for archive, but required to complete execution)
@@ -847,7 +875,7 @@ impl AgentRunner {
 
         // Execute via AiCommandRunner (with shared stagger state)
         let (mut child, mut output_rx) = ai_runner
-            .execute_streaming_with_retry(&command, None)
+            .execute_streaming_with_retry(&command, None, Some("analyze"), None)
             .await?;
 
         // Collect stdout for result
@@ -900,7 +928,8 @@ impl AgentRunner {
             module = module_path!(),
             "Running analyze command (streaming): {}", template
         );
-        self.execute_shell_command_streaming(&command).await
+        self.execute_shell_command_streaming(&command, Some("analyze"), None)
+            .await
     }
 
     /// Execute resolve command with streaming output in a specific directory.
@@ -917,7 +946,7 @@ impl AgentRunner {
             module = module_path!(),
             "Running resolve command (streaming) in {:?}: {}", cwd, command
         );
-        self.execute_shell_command_streaming_in_dir(&command, cwd)
+        self.execute_shell_command_streaming_in_dir(&command, cwd, Some("resolve"), None)
             .await
     }
 
@@ -940,7 +969,7 @@ impl AgentRunner {
 
         // Execute via AiCommandRunner (with shared stagger state)
         let (child, ai_rx) = ai_runner
-            .execute_streaming_with_retry(&command, Some(cwd))
+            .execute_streaming_with_retry(&command, Some(cwd), Some("resolve"), None)
             .await?;
 
         // Convert AiCommandRunner output to AgentRunner output format
@@ -1006,6 +1035,8 @@ impl AgentRunner {
     async fn execute_shell_command_streaming(
         &self,
         command: &str,
+        operation_type: Option<&str>,
+        change_id: Option<&str>,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
         // Create output channel
         let (tx, rx) = mpsc::channel::<OutputLine>(100);
@@ -1028,6 +1059,8 @@ impl AgentRunner {
         // Clone command queue and command string for background task
         let command_queue = self.command_queue.clone();
         let command_str = command.to_string();
+        let operation_type_owned = operation_type.map(|s| s.to_string());
+        let change_id_owned = change_id.map(|s| s.to_string());
 
         // Create oneshot channel to communicate final status
         let (status_tx, status_rx) = tokio::sync::oneshot::channel::<ExitStatus>();
@@ -1035,7 +1068,12 @@ impl AgentRunner {
         // Spawn background task to run retry logic
         tokio::spawn(async move {
             let result = command_queue
-                .execute_with_retry_streaming(|| build_command(&command_str), Some(output_callback))
+                .execute_with_retry_streaming(
+                    || build_command(&command_str),
+                    Some(output_callback),
+                    operation_type_owned.as_deref(),
+                    change_id_owned.as_deref(),
+                )
                 .await;
 
             // Send final status
@@ -1095,6 +1133,8 @@ impl AgentRunner {
         &self,
         command: &str,
         cwd: &Path,
+        operation_type: Option<&str>,
+        change_id: Option<&str>,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
         // Create output channel
         let (tx, rx) = mpsc::channel::<OutputLine>(100);
@@ -1118,6 +1158,8 @@ impl AgentRunner {
         let command_queue = self.command_queue.clone();
         let command_str = command.to_string();
         let cwd_path = cwd.to_path_buf();
+        let operation_type_owned = operation_type.map(|s| s.to_string());
+        let change_id_owned = change_id.map(|s| s.to_string());
 
         // Create oneshot channel to communicate final status
         let (status_tx, status_rx) = tokio::sync::oneshot::channel::<ExitStatus>();
@@ -1128,6 +1170,8 @@ impl AgentRunner {
                 .execute_with_retry_streaming(
                     || build_command_in_dir(&command_str, &cwd_path),
                     Some(output_callback),
+                    operation_type_owned.as_deref(),
+                    change_id_owned.as_deref(),
                 )
                 .await;
 
@@ -1200,6 +1244,8 @@ impl AgentRunner {
                     )
                         -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
                 >,
+                None,
+                None,
             )
             .await?;
 
@@ -1244,7 +1290,12 @@ impl AgentRunner {
         let command_str = command.to_string();
         let (status, _stderr_buf) = self
             .command_queue
-            .execute_with_retry_streaming(|| build_command(&command_str), Some(output_callback))
+            .execute_with_retry_streaming(
+                || build_command(&command_str),
+                Some(output_callback),
+                None,
+                None,
+            )
             .await?;
 
         // Reconstruct Output from collected lines
