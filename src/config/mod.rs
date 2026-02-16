@@ -309,12 +309,12 @@ pub struct OrchestratorConfig {
 
     /// Inactivity timeout for commands (seconds).
     /// 0 = disabled
-    /// Default: 300 (5 minutes)
+    /// Default: 900 (15 minutes)
     #[serde(default)]
     pub command_inactivity_timeout_secs: Option<u64>,
 
     /// Grace period before force-killing inactive commands (seconds).
-    /// Default: 10
+    /// Default: 5
     #[serde(default)]
     pub command_inactivity_kill_grace_secs: Option<u64>,
 }
@@ -649,14 +649,14 @@ impl OrchestratorConfig {
 
     /// Get the inactivity timeout for commands (seconds).
     /// Returns 0 if disabled.
-    /// Default: 300 (5 minutes)
+    /// Default: 900 (15 minutes)
     pub fn get_command_inactivity_timeout_secs(&self) -> u64 {
         self.command_inactivity_timeout_secs
             .unwrap_or(defaults::DEFAULT_COMMAND_INACTIVITY_TIMEOUT_SECS)
     }
 
     /// Get the grace period before force-killing inactive commands (seconds).
-    /// Default: 10
+    /// Default: 5
     pub fn get_command_inactivity_kill_grace_secs(&self) -> u64 {
         self.command_inactivity_kill_grace_secs
             .unwrap_or(defaults::DEFAULT_COMMAND_INACTIVITY_KILL_GRACE_SECS)

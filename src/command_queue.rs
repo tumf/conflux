@@ -448,7 +448,10 @@ impl CommandQueue {
 
                         // Check if process is still running
                         if child.id().is_some() {
-                            warn!("Grace period expired, terminating inactive process");
+                            warn!(
+                                "Grace period expired, terminating inactive process{}",
+                                context
+                            );
                             // Kill the process
                             let _ = child.kill().await;
                         }

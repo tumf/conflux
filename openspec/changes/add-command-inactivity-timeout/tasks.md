@@ -25,3 +25,9 @@
 - [x] `openspec/changes/add-command-inactivity-timeout/specs/configuration/spec.md` の要件（デフォルト 900 秒 / 猶予 5 秒）に合わせて、`src/config/defaults.rs` の `DEFAULT_COMMAND_INACTIVITY_TIMEOUT_SECS` と `DEFAULT_COMMAND_INACTIVITY_KILL_GRACE_SECS`（および関連コメント）を修正する。
 - [x] `openspec/changes/add-command-inactivity-timeout/specs/command-queue/spec.md` の要件に合わせて、無出力タイムアウト時の失敗経路で返すエラー文言に必ず `"inactivity timeout"` を含める（例: `src/command_queue.rs` の `stream_and_wait` / `execute_with_retry_streaming` の連携）。
 - [x] `openspec/changes/add-command-inactivity-timeout/specs/observability/spec.md` の要件に合わせて、無出力タイムアウト warning ログに操作種別（apply/archive/resolve/analyze/acceptance）と `change_id` を含めるよう実装する（`src/command_queue.rs` の warning 出力か、呼び出し元で同等情報を付与）。
+
+## Acceptance #2 Failure Follow-up
+
+- [x] `src/config/mod.rs` の無出力タイムアウト関連コメントを仕様値（900 秒 / 5 秒）に更新する（`command_inactivity_timeout_secs` フィールド説明と `get_command_inactivity_*` getter 説明）。
+- [x] 無出力タイムアウト warning ログに操作種別と `change_id` が実行フローで必ず入るよう、`AiCommandRunner::execute_streaming_with_retry` から `CommandQueue::execute_with_retry_streaming` へ `operation_type`/`change_id` を渡す API を追加し、apply/archive/resolve/analyze/acceptance 呼び出し側から設定する。
+- [x] `src/command_queue.rs` の `Grace period expired, terminating inactive process` warning にも操作種別と `change_id` を含める。
