@@ -94,6 +94,13 @@ pub const DEFAULT_RETRY_DELAY_MS: u64 = 5000;
 /// Default threshold for retry based on execution duration (seconds)
 pub const DEFAULT_RETRY_IF_DURATION_UNDER_SECS: u64 = 5;
 
+/// Default inactivity timeout for commands (seconds)
+/// 0 = disabled
+pub const DEFAULT_COMMAND_INACTIVITY_TIMEOUT_SECS: u64 = 300;
+
+/// Default grace period before force-killing inactive commands (seconds)
+pub const DEFAULT_COMMAND_INACTIVITY_KILL_GRACE_SECS: u64 = 10;
+
 /// Default error patterns that trigger automatic retry
 pub fn default_retry_patterns() -> Vec<String> {
     vec![

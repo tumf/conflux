@@ -306,6 +306,17 @@ pub struct OrchestratorConfig {
     /// Default: 2
     #[serde(default)]
     pub acceptance_max_continues: Option<u32>,
+
+    /// Inactivity timeout for commands (seconds).
+    /// 0 = disabled
+    /// Default: 300 (5 minutes)
+    #[serde(default)]
+    pub command_inactivity_timeout_secs: Option<u64>,
+
+    /// Grace period before force-killing inactive commands (seconds).
+    /// Default: 10
+    #[serde(default)]
+    pub command_inactivity_kill_grace_secs: Option<u64>,
 }
 
 /// Acceptance prompt mode.
@@ -452,6 +463,14 @@ impl OrchestratorConfig {
         // Acceptance config
         if other.acceptance_max_continues.is_some() {
             self.acceptance_max_continues = other.acceptance_max_continues;
+        }
+
+        // Inactivity timeout config
+        if other.command_inactivity_timeout_secs.is_some() {
+            self.command_inactivity_timeout_secs = other.command_inactivity_timeout_secs;
+        }
+        if other.command_inactivity_kill_grace_secs.is_some() {
+            self.command_inactivity_kill_grace_secs = other.command_inactivity_kill_grace_secs;
         }
     }
 
@@ -626,6 +645,21 @@ impl OrchestratorConfig {
     pub fn get_acceptance_max_continues(&self) -> u32 {
         self.acceptance_max_continues
             .unwrap_or(defaults::DEFAULT_ACCEPTANCE_MAX_CONTINUES)
+    }
+
+    /// Get the inactivity timeout for commands (seconds).
+    /// Returns 0 if disabled.
+    /// Default: 300 (5 minutes)
+    pub fn get_command_inactivity_timeout_secs(&self) -> u64 {
+        self.command_inactivity_timeout_secs
+            .unwrap_or(defaults::DEFAULT_COMMAND_INACTIVITY_TIMEOUT_SECS)
+    }
+
+    /// Get the grace period before force-killing inactive commands (seconds).
+    /// Default: 10
+    pub fn get_command_inactivity_kill_grace_secs(&self) -> u64 {
+        self.command_inactivity_kill_grace_secs
+            .unwrap_or(defaults::DEFAULT_COMMAND_INACTIVITY_KILL_GRACE_SECS)
     }
 
     /// Expand `{change_id}` placeholder in a command template

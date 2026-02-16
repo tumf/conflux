@@ -310,6 +310,8 @@ mod tests {
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
             retry_error_patterns: vec![],
             retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 10,
         };
 
         let runner1 = AiCommandRunner::new(config.clone(), shared_state.clone());

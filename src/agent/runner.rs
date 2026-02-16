@@ -54,6 +54,8 @@ impl AgentRunner {
             retry_if_duration_under_secs: config
                 .command_queue_retry_if_duration_under_secs
                 .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+            inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
+            inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
         };
 
         Self {
@@ -100,6 +102,8 @@ impl AgentRunner {
             retry_if_duration_under_secs: config
                 .command_queue_retry_if_duration_under_secs
                 .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+            inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
+            inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
         };
 
         Self {
