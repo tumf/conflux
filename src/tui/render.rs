@@ -479,6 +479,10 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
     if has_queue && !app.is_resolving {
         keys.push("F5: run");
     }
+    // Show toggle all hint only in Select or Stopped mode (not in Running/Stopping/Error)
+    if matches!(app.mode, AppMode::Select | AppMode::Stopped) {
+        keys.push("x: toggle all");
+    }
     keys.push("Tab: worktrees");
     // Show parallel toggle hint only if parallel execution is available
     if app.parallel_available {
@@ -789,6 +793,10 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 keys.push("M: resolve");
             }
         }
+    }
+    // Show toggle all hint only in Select or Stopped mode (not in Running/Stopping/Error)
+    if matches!(app.mode, AppMode::Select | AppMode::Stopped) {
+        keys.push("x: toggle all");
     }
     keys.push("Tab: worktrees");
     // Show QR code hint if web server is enabled
@@ -2520,6 +2528,87 @@ mod tests {
         assert!(
             content.contains("Space: queue"),
             "Space: queue should be shown for committed changes in parallel mode"
+        );
+    }
+
+    #[test]
+    fn test_toggle_all_hint_shown_in_select_mode() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Select;
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            content.contains("x: toggle all"),
+            "Should show 'x: toggle all' hint in Select mode"
+        );
+    }
+
+    #[test]
+    fn test_toggle_all_hint_shown_in_stopped_mode() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Stopped;
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            content.contains("x: toggle all"),
+            "Should show 'x: toggle all' hint in Stopped mode"
+        );
+    }
+
+    #[test]
+    fn test_toggle_all_hint_not_shown_in_running_mode() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Running;
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            !content.contains("x: toggle all"),
+            "Should NOT show 'x: toggle all' hint in Running mode"
+        );
+    }
+
+    #[test]
+    fn test_toggle_all_hint_not_shown_in_stopping_mode() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Stopping;
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            !content.contains("x: toggle all"),
+            "Should NOT show 'x: toggle all' hint in Stopping mode"
+        );
+    }
+
+    #[test]
+    fn test_toggle_all_hint_not_shown_in_error_mode() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Error;
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            !content.contains("x: toggle all"),
+            "Should NOT show 'x: toggle all' hint in Error mode"
+        );
+    }
+
+    #[test]
+    fn test_toggle_all_hint_shown_in_select_mode_with_logs() {
+        // Regression test: verify that toggle all hint is shown in Select mode
+        // when logs are present (i.e., when render_changes_list_running is called)
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Select;
+        app.add_log(LogEntry::info("Test log")); // Add log to trigger running mode rendering
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            content.contains("x: toggle all"),
+            "Should show 'x: toggle all' hint in Select mode with logs present"
         );
     }
 }
