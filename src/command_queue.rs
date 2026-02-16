@@ -230,6 +230,8 @@ impl CommandQueue {
     ///
     /// * `command_fn` - A function that creates the command to execute
     /// * `output_callback` - Optional async callback called for each output line
+    /// * `operation_type` - Optional operation type for logging (e.g., "apply", "archive")
+    /// * `change_id` - Optional change ID for logging
     ///
     /// # Returns
     ///
@@ -241,6 +243,8 @@ impl CommandQueue {
         &self,
         mut command_fn: F,
         output_callback: Option<C>,
+        operation_type: Option<&str>,
+        change_id: Option<&str>,
     ) -> Result<(ExitStatus, String)>
     where
         F: FnMut() -> Command,
@@ -257,7 +261,9 @@ impl CommandQueue {
             let mut child = self.execute_with_stagger(|| command_fn()).await?;
 
             // Stream output and collect stderr for retry decision
-            let (status, stderr) = self.stream_and_wait(&mut child, &output_callback).await?;
+            let (status, stderr, inactivity_timeout_occurred) = self
+                .stream_and_wait(&mut child, &output_callback, operation_type, change_id)
+                .await?;
             let duration = start_time.elapsed();
 
             // Success case
@@ -298,12 +304,22 @@ impl CommandQueue {
             }
 
             // Max retries exceeded or non-retryable error
-            return Err(OrchestratorError::AgentCommand(format!(
-                "Command failed after {} attempt(s) with exit code {:?}: {}",
-                attempt,
-                status.code(),
-                stderr.lines().next().unwrap_or("")
-            )));
+            let error_msg = if inactivity_timeout_occurred {
+                format!(
+                    "Command failed due to inactivity timeout after {} attempt(s) with exit code {:?}: {}",
+                    attempt,
+                    status.code(),
+                    stderr.lines().next().unwrap_or("")
+                )
+            } else {
+                format!(
+                    "Command failed after {} attempt(s) with exit code {:?}: {}",
+                    attempt,
+                    status.code(),
+                    stderr.lines().next().unwrap_or("")
+                )
+            };
+            return Err(OrchestratorError::AgentCommand(error_msg));
         }
     }
 
@@ -314,12 +330,16 @@ impl CommandQueue {
     ///
     /// Monitors inactivity: if no output is received for `inactivity_timeout_secs`,
     /// logs a warning, waits `inactivity_kill_grace_secs`, then terminates the process.
+    ///
+    /// Returns (ExitStatus, stderr_output, inactivity_timeout_occurred)
     #[allow(dead_code)] // Used by execute_with_retry_streaming
     async fn stream_and_wait<C, Fut>(
         &self,
         child: &mut Child,
         output_callback: &Option<C>,
-    ) -> Result<(ExitStatus, String)>
+        operation_type: Option<&str>,
+        change_id: Option<&str>,
+    ) -> Result<(ExitStatus, String, bool)>
     where
         C: Fn(StreamingOutputLine) -> Fut + Clone + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send,
@@ -378,6 +398,7 @@ impl CommandQueue {
         // Inactivity monitoring (if enabled)
         let inactivity_timeout_secs = self.config.inactivity_timeout_secs;
         let kill_grace_secs = self.config.inactivity_kill_grace_secs;
+        let mut inactivity_timeout_occurred = false;
 
         if inactivity_timeout_secs > 0 {
             // Monitor activity with timeout
@@ -405,9 +426,20 @@ impl CommandQueue {
                     // Timeout waiting for activity
                     _ = tokio::time::sleep(remaining) => {
                         // Inactivity timeout triggered
+                        inactivity_timeout_occurred = true;
+
+                        // Build context string for logging
+                        let context = match (operation_type, change_id) {
+                            (Some(op), Some(id)) => format!(" (operation: {}, change_id: {})", op, id),
+                            (Some(op), None) => format!(" (operation: {})", op),
+                            (None, Some(id)) => format!(" (change_id: {})", id),
+                            (None, None) => String::new(),
+                        };
+
                         warn!(
-                            "Command inactivity timeout triggered after {} seconds, waiting {} seconds grace period before terminating",
+                            "Command inactivity timeout triggered after {} seconds{}, waiting {} seconds grace period before terminating",
                             inactivity_timeout_secs,
+                            context,
                             kill_grace_secs
                         );
 
@@ -439,7 +471,7 @@ impl CommandQueue {
         // Wait for process to complete
         let status = child.wait().await.map_err(OrchestratorError::Io)?;
 
-        Ok((status, stderr_collected))
+        Ok((status, stderr_collected, inactivity_timeout_occurred))
     }
 
     /// Get the configuration (for testing and external access)
@@ -590,6 +622,8 @@ mod tests {
                     cmd
                 },
                 None::<fn(StreamingOutputLine) -> std::future::Ready<()>>,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -625,6 +659,8 @@ mod tests {
                     cmd
                 },
                 Some(callback),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -662,6 +698,8 @@ mod tests {
                     cmd
                 },
                 None::<fn(StreamingOutputLine) -> std::future::Ready<()>>,
+                None,
+                None,
             )
             .await;
 
@@ -696,6 +734,8 @@ mod tests {
                     cmd
                 },
                 None::<fn(StreamingOutputLine) -> std::future::Ready<()>>,
+                None,
+                None,
             )
             .await;
 
@@ -744,6 +784,8 @@ mod tests {
                     cmd
                 },
                 None::<fn(StreamingOutputLine) -> std::future::Ready<()>>,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -778,6 +820,8 @@ mod tests {
                     cmd
                 },
                 None::<fn(StreamingOutputLine) -> std::future::Ready<()>>,
+                None,
+                None,
             )
             .await
             .unwrap();

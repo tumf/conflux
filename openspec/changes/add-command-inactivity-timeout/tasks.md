@@ -19,3 +19,9 @@
 - [x] 4.1 無出力タイムアウトが発生するテストを追加する（確認: `src/command_queue.rs` のテストで sleep コマンドがタイムアウトする）
 - [x] 4.2 定期出力でタイムアウトしないテストを追加する（確認: `src/command_queue.rs` のテストで一定間隔出力が成功する）
 - [x] 4.3 タイムアウト無効化（0）のテストを追加する（確認: `src/command_queue.rs` のテストで無効化時にタイムアウトしない）
+
+## Acceptance #1 Failure Follow-up
+
+- [x] `openspec/changes/add-command-inactivity-timeout/specs/configuration/spec.md` の要件（デフォルト 900 秒 / 猶予 5 秒）に合わせて、`src/config/defaults.rs` の `DEFAULT_COMMAND_INACTIVITY_TIMEOUT_SECS` と `DEFAULT_COMMAND_INACTIVITY_KILL_GRACE_SECS`（および関連コメント）を修正する。
+- [x] `openspec/changes/add-command-inactivity-timeout/specs/command-queue/spec.md` の要件に合わせて、無出力タイムアウト時の失敗経路で返すエラー文言に必ず `"inactivity timeout"` を含める（例: `src/command_queue.rs` の `stream_and_wait` / `execute_with_retry_streaming` の連携）。
+- [x] `openspec/changes/add-command-inactivity-timeout/specs/observability/spec.md` の要件に合わせて、無出力タイムアウト warning ログに操作種別（apply/archive/resolve/analyze/acceptance）と `change_id` を含めるよう実装する（`src/command_queue.rs` の warning 出力か、呼び出し元で同等情報を付与）。

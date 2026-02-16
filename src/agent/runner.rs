@@ -1039,7 +1039,12 @@ impl AgentRunner {
         // Spawn background task to run retry logic
         tokio::spawn(async move {
             let result = command_queue
-                .execute_with_retry_streaming(|| build_command(&command_str), Some(output_callback))
+                .execute_with_retry_streaming(
+                    || build_command(&command_str),
+                    Some(output_callback),
+                    None,
+                    None,
+                )
                 .await;
 
             // Send final status
@@ -1132,6 +1137,8 @@ impl AgentRunner {
                 .execute_with_retry_streaming(
                     || build_command_in_dir(&command_str, &cwd_path),
                     Some(output_callback),
+                    None,
+                    None,
                 )
                 .await;
 
@@ -1204,6 +1211,8 @@ impl AgentRunner {
                     )
                         -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
                 >,
+                None,
+                None,
             )
             .await?;
 
@@ -1248,7 +1257,12 @@ impl AgentRunner {
         let command_str = command.to_string();
         let (status, _stderr_buf) = self
             .command_queue
-            .execute_with_retry_streaming(|| build_command(&command_str), Some(output_callback))
+            .execute_with_retry_streaming(
+                || build_command(&command_str),
+                Some(output_callback),
+                None,
+                None,
+            )
             .await?;
 
         // Reconstruct Output from collected lines

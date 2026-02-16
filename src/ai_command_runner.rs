@@ -139,6 +139,8 @@ impl AiCommandRunner {
                         cmd
                     },
                     Some(output_callback),
+                    None, // operation_type not available at this level
+                    None, // change_id not available at this level
                 )
                 .await;
 
