@@ -402,7 +402,12 @@ pub async fn execute_archive_in_workspace(
             workspace_path
         );
         let (mut child, mut output_rx) = ai_runner
-            .execute_streaming_with_retry(&command, Some(workspace_path))
+            .execute_streaming_with_retry(
+                &command,
+                Some(workspace_path),
+                Some("archive"),
+                Some(change_id),
+            )
             .await?;
 
         // Create output collector for history
@@ -855,7 +860,12 @@ pub async fn execute_acceptance_in_workspace(
 
     // Execute command via AiCommandRunner (with stagger and retry)
     let (mut child, mut output_rx) = ai_runner
-        .execute_streaming_with_retry(&command, Some(workspace_path))
+        .execute_streaming_with_retry(
+            &command,
+            Some(workspace_path),
+            Some("acceptance"),
+            Some(change_id),
+        )
         .await?;
 
     // Create output collector for history

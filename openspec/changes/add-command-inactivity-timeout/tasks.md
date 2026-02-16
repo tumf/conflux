@@ -31,3 +31,8 @@
 - [x] `src/config/mod.rs` の無出力タイムアウト関連コメントを仕様値（900 秒 / 5 秒）に更新する（`command_inactivity_timeout_secs` フィールド説明と `get_command_inactivity_*` getter 説明）。
 - [x] 無出力タイムアウト warning ログに操作種別と `change_id` が実行フローで必ず入るよう、`AiCommandRunner::execute_streaming_with_retry` から `CommandQueue::execute_with_retry_streaming` へ `operation_type`/`change_id` を渡す API を追加し、apply/archive/resolve/analyze/acceptance 呼び出し側から設定する。
 - [x] `src/command_queue.rs` の `Grace period expired, terminating inactive process` warning にも操作種別と `change_id` を含める。
+
+## Acceptance #3 Failure Follow-up
+
+- [x] `AiCommandRunner::execute_streaming_with_retry` が `CommandQueue::execute_with_retry_streaming` に `operation_type` / `change_id` を `None` で渡しているため（`src/ai_command_runner.rs:126-144`）、apply/archive/analyze/resolve の実行経路で warning ログの文脈が欠落する。`AiCommandRunner` の API と呼び出し側（`src/agent/runner.rs`）を拡張して操作種別と `change_id` を必ず渡す。
+- [x] acceptance 実行経路（`src/orchestration/acceptance.rs:118-120` → `src/agent/runner.rs:520-579` → `src/agent/runner.rs:1010-1047`）でも `CommandQueue::execute_with_retry_streaming` に `operation_type="acceptance"` と `change_id` が渡されていないため、observability 要件の対象操作（acceptance）を満たしていない。acceptance でも同じ文脈付与を実装する。

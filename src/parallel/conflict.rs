@@ -214,7 +214,12 @@ pub async fn resolve_conflicts_with_retry(
         let template = config.get_resolve_command()?;
         let command = crate::config::OrchestratorConfig::expand_prompt(template, &resolve_prompt);
         let (mut child, mut rx) = ai_runner
-            .execute_streaming_with_retry(&command, Some(workspace_manager.repo_root()))
+            .execute_streaming_with_retry(
+                &command,
+                Some(workspace_manager.repo_root()),
+                Some("resolve"),
+                None,
+            )
             .await?;
 
         // Create output collector for history
@@ -577,7 +582,12 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         let template = config.get_resolve_command()?;
         let command = crate::config::OrchestratorConfig::expand_prompt(template, &resolve_prompt);
         let (mut child, mut rx) = ai_runner
-            .execute_streaming_with_retry(&command, Some(workspace_manager.repo_root()))
+            .execute_streaming_with_retry(
+                &command,
+                Some(workspace_manager.repo_root()),
+                Some("resolve"),
+                None,
+            )
             .await?;
 
         // Create output collector for history

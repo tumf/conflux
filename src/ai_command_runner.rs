@@ -71,6 +71,8 @@ impl AiCommandRunner {
     ///
     /// * `command` - The shell command to execute (will be run via `sh -c`)
     /// * `cwd` - Optional working directory (for worktree execution)
+    /// * `operation_type` - Optional operation type (apply/archive/resolve/analyze/acceptance) for logging
+    /// * `change_id` - Optional change ID for logging context
     ///
     /// # Returns
     ///
@@ -90,6 +92,8 @@ impl AiCommandRunner {
         &self,
         command: &str,
         cwd: Option<&Path>,
+        operation_type: Option<&str>,
+        change_id: Option<&str>,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
         use crate::command_queue::StreamingOutputLine;
         use std::process::ExitStatus;
@@ -116,6 +120,8 @@ impl AiCommandRunner {
         let command_queue = self.command_queue.clone();
         let command_str = command.to_string();
         let cwd_owned = cwd.map(|p| p.to_path_buf());
+        let operation_type_owned = operation_type.map(|s| s.to_string());
+        let change_id_owned = change_id.map(|s| s.to_string());
 
         // Create oneshot channel to communicate final status
         let (status_tx, status_rx) = tokio::sync::oneshot::channel::<ExitStatus>();
@@ -139,8 +145,8 @@ impl AiCommandRunner {
                         cmd
                     },
                     Some(output_callback),
-                    None, // operation_type not available at this level
-                    None, // change_id not available at this level
+                    operation_type_owned.as_deref(),
+                    change_id_owned.as_deref(),
                 )
                 .await;
 

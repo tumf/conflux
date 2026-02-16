@@ -154,7 +154,7 @@ impl ParallelizationAnalyzer {
         let command = crate::config::OrchestratorConfig::expand_prompt(template, prompt);
         let (mut child, mut rx) = self
             .ai_runner
-            .execute_streaming_with_retry(&command, None)
+            .execute_streaming_with_retry(&command, None, Some("analyze"), None)
             .await?;
 
         // Collect output while streaming to callback
