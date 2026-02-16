@@ -12,3 +12,8 @@
 
 - [x] 3.1 全マーク/全アンマークの挙動を検証するユニットテストを追加する（`src/tui/state.rs` の tests に新規テストがあること）
 - [x] 3.2 Running モードではヒントを表示しないことを確認するテストを追加する（`src/tui/render.rs` のテストに `x: toggle all` の有無を確認する検証があること）
+
+## Acceptance #1 Failure Follow-up
+
+- [x] `src/tui/render.rs` の `render_changes_list_running` で `app.mode == AppMode::Select` かつログ表示経路（`render()` が `app.logs.is_empty()` で分岐）でも `x: toggle all` を表示するよう修正し、Select モード要件（`openspec/changes/update-tui-toggle-all-marks/specs/tui-key-hints/spec.md` の Scenario: Select モードでヒントを表示する）を満たす。
+- [x] 上記の回帰防止として、Select モードかつ `app.logs` が非空のときに `x: toggle all` が表示されるテストを `src/tui/render.rs` に追加する。

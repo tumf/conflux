@@ -794,8 +794,8 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             }
         }
     }
-    // Show toggle all hint only in Stopped mode (not in Running/Stopping)
-    if app.mode == AppMode::Stopped {
+    // Show toggle all hint only in Select or Stopped mode (not in Running/Stopping/Error)
+    if matches!(app.mode, AppMode::Select | AppMode::Stopped) {
         keys.push("x: toggle all");
     }
     keys.push("Tab: worktrees");
@@ -2593,6 +2593,22 @@ mod tests {
         assert!(
             !content.contains("x: toggle all"),
             "Should NOT show 'x: toggle all' hint in Error mode"
+        );
+    }
+
+    #[test]
+    fn test_toggle_all_hint_shown_in_select_mode_with_logs() {
+        // Regression test: verify that toggle all hint is shown in Select mode
+        // when logs are present (i.e., when render_changes_list_running is called)
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Select;
+        app.add_log(LogEntry::info("Test log")); // Add log to trigger running mode rendering
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            content.contains("x: toggle all"),
+            "Should show 'x: toggle all' hint in Select mode with logs present"
         );
     }
 }
