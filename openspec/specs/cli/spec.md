@@ -1532,3 +1532,11 @@ TUI のログファイル出力は常時有効でなければならず（MUST）
 - **WHEN** ユーザーが `cflx tui --logs /tmp/debug.log` を実行する
 - **THEN** CLI は不明なオプションとしてエラーを表示する
 - **AND** 終了コードは非0である
+
+### Requirement: server サブコマンド
+CLI は `cflx server` サブコマンドを提供し、サーバモードを起動しなければならない（SHALL）。
+
+#### Scenario: server サブコマンドで起動する
+- **WHEN** ユーザーが `cflx server` を実行する
+- **THEN** サーバモードが起動する
+- **AND** カレントディレクトリの変更一覧は読み込まない

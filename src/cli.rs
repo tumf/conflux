@@ -78,6 +78,12 @@ pub enum Commands {
 
     /// Check for conflicts between spec delta files across changes
     CheckConflicts(CheckConflictsArgs),
+
+    /// Start the multi-project server daemon
+    ///
+    /// Manages multiple projects via a REST API (API v1).
+    /// Requires bearer token authentication when binding to non-loopback addresses.
+    Server(ServerArgs),
 }
 
 /// Arguments for the run subcommand
@@ -224,6 +230,48 @@ pub struct CheckConflictsArgs {
     /// Output results in JSON format
     #[arg(long, short = 'j')]
     pub json: bool,
+}
+
+/// Arguments for the server subcommand
+#[derive(Parser, Debug)]
+#[command(long_about = "Start the multi-project server daemon.
+
+The server daemon runs independently of any particular directory and manages
+multiple projects via a REST API. Projects are identified by remote_url + branch.
+
+SECURITY:
+  When binding to a non-loopback address, bearer token authentication is required.
+  The server will refuse to start if --auth-token is not provided for non-loopback binds.
+
+EXAMPLES:
+  cflx server                                    # Start on 127.0.0.1:9876
+  cflx server --port 9876                        # Explicit port
+  cflx server --bind 0.0.0.0 --auth-token mytoken  # Public bind with auth
+  cflx server --data-dir /var/lib/cflx           # Custom data directory")]
+pub struct ServerArgs {
+    /// Path to custom configuration file (JSONC format)
+    #[arg(long, short = 'c')]
+    pub config: Option<std::path::PathBuf>,
+
+    /// Bind address for the server (overrides global config; default from global config or 127.0.0.1)
+    #[arg(long)]
+    pub bind: Option<String>,
+
+    /// Port for the server (overrides global config; default from global config or 9876)
+    #[arg(long)]
+    pub port: Option<u16>,
+
+    /// Bearer token for authentication (required for non-loopback bind addresses)
+    #[arg(long)]
+    pub auth_token: Option<String>,
+
+    /// Maximum number of concurrent project executions globally
+    #[arg(long)]
+    pub max_concurrent_total: Option<usize>,
+
+    /// Directory for persistent server data (projects registry, etc.)
+    #[arg(long)]
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 /// Check if git directory exists
