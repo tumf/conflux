@@ -319,6 +319,155 @@ pub struct OrchestratorConfig {
     pub command_inactivity_kill_grace_secs: Option<u64>,
 }
 
+/// Authentication mode for the server daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerAuthMode {
+    /// No authentication (only safe for loopback addresses)
+    #[default]
+    None,
+    /// Bearer token authentication (required for non-loopback addresses)
+    BearerToken,
+}
+
+/// Authentication configuration for the server daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerAuthConfig {
+    /// Authentication mode
+    #[serde(default)]
+    pub mode: ServerAuthMode,
+    /// Bearer token for authentication (required when mode = bearer_token)
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+impl Default for ServerAuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: ServerAuthMode::None,
+            token: None,
+        }
+    }
+}
+
+fn default_server_bind() -> String {
+    defaults::DEFAULT_SERVER_BIND.to_string()
+}
+
+fn default_server_port() -> u16 {
+    defaults::DEFAULT_SERVER_PORT
+}
+
+fn default_server_max_concurrent_total() -> usize {
+    defaults::DEFAULT_SERVER_MAX_CONCURRENT_TOTAL
+}
+
+fn default_server_data_dir() -> std::path::PathBuf {
+    defaults::default_server_data_dir()
+}
+
+/// Server daemon configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// Bind address for the server (default: 127.0.0.1)
+    #[serde(default = "default_server_bind")]
+    pub bind: String,
+
+    /// Port for the server (default: 9876)
+    #[serde(default = "default_server_port")]
+    pub port: u16,
+
+    /// Authentication configuration
+    #[serde(default)]
+    pub auth: ServerAuthConfig,
+
+    /// Maximum number of concurrent project executions globally
+    #[serde(default = "default_server_max_concurrent_total")]
+    pub max_concurrent_total: usize,
+
+    /// Directory for persistent server data (projects registry, etc.)
+    #[serde(default = "default_server_data_dir")]
+    pub data_dir: std::path::PathBuf,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_server_bind(),
+            port: default_server_port(),
+            auth: ServerAuthConfig::default(),
+            max_concurrent_total: default_server_max_concurrent_total(),
+            data_dir: default_server_data_dir(),
+        }
+    }
+}
+
+impl ServerConfig {
+    /// Check if the bind address is loopback (127.0.0.0/8 or ::1).
+    pub fn is_loopback_bind(&self) -> bool {
+        let addr = self.bind.trim();
+        // IPv4 loopback: 127.x.x.x
+        if addr.starts_with("127.") || addr == "localhost" {
+            return true;
+        }
+        // IPv6 loopback
+        if addr == "::1" || addr == "[::1]" {
+            return true;
+        }
+        false
+    }
+
+    /// Validate the server configuration.
+    /// Returns error if non-loopback bind is used without bearer token authentication.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if !self.is_loopback_bind() {
+            match self.auth.mode {
+                ServerAuthMode::BearerToken => {
+                    if self.auth.token.as_deref().unwrap_or("").is_empty() {
+                        return Err(crate::error::OrchestratorError::ConfigLoad(
+                            "Server: non-loopback bind requires auth.token to be set when auth.mode=bearer_token".to_string(),
+                        ));
+                    }
+                }
+                ServerAuthMode::None => {
+                    return Err(crate::error::OrchestratorError::ConfigLoad(
+                        "Server: non-loopback bind requires auth.mode=bearer_token with a token"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply CLI overrides (bind, port, auth_token, max_concurrent_total, data_dir).
+    pub fn apply_cli_overrides(
+        &mut self,
+        bind: Option<&str>,
+        port: Option<u16>,
+        auth_token: Option<&str>,
+        max_concurrent_total: Option<usize>,
+        data_dir: Option<&std::path::Path>,
+    ) {
+        if let Some(b) = bind {
+            self.bind = b.to_string();
+        }
+        if let Some(p) = port {
+            self.port = p;
+        }
+        if let Some(token) = auth_token {
+            self.auth.mode = ServerAuthMode::BearerToken;
+            self.auth.token = Some(token.to_string());
+        }
+        if let Some(max) = max_concurrent_total {
+            self.max_concurrent_total = max;
+        }
+        if let Some(dir) = data_dir {
+            self.data_dir = dir.to_path_buf();
+        }
+    }
+}
+
 /// Acceptance prompt mode.
 /// Full is deprecated and now behaves identically to ContextOnly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -2316,5 +2465,125 @@ mod tests {
             "xdg-env-agent apply {change_id}",
             "Expected XDG env config to take priority over XDG default config"
         );
+    }
+
+    // ── ServerConfig validation tests ──
+
+    #[test]
+    fn test_server_config_validate_loopback_no_auth_ok() {
+        // Loopback bind without auth is allowed
+        let config = ServerConfig {
+            bind: "127.0.0.1".to_string(),
+            auth: ServerAuthConfig {
+                mode: ServerAuthMode::None,
+                token: None,
+            },
+            ..ServerConfig::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "Loopback bind without auth should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_server_config_validate_loopback_with_auth_ok() {
+        // Loopback bind with auth is also allowed
+        let config = ServerConfig {
+            bind: "127.0.0.1".to_string(),
+            auth: ServerAuthConfig {
+                mode: ServerAuthMode::BearerToken,
+                token: Some("secret".to_string()),
+            },
+            ..ServerConfig::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "Loopback bind with auth should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_server_config_validate_non_loopback_no_auth_fails() {
+        // Non-loopback bind without auth must fail
+        let config = ServerConfig {
+            bind: "0.0.0.0".to_string(),
+            auth: ServerAuthConfig {
+                mode: ServerAuthMode::None,
+                token: None,
+            },
+            ..ServerConfig::default()
+        };
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "Non-loopback bind without auth should be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("bearer_token"),
+            "Error message should mention bearer_token requirement"
+        );
+    }
+
+    #[test]
+    fn test_server_config_validate_non_loopback_bearer_token_ok() {
+        // Non-loopback bind with valid bearer token is allowed
+        let config = ServerConfig {
+            bind: "0.0.0.0".to_string(),
+            auth: ServerAuthConfig {
+                mode: ServerAuthMode::BearerToken,
+                token: Some("my-secret-token".to_string()),
+            },
+            ..ServerConfig::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "Non-loopback bind with valid bearer token should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_server_config_validate_non_loopback_bearer_token_empty_fails() {
+        // Non-loopback bind with empty bearer token must fail
+        let config = ServerConfig {
+            bind: "0.0.0.0".to_string(),
+            auth: ServerAuthConfig {
+                mode: ServerAuthMode::BearerToken,
+                token: Some("".to_string()),
+            },
+            ..ServerConfig::default()
+        };
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "Non-loopback bind with empty token should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_server_config_is_loopback_bind() {
+        // Test various loopback and non-loopback addresses
+        let loopback_cases = ["127.0.0.1", "127.0.0.2", "127.1.2.3", "localhost", "::1"];
+        for addr in &loopback_cases {
+            let config = ServerConfig {
+                bind: addr.to_string(),
+                ..ServerConfig::default()
+            };
+            assert!(config.is_loopback_bind(), "'{}' should be loopback", addr);
+        }
+
+        let non_loopback_cases = ["0.0.0.0", "192.168.1.1", "10.0.0.1", "::"];
+        for addr in &non_loopback_cases {
+            let config = ServerConfig {
+                bind: addr.to_string(),
+                ..ServerConfig::default()
+            };
+            assert!(
+                !config.is_loopback_bind(),
+                "'{}' should not be loopback",
+                addr
+            );
+        }
     }
 }

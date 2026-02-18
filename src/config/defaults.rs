@@ -134,6 +134,40 @@ pub const DEFAULT_MERGE_STALL_THRESHOLD_MINUTES: u64 = 30;
 /// Default check interval for merge stall detection (seconds)
 pub const DEFAULT_MERGE_STALL_CHECK_INTERVAL_SECONDS: u64 = 60;
 
+/// Default server bind address
+pub const DEFAULT_SERVER_BIND: &str = "127.0.0.1";
+
+/// Default server port
+pub const DEFAULT_SERVER_PORT: u16 = 9876;
+
+/// Default maximum concurrent project executions (server mode)
+pub const DEFAULT_SERVER_MAX_CONCURRENT_TOTAL: usize = 4;
+
+/// Default server data directory (relative path component, under XDG_DATA_HOME/cflx/)
+pub const DEFAULT_SERVER_DATA_SUBDIR: &str = "server";
+
+/// Returns the default server data directory path.
+/// Uses ${XDG_DATA_HOME}/cflx/server, falling back to ~/.local/share/cflx/server.
+pub fn default_server_data_dir() -> std::path::PathBuf {
+    if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
+        if !xdg_data_home.is_empty() {
+            return std::path::PathBuf::from(xdg_data_home)
+                .join("cflx")
+                .join(DEFAULT_SERVER_DATA_SUBDIR);
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        return home
+            .join(".local")
+            .join("share")
+            .join("cflx")
+            .join(DEFAULT_SERVER_DATA_SUBDIR);
+    }
+    std::env::temp_dir()
+        .join("cflx-server-fallback")
+        .join(DEFAULT_SERVER_DATA_SUBDIR)
+}
+
 /// Generates a project slug from the repository root path.
 /// Format: `{repo_basename}-{hash8}` where hash8 is the first 8 chars of the SHA256 hash
 /// of the absolute repository path.

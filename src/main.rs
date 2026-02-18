@@ -22,6 +22,8 @@ mod permission;
 mod process_manager;
 mod progress;
 mod serial_run_service;
+#[cfg(feature = "web-monitoring")]
+mod server;
 mod spec_delta;
 #[cfg(test)]
 mod spec_test_annotations;
@@ -573,6 +575,42 @@ async fn main() -> Result<()> {
                 config_path.display(),
                 args.template
             );
+        }
+
+        // Server subcommand: start the multi-project server daemon
+        #[cfg(feature = "web-monitoring")]
+        Some(Commands::Server(args)) => {
+            // Initialize file logging (always enabled)
+            init_file_logging()?;
+
+            // Build ServerConfig from global config and CLI overrides.
+            // Server mode uses only global config (not project .cflx.jsonc).
+            let mut server_config = config::ServerConfig::default();
+
+            // Apply CLI overrides on top of config defaults.
+            server_config.apply_cli_overrides(
+                Some(&args.bind),
+                Some(args.port),
+                args.auth_token.as_deref(),
+                args.max_concurrent_total,
+                args.data_dir.as_deref(),
+            );
+
+            info!(
+                "Starting server daemon on {}:{} (data_dir: {:?})",
+                server_config.bind, server_config.port, server_config.data_dir
+            );
+
+            server::run_server(server_config).await?;
+        }
+
+        // Server subcommand (web-monitoring feature disabled)
+        #[cfg(not(feature = "web-monitoring"))]
+        Some(Commands::Server(_)) => {
+            eprintln!(
+                "Error: Server daemon requires the 'web-monitoring' feature. Compile with --features web-monitoring"
+            );
+            std::process::exit(1);
         }
 
         // CheckConflicts subcommand: detect conflicts between spec delta files
