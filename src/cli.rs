@@ -253,13 +253,13 @@ pub struct ServerArgs {
     #[arg(long, short = 'c')]
     pub config: Option<std::path::PathBuf>,
 
-    /// Bind address for the server (default: 127.0.0.1)
-    #[arg(long, default_value = "127.0.0.1")]
-    pub bind: String,
+    /// Bind address for the server (overrides global config; default from global config or 127.0.0.1)
+    #[arg(long)]
+    pub bind: Option<String>,
 
-    /// Port for the server (default: 9876)
-    #[arg(long, default_value = "9876")]
-    pub port: u16,
+    /// Port for the server (overrides global config; default from global config or 9876)
+    #[arg(long)]
+    pub port: Option<u16>,
 
     /// Bearer token for authentication (required for non-loopback bind addresses)
     #[arg(long)]

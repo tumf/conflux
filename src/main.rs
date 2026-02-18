@@ -589,9 +589,11 @@ async fn main() -> Result<()> {
             let mut server_config = config::OrchestratorConfig::load_server_config_from_global();
 
             // Apply CLI overrides on top of global config values.
+            // Only override fields that were explicitly specified on the CLI
+            // (None means "not specified", so global config value is preserved).
             server_config.apply_cli_overrides(
-                Some(&args.bind),
-                Some(args.port),
+                args.bind.as_deref(),
+                args.port,
                 args.auth_token.as_deref(),
                 args.max_concurrent_total,
                 args.data_dir.as_deref(),
