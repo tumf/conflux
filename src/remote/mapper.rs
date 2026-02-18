@@ -44,13 +44,17 @@ pub fn group_changes_by_project(projects: &[RemoteProject]) -> Vec<Change> {
 }
 
 /// Apply a [`RemoteChange`] update to an existing list of local [`Change`]s.
-#[allow(dead_code)]
 ///
 /// Implements the "non-regression" rule: `completed_tasks` is only updated if the
 /// new value is **greater than or equal to** the previous value. `total_tasks` is
 /// always updated so the denominator stays accurate.
 ///
 /// Returns `true` if any change was actually modified.
+///
+/// This function is part of the public remote API and is validated by unit tests.
+/// It is available for callers that receive [`RemoteChange`] values directly (e.g.,
+/// from a full-state snapshot followed by manual incremental patching).
+#[allow(dead_code)]
 pub fn apply_remote_update(
     changes: &mut [Change],
     updated: &RemoteChange,

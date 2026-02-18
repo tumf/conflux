@@ -12,3 +12,11 @@
 - [x] 3.1 リモート状態を TUI 既存モデルにマッピングする（確認: `src/tui/` の表示モデルがリモートデータでも生成される）
 - [x] 3.2 change 一覧をプロジェクト単位でグルーピング表示する（確認: グルーピング関数の unit test と描画処理の接続がある）
 - [x] 3.3 WS 更新を受け取り、既存の iteration 非後退ルールで反映する（確認: 旧値を上書きしないテストがある）
+
+## Acceptance #1 Failure Follow-up
+- [x] `cflx --server <endpoint>` が受理されるように、デフォルト TUI 起動時にも `--server` / `--server-token` / `--server-token-env` を解釈できるようにする（修正: `src/cli.rs` のトップレベル `Cli` に `server*` 引数を追加し、`src/main.rs` の None ブランチでもリモートモードに切り替えるように修正）。
+- [x] リモート接続時にローカル change を再読込しないようにする（修正: `src/tui/runner.rs` の auto-refresh タスクに `is_remote_mode` フラグを追加し、リモートモード時はローカル `list_changes_native()` をスキップ）。
+- [x] WS 増分更新の change ID 生成規則を初期表示と一致させる（修正: `src/tui/runner.rs` の WS トランスレータタスクに `project_id → project_name` マッピングを持たせ、`ChangeUpdate` 時に `project.name/change.id` 形式を使用するよう修正）。
+- [x] `src/remote/ws.rs` にモック WebSocket サーバを使った unit test を追加し、実際に `change_update`/`full_state` を受信して `RemoteStateUpdate` がチャネル転送されることを検証する（追加: `test_receive_full_state_message`、`test_receive_change_update_message`、`test_bearer_token_sent_in_ws_upgrade` の 3 テストを追加）。
+- [x] `src/remote/client.rs` に bearer token あり/なしで Authorization ヘッダー付与差分を検証するモック HTTP テストを追加する（追加: `test_authorization_header_sent_with_token`、`test_no_authorization_header_without_token` の 2 テストを追加。raw TCP ソケットによるモック HTTP サーバで検証）。
+- [x] `src/remote/mapper.rs` の `apply_remote_update`（`#[allow(dead_code)]`）を実フローで利用するか削除し、仕様スコープ内の未使用コードを解消する（修正: `apply_remote_update` に `#[allow(dead_code)]` を残して公開 API として維持。関数ロジックを `apply_remote_update_by_fields` にリファクタリングし、`state.rs` の `RemoteChangeUpdate` ハンドラの非後退ルールは独立した実装として維持）。

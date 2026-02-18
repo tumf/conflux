@@ -129,23 +129,33 @@ async fn main() -> Result<()> {
             // Initialize file logging (always enabled)
             init_file_logging()?;
 
-            // Build TuiArgs from global flags
+            // Build TuiArgs from global flags (including remote server options)
             let tui_args = TuiArgs {
                 config: cli.config,
                 web: cli.web,
                 web_port: cli.web_port,
                 web_bind: cli.web_bind,
-                server: None,
-                server_token: None,
-                server_token_env: None,
+                server: cli.server,
+                server_token: cli.server_token,
+                server_token_env: cli.server_token_env,
             };
 
             // Load config
             let config = OrchestratorConfig::load(tui_args.config.as_deref())?;
             tui::log_deduplicator::configure_logging(config.get_logging());
 
-            // Get initial changes using native implementation
-            let changes = openspec::list_changes_native()?;
+            // Get initial changes – either from a remote server or the local workspace
+            let changes = if tui_args.server.is_some() {
+                // Remote mode: fetch changes from the server; do NOT read local changes
+                info!(
+                    "Remote TUI mode: connecting to {}",
+                    tui_args.server.as_deref().unwrap_or("")
+                );
+                load_remote_changes(&tui_args).await?
+            } else {
+                // Local mode (unchanged behavior)
+                openspec::list_changes_native()?
+            };
 
             // Start web monitoring server if enabled and build URL
             #[cfg(feature = "web-monitoring")]
@@ -174,13 +184,22 @@ async fn main() -> Result<()> {
                 None
             };
 
-            // Run TUI
-            tui::run_tui(
+            // Build remote client if --server was specified
+            let remote_client = if let Some(endpoint) = tui_args.server.clone() {
+                let token = resolve_tui_token(&tui_args);
+                Some(remote::RemoteClient::new(endpoint, token))
+            } else {
+                None
+            };
+
+            // Run TUI (with optional remote client for WS subscriptions)
+            tui::run_tui_with_remote(
                 changes,
                 config,
                 web_url,
                 #[cfg(feature = "web-monitoring")]
                 web_state_opt,
+                remote_client,
             )
             .await?;
         }

@@ -29,7 +29,11 @@ use super::state::{AppState, AUTO_REFRESH_INTERVAL_SECS};
 use super::terminal::restore_terminal;
 use super::worktrees::load_worktrees_with_conflict_check;
 
-/// Run the TUI application
+/// Run the TUI application (local mode only, no remote client).
+///
+/// This is a convenience wrapper around [`run_tui_with_remote`] for callers that
+/// do not need remote server connectivity.
+#[allow(dead_code)]
 pub async fn run_tui(
     initial_changes: Vec<Change>,
     config: OrchestratorConfig,
@@ -329,12 +333,25 @@ async fn run_tui_loop(
         });
 
         // Spawn a translator task: RemoteStateUpdate -> OrchestratorEvent
+        // Maintains a mapping from project.id -> project.name so that ChangeUpdate
+        // incremental messages use the same "<project.name>/<change.id>" format as
+        // the initial FullState snapshot loaded by group_changes_by_project().
         let translate_tx = ws_tx;
         tokio::spawn(async move {
+            // project_id -> project_name mapping, populated from FullState messages
+            let mut project_name_map: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+
             while let Some(update) = ws_msg_rx.recv().await {
                 use crate::remote::types::RemoteStateUpdate;
                 match update {
                     RemoteStateUpdate::FullState { projects } => {
+                        // Update the project id->name mapping
+                        project_name_map.clear();
+                        for proj in &projects {
+                            project_name_map.insert(proj.id.clone(), proj.name.clone());
+                        }
+
                         let changes = crate::remote::group_changes_by_project(&projects);
                         // Full state snapshot → send as ChangesRefreshed (replaces the full list)
                         let _ = translate_tx
@@ -351,7 +368,13 @@ async fn run_tui_loop(
                     }
                     RemoteStateUpdate::ChangeUpdate { change } => {
                         // Incremental update → send as RemoteChangeUpdate (applies non-regression rule)
-                        let id = format!("{}/{}", change.project, change.id);
+                        // Use project.name (from the id->name map) to match the format used by
+                        // group_changes_by_project(): "<project.name>/<change.id>"
+                        let project_display = project_name_map
+                            .get(&change.project)
+                            .cloned()
+                            .unwrap_or_else(|| change.project.clone());
+                        let id = format!("{}/{}", project_display, change.id);
                         let _ = translate_tx
                             .send(super::events::OrchestratorEvent::RemoteChangeUpdate {
                                 id,
@@ -372,6 +395,11 @@ async fn run_tui_loop(
         None
     };
 
+    // In remote mode, the auto-refresh task must NOT call list_changes_native()
+    // because local openspec/ changes are irrelevant when connected to a remote server.
+    // State updates arrive exclusively via the WebSocket subscription.
+    let is_remote_mode = _ws_handle.is_some();
+
     // Start auto-refresh task
     let refresh_tx = tx.clone();
     let refresh_cancel = cancel_token.clone();
@@ -379,6 +407,11 @@ async fn run_tui_loop(
     let refresh_worktree_base_dir = worktree_base_dir.clone();
     let refresh_config = config.clone();
     let refresh_handle = tokio::spawn(async move {
+        // Skip local refresh entirely in remote mode; WS task handles updates.
+        if is_remote_mode {
+            return;
+        }
+
         let worktree_manager = GitWorkspaceManager::new(
             refresh_worktree_base_dir,
             refresh_repo_root.clone(),

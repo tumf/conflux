@@ -115,6 +115,7 @@ impl RemoteClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn test_ws_url_http() {
@@ -173,5 +174,83 @@ mod tests {
     fn test_client_without_token() {
         let client = RemoteClient::new("http://localhost:9876", None);
         assert_eq!(client.token(), None);
+    }
+
+    /// Spawn a minimal mock HTTP server that captures the raw request and returns 200 OK.
+    ///
+    /// Returns `(addr, received_request_rx)` where the receiver yields the raw HTTP
+    /// request bytes sent by the client.
+    async fn spawn_mock_http_server(
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request_text = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = tx.send(request_text);
+
+                // Send minimal HTTP 200 response with JSON body
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]";
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        (addr, rx)
+    }
+
+    /// Verify that the `Authorization: Bearer <token>` header is present in the HTTP
+    /// request when a token is configured.
+    #[tokio::test]
+    async fn test_authorization_header_sent_with_token() {
+        let (addr, req_rx) = spawn_mock_http_server().await;
+        let client = RemoteClient::new(
+            format!("http://{}", addr),
+            Some("my-secret-token".to_string()),
+        );
+
+        // list_projects() will fail (server returns "[]" which parses fine as empty vec)
+        // but the HTTP request with Authorization header should have been sent
+        let _ = client.list_projects().await;
+
+        let raw_request = tokio::time::timeout(tokio::time::Duration::from_secs(3), req_rx)
+            .await
+            .expect("Timed out waiting for request")
+            .expect("Server did not receive request");
+
+        // HTTP header names are case-insensitive; reqwest may send lowercase "authorization"
+        let raw_lower = raw_request.to_lowercase();
+        assert!(
+            raw_lower.contains("authorization: bearer my-secret-token"),
+            "Expected 'authorization: bearer my-secret-token' in request headers, got:\n{}",
+            raw_request
+        );
+    }
+
+    /// Verify that NO `Authorization` header is sent when no token is configured.
+    #[tokio::test]
+    async fn test_no_authorization_header_without_token() {
+        let (addr, req_rx) = spawn_mock_http_server().await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        let _ = client.list_projects().await;
+
+        let raw_request = tokio::time::timeout(tokio::time::Duration::from_secs(3), req_rx)
+            .await
+            .expect("Timed out waiting for request")
+            .expect("Server did not receive request");
+
+        let raw_lower = raw_request.to_lowercase();
+        assert!(
+            !raw_lower.contains("authorization:"),
+            "Did not expect 'Authorization' header when no token is set, got:\n{}",
+            raw_request
+        );
     }
 }

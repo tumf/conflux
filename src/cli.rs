@@ -39,6 +39,9 @@ KEY OPTIONS:
   --web                 Enable web monitoring server
   --web-port PORT       Web server port (default: 0 = auto-assign)
   --web-bind ADDR       Web server bind address (default: 127.0.0.1)
+  --server URL          Connect TUI to a remote Conflux server
+  --server-token TOKEN  Bearer token for remote server authentication
+  --server-token-env VAR  Environment variable holding the bearer token
 
 Use 'cflx <subcommand> --help' for more information on a specific command.")]
 #[command(subcommand_required(false))]
@@ -58,6 +61,19 @@ pub struct Cli {
     /// Bind address for web monitoring server (default: 127.0.0.1)
     #[arg(long, default_value = "127.0.0.1")]
     pub web_bind: String,
+
+    /// Remote server endpoint URL (e.g., http://host:9876). When set, TUI connects to
+    /// a remote Conflux server instead of the local workspace.
+    #[arg(long)]
+    pub server: Option<String>,
+
+    /// Bearer token for authenticating with the remote server
+    #[arg(long)]
+    pub server_token: Option<String>,
+
+    /// Name of the environment variable that holds the bearer token for the remote server
+    #[arg(long)]
+    pub server_token_env: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -683,6 +699,51 @@ mod tests {
             }
             _ => panic!("Expected CheckConflicts subcommand"),
         }
+    }
+
+    // Tests for top-level --server / --server-token / --server-token-env options
+    #[test]
+    fn test_top_level_server_option() {
+        // Regression: `cflx --server http://...` must not fail with "unexpected argument"
+        let cli = Cli::try_parse_from(["cflx", "--server", "http://127.0.0.1:9876"]).unwrap();
+        assert_eq!(cli.server, Some("http://127.0.0.1:9876".to_string()));
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn test_top_level_server_token_option() {
+        let cli = Cli::try_parse_from([
+            "cflx",
+            "--server",
+            "http://host:9876",
+            "--server-token",
+            "mytoken",
+        ])
+        .unwrap();
+        assert_eq!(cli.server, Some("http://host:9876".to_string()));
+        assert_eq!(cli.server_token, Some("mytoken".to_string()));
+    }
+
+    #[test]
+    fn test_top_level_server_token_env_option() {
+        let cli = Cli::try_parse_from([
+            "cflx",
+            "--server",
+            "http://host:9876",
+            "--server-token-env",
+            "MY_TOKEN_VAR",
+        ])
+        .unwrap();
+        assert_eq!(cli.server, Some("http://host:9876".to_string()));
+        assert_eq!(cli.server_token_env, Some("MY_TOKEN_VAR".to_string()));
+    }
+
+    #[test]
+    fn test_top_level_no_server_defaults_to_none() {
+        let cli = Cli::try_parse_from(["cflx"]).unwrap();
+        assert!(cli.server.is_none());
+        assert!(cli.server_token.is_none());
+        assert!(cli.server_token_env.is_none());
     }
 
     // Additional tests for web flag parsing behavior
