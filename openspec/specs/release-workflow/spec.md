@@ -43,6 +43,31 @@ The release script SHALL validate code quality before allowing a release.
 - Then the script SHALL exit with an error
 - And display a message about the failed check
 
+### Requirement: REQ-REL-009 Branch-based Pre-release Suffix
+
+When a version bump is performed from a non-main branch, the resulting version SHALL be a SemVer
+pre-release version that appends a branch-derived suffix (e.g. `1.0.0-develop`).
+
+**Priority**: Medium
+
+#### Scenario: Patch bump on a non-main branch
+- Given the current version is "0.1.0"
+- And the current git branch is "develop"
+- When the user runs `./scripts/release.sh patch`
+- Then the version in Cargo.toml SHALL be updated to "0.1.1-develop"
+
+#### Scenario: Patch bump on main branch
+- Given the current version is "0.1.0"
+- And the current git branch is "main"
+- When the user runs `./scripts/release.sh patch`
+- Then the version in Cargo.toml SHALL be updated to "0.1.1"
+
+#### Scenario: Branch names are sanitized for SemVer compatibility
+- Given the current version is "0.1.0"
+- And the current git branch is "feature/foo"
+- When the user runs `./scripts/release.sh patch`
+- Then the version in Cargo.toml SHALL be updated to "0.1.1-feature-foo"
+
 ### Requirement: REQ-REL-003 Changelog Generation
 
 The system SHALL automatically generate a changelog from git history.
