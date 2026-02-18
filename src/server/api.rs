@@ -263,10 +263,7 @@ pub async fn add_project(
 
         match clone_output {
             Ok(out) if out.status.success() => {
-                info!(
-                    "git clone (bare) succeeded: project_id={}",
-                    project_id
-                );
+                info!("git clone (bare) succeeded: project_id={}", project_id);
             }
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -1094,13 +1091,62 @@ mod tests {
         assert_eq!(json, serde_json::json!([]));
     }
 
+    /// Creates a local bare git repository with a `main` branch and one commit.
+    /// Returns the path to the bare repo (usable as a `file://` URL).
+    fn create_local_git_repo(parent: &std::path::Path) -> std::path::PathBuf {
+        let repo_path = parent.join("test-origin");
+        // Create a normal repo, add a commit, then convert to bare-compatible source.
+        let src = parent.join("test-src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        std::fs::write(src.join("README.md"), "hello").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        // Clone as bare so it can be used as a remote.
+        std::process::Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                src.to_str().unwrap(),
+                repo_path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        repo_path
+    }
+
     #[tokio::test]
     async fn test_add_project_returns_201() {
         let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
         let router = make_router(&temp_dir, None);
 
         let body = serde_json::json!({
-            "remote_url": "https://github.com/foo/bar",
+            "remote_url": remote_url,
             "branch": "main"
         });
 
@@ -1113,6 +1159,73 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_add_project_nonexistent_branch_returns_422() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let router = make_router(&temp_dir, None);
+
+        let body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "nonexistent-branch-xyz"
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // Should return 4xx (422 Unprocessable Entity) when branch not found
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Verify registry is not updated (rollback happened)
+        let state = make_state(&temp_dir, None);
+        let registry = state.registry.read().await;
+        assert!(
+            registry.list().is_empty(),
+            "Registry should be empty after failed add"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_project_invalid_remote_returns_422() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let body = serde_json::json!({
+            "remote_url": "file:///nonexistent/path/to/repo",
+            "branch": "main"
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // Should return 4xx when clone fails due to invalid remote
+        assert!(
+            resp.status().is_client_error() || resp.status().is_server_error(),
+            "Expected error status, got: {}",
+            resp.status()
+        );
+
+        // Verify registry is not updated (rollback happened)
+        let state = make_state(&temp_dir, None);
+        let registry = state.registry.read().await;
+        assert!(
+            registry.list().is_empty(),
+            "Registry should be empty after failed add"
+        );
     }
 
     #[tokio::test]
