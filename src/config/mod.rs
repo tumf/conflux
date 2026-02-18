@@ -151,6 +151,11 @@ impl Default for MergeStallDetectionConfig {
 /// Orchestrator configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OrchestratorConfig {
+    /// Server daemon configuration (used only by `cflx server` subcommand).
+    /// When present in global config, its values are applied before CLI overrides.
+    #[serde(default)]
+    pub server: Option<ServerConfig>,
+
     /// Command template for applying changes.
     /// Supports `{change_id}` placeholder.
     #[serde(default)]
@@ -339,6 +344,11 @@ pub struct ServerAuthConfig {
     /// Bearer token for authentication (required when mode = bearer_token)
     #[serde(default)]
     pub token: Option<String>,
+    /// Environment variable name to read the bearer token from.
+    /// If set, the token is resolved from the environment variable at startup.
+    /// Takes precedence over `token` when both are set.
+    #[serde(default)]
+    pub token_env: Option<String>,
 }
 
 impl Default for ServerAuthConfig {
@@ -346,7 +356,24 @@ impl Default for ServerAuthConfig {
         Self {
             mode: ServerAuthMode::None,
             token: None,
+            token_env: None,
         }
+    }
+}
+
+impl ServerAuthConfig {
+    /// Resolve the effective bearer token.
+    /// If `token_env` is set, read the token from the named environment variable.
+    /// If `token_env` is not set (or the variable is unset/empty), fall back to `token`.
+    pub fn resolve_token(&self) -> Option<String> {
+        if let Some(env_var) = &self.token_env {
+            if let Ok(val) = std::env::var(env_var) {
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+        self.token.clone()
     }
 }
 
@@ -423,9 +450,16 @@ impl ServerConfig {
         if !self.is_loopback_bind() {
             match self.auth.mode {
                 ServerAuthMode::BearerToken => {
-                    if self.auth.token.as_deref().unwrap_or("").is_empty() {
+                    // Accept token from token_env (env var resolution) or token field
+                    if self
+                        .auth
+                        .resolve_token()
+                        .as_deref()
+                        .unwrap_or("")
+                        .is_empty()
+                    {
                         return Err(crate::error::OrchestratorError::ConfigLoad(
-                            "Server: non-loopback bind requires auth.token to be set when auth.mode=bearer_token".to_string(),
+                            "Server: non-loopback bind requires auth.token or auth.token_env to be set when auth.mode=bearer_token".to_string(),
                         ));
                     }
                 }
@@ -492,6 +526,11 @@ impl OrchestratorConfig {
     /// Merge another config into this one, with the other config taking priority
     /// for fields that are `Some`.
     pub fn merge(&mut self, other: Self) {
+        // Server config
+        if other.server.is_some() {
+            self.server = other.server;
+        }
+
         // Command fields
         if other.apply_command.is_some() {
             self.apply_command = other.apply_command;
@@ -833,6 +872,48 @@ impl OrchestratorConfig {
     /// Parse JSONC content (JSON with Comments)
     pub fn parse_jsonc(content: &str) -> Result<Self> {
         jsonc::parse(content)
+    }
+
+    /// Load only the server configuration from global config files (no project config).
+    /// Used by `cflx server` to load the `server` section from global config.
+    ///
+    /// Priority (lowest to highest):
+    /// 1. Platform default config
+    /// 2. XDG default config (~/.config/cflx/config.jsonc)
+    /// 3. XDG env config ($XDG_CONFIG_HOME/cflx/config.jsonc)
+    ///
+    /// Project config (`.cflx.jsonc`) is intentionally excluded — server mode is directory-independent.
+    pub fn load_server_config_from_global() -> ServerConfig {
+        let mut merged = OrchestratorConfig::default();
+
+        // 1. Platform default config
+        if let Some(platform_path) = get_platform_config_path() {
+            if platform_path.exists() {
+                if let Ok(c) = Self::load_from_file(&platform_path) {
+                    merged.merge(c);
+                }
+            }
+        }
+
+        // 2. XDG default config (~/.config)
+        if let Some(xdg_default_path) = get_xdg_default_config_path() {
+            if xdg_default_path.exists() {
+                if let Ok(c) = Self::load_from_file(&xdg_default_path) {
+                    merged.merge(c);
+                }
+            }
+        }
+
+        // 3. XDG env config ($XDG_CONFIG_HOME)
+        if let Some(xdg_env_path) = get_xdg_env_config_path() {
+            if xdg_env_path.exists() {
+                if let Ok(c) = Self::load_from_file(&xdg_env_path) {
+                    merged.merge(c);
+                }
+            }
+        }
+
+        merged.server.unwrap_or_default()
     }
 
     /// Load configuration with merge-based priority:
@@ -2477,6 +2558,7 @@ mod tests {
             auth: ServerAuthConfig {
                 mode: ServerAuthMode::None,
                 token: None,
+                token_env: None,
             },
             ..ServerConfig::default()
         };
@@ -2494,6 +2576,7 @@ mod tests {
             auth: ServerAuthConfig {
                 mode: ServerAuthMode::BearerToken,
                 token: Some("secret".to_string()),
+                token_env: None,
             },
             ..ServerConfig::default()
         };
@@ -2511,6 +2594,7 @@ mod tests {
             auth: ServerAuthConfig {
                 mode: ServerAuthMode::None,
                 token: None,
+                token_env: None,
             },
             ..ServerConfig::default()
         };
@@ -2534,6 +2618,7 @@ mod tests {
             auth: ServerAuthConfig {
                 mode: ServerAuthMode::BearerToken,
                 token: Some("my-secret-token".to_string()),
+                token_env: None,
             },
             ..ServerConfig::default()
         };
@@ -2551,6 +2636,7 @@ mod tests {
             auth: ServerAuthConfig {
                 mode: ServerAuthMode::BearerToken,
                 token: Some("".to_string()),
+                token_env: None,
             },
             ..ServerConfig::default()
         };

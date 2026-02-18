@@ -206,9 +206,13 @@ impl ProjectRegistry {
     }
 
     /// Get the global semaphore (for max_concurrent_total).
-    #[allow(dead_code)]
     pub fn global_semaphore(&self) -> Arc<tokio::sync::Semaphore> {
         self.global_semaphore.clone()
+    }
+
+    /// Get the data directory path (used by API handlers to locate bare clones).
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
     }
 }
 

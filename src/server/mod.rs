@@ -30,8 +30,9 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
     let registry = registry::create_shared_registry(&config.data_dir, config.max_concurrent_total)?;
 
     // Build app state.
+    // Resolve the effective auth token: token_env takes precedence over token.
     let auth_token = match &config.auth.mode {
-        crate::config::ServerAuthMode::BearerToken => config.auth.token.clone(),
+        crate::config::ServerAuthMode::BearerToken => config.auth.resolve_token(),
         crate::config::ServerAuthMode::None => None,
     };
 

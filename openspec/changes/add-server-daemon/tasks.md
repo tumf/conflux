@@ -20,3 +20,9 @@
 
 ## 5. ポリシー確認
 - [x] 5.1 サーバが `~/.wt/setup` を参照しないことを明記したガードを追加する（確認: `src/server/` に `~/.wt/setup` 参照がないことをコードレビューで確認できる）
+
+## Acceptance #1 Failure Follow-up
+- [x] `cflx server` がグローバル設定の `server` セクションを読み込むように実装する（実装: `OrchestratorConfig` に `server` フィールドを追加し、`load_server_config_from_global()` でグローバル設定のみを読み込んで `ServerConfig` を返す。`main.rs` の server 分岐で `default()` の代わりにこの関数を呼び出す）。
+- [x] `server.auth.token_env` を設定スキーマに追加し、環境変数から bearer token を解決する実装とテストを追加する（実装: `ServerAuthConfig` に `token_env: Option<String>` フィールドと `resolve_token()` メソッドを追加。`token_env` が設定されている場合は環境変数から取得し、`token` にフォールバック。3つのユニットテストで検証）。
+- [x] `server.max_concurrent_total` を API 実行フローで実際に適用する（実装: `registry.rs` に `global_semaphore()` と `data_dir()` パブリックメソッドを追加。`api.rs` の `git_pull`/`git_push`/`apply_control` でグローバルセマフォを acquire/release するよう更新。並行テスト `test_max_concurrent_total_semaphore_respected` で `max_concurrent_total=2` の上限を検証）。
+- [x] `POST /api/v1/projects/{id}/git/pull` と `/git/push` で non-fast-forward を実際に判定し、失敗時に `non_fast_forward` 理由を含む明示エラーを返す実装と bare repo ベースのテストを追加する（実装: `git_pull` でローカル bare clone の初期化/fetch を実装。`git_push` で `git merge-base --is-ancestor` による non-fast-forward チェックを追加し、リモートが先行している場合は `error: "non_fast_forward"` レスポンスを返す。`test_git_push_no_local_clone_returns_error` と `test_git_push_non_fast_forward_detection_with_bare_repos` テストで検証）。

@@ -585,9 +585,10 @@ async fn main() -> Result<()> {
 
             // Build ServerConfig from global config and CLI overrides.
             // Server mode uses only global config (not project .cflx.jsonc).
-            let mut server_config = config::ServerConfig::default();
+            // Global config is loaded first, then CLI args override individual fields.
+            let mut server_config = config::OrchestratorConfig::load_server_config_from_global();
 
-            // Apply CLI overrides on top of config defaults.
+            // Apply CLI overrides on top of global config values.
             server_config.apply_cli_overrides(
                 Some(&args.bind),
                 Some(args.port),
