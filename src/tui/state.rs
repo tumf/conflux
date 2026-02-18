@@ -1327,6 +1327,7 @@ impl AppState {
                 id,
                 completed_tasks,
                 total_tasks,
+                iteration_number,
             } => {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
                     // Non-regression rule: never decrease completed_tasks
@@ -1335,6 +1336,8 @@ impl AppState {
                     }
                     // Always update total so the denominator stays accurate
                     change.total_tasks = total_tasks;
+                    // Apply monotonic non-regression rule for iteration_number
+                    change.update_iteration_monotonic(iteration_number);
                 }
             }
 
@@ -3427,6 +3430,7 @@ mod tests {
             id: "MyProj/feat".to_string(),
             completed_tasks: 3,
             total_tasks: 5,
+            iteration_number: None,
         });
 
         assert_eq!(app.changes[0].completed_tasks, 3);
@@ -3443,6 +3447,7 @@ mod tests {
             id: "MyProj/feat".to_string(),
             completed_tasks: 2, // lower than current 4
             total_tasks: 5,
+            iteration_number: None,
         });
 
         // completed_tasks must not decrease
@@ -3462,9 +3467,105 @@ mod tests {
             id: "MyProj/feat".to_string(), // does not exist
             completed_tasks: 3,
             total_tasks: 5,
+            iteration_number: None,
         });
 
         // State should be unchanged
         assert_eq!(app.changes[0].completed_tasks, 1);
+    }
+
+    #[test]
+    fn test_remote_change_update_iteration_non_regression_rule() {
+        // iteration_number should NOT decrease (monotonic non-regression rule)
+        let changes = vec![create_test_change("MyProj/feat", 1, 5)];
+        let mut app = AppState::new(changes);
+
+        // First update: set iteration to 3
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 2,
+            total_tasks: 5,
+            iteration_number: Some(3),
+        });
+        assert_eq!(
+            app.changes[0].iteration_number,
+            Some(3),
+            "iteration_number should be 3 after first update"
+        );
+
+        // Second update: attempt to decrease iteration to 2 (should be rejected)
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 3,
+            total_tasks: 5,
+            iteration_number: Some(2), // lower than current 3
+        });
+
+        // iteration_number must not decrease
+        assert_eq!(
+            app.changes[0].iteration_number,
+            Some(3),
+            "iteration_number must not decrease (non-regression rule): iteration=3 display should not regress to iteration=2"
+        );
+    }
+
+    #[test]
+    fn test_remote_change_update_iteration_increases() {
+        // iteration_number should increase when a higher value arrives
+        let changes = vec![create_test_change("MyProj/feat", 1, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set iteration to 2
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 2,
+            total_tasks: 5,
+            iteration_number: Some(2),
+        });
+        assert_eq!(app.changes[0].iteration_number, Some(2));
+
+        // Update with higher iteration 4 (should be accepted)
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 3,
+            total_tasks: 5,
+            iteration_number: Some(4),
+        });
+
+        assert_eq!(
+            app.changes[0].iteration_number,
+            Some(4),
+            "iteration_number should increase when a higher value arrives"
+        );
+    }
+
+    #[test]
+    fn test_remote_change_update_iteration_none_no_op() {
+        // iteration_number = None should not change existing iteration_number
+        let changes = vec![create_test_change("MyProj/feat", 1, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set iteration to 3
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 2,
+            total_tasks: 5,
+            iteration_number: Some(3),
+        });
+
+        // Update with None iteration (should be a no-op for iteration_number)
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 3,
+            total_tasks: 5,
+            iteration_number: None,
+        });
+
+        // iteration_number should remain 3
+        assert_eq!(
+            app.changes[0].iteration_number,
+            Some(3),
+            "iteration_number should not change when None is received"
+        );
     }
 }

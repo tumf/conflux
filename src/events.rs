@@ -425,6 +425,8 @@ pub enum ExecutionEvent {
         completed_tasks: u32,
         /// Updated total number of tasks
         total_tasks: u32,
+        /// Iteration number (applies monotonic non-regression rule)
+        iteration_number: Option<u32>,
     },
 }
 

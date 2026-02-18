@@ -380,6 +380,7 @@ async fn run_tui_loop(
                                 id,
                                 completed_tasks: change.completed_tasks,
                                 total_tasks: change.total_tasks,
+                                iteration_number: change.iteration_number,
                             })
                             .await;
                     }
