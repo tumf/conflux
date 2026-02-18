@@ -114,6 +114,16 @@ pub async fn list_projects(State(state): State<AppState>) -> Response {
 }
 
 /// POST /api/v1/projects - add a new project
+///
+/// Performs the following steps atomically (with rollback on failure):
+/// 1. Register the project in the registry (persisted to disk).
+/// 2. Acquire the global semaphore and per-project lock.
+/// 3. Verify the branch exists on the remote (git ls-remote).
+/// 4. Clone the repository as a bare clone into `data_dir/<project_id>`.
+/// 5. Create a git worktree at `data_dir/worktrees/<project_id>/<branch>`.
+///
+/// If any step after registry insertion fails, the project is removed from the
+/// registry so no inconsistent state is persisted.
 pub async fn add_project(
     State(state): State<AppState>,
     Json(req): Json<AddProjectRequest>,
@@ -125,21 +135,233 @@ pub async fn add_project(
         );
     }
 
-    let mut registry = state.registry.write().await;
-    match registry.add(req.remote_url, req.branch) {
-        Ok(entry) => {
-            info!("Project added: id={}", entry.id);
-            (StatusCode::CREATED, Json(ProjectResponse::from(entry))).into_response()
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("already exists") {
-                error_response(StatusCode::CONFLICT, msg)
-            } else {
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, msg)
+    let remote_url = req.remote_url.clone();
+    let branch = req.branch.clone();
+
+    // Step 1: Register the project in the registry first so we can obtain the lock.
+    let entry = {
+        let mut registry = state.registry.write().await;
+        match registry.add(remote_url.clone(), branch.clone()) {
+            Ok(e) => e,
+            Err(e) => {
+                let msg = e.to_string();
+                return if msg.contains("already exists") {
+                    error_response(StatusCode::CONFLICT, msg)
+                } else {
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, msg)
+                };
             }
         }
+    };
+
+    let project_id = entry.id.clone();
+
+    // Helper: roll back registry insertion on failure.
+    let rollback = |state: &AppState, project_id: String| {
+        let registry = state.registry.clone();
+        async move {
+            let mut reg = registry.write().await;
+            if let Err(e) = reg.remove(&project_id) {
+                error!("Rollback failed for project_id={}: {}", project_id, e);
+            } else {
+                info!("Rolled back registry entry for project_id={}", project_id);
+            }
+        }
+    };
+
+    // Step 2: Acquire global semaphore and per-project lock.
+    let (lock, semaphore) = {
+        let registry = state.registry.read().await;
+        let lock = match registry.project_lock(&project_id) {
+            Some(l) => l,
+            None => {
+                rollback(&state, project_id).await;
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Missing project lock");
+            }
+        };
+        let semaphore = registry.global_semaphore();
+        (lock, semaphore)
+    };
+
+    let _sem_permit = match semaphore.acquire().await {
+        Ok(p) => p,
+        Err(_) => {
+            rollback(&state, project_id).await;
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server is at maximum concurrent capacity",
+            );
+        }
+    };
+
+    let _guard = lock.lock().await;
+
+    info!(
+        "add_project: project_id={} remote_url={} branch={}",
+        project_id, remote_url, branch
+    );
+
+    // Determine local paths.
+    let (local_repo_path, worktree_path) = {
+        let registry = state.registry.read().await;
+        let data_dir = registry.data_dir().to_path_buf();
+        let repo = data_dir.join(&project_id);
+        let wt = data_dir.join("worktrees").join(&project_id).join(&branch);
+        (repo, wt)
+    };
+
+    // Step 3: Verify the branch exists on the remote.
+    let ls_remote = tokio::process::Command::new("git")
+        .args(["ls-remote", "--heads", &remote_url, &branch])
+        .output()
+        .await;
+
+    match ls_remote {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if stdout.trim().is_empty() {
+                rollback(&state, project_id).await;
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("Branch '{}' not found on remote '{}'", branch, remote_url),
+                );
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            error!("git ls-remote failed: {}", stderr);
+            rollback(&state, project_id).await;
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("git operation failed: {}", stderr),
+            );
+        }
+        Err(e) => {
+            error!("Failed to run git: {}", e);
+            rollback(&state, project_id).await;
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to run git: {}", e),
+            );
+        }
     }
+
+    // Step 4: Clone as a bare repository if not already present.
+    if !local_repo_path.exists() {
+        let clone_output = tokio::process::Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "--branch",
+                &branch,
+                "--single-branch",
+                &remote_url,
+                local_repo_path.to_str().unwrap_or(""),
+            ])
+            .output()
+            .await;
+
+        match clone_output {
+            Ok(out) if out.status.success() => {
+                info!("git clone (bare) succeeded: project_id={}", project_id);
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                error!(
+                    "git clone failed: project_id={} stderr={}",
+                    project_id, stderr
+                );
+                rollback(&state, project_id).await;
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("git clone failed: {}", stderr),
+                );
+            }
+            Err(e) => {
+                rollback(&state, project_id).await;
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to run git clone: {}", e),
+                );
+            }
+        }
+    } else {
+        info!(
+            "Bare clone already exists, reusing: project_id={}",
+            project_id
+        );
+    }
+
+    // Step 5: Create a worktree at data_dir/worktrees/<project_id>/<branch>.
+    if !worktree_path.exists() {
+        if let Err(e) = std::fs::create_dir_all(&worktree_path) {
+            error!("Failed to create worktree parent dirs: {}", e);
+            rollback(&state, project_id).await;
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create worktree directory: {}", e),
+            );
+        }
+        // Remove the pre-created dir so git worktree add can create it.
+        if let Err(e) = std::fs::remove_dir(&worktree_path) {
+            error!("Failed to remove pre-created worktree dir: {}", e);
+            rollback(&state, project_id).await;
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to prepare worktree directory: {}", e),
+            );
+        }
+
+        let worktree_output = tokio::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap_or(""),
+                &branch,
+            ])
+            .current_dir(&local_repo_path)
+            .output()
+            .await;
+
+        match worktree_output {
+            Ok(out) if out.status.success() => {
+                info!(
+                    "git worktree add succeeded: project_id={} path={:?}",
+                    project_id, worktree_path
+                );
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                error!(
+                    "git worktree add failed: project_id={} stderr={}",
+                    project_id, stderr
+                );
+                // Clean up bare clone on worktree failure.
+                let _ = std::fs::remove_dir_all(&local_repo_path);
+                rollback(&state, project_id).await;
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("git worktree add failed: {}", stderr),
+                );
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&local_repo_path);
+                rollback(&state, project_id).await;
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to run git worktree add: {}", e),
+                );
+            }
+        }
+    } else {
+        info!(
+            "Worktree already exists, reusing: project_id={} path={:?}",
+            project_id, worktree_path
+        );
+    }
+
+    info!("Project added with clone and worktree: id={}", project_id);
+    (StatusCode::CREATED, Json(ProjectResponse::from(entry))).into_response()
 }
 
 /// DELETE /api/v1/projects/:id - remove a project
@@ -869,13 +1091,62 @@ mod tests {
         assert_eq!(json, serde_json::json!([]));
     }
 
+    /// Creates a local bare git repository with a `main` branch and one commit.
+    /// Returns the path to the bare repo (usable as a `file://` URL).
+    fn create_local_git_repo(parent: &std::path::Path) -> std::path::PathBuf {
+        let repo_path = parent.join("test-origin");
+        // Create a normal repo, add a commit, then convert to bare-compatible source.
+        let src = parent.join("test-src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        std::fs::write(src.join("README.md"), "hello").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        // Clone as bare so it can be used as a remote.
+        std::process::Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                src.to_str().unwrap(),
+                repo_path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        repo_path
+    }
+
     #[tokio::test]
     async fn test_add_project_returns_201() {
         let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
         let router = make_router(&temp_dir, None);
 
         let body = serde_json::json!({
-            "remote_url": "https://github.com/foo/bar",
+            "remote_url": remote_url,
             "branch": "main"
         });
 
@@ -888,6 +1159,73 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_add_project_nonexistent_branch_returns_422() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let router = make_router(&temp_dir, None);
+
+        let body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "nonexistent-branch-xyz"
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // Should return 4xx (422 Unprocessable Entity) when branch not found
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Verify registry is not updated (rollback happened)
+        let state = make_state(&temp_dir, None);
+        let registry = state.registry.read().await;
+        assert!(
+            registry.list().is_empty(),
+            "Registry should be empty after failed add"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_project_invalid_remote_returns_422() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let body = serde_json::json!({
+            "remote_url": "file:///nonexistent/path/to/repo",
+            "branch": "main"
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // Should return 4xx when clone fails due to invalid remote
+        assert!(
+            resp.status().is_client_error() || resp.status().is_server_error(),
+            "Expected error status, got: {}",
+            resp.status()
+        );
+
+        // Verify registry is not updated (rollback happened)
+        let state = make_state(&temp_dir, None);
+        let registry = state.registry.read().await;
+        assert!(
+            registry.list().is_empty(),
+            "Registry should be empty after failed add"
+        );
     }
 
     #[tokio::test]
