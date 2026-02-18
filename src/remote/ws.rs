@@ -145,7 +145,7 @@ mod tests {
                 if let Ok(mut ws) = accept_async(stream).await {
                     use futures_util::SinkExt;
                     for msg in messages {
-                        let _ = ws.send(Message::Text(msg.into())).await;
+                        let _ = ws.send(Message::Text(msg)).await;
                     }
                     let _ = ws.close(None).await;
                 }
