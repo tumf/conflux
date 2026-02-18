@@ -67,10 +67,14 @@ info "Starting release process (type: $RELEASE_TYPE)"
 # Validate environment
 info "Validating environment..."
 
-# Check if on main branch
 CURRENT_BRANCH=$(git branch --show-current)
-if [[ "$CURRENT_BRANCH" != "main" && "$CURRENT_BRANCH" != "master" ]]; then
-	error "Must be on main or master branch (current: $CURRENT_BRANCH)"
+if [[ -z "$CURRENT_BRANCH" ]]; then
+	error "Detached HEAD is not supported for releases"
+fi
+
+IS_MAIN_BRANCH=false
+if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
+	IS_MAIN_BRANCH=true
 fi
 
 # Check for clean working tree
@@ -97,19 +101,41 @@ fi
 info "Current version: $CURRENT_VERSION"
 
 # Calculate new version
-IFS='.' read -r MAJOR MINOR PATCH <<<"$CURRENT_VERSION"
+# Support versions with pre-release suffix, e.g. 1.2.3-develop
+if [[ ! "$CURRENT_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+	error "Invalid version in Cargo.toml: $CURRENT_VERSION"
+fi
+
+MAJOR="${BASH_REMATCH[1]}"
+MINOR="${BASH_REMATCH[2]}"
+PATCH="${BASH_REMATCH[3]}"
 
 case $RELEASE_TYPE in
 patch)
-	NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+	NEW_VERSION_CORE="$MAJOR.$MINOR.$((PATCH + 1))"
 	;;
 minor)
-	NEW_VERSION="$MAJOR.$((MINOR + 1)).0"
+	NEW_VERSION_CORE="$MAJOR.$((MINOR + 1)).0"
 	;;
 major)
-	NEW_VERSION="$((MAJOR + 1)).0.0"
+	NEW_VERSION_CORE="$((MAJOR + 1)).0.0"
 	;;
 esac
+
+if $IS_MAIN_BRANCH; then
+	NEW_VERSION="$NEW_VERSION_CORE"
+else
+	# Convert branch names to a SemVer pre-release identifier
+	# Allowed chars are [0-9A-Za-z-] and dot-separated identifiers.
+	BRANCH_SUFFIX=$(echo "$CURRENT_BRANCH" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^0-9a-z-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')
+	if [[ -z "$BRANCH_SUFFIX" ]]; then
+		error "Could not derive a SemVer-safe suffix from branch: $CURRENT_BRANCH"
+	fi
+	if [[ "$BRANCH_SUFFIX" =~ ^[0-9]+$ ]]; then
+		BRANCH_SUFFIX="b${BRANCH_SUFFIX}"
+	fi
+	NEW_VERSION="${NEW_VERSION_CORE}-${BRANCH_SUFFIX}"
+fi
 
 info "New version: $NEW_VERSION"
 
@@ -141,7 +167,7 @@ success "Pre-release checks passed"
 
 # Update version in Cargo.toml
 info "Updating version in Cargo.toml..."
-sed -i.bak "s/^version = \"$CURRENT_VERSION\"/version = \"$NEW_VERSION\"/" "$CARGO_TOML"
+sed -i.bak -E "s/^version = \".*\"/version = \"$NEW_VERSION\"/" "$CARGO_TOML"
 rm -f "${CARGO_TOML}.bak"
 
 # Update Cargo.lock
