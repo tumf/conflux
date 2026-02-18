@@ -38,6 +38,7 @@ mod parallel_run_service;
 mod permission;
 mod process_manager;
 mod progress;
+mod remote;
 mod serial_run_service;
 mod spec_delta;
 mod stall;
