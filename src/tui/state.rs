@@ -1322,6 +1322,22 @@ impl AppState {
             OrchestratorEvent::Warning { title, message } => self.handle_warning(title, message),
             OrchestratorEvent::Error { message } => self.handle_error(message),
 
+            // Remote server incremental update (applies non-regression rule)
+            OrchestratorEvent::RemoteChangeUpdate {
+                id,
+                completed_tasks,
+                total_tasks,
+            } => {
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
+                    // Non-regression rule: never decrease completed_tasks
+                    if completed_tasks >= change.completed_tasks {
+                        change.completed_tasks = completed_tasks;
+                    }
+                    // Always update total so the denominator stays accurate
+                    change.total_tasks = total_tasks;
+                }
+            }
+
             // Ignore other parallel-specific events that don't affect TUI state
             _ => {
                 // Other events (workspace, merge, group events) are for status tracking

@@ -23,4 +23,4 @@ mod utils;
 mod worktrees;
 
 // Public API re-exports
-pub use runner::run_tui;
+pub use runner::{run_tui, run_tui_with_remote};

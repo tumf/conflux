@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::command_handlers::{handle_tui_command, TuiCommandContext};
 use super::events::{LogEntry, OrchestratorEvent, TuiCommand};
@@ -35,6 +35,28 @@ pub async fn run_tui(
     config: OrchestratorConfig,
     web_url: Option<String>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
+) -> Result<()> {
+    run_tui_with_remote(
+        initial_changes,
+        config,
+        web_url,
+        #[cfg(feature = "web-monitoring")]
+        web_state,
+        None,
+    )
+    .await
+}
+
+/// Run the TUI application with an optional remote client.
+///
+/// When `remote_client` is `Some`, a background task subscribes to the WebSocket
+/// endpoint of the remote server and forwards state updates into the TUI event channel.
+pub async fn run_tui_with_remote(
+    initial_changes: Vec<Change>,
+    config: OrchestratorConfig,
+    web_url: Option<String>,
+    #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
+    remote_client: Option<crate::remote::RemoteClient>,
 ) -> Result<()> {
     // Set up panic hook to restore terminal on panic
     let original_hook = std::panic::take_hook();
@@ -56,6 +78,7 @@ pub async fn run_tui(
         web_url,
         #[cfg(feature = "web-monitoring")]
         web_state,
+        remote_client,
     )
     .await;
 
@@ -72,6 +95,7 @@ async fn run_tui_loop(
     config: OrchestratorConfig,
     web_url: Option<String>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
+    remote_client: Option<crate::remote::RemoteClient>,
 ) -> Result<()> {
     use crate::openspec;
 
@@ -249,6 +273,104 @@ async fn run_tui_loop(
             }
         });
     }
+
+    // Start remote WebSocket subscription task (remote mode only)
+    let _ws_handle: Option<tokio::task::JoinHandle<()>> = if let Some(client) = remote_client {
+        let ws_url = client.ws_url();
+        let ws_token = client.token().map(str::to_owned);
+        let ws_tx = tx.clone();
+        let ws_cancel = cancel_token.clone();
+
+        info!("Starting remote WebSocket subscriber: {}", ws_url);
+
+        // Channel for WS messages
+        let (ws_msg_tx, mut ws_msg_rx) =
+            tokio::sync::mpsc::channel::<crate::remote::RemoteStateUpdate>(64);
+
+        // Spawn the WS connection task
+        let ws_task = tokio::spawn(async move {
+            loop {
+                // Try to connect; on failure, wait and retry
+                match crate::remote::ws::connect_and_subscribe(
+                    ws_url.clone(),
+                    ws_token.as_deref(),
+                    ws_msg_tx.clone(),
+                )
+                .await
+                {
+                    Ok(recv_handle) => {
+                        // Keep an abort handle so we can cancel while also awaiting
+                        let abort_handle = recv_handle.abort_handle();
+                        // Wait until the connection task finishes or cancel is requested
+                        tokio::select! {
+                            _ = ws_cancel.cancelled() => {
+                                abort_handle.abort();
+                                break;
+                            }
+                            result = recv_handle => {
+                                let _ = result; // ignore JoinError
+                                warn!("WS connection dropped, will reconnect in 5s");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("WS connect failed: {}, retrying in 5s", e);
+                    }
+                }
+
+                // Wait before reconnecting (check cancel every second)
+                for _ in 0..5u32 {
+                    if ws_cancel.is_cancelled() {
+                        return;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }
+        });
+
+        // Spawn a translator task: RemoteStateUpdate -> OrchestratorEvent
+        let translate_tx = ws_tx;
+        tokio::spawn(async move {
+            while let Some(update) = ws_msg_rx.recv().await {
+                use crate::remote::types::RemoteStateUpdate;
+                match update {
+                    RemoteStateUpdate::FullState { projects } => {
+                        let changes = crate::remote::group_changes_by_project(&projects);
+                        // Full state snapshot → send as ChangesRefreshed (replaces the full list)
+                        let _ = translate_tx
+                            .send(super::events::OrchestratorEvent::ChangesRefreshed {
+                                changes,
+                                committed_change_ids: std::collections::HashSet::new(),
+                                uncommitted_file_change_ids: std::collections::HashSet::new(),
+                                worktree_change_ids: std::collections::HashSet::new(),
+                                worktree_paths: std::collections::HashMap::new(),
+                                worktree_not_ahead_ids: std::collections::HashSet::new(),
+                                merge_wait_ids: std::collections::HashSet::new(),
+                            })
+                            .await;
+                    }
+                    RemoteStateUpdate::ChangeUpdate { change } => {
+                        // Incremental update → send as RemoteChangeUpdate (applies non-regression rule)
+                        let id = format!("{}/{}", change.project, change.id);
+                        let _ = translate_tx
+                            .send(super::events::OrchestratorEvent::RemoteChangeUpdate {
+                                id,
+                                completed_tasks: change.completed_tasks,
+                                total_tasks: change.total_tasks,
+                            })
+                            .await;
+                    }
+                    RemoteStateUpdate::ChangeRemoved { .. } | RemoteStateUpdate::Ping => {
+                        // Ping is a no-op; ChangeRemoved would require a separate event type (future work)
+                    }
+                }
+            }
+        });
+
+        Some(ws_task)
+    } else {
+        None
+    };
 
     // Start auto-refresh task
     let refresh_tx = tx.clone();

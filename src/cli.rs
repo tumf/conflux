@@ -179,9 +179,16 @@ KEY BINDINGS:
 WEB MONITORING:
   --web enables simultaneous web-based monitoring alongside the TUI.
 
+REMOTE SERVER:
+  --server connects the TUI to a remote Conflux server instead of the local workspace.
+  --server-token provides the bearer token for authentication.
+  --server-token-env reads the token from the named environment variable.
+
 EXAMPLES:
-  cflx tui                    # Launch TUI (default when no subcommand)
-  cflx tui --web              # TUI with web monitoring enabled")]
+  cflx tui                                        # Launch TUI (default when no subcommand)
+  cflx tui --web                                  # TUI with web monitoring enabled
+  cflx tui --server http://host:9876              # Connect to remote server
+  cflx tui --server http://host:9876 --server-token mytoken  # With bearer auth")]
 pub struct TuiArgs {
     /// Path to custom configuration file (JSONC format)
     #[arg(long, short = 'c')]
@@ -198,6 +205,19 @@ pub struct TuiArgs {
     /// Bind address for web monitoring server (default: 127.0.0.1)
     #[arg(long, default_value = "127.0.0.1")]
     pub web_bind: String,
+
+    /// Remote server endpoint URL (e.g., http://host:9876). When set, TUI connects to
+    /// a remote Conflux server instead of the local workspace.
+    #[arg(long)]
+    pub server: Option<String>,
+
+    /// Bearer token for authenticating with the remote server
+    #[arg(long)]
+    pub server_token: Option<String>,
+
+    /// Name of the environment variable that holds the bearer token for the remote server
+    #[arg(long)]
+    pub server_token_env: Option<String>,
 }
 
 /// Template options for init command

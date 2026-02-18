@@ -21,6 +21,7 @@ mod parallel_run_service;
 mod permission;
 mod process_manager;
 mod progress;
+mod remote;
 mod serial_run_service;
 #[cfg(feature = "web-monitoring")]
 mod server;
@@ -44,6 +45,23 @@ use orchestrator::Orchestrator;
 use std::path::Path;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::prelude::*;
+
+/// Helper: resolve the bearer token from CLI args for a TUI invocation.
+fn resolve_tui_token(args: &TuiArgs) -> Option<String> {
+    remote::RemoteClient::resolve_token(args.server_token.clone(), args.server_token_env.as_deref())
+}
+
+/// Helper: load the initial change list for remote mode.
+///
+/// Fetches the project+change list from the remote server and maps it to the
+/// local `Change` type so the TUI can display it unchanged.
+async fn load_remote_changes(args: &TuiArgs) -> Result<Vec<openspec::Change>> {
+    let endpoint = args.server.as_deref().unwrap_or_default();
+    let token = resolve_tui_token(args);
+    let client = remote::RemoteClient::new(endpoint, token);
+    let projects = client.list_projects().await?;
+    Ok(remote::group_changes_by_project(&projects))
+}
 
 /// Initialize file-based logging with automatic log rotation and cleanup.
 /// Logs are written to XDG_STATE_HOME/cflx/logs/<project_slug>/<YYYY-MM-DD>.log
@@ -117,6 +135,9 @@ async fn main() -> Result<()> {
                 web: cli.web,
                 web_port: cli.web_port,
                 web_bind: cli.web_bind,
+                server: None,
+                server_token: None,
+                server_token_env: None,
             };
 
             // Load config
@@ -173,8 +194,18 @@ async fn main() -> Result<()> {
             let config = OrchestratorConfig::load(args.config.as_deref())?;
             tui::log_deduplicator::configure_logging(config.get_logging());
 
-            // Get initial changes using native implementation
-            let changes = openspec::list_changes_native()?;
+            // Get initial changes – either from a remote server or the local workspace
+            let changes = if args.server.is_some() {
+                // Remote mode: fetch changes from the server; do NOT read local changes
+                info!(
+                    "Remote TUI mode: connecting to {}",
+                    args.server.as_deref().unwrap_or("")
+                );
+                load_remote_changes(&args).await?
+            } else {
+                // Local mode (unchanged behavior)
+                openspec::list_changes_native()?
+            };
 
             // Start web monitoring server if enabled and build URL
             #[cfg(feature = "web-monitoring")]
@@ -202,13 +233,22 @@ async fn main() -> Result<()> {
                 None
             };
 
-            // Run TUI
-            tui::run_tui(
+            // Build remote client if --server was specified
+            let remote_client = if let Some(endpoint) = args.server.clone() {
+                let token = resolve_tui_token(&args);
+                Some(remote::RemoteClient::new(endpoint, token))
+            } else {
+                None
+            };
+
+            // Run TUI (with optional remote client for WS subscriptions)
+            tui::run_tui_with_remote(
                 changes,
                 config,
                 web_url,
                 #[cfg(feature = "web-monitoring")]
                 web_state_opt,
+                remote_client,
             )
             .await?;
         }
