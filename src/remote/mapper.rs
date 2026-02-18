@@ -43,39 +43,6 @@ pub fn group_changes_by_project(projects: &[RemoteProject]) -> Vec<Change> {
     result
 }
 
-/// Apply a [`RemoteChange`] update to an existing list of local [`Change`]s.
-///
-/// Implements the "non-regression" rule: `completed_tasks` is only updated if the
-/// new value is **greater than or equal to** the previous value. `total_tasks` is
-/// always updated so the denominator stays accurate.
-///
-/// Returns `true` if any change was actually modified.
-///
-/// This function is part of the public remote API and is validated by unit tests.
-/// It is available for callers that receive [`RemoteChange`] values directly (e.g.,
-/// from a full-state snapshot followed by manual incremental patching).
-#[allow(dead_code)]
-pub fn apply_remote_update(
-    changes: &mut [Change],
-    updated: &RemoteChange,
-    project_name: &str,
-) -> bool {
-    let expected_id = format!("{}/{}", project_name, updated.id);
-    for change in changes.iter_mut() {
-        if change.id == expected_id {
-            // Non-regression rule: do not decrease completed_tasks
-            if updated.completed_tasks >= change.completed_tasks {
-                change.completed_tasks = updated.completed_tasks;
-            }
-            // Always update total tasks so the denominator is accurate
-            change.total_tasks = updated.total_tasks;
-            change.last_modified = updated.last_modified.clone();
-            return true;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,57 +93,5 @@ mod tests {
         assert_eq!(result[0].id, "Project One/change-a");
         assert_eq!(result[1].id, "Project One/change-b");
         assert_eq!(result[2].id, "Project Two/change-c");
-    }
-
-    #[test]
-    fn test_apply_remote_update_increases_progress() {
-        let mut changes = vec![Change {
-            id: "MyProj/feat".to_string(),
-            completed_tasks: 1,
-            total_tasks: 5,
-            last_modified: "old".to_string(),
-            dependencies: Vec::new(),
-        }];
-
-        let update = make_remote_change("feat", "MyProj", 3, 5);
-        let modified = apply_remote_update(&mut changes, &update, "MyProj");
-
-        assert!(modified);
-        assert_eq!(changes[0].completed_tasks, 3);
-        assert_eq!(changes[0].total_tasks, 5);
-    }
-
-    #[test]
-    fn test_apply_remote_update_non_regression_rule() {
-        // completed_tasks should NOT decrease (non-regression rule)
-        let mut changes = vec![Change {
-            id: "MyProj/feat".to_string(),
-            completed_tasks: 4,
-            total_tasks: 5,
-            last_modified: "old".to_string(),
-            dependencies: Vec::new(),
-        }];
-
-        let update = make_remote_change("feat", "MyProj", 2, 5);
-        let modified = apply_remote_update(&mut changes, &update, "MyProj");
-
-        assert!(modified);
-        // completed_tasks must not decrease
-        assert_eq!(changes[0].completed_tasks, 4);
-    }
-
-    #[test]
-    fn test_apply_remote_update_not_found() {
-        let mut changes = vec![Change {
-            id: "MyProj/other".to_string(),
-            completed_tasks: 1,
-            total_tasks: 5,
-            last_modified: "old".to_string(),
-            dependencies: Vec::new(),
-        }];
-
-        let update = make_remote_change("feat", "MyProj", 3, 5);
-        let modified = apply_remote_update(&mut changes, &update, "MyProj");
-        assert!(!modified);
     }
 }

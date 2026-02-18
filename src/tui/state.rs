@@ -3417,4 +3417,54 @@ mod tests {
             "Change should not be added to resolve queue when not resolving"
         );
     }
+
+    #[test]
+    fn test_remote_change_update_increases_progress() {
+        let changes = vec![create_test_change("MyProj/feat", 1, 5)];
+        let mut app = AppState::new(changes);
+
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 3,
+            total_tasks: 5,
+        });
+
+        assert_eq!(app.changes[0].completed_tasks, 3);
+        assert_eq!(app.changes[0].total_tasks, 5);
+    }
+
+    #[test]
+    fn test_remote_change_update_non_regression_rule() {
+        // completed_tasks should NOT decrease (non-regression rule)
+        let changes = vec![create_test_change("MyProj/feat", 4, 5)];
+        let mut app = AppState::new(changes);
+
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 2, // lower than current 4
+            total_tasks: 5,
+        });
+
+        // completed_tasks must not decrease
+        assert_eq!(
+            app.changes[0].completed_tasks, 4,
+            "Non-regression rule: completed_tasks must not decrease"
+        );
+    }
+
+    #[test]
+    fn test_remote_change_update_not_found() {
+        // Update for unknown change ID should be a no-op
+        let changes = vec![create_test_change("MyProj/other", 1, 5)];
+        let mut app = AppState::new(changes);
+
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(), // does not exist
+            completed_tasks: 3,
+            total_tasks: 5,
+        });
+
+        // State should be unchanged
+        assert_eq!(app.changes[0].completed_tasks, 1);
+    }
 }
