@@ -11,12 +11,17 @@
 pub mod api;
 pub mod registry;
 
+use std::io::Write;
 use std::net::SocketAddr;
 
 use tracing::info;
 
 use crate::config::ServerConfig;
 use crate::error::Result;
+
+fn server_base_url(bind: &str, actual_port: u16) -> String {
+    crate::web::build_access_url(bind, actual_port)
+}
 
 /// Run the server daemon.
 ///
@@ -64,11 +69,53 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         )))
     })?;
 
-    info!("Server daemon listening on http://{}", addr);
+    let actual_addr = listener.local_addr().map_err(|e| {
+        crate::error::OrchestratorError::Io(std::io::Error::other(format!(
+            "Failed to resolve bound address: {}",
+            e
+        )))
+    })?;
+
+    let url = server_base_url(&config.bind, actual_addr.port());
+
+    // Print the accessible base URL to stdout for easy copy-paste.
+    // Keep this output minimal (URL only) to support scripts.
+    println!("{}", url);
+    let _ = std::io::stdout().flush();
+
+    info!("Server daemon listening on {}", url);
 
     axum::serve(listener, router).await.map_err(|e| {
         crate::error::OrchestratorError::Io(std::io::Error::other(format!("Server error: {}", e)))
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::server_base_url;
+
+    #[test]
+    fn test_server_base_url_localhost() {
+        let url = server_base_url("127.0.0.1", 9876);
+        assert_eq!(url, "http://localhost:9876");
+
+        let url = server_base_url("localhost", 9876);
+        assert_eq!(url, "http://localhost:9876");
+    }
+
+    #[test]
+    fn test_server_base_url_specific_address() {
+        let url = server_base_url("192.168.1.50", 9000);
+        assert_eq!(url, "http://192.168.1.50:9000");
+    }
+
+    #[test]
+    fn test_server_base_url_zero_address_does_not_expose_zeros() {
+        let url = server_base_url("0.0.0.0", 8080);
+        assert!(url.starts_with("http://"));
+        assert!(url.ends_with(":8080"));
+        assert!(!url.contains("0.0.0.0"));
+    }
 }
