@@ -106,6 +106,10 @@ pub async fn connect_and_subscribe(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::{
+        change_update_json, full_state_json, log_message_json, recv_with_timeout,
+        remote_change_json, spawn_mock_ws_server,
+    };
     use super::*;
     use tokio::sync::mpsc;
 
@@ -130,58 +134,14 @@ mod tests {
         assert!(result.is_err(), "Expected an error for a malformed URL");
     }
 
-    /// Mock WebSocket server that sends a sequence of messages then closes.
-    ///
-    /// Returns the bound address so the test can connect to it.
-    async fn spawn_mock_ws_server(messages: Vec<String>) -> std::net::SocketAddr {
-        use tokio::net::TcpListener;
-        use tokio_tungstenite::accept_async;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                if let Ok(mut ws) = accept_async(stream).await {
-                    use futures_util::SinkExt;
-                    for msg in messages {
-                        let _ = ws.send(Message::Text(msg)).await;
-                    }
-                    let _ = ws.close(None).await;
-                }
-            }
-        });
-
-        addr
-    }
-
     /// Verify that a `full_state` WS message is received and forwarded as a
     /// `RemoteStateUpdate::FullState` through the channel.
     #[tokio::test]
     async fn test_receive_full_state_message() {
-        let full_state_json = r#"{
-            "type": "full_state",
-            "projects": [
-                {
-                    "id": "proj-1",
-                    "name": "Project 1",
-                    "changes": [
-                        {
-                            "id": "my-change",
-                            "project": "proj-1",
-                            "completed_tasks": 2,
-                            "total_tasks": 5,
-                            "last_modified": "2024-01-01T00:00:00Z",
-                            "status": "applying",
-                            "iteration_number": null
-                        }
-                    ]
-                }
-            ]
-        }"#
-        .to_string();
+        let change = remote_change_json("my-change", "proj-1", 2, 5, "applying", None);
+        let msg_json = full_state_json("proj-1", "Project 1", &[change]);
 
-        let addr = spawn_mock_ws_server(vec![full_state_json]).await;
+        let addr = spawn_mock_ws_server(vec![msg_json]).await;
         let ws_url = format!("ws://{}/api/v1/ws", addr);
 
         let (tx, mut rx) = mpsc::channel(16);
@@ -189,11 +149,7 @@ mod tests {
             .await
             .expect("Should connect to mock server");
 
-        // Wait for the message (with timeout)
-        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(3), rx.recv())
-            .await
-            .expect("Timed out waiting for message")
-            .expect("Channel closed before receiving message");
+        let msg = recv_with_timeout(&mut rx, 3, "full_state").await;
 
         match msg {
             super::super::types::RemoteStateUpdate::FullState { projects } => {
@@ -212,21 +168,10 @@ mod tests {
     /// `RemoteStateUpdate::ChangeUpdate` through the channel.
     #[tokio::test]
     async fn test_receive_change_update_message() {
-        let change_update_json = r#"{
-            "type": "change_update",
-            "change": {
-                "id": "feat-x",
-                "project": "proj-2",
-                "completed_tasks": 3,
-                "total_tasks": 7,
-                "last_modified": "2024-06-01T12:00:00Z",
-                "status": "applying",
-                "iteration_number": 1
-            }
-        }"#
-        .to_string();
+        let change = remote_change_json("feat-x", "proj-2", 3, 7, "applying", Some(1));
+        let msg_json = change_update_json(&change);
 
-        let addr = spawn_mock_ws_server(vec![change_update_json]).await;
+        let addr = spawn_mock_ws_server(vec![msg_json]).await;
         let ws_url = format!("ws://{}/api/v1/ws", addr);
 
         let (tx, mut rx) = mpsc::channel(16);
@@ -234,10 +179,7 @@ mod tests {
             .await
             .expect("Should connect to mock server");
 
-        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(3), rx.recv())
-            .await
-            .expect("Timed out waiting for message")
-            .expect("Channel closed before receiving message");
+        let msg = recv_with_timeout(&mut rx, 3, "change_update").await;
 
         match msg {
             super::super::types::RemoteStateUpdate::ChangeUpdate { change } => {
@@ -257,18 +199,14 @@ mod tests {
     /// `RemoteStateUpdate::Log` through the channel.
     #[tokio::test]
     async fn test_receive_log_message() {
-        let log_json = r#"{
-            "type": "log",
-            "entry": {
-                "message": "Build completed successfully",
-                "level": "success",
-                "change_id": "my-change",
-                "timestamp": "2024-01-01T00:00:00Z"
-            }
-        }"#
-        .to_string();
+        let msg_json = log_message_json(
+            "Build completed successfully",
+            "success",
+            Some("my-change"),
+            "2024-01-01T00:00:00Z",
+        );
 
-        let addr = spawn_mock_ws_server(vec![log_json]).await;
+        let addr = spawn_mock_ws_server(vec![msg_json]).await;
         let ws_url = format!("ws://{}/api/v1/ws", addr);
 
         let (tx, mut rx) = mpsc::channel(16);
@@ -276,10 +214,7 @@ mod tests {
             .await
             .expect("Should connect to mock server");
 
-        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(3), rx.recv())
-            .await
-            .expect("Timed out waiting for message")
-            .expect("Channel closed before receiving message");
+        let msg = recv_with_timeout(&mut rx, 3, "log").await;
 
         match msg {
             super::super::types::RemoteStateUpdate::Log { entry } => {
