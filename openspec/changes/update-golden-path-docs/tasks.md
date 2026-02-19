@@ -36,3 +36,6 @@
 
 ## Acceptance #2 Failure Follow-up
 - [x] README.md の Project Structure を現行ソースに正確同期する（`README.md:903-951` は `approval.rs` を記載しているが実ファイルは存在せず、`src/acceptance.rs` など現行ファイルの欠落もあるため、`openspec/changes/update-golden-path-docs/specs/documentation/spec.md:22` の「all current source files」を満たしていない）。
+
+## Acceptance #3 Failure Follow-up
+- [x] README.md の Project Structure を「all current source files」要件に再同期する（`openspec/changes/update-golden-path-docs/specs/documentation/spec.md:22`）。現行の一覧（`README.md:903-1021`）には実在する `src/lib.rs` / `src/config/mod.rs` / `src/execution/mod.rs` / `src/parallel/mod.rs` / `src/vcs/mod.rs` / `src/vcs/git/mod.rs` / `src/vcs/git/commands/mod.rs` / `src/tui/utils.rs` / `src/bin/openapi_gen.rs` などが欠落しているため、`src/**/*.rs`（必要なら `tests/**/*.rs` の扱いも方針明記）と一致するよう更新する。

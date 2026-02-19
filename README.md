@@ -904,6 +904,7 @@ Internal documentation (parallel execution audit) is available in `docs/audit/`.
 
 ```
 src/
+  lib.rs                    # Library crate root
   main.rs                   # Entry point, CLI dispatching
   cli.rs                    # CLI argument parsing (clap)
   error.rs                  # Error types (thiserror)
@@ -930,6 +931,9 @@ src/
   stall.rs                  # Stall detection utilities
   worktree_ops.rs           # Common worktree operations (TUI and Web)
 
+  bin/
+    openapi_gen.rs          # OpenAPI spec generator binary
+
   agent/                    # AI agent command execution
     mod.rs                  # Agent runner module
     runner.rs               # Agent runner implementation
@@ -939,6 +943,7 @@ src/
     tests.rs                # Agent module tests
 
   execution/                # Shared execution logic
+    mod.rs                  # Execution module root
     apply.rs                # Apply operation logic
     archive.rs              # Archive operation logic
     state.rs                # Workspace state detection
@@ -955,20 +960,25 @@ src/
     state.rs                # Shared state management
 
   config/                   # Configuration
+    mod.rs                  # Configuration module root
     defaults.rs             # Default values
     expand.rs               # Environment variable expansion
     jsonc.rs                # JSONC parser
 
   vcs/                      # Version Control abstraction
+    mod.rs                  # VCS module root
     commands.rs             # Common VCS interface
     git/                    # Git backend
+      mod.rs                # Git module root
       commands/             # Git command implementations
+        mod.rs              # Git commands module root
         basic.rs            # Basic git operations
         commit.rs           # Commit operations
         merge.rs            # Merge operations
         worktree.rs         # Worktree management
 
   parallel/                 # Parallel execution
+    mod.rs                  # Parallel module root
     executor.rs             # Parallel change executor
     events.rs               # Progress reporting events
     conflict.rs             # Conflict detection/resolution
@@ -978,6 +988,12 @@ src/
     output_bridge.rs        # Bridge between OutputHandler and ParallelEvent
     types.rs                # Common types for parallel execution
     workspace.rs            # Workspace creation and management
+    tests/                  # Parallel module tests
+      mod.rs                # Test module root
+      auto_resolve.rs       # Auto-resolve tests
+      conflict.rs           # Conflict detection tests
+      executor.rs           # Executor tests
+      manual_resolve.rs     # Manual resolve tests
 
   remote/                   # Remote server client (TUI)
     mod.rs                  # HTTP and WebSocket client module
@@ -1015,6 +1031,7 @@ src/
     worktrees.rs            # Worktree view management
     log_deduplicator.rs     # Log deduplication
     qr.rs                   # QR code generation for Web UI URL
+    utils.rs                # TUI utility functions
 
 tests/
   e2e_tests.rs              # End-to-end tests
