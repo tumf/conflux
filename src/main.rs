@@ -656,6 +656,7 @@ async fn main() -> Result<()> {
                 args.auth_token.as_deref(),
                 args.max_concurrent_total,
                 args.data_dir.as_deref(),
+                args.resolve_command.as_deref(),
             );
 
             info!(

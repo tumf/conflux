@@ -415,6 +415,12 @@ pub struct ServerConfig {
     /// Directory for persistent server data (projects registry, etc.)
     #[serde(default = "default_server_data_dir")]
     pub data_dir: std::path::PathBuf,
+
+    /// Optional command to run when auto_resolve is triggered on non-fast-forward git operations.
+    /// When set, this command is executed in the project's bare clone directory.
+    /// If the command exits with code 0, the git operation continues; otherwise it returns an error.
+    #[serde(default)]
+    pub resolve_command: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -425,6 +431,7 @@ impl Default for ServerConfig {
             auth: ServerAuthConfig::default(),
             max_concurrent_total: default_server_max_concurrent_total(),
             data_dir: default_server_data_dir(),
+            resolve_command: None,
         }
     }
 }
@@ -474,7 +481,7 @@ impl ServerConfig {
         Ok(())
     }
 
-    /// Apply CLI overrides (bind, port, auth_token, max_concurrent_total, data_dir).
+    /// Apply CLI overrides (bind, port, auth_token, max_concurrent_total, data_dir, resolve_command).
     pub fn apply_cli_overrides(
         &mut self,
         bind: Option<&str>,
@@ -482,6 +489,7 @@ impl ServerConfig {
         auth_token: Option<&str>,
         max_concurrent_total: Option<usize>,
         data_dir: Option<&std::path::Path>,
+        resolve_command: Option<&str>,
     ) {
         if let Some(b) = bind {
             self.bind = b.to_string();
@@ -498,6 +506,9 @@ impl ServerConfig {
         }
         if let Some(dir) = data_dir {
             self.data_dir = dir.to_path_buf();
+        }
+        if let Some(cmd) = resolve_command {
+            self.resolve_command = Some(cmd.to_string());
         }
     }
 }
@@ -2681,7 +2692,7 @@ mod tests {
         let mut config = ServerConfig::default();
         let custom_dir = std::path::Path::new("/var/lib/cflx");
 
-        config.apply_cli_overrides(None, None, None, None, Some(custom_dir));
+        config.apply_cli_overrides(None, None, None, None, Some(custom_dir), None);
 
         assert_eq!(
             config.data_dir,
@@ -2696,7 +2707,7 @@ mod tests {
         let mut config = ServerConfig::default();
         let default_data_dir = config.data_dir.clone();
 
-        config.apply_cli_overrides(None, None, None, None, None);
+        config.apply_cli_overrides(None, None, None, None, None, None);
 
         assert_eq!(
             config.data_dir, default_data_dir,
@@ -2716,6 +2727,7 @@ mod tests {
             Some("my-token"),
             Some(10),
             Some(custom_dir),
+            None,
         );
 
         assert_eq!(config.bind, "0.0.0.0");
