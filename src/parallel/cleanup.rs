@@ -59,6 +59,7 @@ impl WorkspaceCleanupGuard {
     ///
     /// Call this when cancellation or errors occur and all workspaces
     /// should be preserved for debugging or resume functionality.
+    #[allow(dead_code)]
     pub fn preserve_all(&mut self) {
         for workspace_name in self.workspaces.keys() {
             self.preserved_workspaces.insert(workspace_name.clone());

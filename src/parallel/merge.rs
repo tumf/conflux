@@ -7,7 +7,14 @@
 
 use crate::error::{OrchestratorError, Result};
 use crate::vcs::git::commands as git_commands;
+use crate::vcs::{VcsBackend, VcsError};
 use std::path::Path;
+use std::path::PathBuf;
+
+use super::conflict;
+use super::events::send_event;
+use super::ParallelEvent;
+use super::ParallelExecutor;
 
 /// Check if the base branch is dirty (has uncommitted changes or merge in progress).
 ///
@@ -51,4 +58,588 @@ pub enum MergeAttempt {
     Merged,
     /// Merge deferred with reason (e.g., base dirty, archive not complete)
     Deferred(String),
+}
+
+impl ParallelExecutor {
+    /// Handle merge attempt and cleanup after successful archive.
+    ///
+    /// # Arguments
+    /// * `workspace_result` - Result from archived workspace
+    /// * `cleanup_guard` - Guard for workspace cleanup tracking
+    pub(super) async fn handle_merge_and_cleanup(
+        &mut self,
+        workspace_result: super::types::WorkspaceResult,
+        cleanup_guard: &mut super::cleanup::WorkspaceCleanupGuard,
+    ) {
+        let revisions = vec![workspace_result.workspace_name.clone()];
+        let change_ids = vec![workspace_result.change_id.clone()];
+
+        // Find workspace path for archive verification
+        let workspace_path = self
+            .workspace_manager
+            .workspaces()
+            .iter()
+            .find(|workspace| workspace.name == workspace_result.workspace_name)
+            .map(|workspace| workspace.path.clone());
+
+        if let Some(path) = workspace_path {
+            let archive_paths = vec![path];
+
+            tracing::info!(
+                "Merging archived {} (workspace: {})",
+                workspace_result.change_id,
+                workspace_result.workspace_name
+            );
+
+            match self
+                .attempt_merge(&revisions, &change_ids, &archive_paths)
+                .await
+            {
+                Ok(MergeAttempt::Merged) => {
+                    // Run on_merged hook after merge completion
+                    if let Some(ref hooks) = self.hooks {
+                        // Fetch actual task counts from change data
+                        let (completed_tasks, total_tasks) =
+                            match crate::openspec::list_changes_native() {
+                                Ok(changes) => changes
+                                    .iter()
+                                    .find(|c| c.id == workspace_result.change_id)
+                                    .map(|c| (c.completed_tasks, c.total_tasks))
+                                    .unwrap_or((0, 0)),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to fetch task counts for on_merged hook: {}",
+                                        e
+                                    );
+                                    (0, 0)
+                                }
+                            };
+
+                        // Find workspace path
+                        let workspace_path = self
+                            .workspace_manager
+                            .workspaces()
+                            .iter()
+                            .find(|w| w.name == workspace_result.workspace_name)
+                            .map(|w| w.path.to_string_lossy().to_string())
+                            .unwrap_or_default();
+
+                        let hook_context = crate::hooks::HookContext::new(
+                            0, // changes_processed not easily available here
+                            0, // total_changes not easily available here
+                            0, // remaining_changes not easily available here
+                            false,
+                        )
+                        .with_change(&workspace_result.change_id, completed_tasks, total_tasks)
+                        .with_apply_count(0)
+                        .with_parallel_context(&workspace_path, None);
+
+                        if let Err(e) = hooks
+                            .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
+                            .await
+                        {
+                            tracing::warn!(
+                                "on_merged hook failed for {}: {}",
+                                workspace_result.change_id,
+                                e
+                            );
+                        }
+                    }
+
+                    // Merge succeeded, cleanup workspace
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::CleanupStarted {
+                            workspace: workspace_result.workspace_name.clone(),
+                        },
+                    )
+                    .await;
+
+                    if let Err(err) = self
+                        .workspace_manager
+                        .cleanup_workspace(&workspace_result.workspace_name)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to cleanup worktree '{}' after merge: {}",
+                            workspace_result.workspace_name,
+                            err
+                        );
+                    } else {
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::CleanupCompleted {
+                                workspace: workspace_result.workspace_name.clone(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+                Ok(MergeAttempt::Deferred(reason)) => {
+                    // Merge deferred, preserve workspace and transition to MergeWait
+                    self.merge_deferred_changes
+                        .insert(workspace_result.change_id.clone());
+
+                    // Update workspace status to MergeWait so it's no longer counted as active
+                    self.workspace_manager.update_workspace_status(
+                        &workspace_result.workspace_name,
+                        crate::vcs::WorkspaceStatus::MergeWait,
+                    );
+
+                    // Preserve this workspace from cleanup
+                    cleanup_guard.preserve(&workspace_result.workspace_name);
+
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::MergeDeferred {
+                            change_id: workspace_result.change_id.clone(),
+                            reason,
+                        },
+                    )
+                    .await;
+
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::WorkspaceStatusUpdated {
+                            workspace_name: workspace_result.workspace_name.clone(),
+                            status: crate::vcs::WorkspaceStatus::MergeWait,
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    let error_msg = format!(
+                        "Failed to merge archived {} (workspace: {}): {}",
+                        workspace_result.change_id, workspace_result.workspace_name, e
+                    );
+                    tracing::error!("{}", error_msg);
+                    send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
+                    // Preserve workspace on merge error to allow debugging
+                    cleanup_guard.preserve(&workspace_result.workspace_name);
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Workspace '{}' not found after archive completion, skipping merge",
+                workspace_result.workspace_name
+            );
+        }
+    }
+
+    pub(super) async fn attempt_merge(
+        &self,
+        revisions: &[String],
+        change_ids: &[String],
+        archive_paths: &[PathBuf],
+    ) -> Result<MergeAttempt> {
+        use crate::execution::archive::is_archive_commit_complete;
+
+        let _merge_guard = super::global_merge_lock().lock().await;
+        if let Some(reason) = base_dirty_reason(&self.repo_root).await? {
+            return Ok(MergeAttempt::Deferred(reason));
+        }
+
+        if change_ids.len() != archive_paths.len() {
+            return Err(OrchestratorError::GitCommand(format!(
+                "Expected {} archive paths for {} changes",
+                change_ids.len(),
+                archive_paths.len()
+            )));
+        }
+
+        // Verify that all changes are actually archived before attempting merge
+        for (change_id, archive_path) in change_ids.iter().zip(archive_paths.iter()) {
+            match is_archive_commit_complete(change_id, Some(archive_path)).await {
+                Ok(true) => {
+                    // Archive is complete, continue
+                }
+                Ok(false) => {
+                    // Archive is incomplete, defer merge with detailed reason
+                    let reason = format!(
+                        "Archive incomplete for '{}': worktree may be dirty, openspec/changes/{} may still exist, or archive entry may be missing",
+                        change_id, change_id
+                    );
+                    tracing::warn!("{}", reason);
+                    return Ok(MergeAttempt::Deferred(reason));
+                }
+                Err(e) => {
+                    let reason = format!(
+                        "Failed to verify archive completion for '{}': {}",
+                        change_id, e
+                    );
+                    tracing::warn!("{}", reason);
+                    return Ok(MergeAttempt::Deferred(reason));
+                }
+            }
+        }
+
+        self.merge_and_resolve(revisions, change_ids).await?;
+        Ok(MergeAttempt::Merged)
+    }
+
+    pub async fn resolve_merge_for_change(&mut self, change_id: &str) -> Result<()> {
+        let workspace_info = self
+            .workspace_manager
+            .find_existing_workspace(change_id)
+            .await
+            .map_err(OrchestratorError::from_vcs_error)?
+            .ok_or_else(|| OrchestratorError::ChangeNotFound(change_id.to_string()))?;
+        let workspace = self
+            .workspace_manager
+            .reuse_workspace(&workspace_info)
+            .await
+            .map_err(OrchestratorError::from_vcs_error)?;
+
+        let revisions = vec![workspace.name.clone()];
+        let change_ids = vec![change_id.to_string()];
+
+        // ResolveStarted event will be sent from within conflict resolution functions with command string
+
+        let archive_paths = vec![workspace.path.clone()];
+        match self
+            .attempt_merge(&revisions, &change_ids, &archive_paths)
+            .await?
+        {
+            MergeAttempt::Merged => {
+                // Run on_merged hook after merge completion
+                if let Some(ref hooks) = self.hooks {
+                    // Fetch actual task counts from change data
+                    let (completed_tasks, total_tasks) =
+                        match crate::openspec::list_changes_native() {
+                            Ok(changes) => changes
+                                .iter()
+                                .find(|c| c.id == *change_id)
+                                .map(|c| (c.completed_tasks, c.total_tasks))
+                                .unwrap_or((0, 0)),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to fetch task counts for on_merged hook: {}",
+                                    e
+                                );
+                                (0, 0)
+                            }
+                        };
+
+                    let hook_context = crate::hooks::HookContext::new(
+                        0, // changes_processed not easily available here
+                        0, // total_changes not easily available here
+                        0, // remaining_changes not easily available here
+                        false,
+                    )
+                    .with_change(change_id, completed_tasks, total_tasks)
+                    .with_apply_count(0)
+                    .with_parallel_context(&workspace.path.to_string_lossy(), None);
+
+                    if let Err(e) = hooks
+                        .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
+                        .await
+                    {
+                        tracing::warn!("on_merged hook failed for {}: {}", change_id, e);
+                    }
+                }
+
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::CleanupStarted {
+                        workspace: workspace.name.clone(),
+                    },
+                )
+                .await;
+                if let Err(err) = self
+                    .workspace_manager
+                    .cleanup_workspace(&workspace.name)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to cleanup worktree '{}' after merge: {}",
+                        workspace.name,
+                        err
+                    );
+                } else {
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::CleanupCompleted {
+                            workspace: workspace.name.clone(),
+                        },
+                    )
+                    .await;
+                }
+
+                // Send ResolveCompleted to update TUI status
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::ResolveCompleted {
+                        change_id: change_id.to_string(),
+                        worktree_change_ids: None,
+                    },
+                )
+                .await;
+
+                Ok(())
+            }
+            MergeAttempt::Deferred(reason) => {
+                // Send ResolveFailed to update TUI status
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::ResolveFailed {
+                        change_id: change_id.to_string(),
+                        error: reason.clone(),
+                    },
+                )
+                .await;
+                Err(OrchestratorError::GitCommand(reason))
+            }
+        }
+    }
+
+    /// Merge revisions and resolve any conflicts
+    pub(super) async fn merge_and_resolve(
+        &self,
+        revisions: &[String],
+        change_ids: &[String],
+    ) -> Result<()> {
+        let change_ids_vec = change_ids.to_vec();
+        let shared_stagger_state = self.shared_stagger_state.clone();
+        let auto_resolve_count = self.auto_resolve_count.clone();
+        self.merge_and_resolve_with(revisions, change_ids, |revisions, details| {
+            let change_ids_clone = change_ids_vec.clone();
+            let shared_stagger_state_clone = shared_stagger_state.clone();
+            let auto_resolve_count_clone = auto_resolve_count.clone();
+            async move {
+                conflict::resolve_conflicts_with_retry(
+                    self.workspace_manager.as_ref(),
+                    &self.config,
+                    &self.event_tx,
+                    &revisions,
+                    &change_ids_clone,
+                    &details,
+                    self.max_conflict_retries,
+                    shared_stagger_state_clone,
+                    auto_resolve_count_clone,
+                )
+                .await
+            }
+        })
+        .await
+    }
+
+    pub(super) async fn merge_and_resolve_with<'a, F, Fut>(
+        &'a self,
+        revisions: &'a [String],
+        change_ids: &'a [String],
+        mut resolve_conflicts: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Vec<String>, String) -> Fut,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'a,
+    {
+        let max_attempts = self.max_conflict_retries.max(1);
+
+        send_event(
+            &self.event_tx,
+            ParallelEvent::MergeStarted {
+                revisions: revisions.to_vec(),
+            },
+        )
+        .await;
+
+        if matches!(
+            self.workspace_manager.backend_type(),
+            VcsBackend::Git | VcsBackend::Auto
+        ) {
+            let base_revision = self.workspace_manager.get_current_revision().await?;
+            let target_branch = self.workspace_manager.original_branch().ok_or_else(|| {
+                OrchestratorError::GitCommand("Original branch not initialized".to_string())
+            })?;
+
+            if change_ids.len() != revisions.len() {
+                return Err(OrchestratorError::GitCommand(format!(
+                    "Expected {} change_ids for {} revisions",
+                    revisions.len(),
+                    change_ids.len()
+                )));
+            }
+
+            conflict::resolve_merges_with_retry(conflict::ResolveMergesWithRetryArgs {
+                workspace_manager: self.workspace_manager.as_ref(),
+                config: &self.config,
+                event_tx: &self.event_tx,
+                revisions,
+                change_ids,
+                target_branch: target_branch.as_str(),
+                base_revision: base_revision.as_str(),
+                max_retries: max_attempts,
+                shared_stagger_state: self.shared_stagger_state.clone(),
+                auto_resolve_count: self.auto_resolve_count.clone(),
+            })
+            .await?;
+
+            self.verify_merge_commits(&base_revision, &target_branch, change_ids)
+                .await?;
+
+            let merge_revision = self.workspace_manager.get_current_revision().await?;
+            send_event(
+                &self.event_tx,
+                ParallelEvent::MergeCompleted {
+                    change_id: change_ids[0].clone(),
+                    revision: merge_revision.clone(),
+                },
+            )
+            .await;
+
+            // Note: on_merged hook is executed by the caller of attempt_merge()
+            // which has better context (workspace paths, etc.)
+            return Ok(());
+        }
+
+        for attempt in 1..=max_attempts {
+            tracing::info!(
+                "Merge attempt {}/{} for revisions: {}",
+                attempt,
+                max_attempts,
+                revisions.join(", ")
+            );
+
+            let merge_result = self.workspace_manager.merge_workspaces(revisions).await;
+
+            match merge_result {
+                Ok(merge_revision) => {
+                    if attempt > 1 {
+                        tracing::info!("Merge succeeded after {} attempts", attempt);
+                    }
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::MergeCompleted {
+                            change_id: change_ids[0].clone(),
+                            revision: merge_revision.clone(),
+                        },
+                    )
+                    .await;
+
+                    // Note: on_merged hook is executed by the caller of attempt_merge()
+                    // which has better context (workspace paths, etc.)
+                    return Ok(());
+                }
+                Err(VcsError::Conflict { details, .. }) => {
+                    let conflict_files =
+                        conflict::detect_conflicts(self.workspace_manager.as_ref()).await?;
+                    tracing::warn!(
+                        "Merge conflict detected on attempt {}/{}",
+                        attempt,
+                        max_attempts
+                    );
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::MergeConflict {
+                            files: conflict_files,
+                        },
+                    )
+                    .await;
+
+                    if attempt >= max_attempts {
+                        let error_msg = format!(
+                            "Merge conflict unresolved after {} attempts: {}",
+                            max_attempts, details
+                        );
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::ConflictResolutionFailed {
+                                error: error_msg.clone(),
+                            },
+                        )
+                        .await;
+
+                        // Send ResolveFailed for each change_id to update TUI status
+                        for change_id in change_ids {
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::ResolveFailed {
+                                    change_id: change_id.to_string(),
+                                    error: error_msg.clone(),
+                                },
+                            )
+                            .await;
+                        }
+
+                        return Err(OrchestratorError::from_vcs_error(VcsError::Conflict {
+                            backend: self.workspace_manager.backend_type(),
+                            details: error_msg,
+                        }));
+                    }
+
+                    tracing::info!(
+                        "Resolving merge conflicts (attempt {}/{}).",
+                        attempt,
+                        max_attempts
+                    );
+
+                    // ResolveStarted event will be sent from within conflict resolution functions with command string
+
+                    if let Err(err) = resolve_conflicts(revisions.to_vec(), details.clone()).await {
+                        tracing::warn!(
+                            "Conflict resolution failed on attempt {}/{}: {}",
+                            attempt,
+                            max_attempts,
+                            err
+                        );
+
+                        // Send ResolveFailed for each change_id to update TUI status
+                        for change_id in change_ids {
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::ResolveFailed {
+                                    change_id: change_id.to_string(),
+                                    error: err.to_string(),
+                                },
+                            )
+                            .await;
+                        }
+
+                        return Err(err);
+                    }
+                    tracing::info!("Conflict resolution completed, retrying merge");
+
+                    // Note: ResolveCompleted will be sent when the merge succeeds
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(super) async fn verify_merge_commits(
+        &self,
+        base_revision: &str,
+        _target_branch: &str,
+        change_ids: &[String],
+    ) -> Result<()> {
+        if matches!(
+            self.workspace_manager.backend_type(),
+            VcsBackend::Git | VcsBackend::Auto
+        ) {
+            let repo_root = self.workspace_manager.repo_root();
+            let missing =
+                git_commands::missing_merge_commits_since(repo_root, base_revision, change_ids)
+                    .await
+                    .map_err(OrchestratorError::from_vcs_error)?;
+            if !missing.is_empty() {
+                return Err(OrchestratorError::GitCommand(format!(
+                    "Missing merge commit message containing change_id(s): {}",
+                    missing.join(", ")
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+pub async fn resolve_deferred_merge(
+    repo_root: PathBuf,
+    config: crate::config::OrchestratorConfig,
+    change_id: &str,
+) -> Result<()> {
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+    executor.resolve_merge_for_change(change_id).await
 }

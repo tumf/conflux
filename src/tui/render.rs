@@ -11,9 +11,114 @@ use ratatui::{
 };
 use std::time::Duration;
 
-use super::state::AppState;
+use super::state::{AppState, ChangeState};
 use super::types::{AppMode, QueueStatus};
 use super::utils::{get_version_string, truncate_to_display_width_with_suffix};
+
+/// Parsed parts of a remote change ID.
+///
+/// Remote server mode encodes the change ID as `<project_id>::<project_name>/<change_id>`.
+/// This struct holds the project label (the human-friendly portion before the last `/`) and the
+/// bare change id (everything after the last `/`).
+#[derive(Debug)]
+struct RemoteChangeId<'a> {
+    /// Human-friendly project label (e.g. `myproject`).  `None` for local changes.
+    project: Option<&'a str>,
+    /// Bare change id without the project prefix (e.g. `add-feature`).
+    change: &'a str,
+}
+
+/// Split a raw change `id` field into its project and change components.
+///
+/// - Local change (no `::`):  `RemoteChangeId { project: None, change: id }`
+/// - Remote change (`<pid>::<pname>/<cid>`): `RemoteChangeId { project: Some(pname), change: cid }`
+/// - Remote change without `/` after `::` is treated as local-like.
+fn split_remote_change_id(id: &str) -> RemoteChangeId<'_> {
+    if let Some((_, after_colon)) = id.split_once("::") {
+        if let Some((project, change)) = after_colon.rsplit_once('/') {
+            return RemoteChangeId {
+                project: Some(project),
+                change,
+            };
+        }
+        // No slash after "::" – use the whole `after_colon` part as the change id.
+        RemoteChangeId {
+            project: None,
+            change: after_colon,
+        }
+    } else {
+        RemoteChangeId {
+            project: None,
+            change: id,
+        }
+    }
+}
+
+/// A single visual row in the Changes list.
+#[derive(Debug)]
+enum ChangeRow {
+    /// A non-selectable project header row.
+    Header(String),
+    /// A selectable change row.  `change_index` is the index into `app.changes`.
+    Item { change_index: usize },
+}
+
+/// Build the ordered list of visual rows for the Changes panel.
+///
+/// Groups changes by project (for remote-mode IDs) and inserts a header row
+/// before the first change of each project.  Local changes (no project prefix)
+/// are also grouped together under a single `(local)` header when the list is
+/// otherwise mixed, or shown directly without any header when *all* changes are
+/// local.
+///
+/// Returns:
+/// - `rows`: the ordered visual rows
+/// - `change_to_visual`: maps `change_index → visual_index` for `ListState::select`
+fn build_change_rows(changes: &[ChangeState]) -> (Vec<ChangeRow>, Vec<usize>) {
+    // Collect unique project names in stable order.
+    let mut seen_projects: Vec<Option<String>> = Vec::new();
+    for change in changes {
+        let parsed = split_remote_change_id(&change.id);
+        let key = parsed.project.map(|p| p.to_string());
+        if !seen_projects.contains(&key) {
+            seen_projects.push(key);
+        }
+    }
+
+    // If all changes are local (no project prefix) we skip the header row entirely.
+    let all_local = seen_projects.len() == 1 && seen_projects[0].is_none();
+
+    let mut rows: Vec<ChangeRow> = Vec::new();
+    let mut change_to_visual: Vec<usize> = vec![0; changes.len()];
+
+    if all_local {
+        // No headers needed – one row per change.
+        for (ci, _) in changes.iter().enumerate() {
+            change_to_visual[ci] = rows.len();
+            rows.push(ChangeRow::Item { change_index: ci });
+        }
+    } else {
+        // Insert a project header before the first change of each project group.
+        for project_key in &seen_projects {
+            let header_label = match project_key {
+                Some(p) => p.clone(),
+                None => "(local)".to_string(),
+            };
+            rows.push(ChangeRow::Header(header_label));
+
+            for (ci, change) in changes.iter().enumerate() {
+                let parsed = split_remote_change_id(&change.id);
+                let key = parsed.project.map(|p| p.to_string());
+                if key == *project_key {
+                    change_to_visual[ci] = rows.len();
+                    rows.push(ChangeRow::Item { change_index: ci });
+                }
+            }
+        }
+    }
+
+    (rows, change_to_visual)
+}
 
 /// Determine checkbox display and color for a change item
 ///
@@ -275,180 +380,198 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
 
 /// Render changes list in selection mode
 fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect) {
-    let items: Vec<ListItem> = app
-        .changes
+    // Build grouped visual rows (project headers + change rows).
+    let (rows, change_to_visual) = build_change_rows(&app.changes);
+
+    let items: Vec<ListItem> = rows
         .iter()
-        .enumerate()
-        .map(|(i, change)| {
-            // Checkbox display (Select mode):
-            // [ ] - not selected (ready to select)
-            // [x] - selected (will become Queued when F5 is pressed)
-            // [x] (gray) - archived (processing complete, no longer actionable)
-            // Note: 'selected' field indicates selection for next run
-            let is_archived = matches!(
-                change.queue_status,
-                QueueStatus::Archived | QueueStatus::Merged
-            );
-            let show_uncommitted_badge = app.parallel_mode
-                && !change.is_parallel_eligible
-                && !is_archived
-                && matches!(
-                    change.queue_status,
-                    QueueStatus::NotQueued | QueueStatus::Queued
-                );
-            let is_parallel_blocked = show_uncommitted_badge;
-            let (checkbox, checkbox_color) = if is_parallel_blocked {
-                ("[ ]", Color::DarkGray)
-            } else {
-                get_checkbox_display(&change.queue_status, change.selected)
-            };
-
-            let cursor = if i == app.cursor_index { "►" } else { " " };
-            let worktree_badge = if change.has_worktree { " WT" } else { "" };
-            let worktree_color = if is_parallel_blocked {
-                Color::DarkGray
-            } else {
-                Color::Green
-            };
-            let new_badge = if change.is_new { " NEW" } else { "" };
-            let uncommitted_badge = if show_uncommitted_badge {
-                " UNCOMMITED"
-            } else {
-                ""
-            };
-
-            // Use brighter colors for selected row to ensure visibility on DarkGray background
-            let is_selected_row = i == app.cursor_index;
-            let dim_color = if is_parallel_blocked {
-                Color::DarkGray
-            } else if is_selected_row {
-                Color::Gray // Brighter than DarkGray for visibility on selected row
-            } else {
-                Color::DarkGray
-            };
-
-            let name_color = if is_parallel_blocked {
-                Color::DarkGray
-            } else {
-                Color::White
-            };
-
-            // For remote server mode we encode project_id into the change id as:
-            // "<project_id>::<project_name>/<change_id>".
-            // Render only the human-friendly portion.
-            let display_id = change
-                .id
-                .split_once("::")
-                .map(|(_, b)| b)
-                .unwrap_or(&change.id);
-
-            let mut spans = vec![
-                Span::styled(
-                    format!("{} {} ", checkbox, cursor),
-                    Style::default().fg(checkbox_color),
-                ),
-                Span::styled(
-                    format!("{:<25}", display_id),
-                    Style::default().fg(name_color),
-                ),
-                Span::styled(
-                    worktree_badge,
-                    Style::default()
-                        .fg(worktree_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    new_badge,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    uncommitted_badge,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" {}/{} tasks", change.completed_tasks, change.total_tasks),
-                    Style::default().fg(dim_color),
-                ),
-                Span::styled(
-                    format!("  {:>5.1}%", change.progress_percent()),
-                    Style::default().fg(Color::Cyan),
-                ),
-            ];
-
-            // Add log preview if available
-            if let Some(log) = app.get_latest_log_for_change(&change.id) {
-                // Calculate actual occupied width dynamically
-                let checkbox_cursor_text = format!("{} {} ", checkbox, cursor);
-                let checkbox_cursor_width = checkbox_cursor_text.len(); // Actual: "[x] ► " is 6 chars
-                let display_id = change
-                    .id
-                    .split_once("::")
-                    .map(|(_, b)| b)
-                    .unwrap_or(&change.id);
-                let id_text = format!("{:<25}", display_id);
-                let id_width = id_text.len(); // max(25, change.id.len())
-                let worktree_badge_width = if change.has_worktree { 3 } else { 0 }; // " WT"
-                let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"
-                let uncommitted_badge_width = if show_uncommitted_badge { 11 } else { 0 }; // " UNCOMMITED"
-                let tasks_text =
-                    format!(" {}/{} tasks", change.completed_tasks, change.total_tasks);
-                let tasks_width = tasks_text.len();
-                let percent_text = format!("  {:>5.1}%", change.progress_percent());
-                let percent_width = percent_text.len();
-                let list_border_width = 2; // List widget border
-
-                let base_width = checkbox_cursor_width
-                    + id_width
-                    + worktree_badge_width
-                    + new_badge_width
-                    + uncommitted_badge_width
-                    + tasks_width
-                    + percent_width
-                    + list_border_width;
-
-                let available = (area.width as usize).saturating_sub(base_width);
-
-                // Only show preview if available width >= 10 chars
-                if available >= 10 {
-                    // Format relative time with parentheses
-                    let relative_time = format!("({})", format_relative_time(&log.created_at));
-
-                    // Build shortened header: [operation:iteration] or [operation]
-                    let header = match (&log.operation, log.iteration) {
-                        (Some(op), Some(iter)) => format!(" [{}:{}]", op, iter),
-                        (Some(op), None) => format!(" [{}]", op),
-                        (None, _) => String::new(),
-                    };
-
-                    // Combine relative time, header, and message
-                    let preview_text = if !header.is_empty() {
-                        format!(" {}{} {}", relative_time, header, log.message)
-                    } else {
-                        format!(" {} {}", relative_time, log.message)
-                    };
-
-                    // Truncate if necessary (Unicode-safe)
-                    let truncated =
-                        truncate_to_display_width_with_suffix(&preview_text, available, "…");
-
-                    // Use brighter color for selected row to ensure visibility on DarkGray background
-                    let preview_color = if is_selected_row {
-                        Color::Gray
-                    } else {
-                        Color::DarkGray
-                    };
-
-                    spans.push(Span::styled(truncated, Style::default().fg(preview_color)));
-                }
+        .map(|row| match row {
+            // Non-selectable project header row.
+            ChangeRow::Header(label) => {
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", label),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "─".repeat(area.width.saturating_sub(label.len() as u16 + 5) as usize),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]);
+                ListItem::new(line)
             }
+            // Selectable change row.
+            ChangeRow::Item { change_index: i } => {
+                let i = *i;
+                let change = &app.changes[i];
+                // Checkbox display (Select mode):
+                // [ ] - not selected (ready to select)
+                // [x] - selected (will become Queued when F5 is pressed)
+                // [x] (gray) - archived (processing complete, no longer actionable)
+                // Note: 'selected' field indicates selection for next run
+                let is_archived = matches!(
+                    change.queue_status,
+                    QueueStatus::Archived | QueueStatus::Merged
+                );
+                let show_uncommitted_badge = app.parallel_mode
+                    && !change.is_parallel_eligible
+                    && !is_archived
+                    && matches!(
+                        change.queue_status,
+                        QueueStatus::NotQueued | QueueStatus::Queued
+                    );
+                let is_parallel_blocked = show_uncommitted_badge;
+                let (checkbox, checkbox_color) = if is_parallel_blocked {
+                    ("[ ]", Color::DarkGray)
+                } else {
+                    get_checkbox_display(&change.queue_status, change.selected)
+                };
 
-            ListItem::new(Line::from(spans))
+                let cursor = if i == app.cursor_index { "►" } else { " " };
+                let worktree_badge = if change.has_worktree { " WT" } else { "" };
+                let worktree_color = if is_parallel_blocked {
+                    Color::DarkGray
+                } else {
+                    Color::Green
+                };
+                let new_badge = if change.is_new { " NEW" } else { "" };
+                let uncommitted_badge = if show_uncommitted_badge {
+                    " UNCOMMITED"
+                } else {
+                    ""
+                };
+
+                // Use brighter colors for selected row to ensure visibility on DarkGray background
+                let is_selected_row = i == app.cursor_index;
+                let dim_color = if is_parallel_blocked {
+                    Color::DarkGray
+                } else if is_selected_row {
+                    Color::Gray // Brighter than DarkGray for visibility on selected row
+                } else {
+                    Color::DarkGray
+                };
+
+                let name_color = if is_parallel_blocked {
+                    Color::DarkGray
+                } else {
+                    Color::White
+                };
+
+                // In grouped mode show only the bare change id (no project prefix).
+                let parsed = split_remote_change_id(&change.id);
+                let display_id = parsed.change;
+
+                let mut spans = vec![
+                    Span::styled(
+                        format!("{} {} ", checkbox, cursor),
+                        Style::default().fg(checkbox_color),
+                    ),
+                    Span::styled(
+                        format!("{:<25}", display_id),
+                        Style::default().fg(name_color),
+                    ),
+                    Span::styled(
+                        worktree_badge,
+                        Style::default()
+                            .fg(worktree_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        new_badge,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        uncommitted_badge,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" {}/{} tasks", change.completed_tasks, change.total_tasks),
+                        Style::default().fg(dim_color),
+                    ),
+                    Span::styled(
+                        format!("  {:>5.1}%", change.progress_percent()),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ];
+
+                // Add log preview if available
+                if let Some(log) = app.get_latest_log_for_change(&change.id) {
+                    // Calculate actual occupied width dynamically
+                    let checkbox_cursor_text = format!("{} {} ", checkbox, cursor);
+                    let checkbox_cursor_width = checkbox_cursor_text.len();
+                    let id_text = format!("{:<25}", display_id);
+                    let id_width = id_text.len();
+                    let worktree_badge_width = if change.has_worktree { 3 } else { 0 }; // " WT"
+                    let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"
+                    let uncommitted_badge_width = if show_uncommitted_badge { 11 } else { 0 }; // " UNCOMMITED"
+                    let tasks_text =
+                        format!(" {}/{} tasks", change.completed_tasks, change.total_tasks);
+                    let tasks_width = tasks_text.len();
+                    let percent_text = format!("  {:>5.1}%", change.progress_percent());
+                    let percent_width = percent_text.len();
+                    let list_border_width = 2; // List widget border
+
+                    let base_width = checkbox_cursor_width
+                        + id_width
+                        + worktree_badge_width
+                        + new_badge_width
+                        + uncommitted_badge_width
+                        + tasks_width
+                        + percent_width
+                        + list_border_width;
+
+                    let available = (area.width as usize).saturating_sub(base_width);
+
+                    // Only show preview if available width >= 10 chars
+                    if available >= 10 {
+                        // Format relative time with parentheses
+                        let relative_time = format!("({})", format_relative_time(&log.created_at));
+
+                        // Build shortened header: [operation:iteration] or [operation]
+                        let header = match (&log.operation, log.iteration) {
+                            (Some(op), Some(iter)) => format!(" [{}:{}]", op, iter),
+                            (Some(op), None) => format!(" [{}]", op),
+                            (None, _) => String::new(),
+                        };
+
+                        // Combine relative time, header, and message
+                        let preview_text = if !header.is_empty() {
+                            format!(" {}{} {}", relative_time, header, log.message)
+                        } else {
+                            format!(" {} {}", relative_time, log.message)
+                        };
+
+                        // Truncate if necessary (Unicode-safe)
+                        let truncated =
+                            truncate_to_display_width_with_suffix(&preview_text, available, "…");
+
+                        // Use brighter color for selected row to ensure visibility on DarkGray background
+                        let preview_color = if is_selected_row {
+                            Color::Gray
+                        } else {
+                            Color::DarkGray
+                        };
+
+                        spans.push(Span::styled(truncated, Style::default().fg(preview_color)));
+                    }
+                }
+
+                ListItem::new(Line::from(spans))
+            }
         })
         .collect();
+
+    // Update list_state to select the visual index corresponding to the current cursor.
+    if !app.changes.is_empty() && app.cursor_index < change_to_visual.len() {
+        app.list_state
+            .select(Some(change_to_visual[app.cursor_index]));
+    }
 
     // Build dynamic key hints based on current state
     let has_selection = !app.changes.is_empty();
@@ -535,253 +658,271 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
 fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect) {
     let spinner_char = SPINNER_CHARS[app.spinner_frame];
 
-    let items: Vec<ListItem> = app
-        .changes
+    // Build grouped visual rows (project headers + change rows).
+    let (rows, change_to_visual) = build_change_rows(&app.changes);
+
+    let items: Vec<ListItem> = rows
         .iter()
-        .enumerate()
-        .map(|(i, change)| {
-            // Checkbox display (Running/Stopped mode):
-            // [ ] - not in queue / not marked
-            // [x] - in queue OR marked for execution (Stopped mode)
-            // [x] (gray) - archived (processing complete, no longer actionable)
-            // Note: Display is driven by 'selected' field, which serves dual purpose:
-            //   - Running: shows queue membership (selected=true means Queued/Processing)
-            //   - Stopped: shows execution mark (selected=true, queue_status=NotQueued)
-            let is_archived = matches!(
-                change.queue_status,
-                QueueStatus::Archived | QueueStatus::Merged
-            );
-            let show_uncommitted_badge = app.parallel_mode
-                && !change.is_parallel_eligible
-                && !is_archived
-                && matches!(
+        .map(|row| match row {
+            // Non-selectable project header row.
+            ChangeRow::Header(label) => {
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", label),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "─".repeat(area.width.saturating_sub(label.len() as u16 + 5) as usize),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]);
+                ListItem::new(line)
+            }
+            // Selectable change row.
+            ChangeRow::Item { change_index: i } => {
+                let i = *i;
+                let change = &app.changes[i];
+                // Checkbox display (Running/Stopped mode):
+                // [ ] - not in queue / not marked
+                // [x] - in queue OR marked for execution (Stopped mode)
+                // [x] (gray) - archived (processing complete, no longer actionable)
+                // Note: Display is driven by 'selected' field, which serves dual purpose:
+                //   - Running: shows queue membership (selected=true means Queued/Processing)
+                //   - Stopped: shows execution mark (selected=true, queue_status=NotQueued)
+                let is_archived = matches!(
                     change.queue_status,
-                    QueueStatus::NotQueued | QueueStatus::Queued
+                    QueueStatus::Archived | QueueStatus::Merged
                 );
-            let is_parallel_blocked = show_uncommitted_badge;
-            let (checkbox, checkbox_color) = if is_parallel_blocked {
-                ("[ ]", Color::DarkGray)
-            } else {
-                get_checkbox_display(&change.queue_status, change.selected)
-            };
+                let show_uncommitted_badge = app.parallel_mode
+                    && !change.is_parallel_eligible
+                    && !is_archived
+                    && matches!(
+                        change.queue_status,
+                        QueueStatus::NotQueued | QueueStatus::Queued
+                    );
+                let is_parallel_blocked = show_uncommitted_badge;
+                let (checkbox, checkbox_color) = if is_parallel_blocked {
+                    ("[ ]", Color::DarkGray)
+                } else {
+                    get_checkbox_display(&change.queue_status, change.selected)
+                };
 
-            let cursor = if i == app.cursor_index { "►" } else { " " };
-            let worktree_badge = if change.has_worktree { " WT" } else { "" };
-            let worktree_color = if is_parallel_blocked {
-                Color::DarkGray
-            } else {
-                Color::Green
-            };
-            let new_badge = if change.is_new { " NEW" } else { "" };
-            let uncommitted_badge = if show_uncommitted_badge {
-                " UNCOMMITED"
-            } else {
-                ""
-            };
+                let cursor = if i == app.cursor_index { "►" } else { " " };
+                let worktree_badge = if change.has_worktree { " WT" } else { "" };
+                let worktree_color = if is_parallel_blocked {
+                    Color::DarkGray
+                } else {
+                    Color::Green
+                };
+                let new_badge = if change.is_new { " NEW" } else { "" };
+                let uncommitted_badge = if show_uncommitted_badge {
+                    " UNCOMMITED"
+                } else {
+                    ""
+                };
 
-            // Use brighter colors for selected row to ensure visibility on DarkGray background
-            let is_selected_row = i == app.cursor_index;
-            let dim_color = if is_parallel_blocked {
-                Color::DarkGray
-            } else if is_selected_row {
-                Color::Gray // Brighter than DarkGray for visibility on selected row
-            } else {
-                Color::DarkGray
-            };
+                // Use brighter colors for selected row to ensure visibility on DarkGray background
+                let is_selected_row = i == app.cursor_index;
+                let dim_color = if is_parallel_blocked {
+                    Color::DarkGray
+                } else if is_selected_row {
+                    Color::Gray // Brighter than DarkGray for visibility on selected row
+                } else {
+                    Color::DarkGray
+                };
 
-            let name_color = if is_parallel_blocked {
-                Color::DarkGray
-            } else {
-                Color::White
-            };
+                let name_color = if is_parallel_blocked {
+                    Color::DarkGray
+                } else {
+                    Color::White
+                };
 
-            // Calculate elapsed time first
-            let elapsed_text = if let Some(elapsed) = change.elapsed_time {
-                format_duration(elapsed)
-            } else if let Some(started) = change.started_at {
-                format_duration(started.elapsed())
-            } else {
-                "--".to_string()
-            };
+                // Calculate elapsed time first
+                let elapsed_text = if let Some(elapsed) = change.elapsed_time {
+                    format_duration(elapsed)
+                } else if let Some(started) = change.started_at {
+                    format_duration(started.elapsed())
+                } else {
+                    "--".to_string()
+                };
 
-            // Build status text (without spinner for in-flight states)
-            // For in-flight states, spinner will be prepended separately with elapsed time
-            let (spinner_prefix, status_text) = match &change.queue_status {
-                QueueStatus::Applying => {
-                    let status = if let Some(iter) = change.iteration_number {
-                        format!("[{}:{}]", change.queue_status.display(), iter)
-                    } else {
-                        format!("[{}]", change.queue_status.display())
-                    };
-                    (format!("{} ", spinner_char), status)
+                // Build status text (without spinner for in-flight states)
+                // For in-flight states, spinner will be prepended separately with elapsed time
+                let (spinner_prefix, status_text) = match &change.queue_status {
+                    QueueStatus::Applying => {
+                        let status = if let Some(iter) = change.iteration_number {
+                            format!("[{}:{}]", change.queue_status.display(), iter)
+                        } else {
+                            format!("[{}]", change.queue_status.display())
+                        };
+                        (format!("{} ", spinner_char), status)
+                    }
+                    QueueStatus::Archiving | QueueStatus::Resolving | QueueStatus::Accepting => {
+                        let status = if let Some(iter) = change.iteration_number {
+                            format!("[{}:{}]", change.queue_status.display(), iter)
+                        } else {
+                            format!("[{}]", change.queue_status.display())
+                        };
+                        (format!("{} ", spinner_char), status)
+                    }
+                    QueueStatus::Archived | QueueStatus::Merged | QueueStatus::Error(_) => (
+                        String::new(),
+                        format!("[{}]", change.queue_status.display()),
+                    ),
+                    status => (String::new(), format!("[{}]", status.display())),
+                };
+
+                // Pre-calculate widths before moving values into Spans
+                let (spinner_elapsed_width, status_only_width) = if !spinner_prefix.is_empty() {
+                    let spinner_elapsed_text =
+                        format!(" {}{:>7} ", spinner_prefix.trim(), elapsed_text);
+                    (spinner_elapsed_text.len(), status_text.len())
+                } else {
+                    let status_formatted = format!(" {:>18}", status_text);
+                    (0, status_formatted.len())
+                };
+
+                // In grouped mode show only the bare change id (no project prefix).
+                let parsed = split_remote_change_id(&change.id);
+                let display_id = parsed.change;
+
+                let mut spans = vec![
+                    Span::styled(
+                        format!("{} {} ", checkbox, cursor),
+                        Style::default().fg(checkbox_color),
+                    ),
+                    Span::styled(
+                        format!("{:<25}", display_id),
+                        Style::default().fg(name_color),
+                    ),
+                    Span::styled(
+                        worktree_badge,
+                        Style::default()
+                            .fg(worktree_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        new_badge,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        uncommitted_badge,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ];
+
+                // For in-flight states: spinner → elapsed → status
+                // For other states: status only
+                if !spinner_prefix.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" {}{:>7} ", spinner_prefix.trim(), elapsed_text),
+                        Style::default().fg(dim_color),
+                    ));
+                    spans.push(Span::styled(
+                        status_text,
+                        Style::default().fg(change.queue_status.color()),
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        format!(" {:>18}", status_text),
+                        Style::default().fg(change.queue_status.color()),
+                    ));
                 }
-                QueueStatus::Archiving | QueueStatus::Resolving | QueueStatus::Accepting => {
-                    let status = if let Some(iter) = change.iteration_number {
-                        format!("[{}:{}]", change.queue_status.display(), iter)
-                    } else {
-                        format!("[{}]", change.queue_status.display())
-                    };
-                    (format!("{} ", spinner_char), status)
-                }
-                QueueStatus::Archived | QueueStatus::Merged | QueueStatus::Error(_) => (
-                    String::new(),
-                    format!("[{}]", change.queue_status.display()),
-                ),
-                status => (String::new(), format!("[{}]", status.display())),
-            };
 
-            // Pre-calculate widths before moving values into Spans
-            let (spinner_elapsed_width, status_only_width) = if !spinner_prefix.is_empty() {
-                let spinner_elapsed_text =
-                    format!(" {}{:>7} ", spinner_prefix.trim(), elapsed_text);
-                (spinner_elapsed_text.len(), status_text.len())
-            } else {
-                let status_formatted = format!(" {:>18}", status_text);
-                (0, status_formatted.len())
-            };
-
-            // For remote server mode we encode project_id into the change id as:
-            // "<project_id>::<project_name>/<change_id>".
-            // Render only the human-friendly portion.
-            let display_id = change
-                .id
-                .split_once("::")
-                .map(|(_, b)| b)
-                .unwrap_or(&change.id);
-
-            let mut spans = vec![
-                Span::styled(
-                    format!("{} {} ", checkbox, cursor),
-                    Style::default().fg(checkbox_color),
-                ),
-                Span::styled(
-                    format!("{:<25}", display_id),
-                    Style::default().fg(name_color),
-                ),
-                Span::styled(
-                    worktree_badge,
-                    Style::default()
-                        .fg(worktree_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    new_badge,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    uncommitted_badge,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ];
-
-            // For in-flight states: spinner → elapsed → status
-            // For other states: status only
-            if !spinner_prefix.is_empty() {
+                // For Applying status, show progress as "completed/total(percent%)"
+                // For other statuses, show just "completed/total"
+                let tasks_text = if matches!(change.queue_status, QueueStatus::Applying) {
+                    format!(
+                        "  {}/{}({:.0}%)",
+                        change.completed_tasks,
+                        change.total_tasks,
+                        change.progress_percent()
+                    )
+                } else {
+                    format!("  {}/{}", change.completed_tasks, change.total_tasks)
+                };
                 spans.push(Span::styled(
-                    format!(" {}{:>7} ", spinner_prefix.trim(), elapsed_text),
+                    tasks_text.clone(),
                     Style::default().fg(dim_color),
                 ));
-                spans.push(Span::styled(
-                    status_text,
-                    Style::default().fg(change.queue_status.color()),
-                ));
-            } else {
-                spans.push(Span::styled(
-                    format!(" {:>18}", status_text),
-                    Style::default().fg(change.queue_status.color()),
-                ));
-            }
 
-            // For Applying status, show progress as "completed/total(percent%)"
-            // For other statuses, show just "completed/total"
-            let tasks_text = if matches!(change.queue_status, QueueStatus::Applying) {
-                format!(
-                    "  {}/{}({:.0}%)",
-                    change.completed_tasks,
-                    change.total_tasks,
-                    change.progress_percent()
-                )
-            } else {
-                format!("  {}/{}", change.completed_tasks, change.total_tasks)
-            };
-            spans.push(Span::styled(
-                tasks_text.clone(),
-                Style::default().fg(dim_color),
-            ));
+                // Add log preview if available
+                if let Some(log) = app.get_latest_log_for_change(&change.id) {
+                    // Calculate actual occupied width dynamically
+                    let checkbox_cursor_text = format!("{} {} ", checkbox, cursor);
+                    let checkbox_cursor_width = checkbox_cursor_text.len();
+                    let id_text = format!("{:<25}", display_id);
+                    let id_width = id_text.len();
+                    let worktree_badge_width = if change.has_worktree { 3 } else { 0 }; // " WT"
+                    let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"
+                    let uncommitted_badge_width = if show_uncommitted_badge { 11 } else { 0 }; // " UNCOMMITED"
 
-            // Add log preview if available
-            if let Some(log) = app.get_latest_log_for_change(&change.id) {
-                // Calculate actual occupied width dynamically
-                let checkbox_cursor_text = format!("{} {} ", checkbox, cursor);
-                let checkbox_cursor_width = checkbox_cursor_text.len(); // Actual: "[x] ► " is 6 chars
-                let display_id = change
-                    .id
-                    .split_once("::")
-                    .map(|(_, b)| b)
-                    .unwrap_or(&change.id);
-                let id_text = format!("{:<25}", display_id);
-                let id_width = id_text.len(); // max(25, change.id.len())
-                let worktree_badge_width = if change.has_worktree { 3 } else { 0 }; // " WT"
-                let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"
-                let uncommitted_badge_width = if show_uncommitted_badge { 11 } else { 0 }; // " UNCOMMITED"
+                    // Use the actual tasks_text that was already formatted above
+                    let tasks_width = tasks_text.len();
+                    let list_border_width = 2; // List widget border
 
-                // Use the actual tasks_text that was already formatted above
-                let tasks_width = tasks_text.len();
-                let list_border_width = 2; // List widget border
+                    let base_width = checkbox_cursor_width
+                        + id_width
+                        + worktree_badge_width
+                        + new_badge_width
+                        + uncommitted_badge_width
+                        + spinner_elapsed_width
+                        + status_only_width
+                        + tasks_width
+                        + list_border_width;
 
-                let base_width = checkbox_cursor_width
-                    + id_width
-                    + worktree_badge_width
-                    + new_badge_width
-                    + uncommitted_badge_width
-                    + spinner_elapsed_width
-                    + status_only_width
-                    + tasks_width
-                    + list_border_width;
+                    let available = (area.width as usize).saturating_sub(base_width);
 
-                let available = (area.width as usize).saturating_sub(base_width);
+                    // Only show preview if available width >= 10 chars
+                    if available >= 10 {
+                        // Format relative time with parentheses
+                        let relative_time = format!("({})", format_relative_time(&log.created_at));
 
-                // Only show preview if available width >= 10 chars
-                if available >= 10 {
-                    // Format relative time with parentheses
-                    let relative_time = format!("({})", format_relative_time(&log.created_at));
+                        // Build shortened header: [operation:iteration] or [operation]
+                        let header = match (&log.operation, log.iteration) {
+                            (Some(op), Some(iter)) => format!(" [{}:{}]", op, iter),
+                            (Some(op), None) => format!(" [{}]", op),
+                            (None, _) => String::new(),
+                        };
 
-                    // Build shortened header: [operation:iteration] or [operation]
-                    let header = match (&log.operation, log.iteration) {
-                        (Some(op), Some(iter)) => format!(" [{}:{}]", op, iter),
-                        (Some(op), None) => format!(" [{}]", op),
-                        (None, _) => String::new(),
-                    };
+                        // Combine relative time, header, and message
+                        let preview_text = if !header.is_empty() {
+                            format!(" {}{} {}", relative_time, header, log.message)
+                        } else {
+                            format!(" {} {}", relative_time, log.message)
+                        };
 
-                    // Combine relative time, header, and message
-                    let preview_text = if !header.is_empty() {
-                        format!(" {}{} {}", relative_time, header, log.message)
-                    } else {
-                        format!(" {} {}", relative_time, log.message)
-                    };
+                        // Truncate if necessary (Unicode-safe)
+                        let truncated =
+                            truncate_to_display_width_with_suffix(&preview_text, available, "…");
 
-                    // Truncate if necessary (Unicode-safe)
-                    let truncated =
-                        truncate_to_display_width_with_suffix(&preview_text, available, "…");
+                        // Use brighter color for selected row to ensure visibility on DarkGray background
+                        let preview_color = if is_selected_row {
+                            Color::Gray
+                        } else {
+                            Color::DarkGray
+                        };
 
-                    // Use brighter color for selected row to ensure visibility on DarkGray background
-                    let preview_color = if is_selected_row {
-                        Color::Gray
-                    } else {
-                        Color::DarkGray
-                    };
-
-                    spans.push(Span::styled(truncated, Style::default().fg(preview_color)));
+                        spans.push(Span::styled(truncated, Style::default().fg(preview_color)));
+                    }
                 }
-            }
 
-            ListItem::new(Line::from(spans))
+                ListItem::new(Line::from(spans))
+            }
         })
         .collect();
+
+    // Update list_state to select the visual index corresponding to the current cursor.
+    if !app.changes.is_empty() && app.cursor_index < change_to_visual.len() {
+        app.list_state
+            .select(Some(change_to_visual[app.cursor_index]));
+    }
 
     // Build dynamic key hints based on current state (same logic as select mode)
     let has_selection = !app.changes.is_empty();
@@ -2637,6 +2778,144 @@ mod tests {
         assert!(
             content.contains("x: toggle all"),
             "Should show 'x: toggle all' hint in Select mode with logs present"
+        );
+    }
+
+    // =========================================================================
+    // Tests for split_remote_change_id
+    // =========================================================================
+
+    #[test]
+    fn test_split_remote_change_id_local() {
+        let parsed = split_remote_change_id("my-change");
+        assert_eq!(parsed.project, None);
+        assert_eq!(parsed.change, "my-change");
+    }
+
+    #[test]
+    fn test_split_remote_change_id_remote() {
+        // Format: <project_id>::<project_name>/<change_id>
+        let parsed = split_remote_change_id("abc123::myproject/add-feature");
+        assert_eq!(parsed.project, Some("myproject"));
+        assert_eq!(parsed.change, "add-feature");
+    }
+
+    #[test]
+    fn test_split_remote_change_id_remote_nested_path() {
+        // rsplit_once('/') means we split at the LAST slash
+        let parsed = split_remote_change_id("abc123::org/project/fix-bug");
+        assert_eq!(parsed.project, Some("org/project"));
+        assert_eq!(parsed.change, "fix-bug");
+    }
+
+    #[test]
+    fn test_split_remote_change_id_no_slash_after_colon() {
+        // "::" present but no "/" after it
+        let parsed = split_remote_change_id("abc123::mychange");
+        assert_eq!(parsed.project, None);
+        assert_eq!(parsed.change, "mychange");
+    }
+
+    // =========================================================================
+    // Tests for build_change_rows
+    // =========================================================================
+
+    fn make_change_state(id: &str) -> ChangeState {
+        ChangeState {
+            id: id.to_string(),
+            completed_tasks: 0,
+            total_tasks: 3,
+            queue_status: crate::tui::types::QueueStatus::NotQueued,
+            selected: false,
+            is_new: false,
+            is_parallel_eligible: true,
+            has_worktree: false,
+            started_at: None,
+            elapsed_time: None,
+            iteration_number: None,
+        }
+    }
+
+    #[test]
+    fn test_build_change_rows_all_local() {
+        let changes = vec![make_change_state("change-a"), make_change_state("change-b")];
+        let (rows, c2v) = build_change_rows(&changes);
+        // No project grouping: 2 rows, no headers
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0], ChangeRow::Item { change_index: 0 }));
+        assert!(matches!(rows[1], ChangeRow::Item { change_index: 1 }));
+        assert_eq!(c2v[0], 0);
+        assert_eq!(c2v[1], 1);
+    }
+
+    #[test]
+    fn test_build_change_rows_remote_grouping() {
+        let changes = vec![
+            make_change_state("p1::proj-a/change-x"),
+            make_change_state("p1::proj-a/change-y"),
+            make_change_state("p2::proj-b/change-z"),
+        ];
+        let (rows, c2v) = build_change_rows(&changes);
+        // 2 project groups → 2 headers + 3 change rows = 5 visual rows
+        assert_eq!(rows.len(), 5);
+        // Row 0: header "proj-a"
+        assert!(matches!(&rows[0], ChangeRow::Header(h) if h == "proj-a"));
+        // Row 1: change-x (change_index=0)
+        assert!(matches!(rows[1], ChangeRow::Item { change_index: 0 }));
+        // Row 2: change-y (change_index=1)
+        assert!(matches!(rows[2], ChangeRow::Item { change_index: 1 }));
+        // Row 3: header "proj-b"
+        assert!(matches!(&rows[3], ChangeRow::Header(h) if h == "proj-b"));
+        // Row 4: change-z (change_index=2)
+        assert!(matches!(rows[4], ChangeRow::Item { change_index: 2 }));
+        // Mapping: change 0 → visual 1, change 1 → visual 2, change 2 → visual 4
+        assert_eq!(c2v[0], 1);
+        assert_eq!(c2v[1], 2);
+        assert_eq!(c2v[2], 4);
+    }
+
+    #[test]
+    fn test_build_change_rows_mixed_local_and_remote() {
+        let changes = vec![
+            make_change_state("local-change"),
+            make_change_state("pid::remote-proj/remote-change"),
+        ];
+        let (rows, c2v) = build_change_rows(&changes);
+        // 2 project groups (None for local, Some("remote-proj") for remote) → 2 headers + 2 items
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(&rows[0], ChangeRow::Header(h) if h == "(local)"));
+        assert!(matches!(rows[1], ChangeRow::Item { change_index: 0 }));
+        assert!(matches!(&rows[2], ChangeRow::Header(h) if h == "remote-proj"));
+        assert!(matches!(rows[3], ChangeRow::Item { change_index: 1 }));
+        assert_eq!(c2v[0], 1);
+        assert_eq!(c2v[1], 3);
+    }
+
+    #[test]
+    fn test_grouped_display_shows_project_header() {
+        // Render with two changes from the same remote project
+        let app_changes = vec![
+            create_test_change("pid::myproject/feat-a"),
+            create_test_change("pid::myproject/feat-b"),
+        ];
+        let mut app = create_test_app(app_changes);
+
+        let buffer = render_buffer(&mut app, 120, 30);
+        let content = buffer_to_string(&buffer);
+
+        // Project header should appear
+        assert!(
+            content.contains("myproject"),
+            "Should show project name as header in grouped display"
+        );
+        // Bare change ids should appear (not the full path)
+        assert!(
+            content.contains("feat-a"),
+            "Should show bare change id feat-a"
+        );
+        assert!(
+            content.contains("feat-b"),
+            "Should show bare change id feat-b"
         );
     }
 }
