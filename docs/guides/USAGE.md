@@ -1,38 +1,42 @@
-# OpenSpec Orchestrator Usage Examples
+# Conflux Usage Examples
 
 ## Quick Start
 
+### Golden Path: First-Time Setup
+
+The fastest way to get started:
+
+```bash
+# Step 1: Generate configuration for your AI agent
+cflx init
+
+# Step 2: Edit the generated .cflx.jsonc to set your agent commands
+vim .cflx.jsonc
+
+# Step 3: Launch the interactive TUI to review and process changes
+cflx
+```
+
 ### Basic Usage
 
-Run the orchestrator to process all pending changes:
+Launch the interactive TUI dashboard (default):
+
+```bash
+cflx
+```
+
+Or run orchestration in headless (non-interactive) mode:
 
 ```bash
 cflx run
 ```
 
-This will:
-1. List all changes via `openspec list`
+The `cflx run` command will:
+1. List all pending changes via `openspec list`
 2. Analyze dependencies and select the next change
-3. Apply changes using `opencode run "/openspec-apply <id>"`
-4. Archive completed changes using `openspec archive <id>`
+3. Apply changes using the configured AI agent command
+4. Archive completed changes
 5. Repeat until all changes are processed
-
-### Dry Run
-
-Preview what the orchestrator would do without executing:
-
-```bash
-cflx run --dry-run
-```
-
-Output:
-```
-[00:00:01] ████████████████████░░░░░░░░░░░░░░░ 2/5 Overall progress
-  [████████████████░░░░░░░░░░░░░░░░░░░░] 4/10 add-feature-x (40.0%)
-
-[DRY RUN] Would apply: add-feature-x
-[DRY RUN] Would archive: fix-bug-y
-```
 
 ### Process Specific Change
 
@@ -44,70 +48,101 @@ cflx run --change add-feature-x
 
 This focuses only on `add-feature-x`, ignoring other changes.
 
-## Advanced Usage
+### Multiple Changes
 
-### Custom Binary Paths
-
-If `opencode` or `openspec` are not in your PATH:
+Process a specific set of changes:
 
 ```bash
-cflx run \
-  --opencode-path ~/bin/opencode \
-  --openspec-path ~/bin/openspec
+cflx run --change add-feature-x,fix-bug-y,refactor-z
 ```
 
-### Check Status
+## Configuration
 
-View current orchestration state:
+### Generate Configuration File
 
 ```bash
-cflx status
+# Default: Claude Code template
+cflx init
+
+# OpenCode template
+cflx init --template opencode
+
+# Codex template
+cflx init --template codex
+
+# Overwrite existing config
+cflx init --force
 ```
 
-Output:
-```
-=== Orchestrator Status ===
-Started at: 2026-01-08 15:00:00 UTC
-Last update: 2026-01-08 15:45:00 UTC
-Total iterations: 5
+Available templates: `claude` (default), `opencode`, `codex`
 
-Current change: "add-feature-x"
-
-Processed changes: 2
-  - add-feature-x
-  - refactor-z
-
-Archived changes: 1
-  - fix-bug-y
-
-Failed changes: 0
-```
-
-### Reset State
-
-Clear orchestration state to start fresh:
+### Custom Configuration File
 
 ```bash
-# With confirmation prompt
-cflx reset
-
-# Skip confirmation
-cflx reset --yes
+cflx run --config /path/to/config.jsonc
 ```
+
+## Parallel Execution
+
+### Preview Parallelization Plan (Dry Run)
+
+Preview parallelization groups without executing:
+
+```bash
+cflx run --parallel --dry-run
+```
+
+### Run in Parallel Mode
+
+```bash
+# Auto-detect VCS backend (default)
+cflx run --parallel
+
+# Force Git worktrees
+cflx run --parallel --vcs git
+
+# Limit concurrent workspaces
+cflx run --parallel --max-concurrent 5
+```
+
+## Web Monitoring
+
+Enable the web monitoring server alongside the TUI or headless run:
+
+```bash
+# TUI with web monitoring (OS auto-assigns port)
+cflx --web
+
+# Headless run with web monitoring
+cflx run --web
+
+# Custom port and bind address
+cflx --web --web-port 9000 --web-bind 0.0.0.0
+```
+
+Access the dashboard at `http://localhost:<port>/` (port shown in startup log).
 
 ## Workflow Examples
 
 ### Example 1: Automated Full Run
 
 ```bash
-# Start orchestration
+# Generate config and start orchestration
+cflx init
 cflx run
-
-# Check progress in another terminal
-watch -n 5 cflx status
 ```
 
-### Example 2: Step-by-Step Processing
+### Example 2: Interactive TUI Workflow
+
+```bash
+# Launch TUI and interactively select changes to process
+cflx
+# - Use @ to approve changes
+# - Use Space to select changes
+# - Press F5 to start processing
+```
+
+### Example 3: Step-by-Step Processing
 
 ```bash
 # Process first change
@@ -118,38 +153,32 @@ openspec list
 
 # Process second change
 cflx run --change change-2
-
-# Check final status
-cflx status
 ```
 
-### Example 3: Recovery from Failure
+### Example 4: Recovery from Interruption
 
 ```bash
 # Run orchestrator
 cflx run
 
-# If interrupted or failed, check status
-cflx status
-
-# Resume (state is automatically loaded)
+# If interrupted, just run again - workspaces are automatically resumed
 cflx run
+
+# To force fresh start (discard existing workspaces)
+cflx run --parallel --no-resume
 ```
 
-### Example 4: Development Workflow
+### Example 5: Development Workflow
 
 ```bash
-# Dry run to see execution plan
-cflx run --dry-run
+# Preview parallelization plan
+cflx run --parallel --dry-run
 
 # Review changes manually
 openspec list
 
-# Execute for real
-cflx run
-
-# Monitor progress
-tail -f .opencode/orchestrator-state.json
+# Execute in parallel
+cflx run --parallel
 ```
 
 ## Integration with CI/CD
@@ -157,7 +186,7 @@ tail -f .opencode/orchestrator-state.json
 ### GitHub Actions
 
 ```yaml
-name: OpenSpec Orchestrator
+name: Conflux Orchestrator
 
 on:
   schedule:
@@ -170,22 +199,13 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - name: Install dependencies
-        run: |
-          cargo install --path cflx
+      - name: Install Conflux
+        run: cargo install --path .
 
       - name: Run orchestrator
-        run: |
-          cflx run
+        run: cflx run
         env:
           RUST_LOG: info
-
-      - name: Upload state
-        if: always()
-        uses: actions/upload-artifact@v3
-        with:
-          name: orchestrator-state
-          path: .opencode/orchestrator-state.json
 ```
 
 ### Docker
@@ -193,7 +213,7 @@ jobs:
 ```dockerfile
 FROM rust:1.75 as builder
 WORKDIR /app
-COPY cflx ./
+COPY . .
 RUN cargo build --release
 
 FROM ubuntu:22.04
@@ -213,7 +233,7 @@ docker run -v $(pwd):/workspace cflx run
 ### Debug Mode
 
 ```bash
-RUST_LOG=debug cflx run --dry-run 2>&1 | tee debug.log
+RUST_LOG=debug cflx run 2>&1 | tee debug.log
 ```
 
 ### Verbose Output
@@ -222,44 +242,37 @@ RUST_LOG=debug cflx run --dry-run 2>&1 | tee debug.log
 RUST_LOG=trace cflx run --change test-change
 ```
 
-### Check Logs
+### Check OpenSpec Changes
 
 ```bash
-# View orchestrator state
-cat .opencode/orchestrator-state.json | jq .
+# List all pending changes
+openspec list
 
-# Check OpenCode logs
-ls -la ~/.opencode/logs/
+# Check for spec conflicts between changes
+cflx check-conflicts
 ```
 
 ## Best Practices
 
-### 1. Always Start with Dry Run
+### 1. Use TUI for Interactive Work
 
 ```bash
-# See what would happen
-cflx run --dry-run
-
-# If looks good, execute
-cflx run
+# Launch TUI for visual progress and control
+cflx
 ```
 
-### 2. Monitor Progress
+### 2. Use `run` for Automated Pipelines
 
-Use a split terminal:
 ```bash
-# Terminal 1
+# Headless mode for CI/CD or background execution
 cflx run
-
-# Terminal 2
-watch -n 2 'openspec list && echo && cflx status'
 ```
 
 ### 3. Incremental Processing
 
 For safety, process one change at a time:
 ```bash
-for change in $(openspec list | grep -oP '^\s*-\s+\K[^\s]+'); do
+for change in $(openspec list --json | jq -r '.[].id'); do
   cflx run --change "$change"
   if [ $? -ne 0 ]; then
     echo "Failed on $change"
@@ -268,23 +281,24 @@ for change in $(openspec list | grep -oP '^\s*-\s+\K[^\s]+'); do
 done
 ```
 
-### 4. Regular State Checks
+### 4. Monitor with Web UI
 
 ```bash
-# Before starting
-openspec list
+# Start with web monitoring
+cflx --web
 
-# After completion
-cflx status
+# Or headless with web
+cflx run --web
+# Access dashboard: http://localhost:<port>/
 ```
 
 ## Tips
 
-- **Performance**: The orchestrator processes changes sequentially to respect dependencies
-- **Recovery**: State is saved after each iteration, so interruptions are safe
+- **Primary interface**: Use `cflx` (TUI) for interactive work; `cflx run` for automation
+- **Recovery**: Parallel mode automatically resumes from interrupted workspaces
 - **Debugging**: Use `RUST_LOG=debug` for detailed execution logs
-- **Safety**: Dry run is your friend - always test first
-- **Monitoring**: State file (`.opencode/orchestrator-state.json`) is human-readable JSON
+- **Conflict checking**: Use `cflx check-conflicts` to find spec conflicts before processing
+- **Templates**: Use `cflx init --template <claude|opencode|codex>` to match your AI agent
 
 ## Common Patterns
 
@@ -295,34 +309,27 @@ cflx status
 # nightly-orchestrator.sh
 
 cd /path/to/project
-cflx run --dry-run > /tmp/orchestrator-plan.txt
+cflx run
+STATUS=$?
 
-if [ $? -eq 0 ]; then
-  cflx run
-  echo "Orchestration completed" | mail -s "OpenSpec Orchestrator" admin@example.com
+if [ $STATUS -eq 0 ]; then
+  echo "Orchestration completed successfully"
+else
+  echo "Orchestration failed with status $STATUS"
 fi
 ```
 
 ### Pattern 2: Selective Processing
 
 ```bash
-# Process only high-priority changes
-openspec list | grep -E 'urgent|critical' | \
-  cut -d' ' -f3 | \
-  xargs -I {} cflx run --change {}
+# Process specific changes by name
+cflx run --change urgent-fix,critical-update
 ```
 
-### Pattern 3: Progress Notification
+### Pattern 3: Parallel with Monitoring
 
 ```bash
-cflx run
-STATUS=$?
-
-if [ $STATUS -eq 0 ]; then
-  curl -X POST https://hooks.slack.com/... \
-    -d '{"text":"✅ OpenSpec orchestration completed"}'
-else
-  curl -X POST https://hooks.slack.com/... \
-    -d '{"text":"❌ OpenSpec orchestration failed"}'
-fi
+# Run parallel with web monitoring
+cflx run --parallel --web --web-bind 0.0.0.0
+# Access from any device on local network
 ```

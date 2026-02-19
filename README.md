@@ -32,6 +32,19 @@ Automates the OpenSpec change workflow (list → dependency analysis → apply �
 
 ## Usage
 
+### Golden Path: Quick Start
+
+```bash
+# Step 1: Generate configuration for your AI agent (Claude Code by default)
+cflx init
+
+# Step 2: Edit the generated .cflx.jsonc to configure your agent
+vim .cflx.jsonc
+
+# Step 3: Launch the interactive TUI to review and process changes
+cflx
+```
+
 ### Interactive TUI (Primary Interface)
 
 The primary way to use the orchestrator is through the interactive TUI dashboard:
@@ -220,29 +233,6 @@ Custom configuration file:
 
 ```bash
 cflx run --config /path/to/config.jsonc
-```
-
-### Manage Change Approval
-
-Approve or unapprove changes to control which changes can be processed:
-
-```bash
-# Approve a change (creates checksums for validation)
-cflx approve set add-feature-x
-
-# Check approval status
-cflx approve status add-feature-x
-
-# Unapprove a change
-cflx approve unset add-feature-x
-```
-
-Approved changes have an `approved` file containing MD5 checksums of all specification files (excluding `tasks.md`). This ensures the change hasn't been modified since approval.
-
-Tip: The `approved` files are generated artifacts. You can commit them to share approvals with your team, but it’s also fine to ignore them. If you prefer to avoid churn/extra commits, add them to `.gitignore`:
-
-```gitignore
-openspec/changes/*/approved
 ```
 
 ## How It Works
@@ -509,35 +499,39 @@ cflx
 Usage: cflx [OPTIONS] [COMMAND]
 
 Commands:
-  run      Run the OpenSpec change orchestration loop (non-interactive, headless mode)
-  init     Initialize a new configuration file
-  approve  Manage change approval status
+  run              Run the OpenSpec change orchestration loop (non-interactive)
+  tui              Launch the interactive TUI dashboard
+  init             Initialize a new configuration file
+  check-conflicts  Check for conflicts between spec delta files across changes
 
 Options:
-  --opencode-path <PATH>   Path to opencode binary (deprecated, use config file)
-  --openspec-cmd <CMD>     OpenSpec command [env: OPENSPEC_CMD]
+  -c, --config <PATH>      Path to custom configuration file (JSONC format)
+  --web                    Enable web monitoring server for remote status viewing
+  --web-port <PORT>        Port for web monitoring server (default: 0 = auto-assign by OS)
+  --web-bind <ADDR>        Bind address for web monitoring server (default: 127.0.0.1)
   -h, --help               Print help
+  -V, --version            Print version
 ```
 
 **Run subcommand options:**
 ```
 Options:
-  --change <ID,...>     Process only specified changes (comma-separated)
-  -c, --config <PATH>   Custom configuration file path (JSONC)
-  --openspec-cmd <CMD>  Custom openspec command [env: OPENSPEC_CMD]
-  --parallel            Enable parallel execution mode
-  --max-concurrent <N>  Maximum concurrent workspaces (default: 3)
-  --vcs <BACKEND>       VCS backend: auto or git (default: auto)
-  --no-resume           Disable workspace resume (always create new workspaces)
-  --dry-run             Preview parallelization groups without executing
-  --web                 Enable web monitoring server
-  --web-port <PORT>     Web server port (default: 0 = auto-assign by OS)
-  --web-bind <ADDR>     Web server bind address (default: 127.0.0.1)
+  --change <ID,...>         Process only specified changes (comma-separated)
+  -c, --config <PATH>       Custom configuration file path (JSONC)
+  --parallel                Enable parallel execution mode
+  --max-concurrent <N>      Maximum concurrent workspaces (default: 3)
+  --vcs <BACKEND>           VCS backend: auto or git (default: auto)
+  --no-resume               Disable workspace resume (always create new workspaces)
+  --dry-run                 Preview parallelization groups without executing
+  --max-iterations <N>      Maximum number of orchestration loop iterations (0 = no limit)
+  --web                     Enable web monitoring server
+  --web-port <PORT>         Web server port (default: 0 = auto-assign by OS)
+  --web-bind <ADDR>         Web server bind address (default: 127.0.0.1)
 ```
 
 **TUI options:**
 
-The TUI (default mode) also supports web monitoring options:
+The TUI (default mode, `cflx` or `cflx tui`) also supports web monitoring options:
 
 ```bash
 # TUI with web monitoring
@@ -844,12 +838,10 @@ Options:
   -f, --force                Overwrite existing configuration file
 ```
 
-**Approve subcommand:**
+**Check-conflicts subcommand options:**
 ```
-Commands:
-  set     Approve a change (create approved file with checksums)
-  unset   Unapprove a change (remove approved file)
-  status  Check approval status of a change
+Options:
+  -j, --json  Output results in JSON format
 ```
 
 Priority: CLI argument > Environment variable > Default value
