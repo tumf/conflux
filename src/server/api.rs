@@ -16,6 +16,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use shlex;
 use tracing::{debug, error, info};
 
 use crate::execution::state::{detect_workspace_state, WorkspaceState};
@@ -650,29 +651,79 @@ pub async fn delete_project(
 ///
 /// Returns `(ran, exit_code)` where `ran` is true if the command was attempted,
 /// and `exit_code` is `Some(code)` if the command completed.
-async fn run_resolve_command(
-    resolve_command: &str,
-    work_dir: &std::path::Path,
-) -> (bool, Option<i32>) {
-    // Split command into program + args using shell-like splitting
-    let parts: Vec<&str> = resolve_command.split_whitespace().collect();
+fn build_resolve_command_argv(
+    resolve_command_template: &str,
+    prompt: &str,
+) -> Result<Vec<String>, String> {
+    let parts = shlex::split(resolve_command_template)
+        .ok_or_else(|| "Failed to parse resolve_command (shlex split returned None)".to_string())?;
     if parts.is_empty() {
-        return (false, None);
+        return Err("resolve_command is empty".to_string());
     }
 
-    let mut cmd = tokio::process::Command::new(parts[0]);
-    if parts.len() > 1 {
-        cmd.args(&parts[1..]);
+    Ok(parts
+        .into_iter()
+        .map(|p| p.replace("{prompt}", prompt))
+        .collect())
+}
+
+async fn run_resolve_command(
+    resolve_command_template: &str,
+    work_dir: &std::path::Path,
+    prompt: &str,
+) -> (bool, Option<i32>) {
+    // Parse into argv (quote-aware), then substitute placeholders at the argv level.
+    // This ensures `{prompt}` becomes a single argument even if it contains spaces.
+    let argv = match build_resolve_command_argv(resolve_command_template, prompt) {
+        Ok(v) => v,
+        Err(e) => {
+            error!(
+                "Failed to build resolve_command argv: template='{}' error='{}'",
+                resolve_command_template, e
+            );
+            return (true, Some(-1));
+        }
+    };
+
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    if argv.len() > 1 {
+        cmd.args(&argv[1..]);
     }
     cmd.current_dir(work_dir);
 
     match cmd.status().await {
         Ok(status) => (true, status.code()),
         Err(e) => {
-            error!("Failed to run resolve_command '{}': {}", resolve_command, e);
+            error!(
+                "Failed to run resolve_command '{}': {}",
+                resolve_command_template, e
+            );
             (true, Some(-1))
         }
     }
+}
+
+fn build_auto_resolve_prompt(
+    operation: &str,
+    project_id: &str,
+    remote_url: &str,
+    branch: &str,
+    local_sha: &str,
+    remote_sha: &str,
+    work_dir: &std::path::Path,
+) -> String {
+    // Keep this prompt short and machine-readable.
+    format!(
+        "Conflux server auto_resolve\noperation={}\nproject_id={}\nremote_url={}\nbranch={}\nlocal_sha={}\nremote_sha={}\nwork_dir={}\n\nTask: reconcile local state so the {} can proceed. Exit 0 on success, non-zero on failure.",
+        operation,
+        project_id,
+        remote_url,
+        branch,
+        local_sha,
+        remote_sha,
+        work_dir.display(),
+        operation
+    )
 }
 
 /// POST /api/v1/projects/:id/git/pull - pull from remote
@@ -891,7 +942,17 @@ pub async fn git_pull(
                                     "Non-fast-forward pull: auto_resolve enabled, running resolve_command: project_id={}",
                                     project_id
                                 );
-                                let (ran, code) = run_resolve_command(cmd, &local_repo_path).await;
+                                let prompt = build_auto_resolve_prompt(
+                                    "git_pull",
+                                    &project_id,
+                                    &remote_url,
+                                    &branch,
+                                    local_sha,
+                                    remote_sha,
+                                    &local_repo_path,
+                                );
+                                let (ran, code) =
+                                    run_resolve_command(cmd, &local_repo_path, &prompt).await;
                                 resolve_command_ran = ran;
                                 resolve_exit_code = code;
 
@@ -1167,7 +1228,16 @@ pub async fn git_push(
                             "Non-fast-forward push: auto_resolve enabled, running resolve_command: project_id={}",
                             project_id
                         );
-                        let (ran, code) = run_resolve_command(cmd, &local_repo_path).await;
+                        let prompt = build_auto_resolve_prompt(
+                            "git_push",
+                            &project_id,
+                            &remote_url,
+                            &branch,
+                            &local_sha,
+                            &remote_sha,
+                            &local_repo_path,
+                        );
+                        let (ran, code) = run_resolve_command(cmd, &local_repo_path, &prompt).await;
                         resolve_command_ran = ran;
                         resolve_exit_code = code;
 
@@ -2739,5 +2809,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_build_resolve_command_argv_replaces_prompt_placeholder_as_single_arg() {
+        let template = "opencode run --agent code '{prompt}'";
+        let prompt = "hello world";
+        let argv = super::build_resolve_command_argv(template, prompt).expect("argv should build");
+        assert_eq!(
+            argv,
+            vec![
+                "opencode".to_string(),
+                "run".to_string(),
+                "--agent".to_string(),
+                "code".to_string(),
+                "hello world".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_resolve_command_argv_handles_quotes_and_braces_literal() {
+        let template = "echo '{prompt}' '{prompt}-suffix'";
+        let prompt = "a b c";
+        let argv = super::build_resolve_command_argv(template, prompt).expect("argv should build");
+        assert_eq!(
+            argv,
+            vec![
+                "echo".to_string(),
+                "a b c".to_string(),
+                "a b c-suffix".to_string(),
+            ]
+        );
     }
 }
