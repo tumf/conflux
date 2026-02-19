@@ -177,8 +177,8 @@ impl RemoteClient {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::spawn_mock_http_server;
     use super::*;
-    use tokio::io::AsyncReadExt;
 
     #[test]
     fn test_ws_url_http() {
@@ -239,35 +239,6 @@ mod tests {
         assert_eq!(client.token(), None);
     }
 
-    /// Spawn a minimal mock HTTP server that captures the raw request and returns 200 OK.
-    ///
-    /// Returns `(addr, received_request_rx)` where the receiver yields the raw HTTP
-    /// request bytes sent by the client.
-    async fn spawn_mock_http_server(
-    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
-                let request_text = String::from_utf8_lossy(&buf[..n]).to_string();
-                let _ = tx.send(request_text);
-
-                // Send minimal HTTP 200 response with JSON body
-                let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]";
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        });
-
-        (addr, rx)
-    }
-
     /// Verify that the `Authorization: Bearer <token>` header is present in the HTTP
     /// request when a token is configured.
     #[tokio::test]
@@ -278,7 +249,7 @@ mod tests {
             Some("my-secret-token".to_string()),
         );
 
-        // list_projects() will fail (server returns "[]" which parses fine as empty vec)
+        // list_projects() will succeed (server returns "[]" which parses as empty vec)
         // but the HTTP request with Authorization header should have been sent
         let _ = client.list_projects().await;
 

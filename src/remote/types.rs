@@ -72,21 +72,17 @@ pub enum RemoteStateUpdate {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::{
+        change_update_json, full_state_json, make_remote_change, make_remote_log_entry,
+        make_remote_project, remote_change_json,
+    };
     use super::*;
 
     #[test]
     fn test_remote_change_deserialization() {
-        let json = r#"{
-            "id": "add-feature-x",
-            "project": "my-project",
-            "completed_tasks": 3,
-            "total_tasks": 5,
-            "last_modified": "2024-01-01T00:00:00Z",
-            "status": "applying",
-            "iteration_number": 2
-        }"#;
+        let json = remote_change_json("add-feature-x", "my-project", 3, 5, "applying", Some(2));
 
-        let change: RemoteChange = serde_json::from_str(json).unwrap();
+        let change: RemoteChange = serde_json::from_str(&json).unwrap();
         assert_eq!(change.id, "add-feature-x");
         assert_eq!(change.project, "my-project");
         assert_eq!(change.completed_tasks, 3);
@@ -97,18 +93,9 @@ mod tests {
 
     #[test]
     fn test_remote_state_update_full_state_deserialization() {
-        let json = r#"{
-            "type": "full_state",
-            "projects": [
-                {
-                    "id": "proj-1",
-                    "name": "Project 1",
-                    "changes": []
-                }
-            ]
-        }"#;
+        let json = full_state_json("proj-1", "Project 1", &[]);
 
-        let update: RemoteStateUpdate = serde_json::from_str(json).unwrap();
+        let update: RemoteStateUpdate = serde_json::from_str(&json).unwrap();
         match update {
             RemoteStateUpdate::FullState { projects } => {
                 assert_eq!(projects.len(), 1);
@@ -120,20 +107,10 @@ mod tests {
 
     #[test]
     fn test_remote_state_update_change_update_deserialization() {
-        let json = r#"{
-            "type": "change_update",
-            "change": {
-                "id": "my-change",
-                "project": "proj-1",
-                "completed_tasks": 1,
-                "total_tasks": 3,
-                "last_modified": "2024-01-01T00:00:00Z",
-                "status": "queued",
-                "iteration_number": null
-            }
-        }"#;
+        let change = remote_change_json("my-change", "proj-1", 1, 3, "queued", None);
+        let json = change_update_json(&change);
 
-        let update: RemoteStateUpdate = serde_json::from_str(json).unwrap();
+        let update: RemoteStateUpdate = serde_json::from_str(&json).unwrap();
         match update {
             RemoteStateUpdate::ChangeUpdate { change } => {
                 assert_eq!(change.id, "my-change");
@@ -148,6 +125,39 @@ mod tests {
         let json = r#"{"type": "ping"}"#;
         let update: RemoteStateUpdate = serde_json::from_str(json).unwrap();
         assert!(matches!(update, RemoteStateUpdate::Ping));
+    }
+
+    /// Verify that the struct builders produce correct default values.
+    #[test]
+    fn test_make_remote_change_defaults() {
+        let change = make_remote_change("test-id", "test-project");
+        assert_eq!(change.id, "test-id");
+        assert_eq!(change.project, "test-project");
+        assert_eq!(change.status, "queued");
+        assert_eq!(change.iteration_number, None);
+    }
+
+    /// Verify that make_remote_project correctly assembles a project with changes.
+    #[test]
+    fn test_make_remote_project() {
+        let changes = vec![
+            make_remote_change("change-1", "proj-a"),
+            make_remote_change("change-2", "proj-a"),
+        ];
+        let project = make_remote_project("proj-a", "Project A", changes);
+        assert_eq!(project.id, "proj-a");
+        assert_eq!(project.name, "Project A");
+        assert_eq!(project.changes.len(), 2);
+    }
+
+    /// Verify that make_remote_log_entry produces a valid log entry.
+    #[test]
+    fn test_make_remote_log_entry_defaults() {
+        let entry = make_remote_log_entry("test message", "info");
+        assert_eq!(entry.message, "test message");
+        assert_eq!(entry.level, "info");
+        assert_eq!(entry.change_id, None);
+        assert_eq!(entry.operation, None);
     }
 
     /// Verify that a RemoteLogEntry can be serialized and deserialized correctly (round-trip).
