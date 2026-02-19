@@ -32,6 +32,22 @@ Automates the OpenSpec change workflow (list → dependency analysis → apply �
 
 ## Usage
 
+### Golden Path: Quick Start
+
+```bash
+# Step 1: Generate configuration for your AI agent (Claude Code by default)
+cflx init
+
+# Step 2: Edit the generated .cflx.jsonc to configure your agent
+vim .cflx.jsonc
+
+# Step 3a: Launch the interactive TUI to review and process changes
+cflx
+
+# Step 3b: Or run in headless (non-interactive) mode
+cflx run
+```
+
 ### Interactive TUI (Primary Interface)
 
 The primary way to use the orchestrator is through the interactive TUI dashboard:
@@ -220,29 +236,6 @@ Custom configuration file:
 
 ```bash
 cflx run --config /path/to/config.jsonc
-```
-
-### Manage Change Approval
-
-Approve or unapprove changes to control which changes can be processed:
-
-```bash
-# Approve a change (creates checksums for validation)
-cflx approve set add-feature-x
-
-# Check approval status
-cflx approve status add-feature-x
-
-# Unapprove a change
-cflx approve unset add-feature-x
-```
-
-Approved changes have an `approved` file containing MD5 checksums of all specification files (excluding `tasks.md`). This ensures the change hasn't been modified since approval.
-
-Tip: The `approved` files are generated artifacts. You can commit them to share approvals with your team, but it’s also fine to ignore them. If you prefer to avoid churn/extra commits, add them to `.gitignore`:
-
-```gitignore
-openspec/changes/*/approved
 ```
 
 ## How It Works
@@ -509,35 +502,43 @@ cflx
 Usage: cflx [OPTIONS] [COMMAND]
 
 Commands:
-  run      Run the OpenSpec change orchestration loop (non-interactive, headless mode)
-  init     Initialize a new configuration file
-  approve  Manage change approval status
+  run              Run the OpenSpec change orchestration loop (non-interactive)
+  tui              Launch the interactive TUI dashboard
+  init             Initialize a new configuration file
+  check-conflicts  Check for conflicts between spec delta files across changes
+  server           Start the multi-project server daemon
 
 Options:
-  --opencode-path <PATH>   Path to opencode binary (deprecated, use config file)
-  --openspec-cmd <CMD>     OpenSpec command [env: OPENSPEC_CMD]
-  -h, --help               Print help
+  -c, --config <PATH>          Path to custom configuration file (JSONC format)
+  --web                        Enable web monitoring server for remote status viewing
+  --web-port <PORT>            Port for web monitoring server (default: 0 = auto-assign by OS)
+  --web-bind <ADDR>            Bind address for web monitoring server (default: 127.0.0.1)
+  --server <URL>               Connect TUI to a remote Conflux server (e.g., http://host:9876)
+  --server-token <TOKEN>       Bearer token for remote server authentication
+  --server-token-env <VAR>     Environment variable holding the bearer token
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
 
 **Run subcommand options:**
 ```
 Options:
-  --change <ID,...>     Process only specified changes (comma-separated)
-  -c, --config <PATH>   Custom configuration file path (JSONC)
-  --openspec-cmd <CMD>  Custom openspec command [env: OPENSPEC_CMD]
-  --parallel            Enable parallel execution mode
-  --max-concurrent <N>  Maximum concurrent workspaces (default: 3)
-  --vcs <BACKEND>       VCS backend: auto or git (default: auto)
-  --no-resume           Disable workspace resume (always create new workspaces)
-  --dry-run             Preview parallelization groups without executing
-  --web                 Enable web monitoring server
-  --web-port <PORT>     Web server port (default: 0 = auto-assign by OS)
-  --web-bind <ADDR>     Web server bind address (default: 127.0.0.1)
+  --change <ID,...>         Process only specified changes (comma-separated)
+  -c, --config <PATH>       Custom configuration file path (JSONC)
+  --parallel                Enable parallel execution mode
+  --max-concurrent <N>      Maximum concurrent workspaces (default: 3)
+  --vcs <BACKEND>           VCS backend: auto or git (default: auto)
+  --no-resume               Disable workspace resume (always create new workspaces)
+  --dry-run                 Preview parallelization groups without executing
+  --max-iterations <N>      Maximum number of orchestration loop iterations (0 = no limit)
+  --web                     Enable web monitoring server
+  --web-port <PORT>         Web server port (default: 0 = auto-assign by OS)
+  --web-bind <ADDR>         Web server bind address (default: 127.0.0.1)
 ```
 
 **TUI options:**
 
-The TUI (default mode) also supports web monitoring options:
+The TUI (default mode, `cflx` or `cflx tui`) also supports web monitoring options:
 
 ```bash
 # TUI with web monitoring
@@ -844,12 +845,10 @@ Options:
   -f, --force                Overwrite existing configuration file
 ```
 
-**Approve subcommand:**
+**Check-conflicts subcommand options:**
 ```
-Commands:
-  set     Approve a change (create approved file with checksums)
-  unset   Unapprove a change (remove approved file)
-  status  Check approval status of a change
+Options:
+  -j, --json  Output results in JSON format
 ```
 
 Priority: CLI argument > Environment variable > Default value
@@ -900,6 +899,146 @@ This will build and install the orchestrator to your Cargo bin directory (typica
 | [API Specification](docs/openapi.yaml) | OpenAPI spec for web monitoring |
 
 Internal documentation (parallel execution audit) is available in `docs/audit/`.
+
+## Project Structure
+
+```
+src/
+  lib.rs                    # Library crate root
+  main.rs                   # Entry point, CLI dispatching
+  cli.rs                    # CLI argument parsing (clap)
+  error.rs                  # Error types (thiserror)
+  openspec.rs               # OpenSpec CLI wrapper
+  orchestrator.rs           # Main orchestration loop
+  progress.rs               # Progress display (indicatif)
+  hooks.rs                  # Lifecycle hook execution
+  task_parser.rs            # Native tasks.md parser
+  templates.rs              # Configuration templates
+  acceptance.rs             # Acceptance test output parsing
+  ai_command_runner.rs      # Common AI command runner (unified stagger state)
+  analyzer.rs               # Change dependency analyzer
+  command_queue.rs          # Command queue with stagger and retry
+  events.rs                 # Unified event system
+  history.rs                # Apply/archive/resolve history
+  error_history.rs          # Error history tracking
+  merge_stall_monitor.rs    # Merge stall detection monitor
+  parallel_run_service.rs   # Parallel execution service
+  permission.rs             # Permission auto-reject detection
+  process_manager.rs        # Cross-platform child process management
+  serial_run_service.rs     # Serial execution service
+  spec_delta.rs             # Spec delta parsing and conflict detection
+  spec_test_annotations.rs  # Spec test annotation support
+  stall.rs                  # Stall detection utilities
+  worktree_ops.rs           # Common worktree operations (TUI and Web)
+
+  bin/
+    openapi_gen.rs          # OpenAPI spec generator binary
+
+  agent/                    # AI agent command execution
+    mod.rs                  # Agent runner module
+    runner.rs               # Agent runner implementation
+    output.rs               # Output line types
+    prompt.rs               # Prompt building functions
+    history_ops.rs          # History management operations
+    tests.rs                # Agent module tests
+
+  execution/                # Shared execution logic
+    mod.rs                  # Execution module root
+    apply.rs                # Apply operation logic
+    archive.rs              # Archive operation logic
+    state.rs                # Workspace state detection
+    types.rs                # Common type definitions
+
+  orchestration/            # Shared orchestration logic
+    mod.rs                  # Common CLI/TUI orchestration
+    acceptance.rs           # Shared acceptance operations
+    apply.rs                # Shared apply operations
+    archive.rs              # Shared archive operations
+    hooks.rs                # Hook context helpers
+    output.rs               # Output handler trait
+    selection.rs            # Shared change selection logic
+    state.rs                # Shared state management
+
+  config/                   # Configuration
+    mod.rs                  # Configuration module root
+    defaults.rs             # Default values
+    expand.rs               # Environment variable expansion
+    jsonc.rs                # JSONC parser
+
+  vcs/                      # Version Control abstraction
+    mod.rs                  # VCS module root
+    commands.rs             # Common VCS interface
+    git/                    # Git backend
+      mod.rs                # Git module root
+      commands/             # Git command implementations
+        mod.rs              # Git commands module root
+        basic.rs            # Basic git operations
+        commit.rs           # Commit operations
+        merge.rs            # Merge operations
+        worktree.rs         # Worktree management
+
+  parallel/                 # Parallel execution
+    mod.rs                  # Parallel module root
+    executor.rs             # Parallel change executor
+    events.rs               # Progress reporting events
+    conflict.rs             # Conflict detection/resolution
+    cleanup.rs              # Workspace cleanup
+    dynamic_queue.rs        # Dynamic queue for runtime change additions
+    merge.rs                # Merge operations for parallel execution
+    output_bridge.rs        # Bridge between OutputHandler and ParallelEvent
+    types.rs                # Common types for parallel execution
+    workspace.rs            # Workspace creation and management
+    tests/                  # Parallel module tests
+      mod.rs                # Test module root
+      auto_resolve.rs       # Auto-resolve tests
+      conflict.rs           # Conflict detection tests
+      executor.rs           # Executor tests
+      manual_resolve.rs     # Manual resolve tests
+
+  remote/                   # Remote server client (TUI)
+    mod.rs                  # HTTP and WebSocket client module
+    client.rs               # HTTP client for remote server
+    mapper.rs               # Remote type to local type mapping
+    types.rs                # Remote communication type definitions
+    ws.rs                   # WebSocket client for real-time updates
+
+  server/                   # Server daemon (multi-project management)
+    mod.rs                  # Server daemon module
+    api.rs                  # REST API handlers
+    registry.rs             # Project registry with persistence
+    runner.rs               # Server-side project runner
+
+  web/                      # Web monitoring
+    mod.rs                  # Web monitoring module
+    api.rs                  # REST API handlers
+    state.rs                # Web monitoring state management
+    url.rs                  # URL conversion utilities
+    websocket.rs            # WebSocket handler for real-time updates
+
+  tui/                      # Terminal User Interface
+    mod.rs                  # TUI module
+    render.rs               # Terminal rendering
+    runner.rs               # TUI main loop
+    state.rs                # TUI state management
+    types.rs                # TUI type definitions
+    type_impls.rs           # TUI type implementations
+    events.rs               # TUI event handling
+    command_handlers.rs     # TuiCommand handlers
+    key_handlers.rs         # Key event handlers
+    orchestrator.rs         # TUI orchestrator execution logic
+    terminal.rs             # Terminal helper functions
+    queue.rs                # Dynamic queue for runtime change additions
+    worktrees.rs            # Worktree view management
+    log_deduplicator.rs     # Log deduplication
+    qr.rs                   # QR code generation for Web UI URL
+    utils.rs                # TUI utility functions
+
+tests/
+  e2e_tests.rs                        # End-to-end tests
+  merge_conflict_check_tests.rs       # Merge conflict detection tests
+  opencode_command_validation.rs      # OpenCode command validation tests
+  process_cleanup_test.rs             # Process cleanup tests
+```
 
 ## Development
 
