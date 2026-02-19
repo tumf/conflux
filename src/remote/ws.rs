@@ -233,25 +233,9 @@ mod tests {
     /// We use a mock server that captures the raw HTTP upgrade request and checks headers.
     #[tokio::test]
     async fn test_bearer_token_sent_in_ws_upgrade() {
-        use tokio::io::AsyncReadExt;
-        use tokio::net::TcpListener;
+        use super::super::test_helpers::{recv_with_timeout, spawn_ws_header_capture_server};
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        // Track whether the auth header was received
-        let (auth_tx, mut auth_rx) = mpsc::channel::<String>(1);
-
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                // Read the raw HTTP upgrade request to inspect headers
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
-                let request_text = String::from_utf8_lossy(&buf[..n]).to_lowercase();
-                let _ = auth_tx.send(request_text).await;
-            }
-        });
-
+        let (addr, mut header_rx) = spawn_ws_header_capture_server().await;
         let ws_url = format!("ws://{}/api/v1/ws", addr);
         let (tx, _rx) = mpsc::channel(16);
 
@@ -260,12 +244,7 @@ mod tests {
         let _ = connect_and_subscribe(ws_url, Some("test-token-abc"), tx).await;
 
         // Check if the auth header was present in the request
-        let request_lower =
-            tokio::time::timeout(tokio::time::Duration::from_secs(2), auth_rx.recv())
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default();
+        let request_lower = recv_with_timeout(&mut header_rx, 2, "WS upgrade request").await;
 
         assert!(
             request_lower.contains("authorization: bearer test-token-abc"),

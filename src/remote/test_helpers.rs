@@ -204,6 +204,45 @@ pub fn make_remote_log_entry(message: &str, level: &str) -> RemoteLogEntry {
     }
 }
 
+// ─── WS header capture server ────────────────────────────────────────────────
+
+/// Spawn a raw TCP server that captures the HTTP upgrade request (including headers)
+/// without completing the WebSocket handshake.
+///
+/// Unlike [`spawn_mock_ws_server`], this server captures raw bytes so that tests can
+/// inspect arbitrary headers (e.g. `Authorization`) in the WS upgrade request.
+///
+/// Returns `(addr, rx)` where `rx` yields the lowercased raw HTTP request text.
+///
+/// # Example
+/// ```rust,ignore
+/// let (addr, mut header_rx) = spawn_ws_header_capture_server().await;
+/// let ws_url = format!("ws://{}/api/v1/ws", addr);
+/// // … initiate connection …
+/// let request = recv_with_timeout(&mut header_rx, 2, "WS upgrade request").await;
+/// assert!(request.contains("authorization: bearer my-token"));
+/// ```
+pub async fn spawn_ws_header_capture_server(
+) -> (std::net::SocketAddr, tokio::sync::mpsc::Receiver<String>) {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(1);
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let request_text = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+            let _ = tx.send(request_text).await;
+        }
+    });
+
+    (addr, rx)
+}
+
 // ─── Channel receive helper ───────────────────────────────────────────────────
 
 /// Wait up to `timeout_secs` seconds for a message on `rx`, panicking with a helpful
