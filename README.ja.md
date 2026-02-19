@@ -15,6 +15,7 @@ OpenSpec変更ワークフロー（list → 依存関係分析 → apply → arc
 - 🪝 **ライフサイクルフック**: ワークフロー各段階でのカスタムアクション設定
 - ✅ **承認ワークフロー**: チェックサム検証による変更の承認管理
 - ⚡ **並列実行**: Git worktreesを使用した複数の独立した変更の同時処理
+- 🌐 **Web監視**: リモートモニタリング用REST APIとWebSocketを備えたオプションのHTTPサーバー
 
 ## アーキテクチャ
 
@@ -40,8 +41,11 @@ cflx init
 # ステップ2: 生成された .cflx.jsonc を編集してエージェントを設定
 vim .cflx.jsonc
 
-# ステップ3: インタラクティブTUIを起動して変更を確認・処理
+# ステップ3a: インタラクティブTUIを起動して変更を確認・処理
 cflx
+
+# ステップ3b: またはヘッドレス（非インタラクティブ）モードで実行
+cflx run
 ```
 
 ### インタラクティブTUI（主要インターフェース）
@@ -334,6 +338,20 @@ cflx run --config /path/to/config.jsonc
 }
 ```
 
+**ロギング設定:**
+
+```jsonc
+{
+  "logging": {
+    "suppress_repetitive_debug": true,
+    "summary_interval_secs": 60
+  }
+}
+```
+
+- `suppress_repetitive_debug`: 状態が変わらない場合に繰り返しのデバッグログを抑制する（デフォルト: true）
+- `summary_interval_secs`: N秒ごとにサマリーログを出力する（0で無効化、デフォルト: 60）
+
 **プレースホルダー:**
 
 | プレースホルダー | 説明 | 使用箇所 |
@@ -487,14 +505,18 @@ cflx
   tui              インタラクティブTUIダッシュボードを起動
   init             新しい設定ファイルを初期化
   check-conflicts  変更間のスペックデルタファイルのコンフリクトを確認
+  server           マルチプロジェクトサーバーデーモンを起動
 
 オプション:
-  -c, --config <PATH>      カスタム設定ファイルパス（JSONC形式）
-  --web                    Web監視サーバーを有効化
-  --web-port <PORT>        Webサーバーポート（デフォルト: 0 = OSが自動割当）
-  --web-bind <ADDR>        Webサーバーバインドアドレス（デフォルト: 127.0.0.1）
-  -h, --help               ヘルプを表示
-  -V, --version            バージョンを表示
+  -c, --config <PATH>              カスタム設定ファイルパス（JSONC形式）
+  --web                            Web監視サーバーを有効化
+  --web-port <PORT>                Webサーバーポート（デフォルト: 0 = OSが自動割当）
+  --web-bind <ADDR>                Webサーバーバインドアドレス（デフォルト: 127.0.0.1）
+  --server <URL>                   リモートConfluxサーバーへの接続URL（例: http://host:9876）
+  --server-token <TOKEN>           リモートサーバー認証用ベアラートークン
+  --server-token-env <VAR>         ベアラートークンを保持する環境変数名
+  -h, --help                       ヘルプを表示
+  -V, --version                    バージョンを表示
 ```
 
 **runサブコマンドのオプション:**
@@ -876,6 +898,56 @@ cargo install --path .
 | [API仕様](docs/openapi.yaml) | Web監視用OpenAPI仕様 |
 
 内部ドキュメント（並列実行監査）は `docs/audit/` にあります。
+
+## プロジェクト構成
+
+```
+src/
+  main.rs                   # エントリーポイント、CLIディスパッチ
+  cli.rs                    # CLI引数解析（clap）
+  error.rs                  # エラー型（thiserror）
+  openspec.rs               # OpenSpec CLIラッパー
+  orchestrator.rs           # メインオーケストレーションループ
+  progress.rs               # 進捗表示（indicatif）
+  hooks.rs                  # ライフサイクルフック実行
+  task_parser.rs            # ネイティブtasks.mdパーサー
+  templates.rs              # 設定テンプレート
+  agent.rs                  # AIエージェントコマンド実行
+  analyzer.rs               # 変更依存関係アナライザー
+  approval.rs               # 変更承認管理
+  command_queue.rs          # スタッガーとリトライ付きコマンドキュー
+  history.rs                # apply/archive/resolve履歴
+  parallel_run_service.rs   # 並列実行サービス
+
+  execution/                # 共有実行ロジック
+    apply.rs                # Apply操作ロジック
+    archive.rs              # Archive操作ロジック
+    state.rs                # ワークスペース状態検出
+    types.rs                # 共通型定義
+
+  config/                   # 設定
+    defaults.rs             # デフォルト値
+    expand.rs               # 環境変数展開
+    jsonc.rs                # JSONCパーサー
+
+  vcs/                      # バージョン管理抽象化
+    commands.rs             # 共通VCSインターフェース
+    git/                    # Gitバックエンド
+
+  parallel/                 # 並列実行
+    executor.rs             # 並列変更エグゼキューター
+    events.rs               # 進捗レポートイベント
+    conflict.rs             # コンフリクト検出/解決
+    cleanup.rs              # ワークスペースクリーンアップ
+
+  tui/                      # ターミナルユーザーインターフェース
+    render.rs               # ターミナルレンダリング
+    runner.rs               # TUIメインループ
+    state/                  # 状態管理
+
+tests/
+  e2e_tests.rs              # エンドツーエンドテスト
+```
 
 ## 開発
 

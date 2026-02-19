@@ -13,8 +13,11 @@ cflx init
 # Step 2: Edit the generated .cflx.jsonc to set your agent commands
 vim .cflx.jsonc
 
-# Step 3: Launch the interactive TUI to review and process changes
+# Step 3a: Launch the interactive TUI to review and process changes
 cflx
+
+# Step 3b: Or run in headless (non-interactive) mode
+cflx run
 ```
 
 ### Basic Usage

@@ -41,8 +41,11 @@ cflx init
 # Step 2: Edit the generated .cflx.jsonc to configure your agent
 vim .cflx.jsonc
 
-# Step 3: Launch the interactive TUI to review and process changes
+# Step 3a: Launch the interactive TUI to review and process changes
 cflx
+
+# Step 3b: Or run in headless (non-interactive) mode
+cflx run
 ```
 
 ### Interactive TUI (Primary Interface)
@@ -503,14 +506,18 @@ Commands:
   tui              Launch the interactive TUI dashboard
   init             Initialize a new configuration file
   check-conflicts  Check for conflicts between spec delta files across changes
+  server           Start the multi-project server daemon
 
 Options:
-  -c, --config <PATH>      Path to custom configuration file (JSONC format)
-  --web                    Enable web monitoring server for remote status viewing
-  --web-port <PORT>        Port for web monitoring server (default: 0 = auto-assign by OS)
-  --web-bind <ADDR>        Bind address for web monitoring server (default: 127.0.0.1)
-  -h, --help               Print help
-  -V, --version            Print version
+  -c, --config <PATH>          Path to custom configuration file (JSONC format)
+  --web                        Enable web monitoring server for remote status viewing
+  --web-port <PORT>            Port for web monitoring server (default: 0 = auto-assign by OS)
+  --web-bind <ADDR>            Bind address for web monitoring server (default: 127.0.0.1)
+  --server <URL>               Connect TUI to a remote Conflux server (e.g., http://host:9876)
+  --server-token <TOKEN>       Bearer token for remote server authentication
+  --server-token-env <VAR>     Environment variable holding the bearer token
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
 
 **Run subcommand options:**
@@ -892,6 +899,56 @@ This will build and install the orchestrator to your Cargo bin directory (typica
 | [API Specification](docs/openapi.yaml) | OpenAPI spec for web monitoring |
 
 Internal documentation (parallel execution audit) is available in `docs/audit/`.
+
+## Project Structure
+
+```
+src/
+  main.rs                   # Entry point, CLI dispatching
+  cli.rs                    # CLI argument parsing (clap)
+  error.rs                  # Error types (thiserror)
+  openspec.rs               # OpenSpec CLI wrapper
+  orchestrator.rs           # Main orchestration loop
+  progress.rs               # Progress display (indicatif)
+  hooks.rs                  # Lifecycle hook execution
+  task_parser.rs            # Native tasks.md parser
+  templates.rs              # Configuration templates
+  agent.rs                  # AI agent command execution
+  analyzer.rs               # Change dependency analyzer
+  approval.rs               # Change approval management
+  command_queue.rs          # Command queue with stagger and retry
+  history.rs                # Apply/archive/resolve history
+  parallel_run_service.rs   # Parallel execution service
+
+  execution/                # Shared execution logic
+    apply.rs                # Apply operation logic
+    archive.rs              # Archive operation logic
+    state.rs                # Workspace state detection
+    types.rs                # Common type definitions
+
+  config/                   # Configuration
+    defaults.rs             # Default values
+    expand.rs               # Environment variable expansion
+    jsonc.rs                # JSONC parser
+
+  vcs/                      # Version Control abstraction
+    commands.rs             # Common VCS interface
+    git/                    # Git backend
+
+  parallel/                 # Parallel execution
+    executor.rs             # Parallel change executor
+    events.rs               # Progress reporting events
+    conflict.rs             # Conflict detection/resolution
+    cleanup.rs              # Workspace cleanup
+
+  tui/                      # Terminal User Interface
+    render.rs               # Terminal rendering
+    runner.rs               # TUI main loop
+    state/                  # State management
+
+tests/
+  e2e_tests.rs              # End-to-end tests
+```
 
 ## Development
 
