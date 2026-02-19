@@ -25,6 +25,7 @@ pub struct TuiCommandContext<'a> {
     pub config: &'a OrchestratorConfig,
     pub tx: &'a mpsc::Sender<OrchestratorEvent>,
     pub dynamic_queue: &'a DynamicQueue,
+    pub remote_client: Option<crate::remote::RemoteClient>,
     #[cfg(feature = "web-monitoring")]
     pub web_state: &'a Option<Arc<crate::web::WebState>>,
 }
@@ -55,6 +56,42 @@ pub async fn handle_start_processing_command(
 
     if let Some(TuiCommand::StartProcessing(selected_ids)) = cmd {
         if !selected_ids.is_empty() {
+            // Remote server mode: trigger server-side run instead of local orchestrator.
+            if let Some(remote) = ctx.remote_client.as_ref() {
+                // Group selected changes by project_id (encoded as "<project_id>::...").
+                let mut by_project: std::collections::BTreeMap<String, Vec<String>> =
+                    std::collections::BTreeMap::new();
+                for id in &selected_ids {
+                    let Some((project_id, rest)) = id.split_once("::") else {
+                        // Unknown format; skip.
+                        continue;
+                    };
+                    // rest looks like "<project_name>/<change_id>".
+                    let change_id = rest.rsplit('/').next().unwrap_or(rest).to_string();
+                    by_project
+                        .entry(project_id.to_string())
+                        .or_default()
+                        .push(change_id);
+                }
+
+                for (project_id, change_ids) in by_project {
+                    if let Err(e) = remote.control_run(&project_id, Some(change_ids)).await {
+                        ctx.app.add_log(LogEntry::error(format!(
+                            "Remote run failed for {}: {}",
+                            project_id, e
+                        )));
+                    } else {
+                        ctx.app.add_log(LogEntry::success(format!(
+                            "Remote run started: {}",
+                            project_id
+                        )));
+                    }
+                }
+
+                // No local orchestrator task.
+                return None;
+            }
+
             graceful_stop_flag.store(false, Ordering::SeqCst);
             let orch_tx = ctx.tx.clone();
             let orch_config = ctx.config.clone();

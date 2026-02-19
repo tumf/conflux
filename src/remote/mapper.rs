@@ -36,7 +36,11 @@ pub fn group_changes_by_project(projects: &[RemoteProject]) -> Vec<Change> {
         for change in &project.changes {
             // Prefix the change ID with the project name so grouping is visible in the TUI
             let mut local = remote_change_to_local(change);
-            local.id = format!("{}/{}", project.name, change.id);
+            // Encode project.id into the local change id so that client-side actions
+            // (run/stop/retry) can target the correct project while keeping the display
+            // portion human-friendly.
+            // Format: "<project_id>::<project_name>/<change_id>"
+            local.id = format!("{}::{}/{}", project.id, project.name, change.id);
             result.push(local);
         }
     }
@@ -90,8 +94,8 @@ mod tests {
 
         let result = group_changes_by_project(&projects);
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0].id, "Project One/change-a");
-        assert_eq!(result[1].id, "Project One/change-b");
-        assert_eq!(result[2].id, "Project Two/change-c");
+        assert_eq!(result[0].id, "proj-1::Project One/change-a");
+        assert_eq!(result[1].id, "proj-1::Project One/change-b");
+        assert_eq!(result[2].id, "proj-2::Project Two/change-c");
     }
 }

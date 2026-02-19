@@ -25,6 +25,79 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+fn apply_remote_status(change: &mut ChangeState, status: &str) {
+    // Avoid regressing active/terminal states based on laggy remote snapshots.
+    let current = change.queue_status.clone();
+
+    let next = match status {
+        "applying" => Some(QueueStatus::Applying),
+        "archiving" => Some(QueueStatus::Archiving),
+        "accepting" => Some(QueueStatus::Accepting),
+        "resolving" => Some(QueueStatus::Resolving),
+        "archived" => Some(QueueStatus::Archived),
+        "merged" => Some(QueueStatus::Merged),
+        "merge_wait" => Some(QueueStatus::MergeWait),
+        "resolve_wait" => Some(QueueStatus::ResolveWait),
+        "blocked" => Some(QueueStatus::Blocked),
+        "queued" => Some(QueueStatus::Queued),
+        "idle" => Some(QueueStatus::NotQueued),
+        "error" => Some(QueueStatus::Error("remote".to_string())),
+        _ => None,
+    };
+
+    let Some(next) = next else {
+        return;
+    };
+
+    // Don't downgrade active states to queued/idle.
+    if matches!(
+        current,
+        QueueStatus::Applying
+            | QueueStatus::Archiving
+            | QueueStatus::Accepting
+            | QueueStatus::Resolving
+    ) && matches!(next, QueueStatus::Queued | QueueStatus::NotQueued)
+    {
+        return;
+    }
+
+    // Only set queued/idle if we're not already in a terminal state.
+    if matches!(next, QueueStatus::Queued | QueueStatus::NotQueued)
+        && matches!(
+            current,
+            QueueStatus::Archived | QueueStatus::Merged | QueueStatus::Error(_)
+        )
+    {
+        return;
+    }
+
+    // Transition bookkeeping for elapsed time.
+    if matches!(next, QueueStatus::Applying) && change.started_at.is_none() {
+        change.started_at = Some(Instant::now());
+        change.elapsed_time = None;
+    }
+
+    if !matches!(
+        next,
+        QueueStatus::Applying
+            | QueueStatus::Archiving
+            | QueueStatus::Accepting
+            | QueueStatus::Resolving
+    ) && matches!(
+        current,
+        QueueStatus::Applying
+            | QueueStatus::Archiving
+            | QueueStatus::Accepting
+            | QueueStatus::Resolving
+    ) {
+        if let Some(started) = change.started_at {
+            change.elapsed_time = Some(started.elapsed());
+        }
+    }
+
+    change.queue_status = next;
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -1327,8 +1400,10 @@ impl AppState {
                 id,
                 completed_tasks,
                 total_tasks,
+                status,
                 iteration_number,
             } => {
+                let mut status_log: Option<String> = None;
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
                     // Non-regression rule: never decrease completed_tasks
                     if completed_tasks >= change.completed_tasks {
@@ -1336,8 +1411,25 @@ impl AppState {
                     }
                     // Always update total so the denominator stays accurate
                     change.total_tasks = total_tasks;
+
+                    // Status update (remote mode)
+                    if let Some(status) = status.as_deref() {
+                        let before = change.queue_status.clone();
+                        apply_remote_status(change, status);
+                        if before != change.queue_status {
+                            status_log = Some(format!(
+                                "Remote status: {} -> {}",
+                                id,
+                                change.queue_status.display()
+                            ));
+                        }
+                    }
+
                     // Apply monotonic non-regression rule for iteration_number
                     change.update_iteration_monotonic(iteration_number);
+                }
+                if let Some(line) = status_log {
+                    self.add_log(LogEntry::info(line));
                 }
             }
 
@@ -3430,6 +3522,7 @@ mod tests {
             id: "MyProj/feat".to_string(),
             completed_tasks: 3,
             total_tasks: 5,
+            status: None,
             iteration_number: None,
         });
 
@@ -3447,6 +3540,7 @@ mod tests {
             id: "MyProj/feat".to_string(),
             completed_tasks: 2, // lower than current 4
             total_tasks: 5,
+            status: None,
             iteration_number: None,
         });
 
@@ -3467,6 +3561,7 @@ mod tests {
             id: "MyProj/feat".to_string(), // does not exist
             completed_tasks: 3,
             total_tasks: 5,
+            status: None,
             iteration_number: None,
         });
 
@@ -3485,6 +3580,7 @@ mod tests {
             id: "MyProj/feat".to_string(),
             completed_tasks: 2,
             total_tasks: 5,
+            status: None,
             iteration_number: Some(3),
         });
         assert_eq!(
@@ -3498,6 +3594,7 @@ mod tests {
             id: "MyProj/feat".to_string(),
             completed_tasks: 3,
             total_tasks: 5,
+            status: None,
             iteration_number: Some(2), // lower than current 3
         });
 
@@ -3520,6 +3617,7 @@ mod tests {
             id: "MyProj/feat".to_string(),
             completed_tasks: 2,
             total_tasks: 5,
+            status: None,
             iteration_number: Some(2),
         });
         assert_eq!(app.changes[0].iteration_number, Some(2));
@@ -3529,6 +3627,7 @@ mod tests {
             id: "MyProj/feat".to_string(),
             completed_tasks: 3,
             total_tasks: 5,
+            status: None,
             iteration_number: Some(4),
         });
 
@@ -3550,6 +3649,7 @@ mod tests {
             id: "MyProj/feat".to_string(),
             completed_tasks: 2,
             total_tasks: 5,
+            status: None,
             iteration_number: Some(3),
         });
 
@@ -3558,6 +3658,7 @@ mod tests {
             id: "MyProj/feat".to_string(),
             completed_tasks: 3,
             total_tasks: 5,
+            status: None,
             iteration_number: None,
         });
 

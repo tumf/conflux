@@ -333,13 +333,22 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 Color::White
             };
 
+            // For remote server mode we encode project_id into the change id as:
+            // "<project_id>::<project_name>/<change_id>".
+            // Render only the human-friendly portion.
+            let display_id = change
+                .id
+                .split_once("::")
+                .map(|(_, b)| b)
+                .unwrap_or(&change.id);
+
             let mut spans = vec![
                 Span::styled(
                     format!("{} {} ", checkbox, cursor),
                     Style::default().fg(checkbox_color),
                 ),
                 Span::styled(
-                    format!("{:<25}", change.id),
+                    format!("{:<25}", display_id),
                     Style::default().fg(name_color),
                 ),
                 Span::styled(
@@ -375,7 +384,12 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 // Calculate actual occupied width dynamically
                 let checkbox_cursor_text = format!("{} {} ", checkbox, cursor);
                 let checkbox_cursor_width = checkbox_cursor_text.len(); // Actual: "[x] ► " is 6 chars
-                let id_text = format!("{:<25}", change.id);
+                let display_id = change
+                    .id
+                    .split_once("::")
+                    .map(|(_, b)| b)
+                    .unwrap_or(&change.id);
+                let id_text = format!("{:<25}", display_id);
                 let id_width = id_text.len(); // max(25, change.id.len())
                 let worktree_badge_width = if change.has_worktree { 3 } else { 0 }; // " WT"
                 let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"
@@ -626,13 +640,22 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 (0, status_formatted.len())
             };
 
+            // For remote server mode we encode project_id into the change id as:
+            // "<project_id>::<project_name>/<change_id>".
+            // Render only the human-friendly portion.
+            let display_id = change
+                .id
+                .split_once("::")
+                .map(|(_, b)| b)
+                .unwrap_or(&change.id);
+
             let mut spans = vec![
                 Span::styled(
                     format!("{} {} ", checkbox, cursor),
                     Style::default().fg(checkbox_color),
                 ),
                 Span::styled(
-                    format!("{:<25}", change.id),
+                    format!("{:<25}", display_id),
                     Style::default().fg(name_color),
                 ),
                 Span::styled(
@@ -695,7 +718,12 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 // Calculate actual occupied width dynamically
                 let checkbox_cursor_text = format!("{} {} ", checkbox, cursor);
                 let checkbox_cursor_width = checkbox_cursor_text.len(); // Actual: "[x] ► " is 6 chars
-                let id_text = format!("{:<25}", change.id);
+                let display_id = change
+                    .id
+                    .split_once("::")
+                    .map(|(_, b)| b)
+                    .unwrap_or(&change.id);
+                let id_text = format!("{:<25}", display_id);
                 let id_width = id_text.len(); // max(25, change.id.len())
                 let worktree_badge_width = if change.has_worktree { 3 } else { 0 }; // " WT"
                 let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"

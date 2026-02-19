@@ -104,24 +104,44 @@ async fn run_tui_loop(
     use crate::openspec;
 
     let repo_root = std::env::current_dir()?;
-    let committed_change_ids: HashSet<String> =
-        match crate::vcs::git::commands::list_changes_in_head(&repo_root).await {
-            Ok(ids) => ids.into_iter().collect(),
-            Err(err) => {
-                warn!("Failed to load committed change snapshot: {}", err);
+
+    // Parallel eligibility is a local-worktree concept.
+    // In remote server mode, avoid incorrectly marking all remote changes as
+    // "uncommitted" based on the local repository.
+    let (committed_change_ids, uncommitted_file_change_ids): (HashSet<String>, HashSet<String>) =
+        if remote_client.is_some() {
+            (
                 initial_changes
                     .iter()
                     .map(|change| change.id.clone())
-                    .collect()
-            }
-        };
-    let uncommitted_file_change_ids: HashSet<String> =
-        match crate::vcs::git::commands::list_changes_with_uncommitted_files(&repo_root).await {
-            Ok(ids) => ids.into_iter().collect(),
-            Err(err) => {
-                warn!("Failed to detect uncommitted files in changes: {}", err);
-                HashSet::new()
-            }
+                    .collect(),
+                HashSet::new(),
+            )
+        } else {
+            let committed_change_ids: HashSet<String> =
+                match crate::vcs::git::commands::list_changes_in_head(&repo_root).await {
+                    Ok(ids) => ids.into_iter().collect(),
+                    Err(err) => {
+                        warn!("Failed to load committed change snapshot: {}", err);
+                        initial_changes
+                            .iter()
+                            .map(|change| change.id.clone())
+                            .collect()
+                    }
+                };
+
+            let uncommitted_file_change_ids: HashSet<String> =
+                match crate::vcs::git::commands::list_changes_with_uncommitted_files(&repo_root)
+                    .await
+                {
+                    Ok(ids) => ids.into_iter().collect(),
+                    Err(err) => {
+                        warn!("Failed to detect uncommitted files in changes: {}", err);
+                        HashSet::new()
+                    }
+                };
+
+            (committed_change_ids, uncommitted_file_change_ids)
         };
     let worktree_base_dir = config
         .get_workspace_base_dir()
@@ -170,8 +190,13 @@ async fn run_tui_loop(
     // Inject shared state reference into TUI for unified tracking
     app.set_shared_state(shared_state.clone());
     let git_dir_exists = crate::cli::check_git_directory();
-    let parallel_available = crate::cli::check_parallel_available();
+    let mut parallel_available = crate::cli::check_parallel_available();
     let mut parallel_mode = config.resolve_parallel_mode(false, git_dir_exists);
+
+    if remote_client.is_some() {
+        parallel_available = false;
+        parallel_mode = false;
+    }
     if parallel_mode && !parallel_available {
         parallel_mode = false;
         app.warning_message =
@@ -278,6 +303,9 @@ async fn run_tui_loop(
         });
     }
 
+    // Keep a clone for user-triggered actions (F5 run/stop/retry).
+    let remote_client_actions = remote_client.clone();
+
     // Start remote WebSocket subscription task (remote mode only)
     let _ws_handle: Option<tokio::task::JoinHandle<()>> = if let Some(client) = remote_client {
         let ws_url = client.ws_url();
@@ -365,21 +393,40 @@ async fn run_tui_loop(
                                 merge_wait_ids: std::collections::HashSet::new(),
                             })
                             .await;
+
+                        // Also send per-change status updates so the TUI can render
+                        // in-flight states (Applying/Archiving/etc) in remote mode.
+                        for proj in &projects {
+                            let project_display = proj.name.clone();
+                            for ch in &proj.changes {
+                                let id = format!("{}::{}/{}", proj.id, project_display, ch.id);
+                                let _ = translate_tx
+                                    .send(super::events::OrchestratorEvent::RemoteChangeUpdate {
+                                        id,
+                                        completed_tasks: ch.completed_tasks,
+                                        total_tasks: ch.total_tasks,
+                                        status: Some(ch.status.clone()),
+                                        iteration_number: ch.iteration_number,
+                                    })
+                                    .await;
+                            }
+                        }
                     }
                     RemoteStateUpdate::ChangeUpdate { change } => {
                         // Incremental update → send as RemoteChangeUpdate (applies non-regression rule)
                         // Use project.name (from the id->name map) to match the format used by
-                        // group_changes_by_project(): "<project.name>/<change.id>"
+                        // group_changes_by_project(): "<project_id>::<project.name>/<change.id>"
                         let project_display = project_name_map
                             .get(&change.project)
                             .cloned()
                             .unwrap_or_else(|| change.project.clone());
-                        let id = format!("{}/{}", project_display, change.id);
+                        let id = format!("{}::{}/{}", change.project, project_display, change.id);
                         let _ = translate_tx
                             .send(super::events::OrchestratorEvent::RemoteChangeUpdate {
                                 id,
                                 completed_tasks: change.completed_tasks,
                                 total_tasks: change.total_tasks,
+                                status: Some(change.status),
                                 iteration_number: change.iteration_number,
                             })
                             .await;
@@ -703,6 +750,7 @@ async fn run_tui_loop(
                 config: &config,
                 tx: &tx,
                 dynamic_queue: &dynamic_queue,
+                remote_client: remote_client_actions.clone(),
                 #[cfg(feature = "web-monitoring")]
                 web_state: &web_state,
             };

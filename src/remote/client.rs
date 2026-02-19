@@ -60,9 +60,9 @@ impl RemoteClient {
 
     /// Fetch the list of projects (and their changes) from the remote server.
     ///
-    /// Calls `GET /api/v1/projects` and returns the parsed list of [`RemoteProject`]s.
+    /// Calls `GET /api/v1/projects/state` and returns the parsed list of [`RemoteProject`]s.
     pub async fn list_projects(&self) -> Result<Vec<RemoteProject>> {
-        let url = format!("{}/api/v1/projects", self.base_url);
+        let url = format!("{}/api/v1/projects/state", self.base_url);
         let req = self.http.get(&url);
         let req = self.authorized(req);
 
@@ -109,6 +109,69 @@ impl RemoteClient {
     /// Returns the bearer token (if any) for use when opening the WebSocket connection.
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref()
+    }
+
+    /// Start processing changes for a project on the remote server.
+    ///
+    /// Calls `POST /api/v1/projects/{id}/control/run`.
+    pub async fn control_run(&self, project_id: &str, changes: Option<Vec<String>>) -> Result<()> {
+        let url = format!(
+            "{}/api/v1/projects/{}/control/run",
+            self.base_url, project_id
+        );
+        let req = self.http.post(&url);
+        let req = self.authorized(req);
+
+        let req = if let Some(changes) = changes {
+            req.json(&serde_json::json!({"changes": changes}))
+        } else {
+            req
+        };
+
+        let resp = req.send().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to call remote run control: {}",
+                e
+            )))
+        })?;
+
+        if !resp.status().is_success() {
+            return Err(OrchestratorError::Io(std::io::Error::other(format!(
+                "Remote server returned status {} for run",
+                resp.status()
+            ))));
+        }
+
+        Ok(())
+    }
+
+    /// Stop processing for a project on the remote server.
+    ///
+    /// Calls `POST /api/v1/projects/{id}/control/stop`.
+    #[allow(dead_code)]
+    pub async fn control_stop(&self, project_id: &str) -> Result<()> {
+        let url = format!(
+            "{}/api/v1/projects/{}/control/stop",
+            self.base_url, project_id
+        );
+        let req = self.http.post(&url);
+        let req = self.authorized(req);
+
+        let resp = req.send().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to call remote stop control: {}",
+                e
+            )))
+        })?;
+
+        if !resp.status().is_success() {
+            return Err(OrchestratorError::Io(std::io::Error::other(format!(
+                "Remote server returned status {} for stop",
+                resp.status()
+            ))));
+        }
+
+        Ok(())
     }
 }
 

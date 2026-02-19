@@ -10,6 +10,7 @@
 
 pub mod api;
 pub mod registry;
+pub mod runner;
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -34,6 +35,9 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
     // Build the shared registry.
     let registry = registry::create_shared_registry(&config.data_dir, config.max_concurrent_total)?;
 
+    // In-memory runners map (per-project execution).
+    let runners = runner::create_shared_runners();
+
     // Build app state.
     // Resolve the effective auth token: token_env takes precedence over token.
     let auth_token = match &config.auth.mode {
@@ -43,6 +47,7 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
 
     let app_state = api::AppState {
         registry,
+        runners,
         auth_token,
         max_concurrent_total: config.max_concurrent_total,
     };

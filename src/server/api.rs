@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{ws::Message, ws::WebSocket, ws::WebSocketUpgrade, Path, State},
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -18,12 +18,18 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
+use crate::execution::state::{detect_workspace_state, WorkspaceState};
+use crate::remote::types::{RemoteChange, RemoteProject, RemoteStateUpdate};
 use crate::server::registry::{ProjectEntry, ProjectStatus, SharedRegistry};
+use crate::server::runner::{ProjectRunRequest, SharedRunners};
+use crate::task_parser;
+use crate::vcs::GitWorkspaceManager;
 
 /// Shared application state passed to axum handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub registry: SharedRegistry,
+    pub(crate) runners: SharedRunners,
     /// Optional bearer token for authentication (None = no auth required)
     pub auth_token: Option<String>,
     /// Maximum concurrent total (informational; actual semaphore is in registry)
@@ -66,6 +72,12 @@ pub async fn auth_middleware(
 pub struct AddProjectRequest {
     pub remote_url: String,
     pub branch: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ControlRunRequest {
+    /// Optional list of change IDs to run (server will pass to `cflx run --change`).
+    pub changes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +123,236 @@ pub async fn list_projects(State(state): State<AppState>) -> Response {
     let registry = state.registry.read().await;
     let projects: Vec<ProjectResponse> = registry.list().into_iter().map(Into::into).collect();
     (StatusCode::OK, Json(projects)).into_response()
+}
+
+/// GET /api/v1/projects/state - list projects with their OpenSpec changes
+///
+/// This endpoint returns a server-oriented state snapshot suitable for any
+/// dashboard or client (including the TUI): projects (remote_url + branch) each
+/// with the list of OpenSpec changes discovered in that project's worktree.
+pub async fn projects_state(State(state): State<AppState>) -> Response {
+    let (entries, data_dir) = {
+        let registry = state.registry.read().await;
+        (registry.list(), registry.data_dir().to_path_buf())
+    };
+
+    let mut projects = Vec::new();
+    for entry in &entries {
+        projects.push(build_remote_project_snapshot_async(&data_dir, entry).await);
+    }
+
+    (StatusCode::OK, Json(projects)).into_response()
+}
+
+/// GET /api/v1/ws - WebSocket stream of remote state updates
+///
+/// Current behavior:
+/// - Sends periodic FullState snapshots (simple, reliable for clients).
+/// - Also sends Ping messages to keep the connection alive.
+///
+/// Incremental updates are a future enhancement.
+pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
+    let registry = state.registry.clone();
+    ws.on_upgrade(move |socket| handle_ws(socket, registry))
+}
+
+async fn handle_ws(mut socket: WebSocket, registry: SharedRegistry) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                // Snapshot
+                let (entries, data_dir) = {
+                    let reg = registry.read().await;
+                    (reg.list(), reg.data_dir().to_path_buf())
+                };
+
+                let mut snapshot = Vec::new();
+                for entry in &entries {
+                    snapshot.push(build_remote_project_snapshot_async(&data_dir, entry).await);
+                }
+
+                if let Ok(payload) = serde_json::to_string(&RemoteStateUpdate::FullState { projects: snapshot }) {
+                    if socket.send(Message::Text(payload.into())).await.is_err() {
+                        break;
+                    }
+                }
+
+                // Keep-alive ping
+                if let Ok(ping) = serde_json::to_string(&RemoteStateUpdate::Ping) {
+                    if socket.send(Message::Text(ping.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {
+                        // Ignore client messages for now.
+                    }
+                    Some(Err(_)) => break,
+                }
+            }
+        }
+    }
+}
+
+async fn build_remote_project_snapshot_async(
+    data_dir: &std::path::Path,
+    entry: &ProjectEntry,
+) -> RemoteProject {
+    let name = project_display_name(&entry.remote_url, &entry.branch);
+    let worktree_path = data_dir
+        .join("worktrees")
+        .join(&entry.id)
+        .join(&entry.branch);
+
+    let changes = list_remote_changes_in_worktree(&worktree_path, &entry.id, &entry.branch).await;
+
+    RemoteProject {
+        id: entry.id.clone(),
+        name,
+        changes,
+    }
+}
+
+fn project_display_name(remote_url: &str, branch: &str) -> String {
+    // Keep it short but recognizable: repo@branch
+    let repo = remote_url
+        .trim_end_matches('/')
+        .split('/')
+        .next_back()
+        .unwrap_or(remote_url)
+        .trim_end_matches(".git");
+    format!("{}@{}", repo, branch)
+}
+
+async fn list_remote_changes_in_worktree(
+    worktree_path: &std::path::Path,
+    project_id: &str,
+    base_branch: &str,
+) -> Vec<RemoteChange> {
+    let changes_dir = worktree_path.join("openspec/changes");
+    if !changes_dir.exists() {
+        return Vec::new();
+    }
+
+    // Build a mapping from sanitized change_id -> worktree path.
+    // This allows us to read progress from active worktrees created during parallel execution.
+    let mut worktree_by_change: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
+    if let Ok(worktrees) = crate::vcs::git::commands::list_worktrees(worktree_path).await {
+        for (path, _head, branch, _is_detached, is_main) in worktrees {
+            if is_main {
+                continue;
+            }
+            if let Some(change_id) =
+                GitWorkspaceManager::extract_change_id_from_worktree_name(&branch)
+            {
+                worktree_by_change.insert(change_id, std::path::PathBuf::from(path));
+            }
+        }
+    }
+
+    let entries = match std::fs::read_dir(&changes_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            debug!("Failed to read changes dir {:?}: {}", changes_dir, e);
+            return Vec::new();
+        }
+    };
+
+    let mut changes = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let dir_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+
+        if dir_name == "archive" || dir_name.starts_with('.') {
+            continue;
+        }
+
+        // Only include directories that look like an active change (proposal.md exists).
+        let proposal_path = path.join("proposal.md");
+        if !proposal_path.exists() {
+            continue;
+        }
+
+        let tasks_path = path.join("tasks.md");
+
+        // Prefer worktree progress if the change is currently executing in a worktree.
+        let wt_path_opt = worktree_by_change.get(dir_name).map(|p| p.as_path());
+        let (completed, total) =
+            match task_parser::parse_progress_with_fallback(dir_name, wt_path_opt) {
+                Ok(p) => (p.completed, p.total),
+                Err(_) => {
+                    // Last resort: try base tasks.md directly.
+                    match task_parser::parse_file(&tasks_path, Some(dir_name)) {
+                        Ok(p) => (p.completed, p.total),
+                        Err(_) => (0, 0),
+                    }
+                }
+            };
+
+        let last_modified = latest_modified_rfc3339(&[&proposal_path, &tasks_path])
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+        let (status, iteration_number) = if let Some(wt_path) = worktree_by_change.get(dir_name) {
+            match detect_workspace_state(dir_name, wt_path, base_branch).await {
+                Ok(WorkspaceState::Created) => ("queued".to_string(), None),
+                Ok(WorkspaceState::Applying { iteration }) => {
+                    ("applying".to_string(), Some(iteration))
+                }
+                Ok(WorkspaceState::Applied) => ("archiving".to_string(), None),
+                Ok(WorkspaceState::Archiving) => ("archiving".to_string(), None),
+                Ok(WorkspaceState::Archived) => ("archived".to_string(), None),
+                Ok(WorkspaceState::Merged) => ("merged".to_string(), None),
+                Err(_) => ("idle".to_string(), None),
+            }
+        } else {
+            ("idle".to_string(), None)
+        };
+
+        changes.push(RemoteChange {
+            id: dir_name.to_string(),
+            project: project_id.to_string(),
+            completed_tasks: completed,
+            total_tasks: total,
+            last_modified,
+            status,
+            iteration_number,
+        });
+    }
+
+    changes.sort_by(|a, b| a.id.cmp(&b.id));
+    changes
+}
+
+fn latest_modified_rfc3339(paths: &[&std::path::Path]) -> Option<String> {
+    use std::time::SystemTime;
+
+    let mut latest: Option<SystemTime> = None;
+    for p in paths {
+        let m = std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        if let Some(ts) = m {
+            latest = Some(match latest {
+                Some(cur) if cur >= ts => cur,
+                _ => ts,
+            });
+        }
+    }
+
+    latest.map(|ts| chrono::DateTime::<chrono::Utc>::from(ts).to_rfc3339())
 }
 
 /// POST /api/v1/projects - add a new project
@@ -884,8 +1126,10 @@ pub static CONTROL_CALLS: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<(String, 
 pub async fn control_run(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    payload: Option<Json<ControlRunRequest>>,
 ) -> Response {
-    apply_control(&state, &project_id, "run", ProjectStatus::Running).await
+    let changes = payload.and_then(|Json(p)| p.changes);
+    apply_control(&state, &project_id, "run", ProjectStatus::Running, changes).await
 }
 
 /// POST /api/v1/projects/:id/control/stop
@@ -893,15 +1137,24 @@ pub async fn control_stop(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
 ) -> Response {
-    apply_control(&state, &project_id, "stop", ProjectStatus::Stopped).await
+    apply_control(&state, &project_id, "stop", ProjectStatus::Stopped, None).await
 }
 
 /// POST /api/v1/projects/:id/control/retry
 pub async fn control_retry(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    payload: Option<Json<ControlRunRequest>>,
 ) -> Response {
-    apply_control(&state, &project_id, "retry", ProjectStatus::Running).await
+    let changes = payload.and_then(|Json(p)| p.changes);
+    apply_control(
+        &state,
+        &project_id,
+        "retry",
+        ProjectStatus::Running,
+        changes,
+    )
+    .await
 }
 
 async fn apply_control(
@@ -909,6 +1162,7 @@ async fn apply_control(
     project_id: &str,
     action: &str,
     new_status: ProjectStatus,
+    changes: Option<Vec<String>>,
 ) -> Response {
     // Record the call for test verification
     if let Some(calls) = CONTROL_CALLS.get() {
@@ -918,14 +1172,14 @@ async fn apply_control(
             .push((project_id.to_string(), action.to_string()));
     }
 
-    let (lock, semaphore) = {
+    let (lock, semaphore, worktree_path) = {
         let registry = state.registry.read().await;
-        if registry.get(project_id).is_none() {
+        let Some(entry) = registry.get(project_id) else {
             return error_response(
                 StatusCode::NOT_FOUND,
                 format!("Project not found: {}", project_id),
             );
-        }
+        };
         let lock = match registry.project_lock(project_id) {
             Some(l) => l,
             None => {
@@ -933,7 +1187,13 @@ async fn apply_control(
             }
         };
         let semaphore = registry.global_semaphore();
-        (lock, semaphore)
+
+        let data_dir = registry.data_dir().to_path_buf();
+        let wt = data_dir
+            .join("worktrees")
+            .join(project_id)
+            .join(&entry.branch);
+        (lock, semaphore, wt)
     };
 
     // Acquire global semaphore (max_concurrent_total)
@@ -949,6 +1209,33 @@ async fn apply_control(
 
     // Acquire per-project exclusive lock
     let _guard = lock.lock().await;
+
+    // Apply action
+    if action == "run" || action == "retry" {
+        // In unit tests we use CONTROL_CALLS as a stub signal; do not spawn real processes.
+        if CONTROL_CALLS.get().is_none() {
+            let req = ProjectRunRequest {
+                project_id: project_id.to_string(),
+                worktree_path,
+                changes,
+            };
+
+            if let Err(e) = crate::server::runner::start_project_run(
+                &state.runners,
+                state.registry.clone(),
+                req,
+            )
+            .await
+            {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to start run: {}", e),
+                );
+            }
+        }
+    } else if action == "stop" {
+        crate::server::runner::stop_project_run(&state.runners, project_id.to_string()).await;
+    }
 
     let mut registry = state.registry.write().await;
     match registry.set_status(project_id, new_status.clone()) {
@@ -982,6 +1269,8 @@ async fn apply_control(
 pub fn build_router(app_state: AppState) -> Router {
     let api_routes = Router::new()
         .route("/projects", get(list_projects).post(add_project))
+        .route("/projects/state", get(projects_state))
+        .route("/ws", get(ws_handler))
         .route("/projects/{id}", delete(delete_project))
         .route("/projects/{id}/git/pull", post(git_pull))
         .route("/projects/{id}/git/push", post(git_push))
@@ -1011,6 +1300,7 @@ mod tests {
         let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
         AppState {
             registry,
+            runners: crate::server::runner::create_shared_runners(),
             auth_token: auth_token.map(|s| s.to_string()),
             max_concurrent_total: 4,
         }
@@ -1275,6 +1565,7 @@ mod tests {
         let registry = create_shared_registry(temp_dir.path(), max_concurrent).unwrap();
         AppState {
             registry,
+            runners: crate::server::runner::create_shared_runners(),
             auth_token: auth_token.map(|s| s.to_string()),
             max_concurrent_total: max_concurrent,
         }
