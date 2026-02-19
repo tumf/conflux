@@ -3669,4 +3669,75 @@ mod tests {
             "iteration_number should not change when None is received"
         );
     }
+
+    /// Verify that a remote Log event is added to the TUI log panel (state.logs).
+    #[test]
+    fn test_remote_log_event_added_to_log_panel() {
+        use crate::tui::events::{LogEntry, LogLevel, OrchestratorEvent};
+
+        let changes = vec![create_test_change("proj/change-a", 0, 3)];
+        let mut app = AppState::new(changes);
+
+        let initial_log_count = app.logs.len();
+
+        // Build a LogEntry simulating what the remote WS translator creates from RemoteStateUpdate::Log
+        let entry = LogEntry {
+            timestamp: "12:00:00".to_string(),
+            created_at: chrono::Utc::now(),
+            message: "remote stdout: cargo build succeeded".to_string(),
+            color: ratatui::style::Color::Reset,
+            level: LogLevel::Info,
+            change_id: Some("change-a".to_string()),
+            operation: None,
+            iteration: None,
+            workspace_path: None,
+        };
+
+        app.handle_orchestrator_event(OrchestratorEvent::Log(entry.clone()));
+
+        // The log entry should be appended to state.logs
+        assert!(
+            app.logs.len() > initial_log_count,
+            "Expected log count to increase after remote Log event"
+        );
+
+        let last = app.logs.last().expect("Should have at least one log entry");
+        assert_eq!(last.message, entry.message, "Log message should match");
+        assert_eq!(
+            last.change_id, entry.change_id,
+            "Log change_id should match"
+        );
+    }
+
+    /// Verify that multiple remote Log events accumulate in the log panel.
+    #[test]
+    fn test_multiple_remote_log_events_accumulate() {
+        use crate::tui::events::{LogEntry, LogLevel, OrchestratorEvent};
+
+        let changes = vec![];
+        let mut app = AppState::new(changes);
+
+        let initial_count = app.logs.len();
+
+        for i in 0..5 {
+            let entry = LogEntry {
+                timestamp: format!("12:00:{:02}", i),
+                created_at: chrono::Utc::now(),
+                message: format!("remote log line {}", i),
+                color: ratatui::style::Color::Reset,
+                level: LogLevel::Info,
+                change_id: None,
+                operation: None,
+                iteration: None,
+                workspace_path: None,
+            };
+            app.handle_orchestrator_event(OrchestratorEvent::Log(entry));
+        }
+
+        assert_eq!(
+            app.logs.len(),
+            initial_count + 5,
+            "All 5 remote log entries should be present in log panel"
+        );
+    }
 }

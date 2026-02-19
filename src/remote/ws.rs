@@ -253,6 +253,49 @@ mod tests {
         handle.abort();
     }
 
+    /// Verify that a `log` WS message is received and forwarded as a
+    /// `RemoteStateUpdate::Log` through the channel.
+    #[tokio::test]
+    async fn test_receive_log_message() {
+        use super::super::types::RemoteLogEntry;
+
+        let log_json = r#"{
+            "type": "log",
+            "entry": {
+                "message": "Build completed successfully",
+                "level": "success",
+                "change_id": "my-change",
+                "timestamp": "2024-01-01T00:00:00Z"
+            }
+        }"#
+        .to_string();
+
+        let addr = spawn_mock_ws_server(vec![log_json]).await;
+        let ws_url = format!("ws://{}/api/v1/ws", addr);
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = connect_and_subscribe(ws_url, None, tx)
+            .await
+            .expect("Should connect to mock server");
+
+        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(3), rx.recv())
+            .await
+            .expect("Timed out waiting for message")
+            .expect("Channel closed before receiving message");
+
+        match msg {
+            super::super::types::RemoteStateUpdate::Log { entry } => {
+                assert_eq!(entry.message, "Build completed successfully");
+                assert_eq!(entry.level, "success");
+                assert_eq!(entry.change_id, Some("my-change".to_string()));
+                assert_eq!(entry.timestamp, "2024-01-01T00:00:00Z");
+            }
+            other => panic!("Expected Log, got {:?}", other),
+        }
+
+        handle.abort();
+    }
+
     /// Verify that the Authorization header is sent when a bearer token is provided.
     /// We use a mock server that captures the raw HTTP upgrade request and checks headers.
     #[tokio::test]

@@ -20,6 +20,7 @@ use tracing::{info, warn};
 
 use crate::error::Result;
 use crate::process_manager::{configure_process_group, ManagedChild};
+use crate::remote::types::RemoteLogEntry;
 use crate::server::registry::{ProjectStatus, SharedRegistry};
 
 #[derive(Debug)]
@@ -47,6 +48,7 @@ pub(crate) async fn start_project_run(
     runners: &SharedRunners,
     registry: SharedRegistry,
     req: ProjectRunRequest,
+    log_tx: tokio::sync::broadcast::Sender<RemoteLogEntry>,
 ) -> Result<()> {
     // If already running, cancel existing runner first.
     stop_project_run(runners, req.project_id.clone()).await;
@@ -69,7 +71,8 @@ pub(crate) async fn start_project_run(
             );
         }
 
-        match run_cflx_in_worktree(&project_id, &worktree_path, changes, cancel_child).await {
+        match run_cflx_in_worktree(&project_id, &worktree_path, changes, cancel_child, log_tx).await
+        {
             Ok(()) => {
                 if let Err(e) =
                     set_project_status(&registry_child, &project_id, ProjectStatus::Idle).await
@@ -110,11 +113,21 @@ async fn set_project_status(
     reg.set_status(project_id, status)
 }
 
+fn make_log_entry(message: String, level: &str, change_id: Option<String>) -> RemoteLogEntry {
+    RemoteLogEntry {
+        message,
+        level: level.to_string(),
+        change_id,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
 async fn run_cflx_in_worktree(
     project_id: &str,
     worktree_path: &Path,
     changes: Option<Vec<String>>,
     cancel: CancellationToken,
+    log_tx: tokio::sync::broadcast::Sender<RemoteLogEntry>,
 ) -> Result<()> {
     if !worktree_path.exists() {
         return Err(crate::error::OrchestratorError::ConfigLoad(format!(
@@ -165,22 +178,30 @@ async fn run_cflx_in_worktree(
         )))
     })?;
 
-    // Drain stdout/stderr to avoid blocking.
+    // Drain stdout/stderr to avoid blocking, and stream to WebSocket clients.
     if let Some(stdout) = child.child.stdout.take() {
         let pid = project_id.to_string();
+        let tx = log_tx.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 info!("[{} stdout] {}", pid, line);
+                let entry = make_log_entry(line, "info", None);
+                // Ignore errors (no subscribers is fine)
+                let _ = tx.send(entry);
             }
         });
     }
     if let Some(stderr) = child.child.stderr.take() {
         let pid = project_id.to_string();
+        let tx = log_tx.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 info!("[{} stderr] {}", pid, line);
+                let entry = make_log_entry(line, "warn", None);
+                // Ignore errors (no subscribers is fine)
+                let _ = tx.send(entry);
             }
         });
     }

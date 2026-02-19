@@ -431,6 +431,30 @@ async fn run_tui_loop(
                             })
                             .await;
                     }
+                    RemoteStateUpdate::Log { entry } => {
+                        // Convert remote log entry to a TUI log event
+                        use crate::tui::events::LogLevel;
+                        let level = match entry.level.as_str() {
+                            "error" => LogLevel::Error,
+                            "warn" | "warning" => LogLevel::Warn,
+                            "success" => LogLevel::Success,
+                            _ => LogLevel::Info,
+                        };
+                        let log_entry = crate::tui::events::LogEntry {
+                            timestamp: entry.timestamp.clone(),
+                            created_at: chrono::Utc::now(),
+                            message: entry.message,
+                            color: ratatui::style::Color::Reset,
+                            level,
+                            change_id: entry.change_id,
+                            operation: None,
+                            iteration: None,
+                            workspace_path: None,
+                        };
+                        let _ = translate_tx
+                            .send(super::events::OrchestratorEvent::Log(log_entry))
+                            .await;
+                    }
                     RemoteStateUpdate::ChangeRemoved { .. } | RemoteStateUpdate::Ping => {
                         // Ping is a no-op; ChangeRemoved would require a separate event type (future work)
                     }
