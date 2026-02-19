@@ -2770,8 +2770,10 @@ mod tests {
     #[test]
     fn test_server_config_validate_rejects_deprecated_resolve_command() {
         // Verify that setting server.resolve_command causes a configuration error
-        let mut config = ServerConfig::default();
-        config.resolve_command = Some("echo resolve".to_string());
+        let config = ServerConfig {
+            resolve_command: Some("echo resolve".to_string()),
+            ..Default::default()
+        };
 
         let result = config.validate();
         assert!(

@@ -854,18 +854,20 @@ The orchestrator SHALL support configuring the maximum number of acceptance CONT
 - `auth.token` または `auth.token_env`
 - `data_dir`
 
+`server.resolve_command` は受け付けてはならない（MUST NOT）。サーバの auto_resolve で使用する resolve_command はトップレベルの `resolve_command` を使用しなければならない（MUST）。
+
 #### Scenario: グローバル設定から server を読み込む
 - **GIVEN** `~/.config/cflx/config.jsonc` に `server` セクションがある
 - **WHEN** `cflx server` を起動する
 - **THEN** サーバは `server` セクションの設定を使用する
 
-#### Scenario: 非ループバック bind は bearer token 必須
-- **GIVEN** `server.bind` がループバック以外である
-- **AND** `server.auth.mode=none`
+#### Scenario: server.resolve_command は設定エラーになる
+- **GIVEN** 設定ファイルに `server.resolve_command` が含まれている
 - **WHEN** 設定を読み込む
 - **THEN** 設定エラーとして失敗する
+- **AND** エラーメッセージに `server.resolve_command` が含まれる
 
-#### Scenario: port 未指定は既定値を使う
-- **GIVEN** `server.port` が未指定である
-- **WHEN** 設定を読み込む
-- **THEN** `server.port=9876` が使用される
+#### Scenario: サーバの auto_resolve はトップレベル resolve_command を使う
+- **GIVEN** 設定のマージ結果にトップレベルの `resolve_command` が存在する
+- **WHEN** サーバが auto_resolve を実行する
+- **THEN** `resolve_command` が使用される
