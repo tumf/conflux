@@ -257,8 +257,6 @@ mod tests {
     /// `RemoteStateUpdate::Log` through the channel.
     #[tokio::test]
     async fn test_receive_log_message() {
-        use super::super::types::RemoteLogEntry;
-
         let log_json = r#"{
             "type": "log",
             "entry": {
