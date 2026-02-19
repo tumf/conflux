@@ -21,7 +21,9 @@ use tracing::{debug, error, info};
 
 use crate::execution::state::{detect_workspace_state, WorkspaceState};
 use crate::remote::types::{RemoteChange, RemoteProject, RemoteStateUpdate};
-use crate::server::registry::{ProjectEntry, ProjectStatus, SharedRegistry};
+use crate::server::registry::{
+    server_worktree_branch, ProjectEntry, ProjectStatus, SharedRegistry,
+};
 use crate::server::runner::{ProjectRunRequest, SharedRunners};
 use crate::task_parser;
 use crate::vcs::GitWorkspaceManager;
@@ -461,6 +463,10 @@ pub async fn add_project(
     );
 
     // Determine local paths.
+    // The worktree uses a server-specific branch name to avoid checking out the base branch.
+    // This is required so that git pull/push on the bare clone can update refs/heads/<branch>
+    // without being blocked by an active checkout of that branch.
+    let server_branch = server_worktree_branch(&project_id, &branch);
     let (local_repo_path, worktree_path) = {
         let registry = state.registry.read().await;
         let data_dir = registry.data_dir().to_path_buf();
@@ -552,6 +558,9 @@ pub async fn add_project(
     }
 
     // Step 5: Create a worktree at data_dir/worktrees/<project_id>/<branch>.
+    // The worktree is created on a server-specific branch (`server-wt/<project_id>/<base_branch>`)
+    // so that the bare clone's refs/heads/<base_branch> can be updated by git pull/push
+    // without being blocked by an active checkout.
     if !worktree_path.exists() {
         if let Err(e) = std::fs::create_dir_all(&worktree_path) {
             error!("Failed to create worktree parent dirs: {}", e);
@@ -571,10 +580,15 @@ pub async fn add_project(
             );
         }
 
+        // Use `-b <server_branch>` to create a new branch for the worktree.
+        // This avoids checking out the base branch directly in the worktree,
+        // which would prevent the bare clone from updating refs/heads/<base_branch>.
         let worktree_output = tokio::process::Command::new("git")
             .args([
                 "worktree",
                 "add",
+                "-b",
+                &server_branch,
                 worktree_path.to_str().unwrap_or(""),
                 &branch,
             ])
@@ -585,8 +599,8 @@ pub async fn add_project(
         match worktree_output {
             Ok(out) if out.status.success() => {
                 info!(
-                    "git worktree add succeeded: project_id={} path={:?}",
-                    project_id, worktree_path
+                    "git worktree add succeeded: project_id={} path={:?} server_branch={}",
+                    project_id, worktree_path, server_branch
                 );
             }
             Ok(out) => {
@@ -613,6 +627,59 @@ pub async fn add_project(
             }
         }
     } else {
+        // Worktree already exists. Check if it is checking out the base branch directly,
+        // which would block git pull/push on the bare clone.
+        // If so, return an error with instructions to recreate the worktree.
+        let head_output = tokio::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&local_repo_path)
+            .output()
+            .await;
+
+        if let Ok(out) = head_output {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            // Parse worktree list output to find the worktree at our path and its branch.
+            // Format:
+            //   worktree /path/to/wt
+            //   HEAD <sha>
+            //   branch refs/heads/<branch>
+            let wt_path_str = worktree_path.to_str().unwrap_or("");
+            let mut in_our_worktree = false;
+            let mut checked_out_branch: Option<String> = None;
+            for line in stdout.lines() {
+                if line.starts_with("worktree ") {
+                    let wt_path = line.trim_start_matches("worktree ");
+                    in_our_worktree = wt_path == wt_path_str;
+                    if !in_our_worktree {
+                        checked_out_branch = None;
+                    }
+                } else if in_our_worktree && line.starts_with("branch refs/heads/") {
+                    checked_out_branch =
+                        Some(line.trim_start_matches("branch refs/heads/").to_string());
+                }
+            }
+
+            if checked_out_branch.as_deref() == Some(branch.as_str()) {
+                // The existing worktree is checking out the base branch directly.
+                // This blocks bare clone pull/push. The user must recreate it.
+                error!(
+                    "Existing worktree checks out base branch '{}' directly: project_id={} path={:?}. \
+                    This blocks git pull/push on the bare clone.",
+                    branch, project_id, worktree_path
+                );
+                let err_msg = format!(
+                    "Existing worktree at {:?} checks out the base branch '{}' directly. \
+                    This prevents git pull/push on the bare clone. \
+                    To fix: remove the project (DELETE /api/v1/projects/{}), then re-add it \
+                    so the worktree is recreated on a server-specific branch ({}). \
+                    Alternatively, run: git worktree remove {:?} && re-add via API.",
+                    worktree_path, branch, project_id, server_branch, worktree_path
+                );
+                rollback(&state, project_id).await;
+                return error_response(StatusCode::CONFLICT, err_msg);
+            }
+        }
+
         info!(
             "Worktree already exists, reusing: project_id={} path={:?}",
             project_id, worktree_path
@@ -2840,6 +2907,94 @@ mod tests {
                 "a b c".to_string(),
                 "a b c-suffix".to_string(),
             ]
+        );
+    }
+
+    // ── Server worktree branch tests ──
+
+    /// Verify that POST /api/v1/projects creates a worktree on a server-specific branch,
+    /// NOT on the base branch directly.
+    #[tokio::test]
+    async fn test_add_project_creates_worktree_on_server_branch() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let router = make_router(&temp_dir, None);
+
+        let body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Retrieve the project ID from the response
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let project_id = json["id"].as_str().expect("Response must have id field");
+
+        // The worktree path is data_dir/worktrees/<project_id>/main
+        let worktree_path = temp_dir
+            .path()
+            .join("worktrees")
+            .join(project_id)
+            .join("main");
+
+        assert!(
+            worktree_path.exists(),
+            "Worktree directory must exist at {:?}",
+            worktree_path
+        );
+
+        // Verify that the worktree's HEAD does NOT reference refs/heads/main (the base branch).
+        // Instead, it should reference the server-specific branch: server-wt/<project_id>/main.
+        let head_output = std::process::Command::new("git")
+            .args(["symbolic-ref", "HEAD"])
+            .current_dir(&worktree_path)
+            .output();
+
+        if let Ok(out) = head_output {
+            if out.status.success() {
+                let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                assert_ne!(
+                    head, "refs/heads/main",
+                    "Worktree HEAD must NOT reference refs/heads/main (base branch). \
+                    It must use a server-specific branch. Got: {}",
+                    head
+                );
+                // Verify the branch follows the server-wt/<project_id>/<base_branch> format
+                let expected_prefix = format!("refs/heads/server-wt/{}/", project_id);
+                assert!(
+                    head.starts_with(&expected_prefix),
+                    "Worktree HEAD must start with '{}'. Got: {}",
+                    expected_prefix,
+                    head
+                );
+            }
+        }
+    }
+
+    /// Verify the server_worktree_branch function is accessible and produces the correct format.
+    #[test]
+    fn test_server_worktree_branch_function_produces_correct_format() {
+        use crate::server::registry::server_worktree_branch;
+        let project_id = "abc123def456789a";
+        let base_branch = "main";
+        let branch = server_worktree_branch(project_id, base_branch);
+        assert_eq!(
+            branch, "server-wt/abc123def456789a/main",
+            "server_worktree_branch must produce 'server-wt/<project_id>/<base_branch>'"
         );
     }
 }
