@@ -2323,7 +2323,7 @@ mod tests {
     /// - Returns (remote_dir, local_clone_dir, project_entry, remote_url) or None if git unavailable.
     /// - remote has: initial + remote_advance
     /// - local has: initial + diverged
-    /// So these branches have diverged (non-fast-forward situation).
+    ///   So these branches have diverged (non-fast-forward situation).
     async fn create_diverged_repo_setup(
         temp_dir: &TempDir,
         state: &AppState,
