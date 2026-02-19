@@ -2770,7 +2770,7 @@ mod tests {
     async fn test_git_sync_fails_without_resolve_command() {
         let temp_dir = TempDir::new().unwrap();
         let state = make_state(&temp_dir, None); // resolve_command = None
-        let router = build_router(state);
+        let _router = build_router(state);
 
         // Add a fake project first (project lookup happens before resolve_command check)
         // We test with no project to confirm the endpoint reachability; the real check
