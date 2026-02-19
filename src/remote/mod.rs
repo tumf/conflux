@@ -8,6 +8,9 @@ pub mod mapper;
 pub mod types;
 pub mod ws;
 
+#[cfg(test)]
+pub mod test_helpers;
+
 pub use client::RemoteClient;
 pub use mapper::group_changes_by_project;
 pub use types::RemoteStateUpdate;
