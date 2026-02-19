@@ -40,8 +40,6 @@ pub use types::{FailedChangeTracker, WorkspaceResult};
 #[cfg(test)]
 pub use crate::vcs::Workspace;
 #[cfg(test)]
-pub use dynamic_queue::ReanalysisReason;
-#[cfg(test)]
 pub use merge::MergeAttempt;
 
 use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
