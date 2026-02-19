@@ -1,8 +1,12 @@
-.PHONY: install build bump-minor bump-patch bump-major index index-full setup fmt lint test check openapi check-openapi
+.PHONY: install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test check openapi check-openapi
 
 # Build the project
 build:
 	cargo build --release
+
+# Clean build artifacts
+clean:
+	cargo clean
 
 # Install the binary locally
 install:
