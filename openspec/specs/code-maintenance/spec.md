@@ -333,3 +333,11 @@ archive ループの実装は、フック実行・コマンド実行・検証・
 - **WHEN** 開発者が `src/parallel/` の構成を確認する
 - **THEN** `parallel/mod.rs` はモジュール宣言と再公開が中心である
 - **AND** `ParallelExecutor` の詳細実装は別のサブモジュールに存在する
+
+### Requirement: Remote Test Support Helpers
+リモートモジュールのテストは、WS/HTTP モックサーバー生成と JSON フィクスチャ生成を共通ヘルパー経由で行わなければならない (MUST)。
+
+#### Scenario: 共通ヘルパーの利用
+- **WHEN** リモートテストがモックサーバーを必要とする
+- **THEN** 共通ヘルパーが WS/HTTP のモックサーバーを生成する
+- **AND** テストは同じ待機/検証条件で実行できる
