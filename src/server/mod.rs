@@ -46,12 +46,16 @@ pub async fn run_server(config: ServerConfig, resolve_command: Option<String>) -
         crate::config::ServerAuthMode::None => None,
     };
 
+    // Create log broadcast channel for streaming execution logs to WebSocket clients.
+    let (log_tx, _) = tokio::sync::broadcast::channel(crate::server::api::SERVER_LOG_BUFFER_SIZE);
+
     let app_state = api::AppState {
         registry,
         runners,
         auth_token,
         max_concurrent_total: config.max_concurrent_total,
         resolve_command,
+        log_tx,
     };
 
     // Build router.

@@ -20,13 +20,16 @@ use shlex;
 use tracing::{debug, error, info};
 
 use crate::execution::state::{detect_workspace_state, WorkspaceState};
-use crate::remote::types::{RemoteChange, RemoteProject, RemoteStateUpdate};
+use crate::remote::types::{RemoteChange, RemoteLogEntry, RemoteProject, RemoteStateUpdate};
 use crate::server::registry::{
     server_worktree_branch, ProjectEntry, ProjectStatus, SharedRegistry,
 };
 use crate::server::runner::{ProjectRunRequest, SharedRunners};
 use crate::task_parser;
 use crate::vcs::GitWorkspaceManager;
+
+/// Maximum number of log entries retained in server-side log buffer (broadcast channel capacity)
+pub const SERVER_LOG_BUFFER_SIZE: usize = 1000;
 
 /// Shared application state passed to axum handlers.
 #[derive(Clone)]
@@ -40,6 +43,8 @@ pub struct AppState {
     pub max_concurrent_total: usize,
     /// Optional resolve command to run when auto_resolve is triggered on non-fast-forward
     pub resolve_command: Option<String>,
+    /// Broadcast channel for streaming log entries to WebSocket clients
+    pub log_tx: tokio::sync::broadcast::Sender<RemoteLogEntry>,
 }
 
 // ─────────────────────────────── Auth middleware ──────────────────────────────
@@ -170,14 +175,18 @@ pub async fn projects_state(State(state): State<AppState>) -> Response {
 /// Current behavior:
 /// - Sends periodic FullState snapshots (simple, reliable for clients).
 /// - Also sends Ping messages to keep the connection alive.
-///
-/// Incremental updates are a future enhancement.
+/// - Streams Log entries from the execution log broadcast channel.
 pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
     let registry = state.registry.clone();
-    ws.on_upgrade(move |socket| handle_ws(socket, registry))
+    let log_rx = state.log_tx.subscribe();
+    ws.on_upgrade(move |socket| handle_ws(socket, registry, log_rx))
 }
 
-async fn handle_ws(mut socket: WebSocket, registry: SharedRegistry) {
+async fn handle_ws(
+    mut socket: WebSocket,
+    registry: SharedRegistry,
+    mut log_rx: tokio::sync::broadcast::Receiver<RemoteLogEntry>,
+) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
 
     loop {
@@ -204,6 +213,24 @@ async fn handle_ws(mut socket: WebSocket, registry: SharedRegistry) {
                 if let Ok(ping) = serde_json::to_string(&RemoteStateUpdate::Ping) {
                     if socket.send(Message::Text(ping.into())).await.is_err() {
                         break;
+                    }
+                }
+            }
+
+            log_result = log_rx.recv() => {
+                match log_result {
+                    Ok(entry) => {
+                        if let Ok(payload) = serde_json::to_string(&RemoteStateUpdate::Log { entry }) {
+                            if socket.send(Message::Text(payload.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        debug!("WS log receiver lagged by {} messages", n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Sender closed – stop streaming logs but keep WS open
                     }
                 }
             }
@@ -1296,6 +1323,7 @@ async fn apply_control(
                 &state.runners,
                 state.registry.clone(),
                 req,
+                state.log_tx.clone(),
             )
             .await
             {
@@ -1371,12 +1399,14 @@ mod tests {
 
     fn make_state(temp_dir: &TempDir, auth_token: Option<&str>) -> AppState {
         let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
         AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
             auth_token: auth_token.map(|s| s.to_string()),
             max_concurrent_total: 4,
             resolve_command: None,
+            log_tx,
         }
     }
 
@@ -1637,12 +1667,14 @@ mod tests {
         max_concurrent: usize,
     ) -> AppState {
         let registry = create_shared_registry(temp_dir.path(), max_concurrent).unwrap();
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
         AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
             auth_token: auth_token.map(|s| s.to_string()),
             max_concurrent_total: max_concurrent,
             resolve_command: None,
+            log_tx,
         }
     }
 
@@ -2418,12 +2450,14 @@ mod tests {
 
         // Create state with resolve_command = "echo resolve"
         let registry = crate::server::registry::create_shared_registry(temp_dir.path(), 4).unwrap();
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
             auth_token: None,
             max_concurrent_total: 4,
             resolve_command: Some("echo resolve".to_string()),
+            log_tx,
         };
 
         let branch = "main";
@@ -2561,6 +2595,7 @@ mod tests {
         // Create state with top-level resolve_command (simulating what run_server now does)
         let temp_dir = TempDir::new().unwrap();
         let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
@@ -2568,6 +2603,7 @@ mod tests {
             max_concurrent_total: 4,
             // This resolve_command now comes from top-level config (not server.resolve_command)
             resolve_command: Some("echo resolve".to_string()),
+            log_tx,
         };
 
         let branch = "main";
@@ -2789,12 +2825,14 @@ mod tests {
             entry.id.clone()
         };
 
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
         let state_with_project = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
             auth_token: None,
             max_concurrent_total: 4,
             resolve_command: None, // Not configured — must cause 422
+            log_tx,
         };
         let router = build_router(state_with_project);
 
@@ -2843,12 +2881,14 @@ mod tests {
             entry.id.clone()
         };
 
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
             auth_token: None,
             max_concurrent_total: 4,
             resolve_command: None, // Will trigger 422 (resolve_command not configured)
+            log_tx,
         };
         let router = build_router(state);
 
@@ -2891,12 +2931,14 @@ mod tests {
         };
 
         // Use resolve_command = "true" (always exits 0)
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
             auth_token: None,
             max_concurrent_total: 4,
             resolve_command: Some("true".to_string()),
+            log_tx,
         };
         let router = build_router(state);
 

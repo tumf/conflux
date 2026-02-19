@@ -32,6 +32,28 @@ pub struct RemoteProject {
     pub changes: Vec<RemoteChange>,
 }
 
+/// A log entry streamed from the remote server
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RemoteLogEntry {
+    /// Log message content
+    pub message: String,
+    /// Log level: "info", "warn", "error", "success"
+    pub level: String,
+    /// Optional change ID this log belongs to
+    pub change_id: Option<String>,
+    /// ISO 8601 timestamp
+    pub timestamp: String,
+    /// Optional project ID this log belongs to (for project-level log association)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Optional operation type (apply, archive, resolve, analyze)
+    /// Always serialized (even as null) so clients can rely on the key being present.
+    pub operation: Option<String>,
+    /// Optional iteration number for apply/archive operations
+    /// Always serialized (even as null) so clients can rely on the key being present.
+    pub iteration: Option<u32>,
+}
+
 /// A state update message received over WebSocket
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -42,6 +64,8 @@ pub enum RemoteStateUpdate {
     ChangeUpdate { change: RemoteChange },
     /// A change was removed
     ChangeRemoved { id: String, project: String },
+    /// A log entry from server execution
+    Log { entry: RemoteLogEntry },
     /// Heartbeat / keep-alive
     Ping,
 }
@@ -124,5 +148,101 @@ mod tests {
         let json = r#"{"type": "ping"}"#;
         let update: RemoteStateUpdate = serde_json::from_str(json).unwrap();
         assert!(matches!(update, RemoteStateUpdate::Ping));
+    }
+
+    /// Verify that a RemoteLogEntry can be serialized and deserialized correctly (round-trip).
+    #[test]
+    fn test_remote_log_entry_round_trip() {
+        let entry = RemoteLogEntry {
+            message: "Running apply for change add-feature-x".to_string(),
+            level: "info".to_string(),
+            change_id: Some("add-feature-x".to_string()),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            project_id: Some("proj-abc123".to_string()),
+            operation: Some("apply".to_string()),
+            iteration: Some(1),
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: RemoteLogEntry = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.message, entry.message);
+        assert_eq!(decoded.level, entry.level);
+        assert_eq!(decoded.change_id, entry.change_id);
+        assert_eq!(decoded.timestamp, entry.timestamp);
+        assert_eq!(decoded.project_id, entry.project_id);
+        assert_eq!(decoded.operation, entry.operation);
+        assert_eq!(decoded.iteration, entry.iteration);
+    }
+
+    /// Verify that RemoteStateUpdate::Log is serialized with type="log" and can be deserialized.
+    #[test]
+    fn test_remote_state_update_log_round_trip() {
+        let entry = RemoteLogEntry {
+            message: "stderr: Build failed".to_string(),
+            level: "warn".to_string(),
+            change_id: None,
+            timestamp: "2024-06-01T12:00:00Z".to_string(),
+            project_id: Some("proj-xyz789".to_string()),
+            operation: None,
+            iteration: None,
+        };
+
+        let update = RemoteStateUpdate::Log {
+            entry: entry.clone(),
+        };
+        let json = serde_json::to_string(&update).unwrap();
+
+        // Verify the type tag is correct
+        assert!(json.contains(r#""type":"log""#));
+
+        // Verify that operation and iteration keys are always present in JSON output
+        // even when their values are None (null), so clients can rely on key presence.
+        assert!(
+            json.contains(r#""operation":null"#),
+            "operation key must be present as null, got: {json}"
+        );
+        assert!(
+            json.contains(r#""iteration":null"#),
+            "iteration key must be present as null, got: {json}"
+        );
+
+        let decoded: RemoteStateUpdate = serde_json::from_str(&json).unwrap();
+        match decoded {
+            RemoteStateUpdate::Log {
+                entry: decoded_entry,
+            } => {
+                assert_eq!(decoded_entry.message, entry.message);
+                assert_eq!(decoded_entry.level, entry.level);
+                assert_eq!(decoded_entry.change_id, entry.change_id);
+                assert_eq!(decoded_entry.timestamp, entry.timestamp);
+            }
+            _ => panic!("Expected Log variant"),
+        }
+    }
+
+    /// Verify deserialization from a raw JSON string with type="log".
+    #[test]
+    fn test_remote_state_update_log_deserialization_from_json() {
+        let json = r#"{
+            "type": "log",
+            "entry": {
+                "message": "Build succeeded",
+                "level": "success",
+                "change_id": "feat-x",
+                "timestamp": "2024-01-02T09:00:00Z"
+            }
+        }"#;
+
+        let update: RemoteStateUpdate = serde_json::from_str(json).unwrap();
+        match update {
+            RemoteStateUpdate::Log { entry } => {
+                assert_eq!(entry.message, "Build succeeded");
+                assert_eq!(entry.level, "success");
+                assert_eq!(entry.change_id, Some("feat-x".to_string()));
+                assert_eq!(entry.timestamp, "2024-01-02T09:00:00Z");
+            }
+            _ => panic!("Expected Log variant"),
+        }
     }
 }

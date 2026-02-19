@@ -431,6 +431,36 @@ async fn run_tui_loop(
                             })
                             .await;
                     }
+                    RemoteStateUpdate::Log { entry } => {
+                        // Convert remote log entry to a TUI log event
+                        use crate::tui::events::LogLevel;
+                        let level = match entry.level.as_str() {
+                            "error" => LogLevel::Error,
+                            "warn" | "warning" => LogLevel::Warn,
+                            "success" => LogLevel::Success,
+                            _ => LogLevel::Info,
+                        };
+                        // Normalize change_id for remote log association:
+                        // When change_id is None but project_id is set, use project_id as
+                        // the change_id so that get_latest_log_for_change() can match logs
+                        // to changes via project_id prefix matching.
+                        let effective_change_id =
+                            entry.change_id.or_else(|| entry.project_id.clone());
+                        let log_entry = crate::tui::events::LogEntry {
+                            timestamp: entry.timestamp.clone(),
+                            created_at: chrono::Utc::now(),
+                            message: entry.message,
+                            color: ratatui::style::Color::Reset,
+                            level,
+                            change_id: effective_change_id,
+                            operation: entry.operation,
+                            iteration: entry.iteration,
+                            workspace_path: None,
+                        };
+                        let _ = translate_tx
+                            .send(super::events::OrchestratorEvent::Log(log_entry))
+                            .await;
+                    }
                     RemoteStateUpdate::ChangeRemoved { .. } | RemoteStateUpdate::Ping => {
                         // Ping is a no-op; ChangeRemoved would require a separate event type (future work)
                     }
