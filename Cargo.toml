@@ -48,7 +48,8 @@ shlex = "1.3"
 rand = "0.8"
 
 # Remote TUI client dependencies
-reqwest = { version = "0.12", features = ["json"] }
+# Use rustls to avoid OpenSSL/native-tls issues in cross-compilation.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 
