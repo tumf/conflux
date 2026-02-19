@@ -43,6 +43,15 @@ pub struct RemoteLogEntry {
     pub change_id: Option<String>,
     /// ISO 8601 timestamp
     pub timestamp: String,
+    /// Optional project ID this log belongs to (for project-level log association)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Optional operation type (apply, archive, resolve, analyze)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    /// Optional iteration number for apply/archive operations
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<u32>,
 }
 
 /// A state update message received over WebSocket
@@ -149,6 +158,9 @@ mod tests {
             level: "info".to_string(),
             change_id: Some("add-feature-x".to_string()),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            project_id: Some("proj-abc123".to_string()),
+            operation: Some("apply".to_string()),
+            iteration: Some(1),
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -158,6 +170,9 @@ mod tests {
         assert_eq!(decoded.level, entry.level);
         assert_eq!(decoded.change_id, entry.change_id);
         assert_eq!(decoded.timestamp, entry.timestamp);
+        assert_eq!(decoded.project_id, entry.project_id);
+        assert_eq!(decoded.operation, entry.operation);
+        assert_eq!(decoded.iteration, entry.iteration);
     }
 
     /// Verify that RemoteStateUpdate::Log is serialized with type="log" and can be deserialized.
@@ -168,6 +183,9 @@ mod tests {
             level: "warn".to_string(),
             change_id: None,
             timestamp: "2024-06-01T12:00:00Z".to_string(),
+            project_id: Some("proj-xyz789".to_string()),
+            operation: None,
+            iteration: None,
         };
 
         let update = RemoteStateUpdate::Log {

@@ -1138,11 +1138,28 @@ impl AppState {
     ///
     /// Returns the most recent log entry that matches the given change_id.
     /// Used for displaying log previews in the change list.
+    ///
+    /// In remote mode, change IDs have the form `"<project_id>::<project_name>/<change_id>"`.
+    /// Log entries from the remote server may have `change_id` set to the bare `project_id`
+    /// (when no specific change is known). This method also matches those project-level logs
+    /// by checking if the `change_id` argument starts with `"<entry.change_id>::"`.
     pub fn get_latest_log_for_change(&self, change_id: &str) -> Option<&LogEntry> {
-        self.logs
-            .iter()
-            .rev()
-            .find(|entry| entry.change_id.as_deref() == Some(change_id))
+        self.logs.iter().rev().find(|entry| {
+            if let Some(entry_cid) = entry.change_id.as_deref() {
+                // Exact match (local mode and remote mode with full change_id)
+                if entry_cid == change_id {
+                    return true;
+                }
+                // Project-level log match: entry has project_id, change_id starts with that project_id
+                // Remote change IDs have the form "<project_id>::<project_name>/<change_id>"
+                // Remote logs with only project_id set as change_id will match via this prefix check.
+                let prefix = format!("{}::", entry_cid);
+                if change_id.starts_with(&prefix) {
+                    return true;
+                }
+            }
+            false
+        })
     }
 
     /// Add a log entry
@@ -3739,5 +3756,112 @@ mod tests {
             initial_count + 5,
             "All 5 remote log entries should be present in log panel"
         );
+    }
+
+    /// Verify that get_latest_log_for_change matches remote project-level logs
+    /// where change_id is the project_id and the queried change_id has the
+    /// format "<project_id>::<project_name>/<change_id>".
+    #[test]
+    fn test_get_latest_log_for_change_project_id_prefix_match() {
+        use crate::tui::events::{LogEntry, LogLevel, OrchestratorEvent};
+
+        let remote_change_id = "proj-abc123::my-project@main/change-a";
+        let changes = vec![create_test_change(remote_change_id, 0, 3)];
+        let mut app = AppState::new(changes);
+
+        // Simulate a project-level remote log where change_id = project_id
+        let project_id = "proj-abc123";
+        let entry = LogEntry {
+            timestamp: "12:00:00".to_string(),
+            created_at: chrono::Utc::now(),
+            message: "Remote project stdout: building...".to_string(),
+            color: ratatui::style::Color::Reset,
+            level: LogLevel::Info,
+            change_id: Some(project_id.to_string()),
+            operation: None,
+            iteration: None,
+            workspace_path: None,
+        };
+
+        app.handle_orchestrator_event(OrchestratorEvent::Log(entry.clone()));
+
+        // The log should be found when querying by the full remote change_id
+        // because the entry's change_id (project_id) is a prefix of the change_id
+        let found = app.get_latest_log_for_change(remote_change_id);
+        assert!(
+            found.is_some(),
+            "Expected to find log for remote change via project_id prefix matching"
+        );
+        assert_eq!(
+            found.unwrap().message,
+            entry.message,
+            "Log message should match"
+        );
+    }
+
+    /// Verify that get_latest_log_for_change still performs exact match for local changes.
+    #[test]
+    fn test_get_latest_log_for_change_exact_match_local() {
+        use crate::tui::events::{LogEntry, LogLevel, OrchestratorEvent};
+
+        let change_id = "my-local-change";
+        let changes = vec![create_test_change(change_id, 0, 3)];
+        let mut app = AppState::new(changes);
+
+        let entry = LogEntry {
+            timestamp: "12:00:00".to_string(),
+            created_at: chrono::Utc::now(),
+            message: "Local apply log".to_string(),
+            color: ratatui::style::Color::Reset,
+            level: LogLevel::Info,
+            change_id: Some(change_id.to_string()),
+            operation: Some("apply".to_string()),
+            iteration: Some(1),
+            workspace_path: None,
+        };
+
+        app.handle_orchestrator_event(OrchestratorEvent::Log(entry.clone()));
+
+        let found = app.get_latest_log_for_change(change_id);
+        assert!(found.is_some(), "Expected to find log by exact change_id");
+        assert_eq!(found.unwrap().message, entry.message);
+
+        // Should not match a different change_id
+        let not_found = app.get_latest_log_for_change("other-change");
+        assert!(
+            not_found.is_none(),
+            "Should not match a different change_id"
+        );
+    }
+
+    /// Verify RemoteLogEntry round-trip with all new fields (project_id, operation, iteration).
+    #[test]
+    fn test_remote_log_entry_with_project_id_round_trip() {
+        use crate::remote::types::RemoteLogEntry;
+
+        let entry = RemoteLogEntry {
+            message: "stdout: tests passed".to_string(),
+            level: "info".to_string(),
+            change_id: None,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            project_id: Some("proj-abc123".to_string()),
+            operation: Some("apply".to_string()),
+            iteration: Some(2),
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: RemoteLogEntry = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.message, entry.message);
+        assert_eq!(decoded.change_id, entry.change_id);
+        assert_eq!(decoded.project_id, entry.project_id);
+        assert_eq!(decoded.operation, entry.operation);
+        assert_eq!(decoded.iteration, entry.iteration);
+        // change_id is None so decoded value is None
+        assert_eq!(decoded.change_id, None);
+        // New fields appear in JSON when Some
+        assert!(json.contains("project_id"));
+        assert!(json.contains("operation"));
+        assert!(json.contains("iteration"));
     }
 }

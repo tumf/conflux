@@ -13,3 +13,8 @@
 
 - [x] 3.1 Log イベントのシリアライズ/デシリアライズ単体テストを追加する（Log payload が round-trip することを確認）
 - [x] 3.2 remote TUI が Log を受け取ってログパネルに追加するテストを追加する（state のログ件数が増えることを確認）
+
+## Acceptance #1 Failure Follow-up
+
+- [x] `RemoteLogEntry` に spec 必須フィールド（`project_id`, `operation`, `iteration`）を追加し、server→WebSocket→remote client のシリアライズ/デシリアライズを更新する（`src/remote/types.rs` に `project_id: Option<String>`, `operation: Option<String>`, `iteration: Option<u32>` を追加）
+- [x] リモートログが change 行プレビューに紐づくよう、`change_id` を remote change の表示 ID 形式に正規化して送受信する（`src/server/runner.rs` の `make_log_entry` で `project_id` を設定、`src/tui/runner.rs` でログ変換時に `project_id` を `change_id` として使用、`src/tui/state.rs` の `get_latest_log_for_change` でプレフィックスマッチング `"<project_id>::"` を追加）

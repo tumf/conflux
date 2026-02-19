@@ -113,12 +113,20 @@ async fn set_project_status(
     reg.set_status(project_id, status)
 }
 
-fn make_log_entry(message: String, level: &str, change_id: Option<String>) -> RemoteLogEntry {
+fn make_log_entry(
+    message: String,
+    level: &str,
+    change_id: Option<String>,
+    project_id: Option<String>,
+) -> RemoteLogEntry {
     RemoteLogEntry {
         message,
         level: level.to_string(),
         change_id,
         timestamp: chrono::Utc::now().to_rfc3339(),
+        project_id,
+        operation: None,
+        iteration: None,
     }
 }
 
@@ -186,7 +194,7 @@ async fn run_cflx_in_worktree(
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 info!("[{} stdout] {}", pid, line);
-                let entry = make_log_entry(line, "info", None);
+                let entry = make_log_entry(line, "info", None, Some(pid.clone()));
                 // Ignore errors (no subscribers is fine)
                 let _ = tx.send(entry);
             }
@@ -199,7 +207,7 @@ async fn run_cflx_in_worktree(
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 info!("[{} stderr] {}", pid, line);
-                let entry = make_log_entry(line, "warn", None);
+                let entry = make_log_entry(line, "warn", None, Some(pid.clone()));
                 // Ignore errors (no subscribers is fine)
                 let _ = tx.send(entry);
             }
