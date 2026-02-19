@@ -46,6 +46,7 @@ impl ParallelExecutor {
         !self.merge_deferred_changes.is_empty()
     }
 
+    #[allow(dead_code)]
     pub(super) fn skip_reason_for_change(&self, change_id: &str) -> Option<String> {
         // Only skip changes with failed dependencies (not merge-wait dependencies).
         // Merge-wait dependencies are handled as blocked/queued status via dependency resolution.
