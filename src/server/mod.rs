@@ -50,6 +50,7 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         runners,
         auth_token,
         max_concurrent_total: config.max_concurrent_total,
+        resolve_command: config.resolve_command.clone(),
     };
 
     // Build router.
