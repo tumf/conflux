@@ -27,3 +27,9 @@
   - `cflx init --help` 出力を取得して確認済み
   - 各ドキュメントに存在しないコマンド (`cflx status`, `cflx reset`, `cflx approve`, `--opencode-path`, `--openspec-path`) が残っていないことを `grep` で確認済み
   - 現行 CLI の実際のコマンドと各ドキュメントの記載が一致することを確認済み
+
+## Acceptance #1 Failure Follow-up
+- [ ] README.md にプロジェクト構成の明示セクションを追加し、`hooks.rs` / `task_parser.rs` / `templates.rs` を含む現行ソースファイル一覧を記載する（evidence: `openspec/changes/update-golden-path-docs/specs/documentation/spec.md:19`, `README.md:890`）。
+- [ ] README.md / README.ja.md の CLI 一覧を `cflx --help` に再同期し、`server` サブコマンドと `--server` / `--server-token` / `--server-token-env` を反映する（evidence: `src/cli.rs:83`, `README.md:501`, `README.ja.md:485`）。
+- [ ] README.ja.md を README.md と同一構成に再同期し、欠落している「Web Monitoring」機能項目と「Logging configuration」節を追加する（evidence: `README.md:18`, `README.ja.md:10`, `README.md:339`, `README.ja.md:337`）。
+- [ ] Golden Path Quick Start の要件を `spec` と一致させる（`cflx run` を Quick Start に含めるか、要件側を `cflx init -> cflx` に修正して整合を取る）（evidence: `openspec/changes/update-golden-path-docs/specs/documentation/spec.md:28`, `README.md:37`, `docs/guides/USAGE.md:9`）。
