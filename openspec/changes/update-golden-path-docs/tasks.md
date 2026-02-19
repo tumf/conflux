@@ -33,3 +33,6 @@
 - [x] README.md / README.ja.md の CLI 一覧を `cflx --help` に再同期し、`server` サブコマンドと `--server` / `--server-token` / `--server-token-env` を反映する（evidence: `src/cli.rs:83`, `README.md:501`, `README.ja.md:485`）。
 - [x] README.ja.md を README.md と同一構成に再同期し、欠落している「Web Monitoring」機能項目と「Logging configuration」節を追加する（evidence: `README.md:18`, `README.ja.md:10`, `README.md:339`, `README.ja.md:337`）。
 - [x] Golden Path Quick Start の要件を `spec` と一致させる（`cflx run` を Quick Start に含めるか、要件側を `cflx init -> cflx` に修正して整合を取る）（evidence: `openspec/changes/update-golden-path-docs/specs/documentation/spec.md:28`, `README.md:37`, `docs/guides/USAGE.md:9`）。
+
+## Acceptance #2 Failure Follow-up
+- [x] README.md の Project Structure を現行ソースに正確同期する（`README.md:903-951` は `approval.rs` を記載しているが実ファイルは存在せず、`src/acceptance.rs` など現行ファイルの欠落もあるため、`openspec/changes/update-golden-path-docs/specs/documentation/spec.md:22` の「all current source files」を満たしていない）。

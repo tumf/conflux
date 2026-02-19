@@ -913,18 +913,46 @@ src/
   hooks.rs                  # Lifecycle hook execution
   task_parser.rs            # Native tasks.md parser
   templates.rs              # Configuration templates
-  agent.rs                  # AI agent command execution
+  acceptance.rs             # Acceptance test output parsing
+  ai_command_runner.rs      # Common AI command runner (unified stagger state)
   analyzer.rs               # Change dependency analyzer
-  approval.rs               # Change approval management
   command_queue.rs          # Command queue with stagger and retry
+  events.rs                 # Unified event system
   history.rs                # Apply/archive/resolve history
+  error_history.rs          # Error history tracking
+  merge_stall_monitor.rs    # Merge stall detection monitor
   parallel_run_service.rs   # Parallel execution service
+  permission.rs             # Permission auto-reject detection
+  process_manager.rs        # Cross-platform child process management
+  serial_run_service.rs     # Serial execution service
+  spec_delta.rs             # Spec delta parsing and conflict detection
+  spec_test_annotations.rs  # Spec test annotation support
+  stall.rs                  # Stall detection utilities
+  worktree_ops.rs           # Common worktree operations (TUI and Web)
+
+  agent/                    # AI agent command execution
+    mod.rs                  # Agent runner module
+    runner.rs               # Agent runner implementation
+    output.rs               # Output line types
+    prompt.rs               # Prompt building functions
+    history_ops.rs          # History management operations
+    tests.rs                # Agent module tests
 
   execution/                # Shared execution logic
     apply.rs                # Apply operation logic
     archive.rs              # Archive operation logic
     state.rs                # Workspace state detection
     types.rs                # Common type definitions
+
+  orchestration/            # Shared orchestration logic
+    mod.rs                  # Common CLI/TUI orchestration
+    acceptance.rs           # Shared acceptance operations
+    apply.rs                # Shared apply operations
+    archive.rs              # Shared archive operations
+    hooks.rs                # Hook context helpers
+    output.rs               # Output handler trait
+    selection.rs            # Shared change selection logic
+    state.rs                # Shared state management
 
   config/                   # Configuration
     defaults.rs             # Default values
@@ -934,17 +962,59 @@ src/
   vcs/                      # Version Control abstraction
     commands.rs             # Common VCS interface
     git/                    # Git backend
+      commands/             # Git command implementations
+        basic.rs            # Basic git operations
+        commit.rs           # Commit operations
+        merge.rs            # Merge operations
+        worktree.rs         # Worktree management
 
   parallel/                 # Parallel execution
     executor.rs             # Parallel change executor
     events.rs               # Progress reporting events
     conflict.rs             # Conflict detection/resolution
     cleanup.rs              # Workspace cleanup
+    dynamic_queue.rs        # Dynamic queue for runtime change additions
+    merge.rs                # Merge operations for parallel execution
+    output_bridge.rs        # Bridge between OutputHandler and ParallelEvent
+    types.rs                # Common types for parallel execution
+    workspace.rs            # Workspace creation and management
+
+  remote/                   # Remote server client (TUI)
+    mod.rs                  # HTTP and WebSocket client module
+    client.rs               # HTTP client for remote server
+    mapper.rs               # Remote type to local type mapping
+    types.rs                # Remote communication type definitions
+    ws.rs                   # WebSocket client for real-time updates
+
+  server/                   # Server daemon (multi-project management)
+    mod.rs                  # Server daemon module
+    api.rs                  # REST API handlers
+    registry.rs             # Project registry with persistence
+    runner.rs               # Server-side project runner
+
+  web/                      # Web monitoring
+    mod.rs                  # Web monitoring module
+    api.rs                  # REST API handlers
+    state.rs                # Web monitoring state management
+    url.rs                  # URL conversion utilities
+    websocket.rs            # WebSocket handler for real-time updates
 
   tui/                      # Terminal User Interface
+    mod.rs                  # TUI module
     render.rs               # Terminal rendering
     runner.rs               # TUI main loop
-    state/                  # State management
+    state.rs                # TUI state management
+    types.rs                # TUI type definitions
+    type_impls.rs           # TUI type implementations
+    events.rs               # TUI event handling
+    command_handlers.rs     # TuiCommand handlers
+    key_handlers.rs         # Key event handlers
+    orchestrator.rs         # TUI orchestrator execution logic
+    terminal.rs             # Terminal helper functions
+    queue.rs                # Dynamic queue for runtime change additions
+    worktrees.rs            # Worktree view management
+    log_deduplicator.rs     # Log deduplication
+    qr.rs                   # QR code generation for Web UI URL
 
 tests/
   e2e_tests.rs              # End-to-end tests
