@@ -2672,4 +2672,61 @@ mod tests {
             );
         }
     }
+
+    // ── ServerConfig::apply_cli_overrides data_dir tests ──
+
+    #[test]
+    fn test_server_config_apply_cli_overrides_data_dir() {
+        // Verify that --data-dir CLI override sets data_dir on ServerConfig
+        let mut config = ServerConfig::default();
+        let custom_dir = std::path::Path::new("/var/lib/cflx");
+
+        config.apply_cli_overrides(None, None, None, None, Some(custom_dir));
+
+        assert_eq!(
+            config.data_dir,
+            std::path::PathBuf::from("/var/lib/cflx"),
+            "data_dir should be overridden by CLI --data-dir option"
+        );
+    }
+
+    #[test]
+    fn test_server_config_apply_cli_overrides_data_dir_not_set_uses_default() {
+        // When --data-dir is not provided, data_dir remains the default value
+        let mut config = ServerConfig::default();
+        let default_data_dir = config.data_dir.clone();
+
+        config.apply_cli_overrides(None, None, None, None, None);
+
+        assert_eq!(
+            config.data_dir, default_data_dir,
+            "data_dir should remain the default when CLI --data-dir is not specified"
+        );
+    }
+
+    #[test]
+    fn test_server_config_apply_cli_overrides_data_dir_with_other_overrides() {
+        // Verify that data_dir override works correctly alongside other CLI overrides
+        let mut config = ServerConfig::default();
+        let custom_dir = std::path::Path::new("/tmp/cflx-server");
+
+        config.apply_cli_overrides(
+            Some("0.0.0.0"),
+            Some(8080),
+            Some("my-token"),
+            Some(10),
+            Some(custom_dir),
+        );
+
+        assert_eq!(config.bind, "0.0.0.0");
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.auth.mode, ServerAuthMode::BearerToken);
+        assert_eq!(config.auth.token, Some("my-token".to_string()));
+        assert_eq!(config.max_concurrent_total, 10);
+        assert_eq!(
+            config.data_dir,
+            std::path::PathBuf::from("/tmp/cflx-server"),
+            "data_dir should be overridden when provided alongside other CLI overrides"
+        );
+    }
 }
