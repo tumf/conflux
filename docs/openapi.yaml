@@ -7,7 +7,7 @@ info:
     url: https://github.com/anomalyco/conflux
   license:
     name: ''
-  version: 0.4.44-server-mode
+  version: 0.4.45-server-mode
 paths:
   /api/changes:
     get:
