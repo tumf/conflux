@@ -741,8 +741,74 @@ mod tests {
     use crate::config::OrchestratorConfig;
     use crate::vcs::VcsBackend;
     use std::fs;
+    use std::path::Path;
     use std::process::Command;
     use tempfile::TempDir;
+
+    // ===========================
+    // Test fixture helpers
+    // ===========================
+
+    /// Create the standard openspec directory structure (changes/ and changes/archive/) under `base`.
+    /// Returns `(changes_dir, archive_dir)`.
+    fn make_openspec_dirs(base: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let changes_dir = base.join("openspec/changes");
+        let archive_dir = base.join("openspec/changes/archive");
+        fs::create_dir_all(&changes_dir).unwrap();
+        fs::create_dir_all(&archive_dir).unwrap();
+        (changes_dir, archive_dir)
+    }
+
+    /// Initialize a bare git repository with test user config at `repo_root`.
+    fn init_git_repo(repo_root: &Path) {
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+    }
+
+    /// Build an `AiCommandRunner` from the given `OrchestratorConfig`.
+    fn make_ai_runner(config: &OrchestratorConfig) -> crate::ai_command_runner::AiCommandRunner {
+        use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
+        use crate::command_queue::CommandQueueConfig;
+        use crate::config::defaults::*;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: config
+                .command_queue_stagger_delay_ms
+                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+            max_retries: config
+                .command_queue_max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_delay_ms: config
+                .command_queue_retry_delay_ms
+                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+            retry_error_patterns: config
+                .command_queue_retry_patterns
+                .clone()
+                .unwrap_or_else(default_retry_patterns),
+            retry_if_duration_under_secs: config
+                .command_queue_retry_if_duration_under_secs
+                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+            inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
+            inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
+        };
+        let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
+        AiCommandRunner::new(queue_config, shared_stagger_state)
+    }
 
     // ===========================
     // verify_archive_completion tests
@@ -754,10 +820,7 @@ mod tests {
         let base = temp_dir.path();
 
         // Create directory structure: change exists, archive doesn't
-        let changes_dir = base.join("openspec/changes");
-        let archive_dir = base.join("openspec/changes/archive");
-        fs::create_dir_all(&changes_dir).unwrap();
-        fs::create_dir_all(&archive_dir).unwrap();
+        let (changes_dir, _archive_dir) = make_openspec_dirs(base);
 
         let change_id = "my-change";
         let change_path = changes_dir.join(change_id);
@@ -779,10 +842,7 @@ mod tests {
         let base = temp_dir.path();
 
         // Create directory structure: change moved to archive
-        let changes_dir = base.join("openspec/changes");
-        let archive_dir = base.join("openspec/changes/archive");
-        fs::create_dir_all(&changes_dir).unwrap();
-        fs::create_dir_all(&archive_dir).unwrap();
+        let (_changes_dir, archive_dir) = make_openspec_dirs(base);
 
         let change_id = "my-change";
         let archive_path = archive_dir.join(change_id);
@@ -799,10 +859,7 @@ mod tests {
         let base = temp_dir.path();
 
         // Create directory structure with date-prefixed archive
-        let changes_dir = base.join("openspec/changes");
-        let archive_dir = base.join("openspec/changes/archive");
-        fs::create_dir_all(&changes_dir).unwrap();
-        fs::create_dir_all(&archive_dir).unwrap();
+        let (_changes_dir, archive_dir) = make_openspec_dirs(base);
 
         let change_id = "my-change";
         let archive_path = archive_dir.join("2024-01-15-my-change");
@@ -818,10 +875,7 @@ mod tests {
         let base = temp_dir.path();
 
         // Create directory structure: neither change nor archive exists
-        let changes_dir = base.join("openspec/changes");
-        let archive_dir = base.join("openspec/changes/archive");
-        fs::create_dir_all(&changes_dir).unwrap();
-        fs::create_dir_all(&archive_dir).unwrap();
+        let (_changes_dir, _archive_dir) = make_openspec_dirs(base);
 
         let change_id = "my-change";
         // Neither path exists - considered success (change was removed)
@@ -835,10 +889,7 @@ mod tests {
         let base = temp_dir.path();
 
         // Edge case: both change and archive exist (incomplete archive)
-        let changes_dir = base.join("openspec/changes");
-        let archive_dir = base.join("openspec/changes/archive");
-        fs::create_dir_all(&changes_dir).unwrap();
-        fs::create_dir_all(&archive_dir).unwrap();
+        let (changes_dir, archive_dir) = make_openspec_dirs(base);
 
         let change_id = "my-change";
         let change_path = changes_dir.join(change_id);
@@ -866,10 +917,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base = temp_dir.path();
 
-        let changes_dir = base.join("openspec/changes");
-        let archive_dir = base.join("openspec/changes/archive");
-        fs::create_dir_all(&changes_dir).unwrap();
-        fs::create_dir_all(&archive_dir).unwrap();
+        let (_changes_dir, archive_dir) = make_openspec_dirs(base);
 
         let change_id = "archived-change";
         let archive_path = archive_dir.join(change_id);
@@ -883,10 +931,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base = temp_dir.path();
 
-        let changes_dir = base.join("openspec/changes");
-        let archive_dir = base.join("openspec/changes/archive");
-        fs::create_dir_all(&changes_dir).unwrap();
-        fs::create_dir_all(&archive_dir).unwrap();
+        let (changes_dir, archive_dir) = make_openspec_dirs(base);
 
         let change_id = "active-change";
         let change_path = changes_dir.join(change_id);
@@ -902,10 +947,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base = temp_dir.path();
 
-        let changes_dir = base.join("openspec/changes");
-        let archive_dir = base.join("openspec/changes/archive");
-        fs::create_dir_all(&changes_dir).unwrap();
-        fs::create_dir_all(&archive_dir).unwrap();
+        let (_changes_dir, _archive_dir) = make_openspec_dirs(base);
 
         let change_id = "missing-archive";
         assert!(!is_change_archived(change_id, Some(base)));
@@ -920,21 +962,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let repo_root = temp_dir.path();
 
-        Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
+        init_git_repo(repo_root);
 
         // Create archive directory (change moved to archive)
         let archive_dir = repo_root.join("openspec/changes/archive/change-a");
@@ -965,21 +993,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let repo_root = temp_dir.path();
 
-        Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
+        init_git_repo(repo_root);
 
         // Create archive directory (change moved to archive)
         let archive_dir = repo_root.join("openspec/changes/archive/change-a");
@@ -1015,21 +1029,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let repo_root = temp_dir.path();
 
-        Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
+        init_git_repo(repo_root);
 
         fs::write(repo_root.join("README.md"), "base").unwrap();
         Command::new("git")
@@ -1079,35 +1079,7 @@ fi\n";
             ..Default::default()
         };
         let agent = AgentRunner::new(config.clone());
-
-        // Create AiCommandRunner for test
-        use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
-        use crate::command_queue::CommandQueueConfig;
-        use crate::config::defaults::*;
-        use std::sync::Arc;
-        use tokio::sync::Mutex;
-        let queue_config = CommandQueueConfig {
-            stagger_delay_ms: config
-                .command_queue_stagger_delay_ms
-                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
-            max_retries: config
-                .command_queue_max_retries
-                .unwrap_or(DEFAULT_MAX_RETRIES),
-            retry_delay_ms: config
-                .command_queue_retry_delay_ms
-                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
-            retry_error_patterns: config
-                .command_queue_retry_patterns
-                .clone()
-                .unwrap_or_else(default_retry_patterns),
-            retry_if_duration_under_secs: config
-                .command_queue_retry_if_duration_under_secs
-                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
-            inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
-            inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
-        };
-        let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
-        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+        let ai_runner = make_ai_runner(&config);
 
         ensure_archive_commit(
             "change-a",
@@ -1326,22 +1298,7 @@ fi\n";
         let temp_dir = TempDir::new().unwrap();
         let repo_root = temp_dir.path();
 
-        // Initialize git repo
-        Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
+        init_git_repo(repo_root);
 
         // Create archive directory (change moved to archive)
         let archive_dir = repo_root.join("openspec/changes/archive/test-change");
@@ -1380,22 +1337,7 @@ fi\n";
         let temp_dir = TempDir::new().unwrap();
         let repo_root = temp_dir.path();
 
-        // Initialize git repo
-        Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
+        init_git_repo(repo_root);
 
         // Create archive directory (change moved to archive)
         let archive_dir = repo_root.join("openspec/changes/archive/test-change");
@@ -1432,22 +1374,7 @@ fi\n";
         let temp_dir = TempDir::new().unwrap();
         let repo_root = temp_dir.path();
 
-        // Initialize git repo
-        Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(repo_root)
-            .output()
-            .unwrap();
+        init_git_repo(repo_root);
 
         // Create initial commit
         fs::write(repo_root.join("README.md"), "base").unwrap();
@@ -1476,35 +1403,7 @@ fi\n";
 
         let config = OrchestratorConfig::default();
         let agent = AgentRunner::new(config.clone());
-
-        // Create AiCommandRunner for test
-        use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
-        use crate::command_queue::CommandQueueConfig;
-        use crate::config::defaults::*;
-        use std::sync::Arc;
-        use tokio::sync::Mutex;
-        let queue_config = CommandQueueConfig {
-            stagger_delay_ms: config
-                .command_queue_stagger_delay_ms
-                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
-            max_retries: config
-                .command_queue_max_retries
-                .unwrap_or(DEFAULT_MAX_RETRIES),
-            retry_delay_ms: config
-                .command_queue_retry_delay_ms
-                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
-            retry_error_patterns: config
-                .command_queue_retry_patterns
-                .clone()
-                .unwrap_or_else(default_retry_patterns),
-            retry_if_duration_under_secs: config
-                .command_queue_retry_if_duration_under_secs
-                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
-            inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
-            inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
-        };
-        let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
-        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+        let ai_runner = make_ai_runner(&config);
 
         // ensure_archive_commit should fail because change directory exists
         let result = ensure_archive_commit(
@@ -1561,8 +1460,9 @@ fi\n";
         let base = temp_dir.path();
 
         let change_id = "nonexistent-change";
-        let changes_dir = base.join("openspec/changes");
-        fs::create_dir_all(&changes_dir).unwrap();
+        let (changes_dir, _) = make_openspec_dirs(base);
+        // changes_dir is created by make_openspec_dirs; just confirm it exists
+        assert!(changes_dir.exists());
 
         // Delete non-existent directory should succeed (idempotent)
         let result = delete_change_directory(change_id, Some(base));
