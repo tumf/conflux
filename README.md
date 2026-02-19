@@ -1034,7 +1034,10 @@ src/
     utils.rs                # TUI utility functions
 
 tests/
-  e2e_tests.rs              # End-to-end tests
+  e2e_tests.rs                        # End-to-end tests
+  merge_conflict_check_tests.rs       # Merge conflict detection tests
+  opencode_command_validation.rs      # OpenCode command validation tests
+  process_cleanup_test.rs             # Process cleanup tests
 ```
 
 ## Development

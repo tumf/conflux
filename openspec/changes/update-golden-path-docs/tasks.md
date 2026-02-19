@@ -39,3 +39,6 @@
 
 ## Acceptance #3 Failure Follow-up
 - [x] README.md の Project Structure を「all current source files」要件に再同期する（`openspec/changes/update-golden-path-docs/specs/documentation/spec.md:22`）。現行の一覧（`README.md:903-1021`）には実在する `src/lib.rs` / `src/config/mod.rs` / `src/execution/mod.rs` / `src/parallel/mod.rs` / `src/vcs/mod.rs` / `src/vcs/git/mod.rs` / `src/vcs/git/commands/mod.rs` / `src/tui/utils.rs` / `src/bin/openapi_gen.rs` などが欠落しているため、`src/**/*.rs`（必要なら `tests/**/*.rs` の扱いも方針明記）と一致するよう更新する。
+
+## Acceptance #4 Failure Follow-up
+- [x] README.md の Project Structure で `tests` 配下の扱いを仕様に合う形で明確化する（`openspec/changes/update-golden-path-docs/specs/documentation/spec.md:22`）。現状は `README.md:1036-1038` に `tests/e2e_tests.rs` のみ記載があり、実在する `tests/merge_conflict_check_tests.rs` / `tests/opencode_command_validation.rs` / `tests/process_cleanup_test.rs` が未記載のため、`tests/**/*.rs` を全件列挙するか、`Project Structure` の対象を `src/**/*.rs` のみに限定する方針を明記して一覧を整合させる。
