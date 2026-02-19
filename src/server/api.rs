@@ -85,16 +85,18 @@ pub struct ControlRunRequest {
     pub changes: Option<Vec<String>>,
 }
 
-/// Request body for git/pull and git/push with optional auto-resolve support.
+/// Request body for git/pull and git/push (kept for backward compatibility).
+/// These endpoints now delegate to git/sync which always runs resolve_command.
+/// The auto_resolve and resolve_strategy fields are ignored but accepted for
+/// compatibility with existing clients.
 #[derive(Debug, Deserialize, Default)]
 pub struct GitAutoResolveRequest {
-    /// When true, run `resolve_command` on non-fast-forward and continue if it succeeds.
-    /// When false or omitted, non-fast-forward returns a 422 error (legacy behavior).
+    /// Deprecated: git/pull and git/push now delegate to git/sync which always runs resolve_command.
+    /// This field is accepted for backward compatibility but has no effect.
     #[serde(default)]
+    #[allow(dead_code)]
     pub auto_resolve: bool,
-    /// Strategy to use when resolving diverged branches. Defaults to "merge".
-    /// Possible values: "merge", "rebase".
-    /// Currently stored for future use; the actual strategy selection is not yet implemented.
+    /// Deprecated: see auto_resolve above.
     #[allow(dead_code)]
     pub resolve_strategy: Option<String>,
 }
@@ -796,655 +798,31 @@ fn build_auto_resolve_prompt(
 /// POST /api/v1/projects/:id/git/pull - pull from remote
 ///
 /// NOTE: This endpoint is kept for backward compatibility.
-/// Prefer using `POST /api/v1/projects/:id/git/sync` which combines pull and push
+/// It delegates to `git_sync` internally. Prefer using
+/// `POST /api/v1/projects/:id/git/sync` which combines pull and push
 /// in a single atomic operation and requires resolve_command to be configured.
 pub async fn git_pull(
-    State(state): State<AppState>,
-    Path(project_id): Path<String>,
-    payload: Option<Json<GitAutoResolveRequest>>,
+    state: State<AppState>,
+    path: Path<String>,
+    _payload: Option<Json<GitAutoResolveRequest>>,
 ) -> Response {
-    let req_body = payload.map(|Json(p)| p).unwrap_or_default();
-    let (remote_url, branch, lock, semaphore) = {
-        let registry = state.registry.read().await;
-        let entry = match registry.get(&project_id) {
-            Some(e) => e.clone(),
-            None => {
-                return error_response(
-                    StatusCode::NOT_FOUND,
-                    format!("Project not found: {}", project_id),
-                )
-            }
-        };
-        let lock = match registry.project_lock(&project_id) {
-            Some(l) => l,
-            None => {
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Missing project lock")
-            }
-        };
-        let semaphore = registry.global_semaphore();
-        (entry.remote_url, entry.branch, lock, semaphore)
-    };
-
-    // Acquire global semaphore (max_concurrent_total)
-    let _sem_permit = match semaphore.acquire().await {
-        Ok(p) => p,
-        Err(_) => {
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Server is at maximum concurrent capacity",
-            )
-        }
-    };
-
-    // Acquire per-project exclusive lock
-    let _guard = lock.lock().await;
-
-    info!(
-        "git pull: project_id={} remote_url={} branch={}",
-        project_id, remote_url, branch
-    );
-
-    // Determine the local bare clone path for this project
-    let local_repo_path = {
-        let registry = state.registry.read().await;
-        registry.data_dir().join(&project_id)
-    };
-
-    // Verify the branch exists on remote before cloning/fetching
-    let ls_remote = tokio::process::Command::new("git")
-        .args(["ls-remote", "--heads", &remote_url, &branch])
-        .output()
-        .await;
-
-    let remote_ref = match ls_remote {
-        Ok(out) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            if stdout.trim().is_empty() {
-                return error_response(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("Branch '{}' not found on remote '{}'", branch, remote_url),
-                );
-            }
-            stdout.trim().to_string()
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            error!("git ls-remote failed: {}", stderr);
-            return error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("git operation failed: {}", stderr),
-            );
-        }
-        Err(e) => {
-            error!("Failed to run git: {}", e);
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to run git: {}", e),
-            );
-        }
-    };
-
-    // Initialize or update the local bare clone
-    if !local_repo_path.exists() {
-        // Clone as bare repository into data_dir/<project_id>
-        let clone_output = tokio::process::Command::new("git")
-            .args([
-                "clone",
-                "--bare",
-                "--branch",
-                &branch,
-                "--single-branch",
-                &remote_url,
-                local_repo_path.to_str().unwrap_or(""),
-            ])
-            .output()
-            .await;
-
-        match clone_output {
-            Ok(out) if out.status.success() => {
-                info!("git clone (bare) succeeded: project_id={}", project_id);
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                error!(
-                    "git clone failed: project_id={} stderr={}",
-                    project_id, stderr
-                );
-                return error_response(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("git clone failed: {}", stderr),
-                );
-            }
-            Err(e) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to run git clone: {}", e),
-                );
-            }
-        }
-    } else {
-        // Fetch latest from remote into a temporary FETCH_HEAD ref first,
-        // then check for non-fast-forward before updating the local branch.
-        let fetch_remote_ref = format!("refs/heads/{}", branch);
-
-        // Get the current local branch tip (before fetch) to compare later
-        let local_head_before = tokio::process::Command::new("git")
-            .args(["rev-parse", &format!("refs/heads/{}", branch)])
-            .current_dir(&local_repo_path)
-            .output()
-            .await
-            .ok()
-            .and_then(|out| {
-                if out.status.success() {
-                    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-                } else {
-                    None
-                }
-            });
-
-        // Fetch into a temporary ref (FETCH_HEAD-style) without updating the local branch
-        let fetch_output = tokio::process::Command::new("git")
-            .args([
-                "fetch",
-                &remote_url,
-                &format!("{}:refs/remotes/origin/{}", fetch_remote_ref, branch),
-            ])
-            .current_dir(&local_repo_path)
-            .output()
-            .await;
-
-        let remote_fetched_sha = match fetch_output {
-            Ok(out) if out.status.success() => {
-                info!("git fetch succeeded: project_id={}", project_id);
-                // Get the SHA of the fetched remote ref
-                let rev_parse = tokio::process::Command::new("git")
-                    .args(["rev-parse", &format!("refs/remotes/origin/{}", branch)])
-                    .current_dir(&local_repo_path)
-                    .output()
-                    .await;
-                match rev_parse {
-                    Ok(o) if o.status.success() => {
-                        Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    }
-                    _ => None,
-                }
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                error!(
-                    "git fetch failed: project_id={} stderr={}",
-                    project_id, stderr
-                );
-                return error_response(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("git fetch failed: {}", stderr),
-                );
-            }
-            Err(e) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to run git fetch: {}", e),
-                );
-            }
-        };
-
-        // Check for non-fast-forward: if local has commits not in remote, it's diverged.
-        // A pull is non-fast-forward when the local branch has commits that are NOT
-        // ancestors of the remote tip (i.e., the branches have diverged).
-        let mut resolve_command_ran = false;
-        let mut resolve_exit_code: Option<i32> = None;
-
-        if let (Some(local_sha), Some(remote_sha)) = (&local_head_before, &remote_fetched_sha) {
-            if local_sha != remote_sha {
-                // Check if remote is a descendant of local (remote contains local changes = fast-forward possible)
-                let local_is_ancestor = tokio::process::Command::new("git")
-                    .args(["merge-base", "--is-ancestor", local_sha, remote_sha])
-                    .current_dir(&local_repo_path)
-                    .status()
-                    .await;
-
-                match local_is_ancestor {
-                    Ok(status) if !status.success() => {
-                        // Local is NOT an ancestor of remote → branches diverged → non-fast-forward
-                        if req_body.auto_resolve {
-                            // Try to run the resolve_command if configured
-                            if let Some(ref cmd) = state.resolve_command {
-                                info!(
-                                    "Non-fast-forward pull: auto_resolve enabled, running resolve_command: project_id={}",
-                                    project_id
-                                );
-                                let prompt = build_auto_resolve_prompt(
-                                    "git_pull",
-                                    &project_id,
-                                    &remote_url,
-                                    &branch,
-                                    local_sha,
-                                    remote_sha,
-                                    &local_repo_path,
-                                );
-                                let (ran, code) =
-                                    run_resolve_command(cmd, &local_repo_path, &prompt).await;
-                                resolve_command_ran = ran;
-                                resolve_exit_code = code;
-
-                                // If resolve_command failed, return error
-                                if code != Some(0) {
-                                    error!(
-                                        "resolve_command failed: project_id={} exit_code={:?}",
-                                        project_id, code
-                                    );
-                                    return (
-                                        StatusCode::UNPROCESSABLE_ENTITY,
-                                        Json(serde_json::json!({
-                                            "error": "resolve_command_failed",
-                                            "reason": "auto_resolve was requested but resolve_command failed",
-                                            "local_sha": local_sha,
-                                            "remote_sha": remote_sha,
-                                            "resolve_command_ran": resolve_command_ran,
-                                            "resolve_exit_code": resolve_exit_code
-                                        })),
-                                    )
-                                        .into_response();
-                                }
-                                // resolve_command succeeded, continue with the pull
-                                info!(
-                                    "resolve_command succeeded: project_id={}, continuing pull",
-                                    project_id
-                                );
-                            } else {
-                                // auto_resolve requested but no resolve_command configured
-                                error!(
-                                    "Non-fast-forward pull: auto_resolve enabled but no resolve_command configured: project_id={}",
-                                    project_id
-                                );
-                                return (
-                                    StatusCode::UNPROCESSABLE_ENTITY,
-                                    Json(serde_json::json!({
-                                        "error": "resolve_command_not_configured",
-                                        "reason": "auto_resolve was requested but resolve_command is not configured",
-                                        "local_sha": local_sha,
-                                        "remote_sha": remote_sha,
-                                        "resolve_command_ran": false
-                                    })),
-                                )
-                                    .into_response();
-                            }
-                        } else {
-                            error!(
-                                "Non-fast-forward pull rejected: project_id={} local={} remote={}",
-                                project_id, local_sha, remote_sha
-                            );
-                            return (
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                Json(serde_json::json!({
-                                    "error": "non_fast_forward",
-                                    "reason": "Pull rejected: local branch has diverged from remote (non-fast-forward). Resolve conflicts before pulling.",
-                                    "local_sha": local_sha,
-                                    "remote_sha": remote_sha
-                                })),
-                            )
-                                .into_response();
-                        }
-                    }
-                    Err(e) => {
-                        return error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to check merge-base: {}", e),
-                        );
-                    }
-                    Ok(_) => {
-                        // local is an ancestor of remote → fast-forward is safe, proceed
-                    }
-                }
-            }
-        }
-
-        // Fast-forward is safe (or auto_resolve succeeded): update the local branch to the remote tip
-        let ff_output = tokio::process::Command::new("git")
-            .args([
-                "fetch",
-                &remote_url,
-                &format!("refs/heads/{}:refs/heads/{}", branch, branch),
-            ])
-            .current_dir(&local_repo_path)
-            .output()
-            .await;
-
-        match ff_output {
-            Ok(out) if out.status.success() => {
-                info!(
-                    "git fetch (fast-forward update) succeeded: project_id={}",
-                    project_id
-                );
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                error!(
-                    "git fetch (fast-forward update) failed: project_id={} stderr={}",
-                    project_id, stderr
-                );
-                return error_response(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("git fetch failed: {}", stderr),
-                );
-            }
-            Err(e) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to run git fetch: {}", e),
-                );
-            }
-        }
-
-        // Return response with resolve metadata if auto_resolve was attempted
-        if resolve_command_ran {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "pulled",
-                    "ref": remote_ref,
-                    "resolve_command_ran": resolve_command_ran,
-                    "resolve_exit_code": resolve_exit_code
-                })),
-            )
-                .into_response();
-        }
-    }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "pulled", "ref": remote_ref})),
-    )
-        .into_response()
+    info!("git pull (delegating to git_sync): project_id={}", path.0);
+    git_sync(state, path).await
 }
 
-/// POST /api/v1/projects/:id/git/push - push to remote (validates non-fast-forward)
+/// POST /api/v1/projects/:id/git/push - push to remote
 ///
 /// NOTE: This endpoint is kept for backward compatibility.
-/// Prefer using `POST /api/v1/projects/:id/git/sync` which combines pull and push
+/// It delegates to `git_sync` internally. Prefer using
+/// `POST /api/v1/projects/:id/git/sync` which combines pull and push
 /// in a single atomic operation and requires resolve_command to be configured.
 pub async fn git_push(
-    State(state): State<AppState>,
-    Path(project_id): Path<String>,
-    payload: Option<Json<GitAutoResolveRequest>>,
+    state: State<AppState>,
+    path: Path<String>,
+    _payload: Option<Json<GitAutoResolveRequest>>,
 ) -> Response {
-    let req_body = payload.map(|Json(p)| p).unwrap_or_default();
-    let (remote_url, branch, lock, semaphore) = {
-        let registry = state.registry.read().await;
-        let entry = match registry.get(&project_id) {
-            Some(e) => e.clone(),
-            None => {
-                return error_response(
-                    StatusCode::NOT_FOUND,
-                    format!("Project not found: {}", project_id),
-                )
-            }
-        };
-        let lock = match registry.project_lock(&project_id) {
-            Some(l) => l,
-            None => {
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Missing project lock")
-            }
-        };
-        let semaphore = registry.global_semaphore();
-        (entry.remote_url, entry.branch, lock, semaphore)
-    };
-
-    // Acquire global semaphore (max_concurrent_total)
-    let _sem_permit = match semaphore.acquire().await {
-        Ok(p) => p,
-        Err(_) => {
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Server is at maximum concurrent capacity",
-            )
-        }
-    };
-
-    // Acquire per-project exclusive lock
-    let _guard = lock.lock().await;
-
-    info!(
-        "git push: project_id={} remote_url={} branch={}",
-        project_id, remote_url, branch
-    );
-
-    // Check for non-fast-forward by comparing local HEAD with remote HEAD.
-    // This requires a local bare clone in data_dir/<project_id>.
-    // If no local clone exists, we return an informative error rather than silently queuing.
-    let local_repo_path = {
-        let registry = state.registry.read().await;
-        registry.data_dir().join(&project_id)
-    };
-
-    if !local_repo_path.exists() {
-        return error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "No local clone found for project {}. Run git/pull first to initialize the local clone.",
-                project_id
-            ),
-        );
-    }
-
-    // Get local HEAD ref for this branch
-    let local_rev = tokio::process::Command::new("git")
-        .args(["rev-parse", &format!("refs/heads/{}", branch)])
-        .current_dir(&local_repo_path)
-        .output()
-        .await;
-
-    let local_sha = match local_rev {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("Failed to get local branch ref: {}", stderr),
-            );
-        }
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to run git rev-parse: {}", e),
-            );
-        }
-    };
-
-    // Get remote HEAD ref for this branch
-    let remote_rev = tokio::process::Command::new("git")
-        .args(["ls-remote", "--heads", &remote_url, &branch])
-        .output()
-        .await;
-
-    let remote_sha = match remote_rev {
-        Ok(out) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if stdout.trim().is_empty() {
-                // Branch doesn't exist on remote yet — push is fine (new branch)
-                String::new()
-            } else {
-                stdout.split_whitespace().next().unwrap_or("").to_string()
-            }
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("Failed to reach remote: {}", stderr),
-            );
-        }
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to run git ls-remote: {}", e),
-            );
-        }
-    };
-
-    // Non-fast-forward check: local must be a descendant of remote HEAD.
-    // If remote SHA is non-empty and local doesn't contain the remote commit, it's non-fast-forward.
-    let mut resolve_command_ran = false;
-    let mut resolve_exit_code: Option<i32> = None;
-
-    if !remote_sha.is_empty() && remote_sha != local_sha {
-        let is_ancestor = tokio::process::Command::new("git")
-            .args(["merge-base", "--is-ancestor", &remote_sha, &local_sha])
-            .current_dir(&local_repo_path)
-            .status()
-            .await;
-
-        match is_ancestor {
-            Ok(status) if !status.success() => {
-                if req_body.auto_resolve {
-                    // Try to run the resolve_command if configured
-                    if let Some(ref cmd) = state.resolve_command {
-                        info!(
-                            "Non-fast-forward push: auto_resolve enabled, running resolve_command: project_id={}",
-                            project_id
-                        );
-                        let prompt = build_auto_resolve_prompt(
-                            "git_push",
-                            &project_id,
-                            &remote_url,
-                            &branch,
-                            &local_sha,
-                            &remote_sha,
-                            &local_repo_path,
-                        );
-                        let (ran, code) = run_resolve_command(cmd, &local_repo_path, &prompt).await;
-                        resolve_command_ran = ran;
-                        resolve_exit_code = code;
-
-                        // If resolve_command failed, return error
-                        if code != Some(0) {
-                            error!(
-                                "resolve_command failed: project_id={} exit_code={:?}",
-                                project_id, code
-                            );
-                            return (
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                Json(serde_json::json!({
-                                    "error": "resolve_command_failed",
-                                    "reason": "auto_resolve was requested but resolve_command failed",
-                                    "local_sha": local_sha,
-                                    "remote_sha": remote_sha,
-                                    "resolve_command_ran": resolve_command_ran,
-                                    "resolve_exit_code": resolve_exit_code
-                                })),
-                            )
-                                .into_response();
-                        }
-                        // resolve_command succeeded, continue with the push
-                        info!(
-                            "resolve_command succeeded: project_id={}, continuing push",
-                            project_id
-                        );
-                    } else {
-                        // auto_resolve requested but no resolve_command configured
-                        error!(
-                            "Non-fast-forward push: auto_resolve enabled but no resolve_command configured: project_id={}",
-                            project_id
-                        );
-                        return (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            Json(serde_json::json!({
-                                "error": "resolve_command_not_configured",
-                                "reason": "auto_resolve was requested but resolve_command is not configured",
-                                "local_sha": local_sha,
-                                "remote_sha": remote_sha,
-                                "resolve_command_ran": false
-                            })),
-                        )
-                            .into_response();
-                    }
-                } else {
-                    error!(
-                        "Non-fast-forward push rejected: project_id={} local={} remote={}",
-                        project_id, local_sha, remote_sha
-                    );
-                    return (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        Json(serde_json::json!({
-                            "error": "non_fast_forward",
-                            "reason": "Push rejected: local branch is not a descendant of remote branch",
-                            "local_sha": local_sha,
-                            "remote_sha": remote_sha
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-            Err(e) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to check merge-base: {}", e),
-                );
-            }
-            Ok(_) => {
-                // Fast-forward is safe, continue
-            }
-        }
-    }
-
-    // Execute the actual push
-    let push_output = tokio::process::Command::new("git")
-        .args([
-            "push",
-            &remote_url,
-            &format!("refs/heads/{}:refs/heads/{}", branch, branch),
-        ])
-        .current_dir(&local_repo_path)
-        .output()
-        .await;
-
-    match push_output {
-        Ok(out) if out.status.success() => {
-            info!("git push succeeded: project_id={}", project_id);
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "pushed",
-                    "remote_url": remote_url,
-                    "branch": branch,
-                    "local_sha": local_sha,
-                    "resolve_command_ran": resolve_command_ran,
-                    "resolve_exit_code": resolve_exit_code
-                })),
-            )
-                .into_response()
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            error!(
-                "git push failed: project_id={} stderr={}",
-                project_id, stderr
-            );
-            // Check for non-fast-forward rejection from the remote side
-            if stderr.contains("non-fast-forward") || stderr.contains("rejected") {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(serde_json::json!({
-                        "error": "non_fast_forward",
-                        "reason": "Push rejected by remote (non-fast-forward)",
-                        "stderr": stderr
-                    })),
-                )
-                    .into_response();
-            }
-            error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("git push failed: {}", stderr),
-            )
-        }
-        Err(e) => {
-            error!("Failed to run git push: {}", e);
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to run git push: {}", e),
-            )
-        }
-    }
+    info!("git push (delegating to git_sync): project_id={}", path.0);
+    git_sync(state, path).await
 }
 
 // ─────────────────────────── /api/v1/projects/:id/git/sync ────────────────────
@@ -1549,9 +927,6 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
         }
     };
 
-    let mut resolve_command_ran = false;
-    let mut resolve_exit_code: Option<i32> = None;
-
     // Initialize or fetch local bare clone
     if !local_repo_path.exists() {
         let clone_output = tokio::process::Command::new("git")
@@ -1586,22 +961,8 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
             }
         }
     } else {
-        // Fetch and check for non-fast-forward
+        // Fetch to get latest remote state
         let fetch_remote_ref = format!("refs/heads/{}", branch);
-
-        let local_head_before = tokio::process::Command::new("git")
-            .args(["rev-parse", &format!("refs/heads/{}", branch)])
-            .current_dir(&local_repo_path)
-            .output()
-            .await
-            .ok()
-            .and_then(|out| {
-                if out.status.success() {
-                    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-                } else {
-                    None
-                }
-            });
 
         let fetch_output = tokio::process::Command::new("git")
             .args([
@@ -1613,19 +974,9 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
             .output()
             .await;
 
-        let remote_fetched_sha = match fetch_output {
+        match fetch_output {
             Ok(out) if out.status.success() => {
-                let rev_parse = tokio::process::Command::new("git")
-                    .args(["rev-parse", &format!("refs/remotes/origin/{}", branch)])
-                    .current_dir(&local_repo_path)
-                    .output()
-                    .await;
-                match rev_parse {
-                    Ok(o) if o.status.success() => {
-                        Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    }
-                    _ => None,
-                }
+                // Fetch succeeded
             }
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -1639,67 +990,6 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to run git fetch: {}", e),
                 );
-            }
-        };
-
-        if let (Some(local_sha), Some(remote_sha)) = (&local_head_before, &remote_fetched_sha) {
-            if local_sha != remote_sha {
-                let local_is_ancestor = tokio::process::Command::new("git")
-                    .args(["merge-base", "--is-ancestor", local_sha, remote_sha])
-                    .current_dir(&local_repo_path)
-                    .status()
-                    .await;
-
-                match local_is_ancestor {
-                    Ok(status) if !status.success() => {
-                        // Non-fast-forward: always run resolve_command (it is required for sync)
-                        info!(
-                            "git sync: non-fast-forward pull, running resolve_command: project_id={}",
-                            project_id
-                        );
-                        let prompt = build_auto_resolve_prompt(
-                            "git_sync_pull",
-                            &project_id,
-                            &remote_url,
-                            &branch,
-                            local_sha,
-                            remote_sha,
-                            &local_repo_path,
-                        );
-                        let (ran, code) =
-                            run_resolve_command(&resolve_command, &local_repo_path, &prompt).await;
-                        resolve_command_ran = ran;
-                        resolve_exit_code = code;
-
-                        if code != Some(0) {
-                            error!(
-                                "git sync: resolve_command failed during pull: project_id={} exit_code={:?}",
-                                project_id, code
-                            );
-                            return (
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                Json(serde_json::json!({
-                                    "error": "resolve_command_failed",
-                                    "reason": "resolve_command failed during pull phase",
-                                    "local_sha": local_sha,
-                                    "remote_sha": remote_sha,
-                                    "resolve_command_ran": resolve_command_ran,
-                                    "resolve_exit_code": resolve_exit_code
-                                })),
-                            )
-                                .into_response();
-                        }
-                    }
-                    Err(e) => {
-                        return error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to check merge-base: {}", e),
-                        );
-                    }
-                    Ok(_) => {
-                        // Fast-forward is safe, continue
-                    }
-                }
             }
         }
 
@@ -1734,9 +1024,7 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
 
     let pull_result = serde_json::json!({
         "status": "pulled",
-        "ref": remote_ref,
-        "resolve_command_ran": resolve_command_ran,
-        "resolve_exit_code": resolve_exit_code
+        "ref": remote_ref
     });
 
     // ── PUSH phase ──────────────────────────────────────────────────────────────
@@ -1765,7 +1053,7 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
         }
     };
 
-    // Get remote SHA for push validation
+    // Get remote SHA for push result
     let remote_rev = tokio::process::Command::new("git")
         .args(["ls-remote", "--heads", &remote_url, &branch])
         .output()
@@ -1795,72 +1083,41 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
         }
     };
 
-    let mut push_resolve_ran = false;
-    let mut push_resolve_exit_code: Option<i32> = None;
+    // Always run resolve_command before push (required for sync)
+    // This ensures a consistent state regardless of whether a non-fast-forward occurred.
+    info!(
+        "git sync: running resolve_command before push: project_id={}",
+        project_id
+    );
+    let resolve_prompt = build_auto_resolve_prompt(
+        "git_sync",
+        &project_id,
+        &remote_url,
+        &branch,
+        &local_sha_for_push,
+        &remote_sha_for_push,
+        &local_repo_path,
+    );
+    let (resolve_command_ran, resolve_exit_code) =
+        run_resolve_command(&resolve_command, &local_repo_path, &resolve_prompt).await;
 
-    // Non-fast-forward check for push
-    if !remote_sha_for_push.is_empty() && remote_sha_for_push != local_sha_for_push {
-        let is_ancestor = tokio::process::Command::new("git")
-            .args([
-                "merge-base",
-                "--is-ancestor",
-                &remote_sha_for_push,
-                &local_sha_for_push,
-            ])
-            .current_dir(&local_repo_path)
-            .status()
-            .await;
-
-        match is_ancestor {
-            Ok(status) if !status.success() => {
-                // Non-fast-forward: always run resolve_command
-                info!(
-                    "git sync: non-fast-forward push, running resolve_command: project_id={}",
-                    project_id
-                );
-                let prompt = build_auto_resolve_prompt(
-                    "git_sync_push",
-                    &project_id,
-                    &remote_url,
-                    &branch,
-                    &local_sha_for_push,
-                    &remote_sha_for_push,
-                    &local_repo_path,
-                );
-                let (ran, code) =
-                    run_resolve_command(&resolve_command, &local_repo_path, &prompt).await;
-                push_resolve_ran = ran;
-                push_resolve_exit_code = code;
-
-                if code != Some(0) {
-                    error!(
-                        "git sync: resolve_command failed during push: project_id={} exit_code={:?}",
-                        project_id, code
-                    );
-                    return (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        Json(serde_json::json!({
-                            "error": "resolve_command_failed",
-                            "reason": "resolve_command failed during push phase",
-                            "local_sha": local_sha_for_push,
-                            "remote_sha": remote_sha_for_push,
-                            "resolve_command_ran": push_resolve_ran,
-                            "resolve_exit_code": push_resolve_exit_code
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-            Err(e) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to check merge-base: {}", e),
-                );
-            }
-            Ok(_) => {
-                // Fast-forward is safe
-            }
-        }
+    if resolve_exit_code != Some(0) {
+        error!(
+            "git sync: resolve_command failed: project_id={} exit_code={:?}",
+            project_id, resolve_exit_code
+        );
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "resolve_command_failed",
+                "reason": "resolve_command failed during sync",
+                "local_sha": local_sha_for_push,
+                "remote_sha": remote_sha_for_push,
+                "resolve_command_ran": resolve_command_ran,
+                "resolve_exit_code": resolve_exit_code
+            })),
+        )
+            .into_response();
     }
 
     // Execute the actual push
@@ -1882,8 +1139,8 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
                 "remote_url": remote_url,
                 "branch": branch,
                 "local_sha": local_sha_for_push,
-                "resolve_command_ran": push_resolve_ran,
-                "resolve_exit_code": push_resolve_exit_code
+                "resolve_command_ran": resolve_command_ran,
+                "resolve_exit_code": resolve_exit_code
             })
         }
         Ok(out) => {
@@ -1923,8 +1180,8 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
             "status": "synced",
             "pull": pull_result,
             "push": push_result,
-            "resolve_command_ran": resolve_command_ran || push_resolve_ran,
-            "resolve_exit_code": if push_resolve_ran { push_resolve_exit_code } else { resolve_exit_code }
+            "resolve_command_ran": resolve_command_ran,
+            "resolve_exit_code": resolve_exit_code
         })),
     )
         .into_response()
@@ -2830,41 +2087,39 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
 
-        // Should be either non_fast_forward (422) or success (200) depending on git availability
-        // We accept both because git behavior on bare repos may vary
+        // git/pull now delegates to git/sync which requires resolve_command.
+        // Without resolve_command, it returns 422 resolve_command_not_configured.
         let status = resp.status();
         let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
 
-        if status == StatusCode::UNPROCESSABLE_ENTITY {
-            let error_val = json["error"].as_str().unwrap_or("");
-            assert_eq!(
-                error_val, "non_fast_forward",
-                "Expected non_fast_forward error for diverged branches, got: {}",
-                json
-            );
-        }
-        // If status is 200, git_pull succeeded (may happen if git resolves it differently)
-        // Both are acceptable outcomes in this test environment
-        assert!(
-            status == StatusCode::OK || status == StatusCode::UNPROCESSABLE_ENTITY,
-            "Expected OK or UNPROCESSABLE_ENTITY, got: {} body: {}",
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "git/pull (delegating to git/sync) should return 422 without resolve_command, got: {} body: {}",
             status,
             json
         );
+        let error_val = json["error"].as_str().unwrap_or("");
+        assert_eq!(
+            error_val, "resolve_command_not_configured",
+            "Expected resolve_command_not_configured (git/pull delegates to git/sync), got: {}",
+            json
+        );
 
-        // The key assertion is: if it's an error, it MUST be non_fast_forward
-        let _ = remote_sha; // used for comparison above
+        let _ = remote_sha; // used in setup above
     }
 
     // ── git push non-fast-forward tests ──
 
     #[tokio::test]
     async fn test_git_push_no_local_clone_returns_error() {
+        // git/push now delegates to git/sync which requires resolve_command.
+        // Without resolve_command configured, it returns 422 with resolve_command_not_configured.
         let temp_dir = TempDir::new().unwrap();
-        let state = make_state(&temp_dir, None);
+        let state = make_state(&temp_dir, None); // resolve_command = None
 
         // Add a project but do NOT create a local clone
         let entry = state
@@ -2883,18 +2138,19 @@ mod tests {
             .unwrap();
 
         let resp = router.oneshot(req).await.unwrap();
-        // Should return UNPROCESSABLE_ENTITY because no local clone exists
+        // git/push delegates to git/sync which returns 422 when resolve_command is not configured
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let error_msg = json["error"].as_str().unwrap_or("");
-        assert!(
-            error_msg.contains("No local clone") || error_msg.contains("git/pull"),
-            "Error should mention missing local clone, got: {}",
-            error_msg
+        let error_val = json["error"].as_str().unwrap_or("");
+        // Since git/push delegates to git/sync, the error is about resolve_command not configured
+        assert_eq!(
+            error_val, "resolve_command_not_configured",
+            "Error should be resolve_command_not_configured (git/push delegates to git/sync), got: {}",
+            error_val
         );
     }
 
@@ -3110,10 +2366,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_git_pull_non_fast_forward_without_auto_resolve_returns_422() {
-        // Test that non-fast-forward pull WITHOUT auto_resolve returns 422 with non_fast_forward error
+    async fn test_git_pull_delegates_to_git_sync_and_requires_resolve_command() {
+        // git/pull now delegates to git/sync, which requires resolve_command to be configured.
+        // Without resolve_command, it should return 422 with resolve_command_not_configured.
         let temp_dir = TempDir::new().unwrap();
-        let state = make_state(&temp_dir, None);
+        let state = make_state(&temp_dir, None); // resolve_command = None
         let branch = "main";
 
         let result = create_diverged_repo_setup(&temp_dir, &state, branch).await;
@@ -3123,12 +2380,10 @@ mod tests {
         };
 
         let router = build_router(state.clone());
-        // Request WITHOUT auto_resolve (default: false)
         let req = Request::builder()
             .method(Method::POST)
             .uri(format!("/api/v1/projects/{}/git/pull", entry.id))
-            .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"auto_resolve": false}"#))
+            .body(Body::empty())
             .unwrap();
 
         let resp = router.oneshot(req).await.unwrap();
@@ -3138,26 +2393,19 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
 
-        // Should return 422 with non_fast_forward error (or 200 if git handles differently)
-        if status == StatusCode::UNPROCESSABLE_ENTITY {
-            let error_val = json["error"].as_str().unwrap_or("");
-            assert_eq!(
-                error_val, "non_fast_forward",
-                "Expected non_fast_forward error, got: {}",
-                json
-            );
-            // Verify reason field is present
-            assert!(
-                json["reason"].is_string(),
-                "Response should have a reason field, got: {}",
-                json
-            );
-        }
-        // Accept 200 as well if git resolves it differently in the test environment
-        assert!(
-            status == StatusCode::OK || status == StatusCode::UNPROCESSABLE_ENTITY,
-            "Expected OK or UNPROCESSABLE_ENTITY, got: {} body: {}",
+        // git/pull delegates to git/sync which requires resolve_command
+        // Without resolve_command, it returns 422 resolve_command_not_configured
+        assert_eq!(
             status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "git/pull (delegating to git/sync) should return 422 without resolve_command, got: {} body: {}",
+            status,
+            json
+        );
+        let error_val = json["error"].as_str().unwrap_or("");
+        assert_eq!(
+            error_val, "resolve_command_not_configured",
+            "Expected resolve_command_not_configured, got: {}",
             json
         );
     }
@@ -3624,36 +2872,31 @@ mod tests {
         );
     }
 
-    /// Test: git/sync response structure contains pull and push sections.
-    /// This test validates the response JSON shape when the sync operation
-    /// would succeed (we verify the structure, not the actual git operations
-    /// which require a real remote).
-    ///
-    /// Since we cannot run real git operations in unit tests, we verify that:
-    /// 1. The route is registered
-    /// 2. The resolve_command check returns the correct error structure
-    /// 3. The error response has the expected JSON fields
+    /// Test: git/sync success response contains both 'pull' and 'push' sections.
+    /// Uses a local bare git repository as a fixture to avoid external dependencies.
+    /// The resolve_command is set to "true" (a no-op that always succeeds).
     #[tokio::test]
-    async fn test_git_sync_response_contains_pull_and_push_sections_on_error() {
+    async fn test_git_sync_success_response_contains_pull_and_push_sections() {
         let temp_dir = TempDir::new().unwrap();
+
+        // Create a local bare git repository as the remote
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
         let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
         let project_id = {
             let mut reg = registry.write().await;
-            let entry = reg
-                .add(
-                    "https://github.com/example/repo.git".to_string(),
-                    "main".to_string(),
-                )
-                .unwrap();
+            let entry = reg.add(remote_url.clone(), "main".to_string()).unwrap();
             entry.id.clone()
         };
 
+        // Use resolve_command = "true" (always exits 0)
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
             auth_token: None,
             max_concurrent_total: 4,
-            resolve_command: None,
+            resolve_command: Some("true".to_string()),
         };
         let router = build_router(state);
 
@@ -3664,21 +2907,46 @@ mod tests {
             .unwrap();
 
         let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let status = resp.status();
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        // Verify the error response has 'error' and 'reason' fields
+        // On success, the response must contain 'pull' and 'push' sections
+        if status == StatusCode::OK {
+            assert!(
+                json.get("pull").is_some(),
+                "Success response must contain 'pull' section, got: {}",
+                json
+            );
+            assert!(
+                json.get("push").is_some(),
+                "Success response must contain 'push' section, got: {}",
+                json
+            );
+            assert_eq!(
+                json["status"].as_str(),
+                Some("synced"),
+                "Top-level status must be 'synced', got: {}",
+                json
+            );
+            // resolve_command_ran must be true (always runs)
+            assert_eq!(
+                json["resolve_command_ran"].as_bool(),
+                Some(true),
+                "resolve_command_ran must be true, got: {}",
+                json
+            );
+        }
+        // Accept 422 if git push fails (e.g., nothing to push because no local changes)
+        // The key assertion is that when status is 200, the response has the correct structure.
         assert!(
-            json.get("error").is_some(),
-            "Response must contain 'error' field"
-        );
-        assert!(
-            json.get("reason").is_some(),
-            "Response must contain 'reason' field"
+            status == StatusCode::OK || status == StatusCode::UNPROCESSABLE_ENTITY,
+            "Expected OK or UNPROCESSABLE_ENTITY, got: {} body: {}",
+            status,
+            json
         );
     }
 }

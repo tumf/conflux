@@ -12,3 +12,9 @@
 
 - [x] 3.1 resolve_command 未設定の `sync` が失敗するテストを追加する（エラーメッセージが返ることを確認）
 - [x] 3.2 `sync` が pull/push の結果を返すテストを追加する（両方の結果が JSON に含まれることを確認）
+
+## Acceptance #1 Failure Follow-up
+
+- [x] `src/server/api.rs` の `git_pull` / `git_push` を `git_sync` へ委譲し、重複実装を解消する（`git_sync` のみが pull/push 本体ロジックを持つ状態にする）。
+- [x] `src/server/api.rs` の `git_sync` で non-fast-forward の有無に関係なく `resolve_command` を必ず 1 回実行し、失敗時は同期失敗を返すように修正する（以前は `merge-base --is-ancestor` 失敗時のみ実行されていた）。
+- [x] `src/server/api.rs` の `test_git_sync_response_contains_pull_and_push_sections_on_error` を、成功レスポンスで `pull` と `push` セクションの存在を検証するテスト（`test_git_sync_success_response_contains_pull_and_push_sections`）に置き換える（ローカル bare remote を使ったフィクスチャで外部依存なしに検証する）。
