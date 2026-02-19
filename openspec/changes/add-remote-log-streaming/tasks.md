@@ -18,3 +18,7 @@
 
 - [x] `RemoteLogEntry` に spec 必須フィールド（`project_id`, `operation`, `iteration`）を追加し、server→WebSocket→remote client のシリアライズ/デシリアライズを更新する（`src/remote/types.rs` に `project_id: Option<String>`, `operation: Option<String>`, `iteration: Option<u32>` を追加）
 - [x] リモートログが change 行プレビューに紐づくよう、`change_id` を remote change の表示 ID 形式に正規化して送受信する（`src/server/runner.rs` の `make_log_entry` で `project_id` を設定、`src/tui/runner.rs` でログ変換時に `project_id` を `change_id` として使用、`src/tui/state.rs` の `get_latest_log_for_change` でプレフィックスマッチング `"<project_id>::"` を追加）
+
+## Acceptance #2 Failure Follow-up
+
+- [x] WebSocket の Log payload で `operation` / `iteration` キーが常に含まれるように修正する（現状は `#[serde(skip_serializing_if = "Option::is_none")]` と `make_log_entry(..., operation=None, iteration=None)` によりキー自体が欠落し、spec の「ログは少なくとも `operation` / `iteration` を含む」を満たせないため、`null` でも必ず出力する）

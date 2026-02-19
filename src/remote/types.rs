@@ -47,10 +47,10 @@ pub struct RemoteLogEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     /// Optional operation type (apply, archive, resolve, analyze)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always serialized (even as null) so clients can rely on the key being present.
     pub operation: Option<String>,
     /// Optional iteration number for apply/archive operations
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always serialized (even as null) so clients can rely on the key being present.
     pub iteration: Option<u32>,
 }
 
@@ -195,6 +195,17 @@ mod tests {
 
         // Verify the type tag is correct
         assert!(json.contains(r#""type":"log""#));
+
+        // Verify that operation and iteration keys are always present in JSON output
+        // even when their values are None (null), so clients can rely on key presence.
+        assert!(
+            json.contains(r#""operation":null"#),
+            "operation key must be present as null, got: {json}"
+        );
+        assert!(
+            json.contains(r#""iteration":null"#),
+            "iteration key must be present as null, got: {json}"
+        );
 
         let decoded: RemoteStateUpdate = serde_json::from_str(&json).unwrap();
         match decoded {
