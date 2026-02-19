@@ -69,6 +69,16 @@ pub fn generate_project_id(remote_url: &str, branch: &str) -> String {
     hex[..16].to_string()
 }
 
+/// Generate the server-specific worktree branch name for a project.
+///
+/// The server worktree must NOT check out the base branch directly, as that would
+/// prevent the bare clone from updating `refs/heads/<base_branch>` during pull/push.
+///
+/// Format: `server-wt/<project_id>/<base_branch>`
+pub fn server_worktree_branch(project_id: &str, base_branch: &str) -> String {
+    format!("server-wt/{}/{}", project_id, base_branch)
+}
+
 const REGISTRY_FILE: &str = "projects.json";
 
 /// Persistent project registry backed by a JSON file in data_dir.
@@ -232,6 +242,55 @@ pub fn create_shared_registry(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_server_worktree_branch_format() {
+        let branch = server_worktree_branch("abc123def456789a", "main");
+        assert_eq!(
+            branch, "server-wt/abc123def456789a/main",
+            "Branch name must follow server-wt/<project_id>/<base_branch> format"
+        );
+    }
+
+    #[test]
+    fn test_server_worktree_branch_different_base_branches() {
+        let branch_main = server_worktree_branch("abc123", "main");
+        let branch_develop = server_worktree_branch("abc123", "develop");
+        assert_ne!(
+            branch_main, branch_develop,
+            "Different base branches must produce different server worktree branch names"
+        );
+    }
+
+    #[test]
+    fn test_server_worktree_branch_different_project_ids() {
+        let branch1 = server_worktree_branch("abc123", "main");
+        let branch2 = server_worktree_branch("xyz789", "main");
+        assert_ne!(
+            branch1, branch2,
+            "Different project IDs must produce different server worktree branch names"
+        );
+    }
+
+    #[test]
+    fn test_server_worktree_branch_is_not_base_branch() {
+        let project_id = "abc123def456789a";
+        let base_branch = "main";
+        let server_branch = server_worktree_branch(project_id, base_branch);
+        assert_ne!(
+            server_branch, base_branch,
+            "Server worktree branch must differ from the base branch"
+        );
+    }
+
+    #[test]
+    fn test_server_worktree_branch_starts_with_server_wt() {
+        let branch = server_worktree_branch("abc123", "main");
+        assert!(
+            branch.starts_with("server-wt/"),
+            "Server worktree branch must start with 'server-wt/'"
+        );
+    }
 
     #[test]
     fn test_generate_project_id_deterministic() {
