@@ -28,8 +28,9 @@ fn server_base_url(bind: &str, actual_port: u16) -> String {
 ///
 /// # Arguments
 /// * `config` - Resolved server configuration (bind, port, auth, data_dir, max_concurrent_total).
-pub async fn run_server(config: ServerConfig) -> Result<()> {
-    // Validate config (enforces auth for non-loopback binds).
+/// * `resolve_command` - Top-level resolve_command from global config (used for auto_resolve).
+pub async fn run_server(config: ServerConfig, resolve_command: Option<String>) -> Result<()> {
+    // Validate config (enforces auth for non-loopback binds, and rejects deprecated server.resolve_command).
     config.validate()?;
 
     // Build the shared registry.
@@ -50,7 +51,7 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         runners,
         auth_token,
         max_concurrent_total: config.max_concurrent_total,
-        resolve_command: config.resolve_command.clone(),
+        resolve_command,
     };
 
     // Build router.

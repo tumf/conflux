@@ -416,9 +416,9 @@ pub struct ServerConfig {
     #[serde(default = "default_server_data_dir")]
     pub data_dir: std::path::PathBuf,
 
-    /// Optional command to run when auto_resolve is triggered on non-fast-forward git operations.
-    /// When set, this command is executed in the project's bare clone directory.
-    /// If the command exits with code 0, the git operation continues; otherwise it returns an error.
+    /// DEPRECATED: `server.resolve_command` is no longer supported.
+    /// Use the top-level `resolve_command` in your config file instead.
+    /// Setting this field will cause a configuration error at startup.
     #[serde(default)]
     pub resolve_command: Option<String>,
 }
@@ -452,8 +452,18 @@ impl ServerConfig {
     }
 
     /// Validate the server configuration.
-    /// Returns error if non-loopback bind is used without bearer token authentication.
+    /// Returns error if non-loopback bind is used without bearer token authentication,
+    /// or if the deprecated `server.resolve_command` field is set.
     pub fn validate(&self) -> crate::error::Result<()> {
+        // Check for deprecated server.resolve_command field
+        if self.resolve_command.is_some() {
+            return Err(crate::error::OrchestratorError::ConfigLoad(
+                "Configuration error: `server.resolve_command` is no longer supported. \
+                Please remove it from your config and use the top-level `resolve_command` instead."
+                    .to_string(),
+            ));
+        }
+
         if !self.is_loopback_bind() {
             match self.auth.mode {
                 ServerAuthMode::BearerToken => {
@@ -481,7 +491,7 @@ impl ServerConfig {
         Ok(())
     }
 
-    /// Apply CLI overrides (bind, port, auth_token, max_concurrent_total, data_dir, resolve_command).
+    /// Apply CLI overrides (bind, port, auth_token, max_concurrent_total, data_dir).
     pub fn apply_cli_overrides(
         &mut self,
         bind: Option<&str>,
@@ -489,7 +499,6 @@ impl ServerConfig {
         auth_token: Option<&str>,
         max_concurrent_total: Option<usize>,
         data_dir: Option<&std::path::Path>,
-        resolve_command: Option<&str>,
     ) {
         if let Some(b) = bind {
             self.bind = b.to_string();
@@ -506,9 +515,6 @@ impl ServerConfig {
         }
         if let Some(dir) = data_dir {
             self.data_dir = dir.to_path_buf();
-        }
-        if let Some(cmd) = resolve_command {
-            self.resolve_command = Some(cmd.to_string());
         }
     }
 }
@@ -894,7 +900,24 @@ impl OrchestratorConfig {
     /// 3. XDG env config ($XDG_CONFIG_HOME/cflx/config.jsonc)
     ///
     /// Project config (`.cflx.jsonc`) is intentionally excluded — server mode is directory-independent.
+    #[allow(dead_code)]
     pub fn load_server_config_from_global() -> ServerConfig {
+        let (server_config, _) = Self::load_server_config_and_resolve_command_from_global();
+        server_config
+    }
+
+    /// Load server configuration and top-level `resolve_command` from global config files.
+    /// Used by `cflx server` to get both the `server` section and the top-level `resolve_command`.
+    ///
+    /// Returns `(ServerConfig, Option<resolve_command>)`.
+    ///
+    /// Priority (lowest to highest):
+    /// 1. Platform default config
+    /// 2. XDG default config (~/.config/cflx/config.jsonc)
+    /// 3. XDG env config ($XDG_CONFIG_HOME/cflx/config.jsonc)
+    ///
+    /// Project config (`.cflx.jsonc`) is intentionally excluded — server mode is directory-independent.
+    pub fn load_server_config_and_resolve_command_from_global() -> (ServerConfig, Option<String>) {
         let mut merged = OrchestratorConfig::default();
 
         // 1. Platform default config
@@ -924,7 +947,8 @@ impl OrchestratorConfig {
             }
         }
 
-        merged.server.unwrap_or_default()
+        let resolve_command = merged.resolve_command.clone();
+        (merged.server.unwrap_or_default(), resolve_command)
     }
 
     /// Load configuration with merge-based priority:
@@ -2692,7 +2716,7 @@ mod tests {
         let mut config = ServerConfig::default();
         let custom_dir = std::path::Path::new("/var/lib/cflx");
 
-        config.apply_cli_overrides(None, None, None, None, Some(custom_dir), None);
+        config.apply_cli_overrides(None, None, None, None, Some(custom_dir));
 
         assert_eq!(
             config.data_dir,
@@ -2707,7 +2731,7 @@ mod tests {
         let mut config = ServerConfig::default();
         let default_data_dir = config.data_dir.clone();
 
-        config.apply_cli_overrides(None, None, None, None, None, None);
+        config.apply_cli_overrides(None, None, None, None, None);
 
         assert_eq!(
             config.data_dir, default_data_dir,
@@ -2727,7 +2751,6 @@ mod tests {
             Some("my-token"),
             Some(10),
             Some(custom_dir),
-            None,
         );
 
         assert_eq!(config.bind, "0.0.0.0");
@@ -2739,6 +2762,77 @@ mod tests {
             config.data_dir,
             std::path::PathBuf::from("/tmp/cflx-server"),
             "data_dir should be overridden when provided alongside other CLI overrides"
+        );
+    }
+
+    // ── server.resolve_command deprecation tests ──
+
+    #[test]
+    fn test_server_config_validate_rejects_deprecated_resolve_command() {
+        // Verify that setting server.resolve_command causes a configuration error
+        let mut config = ServerConfig::default();
+        config.resolve_command = Some("echo resolve".to_string());
+
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "validate() should return Err when server.resolve_command is set"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("server.resolve_command"),
+            "Error message should mention 'server.resolve_command', got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("top-level `resolve_command`"),
+            "Error message should mention the top-level resolve_command as alternative, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_server_config_validate_accepts_config_without_resolve_command() {
+        // Verify that server.resolve_command = None passes validation (loopback bind)
+        let config = ServerConfig::default();
+        assert!(
+            config.resolve_command.is_none(),
+            "Default ServerConfig should not have resolve_command set"
+        );
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "validate() should succeed when server.resolve_command is not set"
+        );
+    }
+
+    #[test]
+    fn test_parse_server_config_with_resolve_command_is_parsed_but_rejected_at_validate() {
+        // Verify that server.resolve_command in config JSON is deserialized
+        // but then rejected by validate()
+        let jsonc = r#"{
+            "server": {
+                "resolve_command": "echo resolve"
+            }
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        let server_config = config.server.unwrap_or_default();
+        assert_eq!(
+            server_config.resolve_command,
+            Some("echo resolve".to_string()),
+            "server.resolve_command should be deserialized from JSON"
+        );
+        // But validate() should reject it
+        let result = server_config.validate();
+        assert!(
+            result.is_err(),
+            "validate() should reject server.resolve_command"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("server.resolve_command"),
+            "Error should mention server.resolve_command, got: {}",
+            err_msg
         );
     }
 }

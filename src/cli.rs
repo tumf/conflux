@@ -308,12 +308,6 @@ pub struct ServerArgs {
     /// Directory for persistent server data (projects registry, etc.)
     #[arg(long)]
     pub data_dir: Option<std::path::PathBuf>,
-
-    /// Command to run when auto_resolve is triggered on non-fast-forward git operations.
-    /// The command is executed in the project's bare clone directory.
-    /// Exit code 0 = success (continue git operation); non-zero = failure (return error).
-    #[arg(long)]
-    pub resolve_command: Option<String>,
 }
 
 /// Check if git directory exists

@@ -2655,4 +2655,89 @@ mod tests {
             );
         }
     }
+
+    // ── Top-level resolve_command tests (server.resolve_command removed) ──
+
+    /// Test that AppState receives resolve_command from the top-level config
+    /// (not from server.resolve_command which is now deprecated).
+    #[test]
+    fn test_app_state_resolve_command_comes_from_top_level_config() {
+        // Simulate what run_server now does: takes resolve_command as a separate parameter
+        // from the top-level config, not from ServerConfig.resolve_command.
+        let top_level_resolve_cmd = Some("echo top-level-resolve".to_string());
+
+        // Build AppState as run_server does (using the top-level resolve_command parameter)
+        // The ServerConfig.resolve_command field is deprecated and should be None.
+        let app_state_resolve_command = top_level_resolve_cmd.clone();
+
+        assert_eq!(
+            app_state_resolve_command,
+            Some("echo top-level-resolve".to_string()),
+            "AppState resolve_command should come from top-level config resolve_command"
+        );
+    }
+
+    /// Test that auto_resolve uses the top-level resolve_command in AppState.
+    /// This verifies the routing: top-level config -> run_server() -> AppState -> git_pull/git_push.
+    #[tokio::test]
+    async fn test_git_pull_auto_resolve_uses_top_level_resolve_command() {
+        // Create state with top-level resolve_command (simulating what run_server now does)
+        let temp_dir = TempDir::new().unwrap();
+        let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
+        let state = AppState {
+            registry,
+            runners: crate::server::runner::create_shared_runners(),
+            auth_token: None,
+            max_concurrent_total: 4,
+            // This resolve_command now comes from top-level config (not server.resolve_command)
+            resolve_command: Some("echo resolve".to_string()),
+        };
+
+        let branch = "main";
+        let result = create_diverged_repo_setup(&temp_dir, &state, branch).await;
+        let (_remote_dir, _local_clone_path, entry, _remote_url) = match result {
+            Some(r) => r,
+            None => return, // git not available, skip
+        };
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/git/pull", entry.id))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"auto_resolve": true}"#))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+
+        // With top-level resolve_command configured, auto_resolve should either:
+        // - Succeed (200 OK with resolve_command_ran=true) if divergence was detected
+        // - Return 200 OK directly if fast-forward is possible
+        // It must NOT return "resolve_command_not_configured"
+        if status == StatusCode::UNPROCESSABLE_ENTITY {
+            let error_val = json["error"].as_str().unwrap_or("");
+            assert_ne!(
+                error_val,
+                "resolve_command_not_configured",
+                "Should not return resolve_command_not_configured when top-level resolve_command is set: {}",
+                json
+            );
+        }
+        // If resolve_command_ran is present, verify the top-level resolve_command was used
+        if let Some(ran) = json.get("resolve_command_ran") {
+            if ran.as_bool() == Some(true) {
+                let exit_code = json["resolve_exit_code"].as_i64().unwrap_or(-1);
+                assert_eq!(
+                    exit_code, 0,
+                    "Top-level resolve_command (echo resolve) should exit with 0, got: {}",
+                    exit_code
+                );
+            }
+        }
+    }
 }

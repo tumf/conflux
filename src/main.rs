@@ -645,7 +645,8 @@ async fn main() -> Result<()> {
             // Build ServerConfig from global config and CLI overrides.
             // Server mode uses only global config (not project .cflx.jsonc).
             // Global config is loaded first, then CLI args override individual fields.
-            let mut server_config = config::OrchestratorConfig::load_server_config_from_global();
+            let (mut server_config, resolve_command) =
+                config::OrchestratorConfig::load_server_config_and_resolve_command_from_global();
 
             // Apply CLI overrides on top of global config values.
             // Only override fields that were explicitly specified on the CLI
@@ -656,7 +657,6 @@ async fn main() -> Result<()> {
                 args.auth_token.as_deref(),
                 args.max_concurrent_total,
                 args.data_dir.as_deref(),
-                args.resolve_command.as_deref(),
             );
 
             info!(
@@ -664,7 +664,7 @@ async fn main() -> Result<()> {
                 server_config.bind, server_config.port, server_config.data_dir
             );
 
-            server::run_server(server_config).await?;
+            server::run_server(server_config, resolve_command).await?;
         }
 
         // Server subcommand (web-monitoring feature disabled)
