@@ -1,7 +1,6 @@
 ---
 agent: build
 description: Scaffold a new OpenSpec change and validate strictly.
-model: openai/gpt-5.2-codex
 ---
 
 The user has requested the following change proposal. Use the npx @fission-ai/openspec@latest instructions to create their change proposal.
@@ -12,15 +11,15 @@ $ARGUMENTS
 **NOTE**:
 - Always consider the preceding conversation context to interpret the user's intent. If `$ARGUMENTS` is empty, summarize the conversation conclusions and create a proposal. If a change ID is not explicitly provided but can be inferred from context, use it without asking the user.
 
-**MUST**: The changes/* (tasks.md, design.md, proposal.md) must be written in Japanese.
 **MUST**: Bugfixes with no intended spec changes still need at least one minimal `## MODIFIED Requirements` delta (one requirement + one `#### Scenario:`) so `npx @fission-ai/openspec@latest validate <id> --strict` passes.
 **MUST**: If a task is not executable by the AI (requires human action, external systems, or long-wait verification), either move it to a Future work section or omit it from tasks.md entirely.
 
-**External dependency policy (mock-first)**:
+**External dependency policy (mock-first / verification-first)**:
 - Any requirement that AI cannot resolve or verify autonomously is an external dependency
-- When designing tasks, prioritize mock/stub/fixture implementations for external dependencies to enable verification without external credentials
+- "Mock-first" means: prioritize mocks/stubs/fixtures as a verification strategy so tasks can be validated without external credentials
+- DO NOT replace production/runtime behavior with mocks/stubs to satisfy requirements; mocks/stubs/fixtures are for tests and local verification only
 - Only truly non-mockable external dependencies (requiring real external systems, human decisions, or long-wait verification) should be marked for Out of Scope / Future Work
-- Missing secrets (API keys, credentials) should NOT block proposal design; instead, include tasks for implementing mocks/stubs
+- Missing secrets (API keys, credentials) should NOT block proposal design; instead, design the interface/contract boundaries and include test-only mock/stub/fixture tasks
 - When creating tasks.md, include specific tasks for mock/stub/fixture implementation where applicable
 
 **CRITICAL RESTRICTIONS**
@@ -31,7 +30,6 @@ $ARGUMENTS
 - You may WRITE only to `openspec/changes/<id>/` paths
 - After proposal validation with `npx @fission-ai/openspec@latest validate <id> --strict`, STOP and present the proposal to the user
 
-<!-- OPENSPEC:START -->
 **Guardrails**
 - Favor straightforward, minimal implementations first and add complexity only when it is requested or clearly required.
 - Keep changes tightly scoped to the requested outcome.
@@ -43,7 +41,7 @@ $ARGUMENTS
 - Identify any vague or ambiguous details and ask the necessary follow-up questions before editing files.
 
 **Steps**
-1. Review `openspec/project.md`, run `npx @fission-ai/openspec@latest list` and `npx @fission-ai/openspec@latest list --specs`, and inspect related code or docs (e.g., via `rg`/`ls`) to ground the proposal in current behaviour; note any gaps that require clarification.
+1. Run `npx @fission-ai/openspec@latest list` and `npx @fission-ai/openspec@latest list --specs`, and inspect related code or docs (e.g., via `rg`/`ls`) to ground the proposal in current behaviour; note any gaps that require clarification.
 2. Choose a unique verb-led `change-id` and scaffold `proposal.md`, `tasks.md`, and `design.md` (when needed) under `openspec/changes/<id>/`.
 3. Map the request into concrete capabilities or requirements and evaluate split boundaries first (independence, ownership, rollout risk, and coupling).
    - If scopes are independent or weakly coupled, split into separate change proposals.
@@ -69,4 +67,3 @@ $ARGUMENTS
 - Use `npx @fission-ai/openspec@latest show <id> --json --deltas-only` or `npx @fission-ai/openspec@latest show <spec> --type spec` to inspect details when validation fails.
 - Search existing requirements with `rg -n "Requirement:|Scenario:" openspec/specs` before writing new ones.
 - Explore the codebase with `rg <keyword>`, `ls`, or direct file reads so proposals align with current implementation realities.
-<!-- OPENSPEC:END -->
