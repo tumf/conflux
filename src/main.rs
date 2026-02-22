@@ -796,7 +796,53 @@ async fn main() -> Result<()> {
                         client.list_projects_management().await
                     }
                 }
-                ProjectCommands::Sync(sync_args) => client.git_sync(&sync_args.project_id).await,
+                ProjectCommands::Sync(sync_args) => {
+                    if sync_args.all {
+                        // Sync all registered projects
+                        let sync_server = sync_args.server.clone();
+                        let sync_client = remote::RemoteClient::new(&sync_server, None);
+                        let projects = match sync_client.list_all_projects().await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("Error listing projects: {}", e);
+                                std::process::exit(1);
+                            }
+                        };
+
+                        if projects.is_empty() {
+                            println!("No projects registered. Nothing to sync.");
+                            std::process::exit(0);
+                        }
+
+                        let mut any_failed = false;
+                        for project in &projects {
+                            match sync_client.sync_project(&project.id).await {
+                                Ok(()) => {
+                                    println!(
+                                        "project {}: synced ({}#{})",
+                                        project.id, project.remote_url, project.branch
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "project {}: failed to sync ({}#{}) - {}",
+                                        project.id, project.remote_url, project.branch, e
+                                    );
+                                    any_failed = true;
+                                }
+                            }
+                        }
+                        if any_failed {
+                            std::process::exit(1);
+                        }
+                        std::process::exit(0);
+                    } else if let Some(ref project_id) = sync_args.project_id {
+                        client.git_sync(project_id).await
+                    } else {
+                        eprintln!("Error: specify --all or a PROJECT_ID");
+                        std::process::exit(1);
+                    }
+                }
             };
 
             match result {

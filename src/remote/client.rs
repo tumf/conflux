@@ -6,7 +6,7 @@ use std::future::Future;
 
 use crate::error::{OrchestratorError, Result};
 
-use super::types::RemoteProject;
+use super::types::{ProjectEntry, RemoteProject};
 
 // ─────────────────────────────── URL parsing ──────────────────────────────
 
@@ -271,6 +271,65 @@ impl RemoteClient {
         Ok(projects)
     }
 
+    /// Fetch the flat list of all registered projects from the remote server.
+    ///
+    /// Calls `GET /api/v1/projects` and returns the parsed list of [`ProjectEntry`]s.
+    pub async fn list_all_projects(&self) -> Result<Vec<ProjectEntry>> {
+        let url = format!("{}/api/v1/projects", self.base_url);
+        let req = self.http.get(&url);
+        let req = self.authorized(req);
+
+        let response = req.send().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to connect to remote server '{}': {}",
+                self.base_url, e
+            )))
+        })?;
+
+        if !response.status().is_success() {
+            return Err(OrchestratorError::Io(std::io::Error::other(format!(
+                "Remote server returned status {}: {}",
+                response.status(),
+                response.status().canonical_reason().unwrap_or("Unknown")
+            ))));
+        }
+
+        let projects: Vec<ProjectEntry> = response.json().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to parse remote server response: {}",
+                e
+            )))
+        })?;
+
+        Ok(projects)
+    }
+
+    /// Trigger git sync for a project on the remote server.
+    ///
+    /// Calls `POST /api/v1/projects/{id}/git/sync`.
+    pub async fn sync_project(&self, project_id: &str) -> Result<()> {
+        let url = format!("{}/api/v1/projects/{}/git/sync", self.base_url, project_id);
+        let req = self.http.post(&url);
+        let req = self.authorized(req);
+
+        let resp = req.send().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to sync project '{}': {}",
+                project_id, e
+            )))
+        })?;
+
+        if !resp.status().is_success() {
+            return Err(OrchestratorError::Io(std::io::Error::other(format!(
+                "Remote server returned status {} for project sync '{}'",
+                resp.status(),
+                project_id
+            ))));
+        }
+
+        Ok(())
+    }
+
     /// Build the WebSocket URL from the base HTTP URL.
     ///
     /// Converts `http://` → `ws://` and `https://` → `wss://`.
@@ -495,7 +554,7 @@ impl RemoteClient {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::spawn_mock_http_server;
+    use super::super::test_helpers::{spawn_mock_http_server, spawn_mock_http_server_ordered};
     use super::*;
 
     #[test]
@@ -555,6 +614,105 @@ mod tests {
     fn test_client_without_token() {
         let client = RemoteClient::new("http://localhost:9876", None);
         assert_eq!(client.token(), None);
+    }
+
+    /// Verify that list_all_projects calls GET /api/v1/projects (not /api/v1/projects/state).
+    #[tokio::test]
+    async fn test_list_all_projects_calls_correct_endpoint() {
+        let project_json = r#"[{"id":"proj-1","remote_url":"https://github.com/a/b","branch":"main","status":"idle","created_at":"2024-01-01T00:00:00Z"}]"#;
+        let responses = vec![(200, project_json.to_string()), (200, "{}".to_string())];
+        let (addr, mut path_rx) = spawn_mock_http_server_ordered(responses).await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        let projects = client
+            .list_all_projects()
+            .await
+            .expect("list_all_projects should succeed");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, "proj-1");
+
+        let method_path = tokio::time::timeout(tokio::time::Duration::from_secs(3), path_rx.recv())
+            .await
+            .expect("Timed out")
+            .expect("No request captured");
+        assert_eq!(method_path, "GET /api/v1/projects");
+    }
+
+    /// Verify that sync_project calls POST /api/v1/projects/{id}/git/sync.
+    #[tokio::test]
+    async fn test_sync_project_calls_correct_endpoint() {
+        let responses = vec![(200, "{}".to_string())];
+        let (addr, mut path_rx) = spawn_mock_http_server_ordered(responses).await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        client
+            .sync_project("proj-abc")
+            .await
+            .expect("sync_project should succeed");
+
+        let method_path = tokio::time::timeout(tokio::time::Duration::from_secs(3), path_rx.recv())
+            .await
+            .expect("Timed out")
+            .expect("No request captured");
+        assert_eq!(method_path, "POST /api/v1/projects/proj-abc/git/sync");
+    }
+
+    /// Verify that list_all_projects is called before sync_project when syncing all projects.
+    /// Task 3.2: GET /api/v1/projects precedes POST /api/v1/projects/{id}/git/sync.
+    #[tokio::test]
+    async fn test_list_then_sync_ordering() {
+        let project_json = r#"[{"id":"proj-1","remote_url":"https://github.com/a/b","branch":"main","status":"idle","created_at":"2024-01-01T00:00:00Z"},{"id":"proj-2","remote_url":"https://github.com/c/d","branch":"dev","status":"idle","created_at":"2024-01-01T00:00:00Z"}]"#;
+        let responses = vec![
+            (200, project_json.to_string()), // GET /api/v1/projects
+            (200, "{}".to_string()),         // POST .../proj-1/git/sync
+            (200, "{}".to_string()),         // POST .../proj-2/git/sync
+        ];
+        let (addr, mut path_rx) = spawn_mock_http_server_ordered(responses).await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        let projects = client
+            .list_all_projects()
+            .await
+            .expect("list should succeed");
+        assert_eq!(projects.len(), 2);
+        for project in &projects {
+            client
+                .sync_project(&project.id)
+                .await
+                .expect("sync should succeed");
+        }
+
+        let first = tokio::time::timeout(tokio::time::Duration::from_secs(3), path_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("no msg");
+        let second = tokio::time::timeout(tokio::time::Duration::from_secs(3), path_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("no msg");
+        let third = tokio::time::timeout(tokio::time::Duration::from_secs(3), path_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("no msg");
+
+        assert_eq!(first, "GET /api/v1/projects");
+        assert_eq!(second, "POST /api/v1/projects/proj-1/git/sync");
+        assert_eq!(third, "POST /api/v1/projects/proj-2/git/sync");
+    }
+
+    /// Verify that sync_project returns an error when the server responds with a non-200 status.
+    /// Task 3.3: failure path used to verify non-zero exit code logic.
+    #[tokio::test]
+    async fn test_sync_project_error_on_non_200() {
+        let responses = vec![(500, r#"{"error":"internal error"}"#.to_string())];
+        let (addr, _) = spawn_mock_http_server_ordered(responses).await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        let result = client.sync_project("failing-project").await;
+        assert!(
+            result.is_err(),
+            "sync_project should return Err on 500 response"
+        );
     }
 
     /// Verify that the `Authorization: Bearer <token>` header is present in the HTTP

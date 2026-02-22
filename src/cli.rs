@@ -430,8 +430,16 @@ pub struct ProjectStatusArgs {
 /// Arguments for `cflx project sync`
 #[derive(Parser, Debug)]
 pub struct ProjectSyncArgs {
-    /// Project ID to sync
-    pub project_id: String,
+    /// Sync all registered projects. Mutually exclusive with PROJECT_ID.
+    #[arg(long, conflicts_with = "project_id")]
+    pub all: bool,
+
+    /// Project ID to sync. Mutually exclusive with --all.
+    pub project_id: Option<String>,
+
+    /// Remote server endpoint URL (default: http://127.0.0.1:9876)
+    #[arg(long, default_value = "http://127.0.0.1:9876")]
+    pub server: String,
 }
 
 /// Subcommands for the `cflx service` command group.
@@ -1044,7 +1052,7 @@ mod tests {
         match cli.command {
             Some(Commands::Project(args)) => match args.command {
                 ProjectCommands::Sync(a) => {
-                    assert_eq!(a.project_id, "proj-abc123");
+                    assert_eq!(a.project_id, Some("proj-abc123".to_string()));
                 }
                 _ => panic!("Expected Sync"),
             },
@@ -1085,6 +1093,86 @@ mod tests {
         }
     }
 
+    // ── project sync --all tests ──────────────────────────────────────────────
+
+    /// Task 3.1: `cflx project sync --all` must parse correctly.
+    #[test]
+    fn test_project_sync_all_flag() {
+        let cli = Cli::parse_from(["cflx", "project", "sync", "--all"]);
+        match cli.command {
+            Some(Commands::Project(args)) => match args.command {
+                ProjectCommands::Sync(sync_args) => {
+                    assert!(sync_args.all);
+                    assert!(sync_args.project_id.is_none());
+                }
+                _ => panic!("Expected Sync"),
+            },
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
+
+    /// `cflx project sync <id>` must parse correctly (project_id only, no --all).
+    #[test]
+    fn test_project_sync_project_id() {
+        let cli = Cli::parse_from(["cflx", "project", "sync", "my-project-id"]);
+        match cli.command {
+            Some(Commands::Project(args)) => match args.command {
+                ProjectCommands::Sync(sync_args) => {
+                    assert!(!sync_args.all);
+                    assert_eq!(sync_args.project_id, Some("my-project-id".to_string()));
+                }
+                _ => panic!("Expected Sync"),
+            },
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
+
+    /// `--all` and `project_id` together must be rejected by clap (conflicts_with).
+    #[test]
+    fn test_project_sync_all_and_project_id_conflict() {
+        let result = Cli::try_parse_from(["cflx", "project", "sync", "--all", "proj-id"]);
+        assert!(
+            result.is_err(),
+            "Expected parse error when --all and project_id are both set"
+        );
+    }
+
+    /// Default server URL for `project sync --all`.
+    #[test]
+    fn test_project_sync_default_server() {
+        let cli = Cli::parse_from(["cflx", "project", "sync", "--all"]);
+        match cli.command {
+            Some(Commands::Project(args)) => match args.command {
+                ProjectCommands::Sync(sync_args) => {
+                    assert_eq!(sync_args.server, "http://127.0.0.1:9876");
+                }
+                _ => panic!("Expected Sync"),
+            },
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
+
+    /// Custom `--server` URL for `project sync --all`.
+    #[test]
+    fn test_project_sync_custom_server() {
+        let cli = Cli::parse_from([
+            "cflx",
+            "project",
+            "sync",
+            "--all",
+            "--server",
+            "http://myhost:1234",
+        ]);
+        match cli.command {
+            Some(Commands::Project(args)) => match args.command {
+                ProjectCommands::Sync(sync_args) => {
+                    assert_eq!(sync_args.server, "http://myhost:1234");
+                }
+                _ => panic!("Expected Sync"),
+            },
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
     #[test]
     fn test_tui_help_displays_key_bindings() {
         // Regression test: Ensure TUI help output contains key bindings

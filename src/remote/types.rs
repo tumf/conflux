@@ -54,6 +54,23 @@ pub struct RemoteLogEntry {
     pub iteration: Option<u32>,
 }
 
+/// A project entry from the `GET /api/v1/projects` endpoint.
+///
+/// Returned by the server's project list endpoint (not the state endpoint).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectEntry {
+    /// Project identifier (e.g., "abc123def")
+    pub id: String,
+    /// Remote URL of the project repository
+    pub remote_url: String,
+    /// Branch being tracked
+    pub branch: String,
+    /// Current status: "idle", "running", etc.
+    pub status: String,
+    /// Creation timestamp (ISO 8601)
+    pub created_at: String,
+}
+
 /// A state update message received over WebSocket
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
