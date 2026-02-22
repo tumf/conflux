@@ -39,7 +39,7 @@ mod web;
 mod worktree_ops;
 
 use clap::Parser;
-use cli::{Cli, Commands, TuiArgs};
+use cli::{Cli, Commands, ProjectCommands, TuiArgs};
 use config::OrchestratorConfig;
 use error::Result;
 use orchestrator::Orchestrator;
@@ -62,6 +62,74 @@ async fn load_remote_changes(args: &TuiArgs) -> Result<Vec<openspec::Change>> {
     let client = remote::RemoteClient::new(endpoint, token);
     let projects = client.list_projects().await?;
     Ok(remote::group_changes_by_project(&projects))
+}
+
+/// Resolve the server URL for `cflx project` commands.
+///
+/// Priority:
+/// 1. Explicit `--server <url>` argument
+/// 2. Global config `server.bind` / `server.port`
+/// 3. Default: `http://127.0.0.1:9876`
+fn resolve_project_server_url(explicit: Option<&str>) -> String {
+    if let Some(url) = explicit {
+        return url.to_string();
+    }
+    let server_config = OrchestratorConfig::load_server_config_from_global();
+    format!("http://{}:{}", server_config.bind, server_config.port)
+}
+
+/// Guard: `cflx project` does not support bearer token authentication.
+///
+/// Returns `Err` if the caller supplied `--server-token` / `--server-token-env`,
+/// or if the global config has `server.auth.mode=bearer_token` for the resolved server.
+fn check_project_auth_not_required(
+    server_url: &str,
+    explicit_server: bool,
+) -> std::result::Result<(), String> {
+    // Only check global-config auth when the URL was resolved from config (not explicit)
+    if !explicit_server {
+        let server_config = OrchestratorConfig::load_server_config_from_global();
+        if matches!(server_config.auth.mode, config::ServerAuthMode::BearerToken) {
+            return Err(format!(
+                "The server at '{}' requires bearer token authentication, \
+                 which is not supported by 'cflx project'. \
+                 Use the TUI or provide an unauthenticated server URL with --server.",
+                server_url
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Print project JSON value in human-readable form.
+fn print_projects_human(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Array(projects) => {
+            if projects.is_empty() {
+                println!("No projects registered.");
+                return;
+            }
+            for p in projects {
+                print_project_human(p);
+            }
+        }
+        serde_json::Value::Null => {
+            println!("Done.");
+        }
+        other => print_project_human(other),
+    }
+}
+
+fn print_project_human(p: &serde_json::Value) {
+    let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("-");
+    let url = p.get("remote_url").and_then(|v| v.as_str()).unwrap_or("-");
+    let branch = p.get("branch").and_then(|v| v.as_str()).unwrap_or("-");
+    let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+    println!("id:         {}", id);
+    println!("remote_url: {}", url);
+    println!("branch:     {}", branch);
+    println!("status:     {}", status);
+    println!();
 }
 
 /// Initialize file-based logging with automatic log rotation and cleanup.
@@ -677,6 +745,78 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
 
+        // Project subcommand: manage projects on a remote Conflux server
+        Some(Commands::Project(args)) => {
+            // Guard: top-level --server-token / --server-token-env are not supported
+            if cli.server_token.is_some() || cli.server_token_env.is_some() {
+                eprintln!(
+                    "Error: --server-token and --server-token-env are not supported by \
+                     'cflx project'. Authentication is not supported by this command."
+                );
+                std::process::exit(1);
+            }
+
+            let explicit_server = args.server.is_some();
+            let server_url = resolve_project_server_url(args.server.as_deref());
+
+            // Auth guard: project commands do not support bearer token auth
+            if let Err(msg) = check_project_auth_not_required(&server_url, explicit_server) {
+                eprintln!("Error: {}", msg);
+                std::process::exit(1);
+            }
+
+            // Project commands use an unauthenticated client (no token)
+            let client = remote::RemoteClient::new(&server_url, None);
+
+            let result: crate::error::Result<serde_json::Value> = match args.command {
+                ProjectCommands::Add(add_args) => {
+                    // Resolve (base_url, branch) using URL parsing + default branch resolution
+                    let (base_url, branch) = match remote::resolve_project_url_and_branch(
+                        &add_args.remote_url,
+                        add_args.branch.as_deref(),
+                        |url| async move { remote::resolve_default_branch(&url).await },
+                    )
+                    .await
+                    {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+                    client.add_project(&base_url, &branch).await
+                }
+                ProjectCommands::Remove(remove_args) => {
+                    client.delete_project(&remove_args.project_id).await
+                }
+                ProjectCommands::Status(status_args) => {
+                    if let Some(ref id) = status_args.project_id {
+                        client.get_project(id).await
+                    } else {
+                        client.list_projects_management().await
+                    }
+                }
+                ProjectCommands::Sync(sync_args) => client.git_sync(&sync_args.project_id).await,
+            };
+
+            match result {
+                Ok(value) => {
+                    if args.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
+                    } else {
+                        print_projects_human(&value);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
         // Service subcommand: manage cflx server as a background service
         Some(Commands::Service(args)) => {
             use cli::ServiceSubcommand;
@@ -691,54 +831,6 @@ async fn main() -> Result<()> {
             if let Err(e) = result {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
-            }
-        }
-
-        // Project subcommand: manage projects on a remote server
-        Some(Commands::Project(args)) => {
-            use cli::ProjectSubcommand;
-            match args.command {
-                ProjectSubcommand::Add(add_args) => {
-                    let token = remote::RemoteClient::resolve_token(
-                        add_args.server_token.clone(),
-                        add_args.server_token_env.as_deref(),
-                    );
-                    let server_url = add_args
-                        .server
-                        .as_deref()
-                        .unwrap_or("http://127.0.0.1:9876");
-                    let client = remote::RemoteClient::new(server_url, token);
-
-                    // Resolve (base_url, branch) using URL parsing + default branch resolution
-                    let (base_url, branch) = match remote::resolve_project_url_and_branch(
-                        &add_args.url,
-                        add_args.branch.as_deref(),
-                        |url| async move { remote::resolve_default_branch(&url).await },
-                    )
-                    .await
-                    {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            eprintln!("Error: {}", e);
-                            std::process::exit(1);
-                        }
-                    };
-
-                    match client.add_project(&base_url, &branch).await {
-                        Ok(result) => {
-                            println!("Project added successfully:");
-                            println!("  URL: {}", base_url);
-                            println!("  Branch: {}", branch);
-                            if let Some(id) = result.get("id").and_then(|v| v.as_str()) {
-                                println!("  ID: {}", id);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Error: {}", e);
-                            std::process::exit(1);
-                        }
-                    }
-                }
             }
         }
 
@@ -786,4 +878,42 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod project_command_tests {
+    use super::*;
+
+    /// When `--server` is specified explicitly the URL is returned as-is.
+    #[test]
+    fn test_resolve_project_server_url_explicit() {
+        let url = resolve_project_server_url(Some("http://custom:1234"));
+        assert_eq!(url, "http://custom:1234");
+    }
+
+    /// Without global config the URL falls back to the default (127.0.0.1:9876).
+    #[test]
+    fn test_resolve_project_server_url_default_fallback() {
+        let url = resolve_project_server_url(None);
+        assert!(
+            url.starts_with("http://"),
+            "Expected http URL, got: {}",
+            url
+        );
+        assert!(url.contains(':'), "URL should contain a port: {}", url);
+    }
+
+    /// When `explicit_server=true` the auth guard always passes (no global config check).
+    #[test]
+    fn test_check_project_auth_explicit_server_always_passes() {
+        let result = check_project_auth_not_required("http://custom:1234", true);
+        assert!(result.is_ok(), "Should pass for explicit server URL");
+    }
+
+    /// Without global config the auth mode defaults to None, so the guard passes.
+    #[test]
+    fn test_check_project_auth_default_no_auth_passes() {
+        let result = check_project_auth_not_required("http://127.0.0.1:9876", false);
+        assert!(result.is_ok(), "Should pass when auth mode is None");
+    }
 }

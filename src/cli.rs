@@ -101,6 +101,23 @@ pub enum Commands {
     /// Requires bearer token authentication when binding to non-loopback addresses.
     Server(ServerArgs),
 
+    /// Manage projects on a Conflux server
+    ///
+    /// Interacts with the server's project management API without authentication.
+    /// When --server is not specified, the server URL is resolved from global config
+    /// (server.bind / server.port).
+    ///
+    /// EXAMPLES:
+    ///   cflx project add https://github.com/org/repo             # auto-resolve default branch
+    ///   cflx project add https://github.com/org/repo/tree/main  # branch from URL path
+    ///   cflx project add https://github.com/org/repo#develop    # branch from fragment
+    ///   cflx project add https://github.com/org/repo main       # explicit branch argument
+    ///   cflx project status                                      # list all projects
+    ///   cflx project status <project-id>                         # show specific project
+    ///   cflx project remove <project-id>                         # remove a project
+    ///   cflx project sync <project-id>                           # trigger git sync
+    Project(ProjectArgs),
+
     /// Manage `cflx server` as a background service
     ///
     /// Installs, uninstalls, starts, stops, restarts, and queries the status of the
@@ -117,15 +134,6 @@ pub enum Commands {
     ///   cflx service restart    # Restart the service
     ///   cflx service uninstall  # Remove the service
     Service(ServiceArgs),
-
-    /// Manage projects on a remote Conflux server
-    ///
-    /// EXAMPLES:
-    ///   cflx project add https://github.com/org/repo             # auto-resolve default branch
-    ///   cflx project add https://github.com/org/repo/tree/main  # branch from URL path
-    ///   cflx project add https://github.com/org/repo#develop    # branch from fragment
-    ///   cflx project add https://github.com/org/repo main       # explicit branch argument
-    Project(ProjectArgs),
 }
 
 /// Arguments for the run subcommand
@@ -336,6 +344,96 @@ pub struct ServerArgs {
     pub data_dir: Option<std::path::PathBuf>,
 }
 
+/// Arguments for the project subcommand
+#[derive(Parser, Debug)]
+#[command(long_about = "Manage projects on a Conflux server.
+
+Connects to a Conflux server and manages projects via the REST API.
+When --server is not specified, the URL is resolved from the global
+configuration (server.bind / server.port, defaulting to 127.0.0.1:9876).
+
+Authentication is not supported by this command. If the server requires
+bearer token authentication, an explicit error is returned.
+
+EXAMPLES:
+  cflx project add https://github.com/org/repo.git main
+  cflx project status
+  cflx project status <project-id>
+  cflx project remove <project-id>
+  cflx project sync <project-id>
+  cflx project --server http://host:9876 status")]
+pub struct ProjectArgs {
+    /// Remote server endpoint URL (e.g., http://host:9876).
+    /// When not set, resolved from global config server.bind/server.port.
+    #[arg(long)]
+    pub server: Option<String>,
+
+    /// Output results in JSON format
+    #[arg(long, short = 'j')]
+    pub json: bool,
+
+    #[command(subcommand)]
+    pub command: ProjectCommands,
+}
+
+/// Subcommands for the project command
+#[derive(Subcommand, Debug)]
+pub enum ProjectCommands {
+    /// Add a new project to the server
+    Add(ProjectAddArgs),
+
+    /// Remove a project from the server
+    Remove(ProjectRemoveArgs),
+
+    /// Show project status (all projects or a specific one)
+    Status(ProjectStatusArgs),
+
+    /// Trigger a git sync (pull + push) for a project
+    Sync(ProjectSyncArgs),
+}
+
+/// Arguments for `cflx project add`
+#[derive(Parser, Debug)]
+#[command(about = "Add a project to the server")]
+#[command(long_about = "Add a project to the Conflux server.
+
+Accepts repository URLs with optional branch specification embedded in the URL:
+  cflx project add https://github.com/org/repo             # auto-resolve default branch
+  cflx project add https://github.com/org/repo/tree/main  # branch from /tree/<branch> path
+  cflx project add https://github.com/org/repo#develop    # branch from #<branch> fragment
+  cflx project add https://github.com/org/repo main       # explicit branch argument
+
+When both a branch is embedded in the URL and an explicit branch argument is given,
+the explicit argument takes precedence.")]
+pub struct ProjectAddArgs {
+    /// Repository URL (may include branch as /tree/<branch> or #<branch>)
+    pub remote_url: String,
+
+    /// Branch name (overrides any branch embedded in the URL; auto-resolved if omitted)
+    pub branch: Option<String>,
+}
+
+/// Arguments for `cflx project remove`
+#[derive(Parser, Debug)]
+pub struct ProjectRemoveArgs {
+    /// Project ID to remove
+    pub project_id: String,
+}
+
+/// Arguments for `cflx project status`
+#[derive(Parser, Debug)]
+pub struct ProjectStatusArgs {
+    /// Optional project ID (if omitted, lists all projects)
+    pub project_id: Option<String>,
+}
+
+/// Arguments for `cflx project sync`
+#[derive(Parser, Debug)]
+pub struct ProjectSyncArgs {
+    /// Project ID to sync
+    pub project_id: String,
+}
+
 /// Subcommands for the `cflx service` command group.
 #[derive(Subcommand, Debug)]
 pub enum ServiceSubcommand {
@@ -359,54 +457,6 @@ pub enum ServiceSubcommand {
 pub struct ServiceArgs {
     #[command(subcommand)]
     pub command: ServiceSubcommand,
-}
-
-/// Subcommands for `cflx project`.
-#[derive(Subcommand, Debug)]
-pub enum ProjectSubcommand {
-    /// Add a project to the remote server
-    Add(ProjectAddArgs),
-}
-
-/// Arguments for the `project` subcommand group.
-#[derive(Parser, Debug)]
-#[command(about = "Manage projects on a remote Conflux server")]
-pub struct ProjectArgs {
-    #[command(subcommand)]
-    pub command: ProjectSubcommand,
-}
-
-/// Arguments for `cflx project add`.
-#[derive(Parser, Debug)]
-#[command(about = "Add a project to the remote server")]
-#[command(long_about = "Add a project to the remote Conflux server.
-
-Accepts repository URLs with optional branch specification embedded in the URL:
-  cflx project add https://github.com/org/repo             # auto-resolve default branch
-  cflx project add https://github.com/org/repo/tree/main  # branch from /tree/<branch> path
-  cflx project add https://github.com/org/repo#develop    # branch from #<branch> fragment
-  cflx project add https://github.com/org/repo main       # explicit branch argument
-
-When both a branch is embedded in the URL and an explicit branch argument is given,
-the explicit argument takes precedence.")]
-pub struct ProjectAddArgs {
-    /// Repository URL (may include branch as /tree/<branch> or #<branch>)
-    pub url: String,
-
-    /// Branch name (overrides any branch embedded in the URL)
-    pub branch: Option<String>,
-
-    /// Remote server endpoint URL (e.g., http://host:9876)
-    #[arg(long)]
-    pub server: Option<String>,
-
-    /// Bearer token for remote server authentication
-    #[arg(long)]
-    pub server_token: Option<String>,
-
-    /// Environment variable name holding the bearer token
-    #[arg(long)]
-    pub server_token_env: Option<String>,
 }
 
 /// Check if git directory exists
@@ -916,6 +966,122 @@ mod tests {
             Err(e) => {
                 panic!("Expected successful parse: {}", e);
             }
+        }
+    }
+
+    // ── project subcommand tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_project_add_subcommand() {
+        let cli = Cli::parse_from([
+            "cflx",
+            "project",
+            "add",
+            "https://github.com/org/repo.git",
+            "main",
+        ]);
+        match cli.command {
+            Some(Commands::Project(args)) => {
+                assert!(!args.json);
+                assert!(args.server.is_none());
+                match args.command {
+                    ProjectCommands::Add(a) => {
+                        assert_eq!(a.remote_url, "https://github.com/org/repo.git");
+                        assert_eq!(a.branch, Some("main".to_string()));
+                    }
+                    _ => panic!("Expected Add"),
+                }
+            }
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_project_remove_subcommand() {
+        let cli = Cli::parse_from(["cflx", "project", "remove", "proj-abc123"]);
+        match cli.command {
+            Some(Commands::Project(args)) => match args.command {
+                ProjectCommands::Remove(a) => {
+                    assert_eq!(a.project_id, "proj-abc123");
+                }
+                _ => panic!("Expected Remove"),
+            },
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_project_status_no_id() {
+        let cli = Cli::parse_from(["cflx", "project", "status"]);
+        match cli.command {
+            Some(Commands::Project(args)) => match args.command {
+                ProjectCommands::Status(a) => {
+                    assert!(a.project_id.is_none());
+                }
+                _ => panic!("Expected Status"),
+            },
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_project_status_with_id() {
+        let cli = Cli::parse_from(["cflx", "project", "status", "proj-abc123"]);
+        match cli.command {
+            Some(Commands::Project(args)) => match args.command {
+                ProjectCommands::Status(a) => {
+                    assert_eq!(a.project_id, Some("proj-abc123".to_string()));
+                }
+                _ => panic!("Expected Status"),
+            },
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_project_sync_subcommand() {
+        let cli = Cli::parse_from(["cflx", "project", "sync", "proj-abc123"]);
+        match cli.command {
+            Some(Commands::Project(args)) => match args.command {
+                ProjectCommands::Sync(a) => {
+                    assert_eq!(a.project_id, "proj-abc123");
+                }
+                _ => panic!("Expected Sync"),
+            },
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_project_json_flag() {
+        let cli = Cli::parse_from(["cflx", "project", "--json", "status"]);
+        match cli.command {
+            Some(Commands::Project(args)) => {
+                assert!(args.json);
+            }
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_project_json_short_flag() {
+        let cli = Cli::parse_from(["cflx", "project", "-j", "status"]);
+        match cli.command {
+            Some(Commands::Project(args)) => {
+                assert!(args.json);
+            }
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_project_server_flag() {
+        let cli = Cli::parse_from(["cflx", "project", "--server", "http://host:9876", "status"]);
+        match cli.command {
+            Some(Commands::Project(args)) => {
+                assert_eq!(args.server, Some("http://host:9876".to_string()));
+            }
+            _ => panic!("Expected Project subcommand"),
         }
     }
 
