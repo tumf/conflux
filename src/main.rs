@@ -39,7 +39,7 @@ mod web;
 mod worktree_ops;
 
 use clap::Parser;
-use cli::{Cli, Commands, TuiArgs};
+use cli::{Cli, Commands, ProjectCommands, TuiArgs};
 use config::OrchestratorConfig;
 use error::Result;
 use orchestrator::Orchestrator;
@@ -691,6 +691,65 @@ async fn main() -> Result<()> {
             if let Err(e) = result {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
+            }
+        }
+
+        // Project subcommand: manage registered projects
+        Some(Commands::Project(args)) => {
+            match args.command {
+                ProjectCommands::Sync(sync_args) => {
+                    let client = remote::RemoteClient::new(&sync_args.server, None);
+
+                    if sync_args.all {
+                        // Fetch the list of all registered projects
+                        let projects = match client.list_all_projects().await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("Error listing projects: {}", e);
+                                std::process::exit(1);
+                            }
+                        };
+
+                        if projects.is_empty() {
+                            println!("No projects registered. Nothing to sync.");
+                        } else {
+                            let mut any_failed = false;
+                            for project in &projects {
+                                match client.sync_project(&project.id).await {
+                                    Ok(()) => {
+                                        println!(
+                                            "project {}: synced ({}#{})",
+                                            project.id, project.remote_url, project.branch
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "project {}: failed to sync ({}#{}) - {}",
+                                            project.id, project.remote_url, project.branch, e
+                                        );
+                                        any_failed = true;
+                                    }
+                                }
+                            }
+                            if any_failed {
+                                std::process::exit(1);
+                            }
+                        }
+                    } else if let Some(project_id) = sync_args.project_id {
+                        match client.sync_project(&project_id).await {
+                            Ok(()) => {
+                                println!("project {}: synced", project_id);
+                            }
+                            Err(e) => {
+                                eprintln!("project {}: failed to sync - {}", project_id, e);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        eprintln!("Error: specify --all or a PROJECT_ID");
+                        std::process::exit(1);
+                    }
+                }
             }
         }
 

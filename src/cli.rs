@@ -117,6 +117,14 @@ pub enum Commands {
     ///   cflx service restart    # Restart the service
     ///   cflx service uninstall  # Remove the service
     Service(ServiceArgs),
+
+    /// Manage registered projects (sync, etc.)
+    ///
+    /// EXAMPLES:
+    ///   cflx project sync --all              # Sync all registered projects
+    ///   cflx project sync <PROJECT_ID>       # Sync a specific project
+    #[command(alias = "p")]
+    Project(ProjectArgs),
 }
 
 /// Arguments for the run subcommand
@@ -350,6 +358,40 @@ pub enum ServiceSubcommand {
 pub struct ServiceArgs {
     #[command(subcommand)]
     pub command: ServiceSubcommand,
+}
+
+/// Arguments for the `project` subcommand group.
+#[derive(Parser, Debug)]
+#[command(about = "Manage registered projects")]
+pub struct ProjectArgs {
+    #[command(subcommand)]
+    pub command: ProjectCommands,
+}
+
+/// Subcommands for the `cflx project` command group.
+#[derive(Subcommand, Debug)]
+pub enum ProjectCommands {
+    /// Synchronize projects with the remote server
+    ///
+    /// EXAMPLES:
+    ///   cflx project sync --all              # Sync all registered projects
+    ///   cflx project sync <PROJECT_ID>       # Sync a specific project
+    Sync(ProjectSyncArgs),
+}
+
+/// Arguments for the `project sync` subcommand.
+#[derive(Parser, Debug)]
+pub struct ProjectSyncArgs {
+    /// Sync all registered projects. Mutually exclusive with PROJECT_ID.
+    #[arg(long, conflicts_with = "project_id")]
+    pub all: bool,
+
+    /// Project ID to sync. Mutually exclusive with --all.
+    pub project_id: Option<String>,
+
+    /// Remote server endpoint URL (default: http://127.0.0.1:9876)
+    #[arg(long, default_value = "http://127.0.0.1:9876")]
+    pub server: String,
 }
 
 /// Check if git directory exists
@@ -859,6 +901,89 @@ mod tests {
             Err(e) => {
                 panic!("Expected successful parse: {}", e);
             }
+        }
+    }
+
+    // ── project sync tests ────────────────────────────────────────────────────
+
+    /// Task 3.1: `cflx project sync --all` must parse correctly.
+    #[test]
+    fn test_project_sync_all_flag() {
+        let cli = Cli::parse_from(["cflx", "project", "sync", "--all"]);
+        match cli.command {
+            Some(Commands::Project(args)) => match args.command {
+                crate::cli::ProjectCommands::Sync(sync_args) => {
+                    assert!(sync_args.all);
+                    assert!(sync_args.project_id.is_none());
+                }
+            },
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
+
+    /// `cflx project sync <id>` must parse correctly (project_id only, no --all).
+    #[test]
+    fn test_project_sync_project_id() {
+        let cli = Cli::parse_from(["cflx", "project", "sync", "my-project-id"]);
+        match cli.command {
+            Some(Commands::Project(args)) => match args.command {
+                crate::cli::ProjectCommands::Sync(sync_args) => {
+                    assert!(!sync_args.all);
+                    assert_eq!(sync_args.project_id, Some("my-project-id".to_string()));
+                }
+            },
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
+
+    /// `--all` and `project_id` together must be rejected by clap (conflicts_with).
+    #[test]
+    fn test_project_sync_all_and_project_id_conflict() {
+        let result = Cli::try_parse_from(["cflx", "project", "sync", "--all", "proj-id"]);
+        assert!(result.is_err(), "Expected parse error when --all and project_id are both set");
+    }
+
+    /// Default server URL for `project sync --all`.
+    #[test]
+    fn test_project_sync_default_server() {
+        let cli = Cli::parse_from(["cflx", "project", "sync", "--all"]);
+        match cli.command {
+            Some(Commands::Project(args)) => match args.command {
+                crate::cli::ProjectCommands::Sync(sync_args) => {
+                    assert_eq!(sync_args.server, "http://127.0.0.1:9876");
+                }
+            },
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
+
+    /// Custom `--server` URL for `project sync --all`.
+    #[test]
+    fn test_project_sync_custom_server() {
+        let cli = Cli::parse_from([
+            "cflx", "project", "sync", "--all", "--server", "http://myhost:1234",
+        ]);
+        match cli.command {
+            Some(Commands::Project(args)) => match args.command {
+                crate::cli::ProjectCommands::Sync(sync_args) => {
+                    assert_eq!(sync_args.server, "http://myhost:1234");
+                }
+            },
+            _ => panic!("Expected Project subcommand"),
+        }
+    }
+
+    /// `cflx p sync --all` alias must work.
+    #[test]
+    fn test_project_alias_p() {
+        let cli = Cli::parse_from(["cflx", "p", "sync", "--all"]);
+        match cli.command {
+            Some(Commands::Project(args)) => match args.command {
+                crate::cli::ProjectCommands::Sync(sync_args) => {
+                    assert!(sync_args.all);
+                }
+            },
+            _ => panic!("Expected Project subcommand"),
         }
     }
 

@@ -243,6 +243,70 @@ pub async fn spawn_ws_header_capture_server(
     (addr, rx)
 }
 
+// ─── Multi-request ordered mock HTTP server ───────────────────────────────────
+
+/// Spawn a mock HTTP server that handles `responses.len()` sequential requests.
+///
+/// For each connection, the server reads the request, captures the HTTP method
+/// and path from the request line, and sends the corresponding `(status, body)`.
+///
+/// Returns `(addr, path_rx)` where `path_rx` yields (in order) strings of the form
+/// `"METHOD /path"` for each request received.
+///
+/// # Example
+/// ```rust,ignore
+/// let responses = vec![
+///     (200, r#"[{"id":"p1","remote_url":"u","branch":"b","status":"idle","created_at":"t"}]"#.to_string()),
+///     (200, "{}".to_string()),
+/// ];
+/// let (addr, mut path_rx) = spawn_mock_http_server_ordered(responses).await;
+/// ```
+pub async fn spawn_mock_http_server_ordered(
+    responses: Vec<(u16, String)>,
+) -> (std::net::SocketAddr, tokio::sync::mpsc::Receiver<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = responses.len();
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(count + 1);
+
+    tokio::spawn(async move {
+        for (status, body) in responses {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request_text = String::from_utf8_lossy(&buf[..n]).to_string();
+
+                // Extract "METHOD /path" from the first request line
+                let method_path = request_text
+                    .lines()
+                    .next()
+                    .and_then(|line| {
+                        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+                        if parts.len() >= 2 {
+                            Some(format!("{} {}", parts[0], parts[1]))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                let _ = tx.send(method_path).await;
+
+                let reason = if status == 200 { "OK" } else { "Internal Server Error" };
+                let content_len = body.len();
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {content_len}\r\n\r\n{body}"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        }
+    });
+
+    (addr, rx)
+}
+
 // ─── Channel receive helper ───────────────────────────────────────────────────
 
 /// Wait up to `timeout_secs` seconds for a message on `rx`, panicking with a helpful
