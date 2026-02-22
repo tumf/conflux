@@ -111,6 +111,130 @@ impl RemoteClient {
         self.token.as_deref()
     }
 
+    /// List all projects from the server's management API (unauthenticated).
+    ///
+    /// Calls `GET /api/v1/projects` and returns raw JSON value.
+    pub async fn list_projects_management(&self) -> Result<serde_json::Value> {
+        let url = format!("{}/api/v1/projects", self.base_url);
+        let req = self.http.get(&url);
+        // No authorization header – project commands are unauthenticated
+
+        let response = req.send().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to connect to server '{}': {}",
+                self.base_url, e
+            )))
+        })?;
+
+        Self::check_project_response(response).await
+    }
+
+    /// Add a project to the server (unauthenticated).
+    ///
+    /// Calls `POST /api/v1/projects` with `{remote_url, branch}`.
+    pub async fn add_project(
+        &self,
+        remote_url: &str,
+        branch: &str,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/api/v1/projects", self.base_url);
+        let body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": branch,
+        });
+        let req = self.http.post(&url).json(&body);
+        // No authorization header – project commands are unauthenticated
+
+        let response = req.send().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to connect to server '{}': {}",
+                self.base_url, e
+            )))
+        })?;
+
+        Self::check_project_response(response).await
+    }
+
+    /// Remove a project from the server (unauthenticated).
+    ///
+    /// Calls `DELETE /api/v1/projects/{id}`.
+    pub async fn delete_project(&self, project_id: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/api/v1/projects/{}", self.base_url, project_id);
+        let req = self.http.delete(&url);
+        // No authorization header – project commands are unauthenticated
+
+        let response = req.send().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to connect to server '{}': {}",
+                self.base_url, e
+            )))
+        })?;
+
+        Self::check_project_response(response).await
+    }
+
+    /// Trigger a git sync for a project (unauthenticated).
+    ///
+    /// Calls `POST /api/v1/projects/{id}/git/sync`.
+    pub async fn git_sync(&self, project_id: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/api/v1/projects/{}/git/sync", self.base_url, project_id);
+        let req = self.http.post(&url);
+        // No authorization header – project commands are unauthenticated
+
+        let response = req.send().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to connect to server '{}': {}",
+                self.base_url, e
+            )))
+        })?;
+
+        Self::check_project_response(response).await
+    }
+
+    /// Common response handling for project management API calls.
+    ///
+    /// Returns the JSON body on success, or a formatted error for well-known HTTP status codes.
+    async fn check_project_response(response: reqwest::Response) -> Result<serde_json::Value> {
+        let status = response.status();
+        if status.is_success() {
+            // Try to parse as JSON; fall back to null if body is empty
+            let text = response.text().await.unwrap_or_default();
+            if text.is_empty() {
+                return Ok(serde_json::Value::Null);
+            }
+            serde_json::from_str(&text).map_err(|e| {
+                OrchestratorError::Io(std::io::Error::other(format!(
+                    "Failed to parse server response: {}",
+                    e
+                )))
+            })
+        } else {
+            // Attempt to extract error message from JSON body
+            let text = response.text().await.unwrap_or_default();
+            let detail = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                v.get("error")
+                    .or_else(|| v.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or(text)
+            } else {
+                text
+            };
+            let label = match status.as_u16() {
+                401 => "Unauthorized (401)",
+                403 => "Forbidden (403)",
+                404 => "Not found (404)",
+                409 => "Conflict (409)",
+                422 => "Unprocessable entity (422)",
+                _ => status.canonical_reason().unwrap_or("Error"),
+            };
+            Err(OrchestratorError::Io(std::io::Error::other(format!(
+                "{}: {}",
+                label, detail
+            ))))
+        }
+    }
+
     /// Start processing changes for a project on the remote server.
     ///
     /// Calls `POST /api/v1/projects/{id}/control/run`.
@@ -285,6 +409,130 @@ mod tests {
             !raw_lower.contains("authorization:"),
             "Did not expect 'Authorization' header when no token is set, got:\n{}",
             raw_request
+        );
+    }
+
+    // ── Project management API tests (unauthenticated) ────────────────────────
+
+    /// `list_projects_management` must NOT send an Authorization header.
+    #[tokio::test]
+    async fn test_list_projects_management_no_auth_header() {
+        use super::super::test_helpers::spawn_flexible_mock_http_server;
+
+        let (addr, req_rx) = spawn_flexible_mock_http_server("[]".to_string()).await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        let _ = client.list_projects_management().await;
+
+        let captured = tokio::time::timeout(
+            tokio::time::Duration::from_secs(3),
+            req_rx,
+        )
+        .await
+        .expect("Timed out")
+        .expect("Server did not receive request");
+
+        assert_eq!(captured.method, "GET");
+        assert_eq!(captured.path, "/api/v1/projects");
+        assert!(
+            !captured.raw.contains("authorization:"),
+            "list_projects_management must not send Authorization header; got:\n{}",
+            captured.raw
+        );
+    }
+
+    /// `add_project` must POST to `/api/v1/projects` with correct body and NO auth header.
+    #[tokio::test]
+    async fn test_add_project_no_auth_header() {
+        use super::super::test_helpers::spawn_flexible_mock_http_server;
+
+        let response_json = r#"{"id":"proj-1","remote_url":"https://example.com/repo.git","branch":"main","status":"idle","created_at":"2024-01-01T00:00:00Z"}"#;
+        let (addr, req_rx) = spawn_flexible_mock_http_server(response_json.to_string()).await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        let _ = client
+            .add_project("https://example.com/repo.git", "main")
+            .await;
+
+        let captured = tokio::time::timeout(
+            tokio::time::Duration::from_secs(3),
+            req_rx,
+        )
+        .await
+        .expect("Timed out")
+        .expect("Server did not receive request");
+
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/api/v1/projects");
+        assert!(
+            !captured.raw.contains("authorization:"),
+            "add_project must not send Authorization header; got:\n{}",
+            captured.raw
+        );
+        // Verify the request body contains remote_url and branch
+        assert!(
+            captured.body.contains("remote_url"),
+            "Request body should contain remote_url; got: {}",
+            captured.body
+        );
+        assert!(
+            captured.body.contains("branch"),
+            "Request body should contain branch; got: {}",
+            captured.body
+        );
+    }
+
+    /// `delete_project` must DELETE `/api/v1/projects/:id` with NO auth header.
+    #[tokio::test]
+    async fn test_delete_project_no_auth_header() {
+        use super::super::test_helpers::spawn_flexible_mock_http_server;
+
+        let (addr, req_rx) = spawn_flexible_mock_http_server("{}".to_string()).await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        let _ = client.delete_project("proj-abc123").await;
+
+        let captured = tokio::time::timeout(
+            tokio::time::Duration::from_secs(3),
+            req_rx,
+        )
+        .await
+        .expect("Timed out")
+        .expect("Server did not receive request");
+
+        assert_eq!(captured.method, "DELETE");
+        assert_eq!(captured.path, "/api/v1/projects/proj-abc123");
+        assert!(
+            !captured.raw.contains("authorization:"),
+            "delete_project must not send Authorization header; got:\n{}",
+            captured.raw
+        );
+    }
+
+    /// `git_sync` must POST to `/api/v1/projects/:id/git/sync` with NO auth header.
+    #[tokio::test]
+    async fn test_git_sync_no_auth_header() {
+        use super::super::test_helpers::spawn_flexible_mock_http_server;
+
+        let (addr, req_rx) = spawn_flexible_mock_http_server("{}".to_string()).await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        let _ = client.git_sync("proj-abc123").await;
+
+        let captured = tokio::time::timeout(
+            tokio::time::Duration::from_secs(3),
+            req_rx,
+        )
+        .await
+        .expect("Timed out")
+        .expect("Server did not receive request");
+
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/api/v1/projects/proj-abc123/git/sync");
+        assert!(
+            !captured.raw.contains("authorization:"),
+            "git_sync must not send Authorization header; got:\n{}",
+            captured.raw
         );
     }
 }
