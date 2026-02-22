@@ -295,11 +295,7 @@ impl RemoteClient {
     ///
     /// Calls `POST /api/v1/projects` with `{ remote_url, branch }` and returns
     /// the parsed JSON response body on success.
-    pub async fn add_project(
-        &self,
-        remote_url: &str,
-        branch: &str,
-    ) -> Result<serde_json::Value> {
+    pub async fn add_project(&self, remote_url: &str, branch: &str) -> Result<serde_json::Value> {
         let url = format!("{}/api/v1/projects", self.base_url);
         let req = self.http.post(&url);
         let req = self.authorized(req);
@@ -515,16 +511,14 @@ mod tests {
 
     #[test]
     fn test_parse_url_tree_branch() {
-        let (url, branch) =
-            parse_project_url("https://github.com/org/repo/tree/develop");
+        let (url, branch) = parse_project_url("https://github.com/org/repo/tree/develop");
         assert_eq!(url, "https://github.com/org/repo");
         assert_eq!(branch, Some("develop".to_string()));
     }
 
     #[test]
     fn test_parse_url_tree_branch_main() {
-        let (url, branch) =
-            parse_project_url("https://github.com/org/repo/tree/main");
+        let (url, branch) = parse_project_url("https://github.com/org/repo/tree/main");
         assert_eq!(url, "https://github.com/org/repo");
         assert_eq!(branch, Some("main".to_string()));
     }
@@ -556,13 +550,12 @@ mod tests {
     async fn test_default_branch_used_when_omitted() {
         // When no branch is embedded in the URL and no explicit branch is given,
         // the resolver is called and its return value is used as the branch.
-        let (url, branch) = resolve_project_url_and_branch(
-            "https://github.com/org/repo",
-            None,
-            |_url| async { Ok("main".to_string()) },
-        )
-        .await
-        .expect("should succeed");
+        let (url, branch) =
+            resolve_project_url_and_branch("https://github.com/org/repo", None, |_url| async {
+                Ok("main".to_string())
+            })
+            .await
+            .expect("should succeed");
 
         assert_eq!(url, "https://github.com/org/repo");
         assert_eq!(branch, "main");
