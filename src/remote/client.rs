@@ -2,9 +2,189 @@
 //!
 //! Provides GET/POST operations with bearer token authentication.
 
+use std::future::Future;
+
 use crate::error::{OrchestratorError, Result};
 
 use super::types::RemoteProject;
+
+// ─────────────────────────────── URL parsing ──────────────────────────────
+
+/// Parse a project URL into `(base_url, Option<branch>)`.
+///
+/// Supports two branch-embedding conventions:
+/// - `/tree/<branch>` path suffix (GitHub tree URLs)
+/// - `#<branch>` URL fragment
+///
+/// The returned `base_url` is the normalized repository root URL (no trailing
+/// slash, no branch suffix/fragment).
+///
+/// # Examples
+///
+/// ```ignore
+/// let (url, branch) = parse_project_url("https://github.com/org/repo/tree/develop");
+/// assert_eq!(url, "https://github.com/org/repo");
+/// assert_eq!(branch, Some("develop".to_string()));
+///
+/// let (url, branch) = parse_project_url("https://github.com/org/repo#main");
+/// assert_eq!(url, "https://github.com/org/repo");
+/// assert_eq!(branch, Some("main".to_string()));
+///
+/// let (url, branch) = parse_project_url("https://github.com/org/repo");
+/// assert_eq!(url, "https://github.com/org/repo");
+/// assert_eq!(branch, None);
+/// ```
+pub fn parse_project_url(url: &str) -> (String, Option<String>) {
+    // Handle fragment (#branch) first
+    let (url_no_frag, frag_branch) = match url.split_once('#') {
+        Some((base, frag)) if !frag.is_empty() => (base, Some(frag.to_string())),
+        _ => (url, None),
+    };
+
+    // Handle /tree/<branch> path segment
+    if let Some(branch) = extract_tree_branch(url_no_frag) {
+        // Remove the "/tree/<branch>" suffix from the URL
+        let suffix_len = "/tree/".len() + branch.len();
+        let base = url_no_frag[..url_no_frag.len() - suffix_len]
+            .trim_end_matches('/')
+            .to_string();
+        return (base, Some(branch));
+    }
+
+    (url_no_frag.trim_end_matches('/').to_string(), frag_branch)
+}
+
+/// Extract the branch name from a `/tree/<branch>` path segment.
+///
+/// Only matches `/tree/` that appears after at least three slash-separated
+/// path components beyond the scheme (i.e., after `host/org/repo`).
+fn extract_tree_branch(url: &str) -> Option<String> {
+    // Skip the scheme (e.g., "https://")
+    let scheme_end = url.find("://")? + 3;
+    let after_scheme = &url[scheme_end..];
+
+    // Walk through the path counting slashes to reach the 3rd one
+    // (which marks the boundary between "repo" and further sub-paths)
+    let mut slash_count = 0;
+    for (i, c) in after_scheme.char_indices() {
+        if c == '/' {
+            slash_count += 1;
+            if slash_count == 3 {
+                let suffix = &after_scheme[i..]; // starts with "/"
+                if let Some(branch_part) = suffix.strip_prefix("/tree/") {
+                    // Branch name ends at the next "/" (or end of string)
+                    let branch = branch_part.split('/').next().unwrap_or("").to_string();
+                    if !branch.is_empty() {
+                        return Some(branch);
+                    }
+                }
+                return None;
+            }
+        }
+    }
+    None
+}
+
+// ─────────────────────────────── Default branch resolution ────────────────
+
+/// Resolve the default branch for the given remote URL using `git ls-remote --symref`.
+///
+/// Runs `git ls-remote --symref <url> HEAD` and parses the symbolic ref line.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - `git` is not available
+/// - the remote is unreachable
+/// - no symbolic HEAD ref can be found in the output
+pub async fn resolve_default_branch(url: &str) -> Result<String> {
+    let output = tokio::process::Command::new("git")
+        .args(["ls-remote", "--symref", url, "HEAD"])
+        .output()
+        .await
+        .map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to run git ls-remote: {}",
+                e
+            )))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(OrchestratorError::Io(std::io::Error::other(format!(
+            "Failed to resolve default branch for '{}': {}",
+            url,
+            stderr.trim()
+        ))));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Expected output line: "ref: refs/heads/main\tHEAD"
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("ref: refs/heads/") {
+            let branch = rest.split('\t').next().unwrap_or("").trim().to_string();
+            if !branch.is_empty() {
+                return Ok(branch);
+            }
+        }
+    }
+
+    Err(OrchestratorError::Io(std::io::Error::other(format!(
+        "Could not determine default branch for '{}': symref not found in git ls-remote output",
+        url
+    ))))
+}
+
+// ─────────────────────────────── Combined resolver ────────────────────────
+
+/// Resolve the final `(base_url, branch)` pair for a `project add` invocation.
+///
+/// Priority:
+/// 1. `explicit_branch` argument (highest – overrides everything)
+/// 2. Branch embedded in `raw_url` via `/tree/<branch>` or `#<branch>`
+/// 3. Default branch resolved by calling `resolver(base_url)` (lowest)
+///
+/// The `resolver` parameter receives the base URL as an **owned** `String` and
+/// returns a `Future<Output = Result<String>>`. This makes the function testable:
+/// in production code pass a closure wrapping [`resolve_default_branch`]; in tests
+/// pass a closure that returns a fixed value without running `git`.
+///
+/// # Example
+/// ```ignore
+/// // Production usage
+/// resolve_project_url_and_branch(&url, branch.as_deref(), |u| async move {
+///     resolve_default_branch(&u).await
+/// }).await?
+///
+/// // Test usage
+/// resolve_project_url_and_branch("https://github.com/org/repo", None, |_| async {
+///     Ok("main".to_string())
+/// }).await?
+/// ```
+pub async fn resolve_project_url_and_branch<F, Fut>(
+    raw_url: &str,
+    explicit_branch: Option<&str>,
+    resolver: F,
+) -> Result<(String, String)>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<String>>,
+{
+    let (base_url, url_branch) = parse_project_url(raw_url);
+
+    let branch = if let Some(b) = explicit_branch {
+        // Explicit argument has highest priority
+        b.to_string()
+    } else if let Some(b) = url_branch {
+        // Branch embedded in URL
+        b
+    } else {
+        // Fall back to remote default branch resolution
+        resolver(base_url.clone()).await?
+    };
+
+    Ok((base_url, branch))
+}
 
 /// HTTP client for connecting to a remote Conflux server.
 ///
@@ -424,6 +604,121 @@ mod tests {
             "Did not expect 'Authorization' header when no token is set, got:\n{}",
             raw_request
         );
+    }
+
+    // ── Task 3.1: parse tests for /tree/<branch> and #<branch> ──────────────
+
+    #[test]
+    fn test_parse_url_tree_branch() {
+        let (url, branch) = parse_project_url("https://github.com/org/repo/tree/develop");
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, Some("develop".to_string()));
+    }
+
+    #[test]
+    fn test_parse_url_tree_branch_main() {
+        let (url, branch) = parse_project_url("https://github.com/org/repo/tree/main");
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, Some("main".to_string()));
+    }
+
+    #[test]
+    fn test_parse_url_fragment_branch() {
+        let (url, branch) = parse_project_url("https://github.com/org/repo#develop");
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, Some("develop".to_string()));
+    }
+
+    #[test]
+    fn test_parse_url_no_branch() {
+        let (url, branch) = parse_project_url("https://github.com/org/repo");
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, None);
+    }
+
+    #[test]
+    fn test_parse_url_trailing_slash_stripped() {
+        let (url, branch) = parse_project_url("https://github.com/org/repo/");
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, None);
+    }
+
+    // ── Task 3.2: default branch used when omitted (mock resolver) ───────────
+
+    #[tokio::test]
+    async fn test_default_branch_used_when_omitted() {
+        // When no branch is embedded in the URL and no explicit branch is given,
+        // the resolver is called and its return value is used as the branch.
+        let (url, branch) =
+            resolve_project_url_and_branch("https://github.com/org/repo", None, |_url| async {
+                Ok("main".to_string())
+            })
+            .await
+            .expect("should succeed");
+
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, "main");
+    }
+
+    #[tokio::test]
+    async fn test_url_branch_used_when_no_explicit_branch() {
+        // When a branch is embedded in the URL and no explicit branch is given,
+        // the URL branch is used (resolver is NOT called).
+        let (url, branch) = resolve_project_url_and_branch(
+            "https://github.com/org/repo/tree/develop",
+            None,
+            |_url| async {
+                // Should never be called when URL branch is present
+                panic!("resolver should not be called when URL has a branch");
+                #[allow(unreachable_code)]
+                Ok(String::new())
+            },
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, "develop");
+    }
+
+    // ── Task 3.3: explicit branch overrides URL branch ───────────────────────
+
+    #[tokio::test]
+    async fn test_explicit_branch_overrides_url_branch() {
+        // When an explicit branch is provided, it takes precedence over any
+        // branch embedded in the URL.
+        let (url, branch) = resolve_project_url_and_branch(
+            "https://github.com/org/repo/tree/develop",
+            Some("main"),
+            |_url| async {
+                panic!("resolver should not be called when explicit branch is given");
+                #[allow(unreachable_code)]
+                Ok(String::new())
+            },
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, "main");
+    }
+
+    #[tokio::test]
+    async fn test_explicit_branch_overrides_fragment_branch() {
+        let (url, branch) = resolve_project_url_and_branch(
+            "https://github.com/org/repo#develop",
+            Some("main"),
+            |_url| async {
+                panic!("resolver should not be called when explicit branch is given");
+                #[allow(unreachable_code)]
+                Ok(String::new())
+            },
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, "main");
     }
 
     // ── Project management API tests (unauthenticated) ────────────────────────

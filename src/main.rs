@@ -770,9 +770,21 @@ async fn main() -> Result<()> {
 
             let result: crate::error::Result<serde_json::Value> = match args.command {
                 ProjectCommands::Add(add_args) => {
-                    client
-                        .add_project(&add_args.remote_url, &add_args.branch)
-                        .await
+                    // Resolve (base_url, branch) using URL parsing + default branch resolution
+                    let (base_url, branch) = match remote::resolve_project_url_and_branch(
+                        &add_args.remote_url,
+                        add_args.branch.as_deref(),
+                        |url| async move { remote::resolve_default_branch(&url).await },
+                    )
+                    .await
+                    {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+                    client.add_project(&base_url, &branch).await
                 }
                 ProjectCommands::Remove(remove_args) => {
                     client.delete_project(&remove_args.project_id).await

@@ -106,6 +106,16 @@ pub enum Commands {
     /// Interacts with the server's project management API without authentication.
     /// When --server is not specified, the server URL is resolved from global config
     /// (server.bind / server.port).
+    ///
+    /// EXAMPLES:
+    ///   cflx project add https://github.com/org/repo             # auto-resolve default branch
+    ///   cflx project add https://github.com/org/repo/tree/main  # branch from URL path
+    ///   cflx project add https://github.com/org/repo#develop    # branch from fragment
+    ///   cflx project add https://github.com/org/repo main       # explicit branch argument
+    ///   cflx project status                                      # list all projects
+    ///   cflx project status <project-id>                         # show specific project
+    ///   cflx project remove <project-id>                         # remove a project
+    ///   cflx project sync <project-id>                           # trigger git sync
     Project(ProjectArgs),
 
     /// Manage `cflx server` as a background service
@@ -384,12 +394,23 @@ pub enum ProjectCommands {
 
 /// Arguments for `cflx project add`
 #[derive(Parser, Debug)]
+#[command(about = "Add a project to the server")]
+#[command(long_about = "Add a project to the Conflux server.
+
+Accepts repository URLs with optional branch specification embedded in the URL:
+  cflx project add https://github.com/org/repo             # auto-resolve default branch
+  cflx project add https://github.com/org/repo/tree/main  # branch from /tree/<branch> path
+  cflx project add https://github.com/org/repo#develop    # branch from #<branch> fragment
+  cflx project add https://github.com/org/repo main       # explicit branch argument
+
+When both a branch is embedded in the URL and an explicit branch argument is given,
+the explicit argument takes precedence.")]
 pub struct ProjectAddArgs {
-    /// Remote git URL of the project repository
+    /// Repository URL (may include branch as /tree/<branch> or #<branch>)
     pub remote_url: String,
 
-    /// Branch to track
-    pub branch: String,
+    /// Branch name (overrides any branch embedded in the URL; auto-resolved if omitted)
+    pub branch: Option<String>,
 }
 
 /// Arguments for `cflx project remove`
@@ -966,7 +987,7 @@ mod tests {
                 match args.command {
                     ProjectCommands::Add(a) => {
                         assert_eq!(a.remote_url, "https://github.com/org/repo.git");
-                        assert_eq!(a.branch, "main");
+                        assert_eq!(a.branch, Some("main".to_string()));
                     }
                     _ => panic!("Expected Add"),
                 }
