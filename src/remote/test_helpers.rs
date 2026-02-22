@@ -204,6 +204,78 @@ pub fn make_remote_log_entry(message: &str, level: &str) -> RemoteLogEntry {
     }
 }
 
+// ─── Flexible HTTP mock server ────────────────────────────────────────────────
+
+/// A captured HTTP request from the flexible mock server.
+#[derive(Debug)]
+pub struct CapturedRequest {
+    /// Raw HTTP request text (lowercased for easy header inspection)
+    pub raw: String,
+    /// HTTP method extracted from the request line (e.g., "GET", "POST", "DELETE")
+    pub method: String,
+    /// Request path extracted from the request line (e.g., "/api/v1/projects")
+    pub path: String,
+    /// Request body (if any)
+    pub body: String,
+}
+
+/// Spawn a flexible HTTP mock server that captures the full request and returns a
+/// configurable response body with HTTP 200.
+///
+/// Returns `(addr, rx)` where `rx` yields a [`CapturedRequest`] for the first
+/// connection received.
+pub async fn spawn_flexible_mock_http_server(
+    response_body: String,
+) -> (
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Receiver<CapturedRequest>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let request_text = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            // Parse method and path from the request line
+            let first_line = request_text.lines().next().unwrap_or("");
+            let parts: Vec<&str> = first_line.split_whitespace().collect();
+            let method = parts.first().copied().unwrap_or("").to_string();
+            let path = parts.get(1).copied().unwrap_or("").to_string();
+
+            // Extract body (after blank line separating headers from body)
+            let body = if let Some(idx) = request_text.find("\r\n\r\n") {
+                request_text[idx + 4..].to_string()
+            } else {
+                String::new()
+            };
+
+            let captured = CapturedRequest {
+                raw: request_text.to_lowercase(),
+                method,
+                path,
+                body,
+            };
+            let _ = tx.send(captured);
+
+            let content_len = response_body.len();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                content_len, response_body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+
+    (addr, rx)
+}
+
 // ─── WS header capture server ────────────────────────────────────────────────
 
 /// Spawn a raw TCP server that captures the HTTP upgrade request (including headers)
