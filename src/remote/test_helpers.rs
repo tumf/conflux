@@ -300,8 +300,12 @@ pub async fn spawn_mock_http_server_ordered(
                     "Internal Server Error"
                 };
                 let content_len = body.len();
+                // Include Connection: close so that HTTP/1.1 clients (e.g. reqwest) do not
+                // attempt to reuse the connection.  Without this header, reqwest's keep-alive
+                // pool may try to reuse a connection that the server has already dropped,
+                // causing intermittent "error sending request" failures in the test suite.
                 let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {content_len}\r\n\r\n{body}"
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {content_len}\r\nConnection: close\r\n\r\n{body}"
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
             }

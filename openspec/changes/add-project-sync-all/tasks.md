@@ -20,3 +20,7 @@
 
 - [x] Ensure `git status --porcelain` is empty by resolving uncommitted changes in `src/cli.rs`, `src/remote/client.rs`, and `src/remote/test_helpers.rs` before the next acceptance run.
 - [x] Fix flakiness in `remote::client::tests::test_list_then_sync_ordering` so `cargo test` passes reliably in the full suite (update `src/remote/test_helpers.rs` `spawn_mock_http_server_ordered` or equivalent test/client setup to handle sequential sync requests deterministically).
+
+## Acceptance #2 Failure Follow-up
+
+- [x] Fix `remote::client::tests::test_list_then_sync_ordering` instability so full-suite `cargo test -q` passes consistently; latest run still fails at `src/remote/client.rs:364` with `Failed to sync project 'proj-2': error sending request` while using `spawn_mock_http_server_ordered` in `src/remote/test_helpers.rs:264`.
