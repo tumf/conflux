@@ -12,5 +12,9 @@ pub mod ws;
 pub mod test_helpers;
 
 pub use client::RemoteClient;
+// Re-export project URL helpers used by the binary (main.rs).
+// The lib target doesn't reference them directly, so silence the warning.
+#[allow(unused_imports)]
+pub use client::{resolve_default_branch, resolve_project_url_and_branch};
 pub use mapper::group_changes_by_project;
 pub use types::RemoteStateUpdate;

@@ -2,9 +2,189 @@
 //!
 //! Provides GET/POST operations with bearer token authentication.
 
+use std::future::Future;
+
 use crate::error::{OrchestratorError, Result};
 
 use super::types::{ProjectEntry, RemoteProject};
+
+// ─────────────────────────────── URL parsing ──────────────────────────────
+
+/// Parse a project URL into `(base_url, Option<branch>)`.
+///
+/// Supports two branch-embedding conventions:
+/// - `/tree/<branch>` path suffix (GitHub tree URLs)
+/// - `#<branch>` URL fragment
+///
+/// The returned `base_url` is the normalized repository root URL (no trailing
+/// slash, no branch suffix/fragment).
+///
+/// # Examples
+///
+/// ```ignore
+/// let (url, branch) = parse_project_url("https://github.com/org/repo/tree/develop");
+/// assert_eq!(url, "https://github.com/org/repo");
+/// assert_eq!(branch, Some("develop".to_string()));
+///
+/// let (url, branch) = parse_project_url("https://github.com/org/repo#main");
+/// assert_eq!(url, "https://github.com/org/repo");
+/// assert_eq!(branch, Some("main".to_string()));
+///
+/// let (url, branch) = parse_project_url("https://github.com/org/repo");
+/// assert_eq!(url, "https://github.com/org/repo");
+/// assert_eq!(branch, None);
+/// ```
+pub fn parse_project_url(url: &str) -> (String, Option<String>) {
+    // Handle fragment (#branch) first
+    let (url_no_frag, frag_branch) = match url.split_once('#') {
+        Some((base, frag)) if !frag.is_empty() => (base, Some(frag.to_string())),
+        _ => (url, None),
+    };
+
+    // Handle /tree/<branch> path segment
+    if let Some(branch) = extract_tree_branch(url_no_frag) {
+        // Remove the "/tree/<branch>" suffix from the URL
+        let suffix_len = "/tree/".len() + branch.len();
+        let base = url_no_frag[..url_no_frag.len() - suffix_len]
+            .trim_end_matches('/')
+            .to_string();
+        return (base, Some(branch));
+    }
+
+    (url_no_frag.trim_end_matches('/').to_string(), frag_branch)
+}
+
+/// Extract the branch name from a `/tree/<branch>` path segment.
+///
+/// Only matches `/tree/` that appears after at least three slash-separated
+/// path components beyond the scheme (i.e., after `host/org/repo`).
+fn extract_tree_branch(url: &str) -> Option<String> {
+    // Skip the scheme (e.g., "https://")
+    let scheme_end = url.find("://")? + 3;
+    let after_scheme = &url[scheme_end..];
+
+    // Walk through the path counting slashes to reach the 3rd one
+    // (which marks the boundary between "repo" and further sub-paths)
+    let mut slash_count = 0;
+    for (i, c) in after_scheme.char_indices() {
+        if c == '/' {
+            slash_count += 1;
+            if slash_count == 3 {
+                let suffix = &after_scheme[i..]; // starts with "/"
+                if let Some(branch_part) = suffix.strip_prefix("/tree/") {
+                    // Branch name ends at the next "/" (or end of string)
+                    let branch = branch_part.split('/').next().unwrap_or("").to_string();
+                    if !branch.is_empty() {
+                        return Some(branch);
+                    }
+                }
+                return None;
+            }
+        }
+    }
+    None
+}
+
+// ─────────────────────────────── Default branch resolution ────────────────
+
+/// Resolve the default branch for the given remote URL using `git ls-remote --symref`.
+///
+/// Runs `git ls-remote --symref <url> HEAD` and parses the symbolic ref line.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - `git` is not available
+/// - the remote is unreachable
+/// - no symbolic HEAD ref can be found in the output
+pub async fn resolve_default_branch(url: &str) -> Result<String> {
+    let output = tokio::process::Command::new("git")
+        .args(["ls-remote", "--symref", url, "HEAD"])
+        .output()
+        .await
+        .map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to run git ls-remote: {}",
+                e
+            )))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(OrchestratorError::Io(std::io::Error::other(format!(
+            "Failed to resolve default branch for '{}': {}",
+            url,
+            stderr.trim()
+        ))));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Expected output line: "ref: refs/heads/main\tHEAD"
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("ref: refs/heads/") {
+            let branch = rest.split('\t').next().unwrap_or("").trim().to_string();
+            if !branch.is_empty() {
+                return Ok(branch);
+            }
+        }
+    }
+
+    Err(OrchestratorError::Io(std::io::Error::other(format!(
+        "Could not determine default branch for '{}': symref not found in git ls-remote output",
+        url
+    ))))
+}
+
+// ─────────────────────────────── Combined resolver ────────────────────────
+
+/// Resolve the final `(base_url, branch)` pair for a `project add` invocation.
+///
+/// Priority:
+/// 1. `explicit_branch` argument (highest – overrides everything)
+/// 2. Branch embedded in `raw_url` via `/tree/<branch>` or `#<branch>`
+/// 3. Default branch resolved by calling `resolver(base_url)` (lowest)
+///
+/// The `resolver` parameter receives the base URL as an **owned** `String` and
+/// returns a `Future<Output = Result<String>>`. This makes the function testable:
+/// in production code pass a closure wrapping [`resolve_default_branch`]; in tests
+/// pass a closure that returns a fixed value without running `git`.
+///
+/// # Example
+/// ```ignore
+/// // Production usage
+/// resolve_project_url_and_branch(&url, branch.as_deref(), |u| async move {
+///     resolve_default_branch(&u).await
+/// }).await?
+///
+/// // Test usage
+/// resolve_project_url_and_branch("https://github.com/org/repo", None, |_| async {
+///     Ok("main".to_string())
+/// }).await?
+/// ```
+pub async fn resolve_project_url_and_branch<F, Fut>(
+    raw_url: &str,
+    explicit_branch: Option<&str>,
+    resolver: F,
+) -> Result<(String, String)>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<String>>,
+{
+    let (base_url, url_branch) = parse_project_url(raw_url);
+
+    let branch = if let Some(b) = explicit_branch {
+        // Explicit argument has highest priority
+        b.to_string()
+    } else if let Some(b) = url_branch {
+        // Branch embedded in URL
+        b
+    } else {
+        // Fall back to remote default branch resolution
+        resolver(base_url.clone()).await?
+    };
+
+    Ok((base_url, branch))
+}
 
 /// HTTP client for connecting to a remote Conflux server.
 ///
@@ -168,6 +348,144 @@ impl RemoteClient {
     /// Returns the bearer token (if any) for use when opening the WebSocket connection.
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref()
+    }
+
+    /// Get a specific project from the server's management API (unauthenticated).
+    ///
+    /// Calls `GET /api/v1/projects/{id}` and returns raw JSON value.
+    pub async fn get_project(&self, project_id: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/api/v1/projects/{}", self.base_url, project_id);
+        let req = self.http.get(&url);
+        // No authorization header – project commands are unauthenticated
+
+        let response = req.send().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to connect to server '{}': {}",
+                self.base_url, e
+            )))
+        })?;
+
+        Self::check_project_response(response).await
+    }
+
+    /// List all projects from the server's management API (unauthenticated).
+    ///
+    /// Calls `GET /api/v1/projects` and returns raw JSON value.
+    pub async fn list_projects_management(&self) -> Result<serde_json::Value> {
+        let url = format!("{}/api/v1/projects", self.base_url);
+        let req = self.http.get(&url);
+        // No authorization header – project commands are unauthenticated
+
+        let response = req.send().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to connect to server '{}': {}",
+                self.base_url, e
+            )))
+        })?;
+
+        Self::check_project_response(response).await
+    }
+
+    /// Add a project to the server (unauthenticated).
+    ///
+    /// Calls `POST /api/v1/projects` with `{remote_url, branch}`.
+    pub async fn add_project(&self, remote_url: &str, branch: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/api/v1/projects", self.base_url);
+        let body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": branch,
+        });
+        let req = self.http.post(&url).json(&body);
+        // No authorization header – project commands are unauthenticated
+
+        let response = req.send().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to connect to server '{}': {}",
+                self.base_url, e
+            )))
+        })?;
+
+        Self::check_project_response(response).await
+    }
+
+    /// Remove a project from the server (unauthenticated).
+    ///
+    /// Calls `DELETE /api/v1/projects/{id}`.
+    pub async fn delete_project(&self, project_id: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/api/v1/projects/{}", self.base_url, project_id);
+        let req = self.http.delete(&url);
+        // No authorization header – project commands are unauthenticated
+
+        let response = req.send().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to connect to server '{}': {}",
+                self.base_url, e
+            )))
+        })?;
+
+        Self::check_project_response(response).await
+    }
+
+    /// Trigger a git sync for a project (unauthenticated).
+    ///
+    /// Calls `POST /api/v1/projects/{id}/git/sync`.
+    pub async fn git_sync(&self, project_id: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/api/v1/projects/{}/git/sync", self.base_url, project_id);
+        let req = self.http.post(&url);
+        // No authorization header – project commands are unauthenticated
+
+        let response = req.send().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to connect to server '{}': {}",
+                self.base_url, e
+            )))
+        })?;
+
+        Self::check_project_response(response).await
+    }
+
+    /// Common response handling for project management API calls.
+    ///
+    /// Returns the JSON body on success, or a formatted error for well-known HTTP status codes.
+    async fn check_project_response(response: reqwest::Response) -> Result<serde_json::Value> {
+        let status = response.status();
+        if status.is_success() {
+            // Try to parse as JSON; fall back to null if body is empty
+            let text = response.text().await.unwrap_or_default();
+            if text.is_empty() {
+                return Ok(serde_json::Value::Null);
+            }
+            serde_json::from_str(&text).map_err(|e| {
+                OrchestratorError::Io(std::io::Error::other(format!(
+                    "Failed to parse server response: {}",
+                    e
+                )))
+            })
+        } else {
+            // Attempt to extract error message from JSON body
+            let text = response.text().await.unwrap_or_default();
+            let detail = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                v.get("error")
+                    .or_else(|| v.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or(text)
+            } else {
+                text
+            };
+            let label = match status.as_u16() {
+                401 => "Unauthorized (401)",
+                403 => "Forbidden (403)",
+                404 => "Not found (404)",
+                409 => "Conflict (409)",
+                422 => "Unprocessable entity (422)",
+                _ => status.canonical_reason().unwrap_or("Error"),
+            };
+            Err(OrchestratorError::Io(std::io::Error::other(format!(
+                "{}: {}",
+                label, detail
+            ))))
+        }
     }
 
     /// Start processing changes for a project on the remote server.
@@ -443,6 +761,258 @@ mod tests {
             !raw_lower.contains("authorization:"),
             "Did not expect 'Authorization' header when no token is set, got:\n{}",
             raw_request
+        );
+    }
+
+    // ── Task 3.1: parse tests for /tree/<branch> and #<branch> ──────────────
+
+    #[test]
+    fn test_parse_url_tree_branch() {
+        let (url, branch) = parse_project_url("https://github.com/org/repo/tree/develop");
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, Some("develop".to_string()));
+    }
+
+    #[test]
+    fn test_parse_url_tree_branch_main() {
+        let (url, branch) = parse_project_url("https://github.com/org/repo/tree/main");
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, Some("main".to_string()));
+    }
+
+    #[test]
+    fn test_parse_url_fragment_branch() {
+        let (url, branch) = parse_project_url("https://github.com/org/repo#develop");
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, Some("develop".to_string()));
+    }
+
+    #[test]
+    fn test_parse_url_no_branch() {
+        let (url, branch) = parse_project_url("https://github.com/org/repo");
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, None);
+    }
+
+    #[test]
+    fn test_parse_url_trailing_slash_stripped() {
+        let (url, branch) = parse_project_url("https://github.com/org/repo/");
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, None);
+    }
+
+    // ── Task 3.2: default branch used when omitted (mock resolver) ───────────
+
+    #[tokio::test]
+    async fn test_default_branch_used_when_omitted() {
+        // When no branch is embedded in the URL and no explicit branch is given,
+        // the resolver is called and its return value is used as the branch.
+        let (url, branch) =
+            resolve_project_url_and_branch("https://github.com/org/repo", None, |_url| async {
+                Ok("main".to_string())
+            })
+            .await
+            .expect("should succeed");
+
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, "main");
+    }
+
+    #[tokio::test]
+    async fn test_url_branch_used_when_no_explicit_branch() {
+        // When a branch is embedded in the URL and no explicit branch is given,
+        // the URL branch is used (resolver is NOT called).
+        let (url, branch) = resolve_project_url_and_branch(
+            "https://github.com/org/repo/tree/develop",
+            None,
+            |_url| async {
+                // Should never be called when URL branch is present
+                panic!("resolver should not be called when URL has a branch");
+                #[allow(unreachable_code)]
+                Ok(String::new())
+            },
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, "develop");
+    }
+
+    // ── Task 3.3: explicit branch overrides URL branch ───────────────────────
+
+    #[tokio::test]
+    async fn test_explicit_branch_overrides_url_branch() {
+        // When an explicit branch is provided, it takes precedence over any
+        // branch embedded in the URL.
+        let (url, branch) = resolve_project_url_and_branch(
+            "https://github.com/org/repo/tree/develop",
+            Some("main"),
+            |_url| async {
+                panic!("resolver should not be called when explicit branch is given");
+                #[allow(unreachable_code)]
+                Ok(String::new())
+            },
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, "main");
+    }
+
+    #[tokio::test]
+    async fn test_explicit_branch_overrides_fragment_branch() {
+        let (url, branch) = resolve_project_url_and_branch(
+            "https://github.com/org/repo#develop",
+            Some("main"),
+            |_url| async {
+                panic!("resolver should not be called when explicit branch is given");
+                #[allow(unreachable_code)]
+                Ok(String::new())
+            },
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(url, "https://github.com/org/repo");
+        assert_eq!(branch, "main");
+    }
+
+    // ── Project management API tests (unauthenticated) ────────────────────────
+
+    /// `get_project` must GET `/api/v1/projects/:id` with NO auth header.
+    #[tokio::test]
+    async fn test_get_project_no_auth_header() {
+        use super::super::test_helpers::spawn_flexible_mock_http_server;
+
+        let response_json = r#"{"id":"proj-abc123","remote_url":"https://example.com/repo.git","branch":"main","status":"idle","created_at":"2024-01-01T00:00:00Z"}"#;
+        let (addr, req_rx) = spawn_flexible_mock_http_server(response_json.to_string()).await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        let _ = client.get_project("proj-abc123").await;
+
+        let captured = tokio::time::timeout(tokio::time::Duration::from_secs(3), req_rx)
+            .await
+            .expect("Timed out")
+            .expect("Server did not receive request");
+
+        assert_eq!(captured.method, "GET");
+        assert_eq!(captured.path, "/api/v1/projects/proj-abc123");
+        assert!(
+            !captured.raw.contains("authorization:"),
+            "get_project must not send Authorization header; got:\n{}",
+            captured.raw
+        );
+    }
+
+    /// `list_projects_management` must NOT send an Authorization header.
+    #[tokio::test]
+    async fn test_list_projects_management_no_auth_header() {
+        use super::super::test_helpers::spawn_flexible_mock_http_server;
+
+        let (addr, req_rx) = spawn_flexible_mock_http_server("[]".to_string()).await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        let _ = client.list_projects_management().await;
+
+        let captured = tokio::time::timeout(tokio::time::Duration::from_secs(3), req_rx)
+            .await
+            .expect("Timed out")
+            .expect("Server did not receive request");
+
+        assert_eq!(captured.method, "GET");
+        assert_eq!(captured.path, "/api/v1/projects");
+        assert!(
+            !captured.raw.contains("authorization:"),
+            "list_projects_management must not send Authorization header; got:\n{}",
+            captured.raw
+        );
+    }
+
+    /// `add_project` must POST to `/api/v1/projects` with correct body and NO auth header.
+    #[tokio::test]
+    async fn test_add_project_no_auth_header() {
+        use super::super::test_helpers::spawn_flexible_mock_http_server;
+
+        let response_json = r#"{"id":"proj-1","remote_url":"https://example.com/repo.git","branch":"main","status":"idle","created_at":"2024-01-01T00:00:00Z"}"#;
+        let (addr, req_rx) = spawn_flexible_mock_http_server(response_json.to_string()).await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        let _ = client
+            .add_project("https://example.com/repo.git", "main")
+            .await;
+
+        let captured = tokio::time::timeout(tokio::time::Duration::from_secs(3), req_rx)
+            .await
+            .expect("Timed out")
+            .expect("Server did not receive request");
+
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/api/v1/projects");
+        assert!(
+            !captured.raw.contains("authorization:"),
+            "add_project must not send Authorization header; got:\n{}",
+            captured.raw
+        );
+        // Verify the request body contains remote_url and branch
+        assert!(
+            captured.body.contains("remote_url"),
+            "Request body should contain remote_url; got: {}",
+            captured.body
+        );
+        assert!(
+            captured.body.contains("branch"),
+            "Request body should contain branch; got: {}",
+            captured.body
+        );
+    }
+
+    /// `delete_project` must DELETE `/api/v1/projects/:id` with NO auth header.
+    #[tokio::test]
+    async fn test_delete_project_no_auth_header() {
+        use super::super::test_helpers::spawn_flexible_mock_http_server;
+
+        let (addr, req_rx) = spawn_flexible_mock_http_server("{}".to_string()).await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        let _ = client.delete_project("proj-abc123").await;
+
+        let captured = tokio::time::timeout(tokio::time::Duration::from_secs(3), req_rx)
+            .await
+            .expect("Timed out")
+            .expect("Server did not receive request");
+
+        assert_eq!(captured.method, "DELETE");
+        assert_eq!(captured.path, "/api/v1/projects/proj-abc123");
+        assert!(
+            !captured.raw.contains("authorization:"),
+            "delete_project must not send Authorization header; got:\n{}",
+            captured.raw
+        );
+    }
+
+    /// `git_sync` must POST to `/api/v1/projects/:id/git/sync` with NO auth header.
+    #[tokio::test]
+    async fn test_git_sync_no_auth_header() {
+        use super::super::test_helpers::spawn_flexible_mock_http_server;
+
+        let (addr, req_rx) = spawn_flexible_mock_http_server("{}".to_string()).await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        let _ = client.git_sync("proj-abc123").await;
+
+        let captured = tokio::time::timeout(tokio::time::Duration::from_secs(3), req_rx)
+            .await
+            .expect("Timed out")
+            .expect("Server did not receive request");
+
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/api/v1/projects/proj-abc123/git/sync");
+        assert!(
+            !captured.raw.contains("authorization:"),
+            "git_sync must not send Authorization header; got:\n{}",
+            captured.raw
         );
     }
 }
