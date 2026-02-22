@@ -25,6 +25,7 @@ mod remote;
 mod serial_run_service;
 #[cfg(feature = "web-monitoring")]
 mod server;
+mod service;
 mod spec_delta;
 #[cfg(test)]
 mod spec_test_annotations;
@@ -801,6 +802,23 @@ async fn main() -> Result<()> {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
+            }
+        }
+
+        // Service subcommand: manage cflx server as a background service
+        Some(Commands::Service(args)) => {
+            use cli::ServiceSubcommand;
+            let result = match args.command {
+                ServiceSubcommand::Install => service::install(),
+                ServiceSubcommand::Uninstall => service::uninstall(),
+                ServiceSubcommand::Status => service::status(),
+                ServiceSubcommand::Start => service::start(),
+                ServiceSubcommand::Stop => service::stop(),
+                ServiceSubcommand::Restart => service::restart(),
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
             }
         }
 

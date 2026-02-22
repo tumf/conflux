@@ -1,6 +1,6 @@
 [package]
 name = "conflux"
-version = "0.4.51-server-mode"
+version = "0.4.52-server-mode"
 edition = "2021"
 default-run = "cflx"
 
