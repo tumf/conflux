@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "conflux"
-version = "0.4.54-server-mode"
+version = "0.4.55-server-mode"
 dependencies = [
  "anyhow",
  "async-trait",
