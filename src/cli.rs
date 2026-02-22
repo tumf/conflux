@@ -100,6 +100,23 @@ pub enum Commands {
     /// Manages multiple projects via a REST API (API v1).
     /// Requires bearer token authentication when binding to non-loopback addresses.
     Server(ServerArgs),
+
+    /// Manage `cflx server` as a background service
+    ///
+    /// Installs, uninstalls, starts, stops, restarts, and queries the status of the
+    /// `cflx server` daemon using the native service manager for your OS:
+    ///   - macOS: launchd user agent
+    ///   - Linux: systemd user service
+    ///   - Windows: Scheduled Task
+    ///
+    /// EXAMPLES:
+    ///   cflx service install    # Install and enable the service
+    ///   cflx service start      # Start the service
+    ///   cflx service status     # Show current status
+    ///   cflx service stop       # Stop the service
+    ///   cflx service restart    # Restart the service
+    ///   cflx service uninstall  # Remove the service
+    Service(ServiceArgs),
 }
 
 /// Arguments for the run subcommand
@@ -308,6 +325,31 @@ pub struct ServerArgs {
     /// Directory for persistent server data (projects registry, etc.)
     #[arg(long)]
     pub data_dir: Option<std::path::PathBuf>,
+}
+
+/// Subcommands for the `cflx service` command group.
+#[derive(Subcommand, Debug)]
+pub enum ServiceSubcommand {
+    /// Install `cflx server` as a background service (macOS: launchd, Linux: systemd, Windows: schtasks)
+    Install,
+    /// Uninstall the background service
+    Uninstall,
+    /// Show the current status of the background service
+    Status,
+    /// Start the background service
+    Start,
+    /// Stop the background service
+    Stop,
+    /// Restart the background service
+    Restart,
+}
+
+/// Arguments for the `service` subcommand group.
+#[derive(Parser, Debug)]
+#[command(about = "Manage cflx server as a background service")]
+pub struct ServiceArgs {
+    #[command(subcommand)]
+    pub command: ServiceSubcommand,
 }
 
 /// Check if git directory exists
