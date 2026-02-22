@@ -294,7 +294,11 @@ pub async fn spawn_mock_http_server_ordered(
                     .unwrap_or_default();
                 let _ = tx.send(method_path).await;
 
-                let reason = if status == 200 { "OK" } else { "Internal Server Error" };
+                let reason = if status == 200 {
+                    "OK"
+                } else {
+                    "Internal Server Error"
+                };
                 let content_len = body.len();
                 let response = format!(
                     "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {content_len}\r\n\r\n{body}"

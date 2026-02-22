@@ -940,7 +940,10 @@ mod tests {
     #[test]
     fn test_project_sync_all_and_project_id_conflict() {
         let result = Cli::try_parse_from(["cflx", "project", "sync", "--all", "proj-id"]);
-        assert!(result.is_err(), "Expected parse error when --all and project_id are both set");
+        assert!(
+            result.is_err(),
+            "Expected parse error when --all and project_id are both set"
+        );
     }
 
     /// Default server URL for `project sync --all`.
@@ -961,7 +964,12 @@ mod tests {
     #[test]
     fn test_project_sync_custom_server() {
         let cli = Cli::parse_from([
-            "cflx", "project", "sync", "--all", "--server", "http://myhost:1234",
+            "cflx",
+            "project",
+            "sync",
+            "--all",
+            "--server",
+            "http://myhost:1234",
         ]);
         match cli.command {
             Some(Commands::Project(args)) => match args.command {

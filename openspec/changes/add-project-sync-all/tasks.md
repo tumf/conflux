@@ -15,3 +15,8 @@
 - [x] 3.1 `sync --all` の clap パーステストを追加する（確認: `cflx project sync --all` がパースできる）
 - [x] 3.2 モック HTTP サーバで一覧取得と同期呼び出しの順序を検証する（確認: `GET /api/v1/projects` 後に `POST /api/v1/projects/{id}/git/sync` が呼ばれる）
 - [x] 3.3 同期失敗が含まれる場合の終了コードを検証する（確認: 1 件でも失敗時に非 0）
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Ensure `git status --porcelain` is empty by resolving uncommitted changes in `src/cli.rs`, `src/remote/client.rs`, and `src/remote/test_helpers.rs` before the next acceptance run.
+- [x] Fix flakiness in `remote::client::tests::test_list_then_sync_ordering` so `cargo test` passes reliably in the full suite (update `src/remote/test_helpers.rs` `spawn_mock_http_server_ordered` or equivalent test/client setup to handle sequential sync requests deterministically).

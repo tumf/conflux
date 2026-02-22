@@ -128,10 +128,7 @@ impl RemoteClient {
     ///
     /// Calls `POST /api/v1/projects/{id}/git/sync`.
     pub async fn sync_project(&self, project_id: &str) -> Result<()> {
-        let url = format!(
-            "{}/api/v1/projects/{}/git/sync",
-            self.base_url, project_id
-        );
+        let url = format!("{}/api/v1/projects/{}/git/sync", self.base_url, project_id);
         let req = self.http.post(&url);
         let req = self.authorized(req);
 
@@ -309,17 +306,17 @@ mod tests {
         let (addr, mut path_rx) = spawn_mock_http_server_ordered(responses).await;
         let client = RemoteClient::new(format!("http://{}", addr), None);
 
-        let projects = client.list_all_projects().await.expect("list_all_projects should succeed");
+        let projects = client
+            .list_all_projects()
+            .await
+            .expect("list_all_projects should succeed");
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, "proj-1");
 
-        let method_path = tokio::time::timeout(
-            tokio::time::Duration::from_secs(3),
-            path_rx.recv(),
-        )
-        .await
-        .expect("Timed out")
-        .expect("No request captured");
+        let method_path = tokio::time::timeout(tokio::time::Duration::from_secs(3), path_rx.recv())
+            .await
+            .expect("Timed out")
+            .expect("No request captured");
         assert_eq!(method_path, "GET /api/v1/projects");
     }
 
@@ -330,15 +327,15 @@ mod tests {
         let (addr, mut path_rx) = spawn_mock_http_server_ordered(responses).await;
         let client = RemoteClient::new(format!("http://{}", addr), None);
 
-        client.sync_project("proj-abc").await.expect("sync_project should succeed");
+        client
+            .sync_project("proj-abc")
+            .await
+            .expect("sync_project should succeed");
 
-        let method_path = tokio::time::timeout(
-            tokio::time::Duration::from_secs(3),
-            path_rx.recv(),
-        )
-        .await
-        .expect("Timed out")
-        .expect("No request captured");
+        let method_path = tokio::time::timeout(tokio::time::Duration::from_secs(3), path_rx.recv())
+            .await
+            .expect("Timed out")
+            .expect("No request captured");
         assert_eq!(method_path, "POST /api/v1/projects/proj-abc/git/sync");
     }
 
@@ -348,25 +345,37 @@ mod tests {
     async fn test_list_then_sync_ordering() {
         let project_json = r#"[{"id":"proj-1","remote_url":"https://github.com/a/b","branch":"main","status":"idle","created_at":"2024-01-01T00:00:00Z"},{"id":"proj-2","remote_url":"https://github.com/c/d","branch":"dev","status":"idle","created_at":"2024-01-01T00:00:00Z"}]"#;
         let responses = vec![
-            (200, project_json.to_string()),    // GET /api/v1/projects
-            (200, "{}".to_string()),             // POST .../proj-1/git/sync
-            (200, "{}".to_string()),             // POST .../proj-2/git/sync
+            (200, project_json.to_string()), // GET /api/v1/projects
+            (200, "{}".to_string()),         // POST .../proj-1/git/sync
+            (200, "{}".to_string()),         // POST .../proj-2/git/sync
         ];
         let (addr, mut path_rx) = spawn_mock_http_server_ordered(responses).await;
         let client = RemoteClient::new(format!("http://{}", addr), None);
 
-        let projects = client.list_all_projects().await.expect("list should succeed");
+        let projects = client
+            .list_all_projects()
+            .await
+            .expect("list should succeed");
         assert_eq!(projects.len(), 2);
         for project in &projects {
-            client.sync_project(&project.id).await.expect("sync should succeed");
+            client
+                .sync_project(&project.id)
+                .await
+                .expect("sync should succeed");
         }
 
         let first = tokio::time::timeout(tokio::time::Duration::from_secs(3), path_rx.recv())
-            .await.expect("timeout").expect("no msg");
+            .await
+            .expect("timeout")
+            .expect("no msg");
         let second = tokio::time::timeout(tokio::time::Duration::from_secs(3), path_rx.recv())
-            .await.expect("timeout").expect("no msg");
+            .await
+            .expect("timeout")
+            .expect("no msg");
         let third = tokio::time::timeout(tokio::time::Duration::from_secs(3), path_rx.recv())
-            .await.expect("timeout").expect("no msg");
+            .await
+            .expect("timeout")
+            .expect("no msg");
 
         assert_eq!(first, "GET /api/v1/projects");
         assert_eq!(second, "POST /api/v1/projects/proj-1/git/sync");
@@ -382,7 +391,10 @@ mod tests {
         let client = RemoteClient::new(format!("http://{}", addr), None);
 
         let result = client.sync_project("failing-project").await;
-        assert!(result.is_err(), "sync_project should return Err on 500 response");
+        assert!(
+            result.is_err(),
+            "sync_project should return Err on 500 response"
+        );
     }
 
     /// Verify that the `Authorization: Bearer <token>` header is present in the HTTP
