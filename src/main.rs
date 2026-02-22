@@ -694,6 +694,54 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Project subcommand: manage projects on a remote server
+        Some(Commands::Project(args)) => {
+            use cli::ProjectSubcommand;
+            match args.command {
+                ProjectSubcommand::Add(add_args) => {
+                    let token = remote::RemoteClient::resolve_token(
+                        add_args.server_token.clone(),
+                        add_args.server_token_env.as_deref(),
+                    );
+                    let server_url = add_args
+                        .server
+                        .as_deref()
+                        .unwrap_or("http://127.0.0.1:9876");
+                    let client = remote::RemoteClient::new(server_url, token);
+
+                    // Resolve (base_url, branch) using URL parsing + default branch resolution
+                    let (base_url, branch) = match remote::resolve_project_url_and_branch(
+                        &add_args.url,
+                        add_args.branch.as_deref(),
+                        |url| async move { remote::resolve_default_branch(&url).await },
+                    )
+                    .await
+                    {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+
+                    match client.add_project(&base_url, &branch).await {
+                        Ok(result) => {
+                            println!("Project added successfully:");
+                            println!("  URL: {}", base_url);
+                            println!("  Branch: {}", branch);
+                            if let Some(id) = result.get("id").and_then(|v| v.as_str()) {
+                                println!("  ID: {}", id);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
+
         // CheckConflicts subcommand: detect conflicts between spec delta files
         Some(Commands::CheckConflicts(args)) => {
             // Get list of all non-archived changes

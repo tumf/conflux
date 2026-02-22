@@ -117,6 +117,15 @@ pub enum Commands {
     ///   cflx service restart    # Restart the service
     ///   cflx service uninstall  # Remove the service
     Service(ServiceArgs),
+
+    /// Manage projects on a remote Conflux server
+    ///
+    /// EXAMPLES:
+    ///   cflx project add https://github.com/org/repo             # auto-resolve default branch
+    ///   cflx project add https://github.com/org/repo/tree/main  # branch from URL path
+    ///   cflx project add https://github.com/org/repo#develop    # branch from fragment
+    ///   cflx project add https://github.com/org/repo main       # explicit branch argument
+    Project(ProjectArgs),
 }
 
 /// Arguments for the run subcommand
@@ -350,6 +359,54 @@ pub enum ServiceSubcommand {
 pub struct ServiceArgs {
     #[command(subcommand)]
     pub command: ServiceSubcommand,
+}
+
+/// Subcommands for `cflx project`.
+#[derive(Subcommand, Debug)]
+pub enum ProjectSubcommand {
+    /// Add a project to the remote server
+    Add(ProjectAddArgs),
+}
+
+/// Arguments for the `project` subcommand group.
+#[derive(Parser, Debug)]
+#[command(about = "Manage projects on a remote Conflux server")]
+pub struct ProjectArgs {
+    #[command(subcommand)]
+    pub command: ProjectSubcommand,
+}
+
+/// Arguments for `cflx project add`.
+#[derive(Parser, Debug)]
+#[command(about = "Add a project to the remote server")]
+#[command(long_about = "Add a project to the remote Conflux server.
+
+Accepts repository URLs with optional branch specification embedded in the URL:
+  cflx project add https://github.com/org/repo             # auto-resolve default branch
+  cflx project add https://github.com/org/repo/tree/main  # branch from /tree/<branch> path
+  cflx project add https://github.com/org/repo#develop    # branch from #<branch> fragment
+  cflx project add https://github.com/org/repo main       # explicit branch argument
+
+When both a branch is embedded in the URL and an explicit branch argument is given,
+the explicit argument takes precedence.")]
+pub struct ProjectAddArgs {
+    /// Repository URL (may include branch as /tree/<branch> or #<branch>)
+    pub url: String,
+
+    /// Branch name (overrides any branch embedded in the URL)
+    pub branch: Option<String>,
+
+    /// Remote server endpoint URL (e.g., http://host:9876)
+    #[arg(long)]
+    pub server: Option<String>,
+
+    /// Bearer token for remote server authentication
+    #[arg(long)]
+    pub server_token: Option<String>,
+
+    /// Environment variable name holding the bearer token
+    #[arg(long)]
+    pub server_token_env: Option<String>,
 }
 
 /// Check if git directory exists
