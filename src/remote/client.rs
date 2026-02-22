@@ -111,6 +111,24 @@ impl RemoteClient {
         self.token.as_deref()
     }
 
+    /// Get a specific project from the server's management API (unauthenticated).
+    ///
+    /// Calls `GET /api/v1/projects/{id}` and returns raw JSON value.
+    pub async fn get_project(&self, project_id: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/api/v1/projects/{}", self.base_url, project_id);
+        let req = self.http.get(&url);
+        // No authorization header – project commands are unauthenticated
+
+        let response = req.send().await.map_err(|e| {
+            OrchestratorError::Io(std::io::Error::other(format!(
+                "Failed to connect to server '{}': {}",
+                self.base_url, e
+            )))
+        })?;
+
+        Self::check_project_response(response).await
+    }
+
     /// List all projects from the server's management API (unauthenticated).
     ///
     /// Calls `GET /api/v1/projects` and returns raw JSON value.
@@ -132,11 +150,7 @@ impl RemoteClient {
     /// Add a project to the server (unauthenticated).
     ///
     /// Calls `POST /api/v1/projects` with `{remote_url, branch}`.
-    pub async fn add_project(
-        &self,
-        remote_url: &str,
-        branch: &str,
-    ) -> Result<serde_json::Value> {
+    pub async fn add_project(&self, remote_url: &str, branch: &str) -> Result<serde_json::Value> {
         let url = format!("{}/api/v1/projects", self.base_url);
         let body = serde_json::json!({
             "remote_url": remote_url,
@@ -414,6 +428,31 @@ mod tests {
 
     // ── Project management API tests (unauthenticated) ────────────────────────
 
+    /// `get_project` must GET `/api/v1/projects/:id` with NO auth header.
+    #[tokio::test]
+    async fn test_get_project_no_auth_header() {
+        use super::super::test_helpers::spawn_flexible_mock_http_server;
+
+        let response_json = r#"{"id":"proj-abc123","remote_url":"https://example.com/repo.git","branch":"main","status":"idle","created_at":"2024-01-01T00:00:00Z"}"#;
+        let (addr, req_rx) = spawn_flexible_mock_http_server(response_json.to_string()).await;
+        let client = RemoteClient::new(format!("http://{}", addr), None);
+
+        let _ = client.get_project("proj-abc123").await;
+
+        let captured = tokio::time::timeout(tokio::time::Duration::from_secs(3), req_rx)
+            .await
+            .expect("Timed out")
+            .expect("Server did not receive request");
+
+        assert_eq!(captured.method, "GET");
+        assert_eq!(captured.path, "/api/v1/projects/proj-abc123");
+        assert!(
+            !captured.raw.contains("authorization:"),
+            "get_project must not send Authorization header; got:\n{}",
+            captured.raw
+        );
+    }
+
     /// `list_projects_management` must NOT send an Authorization header.
     #[tokio::test]
     async fn test_list_projects_management_no_auth_header() {
@@ -424,13 +463,10 @@ mod tests {
 
         let _ = client.list_projects_management().await;
 
-        let captured = tokio::time::timeout(
-            tokio::time::Duration::from_secs(3),
-            req_rx,
-        )
-        .await
-        .expect("Timed out")
-        .expect("Server did not receive request");
+        let captured = tokio::time::timeout(tokio::time::Duration::from_secs(3), req_rx)
+            .await
+            .expect("Timed out")
+            .expect("Server did not receive request");
 
         assert_eq!(captured.method, "GET");
         assert_eq!(captured.path, "/api/v1/projects");
@@ -454,13 +490,10 @@ mod tests {
             .add_project("https://example.com/repo.git", "main")
             .await;
 
-        let captured = tokio::time::timeout(
-            tokio::time::Duration::from_secs(3),
-            req_rx,
-        )
-        .await
-        .expect("Timed out")
-        .expect("Server did not receive request");
+        let captured = tokio::time::timeout(tokio::time::Duration::from_secs(3), req_rx)
+            .await
+            .expect("Timed out")
+            .expect("Server did not receive request");
 
         assert_eq!(captured.method, "POST");
         assert_eq!(captured.path, "/api/v1/projects");
@@ -492,13 +525,10 @@ mod tests {
 
         let _ = client.delete_project("proj-abc123").await;
 
-        let captured = tokio::time::timeout(
-            tokio::time::Duration::from_secs(3),
-            req_rx,
-        )
-        .await
-        .expect("Timed out")
-        .expect("Server did not receive request");
+        let captured = tokio::time::timeout(tokio::time::Duration::from_secs(3), req_rx)
+            .await
+            .expect("Timed out")
+            .expect("Server did not receive request");
 
         assert_eq!(captured.method, "DELETE");
         assert_eq!(captured.path, "/api/v1/projects/proj-abc123");
@@ -519,13 +549,10 @@ mod tests {
 
         let _ = client.git_sync("proj-abc123").await;
 
-        let captured = tokio::time::timeout(
-            tokio::time::Duration::from_secs(3),
-            req_rx,
-        )
-        .await
-        .expect("Timed out")
-        .expect("Server did not receive request");
+        let captured = tokio::time::timeout(tokio::time::Duration::from_secs(3), req_rx)
+            .await
+            .expect("Timed out")
+            .expect("Server did not receive request");
 
         assert_eq!(captured.method, "POST");
         assert_eq!(captured.path, "/api/v1/projects/proj-abc123/git/sync");

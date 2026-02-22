@@ -991,12 +991,7 @@ mod tests {
 
     #[test]
     fn test_project_json_flag() {
-        let cli = Cli::parse_from([
-            "cflx",
-            "project",
-            "--json",
-            "status",
-        ]);
+        let cli = Cli::parse_from(["cflx", "project", "--json", "status"]);
         match cli.command {
             Some(Commands::Project(args)) => {
                 assert!(args.json);
@@ -1007,12 +1002,7 @@ mod tests {
 
     #[test]
     fn test_project_json_short_flag() {
-        let cli = Cli::parse_from([
-            "cflx",
-            "project",
-            "-j",
-            "status",
-        ]);
+        let cli = Cli::parse_from(["cflx", "project", "-j", "status"]);
         match cli.command {
             Some(Commands::Project(args)) => {
                 assert!(args.json);
@@ -1023,13 +1013,7 @@ mod tests {
 
     #[test]
     fn test_project_server_flag() {
-        let cli = Cli::parse_from([
-            "cflx",
-            "project",
-            "--server",
-            "http://host:9876",
-            "status",
-        ]);
+        let cli = Cli::parse_from(["cflx", "project", "--server", "http://host:9876", "status"]);
         match cli.command {
             Some(Commands::Project(args)) => {
                 assert_eq!(args.server, Some("http://host:9876".to_string()));

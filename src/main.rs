@@ -88,10 +88,7 @@ fn check_project_auth_not_required(
     // Only check global-config auth when the URL was resolved from config (not explicit)
     if !explicit_server {
         let server_config = OrchestratorConfig::load_server_config_from_global();
-        if matches!(
-            server_config.auth.mode,
-            config::ServerAuthMode::BearerToken
-        ) {
+        if matches!(server_config.auth.mode, config::ServerAuthMode::BearerToken) {
             return Err(format!(
                 "The server at '{}' requires bearer token authentication, \
                  which is not supported by 'cflx project'. \
@@ -124,10 +121,7 @@ fn print_projects_human(value: &serde_json::Value) {
 
 fn print_project_human(p: &serde_json::Value) {
     let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("-");
-    let url = p
-        .get("remote_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("-");
+    let url = p.get("remote_url").and_then(|v| v.as_str()).unwrap_or("-");
     let branch = p.get("branch").and_then(|v| v.as_str()).unwrap_or("-");
     let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("-");
     println!("id:         {}", id);
@@ -752,6 +746,15 @@ async fn main() -> Result<()> {
 
         // Project subcommand: manage projects on a remote Conflux server
         Some(Commands::Project(args)) => {
+            // Guard: top-level --server-token / --server-token-env are not supported
+            if cli.server_token.is_some() || cli.server_token_env.is_some() {
+                eprintln!(
+                    "Error: --server-token and --server-token-env are not supported by \
+                     'cflx project'. Authentication is not supported by this command."
+                );
+                std::process::exit(1);
+            }
+
             let explicit_server = args.server.is_some();
             let server_url = resolve_project_server_url(args.server.as_deref());
 
@@ -773,19 +776,23 @@ async fn main() -> Result<()> {
                 ProjectCommands::Remove(remove_args) => {
                     client.delete_project(&remove_args.project_id).await
                 }
-                ProjectCommands::Status(_status_args) => {
-                    // List all projects; filtering by ID is handled server-side if needed
-                    client.list_projects_management().await
+                ProjectCommands::Status(status_args) => {
+                    if let Some(ref id) = status_args.project_id {
+                        client.get_project(id).await
+                    } else {
+                        client.list_projects_management().await
+                    }
                 }
-                ProjectCommands::Sync(sync_args) => {
-                    client.git_sync(&sync_args.project_id).await
-                }
+                ProjectCommands::Sync(sync_args) => client.git_sync(&sync_args.project_id).await,
             };
 
             match result {
                 Ok(value) => {
                     if args.json {
-                        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).unwrap_or_default()
+                        );
                     } else {
                         print_projects_human(&value);
                     }
@@ -858,7 +865,11 @@ mod project_command_tests {
     #[test]
     fn test_resolve_project_server_url_default_fallback() {
         let url = resolve_project_server_url(None);
-        assert!(url.starts_with("http://"), "Expected http URL, got: {}", url);
+        assert!(
+            url.starts_with("http://"),
+            "Expected http URL, got: {}",
+            url
+        );
         assert!(url.contains(':'), "URL should contain a port: {}", url);
     }
 

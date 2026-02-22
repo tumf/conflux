@@ -22,3 +22,9 @@
 - [x] 4.1 `src/main.rs` に `project` サブコマンドの実行分岐を追加し、API 呼び出しを行う（確認: 各サブコマンドが対応するクライアントメソッドを呼ぶ）
 - [x] 4.2 人間向け出力と `--json` 出力を実装する（確認: JSON はサーバ応答をそのまま出力し、human は要約表示）
 - [x] 4.3 失敗時のエラー整形（401/404/422/接続失敗）を実装する（確認: エラー内容が明示され、exit code が非 0 になる）
+
+## Acceptance #1 Failure Follow-up
+
+- [x] `git status --porcelain` が空になるように未コミット変更を解消する（対象: `src/cli.rs`, `src/main.rs`, `src/remote/client.rs`）。
+- [x] `cflx project` 実行時にトップレベル `--server-token` / `--server-token-env` が指定されていたら、HTTP リクエスト送信前に未対応エラーで即時終了するガードを `src/main.rs` の `Some(Commands::Project(args))` 分岐に追加する。
+- [x] `cflx project status <project_id>` で指定 ID の情報を取得・表示する実装に修正する（`src/main.rs` の `ProjectCommands::Status(_status_args)` で引数を無視しているため、ID を使って絞り込みまたは対応 API 呼び出しを行う）。
