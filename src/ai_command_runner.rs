@@ -537,8 +537,6 @@ fn make_fail_status() -> std::process::ExitStatus {
 mod tests {
     use super::*;
     use crate::config::defaults::*;
-    #[cfg(unix)]
-    use libc;
 
     #[tokio::test]
     async fn test_shared_stagger_state() {
