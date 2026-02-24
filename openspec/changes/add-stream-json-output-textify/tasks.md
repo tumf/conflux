@@ -16,7 +16,7 @@
 
 ## 4. Acceptance #2 Failure Follow-up
 
-- [ ] 4.1 Clean the working tree before rerunning acceptance (`git status --porcelain` must be empty, including `src/agent/runner.rs`)
+- [x] 4.1 Clean the working tree before rerunning acceptance (`git status --porcelain` must be empty, including `src/agent/runner.rs`)
 
 ## Future Work
 
