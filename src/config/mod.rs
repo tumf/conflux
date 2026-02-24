@@ -317,6 +317,14 @@ pub struct OrchestratorConfig {
     /// Default: 5
     #[serde(default)]
     pub command_inactivity_kill_grace_secs: Option<u64>,
+
+    /// Enable stream-json output textification.
+    /// When true (default), stdout lines that are Claude Code stream-json (NDJSON) events
+    /// are converted to human-readable text before being emitted to logs.
+    /// Set to false to disable conversion and emit raw JSON lines for troubleshooting.
+    /// Default: true
+    #[serde(default)]
+    pub stream_json_textify: Option<bool>,
 }
 
 /// Acceptance prompt mode.
@@ -471,6 +479,11 @@ impl OrchestratorConfig {
         }
         if other.command_inactivity_kill_grace_secs.is_some() {
             self.command_inactivity_kill_grace_secs = other.command_inactivity_kill_grace_secs;
+        }
+
+        // Stream-JSON textification
+        if other.stream_json_textify.is_some() {
+            self.stream_json_textify = other.stream_json_textify;
         }
     }
 
@@ -660,6 +673,13 @@ impl OrchestratorConfig {
     pub fn get_command_inactivity_kill_grace_secs(&self) -> u64 {
         self.command_inactivity_kill_grace_secs
             .unwrap_or(defaults::DEFAULT_COMMAND_INACTIVITY_KILL_GRACE_SECS)
+    }
+
+    /// Get whether stream-json output textification is enabled.
+    /// Default: true (convert stream-json events to human-readable text)
+    pub fn get_stream_json_textify(&self) -> bool {
+        self.stream_json_textify
+            .unwrap_or(defaults::DEFAULT_STREAM_JSON_TEXTIFY)
     }
 
     /// Expand `{change_id}` placeholder in a command template

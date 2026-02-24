@@ -231,7 +231,9 @@ impl ParallelExecutor {
         };
 
         // Create shared AI command runner
-        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+        let stream_json_textify = config.get_stream_json_textify();
+        let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+        ai_runner.set_stream_json_textify(stream_json_textify);
 
         Self {
             workspace_manager,

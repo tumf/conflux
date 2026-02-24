@@ -64,7 +64,8 @@ impl ParallelRunService {
             inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
         };
-        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+        let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+        ai_runner.set_stream_json_textify(config.get_stream_json_textify());
 
         Self {
             config,
@@ -101,7 +102,8 @@ impl ParallelRunService {
             inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
         };
-        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+        let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+        ai_runner.set_stream_json_textify(config.get_stream_json_textify());
 
         Self {
             config,

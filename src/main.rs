@@ -26,6 +26,7 @@ mod spec_delta;
 #[cfg(test)]
 mod spec_test_annotations;
 mod stall;
+mod stream_json_textifier;
 mod task_parser;
 mod templates;
 mod tui;

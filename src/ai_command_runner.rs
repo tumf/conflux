@@ -7,6 +7,7 @@
 use crate::command_queue::{CommandQueue, CommandQueueConfig};
 use crate::error::{OrchestratorError, Result};
 use crate::process_manager::{ManagedChild, StreamingChildHandle};
+use crate::stream_json_textifier::{process_stdout_line, StreamJsonTextBuffer};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -40,10 +41,16 @@ pub enum OutputLine {
 #[allow(dead_code)] // Infrastructure ready, integration pending (tasks 3.2, 3.3, 4.1-4.3)
 pub struct AiCommandRunner {
     command_queue: CommandQueue,
+    /// When true, stdout lines that are Claude Code stream-json (NDJSON) events are
+    /// converted to human-readable text before being emitted to the output channel.
+    stream_json_textify: bool,
 }
 
 impl AiCommandRunner {
     /// Create a new AiCommandRunner with shared stagger state.
+    ///
+    /// Stream-JSON textification is enabled by default.  Use
+    /// [`AiCommandRunner::set_stream_json_textify`] to override.
     ///
     /// # Arguments
     ///
@@ -52,7 +59,15 @@ impl AiCommandRunner {
     pub fn new(config: CommandQueueConfig, shared_state: SharedStaggerState) -> Self {
         Self {
             command_queue: CommandQueue::new_with_shared_state(config, shared_state),
+            stream_json_textify: true,
         }
+    }
+
+    /// Override stream-JSON textification setting.
+    ///
+    /// When `false`, raw stdout lines are forwarded unchanged (useful for troubleshooting).
+    pub fn set_stream_json_textify(&mut self, enabled: bool) {
+        self.stream_json_textify = enabled;
     }
 
     /// Get access to the underlying CommandQueue configuration.
@@ -118,6 +133,7 @@ impl AiCommandRunner {
         let operation_type_owned = operation_type.map(|s| s.to_string());
         let change_id_owned = change_id.map(|s| s.to_string());
         let pid_arc = current_pid.clone();
+        let stream_json_textify = self.stream_json_textify;
 
         // Spawn the background retry task. It owns the real child processes and responds
         // to the cancel signal by terminating the current process group via SIGTERM/SIGKILL.
@@ -212,12 +228,29 @@ impl AiCommandRunner {
                 // Spawn stdout reader.
                 let out_tx_stdout = out_tx.clone();
                 let activity_tx_stdout = activity_tx.clone();
+                let textify = stream_json_textify;
                 let stdout_handle = tokio::spawn(async move {
                     if let Some(stdout) = stdout {
                         let mut lines = BufReader::new(stdout).lines();
+                        let mut text_buf = StreamJsonTextBuffer::new();
                         while let Ok(Some(line)) = lines.next_line().await {
                             let _ = activity_tx_stdout.send(()).await;
-                            let _ = out_tx_stdout.send(OutputLine::Stdout(line)).await;
+                            if textify {
+                                let emitted = process_stdout_line(&line, &mut text_buf);
+                                for l in emitted {
+                                    let _ = out_tx_stdout.send(OutputLine::Stdout(l)).await;
+                                }
+                            } else {
+                                let _ = out_tx_stdout.send(OutputLine::Stdout(line)).await;
+                            }
+                        }
+                        // Flush any remaining partial line in the buffer.
+                        if textify {
+                            if let Some(tail) = text_buf.finalize() {
+                                if !tail.is_empty() {
+                                    let _ = out_tx_stdout.send(OutputLine::Stdout(tail)).await;
+                                }
+                            }
                         }
                     }
                 });

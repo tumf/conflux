@@ -731,7 +731,9 @@ mod tests {
             inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
         };
-        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+        let stream_json_textify = config.get_stream_json_textify();
+        let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+        ai_runner.set_stream_json_textify(stream_json_textify);
         ParallelizationAnalyzer::new(ai_runner, config)
     }
 
