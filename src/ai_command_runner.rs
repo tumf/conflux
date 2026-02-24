@@ -397,6 +397,11 @@ impl AiCommandRunner {
                             change_id = ?change_id_owned,
                             "Retryable error detected, retrying in {}ms", retry_delay_ms
                         );
+                        // Explicitly terminate the process group before retrying to ensure
+                        // no pipeline children (e.g. background sh subprocesses) survive into
+                        // the next attempt. managed_child.wait() has already reaped `sh`, but
+                        // pipeline siblings sharing the same PGID may still be running.
+                        let _ = managed_child.terminate();
                         let retry_msg = format!(
                             "[Retry {}/{}] Command crashed, retrying in {}ms...",
                             attempt, max_retries, retry_delay_ms

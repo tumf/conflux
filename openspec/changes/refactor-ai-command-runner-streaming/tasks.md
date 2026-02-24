@@ -11,3 +11,8 @@
 
 - Consider removing `sh -c` usage for agent commands by switching to structured argv execution when possible.
 - Consider adding a wall-clock timeout (distinct from inactivity timeout) for long-running commands.
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Update serial acceptance integration to use `AiCommandRunner::execute_streaming_with_retry()` (real process handle) instead of the dummy-child path: added `run_acceptance_streaming_with_runner()` to `AgentRunner` and updated `acceptance_test_streaming` in `src/orchestration/acceptance.rs` to use it via `ai_runner`.
+- [x] Enforce and verify retry-attempt process cleanup for streaming retries: in `src/ai_command_runner.rs`, added explicit `managed_child.terminate()` call before `continue 'retry` to kill any surviving pipeline process-group members from the previous attempt.
