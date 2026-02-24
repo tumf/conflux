@@ -14,6 +14,10 @@
 
 - [x] 3.1 Fix clippy `explicit_auto_deref` violations in `src/agent/runner.rs` (`&mut *buf` → `&mut buf` at the two `process_stdout_line` call sites)
 
+## 4. Acceptance #2 Failure Follow-up
+
+- [ ] 4.1 Clean the working tree before rerunning acceptance (`git status --porcelain` must be empty, including `src/agent/runner.rs`)
+
 ## Future Work
 
 - Consider supporting additional Claude stream-json event types (tool-use deltas, etc.) behind a debug flag to avoid log noise.
