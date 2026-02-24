@@ -3,6 +3,8 @@ title: Conflux 側の根本対策 (TTY停止/STAT=T 対策)
 status: approved
 ---
 
+# Change: conflux-root-tty-hardening
+
 ## 背景
 
 Claude Code (`claude --output-format stream-json`) を `cflx` がパイプライン（例: `sh -c "... | ..."`）として起動する際、実行途中にプロセスが `STAT=T`（stop）となり、出力が途中で止まってストールしたように見えることがある。
