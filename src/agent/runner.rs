@@ -8,7 +8,7 @@ use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{AcceptanceAttempt, AcceptanceHistory, ApplyHistory, ArchiveHistory};
-use crate::process_manager::ManagedChild;
+use crate::process_manager::{ManagedChild, StreamingChildHandle};
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -182,7 +182,12 @@ impl AgentRunner {
         change_id: &str,
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
         cwd: Option<&Path>,
-    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant, String)> {
+    ) -> Result<(
+        StreamingChildHandle,
+        mpsc::Receiver<OutputLine>,
+        Instant,
+        String,
+    )> {
         use crate::ai_command_runner::OutputLine as AiOutputLine;
         let start = Instant::now();
         // Get acceptance tail first (requires &mut self)
@@ -306,7 +311,12 @@ impl AgentRunner {
         change_id: &str,
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
         cwd: Option<&Path>,
-    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant, String)> {
+    ) -> Result<(
+        StreamingChildHandle,
+        mpsc::Receiver<OutputLine>,
+        Instant,
+        String,
+    )> {
         use crate::ai_command_runner::OutputLine as AiOutputLine;
         let start = Instant::now();
         let template = self.config.get_archive_command()?;
@@ -958,7 +968,7 @@ impl AgentRunner {
         prompt: &str,
         cwd: &Path,
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
-    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
+    ) -> Result<(StreamingChildHandle, mpsc::Receiver<OutputLine>)> {
         use crate::ai_command_runner::OutputLine as AiOutputLine;
         let template = self.config.get_resolve_command()?;
         let command = OrchestratorConfig::expand_prompt(template, prompt);
