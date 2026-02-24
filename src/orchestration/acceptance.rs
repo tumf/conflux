@@ -89,7 +89,7 @@ impl AcceptanceResult {
 pub async fn acceptance_test_streaming<O, F>(
     change: &Change,
     agent: &mut AgentRunner,
-    _ai_runner: &crate::ai_command_runner::AiCommandRunner,
+    ai_runner: &crate::ai_command_runner::AiCommandRunner,
     _config: &crate::config::OrchestratorConfig,
     output: &O,
     cancel_check: F,
@@ -114,9 +114,9 @@ where
         .ok()
         .flatten(); // None if in detached HEAD or non-git repo
 
-    // Execute acceptance command with streaming
+    // Execute acceptance command with streaming via AiCommandRunner (real process handle)
     let (mut child, mut output_rx, start_time, command) = agent
-        .run_acceptance_streaming(&change.id, None, base_branch.as_deref())
+        .run_acceptance_streaming_with_runner(&change.id, ai_runner, None, base_branch.as_deref())
         .await?;
 
     // Log acceptance started with command

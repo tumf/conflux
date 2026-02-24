@@ -5,6 +5,8 @@
 //! - Windows: Job Objects (automatic termination on parent exit)
 
 use std::io;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Child;
 use tracing::{debug, warn};
@@ -130,6 +132,98 @@ impl ManagedChild {
     #[allow(dead_code)]
     pub async fn kill(&mut self) -> io::Result<()> {
         self.child.kill().await
+    }
+}
+
+/// A handle for a streaming command execution that may involve retry attempts.
+///
+/// Unlike [`ManagedChild`], this handle represents a long-running background task that
+/// owns the real child process. It provides the same lifecycle interface (terminate, wait,
+/// kill, id) but routes signals through the background task so the real process group is
+/// always targeted—never a placeholder process.
+pub struct StreamingChildHandle {
+    /// Send `()` to signal cancellation to the background task.
+    /// Wrapped in `Option` so `terminate()` is idempotent after the first call.
+    cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// PID of the currently-running real child process (0 = none running).
+    current_pid: Arc<AtomicU32>,
+    /// Receives the final exit status when the background task completes.
+    final_status_rx: tokio::sync::oneshot::Receiver<std::process::ExitStatus>,
+}
+
+#[allow(dead_code)] // kill() and id() are part of the public lifecycle API; not all callers use both
+impl StreamingChildHandle {
+    /// Create a new handle. Called by the streaming executor after setting up the
+    /// background task.
+    pub fn new(
+        cancel_tx: tokio::sync::oneshot::Sender<()>,
+        current_pid: Arc<AtomicU32>,
+        final_status_rx: tokio::sync::oneshot::Receiver<std::process::ExitStatus>,
+    ) -> Self {
+        Self {
+            cancel_tx: Some(cancel_tx),
+            current_pid,
+            final_status_rx,
+        }
+    }
+
+    /// Signal the background task to terminate the current child process group.
+    ///
+    /// Idempotent: subsequent calls after the first are no-ops.
+    pub fn terminate(&mut self) -> io::Result<()> {
+        if let Some(tx) = self.cancel_tx.take() {
+            let _ = tx.send(());
+        }
+        Ok(())
+    }
+
+    /// Terminate the process then wait up to `timeout` for the background task to finish.
+    pub async fn terminate_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> io::Result<TerminationOutcome> {
+        self.terminate()?;
+        match tokio::time::timeout(timeout, &mut self.final_status_rx).await {
+            Ok(Ok(status)) => Ok(TerminationOutcome::Exited(status)),
+            Ok(Err(_)) => {
+                // Sender was dropped (background task ended without sending).
+                Ok(TerminationOutcome::ForceKilled({
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        std::process::ExitStatus::from_raw(0)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        use std::os::windows::process::ExitStatusExt;
+                        std::process::ExitStatus::from_raw(0)
+                    }
+                }))
+            }
+            Err(_elapsed) => Ok(TerminationOutcome::TimedOut),
+        }
+    }
+
+    /// Force kill (sends the same cancel signal; the background task handles graceful shutdown).
+    pub async fn kill(&mut self) -> io::Result<()> {
+        self.terminate()
+    }
+
+    /// Wait for the background task to complete and return the final exit status.
+    pub async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        (&mut self.final_status_rx).await.map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "streaming child handle dropped")
+        })
+    }
+
+    /// Returns the PID of the currently-running real child process, if any.
+    pub fn id(&self) -> Option<u32> {
+        let pid = self.current_pid.load(Ordering::SeqCst);
+        if pid == 0 {
+            None
+        } else {
+            Some(pid)
+        }
     }
 }
 

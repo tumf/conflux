@@ -113,8 +113,7 @@ impl CommandQueue {
     }
 
     /// Check if an error message matches retryable patterns
-    #[allow(dead_code)] // Public API for unified retry logic
-    fn is_retryable_error(&self, stderr: &str) -> bool {
+    pub fn is_retryable_error(&self, stderr: &str) -> bool {
         self.config.retry_error_patterns.iter().any(|pattern| {
             Regex::new(pattern)
                 .map(|re| re.is_match(stderr))
@@ -129,8 +128,13 @@ impl CommandQueue {
     /// - Attempt count (must be under max_retries)
     /// - Exit code (non-zero)
     /// - Error pattern match OR short execution duration OR agent crash (exit code != 0)
-    #[allow(dead_code)] // Public API for unified retry logic
-    fn should_retry(&self, attempt: u32, duration: Duration, stderr: &str, exit_code: i32) -> bool {
+    pub fn should_retry(
+        &self,
+        attempt: u32,
+        duration: Duration,
+        stderr: &str,
+        exit_code: i32,
+    ) -> bool {
         // Check maximum retries
         if attempt >= self.config.max_retries {
             return false;
@@ -428,16 +432,19 @@ impl CommandQueue {
                         // Inactivity timeout triggered
                         inactivity_timeout_occurred = true;
 
+                        // Capture PID before killing for log context
+                        let pid = child.id().unwrap_or(0);
+
                         // Build context string for logging
                         let context = match (operation_type, change_id) {
-                            (Some(op), Some(id)) => format!(" (operation: {}, change_id: {})", op, id),
-                            (Some(op), None) => format!(" (operation: {})", op),
-                            (None, Some(id)) => format!(" (change_id: {})", id),
-                            (None, None) => String::new(),
+                            (Some(op), Some(id)) => format!(" (pid={}, operation: {}, change_id: {})", pid, op, id),
+                            (Some(op), None) => format!(" (pid={}, operation: {})", pid, op),
+                            (None, Some(id)) => format!(" (pid={}, change_id: {})", pid, id),
+                            (None, None) => format!(" (pid={})", pid),
                         };
 
                         warn!(
-                            "Command inactivity timeout triggered after {} seconds{}, waiting {} seconds grace period before terminating",
+                            "Command inactivity timeout triggered after {} seconds{}, waiting {} seconds grace period before terminating process group",
                             inactivity_timeout_secs,
                             context,
                             kill_grace_secs
@@ -446,14 +453,36 @@ impl CommandQueue {
                         // Wait grace period
                         tokio::time::sleep(Duration::from_secs(kill_grace_secs)).await;
 
-                        // Check if process is still running
-                        if child.id().is_some() {
+                        // Kill the process (and its process group if it's the group leader)
+                        if pid > 0 {
                             warn!(
                                 "Grace period expired, terminating inactive process{}",
                                 context
                             );
-                            // Kill the process
-                            let _ = child.kill().await;
+                            #[cfg(unix)]
+                            {
+                                use nix::sys::signal::{kill, killpg, Signal};
+                                use nix::unistd::{getpgid, Pid};
+                                let pid_raw = Pid::from_raw(pid as i32);
+                                // Get the actual process group ID
+                                let pgid =
+                                    getpgid(Some(pid_raw)).unwrap_or(pid_raw);
+                                if pgid == pid_raw {
+                                    // Process is its own group leader: kill the whole group
+                                    let _ = killpg(pgid, Signal::SIGTERM);
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                    let _ = killpg(pgid, Signal::SIGKILL);
+                                } else {
+                                    // Process is in parent's group: only kill this process
+                                    let _ = kill(pid_raw, Signal::SIGTERM);
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                    let _ = kill(pid_raw, Signal::SIGKILL);
+                                }
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                let _ = child.kill().await;
+                            }
                         }
                         break;
                     }

@@ -8,7 +8,7 @@ use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{AcceptanceAttempt, AcceptanceHistory, ApplyHistory, ArchiveHistory};
-use crate::process_manager::ManagedChild;
+use crate::process_manager::{ManagedChild, StreamingChildHandle};
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -182,7 +182,12 @@ impl AgentRunner {
         change_id: &str,
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
         cwd: Option<&Path>,
-    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant, String)> {
+    ) -> Result<(
+        StreamingChildHandle,
+        mpsc::Receiver<OutputLine>,
+        Instant,
+        String,
+    )> {
         use crate::ai_command_runner::OutputLine as AiOutputLine;
         let start = Instant::now();
         // Get acceptance tail first (requires &mut self)
@@ -306,7 +311,12 @@ impl AgentRunner {
         change_id: &str,
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
         cwd: Option<&Path>,
-    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant, String)> {
+    ) -> Result<(
+        StreamingChildHandle,
+        mpsc::Receiver<OutputLine>,
+        Instant,
+        String,
+    )> {
         use crate::ai_command_runner::OutputLine as AiOutputLine;
         let start = Instant::now();
         let template = self.config.get_archive_command()?;
@@ -599,6 +609,99 @@ impl AgentRunner {
                     .await?
             }
         };
+        Ok((child, rx, start, command))
+    }
+
+    /// Run acceptance command using AiCommandRunner with streaming output.
+    /// This ensures acceptance commands share stagger state with apply/archive/resolve.
+    /// Returns a streaming handle, a receiver for output lines, a start time, and the command string.
+    /// The caller is responsible for recording the attempt after the child completes
+    /// by calling `record_acceptance_attempt()`.
+    ///
+    /// The prompt is constructed as: system_prompt + diff_context + user_prompt + history_context
+    /// - system_prompt: ACCEPTANCE_SYSTEM_PROMPT constant (always included)
+    /// - diff_context: changed files and previous findings (2nd+ attempts only)
+    /// - user_prompt: from config.acceptance_prompt (user-customizable)
+    /// - history_context: previous acceptance attempts (if any)
+    pub async fn run_acceptance_streaming_with_runner(
+        &self,
+        change_id: &str,
+        ai_runner: &crate::ai_command_runner::AiCommandRunner,
+        cwd: Option<&Path>,
+        base_branch: Option<&str>,
+    ) -> Result<(
+        StreamingChildHandle,
+        mpsc::Receiver<OutputLine>,
+        Instant,
+        String,
+    )> {
+        use crate::ai_command_runner::OutputLine as AiOutputLine;
+        let start = Instant::now();
+        let template = self.config.get_acceptance_command()?;
+        let user_prompt = self.config.get_acceptance_prompt();
+        let history_context = self.acceptance_history.format_context(change_id);
+
+        // Build diff context for all attempts
+        let diff_context = self
+            .build_acceptance_diff_context(change_id, cwd, base_branch)
+            .await?;
+
+        // Build last acceptance output context for 2nd+ attempts
+        use super::prompt::build_last_acceptance_output_context;
+        let stdout_tail = self.acceptance_history.last_stdout_tail(change_id);
+        let stderr_tail = self.acceptance_history.last_stderr_tail(change_id);
+        let last_output_context =
+            build_last_acceptance_output_context(stdout_tail.as_deref(), stderr_tail.as_deref());
+
+        // Build prompt injected into `{prompt}`
+        // NOTE: Full and ContextOnly modes now behave identically (no embedded system prompt).
+        // The match is kept for clarity, but both branches produce the same result.
+        let full_prompt = match self.config.get_acceptance_prompt_mode() {
+            crate::config::AcceptancePromptMode::Full => build_acceptance_prompt(
+                change_id,
+                user_prompt,
+                &history_context,
+                &last_output_context,
+                &diff_context,
+            ),
+            crate::config::AcceptancePromptMode::ContextOnly => {
+                super::prompt::build_acceptance_prompt_context_only(
+                    change_id,
+                    user_prompt,
+                    &history_context,
+                    &last_output_context,
+                    &diff_context,
+                )
+            }
+        };
+
+        let command = OrchestratorConfig::expand_change_id(template, change_id);
+        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        info!(
+            module = module_path!(),
+            "Running acceptance command via AiCommandRunner: {}", command
+        );
+
+        // Execute via AiCommandRunner (with shared stagger state)
+        let (child, ai_rx) = ai_runner
+            .execute_streaming_with_retry(&command, cwd, Some("acceptance"), Some(change_id))
+            .await?;
+
+        // Convert AiCommandRunner output to AgentRunner output format
+        let (tx, rx) = mpsc::channel::<OutputLine>(1024);
+        tokio::spawn(async move {
+            let mut ai_rx = ai_rx;
+            while let Some(line) = ai_rx.recv().await {
+                let converted = match line {
+                    AiOutputLine::Stdout(s) => OutputLine::Stdout(s),
+                    AiOutputLine::Stderr(s) => OutputLine::Stderr(s),
+                };
+                if tx.send(converted).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         Ok((child, rx, start, command))
     }
 
@@ -958,7 +1061,7 @@ impl AgentRunner {
         prompt: &str,
         cwd: &Path,
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
-    ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
+    ) -> Result<(StreamingChildHandle, mpsc::Receiver<OutputLine>)> {
         use crate::ai_command_runner::OutputLine as AiOutputLine;
         let template = self.config.get_resolve_command()?;
         let command = OrchestratorConfig::expand_prompt(template, prompt);
