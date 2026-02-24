@@ -30,6 +30,29 @@ Automates the OpenSpec change workflow (list → dependency analysis → apply �
 └─────────────────────────────────────────────┘
 ```
 
+## Quick Start
+
+```bash
+# 1. Install
+cargo install --path .
+
+# 2. Initialize configuration (Claude Code agent by default)
+cflx init
+
+# 3. Launch the interactive TUI (default entry point)
+cflx
+
+# Or run headless (non-interactive)
+cflx run
+```
+
+For other templates:
+
+```bash
+cflx init --template opencode
+cflx init --template codex
+```
+
 ## Usage
 
 ### Interactive TUI (Primary Interface)
@@ -220,29 +243,6 @@ Custom configuration file:
 
 ```bash
 cflx run --config /path/to/config.jsonc
-```
-
-### Manage Change Approval
-
-Approve or unapprove changes to control which changes can be processed:
-
-```bash
-# Approve a change (creates checksums for validation)
-cflx approve set add-feature-x
-
-# Check approval status
-cflx approve status add-feature-x
-
-# Unapprove a change
-cflx approve unset add-feature-x
-```
-
-Approved changes have an `approved` file containing MD5 checksums of all specification files (excluding `tasks.md`). This ensures the change hasn't been modified since approval.
-
-Tip: The `approved` files are generated artifacts. You can commit them to share approvals with your team, but it’s also fine to ignore them. If you prefer to avoid churn/extra commits, add them to `.gitignore`:
-
-```gitignore
-openspec/changes/*/approved
 ```
 
 ## How It Works
@@ -509,30 +509,34 @@ cflx
 Usage: cflx [OPTIONS] [COMMAND]
 
 Commands:
-  run      Run the OpenSpec change orchestration loop (non-interactive, headless mode)
-  init     Initialize a new configuration file
-  approve  Manage change approval status
+  run              Run the OpenSpec change orchestration loop (non-interactive)
+  tui              Launch the interactive TUI dashboard
+  init             Initialize a new configuration file
+  check-conflicts  Check for conflicts between spec delta files across changes
 
 Options:
-  --opencode-path <PATH>   Path to opencode binary (deprecated, use config file)
-  --openspec-cmd <CMD>     OpenSpec command [env: OPENSPEC_CMD]
-  -h, --help               Print help
+  -c, --config <CONFIG>   Path to custom configuration file (JSONC format)
+      --web               Enable web monitoring server
+      --web-port <PORT>   Port for web monitoring server (default: 0 = auto-assign by OS)
+      --web-bind <ADDR>   Bind address for web monitoring server (default: 127.0.0.1)
+  -h, --help              Print help
+  -V, --version           Print version
 ```
 
 **Run subcommand options:**
 ```
 Options:
-  --change <ID,...>     Process only specified changes (comma-separated)
-  -c, --config <PATH>   Custom configuration file path (JSONC)
-  --openspec-cmd <CMD>  Custom openspec command [env: OPENSPEC_CMD]
-  --parallel            Enable parallel execution mode
-  --max-concurrent <N>  Maximum concurrent workspaces (default: 3)
-  --vcs <BACKEND>       VCS backend: auto or git (default: auto)
-  --no-resume           Disable workspace resume (always create new workspaces)
-  --dry-run             Preview parallelization groups without executing
-  --web                 Enable web monitoring server
-  --web-port <PORT>     Web server port (default: 0 = auto-assign by OS)
-  --web-bind <ADDR>     Web server bind address (default: 127.0.0.1)
+      --change <CHANGE>            Process only the specified changes (comma-separated)
+  -c, --config <CONFIG>            Path to custom configuration file (JSONC format)
+      --max-iterations <N>         Maximum number of iterations (0 = no limit)
+      --parallel                   Enable parallel execution mode using git worktrees
+      --max-concurrent <N>         Maximum number of concurrent workspaces (default: 3)
+      --dry-run                    Preview parallelization groups without executing
+      --vcs <VCS>                  VCS backend: auto or git (default: auto)
+      --no-resume                  Disable automatic workspace resume
+      --web                        Enable web monitoring server
+      --web-port <PORT>            Web server port (default: 0 = auto-assign by OS)
+      --web-bind <ADDR>            Web server bind address (default: 127.0.0.1)
 ```
 
 **TUI options:**
@@ -844,14 +848,6 @@ Options:
   -f, --force                Overwrite existing configuration file
 ```
 
-**Approve subcommand:**
-```
-Commands:
-  set     Approve a change (create approved file with checksums)
-  unset   Unapprove a change (remove approved file)
-  status  Check approval status of a change
-```
-
 Priority: CLI argument > Environment variable > Default value
 
 ## Error Handling
@@ -901,9 +897,26 @@ This will build and install the orchestrator to your Cargo bin directory (typica
 
 Internal documentation (parallel execution audit) is available in `docs/audit/`.
 
+## Project Structure
+
+```
+src/
+├── main.rs                  # Entry point (default: TUI mode)
+├── cli.rs                   # CLI argument parsing
+├── config/                  # Configuration file parsing (JSONC)
+├── orchestrator.rs          # Main orchestration loop
+├── hooks.rs                 # Lifecycle hooks execution
+├── task_parser.rs           # Task file parsing and progress calculation
+├── templates.rs             # Configuration templates (claude, opencode, codex)
+├── tui/                     # Interactive TUI dashboard (ratatui)
+├── parallel/                # Parallel execution with git worktrees
+├── web/                     # Web monitoring server
+└── ...                      # Additional modules
+```
+
 ## Development
 
-See [Development Guide](docs/guides/DEVELOPMENT.md) for build instructions, testing, and project structure.
+See [Development Guide](docs/guides/DEVELOPMENT.md) for build instructions, testing, and full project structure.
 
 ### Git Hooks
 
