@@ -142,7 +142,8 @@ impl Orchestrator {
             inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
         };
-        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+        let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+        ai_runner.set_stream_json_textify(config.get_stream_json_textify());
 
         // Initialize shared state (will be populated when run() is called with actual changes)
         // Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
@@ -239,7 +240,8 @@ impl Orchestrator {
             inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
         };
-        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+        let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+        ai_runner.set_stream_json_textify(config.get_stream_json_textify());
 
         // Initialize shared state (for testing, will use empty change list)
         // Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring

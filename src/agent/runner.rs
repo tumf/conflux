@@ -1146,16 +1146,33 @@ impl AgentRunner {
 
         // Clone tx for callback
         let tx_clone = tx.clone();
+        let textify = self.config.get_stream_json_textify();
+        let text_buf = Arc::new(Mutex::new(
+            crate::stream_json_textifier::StreamJsonTextBuffer::new(),
+        ));
+        let text_buf_cb = text_buf.clone();
 
         // Create callback to forward streaming output
         let output_callback = move |line: StreamingOutputLine| {
             let tx = tx_clone.clone();
+            let buf = text_buf_cb.clone();
             async move {
-                let output_line = match line {
-                    StreamingOutputLine::Stdout(s) => OutputLine::Stdout(s),
-                    StreamingOutputLine::Stderr(s) => OutputLine::Stderr(s),
-                };
-                let _ = tx.send(output_line).await;
+                match line {
+                    StreamingOutputLine::Stdout(s) => {
+                        if textify {
+                            let mut buf = buf.lock().await;
+                            for l in crate::stream_json_textifier::process_stdout_line(&s, &mut buf)
+                            {
+                                let _ = tx.send(OutputLine::Stdout(l)).await;
+                            }
+                        } else {
+                            let _ = tx.send(OutputLine::Stdout(s)).await;
+                        }
+                    }
+                    StreamingOutputLine::Stderr(s) => {
+                        let _ = tx.send(OutputLine::Stderr(s)).await;
+                    }
+                }
             }
         };
 
@@ -1178,6 +1195,16 @@ impl AgentRunner {
                     change_id_owned.as_deref(),
                 )
                 .await;
+
+            // Flush any partial line remaining in the text buffer
+            if textify {
+                let mut buf = text_buf.lock().await;
+                if let Some(tail) = buf.finalize() {
+                    if !tail.is_empty() {
+                        let _ = tx.send(OutputLine::Stdout(tail)).await;
+                    }
+                }
+            }
 
             // Send final status
             match result {
@@ -1244,16 +1271,33 @@ impl AgentRunner {
 
         // Clone tx for callback
         let tx_clone = tx.clone();
+        let textify = self.config.get_stream_json_textify();
+        let text_buf = Arc::new(Mutex::new(
+            crate::stream_json_textifier::StreamJsonTextBuffer::new(),
+        ));
+        let text_buf_cb = text_buf.clone();
 
         // Create callback to forward streaming output
         let output_callback = move |line: StreamingOutputLine| {
             let tx = tx_clone.clone();
+            let buf = text_buf_cb.clone();
             async move {
-                let output_line = match line {
-                    StreamingOutputLine::Stdout(s) => OutputLine::Stdout(s),
-                    StreamingOutputLine::Stderr(s) => OutputLine::Stderr(s),
-                };
-                let _ = tx.send(output_line).await;
+                match line {
+                    StreamingOutputLine::Stdout(s) => {
+                        if textify {
+                            let mut buf = buf.lock().await;
+                            for l in crate::stream_json_textifier::process_stdout_line(&s, &mut buf)
+                            {
+                                let _ = tx.send(OutputLine::Stdout(l)).await;
+                            }
+                        } else {
+                            let _ = tx.send(OutputLine::Stdout(s)).await;
+                        }
+                    }
+                    StreamingOutputLine::Stderr(s) => {
+                        let _ = tx.send(OutputLine::Stderr(s)).await;
+                    }
+                }
             }
         };
 
@@ -1277,6 +1321,16 @@ impl AgentRunner {
                     change_id_owned.as_deref(),
                 )
                 .await;
+
+            // Flush any partial line remaining in the text buffer
+            if textify {
+                let mut buf = text_buf.lock().await;
+                if let Some(tail) = buf.finalize() {
+                    if !tail.is_empty() {
+                        let _ = tx.send(OutputLine::Stdout(tail)).await;
+                    }
+                }
+            }
 
             // Send final status
             match result {

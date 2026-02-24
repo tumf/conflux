@@ -189,3 +189,6 @@ The orchestrator MUST log warning messages when user input is ignored in the TUI
 - **WHEN** タイムアウト検知が行われる
 - **THEN** warning ログが出力される
 - **AND** ログに操作種別と change_id が含まれる
+
+
+#
