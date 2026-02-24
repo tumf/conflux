@@ -7,3 +7,8 @@ title: タスク - Conflux 側の根本対策 (TTY停止/STAT=T 対策)
 - [x] 3. `src/agent/runner.rs` の `build_command_in_dir()` を `configure_process_group()` 利用に切り替える
 - [x] 4. 必要なテスト/コンパイルが通るように調整する
 - [x] 5. `cargo fmt --check` / `cargo clippy -- -D warnings` / `cargo test` を実行して成功させる
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Add required `# Change: ...` title heading to `openspec/changes/conflux-root-tty-hardening/proposal.md` (strict validation currently reports missing title heading).
+- [x] Add spec deltas under `openspec/changes/conflux-root-tty-hardening/specs/` so strict validation can verify requirements for this change.
