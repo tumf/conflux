@@ -16,3 +16,8 @@
 
 - [x] Update serial acceptance integration to use `AiCommandRunner::execute_streaming_with_retry()` (real process handle) instead of the dummy-child path: added `run_acceptance_streaming_with_runner()` to `AgentRunner` and updated `acceptance_test_streaming` in `src/orchestration/acceptance.rs` to use it via `ai_runner`.
 - [x] Enforce and verify retry-attempt process cleanup for streaming retries: in `src/ai_command_runner.rs`, added explicit `managed_child.terminate()` call before `continue 'retry` to kill any surviving pipeline process-group members from the previous attempt.
+
+## Acceptance #2 Failure Follow-up
+
+- [x] Strengthen retry cleanup in `AiCommandRunner::execute_streaming_with_retry()` (`src/ai_command_runner.rs`) so the previous attempt's process group is confirmed fully terminated before `continue 'retry` (do not rely on best-effort `terminate()` only; enforce wait/timeout + forced kill as needed).
+- [x] Add a retry-leak regression test for the scenario `Streaming retry does not leak processes across attempts` that reproduces an attempt-1 leak candidate and asserts no stray/orphan processes remain before attempt 2 begins.

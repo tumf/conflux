@@ -397,11 +397,16 @@ impl AiCommandRunner {
                             change_id = ?change_id_owned,
                             "Retryable error detected, retrying in {}ms", retry_delay_ms
                         );
-                        // Explicitly terminate the process group before retrying to ensure
-                        // no pipeline children (e.g. background sh subprocesses) survive into
-                        // the next attempt. managed_child.wait() has already reaped `sh`, but
-                        // pipeline siblings sharing the same PGID may still be running.
+                        // Enforce full process-group cleanup before the next attempt:
+                        //   1. SIGTERM → cooperative shutdown of all PGID members.
+                        //   2. 100ms grace period → let SIGTERM-responsive processes exit.
+                        //   3. SIGKILL → force-kill any survivors (e.g. SIGTERM-immune loops).
+                        // managed_child.wait() has already reaped `sh`, but pipeline siblings
+                        // sharing the same PGID may still be running. terminate() alone is
+                        // best-effort; force_kill() after the grace window ensures they die.
                         let _ = managed_child.terminate();
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let _ = managed_child.force_kill().await;
                         let retry_msg = format!(
                             "[Retry {}/{}] Command crashed, retrying in {}ms...",
                             attempt, max_retries, retry_delay_ms
@@ -532,6 +537,8 @@ fn make_fail_status() -> std::process::ExitStatus {
 mod tests {
     use super::*;
     use crate::config::defaults::*;
+    #[cfg(unix)]
+    use libc;
 
     #[tokio::test]
     async fn test_shared_stagger_state() {
@@ -599,6 +606,99 @@ mod tests {
         // Drain output and wait.
         while rx.recv().await.is_some() {}
         let _ = handle.wait().await;
+    }
+
+    /// Verify that retry-attempt cleanup does not leave leaked processes.
+    ///
+    /// Spawns a command that starts a lingering background subprocess (`sleep 30`) then
+    /// exits with failure, triggering a retry. After all retries complete the test asserts
+    /// that the process group from attempt 1 has no surviving members.
+    ///
+    /// This is the regression test for the "Streaming retry does not leak processes across
+    /// attempts" scenario from Acceptance #2 Follow-up.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_streaming_retry_no_leaked_processes() {
+        let shared_state = Arc::new(Mutex::new(None));
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 2,
+            retry_delay_ms: 300,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 5, // treat short exits as retryable
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 5,
+        };
+        let runner = AiCommandRunner::new(config, shared_state);
+
+        // Each attempt writes its sh PID (= PGID because configure_process_group makes sh
+        // the group leader) to a temp file, spawns a lingering `sleep 30` that shares the
+        // PGID, then exits with failure so a retry is triggered.
+        let pgid_file =
+            std::env::temp_dir().join(format!("retry_leak_pgid_{}.txt", std::process::id()));
+        let pgid_path = pgid_file.display().to_string();
+        // Redirect sleep's I/O away from the inherited pipes so the stdout/stderr readers
+        // reach EOF immediately when sh exits (instead of waiting 30 s for sleep to end).
+        // sleep 30 stays in the same PGID as sh and is the "orphan candidate" we verify
+        // is killed by the retry cleanup before the next attempt begins.
+        let cmd = format!(
+            "echo $$ >> {path}; sleep 30 >/dev/null 2>&1 </dev/null & exit 1",
+            path = pgid_path
+        );
+
+        let (mut handle, mut rx) = runner
+            .execute_streaming_with_retry(&cmd, None, Some("test"), None)
+            .await
+            .unwrap();
+
+        // Drain output to avoid backpressure stalling the background task.
+        while rx.recv().await.is_some() {}
+        let _ = handle.wait().await;
+
+        // Read PGIDs recorded by the attempts.
+        assert!(
+            pgid_file.exists(),
+            "PGID file should have been created by at least one attempt"
+        );
+        let content = std::fs::read_to_string(&pgid_file).unwrap_or_default();
+        let _ = std::fs::remove_file(&pgid_file);
+
+        let pgids: Vec<i32> = content
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        assert!(
+            pgids.len() >= 2,
+            "Expected PGIDs from at least 2 attempts (attempt 1 + retry), got: {:?}",
+            pgids
+        );
+
+        // Give a brief moment for OS signal delivery to fully propagate.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // The retry cleanup fires only between attempts (before `continue 'retry`).
+        // The *final* attempt has no subsequent retry, so its background process is not
+        // cleaned up by the retry logic. We verify all non-final attempt PGIDs are dead.
+        //
+        // `killpg(pgid, 0)` returns 0 if any process in the group is alive (ESRCH otherwise).
+        let non_final_count = pgids.len() - 1;
+        for pgid in &pgids[..non_final_count] {
+            let result = unsafe { libc::killpg(*pgid, 0) };
+            assert_eq!(
+                result, -1,
+                "Process group {} (non-final attempt) should be dead after retry cleanup, \
+                 but it still has live members (killpg returned 0)",
+                pgid
+            );
+        }
+
+        // Clean up the final attempt's background sleep so the test does not leak
+        // a `sleep 30` process into the test runner's process table.
+        if let Some(last_pgid) = pgids.last() {
+            unsafe {
+                libc::killpg(*last_pgid, libc::SIGKILL);
+            }
+        }
     }
 
     /// Verify that terminating a pipeline via StreamingChildHandle kills the entire
