@@ -39,9 +39,15 @@ impl ApplyEventHandler for ParallelApplyEventHandler {
     fn on_apply_started(&self, change_id: &str, command: &str) {
         info!("Apply started for {}: {}", change_id, command);
         if let Some(ref tx) = self.event_tx {
-            let _ = tx.try_send(ParallelEvent::ApplyStarted {
+            // Avoid dropping events when the bounded channel is temporarily full.
+            // Apply output can be high-volume; losing events makes CLI/TUI appear stalled.
+            let tx = tx.clone();
+            let event = ParallelEvent::ApplyStarted {
                 change_id: change_id.to_string(),
                 command: command.to_string(),
+            };
+            tokio::spawn(async move {
+                let _ = tx.send(event).await;
             });
         }
     }
@@ -52,10 +58,14 @@ impl ApplyEventHandler for ParallelApplyEventHandler {
             change_id, completed, total
         );
         if let Some(ref tx) = self.event_tx {
-            let _ = tx.try_send(ParallelEvent::ProgressUpdated {
+            let tx = tx.clone();
+            let event = ParallelEvent::ProgressUpdated {
                 change_id: change_id.to_string(),
                 completed,
                 total,
+            };
+            tokio::spawn(async move {
+                let _ = tx.send(event).await;
             });
         }
     }
@@ -63,9 +73,13 @@ impl ApplyEventHandler for ParallelApplyEventHandler {
     fn on_hook_started(&self, change_id: &str, hook_type: &str) {
         debug!("Hook started for {}: {}", change_id, hook_type);
         if let Some(ref tx) = self.event_tx {
-            let _ = tx.try_send(ParallelEvent::HookStarted {
+            let tx = tx.clone();
+            let event = ParallelEvent::HookStarted {
                 change_id: change_id.to_string(),
                 hook_type: hook_type.to_string(),
+            };
+            tokio::spawn(async move {
+                let _ = tx.send(event).await;
             });
         }
     }
@@ -73,9 +87,13 @@ impl ApplyEventHandler for ParallelApplyEventHandler {
     fn on_hook_completed(&self, change_id: &str, hook_type: &str) {
         debug!("Hook completed for {}: {}", change_id, hook_type);
         if let Some(ref tx) = self.event_tx {
-            let _ = tx.try_send(ParallelEvent::HookCompleted {
+            let tx = tx.clone();
+            let event = ParallelEvent::HookCompleted {
                 change_id: change_id.to_string(),
                 hook_type: hook_type.to_string(),
+            };
+            tokio::spawn(async move {
+                let _ = tx.send(event).await;
             });
         }
     }
@@ -83,10 +101,14 @@ impl ApplyEventHandler for ParallelApplyEventHandler {
     fn on_hook_failed(&self, change_id: &str, hook_type: &str, error: &str) {
         error!("Hook failed for {} ({}): {}", change_id, hook_type, error);
         if let Some(ref tx) = self.event_tx {
-            let _ = tx.try_send(ParallelEvent::HookFailed {
+            let tx = tx.clone();
+            let event = ParallelEvent::HookFailed {
                 change_id: change_id.to_string(),
                 hook_type: hook_type.to_string(),
                 error: error.to_string(),
+            };
+            tokio::spawn(async move {
+                let _ = tx.send(event).await;
             });
         }
     }
@@ -96,10 +118,14 @@ impl ApplyEventHandler for ParallelApplyEventHandler {
             OutputLine::Stdout(s) | OutputLine::Stderr(s) => s.clone(),
         };
         if let Some(ref tx) = self.event_tx {
-            let _ = tx.try_send(ParallelEvent::ApplyOutput {
+            let tx = tx.clone();
+            let event = ParallelEvent::ApplyOutput {
                 change_id: change_id.to_string(),
                 output,
                 iteration: Some(iteration),
+            };
+            tokio::spawn(async move {
+                let _ = tx.send(event).await;
             });
         }
     }
@@ -108,6 +134,7 @@ impl ApplyEventHandler for ParallelApplyEventHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::{timeout, Duration};
 
     #[tokio::test]
     async fn test_parallel_apply_event_handler_with_channel() {
@@ -119,9 +146,12 @@ mod tests {
         handler.on_hook_started("test-change", "pre_apply");
         handler.on_hook_completed("test-change", "pre_apply");
 
-        // Should receive 4 events
+        // Should receive 4 events (async send)
         for _ in 0..4 {
-            assert!(rx.try_recv().is_ok());
+            timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("timeout waiting for event")
+                .expect("channel closed unexpectedly");
         }
     }
 

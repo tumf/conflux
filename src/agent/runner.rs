@@ -1495,19 +1495,9 @@ fn build_command(command: &str) -> Command {
 
         #[cfg(unix)]
         {
-            // Detach from controlling terminal and create new process group
-            unsafe {
-                #[allow(unused_imports)]
-                use std::os::unix::process::CommandExt;
-                cmd.pre_exec(|| {
-                    use nix::unistd::{setpgid, Pid};
-
-                    // Create a new process group (replacing setsid for better cleanup)
-                    setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(std::io::Error::other)?;
-
-                    Ok(())
-                });
-            }
+            // Detach from controlling TTY (setsid) to avoid job-control stops (STAT=T).
+            // Fall back to process-group creation if setsid fails.
+            crate::process_manager::configure_process_group(&mut cmd);
         }
 
         cmd
@@ -1575,19 +1565,9 @@ fn build_command_in_dir(command: &str, cwd: &Path) -> Command {
 
         #[cfg(unix)]
         {
-            // Detach from controlling terminal and create new process group
-            unsafe {
-                #[allow(unused_imports)]
-                use std::os::unix::process::CommandExt;
-                cmd.pre_exec(|| {
-                    use nix::unistd::{setpgid, Pid};
-
-                    // Create a new process group (replacing setsid for better cleanup)
-                    setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(std::io::Error::other)?;
-
-                    Ok(())
-                });
-            }
+            // Detach from controlling TTY (setsid) to avoid job-control stops (STAT=T).
+            // Fall back to process-group creation if setsid fails.
+            crate::process_manager::configure_process_group(&mut cmd);
         }
 
         cmd

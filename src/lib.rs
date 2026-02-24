@@ -45,3 +45,6 @@ mod task_parser;
 mod templates;
 mod vcs;
 pub mod worktree_ops;
+
+#[cfg(test)]
+mod test_support;

@@ -34,6 +34,9 @@ mod vcs;
 mod web;
 mod worktree_ops;
 
+#[cfg(test)]
+mod test_support;
+
 use clap::Parser;
 use cli::{Cli, Commands, TuiArgs};
 use config::OrchestratorConfig;
@@ -43,10 +46,14 @@ use std::path::Path;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::prelude::*;
 
-/// Initialize file-based logging with automatic log rotation and cleanup.
-/// Logs are written to XDG_STATE_HOME/cflx/logs/<project_slug>/<YYYY-MM-DD>.log
+/// Initialize logging.
+///
+/// - Always enables file logging with automatic log rotation and cleanup.
+/// - Optionally enables stdout logging (for non-TUI modes).
+///
+/// Logs are written to XDG_STATE_HOME/cflx/logs/<project_slug>/<YYYY-MM-DD>.log.
 /// Old logs are automatically cleaned up (7-day retention).
-fn init_file_logging() -> Result<()> {
+fn init_logging(enable_stdout: bool) -> Result<()> {
     use config::defaults::{cleanup_old_logs, get_log_file_path};
     use std::fs::{create_dir_all, File};
     use tracing_subscriber::fmt::writer::MakeWriterExt;
@@ -94,7 +101,21 @@ fn init_file_logging() -> Result<()> {
         .with_file(true)
         .with_line_number(true);
 
-    tracing_subscriber::registry().with(file_layer).init();
+    let registry = tracing_subscriber::registry().with(file_layer);
+
+    if enable_stdout {
+        let stdout_layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stdout)
+            .with_ansi(true)
+            .with_target(false)
+            .with_thread_ids(false)
+            .with_file(false)
+            .with_line_number(false);
+
+        registry.with(stdout_layer).init();
+    } else {
+        registry.init();
+    }
 
     Ok(())
 }
@@ -106,8 +127,8 @@ async fn main() -> Result<()> {
     match cli.command {
         // No subcommand: launch TUI (default behavior)
         None => {
-            // Initialize file logging (always enabled)
-            init_file_logging()?;
+            // Initialize logging: file only (avoid stdout noise in TUI)
+            init_logging(false)?;
 
             // Build TuiArgs from global flags
             let tui_args = TuiArgs {
@@ -164,8 +185,8 @@ async fn main() -> Result<()> {
 
         // Explicit TUI subcommand
         Some(Commands::Tui(args)) => {
-            // Initialize file logging (always enabled)
-            init_file_logging()?;
+            // Initialize logging: file only (avoid stdout noise in TUI)
+            init_logging(false)?;
 
             // Load config
             let config = OrchestratorConfig::load(args.config.as_deref())?;
@@ -213,8 +234,8 @@ async fn main() -> Result<()> {
 
         // Run subcommand: non-interactive orchestration
         Some(Commands::Run(args)) => {
-            // Initialize file logging (always enabled)
-            init_file_logging()?;
+            // Initialize logging: include stdout for run mode
+            init_logging(true)?;
 
             // Start web monitoring server if enabled
             #[cfg(feature = "web-monitoring")]

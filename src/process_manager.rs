@@ -295,19 +295,31 @@ impl ProcessHandle {
 /// Configures the command to create a new process group
 #[allow(dead_code)]
 pub fn configure_process_group(cmd: &mut tokio::process::Command) {
-    use nix::unistd::{setpgid, Pid};
+    use nix::unistd::{setpgid, setsid, Pid};
 
     unsafe {
         cmd.pre_exec(|| {
-            // Set the process group ID to the process ID (making it the group leader)
-            match setpgid(Pid::from_raw(0), Pid::from_raw(0)) {
+            // Detach from the controlling terminal to avoid job-control stops (SIGTTIN/SIGTTOU).
+            // This is especially important for shell pipelines and CLI wrappers that may
+            // attempt to touch /dev/tty internally.
+            match setsid() {
                 Ok(_) => {
-                    debug!("Process group created successfully");
+                    debug!("Created new session (setsid) for child process");
                     Ok(())
                 }
                 Err(e) => {
-                    warn!("Failed to create process group: {}", e);
-                    Err(io::Error::other(e))
+                    warn!("Failed to create new session (setsid): {}", e);
+                    // Fallback: at least create a new process group.
+                    match setpgid(Pid::from_raw(0), Pid::from_raw(0)) {
+                        Ok(_) => {
+                            debug!("Process group created successfully (fallback)");
+                            Ok(())
+                        }
+                        Err(e) => {
+                            warn!("Failed to create process group: {}", e);
+                            Err(io::Error::other(e))
+                        }
+                    }
                 }
             }
         });
