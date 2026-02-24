@@ -199,8 +199,7 @@ mod tests {
 
     #[test]
     fn test_extract_result_success() {
-        let line =
-            r#"{"type":"result","subtype":"success","result":"Done successfully","is_error":false}"#;
+        let line = r#"{"type":"result","subtype":"success","result":"Done successfully","is_error":false}"#;
         assert_eq!(
             extract_text_from_stream_json(line),
             Some("Done successfully".to_string())
@@ -328,7 +327,10 @@ mod tests {
 
         let mut all_lines = process_stdout_line(event, &mut buf);
         // "Third line" has no trailing newline → held in buffer
-        assert_eq!(all_lines, vec!["First line".to_string(), "Second line".to_string()]);
+        assert_eq!(
+            all_lines,
+            vec!["First line".to_string(), "Second line".to_string()]
+        );
 
         // Finalize flushes the remaining fragment as the third log line
         if let Some(tail) = buf.finalize() {

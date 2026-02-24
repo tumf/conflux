@@ -1161,7 +1161,9 @@ impl AgentRunner {
                     StreamingOutputLine::Stdout(s) => {
                         if textify {
                             let mut buf = buf.lock().await;
-                            for l in crate::stream_json_textifier::process_stdout_line(&s, &mut *buf) {
+                            for l in
+                                crate::stream_json_textifier::process_stdout_line(&s, &mut buf)
+                            {
                                 let _ = tx.send(OutputLine::Stdout(l)).await;
                             }
                         } else {
@@ -1285,7 +1287,9 @@ impl AgentRunner {
                     StreamingOutputLine::Stdout(s) => {
                         if textify {
                             let mut buf = buf.lock().await;
-                            for l in crate::stream_json_textifier::process_stdout_line(&s, &mut *buf) {
+                            for l in
+                                crate::stream_json_textifier::process_stdout_line(&s, &mut buf)
+                            {
                                 let _ = tx.send(OutputLine::Stdout(l)).await;
                             }
                         } else {

@@ -10,6 +10,11 @@
 
 - [x] 2.1 Run `openspec validate add-stream-json-output-textify --strict --no-interactive` (verification: passes)
 
+## 3. Acceptance #1 Failure Follow-up
+
+- [x] 3.1 Fix clippy `explicit_auto_deref` violations in `src/agent/runner.rs` (`&mut *buf` → `&mut buf` at the two `process_stdout_line` call sites)
+
 ## Future Work
 
 - Consider supporting additional Claude stream-json event types (tool-use deltas, etc.) behind a debug flag to avoid log noise.
+- Ensure the working tree is clean before acceptance rerun (commit/stash/revert local edits if needed) — human step.
