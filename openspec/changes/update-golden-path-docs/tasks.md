@@ -5,3 +5,6 @@
 
 ## 2. 検証
 - [x] 2.1 README.md / README.ja.md / docs/guides/USAGE.md で記載されているコマンド・フラグが `cflx --help` の内容と一致していることを確認する（更新済みの各ファイルを目視で照合する）
+
+## Acceptance #1 Failure Follow-up
+- [x] README.ja.md を README.md と完全に同期する（翻訳差分のみ）。不足している `## Documentation` セクション、Features の Web Monitoring 項目、Web Monitoring の REST API (`/api/changes/{id}/approve`, `/api/changes/{id}/unapprove`)、および Configuration 例/プレースホルダー表の `acceptance_command`・`resolve_command`・`acceptance_prompt`・`acceptance_prompt_mode` 関連記述を追加する。

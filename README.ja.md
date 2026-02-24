@@ -15,6 +15,7 @@ OpenSpec変更ワークフロー（list → 依存関係分析 → apply → arc
 - 🪝 **ライフサイクルフック**: ワークフロー各段階でのカスタムアクション設定
 - ✅ **承認ワークフロー**: チェックサム検証による変更の承認管理
 - ⚡ **並列実行**: Git worktreesを使用した複数の独立した変更の同時処理
+- 🌐 **Web監視**: REST APIとWebSocketを備えたオプションのHTTPサーバーによるリモート監視
 
 ## アーキテクチャ
 
@@ -306,14 +307,36 @@ cflx run --config /path/to/config.jsonc
   // 変更を適用するコマンド（{change_id}と{prompt}プレースホルダーをサポート）
   "apply_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id} {prompt}'",
 
+  // apply後に受け入れテストを実行するコマンド（{change_id}と{prompt}プレースホルダーをサポート）
+  "acceptance_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:accept {change_id} {prompt}'",
+
   // 完了した変更をアーカイブするコマンド（{change_id}と{prompt}プレースホルダーをサポート）
   "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id} {prompt}'",
+
+  // マージコンフリクトを解決するコマンド（{prompt}プレースホルダーをサポート）
+  "resolve_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
 
   // applyコマンドのシステムプロンプト（{prompt}プレースホルダーに注入）
   "apply_prompt": "スコープ外タスクは削除せよ。ユーザを待つもしくはユーザによるタスクは削除せよ。",
 
+  // acceptanceコマンドのシステムプロンプト（{prompt}プレースホルダーに注入）
+  "acceptance_prompt": "",
+
+  // acceptanceの{prompt}の構築方法を制御
+  // - "full": ハードコードされた受け入れシステムプロンプト + diff/履歴コンテキストを含む（デフォルト）
+  // - "context_only": 変更メタデータ + diff/履歴コンテキストのみを含む
+  // acceptance_commandが固定の指示を持つコマンドテンプレートを使用する場合は"context_only"を使用
+  "acceptance_prompt_mode": "full",
+
+  // CONTINUE応答の最大リトライ回数（デフォルト: 10）
+  "acceptance_max_continues": 10,
+
   // archiveコマンドのシステムプロンプト（{prompt}プレースホルダーに注入）
   "archive_prompt": "",
+
+  // TUIからプロポーザルworktreeを作成するコマンド（+キー）
+  // {workspace_dir}と{repo_root}プレースホルダーをサポート
+  "worktree_command": "claude --dangerously-skip-permissions --verbose -p '/openspec:proposal --worktree {workspace_dir}'",
 
   // ライフサイクルフック（オプション）
   "hooks": {
@@ -327,14 +350,17 @@ cflx run --config /path/to/config.jsonc
 
 | プレースホルダー | 説明 | 使用箇所 |
 |-------------|-------------|---------|
-| `{change_id}` | 処理中の変更ID | apply_command, archive_command |
-| `{prompt}` | エージェントコマンドのシステムプロンプト | apply_command, archive_command, analyze_command |
+| `{change_id}` | 処理中の変更ID | apply_command, acceptance_command, archive_command |
+| `{prompt}` | エージェントコマンドのシステムプロンプト | apply_command, acceptance_command, archive_command, resolve_command, analyze_command |
+| `{workspace_dir}` | プロポーザル用の新しいworktreeパス | worktree_command |
+| `{repo_root}` | リポジトリルートパス | worktree_command |
 
 **システムプロンプト:**
 
 | 設定キー | 説明 | デフォルト |
 |------------|-------------|---------|
-| `apply_prompt` | apply_commandの`{prompt}`に注入されるプロンプト | `スコープ外タスクは削除せよ。ユーザを待つもしくはユーザによるタスクは削除せよ。` |
+| `apply_prompt` | apply_commandの`{prompt}`に注入されるプロンプト | （パスコンテキストを含む） |
+| `acceptance_prompt` | acceptance_commandの`{prompt}`に注入されるプロンプト | （空） |
 | `archive_prompt` | archive_commandの`{prompt}`に注入されるプロンプト | （空） |
 
 **クイックスタート:**
@@ -720,6 +746,10 @@ cflx run --web
 | `/api/state` | GET | 完全なオーケストレーター状態 |
 | `/api/changes` | GET | 進捗を含むすべての変更をリスト |
 | `/api/changes/{id}` | GET | 特定の変更の詳細 |
+| `/api/changes/{id}/approve` | POST | 変更を承認 |
+| `/api/changes/{id}/unapprove` | POST | 変更の承認を解除 |
+
+完全なAPI仕様については、[OpenAPIドキュメント](docs/openapi.yaml)を参照してください。
 
 **WebSocket:**
 
@@ -841,6 +871,17 @@ cargo install --path .
 ```
 
 これにより、オーケストレーターがビルドされ、Cargoのbinディレクトリ（通常は`~/.cargo/bin`）にインストールされます。
+
+## ドキュメント
+
+| ドキュメント | 説明 |
+|----------|-------------|
+| [Usage Examples](docs/guides/USAGE.md) | クイックスタートと使用例 |
+| [Development Guide](docs/guides/DEVELOPMENT.md) | ビルド手順とプロジェクト構造 |
+| [Release Guide](docs/guides/RELEASE.md) | リリースの作成方法 |
+| [API Specification](docs/openapi.yaml) | Web監視用OpenAPI仕様 |
+
+内部ドキュメント（並列実行監査）は `docs/audit/` で参照できます。
 
 ## プロジェクト構造
 
