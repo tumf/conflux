@@ -309,11 +309,21 @@ impl CommandQueue {
 
             // Max retries exceeded or non-retryable error
             let error_msg = if inactivity_timeout_occurred {
+                let exit_str = match status.code() {
+                    Some(code) => format!("exit code {}", code),
+                    None => "terminated by signal (no exit code)".to_string(),
+                };
+                let context = match (operation_type, change_id) {
+                    (Some(op), Some(id)) => {
+                        format!(" (operation: {}, change_id: {})", op, id)
+                    }
+                    (Some(op), None) => format!(" (operation: {})", op),
+                    (None, Some(id)) => format!(" (change_id: {})", id),
+                    (None, None) => String::new(),
+                };
                 format!(
-                    "Command failed due to inactivity timeout after {} attempt(s) with exit code {:?}: {}",
-                    attempt,
-                    status.code(),
-                    stderr.lines().next().unwrap_or("")
+                    "Command terminated by inactivity timeout after {}s{}, {}",
+                    self.config.inactivity_timeout_secs, context, exit_str,
                 )
             } else {
                 format!(
@@ -431,23 +441,38 @@ impl CommandQueue {
                     _ = tokio::time::sleep(remaining) => {
                         // Inactivity timeout triggered
                         inactivity_timeout_occurred = true;
+                        let last_activity_age_secs = last_activity.elapsed().as_secs();
 
                         // Capture PID before killing for log context
                         let pid = child.id().unwrap_or(0);
 
-                        // Build context string for logging
-                        let context = match (operation_type, change_id) {
-                            (Some(op), Some(id)) => format!(" (pid={}, operation: {}, change_id: {})", pid, op, id),
-                            (Some(op), None) => format!(" (pid={}, operation: {})", pid, op),
-                            (None, Some(id)) => format!(" (pid={}, change_id: {})", pid, id),
-                            (None, None) => format!(" (pid={})", pid),
+                        // Get PGID for structured logging (Unix only).
+                        #[cfg(unix)]
+                        let pgid_opt: Option<u32> = if pid > 0 {
+                            use nix::unistd::{getpgid, Pid};
+                            getpgid(Some(Pid::from_raw(pid as i32)))
+                                .ok()
+                                .map(|p| p.as_raw() as u32)
+                        } else {
+                            None
                         };
+                        #[cfg(not(unix))]
+                        let pgid_opt: Option<u32> = None;
 
                         warn!(
-                            "Command inactivity timeout triggered after {} seconds{}, waiting {} seconds grace period before terminating process group",
-                            inactivity_timeout_secs,
-                            context,
-                            kill_grace_secs
+                            pid,
+                            pgid = pgid_opt,
+                            timeout_secs = inactivity_timeout_secs,
+                            grace_secs = kill_grace_secs,
+                            last_activity_age_secs,
+                            op = ?operation_type,
+                            change_id = ?change_id,
+                            "Inactivity timeout triggered: no output for {}s \
+                             (pid={}, pgid={:?}, timeout={}s, grace={}s, \
+                             last_activity_age={}s, op={:?}, change_id={:?})",
+                            last_activity_age_secs, pid, pgid_opt,
+                            inactivity_timeout_secs, kill_grace_secs,
+                            last_activity_age_secs, operation_type, change_id
                         );
 
                         // Wait grace period
@@ -456,8 +481,13 @@ impl CommandQueue {
                         // Kill the process (and its process group if it's the group leader)
                         if pid > 0 {
                             warn!(
-                                "Grace period expired, terminating inactive process{}",
-                                context
+                                pid,
+                                pgid = pgid_opt,
+                                op = ?operation_type,
+                                change_id = ?change_id,
+                                "Grace period expired, sending SIGTERM to process \
+                                 (pid={}, pgid={:?})",
+                                pid, pgid_opt
                             );
                             #[cfg(unix)]
                             {
@@ -467,16 +497,67 @@ impl CommandQueue {
                                 // Get the actual process group ID
                                 let pgid =
                                     getpgid(Some(pid_raw)).unwrap_or(pid_raw);
-                                if pgid == pid_raw {
-                                    // Process is its own group leader: kill the whole group
-                                    let _ = killpg(pgid, Signal::SIGTERM);
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-                                    let _ = killpg(pgid, Signal::SIGKILL);
-                                } else {
-                                    // Process is in parent's group: only kill this process
-                                    let _ = kill(pid_raw, Signal::SIGTERM);
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-                                    let _ = kill(pid_raw, Signal::SIGKILL);
+                                let (target_desc, sigterm_result, sigkill_result) =
+                                    if pgid == pid_raw {
+                                        // Process is its own group leader: kill the whole group
+                                        let sr = killpg(pgid, Signal::SIGTERM);
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                        let kr = killpg(pgid, Signal::SIGKILL);
+                                        ("process group", sr, kr)
+                                    } else {
+                                        // Process is in parent's group: only kill this process
+                                        let sr = kill(pid_raw, Signal::SIGTERM);
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                        let kr = kill(pid_raw, Signal::SIGKILL);
+                                        ("process", sr, kr)
+                                    };
+                                match sigterm_result {
+                                    Ok(()) => {
+                                        debug!(
+                                            pid,
+                                            pgid = pgid_opt,
+                                            signal = "SIGTERM",
+                                            target = target_desc,
+                                            "SIGTERM delivered to {}", target_desc
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            pid,
+                                            pgid = pgid_opt,
+                                            signal = "SIGTERM",
+                                            target = target_desc,
+                                            errno = %e,
+                                            op = ?operation_type,
+                                            change_id = ?change_id,
+                                            "SIGTERM failed for {} (pid={}, pgid={:?}): {}",
+                                            target_desc, pid, pgid_opt, e
+                                        );
+                                    }
+                                }
+                                match sigkill_result {
+                                    Ok(()) => {
+                                        debug!(
+                                            pid,
+                                            pgid = pgid_opt,
+                                            signal = "SIGKILL",
+                                            target = target_desc,
+                                            "SIGKILL delivered to {}", target_desc
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            pid,
+                                            pgid = pgid_opt,
+                                            signal = "SIGKILL",
+                                            target = target_desc,
+                                            errno = %e,
+                                            op = ?operation_type,
+                                            change_id = ?change_id,
+                                            "SIGKILL failed for {} (pid={}, pgid={:?}): {}",
+                                            target_desc, pid, pgid_opt, e
+                                        );
+                                    }
                                 }
                             }
                             #[cfg(not(unix))]
@@ -860,5 +941,60 @@ mod tests {
 
         // Should succeed (timeout disabled)
         assert!(status.success());
+    }
+
+    /// Verify that the user-facing error message for inactivity timeout contains
+    /// "inactivity timeout", the configured timeout seconds, and operation context.
+    #[tokio::test]
+    async fn test_inactivity_timeout_error_message_format() {
+        use std::process::Stdio;
+
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 1,
+            retry_delay_ms: 50,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 2,
+            inactivity_kill_grace_secs: 1,
+        };
+        let queue = CommandQueue::new(config);
+
+        let result = queue
+            .execute_with_retry_streaming(
+                || {
+                    let mut cmd = Command::new("sleep");
+                    cmd.arg("30").stdout(Stdio::piped()).stderr(Stdio::piped());
+                    cmd
+                },
+                None::<fn(StreamingOutputLine) -> std::future::Ready<()>>,
+                Some("apply"),
+                Some("test-change"),
+            )
+            .await;
+
+        assert!(result.is_err(), "Expected error due to inactivity timeout");
+        let err = result.unwrap_err().to_string();
+
+        // Must contain "inactivity timeout"
+        assert!(
+            err.contains("inactivity timeout"),
+            "Error message must mention 'inactivity timeout': {err}"
+        );
+        // Must contain the timeout duration (2s)
+        assert!(
+            err.contains("2s"),
+            "Error message must include timeout seconds '2s': {err}"
+        );
+        // Must contain operation context
+        assert!(
+            err.contains("apply"),
+            "Error message must include operation 'apply': {err}"
+        );
+        // Must contain change_id context
+        assert!(
+            err.contains("test-change"),
+            "Error message must include change_id 'test-change': {err}"
+        );
     }
 }
