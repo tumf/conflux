@@ -333,24 +333,119 @@ impl AiCommandRunner {
                             // Inactivity timeout reached.
                             _ = tokio::time::sleep(remaining) => {
                                 inactivity_triggered = true;
+                                let last_activity_age_secs = last_activity.elapsed().as_secs();
+
+                                // Get PGID for structured logging (Unix only).
+                                #[cfg(unix)]
+                                let pgid_opt: Option<u32> = {
+                                    use nix::unistd::{getpgid, Pid};
+                                    getpgid(Some(Pid::from_raw(pid as i32)))
+                                        .ok()
+                                        .map(|p| p.as_raw() as u32)
+                                };
+                                #[cfg(not(unix))]
+                                let pgid_opt: Option<u32> = None;
+
                                 warn!(
                                     pid,
+                                    pgid = pgid_opt,
+                                    timeout_secs = inactivity_timeout_secs,
+                                    grace_secs = kill_grace_secs,
+                                    last_activity_age_secs,
                                     op = ?operation_type_owned,
                                     change_id = ?change_id_owned,
-                                    "Inactivity timeout after {}s (pid={}), grace {}s then terminating process group",
-                                    inactivity_timeout_secs, pid, kill_grace_secs
+                                    cwd = ?cwd_owned,
+                                    "Inactivity timeout triggered: no output for {}s \
+                                     (pid={}, pgid={:?}, timeout={}s, grace={}s, \
+                                     last_activity_age={}s, op={:?}, change_id={:?}, cwd={:?})",
+                                    last_activity_age_secs, pid, pgid_opt,
+                                    inactivity_timeout_secs, kill_grace_secs,
+                                    last_activity_age_secs,
+                                    operation_type_owned, change_id_owned, cwd_owned
                                 );
+
+                                // Emit a user-facing message so callers see the timeout context.
+                                let timeout_msg = format!(
+                                    "Command terminated by inactivity timeout after {}s \
+                                     (op={}, change_id={}, pid={}, last_activity_age={}s)",
+                                    inactivity_timeout_secs,
+                                    operation_type_owned.as_deref().unwrap_or("unknown"),
+                                    change_id_owned.as_deref().unwrap_or("none"),
+                                    pid,
+                                    last_activity_age_secs,
+                                );
+                                let _ = out_tx.send(OutputLine::Stderr(timeout_msg)).await;
+
                                 tokio::time::sleep(Duration::from_secs(kill_grace_secs)).await;
                                 if managed_child.id().is_some() {
                                     warn!(
                                         pid,
+                                        pgid = pgid_opt,
+                                        signal = "SIGTERM",
                                         op = ?operation_type_owned,
                                         change_id = ?change_id_owned,
-                                        "Grace expired, killing process group (pid={})", pid
+                                        "Grace period expired, sending SIGTERM to process group \
+                                         (pid={}, pgid={:?})",
+                                        pid, pgid_opt
                                     );
-                                    let _ = managed_child.terminate();
+                                    match managed_child.terminate() {
+                                        Ok(()) => {
+                                            debug!(
+                                                pid,
+                                                signal = "SIGTERM",
+                                                target_pgid = pgid_opt,
+                                                "SIGTERM delivered to process group"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                pid,
+                                                signal = "SIGTERM",
+                                                target_pid = pid,
+                                                target_pgid = pgid_opt,
+                                                errno = %e,
+                                                op = ?operation_type_owned,
+                                                change_id = ?change_id_owned,
+                                                "SIGTERM failed for process group \
+                                                 (pid={}, pgid={:?}): {}",
+                                                pid, pgid_opt, e
+                                            );
+                                        }
+                                    }
                                     tokio::time::sleep(Duration::from_millis(500)).await;
-                                    let _ = managed_child.force_kill().await;
+                                    warn!(
+                                        pid,
+                                        pgid = pgid_opt,
+                                        signal = "SIGKILL",
+                                        op = ?operation_type_owned,
+                                        change_id = ?change_id_owned,
+                                        "Sending SIGKILL to process group (pid={}, pgid={:?})",
+                                        pid, pgid_opt
+                                    );
+                                    match managed_child.force_kill().await {
+                                        Ok(()) => {
+                                            debug!(
+                                                pid,
+                                                signal = "SIGKILL",
+                                                target_pgid = pgid_opt,
+                                                "SIGKILL delivered to process group"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                pid,
+                                                signal = "SIGKILL",
+                                                target_pid = pid,
+                                                target_pgid = pgid_opt,
+                                                errno = %e,
+                                                op = ?operation_type_owned,
+                                                change_id = ?change_id_owned,
+                                                "SIGKILL failed for process group \
+                                                 (pid={}, pgid={:?}): {}",
+                                                pid, pgid_opt, e
+                                            );
+                                        }
+                                    }
                                 }
                                 break 'watch;
                             }
@@ -774,6 +869,63 @@ mod tests {
                 crate::process_manager::TerminationOutcome::TimedOut
             ),
             "Expected process to exit after termination, got TimedOut"
+        );
+    }
+
+    /// Verify that inactivity timeout fires for a streaming pipeline that produces no output,
+    /// and that the output channel receives a user-facing message containing "inactivity timeout".
+    #[tokio::test]
+    async fn test_inactivity_timeout_streaming_pipeline() {
+        let shared_state = Arc::new(Mutex::new(None));
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 1,
+            retry_delay_ms: 50,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 2,
+            inactivity_kill_grace_secs: 1,
+        };
+        let runner = AiCommandRunner::new(config, shared_state);
+
+        let start = Instant::now();
+        // Pipeline with no output — sleep 30 piped through cat produces nothing.
+        let (mut handle, mut rx) = runner
+            .execute_streaming_with_retry(
+                "sleep 30 | cat",
+                None,
+                Some("apply"),
+                Some("test-change"),
+            )
+            .await
+            .unwrap();
+
+        // Collect all output lines emitted before the channel closes.
+        let mut lines: Vec<String> = Vec::new();
+        while let Some(line) = rx.recv().await {
+            match line {
+                OutputLine::Stdout(s) | OutputLine::Stderr(s) => lines.push(s),
+            }
+        }
+
+        let _ = handle.wait().await;
+        let elapsed = start.elapsed();
+
+        // Should complete after timeout + grace (2s + 1s = ~3s), well under 15s.
+        assert!(
+            elapsed.as_secs() >= 2 && elapsed.as_secs() <= 15,
+            "Expected completion between 2–15s, got {:?}",
+            elapsed
+        );
+
+        // The output channel should contain a message about inactivity timeout.
+        let has_timeout_msg = lines
+            .iter()
+            .any(|l| l.contains("inactivity timeout") && l.contains("2s"));
+        assert!(
+            has_timeout_msg,
+            "Expected inactivity timeout message in output (with timeout seconds), got: {:?}",
+            lines
         );
     }
 }
