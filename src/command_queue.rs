@@ -44,6 +44,11 @@ pub struct CommandQueueConfig {
     #[allow(dead_code)]
     // Used by execute_with_retry_streaming for graceful shutdown
     pub inactivity_kill_grace_secs: u64,
+
+    /// Maximum number of retries after inactivity timeout (0 = disabled)
+    #[allow(dead_code)]
+    // Used by execute_streaming_with_retry for inactivity-timeout retry logic
+    pub inactivity_timeout_max_retries: u32,
 }
 
 /// Command execution queue with staggered start and retry mechanism
@@ -618,6 +623,7 @@ mod tests {
             retry_if_duration_under_secs: 5,
             inactivity_timeout_secs: 0, // Disabled for most tests
             inactivity_kill_grace_secs: 10,
+            inactivity_timeout_max_retries: 0,
         }
     }
 
@@ -799,6 +805,7 @@ mod tests {
             retry_if_duration_under_secs: 0, // Disable short duration retry
             inactivity_timeout_secs: 0,
             inactivity_kill_grace_secs: 10,
+            inactivity_timeout_max_retries: 0,
         };
         let queue = CommandQueue::new(config);
 
@@ -834,6 +841,7 @@ mod tests {
             retry_if_duration_under_secs: 0,
             inactivity_timeout_secs: 3,
             inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 0,
         };
         let queue = CommandQueue::new(config);
 
@@ -882,6 +890,7 @@ mod tests {
             retry_if_duration_under_secs: 0,
             inactivity_timeout_secs: 5,
             inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 0,
         };
         let queue = CommandQueue::new(config);
 
@@ -920,6 +929,7 @@ mod tests {
             retry_if_duration_under_secs: 0,
             inactivity_timeout_secs: 0, // Disabled
             inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 0,
         };
         let queue = CommandQueue::new(config);
 
@@ -957,6 +967,7 @@ mod tests {
             retry_if_duration_under_secs: 0,
             inactivity_timeout_secs: 2,
             inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 0,
         };
         let queue = CommandQueue::new(config);
 

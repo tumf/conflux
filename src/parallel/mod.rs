@@ -228,6 +228,7 @@ impl ParallelExecutor {
                 .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
             inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
+            inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
         };
 
         // Create shared AI command runner
