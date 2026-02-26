@@ -12,3 +12,7 @@
 ## Future Work
 
 - デバッグ用途に非テキストイベントを要約表示するモードの追加（必要が出た場合）
+
+## Acceptance #1 Failure Follow-up
+
+- [x] 作業ツリーをクリーンにする（`src/stream_json_textifier.rs` の未コミット変更をコミットまたは整理する）

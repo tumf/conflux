@@ -370,10 +370,16 @@ mod tests {
 
     #[test]
     fn test_is_stream_json_event_true() {
-        assert!(is_stream_json_event(r#"{"type":"system","subtype":"init"}"#));
+        assert!(is_stream_json_event(
+            r#"{"type":"system","subtype":"init"}"#
+        ));
         assert!(is_stream_json_event(r#"{"type":"tool_use","name":"bash"}"#));
-        assert!(is_stream_json_event(r#"{"type":"thinking","thinking":"..."}"#));
-        assert!(is_stream_json_event(r#"{"type":"stream_event","event":{}}"#));
+        assert!(is_stream_json_event(
+            r#"{"type":"thinking","thinking":"..."}"#
+        ));
+        assert!(is_stream_json_event(
+            r#"{"type":"stream_event","event":{}}"#
+        ));
     }
 
     #[test]
