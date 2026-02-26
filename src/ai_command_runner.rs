@@ -142,12 +142,15 @@ impl AiCommandRunner {
             let retry_delay_ms = command_queue.config().retry_delay_ms;
             let inactivity_timeout_secs = command_queue.config().inactivity_timeout_secs;
             let kill_grace_secs = command_queue.config().inactivity_kill_grace_secs;
+            let inactivity_timeout_max_retries =
+                command_queue.config().inactivity_timeout_max_retries;
 
             // cancel_rx is wrapped in Option so we can neutralise it after first use.
             let mut cancel_rx_opt = Some(cancel_rx);
             let mut cancel_observed = false;
 
             let mut attempt = 0u32;
+            let mut inactivity_retries_used = 0u32;
             let mut final_exit_status: Option<std::process::ExitStatus> = None;
 
             'retry: loop {
@@ -511,8 +514,57 @@ impl AiCommandRunner {
 
                 pid_arc.store(0, Ordering::SeqCst);
 
-                // Check whether a retry is warranted (not for inactivity-triggered exits).
-                if !status.success() && !inactivity_triggered {
+                // Handle inactivity-timeout exits with dedicated retry policy.
+                if inactivity_triggered {
+                    if inactivity_timeout_max_retries > 0
+                        && inactivity_retries_used < inactivity_timeout_max_retries
+                    {
+                        inactivity_retries_used += 1;
+                        warn!(
+                            inactivity_retries_used,
+                            inactivity_timeout_max_retries,
+                            op = ?operation_type_owned,
+                            change_id = ?change_id_owned,
+                            "Inactivity timeout retry {}/{}, retrying in {}ms",
+                            inactivity_retries_used, inactivity_timeout_max_retries,
+                            retry_delay_ms
+                        );
+                        let _ = managed_child.terminate();
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let _ = managed_child.force_kill().await;
+                        let retry_msg = format!(
+                            "[Retry {}/{}] Inactivity timeout, retrying in {}ms \
+                             (op={}, change_id={})",
+                            inactivity_retries_used,
+                            inactivity_timeout_max_retries,
+                            retry_delay_ms,
+                            operation_type_owned.as_deref().unwrap_or("unknown"),
+                            change_id_owned.as_deref().unwrap_or("none"),
+                        );
+                        let _ = out_tx.send(OutputLine::Stderr(retry_msg)).await;
+                        tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                        continue 'retry;
+                    }
+
+                    // Exhausted inactivity retries (or retries disabled): emit final message.
+                    if inactivity_timeout_max_retries > 0 {
+                        let exhausted_msg = format!(
+                            "Inactivity timeout: exhausted all {} retries \
+                             (op={}, change_id={})",
+                            inactivity_timeout_max_retries,
+                            operation_type_owned.as_deref().unwrap_or("unknown"),
+                            change_id_owned.as_deref().unwrap_or("none"),
+                        );
+                        let _ = out_tx.send(OutputLine::Stderr(exhausted_msg)).await;
+                    }
+
+                    // Do not fall through to the crash/pattern retry check.
+                    final_exit_status = Some(status);
+                    break 'retry;
+                }
+
+                // Check whether a retry is warranted for non-inactivity exits.
+                if !status.success() {
                     let exit_code = status.code().unwrap_or(-1);
                     let duration = start_time.elapsed();
 
@@ -678,6 +730,7 @@ mod tests {
             retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
             inactivity_timeout_secs: 0,
             inactivity_kill_grace_secs: 10,
+            inactivity_timeout_max_retries: 0,
         };
 
         let runner1 = AiCommandRunner::new(config.clone(), shared_state.clone());
@@ -713,6 +766,7 @@ mod tests {
             retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
             inactivity_timeout_secs: 0,
             inactivity_kill_grace_secs: 10,
+            inactivity_timeout_max_retries: 0,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -754,6 +808,7 @@ mod tests {
             retry_if_duration_under_secs: 5, // treat short exits as retryable
             inactivity_timeout_secs: 0,
             inactivity_kill_grace_secs: 5,
+            inactivity_timeout_max_retries: 0,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -841,6 +896,7 @@ mod tests {
             retry_if_duration_under_secs: 0,
             inactivity_timeout_secs: 0,
             inactivity_kill_grace_secs: 10,
+            inactivity_timeout_max_retries: 0,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -885,6 +941,7 @@ mod tests {
             retry_if_duration_under_secs: 0,
             inactivity_timeout_secs: 2,
             inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 0,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -925,6 +982,66 @@ mod tests {
         assert!(
             has_timeout_msg,
             "Expected inactivity timeout message in output (with timeout seconds), got: {:?}",
+            lines
+        );
+    }
+
+    /// Verify that inactivity-timeout retries work: a command that produces no output
+    /// triggers the inactivity timeout and is re-run up to `inactivity_timeout_max_retries` times.
+    #[tokio::test]
+    async fn test_inactivity_timeout_retry() {
+        let shared_state = Arc::new(Mutex::new(None));
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 1,
+            retry_delay_ms: 100,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 2,
+            inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 3,
+        };
+        let runner = AiCommandRunner::new(config, shared_state);
+
+        // Command that produces no output — will trigger inactivity timeout on every attempt.
+        let (mut handle, mut rx) = runner
+            .execute_streaming_with_retry(
+                "sleep 30 | cat",
+                None,
+                Some("apply"),
+                Some("test-change-retry"),
+            )
+            .await
+            .unwrap();
+
+        let mut lines: Vec<String> = Vec::new();
+        while let Some(line) = rx.recv().await {
+            match line {
+                OutputLine::Stdout(s) | OutputLine::Stderr(s) => lines.push(s),
+            }
+        }
+        let _ = handle.wait().await;
+
+        // Expect 3 retry messages ("[Retry 1/3]", "[Retry 2/3]", "[Retry 3/3]").
+        for i in 1u32..=3 {
+            let expected = format!("[Retry {}/3]", i);
+            let found = lines
+                .iter()
+                .any(|l| l.contains(&expected) && l.contains("Inactivity timeout"));
+            assert!(
+                found,
+                "Expected retry message '{}' with 'Inactivity timeout' in output, got: {:?}",
+                expected, lines
+            );
+        }
+
+        // Expect the exhaustion message.
+        let exhausted = lines
+            .iter()
+            .any(|l| l.contains("Inactivity timeout") && l.contains("exhausted all 3 retries"));
+        assert!(
+            exhausted,
+            "Expected 'exhausted all 3 retries' message in output, got: {:?}",
             lines
         );
     }
