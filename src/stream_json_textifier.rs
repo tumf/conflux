@@ -2,8 +2,25 @@
 //!
 //! Converts NDJSON event lines emitted by Claude Code into human-readable text
 //! with line-oriented buffering.  Each JSON event that carries text is decoded;
-//! events that carry no text (tool calls, system init messages, …) and plain
-//! non-JSON lines are passed through unchanged.
+//! events that carry no text (tool calls, system init messages, …) are suppressed
+//! when textify mode is active.  Plain non-JSON lines are passed through unchanged.
+
+/// Returns `true` if `line` is a parseable JSON object that contains a `type`
+/// field — i.e., it is a stream-json event line rather than plain text output.
+///
+/// Used by [`process_stdout_line`] to distinguish "recognisable but non-text
+/// stream-json events" (which should be suppressed in textify mode) from
+/// ordinary non-JSON output lines (which should pass through unchanged).
+pub fn is_stream_json_event(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return false;
+    };
+    value.get("type").and_then(|t| t.as_str()).is_some()
+}
 
 /// Extract human-readable text from a single stream-json (NDJSON) line.
 ///
@@ -133,16 +150,28 @@ impl StreamJsonTextBuffer {
 
 /// Process a single raw stdout line with stream-json textification.
 ///
-/// If the line is a recognized stream-json event, its text is extracted and
-/// fed into `buffer`, returning any complete lines that result.  If the line
-/// is not a recognized event it is returned unchanged as a single-element vec.
+/// - If the line is a recognized stream-json event that carries text, the text
+///   is extracted and fed into `buffer`, returning any complete lines.
+/// - If the line is a parseable stream-json event but carries no human-readable
+///   text (e.g., `thinking`, `tool_use`, `system`), it is **suppressed**
+///   (empty vec returned).
+/// - If the line is not a stream-json event at all (plain text, non-JSON output),
+///   it is returned unchanged as a single-element vec.
 ///
 /// Call [`StreamJsonTextBuffer::finalize`] at stream end to flush any trailing
 /// partial line remaining in the buffer.
 pub fn process_stdout_line(line: &str, buffer: &mut StreamJsonTextBuffer) -> Vec<String> {
     match extract_text_from_stream_json(line) {
         Some(text) => buffer.feed(&text),
-        None => vec![line.to_string()],
+        None => {
+            // Suppress parseable stream-json events that have no human-readable text.
+            // Pass through non-JSON lines (plain command output, log lines, …).
+            if is_stream_json_event(line) {
+                vec![]
+            } else {
+                vec![line.to_string()]
+            }
+        }
     }
 }
 
@@ -308,11 +337,57 @@ mod tests {
     }
 
     #[test]
-    fn test_process_unrecognized_json_passthrough() {
+    fn test_process_unrecognized_json_suppressed() {
+        // Parseable stream-json events without text content must be suppressed.
         let mut buf = StreamJsonTextBuffer::new();
         let line = r#"{"type":"system","subtype":"init"}"#;
         let result = process_stdout_line(line, &mut buf);
-        assert_eq!(result, vec![line.to_string()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_process_thinking_event_suppressed() {
+        let mut buf = StreamJsonTextBuffer::new();
+        let line = r#"{"type":"thinking","thinking":"some internal reasoning"}"#;
+        assert!(process_stdout_line(line, &mut buf).is_empty());
+    }
+
+    #[test]
+    fn test_process_tool_use_event_suppressed() {
+        let mut buf = StreamJsonTextBuffer::new();
+        let line = r#"{"type":"tool_use","name":"bash","input":{"command":"ls"}}"#;
+        assert!(process_stdout_line(line, &mut buf).is_empty());
+    }
+
+    #[test]
+    fn test_process_empty_line_passthrough() {
+        let mut buf = StreamJsonTextBuffer::new();
+        let result = process_stdout_line("", &mut buf);
+        assert_eq!(result, vec!["".to_string()]);
+    }
+
+    // ── is_stream_json_event ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_stream_json_event_true() {
+        assert!(is_stream_json_event(
+            r#"{"type":"system","subtype":"init"}"#
+        ));
+        assert!(is_stream_json_event(r#"{"type":"tool_use","name":"bash"}"#));
+        assert!(is_stream_json_event(
+            r#"{"type":"thinking","thinking":"..."}"#
+        ));
+        assert!(is_stream_json_event(
+            r#"{"type":"stream_event","event":{}}"#
+        ));
+    }
+
+    #[test]
+    fn test_is_stream_json_event_false() {
+        assert!(!is_stream_json_event("plain text"));
+        assert!(!is_stream_json_event(""));
+        assert!(!is_stream_json_event(r#"{"no_type": true}"#));
+        assert!(!is_stream_json_event("not json {"));
     }
 
     // ── multi-line log emission ───────────────────────────────────────────────
