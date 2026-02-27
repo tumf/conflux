@@ -107,6 +107,11 @@ pub const DEFAULT_COMMAND_INACTIVITY_TIMEOUT_MAX_RETRIES: u32 = 0;
 /// Default enablement for stream-json output textification
 pub const DEFAULT_STREAM_JSON_TEXTIFY: bool = true;
 
+/// Default enablement for strict post-completion process-group cleanup.
+/// When true, the orchestrator always runs a SIGTERM→SIGKILL sweep on the
+/// spawned process group after a command completes (regardless of exit status).
+pub const DEFAULT_COMMAND_STRICT_PROCESS_CLEANUP: bool = true;
+
 /// Default error patterns that trigger automatic retry
 pub fn default_retry_patterns() -> Vec<String> {
     vec![

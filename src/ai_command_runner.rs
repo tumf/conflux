@@ -6,7 +6,7 @@
 
 use crate::command_queue::{CommandQueue, CommandQueueConfig};
 use crate::error::{OrchestratorError, Result};
-use crate::process_manager::{ManagedChild, StreamingChildHandle};
+use crate::process_manager::{cleanup_process_group, ManagedChild, StreamingChildHandle};
 use crate::stream_json_textifier::{process_stdout_line, StreamJsonTextBuffer};
 use std::path::Path;
 use std::process::Stdio;
@@ -44,6 +44,10 @@ pub struct AiCommandRunner {
     /// When true, stdout lines that are Claude Code stream-json (NDJSON) events are
     /// converted to human-readable text before being emitted to the output channel.
     stream_json_textify: bool,
+    /// When true, perform a strict post-completion SIGTERM→SIGKILL sweep on the spawned
+    /// process group after every command outcome (success, failure, cancellation, or
+    /// inactivity timeout) to prevent orphaned background processes.
+    strict_process_cleanup: bool,
 }
 
 impl AiCommandRunner {
@@ -60,6 +64,7 @@ impl AiCommandRunner {
         Self {
             command_queue: CommandQueue::new_with_shared_state(config, shared_state),
             stream_json_textify: true,
+            strict_process_cleanup: true,
         }
     }
 
@@ -68,6 +73,16 @@ impl AiCommandRunner {
     /// When `false`, raw stdout lines are forwarded unchanged (useful for troubleshooting).
     pub fn set_stream_json_textify(&mut self, enabled: bool) {
         self.stream_json_textify = enabled;
+    }
+
+    /// Override strict post-completion process-group cleanup setting.
+    ///
+    /// When `false`, no SIGTERM/SIGKILL sweep is performed after a command completes
+    /// successfully.  Cancellation and inactivity-timeout paths continue to clean up
+    /// regardless (they have independent termination logic).  Set to `false` only for
+    /// debugging workflows where intentional background processes must outlive the command.
+    pub fn set_strict_process_cleanup(&mut self, enabled: bool) {
+        self.strict_process_cleanup = enabled;
     }
 
     /// Get access to the underlying CommandQueue configuration.
@@ -134,6 +149,7 @@ impl AiCommandRunner {
         let change_id_owned = change_id.map(|s| s.to_string());
         let pid_arc = current_pid.clone();
         let stream_json_textify = self.stream_json_textify;
+        let strict_process_cleanup = self.strict_process_cleanup;
 
         // Spawn the background retry task. It owns the real child processes and responds
         // to the cancel signal by terminating the current process group via SIGTERM/SIGKILL.
@@ -514,6 +530,19 @@ impl AiCommandRunner {
 
                 pid_arc.store(0, Ordering::SeqCst);
 
+                // Strict post-completion cleanup: sweep the process group after every
+                // command outcome (success, failure, inactivity timeout) to ensure no
+                // background processes spawned by the agent command outlive it.
+                if strict_process_cleanup && pid > 0 {
+                    cleanup_process_group(
+                        pid,
+                        100,
+                        operation_type_owned.as_deref(),
+                        change_id_owned.as_deref(),
+                    )
+                    .await;
+                }
+
                 // Handle inactivity-timeout exits with dedicated retry policy.
                 if inactivity_triggered {
                     if inactivity_timeout_max_retries > 0
@@ -731,6 +760,7 @@ mod tests {
             inactivity_timeout_secs: 0,
             inactivity_kill_grace_secs: 10,
             inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         };
 
         let runner1 = AiCommandRunner::new(config.clone(), shared_state.clone());
@@ -767,6 +797,7 @@ mod tests {
             inactivity_timeout_secs: 0,
             inactivity_kill_grace_secs: 10,
             inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -809,6 +840,7 @@ mod tests {
             inactivity_timeout_secs: 0,
             inactivity_kill_grace_secs: 5,
             inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -897,6 +929,7 @@ mod tests {
             inactivity_timeout_secs: 0,
             inactivity_kill_grace_secs: 10,
             inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -942,6 +975,7 @@ mod tests {
             inactivity_timeout_secs: 2,
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -1000,6 +1034,7 @@ mod tests {
             inactivity_timeout_secs: 2,
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 3,
+            strict_process_cleanup: true,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -1043,6 +1078,204 @@ mod tests {
             exhausted,
             "Expected 'exhausted all 3 retries' message in output, got: {:?}",
             lines
+        );
+    }
+
+    /// Regression test (task 1.6): a successful command that backgrounds a child process is
+    /// cleaned up by strict_process_cleanup. After the command exits with status 0, no
+    /// members should remain in its process group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_post_completion_cleanup_on_success() {
+        let shared_state = Arc::new(Mutex::new(None));
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 1,
+            retry_delay_ms: 50,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 5,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
+        };
+        let runner = AiCommandRunner::new(config, shared_state);
+
+        let pgid_file =
+            std::env::temp_dir().join(format!("post_cleanup_success_{}.txt", std::process::id()));
+        let pgid_path = pgid_file.display().to_string();
+        // Write the sh PID (= PGID after setsid) to a file, background a long sleep, then exit 0.
+        let cmd = format!(
+            "echo $$ > {path}; sleep 30 >/dev/null 2>&1 </dev/null & exit 0",
+            path = pgid_path
+        );
+
+        let (mut handle, mut rx) = runner
+            .execute_streaming_with_retry(&cmd, None, Some("test"), None)
+            .await
+            .unwrap();
+
+        while rx.recv().await.is_some() {}
+        let status = handle.wait().await.expect("wait");
+        assert!(status.success(), "Command should succeed");
+
+        // Allow signal delivery to propagate.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let content = std::fs::read_to_string(&pgid_file).unwrap_or_default();
+        let _ = std::fs::remove_file(&pgid_file);
+        let pgid: i32 = content.trim().parse().expect("valid pgid");
+
+        // killpg(pgid, 0) should return -1 with ESRCH — no live members remain.
+        let result = unsafe { libc::killpg(pgid, 0) };
+        if result == 0 {
+            // Kill the leaked process so the test doesn't leave orphans.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            panic!(
+                "post-cleanup: process group {} still has live members after successful command completion",
+                pgid
+            );
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        assert_eq!(
+            errno,
+            libc::ESRCH,
+            "post-cleanup: expected ESRCH for pgid={}, got errno={}",
+            pgid,
+            errno
+        );
+    }
+
+    /// Regression test (task 1.7): a failed command that backgrounds a child process is
+    /// cleaned up by strict_process_cleanup. After the command exits with status 1, no
+    /// members should remain in its process group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_post_completion_cleanup_on_failure() {
+        let shared_state = Arc::new(Mutex::new(None));
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 1, // One attempt only — no retry on failure
+            retry_delay_ms: 50,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0, // Disable short-duration retry
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 5,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
+        };
+        let runner = AiCommandRunner::new(config, shared_state);
+
+        let pgid_file =
+            std::env::temp_dir().join(format!("post_cleanup_failure_{}.txt", std::process::id()));
+        let pgid_path = pgid_file.display().to_string();
+        // Write the sh PID, background a long sleep, then exit 1.
+        let cmd = format!(
+            "echo $$ > {path}; sleep 30 >/dev/null 2>&1 </dev/null & exit 1",
+            path = pgid_path
+        );
+
+        let (mut handle, mut rx) = runner
+            .execute_streaming_with_retry(&cmd, None, Some("test"), None)
+            .await
+            .unwrap();
+
+        while rx.recv().await.is_some() {}
+        let _ = handle.wait().await;
+
+        // Allow signal delivery to propagate.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let content = std::fs::read_to_string(&pgid_file).unwrap_or_default();
+        let _ = std::fs::remove_file(&pgid_file);
+        let pgid: i32 = content.trim().parse().expect("valid pgid");
+
+        // killpg(pgid, 0) should return -1 with ESRCH — no live members remain.
+        let result = unsafe { libc::killpg(pgid, 0) };
+        if result == 0 {
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            panic!(
+                "post-cleanup: process group {} still has live members after failed command completion",
+                pgid
+            );
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        assert_eq!(
+            errno,
+            libc::ESRCH,
+            "post-cleanup: expected ESRCH for pgid={}, got errno={}",
+            pgid,
+            errno
+        );
+    }
+
+    /// Regression test (task 1.8): cancellation via StreamingChildHandle triggers full
+    /// process-group cleanup. After terminate_with_timeout, no members should remain.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_post_completion_cleanup_on_cancellation() {
+        let shared_state = Arc::new(Mutex::new(None));
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 1,
+            retry_delay_ms: 50,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 5,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
+        };
+        let runner = AiCommandRunner::new(config, shared_state);
+
+        // Long-running command: background a sleep then loop so the shell itself stays alive.
+        let (mut handle, _rx) = runner
+            .execute_streaming_with_retry(
+                "sleep 999 >/dev/null 2>&1 </dev/null & sleep 999",
+                None,
+                Some("test"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Give the child time to start.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let pid = handle.id().expect("should have a real PID") as i32;
+
+        // Cancel via the handle.
+        let outcome = handle
+            .terminate_with_timeout(Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(
+            !matches!(
+                outcome,
+                crate::process_manager::TerminationOutcome::TimedOut
+            ),
+            "Expected termination, not timeout"
+        );
+
+        // Allow OS signal delivery to settle.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // The process group (PGID == PID for setsid'd process) should be fully gone.
+        let result = unsafe { libc::killpg(pid, 0) };
+        if result == 0 {
+            unsafe { libc::killpg(pid, libc::SIGKILL) };
+            panic!(
+                "post-cleanup: process group {} still has live members after cancellation",
+                pid
+            );
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        assert_eq!(
+            errno,
+            libc::ESRCH,
+            "post-cleanup: expected ESRCH for pgid={} after cancellation, got errno={}",
+            pid,
+            errno
         );
     }
 }

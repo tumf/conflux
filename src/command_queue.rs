@@ -1,4 +1,5 @@
 use crate::error::{OrchestratorError, Result};
+use crate::process_manager::cleanup_process_group;
 use regex::Regex;
 use std::process::ExitStatus;
 use std::sync::Arc;
@@ -49,6 +50,12 @@ pub struct CommandQueueConfig {
     #[allow(dead_code)]
     // Used by execute_streaming_with_retry for inactivity-timeout retry logic
     pub inactivity_timeout_max_retries: u32,
+
+    /// Enable strict post-completion process-group cleanup.
+    /// When true (default), after a command finishes the orchestrator sweeps the
+    /// spawned process group with SIGTERM → SIGKILL to prevent orphaned processes.
+    #[allow(dead_code)]
+    pub strict_process_cleanup: bool,
 }
 
 /// Command execution queue with staggered start and retry mechanism
@@ -266,14 +273,26 @@ impl CommandQueue {
             attempt += 1;
             let start_time = Instant::now();
 
-            // Execute with stagger
+            // Execute with stagger.
+            // Callers (e.g., build_command in agent/runner.rs) are responsible for calling
+            // configure_process_group() so that PGID == PID (via setsid) before spawning,
+            // which is required for post-completion process-group cleanup to work correctly.
             let mut child = self.execute_with_stagger(|| command_fn()).await?;
+
+            // Capture PID (= PGID if caller used setsid) before handing child to stream_and_wait.
+            let pid = child.id().unwrap_or(0);
 
             // Stream output and collect stderr for retry decision
             let (status, stderr, inactivity_timeout_occurred) = self
                 .stream_and_wait(&mut child, &output_callback, operation_type, change_id)
                 .await?;
             let duration = start_time.elapsed();
+
+            // Post-completion cleanup: sweep the process group with SIGTERM→SIGKILL to
+            // ensure no background processes spawned by the agent command survive.
+            if self.config.strict_process_cleanup && pid > 0 {
+                cleanup_process_group(pid, 100, operation_type, change_id).await;
+            }
 
             // Success case
             if status.success() {
@@ -624,6 +643,7 @@ mod tests {
             inactivity_timeout_secs: 0, // Disabled for most tests
             inactivity_kill_grace_secs: 10,
             inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         }
     }
 
@@ -806,6 +826,7 @@ mod tests {
             inactivity_timeout_secs: 0,
             inactivity_kill_grace_secs: 10,
             inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         };
         let queue = CommandQueue::new(config);
 
@@ -842,6 +863,7 @@ mod tests {
             inactivity_timeout_secs: 3,
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         };
         let queue = CommandQueue::new(config);
 
@@ -891,6 +913,7 @@ mod tests {
             inactivity_timeout_secs: 5,
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         };
         let queue = CommandQueue::new(config);
 
@@ -930,6 +953,7 @@ mod tests {
             inactivity_timeout_secs: 0, // Disabled
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         };
         let queue = CommandQueue::new(config);
 
@@ -968,6 +992,7 @@ mod tests {
             inactivity_timeout_secs: 2,
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         };
         let queue = CommandQueue::new(config);
 

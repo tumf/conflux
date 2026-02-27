@@ -731,10 +731,12 @@ mod tests {
             inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
             inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
+            strict_process_cleanup: config.get_command_strict_process_cleanup(),
         };
         let stream_json_textify = config.get_stream_json_textify();
         let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
         ai_runner.set_stream_json_textify(stream_json_textify);
+        ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
         ParallelizationAnalyzer::new(ai_runner, config)
     }
 

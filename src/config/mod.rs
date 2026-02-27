@@ -331,6 +331,16 @@ pub struct OrchestratorConfig {
     /// Default: true
     #[serde(default)]
     pub stream_json_textify: Option<bool>,
+
+    /// Enable strict post-completion process-group cleanup.
+    /// When true (default), after a command finishes (success, failure, cancellation, or
+    /// inactivity timeout), the orchestrator sends SIGTERM then SIGKILL to the entire
+    /// spawned process group to prevent orphaned background processes.
+    /// Set to false to disable for debugging scenarios where intentional background
+    /// processes should survive command completion.
+    /// Default: true
+    #[serde(default)]
+    pub command_strict_process_cleanup: Option<bool>,
 }
 
 /// Acceptance prompt mode.
@@ -494,6 +504,11 @@ impl OrchestratorConfig {
         // Stream-JSON textification
         if other.stream_json_textify.is_some() {
             self.stream_json_textify = other.stream_json_textify;
+        }
+
+        // Strict process cleanup
+        if other.command_strict_process_cleanup.is_some() {
+            self.command_strict_process_cleanup = other.command_strict_process_cleanup;
         }
     }
 
@@ -697,6 +712,13 @@ impl OrchestratorConfig {
     pub fn get_stream_json_textify(&self) -> bool {
         self.stream_json_textify
             .unwrap_or(defaults::DEFAULT_STREAM_JSON_TEXTIFY)
+    }
+
+    /// Get whether strict post-completion process-group cleanup is enabled.
+    /// Default: true (always sweep the process group after command completion)
+    pub fn get_command_strict_process_cleanup(&self) -> bool {
+        self.command_strict_process_cleanup
+            .unwrap_or(defaults::DEFAULT_COMMAND_STRICT_PROCESS_CLEANUP)
     }
 
     /// Expand `{change_id}` placeholder in a command template

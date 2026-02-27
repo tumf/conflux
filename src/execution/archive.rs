@@ -1106,6 +1106,7 @@ fi\n";
             inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
             inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
+            strict_process_cleanup: config.get_command_strict_process_cleanup(),
         };
         let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
         let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
@@ -1504,6 +1505,7 @@ fi\n";
             inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
             inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
+            strict_process_cleanup: config.get_command_strict_process_cleanup(),
         };
         let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
         let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
