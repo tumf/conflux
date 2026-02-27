@@ -284,6 +284,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         inactivity_timeout_secs: 0,
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
     };
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
 
@@ -564,6 +565,7 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         inactivity_timeout_secs: 0,
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
     };
 
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
@@ -735,6 +737,7 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         inactivity_timeout_secs: 0,
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
     };
 
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
@@ -878,6 +881,7 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         inactivity_timeout_secs: 0,
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
     };
 
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
@@ -1050,6 +1054,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         inactivity_timeout_secs: 0,
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
     };
 
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
@@ -1236,6 +1241,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         inactivity_timeout_secs: 0,
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
     };
 
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
@@ -1428,6 +1434,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         inactivity_timeout_secs: 0,
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
     };
 
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());

@@ -57,6 +57,7 @@ impl AgentRunner {
             inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
             inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
+            strict_process_cleanup: config.get_command_strict_process_cleanup(),
         };
 
         Self {
@@ -106,6 +107,7 @@ impl AgentRunner {
             inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
             inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
+            strict_process_cleanup: config.get_command_strict_process_cleanup(),
         };
 
         Self {

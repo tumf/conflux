@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Child;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Platform-specific process handle for managing child processes
 #[cfg(unix)]
@@ -376,6 +376,151 @@ pub fn configure_process_group(_cmd: &mut tokio::process::Command) {
     // No pre-spawn configuration needed on Windows
 }
 
+/// Outcome of a post-completion process-group cleanup sweep.
+///
+/// Returned by [`cleanup_process_group`] to allow callers to log or assert on
+/// what actually happened during the sweep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostCleanupOutcome {
+    /// No process group ID was available; cleanup was skipped (non-Unix platforms).
+    #[allow(dead_code)]
+    NoPgid,
+    /// SIGTERM was sent.  The process group may already have exited before
+    /// SIGKILL was delivered.
+    Terminated,
+    /// SIGTERM was sent and SIGKILL was subsequently sent to any survivors.
+    Killed,
+    /// The process group was already gone when SIGTERM was attempted (ESRCH).
+    AlreadyGone,
+}
+
+/// Performs a strict post-completion cleanup sweep on a Unix process group.
+///
+/// This function is the canonical "launcher owns cleanup" implementation.
+/// It should be called after a command is considered complete (success,
+/// failure, cancellation, or inactivity timeout) when strict cleanup is
+/// enabled.
+///
+/// # Sequence
+///
+/// 1. `SIGTERM` → process group (`killpg`).
+/// 2. `sigterm_grace_ms` millisecond sleep.
+/// 3. `SIGKILL` → process group (`killpg`).
+/// 4. Verify absence via `killpg(pgid, 0)` and log at `warn` if survivors remain.
+///
+/// # Arguments
+///
+/// * `pgid` - Process group ID to sweep (typically the PID of the spawned `sh` process).
+/// * `sigterm_grace_ms` - Grace period in ms between SIGTERM and SIGKILL.
+/// * `op` - Operation name for structured log fields (e.g. `"apply"`).
+/// * `change_id` - Change ID for structured log fields.
+#[cfg(unix)]
+pub async fn cleanup_process_group(
+    pgid: u32,
+    sigterm_grace_ms: u64,
+    op: Option<&str>,
+    change_id: Option<&str>,
+) -> PostCleanupOutcome {
+    use nix::errno::Errno;
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let pgid_nix = Pid::from_raw(pgid as i32);
+
+    // Step 1: SIGTERM
+    match killpg(pgid_nix, Signal::SIGTERM) {
+        Ok(()) => {
+            info!(
+                pgid,
+                op, change_id, "post-cleanup: SIGTERM sent to process group (pgid={})", pgid
+            );
+        }
+        Err(Errno::ESRCH) => {
+            // Process group already gone — nothing to do.
+            debug!(
+                pgid,
+                op, change_id, "post-cleanup: process group already gone (ESRCH, pgid={})", pgid
+            );
+            return PostCleanupOutcome::AlreadyGone;
+        }
+        Err(e) => {
+            warn!(
+                pgid,
+                op, change_id, "post-cleanup: SIGTERM failed for pgid={}: {}", pgid, e
+            );
+        }
+    }
+
+    // Step 2: grace period
+    tokio::time::sleep(Duration::from_millis(sigterm_grace_ms)).await;
+
+    // Step 3: SIGKILL
+    let outcome = match killpg(pgid_nix, Signal::SIGKILL) {
+        Ok(()) => {
+            info!(
+                pgid,
+                op, change_id, "post-cleanup: SIGKILL sent to process group (pgid={})", pgid
+            );
+            PostCleanupOutcome::Killed
+        }
+        Err(Errno::ESRCH) => {
+            // Already gone by the time we sent SIGKILL — SIGTERM was sufficient.
+            debug!(
+                pgid,
+                op, change_id, "post-cleanup: process group gone before SIGKILL (pgid={})", pgid
+            );
+            PostCleanupOutcome::Terminated
+        }
+        Err(e) => {
+            warn!(
+                pgid,
+                op, change_id, "post-cleanup: SIGKILL failed for pgid={}: {}", pgid, e
+            );
+            PostCleanupOutcome::Killed
+        }
+    };
+
+    // Step 4: verify — warn if any survivors remain
+    match killpg(pgid_nix, Signal::SIGKILL) {
+        Ok(()) => {
+            warn!(
+                pgid,
+                op,
+                change_id,
+                "post-cleanup: survivors detected after SIGKILL sweep (pgid={}); \
+                 processes may have escaped to a new session",
+                pgid
+            );
+        }
+        Err(Errno::ESRCH) => {
+            debug!(
+                pgid,
+                op, change_id, "post-cleanup: verified no live members in pgid={}", pgid
+            );
+        }
+        Err(e) => {
+            warn!(
+                pgid,
+                op, change_id, "post-cleanup: verification signal failed for pgid={}: {}", pgid, e
+            );
+        }
+    }
+
+    outcome
+}
+
+/// No-op stub for non-Unix platforms (Windows uses Job Objects for cleanup).
+#[cfg(not(unix))]
+pub async fn cleanup_process_group(
+    pgid: u32,
+    _sigterm_grace_ms: u64,
+    _op: Option<&str>,
+    _change_id: Option<&str>,
+) -> PostCleanupOutcome {
+    debug!("post-cleanup: no-op on non-Unix platform (pgid={})", pgid);
+    PostCleanupOutcome::NoPgid
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -427,5 +572,120 @@ mod tests {
                 | TerminationOutcome::ForceKilled(_)
                 | TerminationOutcome::TimedOut
         ));
+    }
+
+    /// Helper: check whether a process group has any live members.
+    /// Returns true if the group is gone (ESRCH), false if members remain.
+    fn pgid_is_gone(pgid: u32) -> bool {
+        use nix::errno::Errno;
+        use nix::sys::signal::{killpg, Signal};
+        use nix::unistd::Pid;
+        match killpg(Pid::from_raw(pgid as i32), Signal::SIGKILL) {
+            Ok(()) => false,           // still alive
+            Err(Errno::ESRCH) => true, // gone
+            Err(_) => false,
+        }
+    }
+
+    /// Regression test 1.6: successful command that backgrounds a child is cleaned up.
+    ///
+    /// Spawns `sh -c 'sleep 60 & exit 0'` (exits immediately; backgrounds a sleep).
+    /// After the parent exits and `cleanup_process_group` is called, `killpg(pgid, 0)`
+    /// must return ESRCH (no live members).
+    #[tokio::test]
+    async fn successful_command_backgrounded_child_is_cleaned_up() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 60 & exit 0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        configure_process_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn");
+        let mut child = ManagedChild::new(child).expect("managed child");
+        let pgid = child.id().unwrap_or(0);
+        assert!(pgid > 0, "process must have a PID");
+
+        // Wait for the parent shell to exit (it exits immediately after backgrounding sleep).
+        child.wait().await.expect("wait");
+
+        // At this point the backgrounded `sleep 60` may still be running.
+        // cleanup_process_group must terminate it.
+        cleanup_process_group(pgid, 50, Some("test"), Some("regression-1.6")).await;
+
+        // Allow a brief moment for the kernel to reap the process.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            pgid_is_gone(pgid),
+            "process group {} should be gone after cleanup, but members remain",
+            pgid
+        );
+    }
+
+    /// Regression test 1.7: failed command that backgrounds a child is cleaned up.
+    ///
+    /// Spawns `sh -c 'sleep 60 & exit 1'` (fails; backgrounds a sleep).
+    /// Same verification as 1.6.
+    #[tokio::test]
+    async fn failed_command_backgrounded_child_is_cleaned_up() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 60 & exit 1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        configure_process_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn");
+        let mut child = ManagedChild::new(child).expect("managed child");
+        let pgid = child.id().unwrap_or(0);
+        assert!(pgid > 0);
+
+        child.wait().await.expect("wait");
+
+        cleanup_process_group(pgid, 50, Some("test"), Some("regression-1.7")).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            pgid_is_gone(pgid),
+            "process group {} should be gone after cleanup, but members remain",
+            pgid
+        );
+    }
+
+    /// Regression test 1.8: cancellation (terminate_with_timeout) triggers full
+    /// process-group cleanup.
+    ///
+    /// Spawns `sh -c 'sleep 60 & sleep 60'` (both parent and a backgrounded sibling sleep).
+    /// After `terminate_with_timeout` is called, `cleanup_process_group` sweeps survivors.
+    /// `killpg(pgid, 0)` must then return ESRCH.
+    #[tokio::test]
+    async fn cancellation_triggers_full_process_group_cleanup() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 60 & sleep 60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        configure_process_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn");
+        let mut child = ManagedChild::new(child).expect("managed child");
+        let pgid = child.id().unwrap_or(0);
+        assert!(pgid > 0);
+
+        // Simulate cancellation.
+        let _ = child
+            .terminate_with_timeout(Duration::from_millis(500))
+            .await;
+
+        // Run post-completion cleanup to sweep any survivors (e.g. the backgrounded sleep).
+        cleanup_process_group(pgid, 50, Some("test"), Some("regression-1.8")).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            pgid_is_gone(pgid),
+            "process group {} should be gone after cancellation + cleanup",
+            pgid
+        );
     }
 }
