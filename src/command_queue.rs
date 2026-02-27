@@ -4,7 +4,7 @@ use regex::Regex;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -396,13 +396,33 @@ impl CommandQueue {
         let activity_tx_stdout = activity_tx.clone();
         let stdout_handle = tokio::spawn(async move {
             if let Some(stdout) = stdout {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    // Signal activity
-                    let _ = activity_tx_stdout.send(()).await;
+                let mut reader = BufReader::new(stdout);
+                let mut line_buf = String::new();
+                let mut byte_buf = vec![0u8; 4096];
+                loop {
+                    match reader.read(&mut byte_buf).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            // Signal activity on byte reception (not line reception)
+                            let _ = activity_tx_stdout.send(()).await;
+                            let chunk = String::from_utf8_lossy(&byte_buf[..n]);
+                            line_buf.push_str(&chunk);
+                            // Emit complete lines
+                            while let Some(pos) = line_buf.find('\n') {
+                                let line = line_buf[..pos].trim_end_matches('\r').to_string();
+                                line_buf.drain(..=pos);
+                                if let Some(ref cb) = stdout_callback {
+                                    cb(StreamingOutputLine::Stdout(line)).await;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Emit any remaining incomplete line (no trailing newline)
+                if !line_buf.is_empty() {
                     if let Some(ref cb) = stdout_callback {
-                        cb(StreamingOutputLine::Stdout(line)).await;
+                        cb(StreamingOutputLine::Stdout(line_buf)).await;
                     }
                 }
             }
@@ -414,15 +434,37 @@ impl CommandQueue {
         let stderr_handle = tokio::spawn(async move {
             let mut stderr_buffer = String::new();
             if let Some(stderr) = stderr {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    // Signal activity
-                    let _ = activity_tx_stderr.send(()).await;
-                    stderr_buffer.push_str(&line);
+                let mut reader = BufReader::new(stderr);
+                let mut line_buf = String::new();
+                let mut byte_buf = vec![0u8; 4096];
+                loop {
+                    match reader.read(&mut byte_buf).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            // Signal activity on byte reception (not line reception)
+                            let _ = activity_tx_stderr.send(()).await;
+                            let chunk = String::from_utf8_lossy(&byte_buf[..n]);
+                            line_buf.push_str(&chunk);
+                            // Emit complete lines
+                            while let Some(pos) = line_buf.find('\n') {
+                                let line = line_buf[..pos].trim_end_matches('\r').to_string();
+                                line_buf.drain(..=pos);
+                                stderr_buffer.push_str(&line);
+                                stderr_buffer.push('\n');
+                                if let Some(ref cb) = stderr_callback {
+                                    cb(StreamingOutputLine::Stderr(line)).await;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Emit any remaining incomplete line (no trailing newline)
+                if !line_buf.is_empty() {
+                    stderr_buffer.push_str(&line_buf);
                     stderr_buffer.push('\n');
                     if let Some(ref cb) = stderr_callback {
-                        cb(StreamingOutputLine::Stderr(line)).await;
+                        cb(StreamingOutputLine::Stderr(line_buf)).await;
                     }
                 }
             }
@@ -1032,5 +1074,91 @@ mod tests {
             err.contains("test-change"),
             "Error message must include change_id 'test-change': {err}"
         );
+    }
+
+    /// Verify that byte reception without newlines resets the inactivity timer.
+    /// A command that emits bytes periodically but never emits a newline must NOT
+    /// trigger an inactivity timeout.
+    #[tokio::test]
+    async fn test_no_timeout_with_bytes_without_newlines() {
+        use std::process::Stdio;
+
+        // Inactivity timeout of 5 seconds; command emits bytes every 1s for 3s (no newlines)
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 1,
+            retry_delay_ms: 50,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 5,
+            inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
+        };
+        let queue = CommandQueue::new(config);
+
+        // printf writes bytes without newlines; sleep gaps between them
+        let (status, _) = queue
+            .execute_with_retry_streaming(
+                || {
+                    let mut cmd = Command::new("sh");
+                    cmd.args(["-c", "printf '.'; sleep 1; printf '.'; sleep 1; printf '.'"])
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                    cmd
+                },
+                None::<fn(StreamingOutputLine) -> std::future::Ready<()>>,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Should succeed: bytes reset the timer even without newlines
+        assert!(status.success());
+    }
+
+    /// Verify that stderr byte reception resets the inactivity timer even when
+    /// stdout is silent.
+    #[tokio::test]
+    async fn test_no_timeout_with_stderr_only_bytes() {
+        use std::process::Stdio;
+
+        // Inactivity timeout of 5 seconds; command emits to stderr every 1s for 3s
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 1,
+            retry_delay_ms: 50,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 5,
+            inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
+        };
+        let queue = CommandQueue::new(config);
+
+        // Write to stderr only (no stdout output)
+        let (status, _) = queue
+            .execute_with_retry_streaming(
+                || {
+                    let mut cmd = Command::new("sh");
+                    cmd.args([
+                        "-c",
+                        "printf 'err1' >&2; sleep 1; printf 'err2' >&2; sleep 1; printf 'err3' >&2",
+                    ])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                    cmd
+                },
+                None::<fn(StreamingOutputLine) -> std::future::Ready<()>>,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Should succeed: stderr bytes reset the inactivity timer
+        assert!(status.success());
     }
 }
