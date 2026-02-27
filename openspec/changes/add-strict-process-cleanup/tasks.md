@@ -19,4 +19,4 @@
 
 ## Acceptance #1 Failure Follow-up
 
-- [ ] Resolve dirty working tree before acceptance (`git status --porcelain` must be empty)
+- [x] Resolve dirty working tree before acceptance (`git status --porcelain` must be empty)
