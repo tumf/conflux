@@ -2,7 +2,8 @@
 //!
 //! Converts NDJSON event lines emitted by Claude Code into human-readable text
 //! with line-oriented buffering.  Each JSON event that carries text is decoded;
-//! events that carry no text (tool calls, system init messages, …) are suppressed
+//! tool-related events are converted to one-line summaries;
+//! other non-text events (system init messages, thinking, …) are suppressed
 //! when textify mode is active.  Plain non-JSON lines are passed through unchanged.
 
 /// Returns `true` if `line` is a parseable JSON object that contains a `type`
@@ -101,6 +102,111 @@ fn extract_from_result(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Extract a one-line summary from tool-related stream-json events.
+///
+/// Returns `Some(summary)` for `tool_use` and `tool_result` events.
+/// Returns `None` for all other event types.
+///
+/// Format:
+/// - `tool_use`: `[tool_use:<name>] key=value ...`
+/// - `tool_result`: `[tool_result:<name>] content (truncated if too long)`
+pub fn extract_tool_summary_from_stream_json(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let event_type = value.get("type")?.as_str()?;
+
+    match event_type {
+        "tool_use" => extract_tool_use_summary(&value),
+        "tool_result" => extract_tool_result_summary(&value),
+        "assistant" => extract_assistant_tool_summary(&value),
+        _ => None,
+    }
+}
+
+fn extract_tool_use_summary(value: &serde_json::Value) -> Option<String> {
+    // {"type":"tool_use","name":"bash","id":"...","input":{...}}
+    let name = value.get("name")?.as_str()?;
+    let input = value.get("input")?;
+
+    let mut parts = Vec::new();
+    parts.push(format!("[tool_use:{}]", name));
+
+    // Extract key fields from input based on common tool patterns
+    if let Some(obj) = input.as_object() {
+        let key_fields = [
+            "command",
+            "url",
+            "path",
+            "query",
+            "selector",
+            "text",
+            "filePath",
+            "pattern",
+            "description",
+        ];
+
+        for key in &key_fields {
+            if let Some(val) = obj.get(*key) {
+                let val_str = match val {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => val.to_string(),
+                };
+                let truncated = truncate_string(&val_str, 100);
+                parts.push(format!("{}={}", key, truncated));
+            }
+        }
+    }
+
+    Some(parts.join(" "))
+}
+
+fn extract_tool_result_summary(value: &serde_json::Value) -> Option<String> {
+    // {"type":"tool_result","tool_use_id":"...","content":"..."}
+    let tool_use_id = value.get("tool_use_id").and_then(|v| v.as_str());
+    let content = value.get("content");
+
+    let mut parts = Vec::new();
+    if let Some(id) = tool_use_id {
+        parts.push(format!("[tool_result:{}]", id));
+    } else {
+        parts.push("[tool_result]".to_string());
+    }
+
+    if let Some(content_val) = content {
+        let content_str = match content_val {
+            serde_json::Value::String(s) => s.clone(),
+            _ => content_val.to_string(),
+        };
+        let truncated = truncate_string(&content_str, 200);
+        parts.push(truncated);
+    }
+
+    Some(parts.join(" "))
+}
+
+fn extract_assistant_tool_summary(value: &serde_json::Value) -> Option<String> {
+    // {"type":"assistant","message":{"content":[{"type":"tool_use",...}]}}
+    let content = value.get("message")?.get("content")?.as_array()?;
+
+    for block in content {
+        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+            return extract_tool_use_summary(block);
+        }
+    }
+    None
+}
+
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len])
+    }
+}
+
 /// Line-oriented buffer for stream-json text output.
 ///
 /// Text chunks emitted by streaming events are typically not newline-terminated.
@@ -152,8 +258,10 @@ impl StreamJsonTextBuffer {
 ///
 /// - If the line is a recognized stream-json event that carries text, the text
 ///   is extracted and fed into `buffer`, returning any complete lines.
+/// - If the line is a tool-related event (`tool_use`, `tool_result`), a one-line
+///   summary is returned instead of the raw JSON.
 /// - If the line is a parseable stream-json event but carries no human-readable
-///   text (e.g., `thinking`, `tool_use`, `system`), it is **suppressed**
+///   text or summary (e.g., `thinking`, `system`), it is **suppressed**
 ///   (empty vec returned).
 /// - If the line is not a stream-json event at all (plain text, non-JSON output),
 ///   it is returned unchanged as a single-element vec.
@@ -161,17 +269,21 @@ impl StreamJsonTextBuffer {
 /// Call [`StreamJsonTextBuffer::finalize`] at stream end to flush any trailing
 /// partial line remaining in the buffer.
 pub fn process_stdout_line(line: &str, buffer: &mut StreamJsonTextBuffer) -> Vec<String> {
-    match extract_text_from_stream_json(line) {
-        Some(text) => buffer.feed(&text),
-        None => {
-            // Suppress parseable stream-json events that have no human-readable text.
-            // Pass through non-JSON lines (plain command output, log lines, …).
-            if is_stream_json_event(line) {
-                vec![]
-            } else {
-                vec![line.to_string()]
-            }
-        }
+    // First, try to extract text (for text_delta, assistant text, result text)
+    if let Some(text) = extract_text_from_stream_json(line) {
+        return buffer.feed(&text);
+    }
+
+    // Second, try to extract tool summary (for tool_use, tool_result)
+    if let Some(summary) = extract_tool_summary_from_stream_json(line) {
+        return vec![summary];
+    }
+
+    // Finally, suppress other stream-json events or pass through non-JSON lines
+    if is_stream_json_event(line) {
+        vec![]
+    } else {
+        vec![line.to_string()]
     }
 }
 
@@ -353,10 +465,13 @@ mod tests {
     }
 
     #[test]
-    fn test_process_tool_use_event_suppressed() {
+    fn test_process_tool_use_event_emits_summary() {
         let mut buf = StreamJsonTextBuffer::new();
         let line = r#"{"type":"tool_use","name":"bash","input":{"command":"ls"}}"#;
-        assert!(process_stdout_line(line, &mut buf).is_empty());
+        let result = process_stdout_line(line, &mut buf);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].starts_with("[tool_use:bash]"));
+        assert!(result[0].contains("command=ls"));
     }
 
     #[test]
@@ -437,5 +552,108 @@ mod tests {
         assert_eq!(lines2, vec!["World".to_string()]);
         // Buffer should be empty after all newlines consumed
         assert_eq!(buf.finalize(), None);
+    }
+
+    // ── extract_tool_summary tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_tool_use_summary_bash() {
+        let line =
+            r#"{"type":"tool_use","name":"bash","id":"tool_123","input":{"command":"ls -la"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line);
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        assert!(s.starts_with("[tool_use:bash]"));
+        assert!(s.contains("command=ls -la"));
+    }
+
+    #[test]
+    fn test_extract_tool_use_summary_read() {
+        let line = r#"{"type":"tool_use","name":"read","input":{"filePath":"/path/to/file.txt"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line);
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        assert!(s.starts_with("[tool_use:read]"));
+        assert!(s.contains("filePath=/path/to/file.txt"));
+    }
+
+    #[test]
+    fn test_extract_tool_use_summary_truncates_long_values() {
+        let long_cmd = "a".repeat(150);
+        let line = format!(
+            r#"{{"type":"tool_use","name":"bash","input":{{"command":"{}"}}}}"#,
+            long_cmd
+        );
+        let summary = extract_tool_summary_from_stream_json(&line);
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        assert!(s.len() < line.len());
+        assert!(s.contains("..."));
+    }
+
+    #[test]
+    fn test_extract_tool_result_summary() {
+        let line =
+            r#"{"type":"tool_result","tool_use_id":"tool_123","content":"Success: file created"}"#;
+        let summary = extract_tool_summary_from_stream_json(line);
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        assert!(s.starts_with("[tool_result:tool_123]"));
+        assert!(s.contains("Success: file created"));
+    }
+
+    #[test]
+    fn test_extract_tool_result_truncates_long_content() {
+        let long_content = "x".repeat(300);
+        let line = format!(
+            r#"{{"type":"tool_result","tool_use_id":"tool_456","content":"{}"}}"#,
+            long_content
+        );
+        let summary = extract_tool_summary_from_stream_json(&line);
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        assert!(s.len() < line.len());
+        assert!(s.contains("..."));
+    }
+
+    #[test]
+    fn test_extract_assistant_tool_use_summary() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"grep","input":{"pattern":"error"}}]}}"#;
+        let summary = extract_tool_summary_from_stream_json(line);
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        assert!(s.starts_with("[tool_use:grep]"));
+        assert!(s.contains("pattern=error"));
+    }
+
+    #[test]
+    fn test_extract_tool_summary_non_tool_event_returns_none() {
+        let line = r#"{"type":"thinking","thinking":"some reasoning"}"#;
+        assert_eq!(extract_tool_summary_from_stream_json(line), None);
+
+        let line2 = r#"{"type":"system","subtype":"init"}"#;
+        assert_eq!(extract_tool_summary_from_stream_json(line2), None);
+    }
+
+    #[test]
+    fn test_process_tool_use_summary_does_not_use_buffer() {
+        // Tool summaries are returned immediately, not buffered
+        let mut buf = StreamJsonTextBuffer::new();
+        let line = r#"{"type":"tool_use","name":"bash","input":{"command":"echo hello"}}"#;
+        let result = process_stdout_line(line, &mut buf);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].starts_with("[tool_use:bash]"));
+        // Buffer should remain empty
+        assert_eq!(buf.finalize(), None);
+    }
+
+    #[test]
+    fn test_process_tool_result_summary() {
+        let mut buf = StreamJsonTextBuffer::new();
+        let line = r#"{"type":"tool_result","tool_use_id":"tool_789","content":"File not found"}"#;
+        let result = process_stdout_line(line, &mut buf);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].starts_with("[tool_result:tool_789]"));
+        assert!(result[0].contains("File not found"));
     }
 }
