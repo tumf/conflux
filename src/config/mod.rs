@@ -319,8 +319,8 @@ pub struct OrchestratorConfig {
     pub command_inactivity_kill_grace_secs: Option<u64>,
 
     /// Maximum number of retries after inactivity timeout.
-    /// 0 = disabled (default, safe-by-default).
-    /// When set > 0, a command terminated by inactivity timeout is retried up to this many times.
+    /// Default: 3. Set to 0 to disable retries entirely.
+    /// When the command is terminated by inactivity timeout it is retried up to this many times.
     #[serde(default)]
     pub command_inactivity_timeout_max_retries: Option<u32>,
 
@@ -701,7 +701,7 @@ impl OrchestratorConfig {
     }
 
     /// Get the maximum number of retries after inactivity timeout.
-    /// Default: 0 (disabled, opt-in).
+    /// Default: 3. Set to 0 to disable retries.
     pub fn get_command_inactivity_timeout_max_retries(&self) -> u32 {
         self.command_inactivity_timeout_max_retries
             .unwrap_or(defaults::DEFAULT_COMMAND_INACTIVITY_TIMEOUT_MAX_RETRIES)
@@ -1786,14 +1786,24 @@ mod tests {
     }
 
     #[test]
-    fn test_inactivity_timeout_max_retries_default_is_zero() {
+    fn test_inactivity_timeout_max_retries_default_is_three() {
         let config = OrchestratorConfig::default();
         assert!(config.command_inactivity_timeout_max_retries.is_none());
         assert_eq!(
             config.get_command_inactivity_timeout_max_retries(),
-            0,
-            "Default inactivity timeout max retries must be 0 (disabled)"
+            3,
+            "Default inactivity timeout max retries must be 3"
         );
+    }
+
+    #[test]
+    fn test_inactivity_timeout_max_retries_can_be_disabled() {
+        let jsonc = r#"{
+            "command_inactivity_timeout_max_retries": 0
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        assert_eq!(config.command_inactivity_timeout_max_retries, Some(0));
+        assert_eq!(config.get_command_inactivity_timeout_max_retries(), 0);
     }
 
     #[test]
