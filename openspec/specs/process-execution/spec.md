@@ -29,3 +29,6 @@ This ensures that background or piped child processes cannot receive job-control
 - **WHEN** the child process runs
 - **THEN** the process does not transition to `STAT=T` (stopped) during execution
 - **AND** output streaming continues uninterrupted until the process exits
+
+
+#
