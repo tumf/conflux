@@ -319,8 +319,8 @@ pub struct OrchestratorConfig {
     pub command_inactivity_kill_grace_secs: Option<u64>,
 
     /// Maximum number of retries after inactivity timeout.
-    /// 0 = disabled (default, safe-by-default).
-    /// When set > 0, a command terminated by inactivity timeout is retried up to this many times.
+    /// Default: 3. Set to 0 to disable retries entirely.
+    /// When the command is terminated by inactivity timeout it is retried up to this many times.
     #[serde(default)]
     pub command_inactivity_timeout_max_retries: Option<u32>,
 

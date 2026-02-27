@@ -8,3 +8,7 @@
 ## Future Work
 
 - Consider improving inactivity-timeout detection so near-completion output does not get killed (would be a separate change).
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Update stale config field comment to reflect default `command_inactivity_timeout_max_retries` is 3 (and `0` disables retries)
