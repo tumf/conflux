@@ -1,9 +1,10 @@
 use crate::error::{OrchestratorError, Result};
+use crate::process_manager::cleanup_process_group;
 use regex::Regex;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -44,6 +45,17 @@ pub struct CommandQueueConfig {
     #[allow(dead_code)]
     // Used by execute_with_retry_streaming for graceful shutdown
     pub inactivity_kill_grace_secs: u64,
+
+    /// Maximum number of retries after inactivity timeout (0 = disabled)
+    #[allow(dead_code)]
+    // Used by execute_streaming_with_retry for inactivity-timeout retry logic
+    pub inactivity_timeout_max_retries: u32,
+
+    /// Enable strict post-completion process-group cleanup.
+    /// When true (default), after a command finishes the orchestrator sweeps the
+    /// spawned process group with SIGTERM → SIGKILL to prevent orphaned processes.
+    #[allow(dead_code)]
+    pub strict_process_cleanup: bool,
 }
 
 /// Command execution queue with staggered start and retry mechanism
@@ -113,8 +125,7 @@ impl CommandQueue {
     }
 
     /// Check if an error message matches retryable patterns
-    #[allow(dead_code)] // Public API for unified retry logic
-    fn is_retryable_error(&self, stderr: &str) -> bool {
+    pub fn is_retryable_error(&self, stderr: &str) -> bool {
         self.config.retry_error_patterns.iter().any(|pattern| {
             Regex::new(pattern)
                 .map(|re| re.is_match(stderr))
@@ -129,8 +140,13 @@ impl CommandQueue {
     /// - Attempt count (must be under max_retries)
     /// - Exit code (non-zero)
     /// - Error pattern match OR short execution duration OR agent crash (exit code != 0)
-    #[allow(dead_code)] // Public API for unified retry logic
-    fn should_retry(&self, attempt: u32, duration: Duration, stderr: &str, exit_code: i32) -> bool {
+    pub fn should_retry(
+        &self,
+        attempt: u32,
+        duration: Duration,
+        stderr: &str,
+        exit_code: i32,
+    ) -> bool {
         // Check maximum retries
         if attempt >= self.config.max_retries {
             return false;
@@ -257,14 +273,26 @@ impl CommandQueue {
             attempt += 1;
             let start_time = Instant::now();
 
-            // Execute with stagger
+            // Execute with stagger.
+            // Callers (e.g., build_command in agent/runner.rs) are responsible for calling
+            // configure_process_group() so that PGID == PID (via setsid) before spawning,
+            // which is required for post-completion process-group cleanup to work correctly.
             let mut child = self.execute_with_stagger(|| command_fn()).await?;
+
+            // Capture PID (= PGID if caller used setsid) before handing child to stream_and_wait.
+            let pid = child.id().unwrap_or(0);
 
             // Stream output and collect stderr for retry decision
             let (status, stderr, inactivity_timeout_occurred) = self
                 .stream_and_wait(&mut child, &output_callback, operation_type, change_id)
                 .await?;
             let duration = start_time.elapsed();
+
+            // Post-completion cleanup: sweep the process group with SIGTERM→SIGKILL to
+            // ensure no background processes spawned by the agent command survive.
+            if self.config.strict_process_cleanup && pid > 0 {
+                cleanup_process_group(pid, 100, operation_type, change_id).await;
+            }
 
             // Success case
             if status.success() {
@@ -305,11 +333,21 @@ impl CommandQueue {
 
             // Max retries exceeded or non-retryable error
             let error_msg = if inactivity_timeout_occurred {
+                let exit_str = match status.code() {
+                    Some(code) => format!("exit code {}", code),
+                    None => "terminated by signal (no exit code)".to_string(),
+                };
+                let context = match (operation_type, change_id) {
+                    (Some(op), Some(id)) => {
+                        format!(" (operation: {}, change_id: {})", op, id)
+                    }
+                    (Some(op), None) => format!(" (operation: {})", op),
+                    (None, Some(id)) => format!(" (change_id: {})", id),
+                    (None, None) => String::new(),
+                };
                 format!(
-                    "Command failed due to inactivity timeout after {} attempt(s) with exit code {:?}: {}",
-                    attempt,
-                    status.code(),
-                    stderr.lines().next().unwrap_or("")
+                    "Command terminated by inactivity timeout after {}s{}, {}",
+                    self.config.inactivity_timeout_secs, context, exit_str,
                 )
             } else {
                 format!(
@@ -358,13 +396,33 @@ impl CommandQueue {
         let activity_tx_stdout = activity_tx.clone();
         let stdout_handle = tokio::spawn(async move {
             if let Some(stdout) = stdout {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    // Signal activity
-                    let _ = activity_tx_stdout.send(()).await;
+                let mut reader = BufReader::new(stdout);
+                let mut line_buf = String::new();
+                let mut byte_buf = vec![0u8; 4096];
+                loop {
+                    match reader.read(&mut byte_buf).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            // Signal activity on byte reception (not line reception)
+                            let _ = activity_tx_stdout.send(()).await;
+                            let chunk = String::from_utf8_lossy(&byte_buf[..n]);
+                            line_buf.push_str(&chunk);
+                            // Emit complete lines
+                            while let Some(pos) = line_buf.find('\n') {
+                                let line = line_buf[..pos].trim_end_matches('\r').to_string();
+                                line_buf.drain(..=pos);
+                                if let Some(ref cb) = stdout_callback {
+                                    cb(StreamingOutputLine::Stdout(line)).await;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Emit any remaining incomplete line (no trailing newline)
+                if !line_buf.is_empty() {
                     if let Some(ref cb) = stdout_callback {
-                        cb(StreamingOutputLine::Stdout(line)).await;
+                        cb(StreamingOutputLine::Stdout(line_buf)).await;
                     }
                 }
             }
@@ -376,15 +434,37 @@ impl CommandQueue {
         let stderr_handle = tokio::spawn(async move {
             let mut stderr_buffer = String::new();
             if let Some(stderr) = stderr {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    // Signal activity
-                    let _ = activity_tx_stderr.send(()).await;
-                    stderr_buffer.push_str(&line);
+                let mut reader = BufReader::new(stderr);
+                let mut line_buf = String::new();
+                let mut byte_buf = vec![0u8; 4096];
+                loop {
+                    match reader.read(&mut byte_buf).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            // Signal activity on byte reception (not line reception)
+                            let _ = activity_tx_stderr.send(()).await;
+                            let chunk = String::from_utf8_lossy(&byte_buf[..n]);
+                            line_buf.push_str(&chunk);
+                            // Emit complete lines
+                            while let Some(pos) = line_buf.find('\n') {
+                                let line = line_buf[..pos].trim_end_matches('\r').to_string();
+                                line_buf.drain(..=pos);
+                                stderr_buffer.push_str(&line);
+                                stderr_buffer.push('\n');
+                                if let Some(ref cb) = stderr_callback {
+                                    cb(StreamingOutputLine::Stderr(line)).await;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Emit any remaining incomplete line (no trailing newline)
+                if !line_buf.is_empty() {
+                    stderr_buffer.push_str(&line_buf);
                     stderr_buffer.push('\n');
                     if let Some(ref cb) = stderr_callback {
-                        cb(StreamingOutputLine::Stderr(line)).await;
+                        cb(StreamingOutputLine::Stderr(line_buf)).await;
                     }
                 }
             }
@@ -427,33 +507,129 @@ impl CommandQueue {
                     _ = tokio::time::sleep(remaining) => {
                         // Inactivity timeout triggered
                         inactivity_timeout_occurred = true;
+                        let last_activity_age_secs = last_activity.elapsed().as_secs();
 
-                        // Build context string for logging
-                        let context = match (operation_type, change_id) {
-                            (Some(op), Some(id)) => format!(" (operation: {}, change_id: {})", op, id),
-                            (Some(op), None) => format!(" (operation: {})", op),
-                            (None, Some(id)) => format!(" (change_id: {})", id),
-                            (None, None) => String::new(),
+                        // Capture PID before killing for log context
+                        let pid = child.id().unwrap_or(0);
+
+                        // Get PGID for structured logging (Unix only).
+                        #[cfg(unix)]
+                        let pgid_opt: Option<u32> = if pid > 0 {
+                            use nix::unistd::{getpgid, Pid};
+                            getpgid(Some(Pid::from_raw(pid as i32)))
+                                .ok()
+                                .map(|p| p.as_raw() as u32)
+                        } else {
+                            None
                         };
+                        #[cfg(not(unix))]
+                        let pgid_opt: Option<u32> = None;
 
                         warn!(
-                            "Command inactivity timeout triggered after {} seconds{}, waiting {} seconds grace period before terminating",
-                            inactivity_timeout_secs,
-                            context,
-                            kill_grace_secs
+                            pid,
+                            pgid = pgid_opt,
+                            timeout_secs = inactivity_timeout_secs,
+                            grace_secs = kill_grace_secs,
+                            last_activity_age_secs,
+                            op = ?operation_type,
+                            change_id = ?change_id,
+                            "Inactivity timeout triggered: no output for {}s \
+                             (pid={}, pgid={:?}, timeout={}s, grace={}s, \
+                             last_activity_age={}s, op={:?}, change_id={:?})",
+                            last_activity_age_secs, pid, pgid_opt,
+                            inactivity_timeout_secs, kill_grace_secs,
+                            last_activity_age_secs, operation_type, change_id
                         );
 
                         // Wait grace period
                         tokio::time::sleep(Duration::from_secs(kill_grace_secs)).await;
 
-                        // Check if process is still running
-                        if child.id().is_some() {
+                        // Kill the process (and its process group if it's the group leader)
+                        if pid > 0 {
                             warn!(
-                                "Grace period expired, terminating inactive process{}",
-                                context
+                                pid,
+                                pgid = pgid_opt,
+                                op = ?operation_type,
+                                change_id = ?change_id,
+                                "Grace period expired, sending SIGTERM to process \
+                                 (pid={}, pgid={:?})",
+                                pid, pgid_opt
                             );
-                            // Kill the process
-                            let _ = child.kill().await;
+                            #[cfg(unix)]
+                            {
+                                use nix::sys::signal::{kill, killpg, Signal};
+                                use nix::unistd::{getpgid, Pid};
+                                let pid_raw = Pid::from_raw(pid as i32);
+                                // Get the actual process group ID
+                                let pgid =
+                                    getpgid(Some(pid_raw)).unwrap_or(pid_raw);
+                                let (target_desc, sigterm_result, sigkill_result) =
+                                    if pgid == pid_raw {
+                                        // Process is its own group leader: kill the whole group
+                                        let sr = killpg(pgid, Signal::SIGTERM);
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                        let kr = killpg(pgid, Signal::SIGKILL);
+                                        ("process group", sr, kr)
+                                    } else {
+                                        // Process is in parent's group: only kill this process
+                                        let sr = kill(pid_raw, Signal::SIGTERM);
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                        let kr = kill(pid_raw, Signal::SIGKILL);
+                                        ("process", sr, kr)
+                                    };
+                                match sigterm_result {
+                                    Ok(()) => {
+                                        debug!(
+                                            pid,
+                                            pgid = pgid_opt,
+                                            signal = "SIGTERM",
+                                            target = target_desc,
+                                            "SIGTERM delivered to {}", target_desc
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            pid,
+                                            pgid = pgid_opt,
+                                            signal = "SIGTERM",
+                                            target = target_desc,
+                                            errno = %e,
+                                            op = ?operation_type,
+                                            change_id = ?change_id,
+                                            "SIGTERM failed for {} (pid={}, pgid={:?}): {}",
+                                            target_desc, pid, pgid_opt, e
+                                        );
+                                    }
+                                }
+                                match sigkill_result {
+                                    Ok(()) => {
+                                        debug!(
+                                            pid,
+                                            pgid = pgid_opt,
+                                            signal = "SIGKILL",
+                                            target = target_desc,
+                                            "SIGKILL delivered to {}", target_desc
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            pid,
+                                            pgid = pgid_opt,
+                                            signal = "SIGKILL",
+                                            target = target_desc,
+                                            errno = %e,
+                                            op = ?operation_type,
+                                            change_id = ?change_id,
+                                            "SIGKILL failed for {} (pid={}, pgid={:?}): {}",
+                                            target_desc, pid, pgid_opt, e
+                                        );
+                                    }
+                                }
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                let _ = child.kill().await;
+                            }
                         }
                         break;
                     }
@@ -508,6 +684,8 @@ mod tests {
             retry_if_duration_under_secs: 5,
             inactivity_timeout_secs: 0, // Disabled for most tests
             inactivity_kill_grace_secs: 10,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         }
     }
 
@@ -689,6 +867,8 @@ mod tests {
             retry_if_duration_under_secs: 0, // Disable short duration retry
             inactivity_timeout_secs: 0,
             inactivity_kill_grace_secs: 10,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         };
         let queue = CommandQueue::new(config);
 
@@ -724,6 +904,8 @@ mod tests {
             retry_if_duration_under_secs: 0,
             inactivity_timeout_secs: 3,
             inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         };
         let queue = CommandQueue::new(config);
 
@@ -772,6 +954,8 @@ mod tests {
             retry_if_duration_under_secs: 0,
             inactivity_timeout_secs: 5,
             inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         };
         let queue = CommandQueue::new(config);
 
@@ -810,6 +994,8 @@ mod tests {
             retry_if_duration_under_secs: 0,
             inactivity_timeout_secs: 0, // Disabled
             inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
         };
         let queue = CommandQueue::new(config);
 
@@ -830,6 +1016,149 @@ mod tests {
             .unwrap();
 
         // Should succeed (timeout disabled)
+        assert!(status.success());
+    }
+
+    /// Verify that the user-facing error message for inactivity timeout contains
+    /// "inactivity timeout", the configured timeout seconds, and operation context.
+    #[tokio::test]
+    async fn test_inactivity_timeout_error_message_format() {
+        use std::process::Stdio;
+
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 1,
+            retry_delay_ms: 50,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 2,
+            inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
+        };
+        let queue = CommandQueue::new(config);
+
+        let result = queue
+            .execute_with_retry_streaming(
+                || {
+                    let mut cmd = Command::new("sleep");
+                    cmd.arg("30").stdout(Stdio::piped()).stderr(Stdio::piped());
+                    cmd
+                },
+                None::<fn(StreamingOutputLine) -> std::future::Ready<()>>,
+                Some("apply"),
+                Some("test-change"),
+            )
+            .await;
+
+        assert!(result.is_err(), "Expected error due to inactivity timeout");
+        let err = result.unwrap_err().to_string();
+
+        // Must contain "inactivity timeout"
+        assert!(
+            err.contains("inactivity timeout"),
+            "Error message must mention 'inactivity timeout': {err}"
+        );
+        // Must contain the timeout duration (2s)
+        assert!(
+            err.contains("2s"),
+            "Error message must include timeout seconds '2s': {err}"
+        );
+        // Must contain operation context
+        assert!(
+            err.contains("apply"),
+            "Error message must include operation 'apply': {err}"
+        );
+        // Must contain change_id context
+        assert!(
+            err.contains("test-change"),
+            "Error message must include change_id 'test-change': {err}"
+        );
+    }
+
+    /// Verify that byte reception without newlines resets the inactivity timer.
+    /// A command that emits bytes periodically but never emits a newline must NOT
+    /// trigger an inactivity timeout.
+    #[tokio::test]
+    async fn test_no_timeout_with_bytes_without_newlines() {
+        use std::process::Stdio;
+
+        // Inactivity timeout of 5 seconds; command emits bytes every 1s for 3s (no newlines)
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 1,
+            retry_delay_ms: 50,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 5,
+            inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
+        };
+        let queue = CommandQueue::new(config);
+
+        // printf writes bytes without newlines; sleep gaps between them
+        let (status, _) = queue
+            .execute_with_retry_streaming(
+                || {
+                    let mut cmd = Command::new("sh");
+                    cmd.args(["-c", "printf '.'; sleep 1; printf '.'; sleep 1; printf '.'"])
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                    cmd
+                },
+                None::<fn(StreamingOutputLine) -> std::future::Ready<()>>,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Should succeed: bytes reset the timer even without newlines
+        assert!(status.success());
+    }
+
+    /// Verify that stderr byte reception resets the inactivity timer even when
+    /// stdout is silent.
+    #[tokio::test]
+    async fn test_no_timeout_with_stderr_only_bytes() {
+        use std::process::Stdio;
+
+        // Inactivity timeout of 5 seconds; command emits to stderr every 1s for 3s
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 1,
+            retry_delay_ms: 50,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 5,
+            inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
+        };
+        let queue = CommandQueue::new(config);
+
+        // Write to stderr only (no stdout output)
+        let (status, _) = queue
+            .execute_with_retry_streaming(
+                || {
+                    let mut cmd = Command::new("sh");
+                    cmd.args([
+                        "-c",
+                        "printf 'err1' >&2; sleep 1; printf 'err2' >&2; sleep 1; printf 'err3' >&2",
+                    ])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                    cmd
+                },
+                None::<fn(StreamingOutputLine) -> std::future::Ready<()>>,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Should succeed: stderr bytes reset the inactivity timer
         assert!(status.success());
     }
 }

@@ -42,7 +42,11 @@ mod remote;
 mod serial_run_service;
 mod spec_delta;
 mod stall;
+mod stream_json_textifier;
 mod task_parser;
 mod templates;
 mod vcs;
 pub mod worktree_ops;
+
+#[cfg(test)]
+mod test_support;

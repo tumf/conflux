@@ -1,21 +1,15 @@
 //! Parallel execution coordinator for VCS workspace-based parallel change application.
 //!
-//! This module is the entry point for the parallel execution subsystem. It re-exports
-//! the public API and declares the submodules, each with a focused responsibility:
+//! This module is the entry point for the parallel execution subsystem. It defines the
+//! shared state container (`ParallelExecutor`) and re-exports the public API.
 //!
-//! - [`builder`]: Construction and initialization of [`ParallelExecutor`]
-//! - [`queue_state`]: Queue state management, debounce logic, and dispatch coordination
-//! - [`executor`]: Apply/acceptance/archive command execution in workspaces
-//! - [`merge`]: Branch merge and conflict resolution
-//! - [`orchestration`]: Order-based re-analysis scheduler loop
-//! - [`dispatch`]: Change dispatch to workspaces (apply+acceptance+archive pipeline)
-//! - [`workspace`]: Workspace lifecycle management helpers
-//! - [`cleanup`]: Workspace cleanup guards
-//! - [`conflict`]: Conflict detection and resolution
-//! - [`dynamic_queue`]: Dynamic queue (TUI mode) support
-//! - [`events`]: Event sending utilities
-//! - [`output_bridge`]: Output line bridging
-//! - [`types`]: Shared type definitions
+//! Implementation is split into focused submodules:
+//! - `builder`: construction and initialization
+//! - `queue_state`: queue management and dispatch coordination
+//! - `executor`: apply/acceptance/archive execution in workspaces
+//! - `merge`: branch merge and conflict resolution
+//! - `dispatch`: per-change dispatch logic
+//! - `orchestration`: order-based re-analysis scheduler loop
 
 mod builder;
 mod cleanup;
@@ -31,12 +25,13 @@ mod queue_state;
 mod types;
 mod workspace;
 
-// Re-export ExecutionEvent as ParallelEvent for backward compatibility
+// Re-export unified event type as ParallelEvent for backward compatibility.
 pub use crate::events::ExecutionEvent as ParallelEvent;
+
 pub use merge::{base_dirty_reason, resolve_deferred_merge};
 pub use types::{FailedChangeTracker, WorkspaceResult};
 
-// Re-exports used in tests via `use super::super::*`
+// Re-exports used in tests via `use super::super::*`.
 #[cfg(test)]
 pub use crate::vcs::Workspace;
 #[cfg(test)]
@@ -44,6 +39,7 @@ pub use merge::MergeAttempt;
 
 use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
 use crate::config::OrchestratorConfig;
+use crate::hooks::HookRunner;
 use crate::vcs::WorkspaceManager;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -51,15 +47,12 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::hooks::HookRunner;
-
 const DEFAULT_MAX_CONFLICT_RETRIES: u32 = 3;
 
 /// Global lock for serializing all merge/resolve operations to base branch.
 ///
 /// This ensures that only one merge operation can modify the base branch
-/// at any given time, regardless of which ParallelExecutor instance
-/// initiates the operation.
+/// at any given time, regardless of which `ParallelExecutor` instance initiates it.
 static GLOBAL_MERGE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// Get the global merge lock, initializing it if necessary.
@@ -67,7 +60,9 @@ fn global_merge_lock() -> &'static Mutex<()> {
     GLOBAL_MERGE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Parallel executor for running changes in git worktrees
+/// Parallel executor for running changes in VCS workspaces (git worktrees today).
+///
+/// All execution logic lives in submodules as `impl ParallelExecutor` blocks.
 pub struct ParallelExecutor {
     /// Workspace manager (VCS-agnostic)
     workspace_manager: Box<dyn WorkspaceManager>,
@@ -107,7 +102,7 @@ pub struct ParallelExecutor {
     /// Shared AI command runner for stagger coordination
     ai_runner: AiCommandRunner,
     /// Shared stagger state for resolve operations
-    #[allow(dead_code)] // Reserved for future resolve integration
+    #[allow(dead_code)]
     shared_stagger_state: SharedStaggerState,
     /// History of apply attempts per change for context injection
     apply_history: Arc<Mutex<crate::history::ApplyHistory>>,
@@ -120,10 +115,8 @@ pub struct ParallelExecutor {
     /// Flag to trigger re-analysis on next loop iteration
     needs_reanalysis: bool,
     /// Counter for active manual resolve operations (TUI mode)
-    /// This allows manual resolves to consume parallel execution slots
     manual_resolve_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Counter for active automatic resolve operations
-    /// This allows automatic resolves to consume parallel execution slots
     auto_resolve_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 

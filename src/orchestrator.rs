@@ -141,8 +141,12 @@ impl Orchestrator {
                 .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
             inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
+            inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
+            strict_process_cleanup: config.get_command_strict_process_cleanup(),
         };
-        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+        let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+        ai_runner.set_stream_json_textify(config.get_stream_json_textify());
+        ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
 
         // Initialize shared state (will be populated when run() is called with actual changes)
         // Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
@@ -238,8 +242,12 @@ impl Orchestrator {
                 .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
             inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
+            inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
+            strict_process_cleanup: config.get_command_strict_process_cleanup(),
         };
-        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+        let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+        ai_runner.set_stream_json_textify(config.get_stream_json_textify());
+        ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
 
         // Initialize shared state (for testing, will use empty change list)
         // Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
@@ -1239,14 +1247,79 @@ impl Orchestrator {
                     let _ = tx.send(event.clone());
                 }
                 match event {
+                    ParallelEvent::ApplyStarted { change_id, command } => {
+                        info!("Apply started for {}", change_id);
+                        println!("[{} apply] {}", change_id, command);
+                    }
+                    ParallelEvent::ApplyOutput {
+                        change_id,
+                        output,
+                        iteration,
+                    } => {
+                        let iter = iteration
+                            .map(|n| format!("#{}", n))
+                            .unwrap_or_else(|| "".to_string());
+                        if iter.is_empty() {
+                            println!("[{} apply] {}", change_id, output);
+                        } else {
+                            println!("[{} apply {}] {}", change_id, iter, output);
+                        }
+                    }
+                    ParallelEvent::ProgressUpdated {
+                        change_id,
+                        completed,
+                        total,
+                    } => {
+                        if total > 0 {
+                            info!("Progress {}: {}/{}", change_id, completed, total);
+                        }
+                    }
                     ParallelEvent::ApplyCompleted { change_id, .. } => {
                         info!("Apply completed for {}", change_id);
                     }
                     ParallelEvent::ApplyFailed { change_id, error } => {
                         error!("Apply failed for {}: {}", change_id, error);
                     }
+                    ParallelEvent::AcceptanceStarted { change_id, command } => {
+                        info!("Acceptance started for {}", change_id);
+                        println!("[{} acceptance] {}", change_id, command);
+                    }
+                    ParallelEvent::AcceptanceOutput {
+                        change_id,
+                        output,
+                        iteration,
+                    } => {
+                        let iter = iteration
+                            .map(|n| format!("#{}", n))
+                            .unwrap_or_else(|| "".to_string());
+                        if iter.is_empty() {
+                            println!("[{} acceptance] {}", change_id, output);
+                        } else {
+                            println!("[{} acceptance {}] {}", change_id, iter, output);
+                        }
+                    }
+                    ParallelEvent::AcceptanceCompleted { change_id } => {
+                        info!("Acceptance completed for {}", change_id);
+                    }
+                    ParallelEvent::AcceptanceFailed { change_id, error } => {
+                        error!("Acceptance failed for {}: {}", change_id, error);
+                    }
+                    ParallelEvent::ArchiveStarted { change_id, command } => {
+                        info!("Archive started for {}", change_id);
+                        println!("[{} archive] {}", change_id, command);
+                    }
+                    ParallelEvent::ArchiveOutput {
+                        change_id,
+                        output,
+                        iteration,
+                    } => {
+                        println!("[{} archive #{}] {}", change_id, iteration, output);
+                    }
                     ParallelEvent::ChangeArchived(change_id) => {
                         info!("Archived {}", change_id);
+                    }
+                    ParallelEvent::ArchiveFailed { change_id, error } => {
+                        error!("Archive failed for {}: {}", change_id, error);
                     }
                     ParallelEvent::AllCompleted => {
                         info!("All parallel execution completed");
@@ -1256,6 +1329,10 @@ impl Orchestrator {
                     }
                     ParallelEvent::Warning { message, .. } => {
                         eprintln!("{}", message);
+                    }
+                    ParallelEvent::Log(entry) => {
+                        // Forward user-facing log entries in CLI mode as well.
+                        println!("{}", entry.message);
                     }
                     _ => {}
                 }

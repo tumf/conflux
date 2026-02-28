@@ -321,6 +321,7 @@ mod tests {
 
     #[test]
     fn test_list_changes_native_excludes_without_proposal() {
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
         // Test that changes without proposal.md are excluded
         let temp_dir = TempDir::new().unwrap();
         let changes_dir = temp_dir.path().join("openspec").join("changes");
@@ -355,6 +356,7 @@ mod tests {
 
     #[test]
     fn test_list_changes_native_suppresses_repetitive_logs() {
+        let _cwd_lock = crate::test_support::cwd_lock().lock().unwrap();
         let log_lock = LOG_TEST_MUTEX.get_or_init(|| Mutex::new(()));
         let _guard = log_lock.lock().expect("log mutex poisoned");
 

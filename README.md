@@ -30,6 +30,29 @@ Automates the OpenSpec change workflow (list → dependency analysis → apply �
 └─────────────────────────────────────────────┘
 ```
 
+## Quick Start
+
+```bash
+# 1. Install
+cargo install --path .
+
+# 2. Initialize configuration (Claude Code agent by default)
+cflx init
+
+# 3. Launch the interactive TUI (default entry point)
+cflx
+
+# Or run headless (non-interactive)
+cflx run
+```
+
+For other templates:
+
+```bash
+cflx init --template opencode
+cflx init --template codex
+```
+
 ## Usage
 
 ### Golden Path: Quick Start
@@ -850,7 +873,6 @@ Options:
 Options:
   -j, --json  Output results in JSON format
 ```
-
 Priority: CLI argument > Environment variable > Default value
 
 ## Error Handling
@@ -1042,7 +1064,7 @@ tests/
 
 ## Development
 
-See [Development Guide](docs/guides/DEVELOPMENT.md) for build instructions, testing, and project structure.
+See [Development Guide](docs/guides/DEVELOPMENT.md) for build instructions, testing, and full project structure.
 
 ### Git Hooks
 

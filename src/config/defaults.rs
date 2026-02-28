@@ -101,6 +101,17 @@ pub const DEFAULT_COMMAND_INACTIVITY_TIMEOUT_SECS: u64 = 900;
 /// Default grace period before force-killing inactive commands (seconds)
 pub const DEFAULT_COMMAND_INACTIVITY_KILL_GRACE_SECS: u64 = 5;
 
+/// Default maximum number of retries after inactivity timeout (0 = disabled; set to 0 to opt out)
+pub const DEFAULT_COMMAND_INACTIVITY_TIMEOUT_MAX_RETRIES: u32 = 3;
+
+/// Default enablement for stream-json output textification
+pub const DEFAULT_STREAM_JSON_TEXTIFY: bool = true;
+
+/// Default enablement for strict post-completion process-group cleanup.
+/// When true, the orchestrator always runs a SIGTERM→SIGKILL sweep on the
+/// spawned process group after a command completes (regardless of exit status).
+pub const DEFAULT_COMMAND_STRICT_PROCESS_CLEANUP: bool = true;
+
 /// Default error patterns that trigger automatic retry
 pub fn default_retry_patterns() -> Vec<String> {
     vec![

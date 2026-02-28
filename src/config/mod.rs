@@ -322,6 +322,30 @@ pub struct OrchestratorConfig {
     /// Default: 5
     #[serde(default)]
     pub command_inactivity_kill_grace_secs: Option<u64>,
+
+    /// Maximum number of retries after inactivity timeout.
+    /// Default: 3. Set to 0 to disable retries entirely.
+    /// When the command is terminated by inactivity timeout it is retried up to this many times.
+    #[serde(default)]
+    pub command_inactivity_timeout_max_retries: Option<u32>,
+
+    /// Enable stream-json output textification.
+    /// When true (default), stdout lines that are Claude Code stream-json (NDJSON) events
+    /// are converted to human-readable text before being emitted to logs.
+    /// Set to false to disable conversion and emit raw JSON lines for troubleshooting.
+    /// Default: true
+    #[serde(default)]
+    pub stream_json_textify: Option<bool>,
+
+    /// Enable strict post-completion process-group cleanup.
+    /// When true (default), after a command finishes (success, failure, cancellation, or
+    /// inactivity timeout), the orchestrator sends SIGTERM then SIGKILL to the entire
+    /// spawned process group to prevent orphaned background processes.
+    /// Set to false to disable for debugging scenarios where intentional background
+    /// processes should survive command completion.
+    /// Default: true
+    #[serde(default)]
+    pub command_strict_process_cleanup: Option<bool>,
 }
 
 /// Authentication mode for the server daemon.
@@ -677,6 +701,20 @@ impl OrchestratorConfig {
         if other.command_inactivity_kill_grace_secs.is_some() {
             self.command_inactivity_kill_grace_secs = other.command_inactivity_kill_grace_secs;
         }
+        if other.command_inactivity_timeout_max_retries.is_some() {
+            self.command_inactivity_timeout_max_retries =
+                other.command_inactivity_timeout_max_retries;
+        }
+
+        // Stream-JSON textification
+        if other.stream_json_textify.is_some() {
+            self.stream_json_textify = other.stream_json_textify;
+        }
+
+        // Strict process cleanup
+        if other.command_strict_process_cleanup.is_some() {
+            self.command_strict_process_cleanup = other.command_strict_process_cleanup;
+        }
     }
 
     /// Get the apply command (required, returns error if not set)
@@ -865,6 +903,27 @@ impl OrchestratorConfig {
     pub fn get_command_inactivity_kill_grace_secs(&self) -> u64 {
         self.command_inactivity_kill_grace_secs
             .unwrap_or(defaults::DEFAULT_COMMAND_INACTIVITY_KILL_GRACE_SECS)
+    }
+
+    /// Get the maximum number of retries after inactivity timeout.
+    /// Default: 3. Set to 0 to disable retries.
+    pub fn get_command_inactivity_timeout_max_retries(&self) -> u32 {
+        self.command_inactivity_timeout_max_retries
+            .unwrap_or(defaults::DEFAULT_COMMAND_INACTIVITY_TIMEOUT_MAX_RETRIES)
+    }
+
+    /// Get whether stream-json output textification is enabled.
+    /// Default: true (convert stream-json events to human-readable text)
+    pub fn get_stream_json_textify(&self) -> bool {
+        self.stream_json_textify
+            .unwrap_or(defaults::DEFAULT_STREAM_JSON_TEXTIFY)
+    }
+
+    /// Get whether strict post-completion process-group cleanup is enabled.
+    /// Default: true (always sweep the process group after command completion)
+    pub fn get_command_strict_process_cleanup(&self) -> bool {
+        self.command_strict_process_cleanup
+            .unwrap_or(defaults::DEFAULT_COMMAND_STRICT_PROCESS_CLEANUP)
     }
 
     /// Expand `{change_id}` placeholder in a command template
@@ -1989,6 +2048,37 @@ mod tests {
         let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
         assert_eq!(config.acceptance_max_continues, Some(5));
         assert_eq!(config.get_acceptance_max_continues(), 5);
+    }
+
+    #[test]
+    fn test_inactivity_timeout_max_retries_default_is_three() {
+        let config = OrchestratorConfig::default();
+        assert!(config.command_inactivity_timeout_max_retries.is_none());
+        assert_eq!(
+            config.get_command_inactivity_timeout_max_retries(),
+            3,
+            "Default inactivity timeout max retries must be 3"
+        );
+    }
+
+    #[test]
+    fn test_inactivity_timeout_max_retries_can_be_disabled() {
+        let jsonc = r#"{
+            "command_inactivity_timeout_max_retries": 0
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        assert_eq!(config.command_inactivity_timeout_max_retries, Some(0));
+        assert_eq!(config.get_command_inactivity_timeout_max_retries(), 0);
+    }
+
+    #[test]
+    fn test_inactivity_timeout_max_retries_can_be_configured() {
+        let jsonc = r#"{
+            "command_inactivity_timeout_max_retries": 3
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        assert_eq!(config.command_inactivity_timeout_max_retries, Some(3));
+        assert_eq!(config.get_command_inactivity_timeout_max_retries(), 3);
     }
 
     #[test]

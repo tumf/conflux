@@ -1072,14 +1072,15 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
     frame.render_widget(status, area);
 }
 
-/// Wrap a log message with proper indentation for continuation lines
+/// Wrap a log message for the Logs view.
 ///
 /// The first line starts at column 0 (after timestamp+header prefix).
-/// Continuation lines are indented by `prefix_width` spaces to align with the first line.
+/// Continuation lines are NOT indented and use the full available width
+/// (including the timestamp column area), so more text is visible.
 ///
-/// `available_width` is the total width available after subtracting borders and timestamp.
+/// `available_width` is the width available after subtracting borders and timestamp.
 /// `header_width` is the width of the header (e.g., "[change-id:operation]").
-/// `prefix_width` is the total indentation width for continuation lines (timestamp + header).
+/// `prefix_width` is timestamp_width + header_width (used to compute continuation width).
 ///
 /// Returns a vector of display lines (wrapped output).
 fn wrap_log_message(
@@ -1120,22 +1121,21 @@ fn wrap_log_message(
     lines.push(remaining[..split_point].to_string());
     remaining = &remaining[split_point..];
 
-    // Continuation lines: indent by prefix_width, use (available_width - header_width)
-    // Note: available_width already has timestamp subtracted, so we only subtract header_width
-    // to get the same message width as the first line
-    let indent = " ".repeat(prefix_width);
-    let continuation_width = available_width.saturating_sub(header_width);
+    // Continuation lines: no indent, use full width (available_width + timestamp_width).
+    // timestamp_width = prefix_width - header_width, so continuation_width = available_width + (prefix_width - header_width).
+    let continuation_width =
+        available_width.saturating_add(prefix_width.saturating_sub(header_width));
 
     while !remaining.is_empty() {
         if continuation_width == 0 {
             // No space for continuation, append as-is
-            lines.push(format!("{}{}", indent, remaining));
+            lines.push(remaining.to_string());
             break;
         }
 
         if remaining.len() <= continuation_width {
             // Remaining message fits on this line
-            lines.push(format!("{}{}", indent, remaining));
+            lines.push(remaining.to_string());
             break;
         }
 
@@ -1148,7 +1148,7 @@ fn wrap_log_message(
             split_point = continuation_width;
         }
 
-        lines.push(format!("{}{}", indent, &remaining[..split_point]));
+        lines.push(remaining[..split_point].to_string());
         remaining = &remaining[split_point..];
     }
 
@@ -2464,13 +2464,13 @@ mod tests {
         }
     }
 
-    // === Tests for fix-tui-logs-wrap ===
+    // === Tests for update-tui-log-wrap-no-indent ===
 
     #[test]
-    fn test_logs_wrap_indents_continuation_lines() {
-        // Test that wrapped log lines maintain proper indentation
-        // First line starts at column 0 (after timestamp+header)
-        // Continuation lines are indented by prefix_width
+    fn test_logs_wrap_no_indent_continuation_lines() {
+        // Continuation lines must NOT be indented; they start at column 0.
+        // First line: timestamp + header + message start.
+        // Continuation lines: message continuation from column 0 (no leading spaces).
 
         let message = "This is a very long message that will definitely wrap across multiple lines when rendered in the logs view with a narrow width";
         let available_width = 40;
@@ -2489,16 +2489,51 @@ mod tests {
             wrapped[0]
         );
 
-        // Second and subsequent lines should have indentation
+        // Continuation lines should NOT be indented
         for (idx, line) in wrapped.iter().skip(1).enumerate() {
-            let expected_indent = " ".repeat(prefix_width);
             assert!(
-                line.starts_with(&expected_indent),
-                "Continuation line {} should start with {} spaces, got: '{}'",
+                !line.starts_with(' '),
+                "Continuation line {} should NOT be indented, got: '{}'",
                 idx + 2,
-                prefix_width,
                 line
             );
+        }
+    }
+
+    #[test]
+    fn test_wrap_log_message_continuation_uses_full_width() {
+        // Continuation lines use available_width + timestamp_width (no indent),
+        // so they can fit more characters than the first line.
+        let message = "A".repeat(200);
+        let available_width = 60; // area_width - border - timestamp
+        let header_width = 10; // "[op:iter]" length
+        let prefix_width = 19; // timestamp(9) + header(10)
+
+        let wrapped = wrap_log_message(&message, available_width, header_width, prefix_width);
+
+        // First line width: available_width - header_width = 50
+        assert_eq!(wrapped[0].len(), 50, "First line should be 50 chars");
+
+        // Continuation lines width: available_width + (prefix_width - header_width) = 60 + 9 = 69
+        let continuation_width = available_width + (prefix_width - header_width);
+        for (idx, line) in wrapped.iter().skip(1).enumerate() {
+            assert!(
+                line.len() <= continuation_width,
+                "Continuation line {} len {} exceeds expected continuation_width {}",
+                idx + 2,
+                line.len(),
+                continuation_width
+            );
+            // Lines that are not the last should be exactly continuation_width
+            if idx + 2 < wrapped.len() {
+                assert_eq!(
+                    line.len(),
+                    continuation_width,
+                    "Non-last continuation line {} should be exactly {} chars",
+                    idx + 2,
+                    continuation_width
+                );
+            }
         }
     }
 
@@ -2580,11 +2615,11 @@ mod tests {
             assert!(line.is_char_boundary(line.len()));
         }
 
-        // Continuation lines should have indentation
+        // Continuation lines should NOT be indented (no-indent policy)
         for line in wrapped.iter().skip(1) {
             assert!(
-                line.starts_with("          "), // 10 spaces
-                "Continuation line should be indented, got: '{}'",
+                !line.starts_with(' '),
+                "Continuation line should NOT be indented, got: '{}'",
                 line
             );
         }

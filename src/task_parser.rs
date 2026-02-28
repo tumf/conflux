@@ -637,8 +637,7 @@ mod tests {
         assert_eq!(progress.total, 3);
     }
 
-    // Mutex to serialize tests that change current directory
-    static DIR_TEST_MUTEX: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    // NOTE: These tests change the process cwd; serialize across the whole crate.
 
     #[test]
     fn test_parse_change_with_worktree_fallback_to_base() {
@@ -646,10 +645,7 @@ mod tests {
         use tempfile::TempDir;
 
         // Acquire lock to prevent concurrent directory changes
-        let _lock = DIR_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
 
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path();
@@ -733,10 +729,7 @@ mod tests {
         use tempfile::TempDir;
 
         // Acquire lock to prevent concurrent directory changes
-        let _lock = DIR_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
 
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path();
@@ -770,10 +763,7 @@ mod tests {
         use tempfile::TempDir;
 
         // Acquire lock to prevent concurrent directory changes
-        let _lock = DIR_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
 
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path();
@@ -817,10 +807,7 @@ mod tests {
         use tempfile::TempDir;
 
         // Acquire lock to prevent concurrent directory changes
-        let _lock = DIR_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
 
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path();
@@ -854,10 +841,7 @@ mod tests {
         use tempfile::TempDir;
 
         // Acquire lock to prevent concurrent directory changes
-        let _lock = DIR_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
 
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path();
@@ -892,10 +876,7 @@ mod tests {
         use tempfile::TempDir;
 
         // Acquire lock to prevent concurrent directory changes
-        let _lock = DIR_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
 
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path();
@@ -982,10 +963,7 @@ mod tests {
         use tempfile::TempDir;
 
         // Acquire lock to prevent concurrent directory changes
-        let _lock = DIR_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
 
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path();
@@ -1021,10 +999,7 @@ mod tests {
         use tempfile::TempDir;
 
         // Acquire lock to prevent concurrent directory changes
-        let _lock = DIR_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
 
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path();
@@ -1060,10 +1035,7 @@ mod tests {
         use tempfile::TempDir;
 
         // Acquire lock to prevent concurrent directory changes
-        let _lock = DIR_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
 
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path();
@@ -1094,10 +1066,7 @@ mod tests {
         use tempfile::TempDir;
 
         // Acquire lock to prevent concurrent directory changes
-        let _lock = DIR_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
 
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path();
@@ -1128,10 +1097,7 @@ mod tests {
         use tempfile::TempDir;
 
         // Acquire lock to prevent concurrent directory changes
-        let _lock = DIR_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
 
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path();
@@ -1188,10 +1154,7 @@ mod tests {
         use tempfile::TempDir;
 
         // Acquire lock to prevent concurrent directory changes
-        let _lock = DIR_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
 
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path();

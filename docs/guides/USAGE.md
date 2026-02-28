@@ -1,67 +1,16 @@
 # Conflux Usage Examples
 
-## Quick Start
+## Quick Start (Golden Path)
 
-### Golden Path: First-Time Setup
-
-The fastest way to get started:
+### 1. Install
 
 ```bash
-# Step 1: Generate configuration for your AI agent
-cflx init
-
-# Step 2: Edit the generated .cflx.jsonc to set your agent commands
-vim .cflx.jsonc
-
-# Step 3a: Launch the interactive TUI to review and process changes
-cflx
-
-# Step 3b: Or run in headless (non-interactive) mode
-cflx run
+cargo install --path .
 ```
 
-### Basic Usage
+### 2. Initialize Configuration
 
-Launch the interactive TUI dashboard (default):
-
-```bash
-cflx
-```
-
-Or run orchestration in headless (non-interactive) mode:
-
-```bash
-cflx run
-```
-
-The `cflx run` command will:
-1. List all pending changes via `openspec list`
-2. Analyze dependencies and select the next change
-3. Apply changes using the configured AI agent command
-4. Archive completed changes
-5. Repeat until all changes are processed
-
-### Process Specific Change
-
-Work on a single change:
-
-```bash
-cflx run --change add-feature-x
-```
-
-This focuses only on `add-feature-x`, ignoring other changes.
-
-### Multiple Changes
-
-Process a specific set of changes:
-
-```bash
-cflx run --change add-feature-x,fix-bug-y,refactor-z
-```
-
-## Configuration
-
-### Generate Configuration File
+Generate a configuration file for your preferred AI agent:
 
 ```bash
 # Default: Claude Code template
@@ -77,9 +26,50 @@ cflx init --template codex
 cflx init --force
 ```
 
-Available templates: `claude` (default), `opencode`, `codex`
+### 3. Launch the TUI (Default)
 
-### Custom Configuration File
+The primary interface is the interactive TUI dashboard:
+
+```bash
+cflx
+```
+
+In the TUI:
+- Use `@` to approve changes
+- Use `Space` to select changes
+- Press `F5` to start processing
+
+### 4. Run Headless (Non-Interactive)
+
+Process all pending changes without the TUI:
+
+```bash
+cflx run
+```
+
+The `cflx run` command will:
+1. List pending changes via `openspec list`
+2. Analyze dependencies and select the next change
+3. Apply changes using the configured AI agent command
+4. Run acceptance (if configured)
+5. Archive completed changes
+6. Repeat until all changes are processed
+
+## Common Usage Patterns
+
+### Process a Specific Change
+
+```bash
+cflx run --change add-feature-x
+```
+
+### Process Multiple Specific Changes
+
+```bash
+cflx run --change add-feature-x,fix-bug-y,refactor-z
+```
+
+### Use a Custom Configuration File
 
 ```bash
 cflx run --config /path/to/config.jsonc
@@ -87,25 +77,24 @@ cflx run --config /path/to/config.jsonc
 
 ## Parallel Execution
 
-### Preview Parallelization Plan (Dry Run)
-
-Preview parallelization groups without executing:
+Run independent changes in parallel using Git worktrees:
 
 ```bash
+# Preview parallelization groups without executing
 cflx run --parallel --dry-run
+
+# Execute in parallel
+cflx run --parallel
 ```
 
-### Run in Parallel Mode
+Resume behavior:
 
 ```bash
-# Auto-detect VCS backend (default)
+# Parallel mode automatically reuses existing workspaces
 cflx run --parallel
 
-# Force Git worktrees
-cflx run --parallel --vcs git
-
-# Limit concurrent workspaces
-cflx run --parallel --max-concurrent 5
+# Force a fresh start (discard existing workspaces)
+cflx run --parallel --no-resume
 ```
 
 ## Web Monitoring
@@ -125,24 +114,33 @@ cflx --web --web-port 9000 --web-bind 0.0.0.0
 
 Access the dashboard at `http://localhost:<port>/` (port shown in startup log).
 
-## Workflow Examples
+## Remote TUI (Server Mode)
 
-### Example 1: Automated Full Run
+If you're running the multi-project server daemon, you can point the TUI at it:
 
 ```bash
-# Generate config and start orchestration
-cflx init
+# Connect the TUI to a remote Conflux server
+cflx --server http://host:9876
+
+# With bearer-token auth
+cflx --server http://host:9876 --server-token "$TOKEN"
+
+# Or read token from environment variable
+cflx --server http://host:9876 --server-token-env CFLX_SERVER_TOKEN
+```
+
+## Workflow Examples
+
+### Example 1: Automated Full Run (Headless)
+
+```bash
 cflx run
 ```
 
 ### Example 2: Interactive TUI Workflow
 
 ```bash
-# Launch TUI and interactively select changes to process
 cflx
-# - Use @ to approve changes
-# - Use Space to select changes
-# - Press F5 to start processing
 ```
 
 ### Example 3: Step-by-Step Processing
@@ -151,37 +149,31 @@ cflx
 # Process first change
 cflx run --change change-1
 
-# Verify completion
+# Verify changes
 openspec list
 
 # Process second change
 cflx run --change change-2
 ```
 
-### Example 4: Recovery from Interruption
+### Example 4: Resume After Interruption
 
 ```bash
-# Run orchestrator
+# Run orchestrator (interrupted mid-run)
 cflx run
 
 # If interrupted, just run again - workspaces are automatically resumed
 cflx run
-
-# To force fresh start (discard existing workspaces)
-cflx run --parallel --no-resume
 ```
 
-### Example 5: Development Workflow
+### Example 5: Parallel Execution with Web Monitoring
 
 ```bash
-# Preview parallelization plan
-cflx run --parallel --dry-run
+# Run with parallel mode and web dashboard
+cflx run --parallel --web
 
-# Review changes manually
-openspec list
-
-# Execute in parallel
-cflx run --parallel
+# Or use TUI with web monitoring
+cflx --web
 ```
 
 ## Integration with CI/CD
@@ -226,6 +218,7 @@ ENTRYPOINT ["cflx"]
 ```
 
 Run:
+
 ```bash
 docker build -t cflx .
 docker run -v $(pwd):/workspace cflx run
@@ -245,35 +238,24 @@ RUST_LOG=debug cflx run 2>&1 | tee debug.log
 RUST_LOG=trace cflx run --change test-change
 ```
 
-### Check OpenSpec Changes
-
-```bash
-# List all pending changes
-openspec list
-
-# Check for spec conflicts between changes
-cflx check-conflicts
-```
-
 ## Best Practices
 
-### 1. Use TUI for Interactive Work
+### 1. Use the TUI for Interactive Work
 
 ```bash
-# Launch TUI for visual progress and control
 cflx
 ```
 
-### 2. Use `run` for Automated Pipelines
+### 2. Use Headless Mode for Automation
 
 ```bash
-# Headless mode for CI/CD or background execution
 cflx run
 ```
 
 ### 3. Incremental Processing
 
 For safety, process one change at a time:
+
 ```bash
 for change in $(openspec list --json | jq -r '.[].id'); do
   cflx run --change "$change"
@@ -284,24 +266,33 @@ for change in $(openspec list --json | jq -r '.[].id'); do
 done
 ```
 
-### 4. Monitor with Web UI
+### 4. Preview Before Running (Parallel Mode)
 
 ```bash
-# Start with web monitoring
-cflx --web
+cflx run --parallel --dry-run
+cflx run --parallel
+```
 
-# Or headless with web
+### 5. Monitor with Web UI
+
+```bash
+cflx --web
 cflx run --web
-# Access dashboard: http://localhost:<port>/
+```
+
+### 6. Check Spec Conflicts Early
+
+```bash
+cflx check-conflicts
 ```
 
 ## Tips
 
-- **Primary interface**: Use `cflx` (TUI) for interactive work; `cflx run` for automation
-- **Recovery**: Parallel mode automatically resumes from interrupted workspaces
-- **Debugging**: Use `RUST_LOG=debug` for detailed execution logs
-- **Conflict checking**: Use `cflx check-conflicts` to find spec conflicts before processing
-- **Templates**: Use `cflx init --template <claude|opencode|codex>` to match your AI agent
+- Default mode is the TUI: `cflx`
+- Use `cflx run` for CI/CD and automated pipelines
+- Use `cflx run --parallel` for independent changes
+- Add `--web` for the HTTP dashboard
+- Use `RUST_LOG=debug` for detailed logs
 
 ## Common Patterns
 
@@ -313,8 +304,8 @@ cflx run --web
 
 cd /path/to/project
 cflx run
-STATUS=$?
 
+STATUS=$?
 if [ $STATUS -eq 0 ]; then
   echo "Orchestration completed successfully"
 else
@@ -325,7 +316,7 @@ fi
 ### Pattern 2: Selective Processing
 
 ```bash
-# Process specific changes by name
+# Process only specific changes
 cflx run --change urgent-fix,critical-update
 ```
 
@@ -334,5 +325,4 @@ cflx run --change urgent-fix,critical-update
 ```bash
 # Run parallel with web monitoring
 cflx run --parallel --web --web-bind 0.0.0.0
-# Access from any device on local network
 ```
