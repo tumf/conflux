@@ -10,6 +10,7 @@ use ratatui::{
     Frame,
 };
 use std::time::Duration;
+use unicode_width::UnicodeWidthChar;
 
 use super::state::AppState;
 use super::types::{AppMode, QueueStatus};
@@ -914,6 +915,31 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
 /// `prefix_width` is timestamp_width + header_width (used to compute continuation width).
 ///
 /// Returns a vector of display lines (wrapped output).
+/// Split `s` into `(prefix, remainder)` where `prefix` occupies at most
+/// `max_width` terminal display columns and never cuts inside a UTF-8 codepoint.
+///
+/// If the very first character is wider than `max_width` (e.g. a wide CJK
+/// character when `max_width` is 1) it is included anyway to prevent an
+/// infinite loop in the caller.
+fn take_chars_by_display_width(s: &str, max_width: usize) -> (&str, &str) {
+    let mut current_width = 0usize;
+    let mut byte_pos = 0usize;
+    for ch in s.chars() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(1);
+        if current_width + char_width > max_width {
+            // If no character has been consumed yet, take this one anyway to
+            // avoid an infinite loop caused by a wide char exceeding max_width.
+            if current_width == 0 {
+                byte_pos += ch.len_utf8();
+            }
+            break;
+        }
+        current_width += char_width;
+        byte_pos += ch.len_utf8();
+    }
+    (&s[..byte_pos], &s[byte_pos..])
+}
+
 fn wrap_log_message(
     message: &str,
     available_width: usize,
@@ -934,23 +960,14 @@ fn wrap_log_message(
         return lines;
     }
 
-    if remaining.len() <= first_width {
-        // Entire message fits on first line
-        lines.push(remaining.to_string());
+    // Split using display width so multi-byte chars are never broken.
+    let (first_part, rest) = take_chars_by_display_width(remaining, first_width);
+    lines.push(first_part.to_string());
+    remaining = rest;
+
+    if remaining.is_empty() {
         return lines;
     }
-
-    // Split first line at character boundary
-    let mut split_point = first_width;
-    while split_point > 0 && !remaining.is_char_boundary(split_point) {
-        split_point -= 1;
-    }
-    if split_point == 0 {
-        split_point = first_width;
-    }
-
-    lines.push(remaining[..split_point].to_string());
-    remaining = &remaining[split_point..];
 
     // Continuation lines: no indent, use full width (available_width + timestamp_width).
     // timestamp_width = prefix_width - header_width, so continuation_width = available_width + (prefix_width - header_width).
@@ -964,23 +981,9 @@ fn wrap_log_message(
             break;
         }
 
-        if remaining.len() <= continuation_width {
-            // Remaining message fits on this line
-            lines.push(remaining.to_string());
-            break;
-        }
-
-        // Split at character boundary
-        let mut split_point = continuation_width;
-        while split_point > 0 && !remaining.is_char_boundary(split_point) {
-            split_point -= 1;
-        }
-        if split_point == 0 {
-            split_point = continuation_width;
-        }
-
-        lines.push(remaining[..split_point].to_string());
-        remaining = &remaining[split_point..];
+        let (chunk, rest) = take_chars_by_display_width(remaining, continuation_width);
+        lines.push(chunk.to_string());
+        remaining = rest;
     }
 
     lines
@@ -2452,6 +2455,45 @@ mod tests {
                 !line.starts_with(' '),
                 "Continuation line should NOT be indented, got: '{}'",
                 line
+            );
+        }
+    }
+
+    // === Regression tests for fix-tui-log-wrap-unicode-boundary ===
+
+    #[test]
+    fn test_wrap_log_message_no_panic_arrow_unicode_prefix() {
+        // Regression: panicked when message starts with \u{2192} (→, 3-byte UTF-8)
+        // and available_width caused split_point to land inside the multi-byte char.
+        //
+        // Original panic:
+        //   byte index 1 is not a char boundary; it is inside '\u{2192}' (bytes 0..3)
+        //   of `\u{2192} Skill "cflx-workflow"`
+        let message = "\u{2192} Skill \"cflx-workflow\"";
+        // Narrow widths exercise the boundary condition
+        for width in 1..=30 {
+            let wrapped = wrap_log_message(message, width, 0, 0);
+            // All characters must be preserved (no data loss)
+            let reconstructed: String = wrapped.join("");
+            assert_eq!(
+                reconstructed, message,
+                "Content must be preserved for width={}",
+                width
+            );
+        }
+    }
+
+    #[test]
+    fn test_wrap_log_message_available_width_1_no_panic() {
+        // Regression: available_width=1 must not panic for any message content
+        let messages = ["hello", "\u{2192} arrow", "日本語", "abc\u{2192}def"];
+        for message in &messages {
+            let wrapped = wrap_log_message(message, 1, 0, 0);
+            let reconstructed: String = wrapped.join("");
+            assert_eq!(
+                reconstructed, *message,
+                "Content must be preserved for message={:?} at width=1",
+                message
             );
         }
     }
