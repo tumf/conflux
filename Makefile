@@ -8,6 +8,9 @@ build:
 install:
 	cargo install --path .
 
+clean:
+	cargo clean
+
 # Create fast indexes (LEANN + TLDR warm cache) - runs in parallel
 index:
 	@echo "Starting parallel index creation..."
