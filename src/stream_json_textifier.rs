@@ -134,28 +134,57 @@ fn extract_tool_use_summary(value: &serde_json::Value) -> Option<String> {
     let mut parts = Vec::new();
     parts.push(format!("[tool_use:{}]", name));
 
-    // Extract key fields from input based on common tool patterns
-    if let Some(obj) = input.as_object() {
-        let key_fields = [
-            "command",
-            "url",
-            "path",
-            "query",
-            "selector",
-            "text",
-            "filePath",
-            "pattern",
-            "description",
-        ];
+    let is_file_tool = matches!(name, "read" | "write" | "edit");
+    let is_write_edit = matches!(name, "write" | "edit");
 
-        for key in &key_fields {
-            if let Some(val) = obj.get(*key) {
-                let val_str = match val {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => val.to_string(),
-                };
-                let truncated = truncate_string(&val_str, 100);
-                parts.push(format!("{}={}", key, truncated));
+    if let Some(obj) = input.as_object() {
+        if is_file_tool {
+            // For file tools, always include the file path (prefer filePath, fall back to path)
+            let file_path = obj
+                .get("filePath")
+                .or_else(|| obj.get("path"))
+                .and_then(|v| v.as_str());
+            if let Some(fp) = file_path {
+                let truncated = truncate_string(fp, 100);
+                parts.push(format!("filePath={}", truncated));
+            }
+
+            if is_write_edit {
+                // For write/edit: do NOT include raw body content (text/content/old_string/new_string).
+                // Instead, emit safe metadata: chars=<n> lines=<n> derived from body fields.
+                let body_text = obj
+                    .get("text")
+                    .or_else(|| obj.get("content"))
+                    .or_else(|| obj.get("new_string"))
+                    .and_then(|v| v.as_str());
+                if let Some(body) = body_text {
+                    parts.push(format!("chars={}", body.len()));
+                    parts.push(format!("lines={}", body.lines().count()));
+                }
+            }
+        } else {
+            // Non-file tools: use generic key field extraction
+            let key_fields = [
+                "command",
+                "url",
+                "path",
+                "query",
+                "selector",
+                "text",
+                "filePath",
+                "pattern",
+                "description",
+            ];
+
+            for key in &key_fields {
+                if let Some(val) = obj.get(*key) {
+                    let val_str = match val {
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => val.to_string(),
+                    };
+                    let truncated = truncate_string(&val_str, 100);
+                    parts.push(format!("{}={}", key, truncated));
+                }
             }
         }
     }
@@ -633,6 +662,93 @@ mod tests {
 
         let line2 = r#"{"type":"system","subtype":"init"}"#;
         assert_eq!(extract_tool_summary_from_stream_json(line2), None);
+    }
+
+    // ── file tool (read/write/edit) path and body rules ───────────────────────
+
+    #[test]
+    fn test_read_tool_includes_filepath() {
+        let line = r#"{"type":"tool_use","name":"read","input":{"filePath":"/src/main.rs"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:read]"));
+        assert!(summary.contains("filePath=/src/main.rs"));
+    }
+
+    #[test]
+    fn test_read_tool_uses_path_alias_when_no_filepath() {
+        let line = r#"{"type":"tool_use","name":"read","input":{"path":"/etc/config.toml"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.contains("filePath=/etc/config.toml"));
+    }
+
+    #[test]
+    fn test_write_tool_includes_filepath_no_body() {
+        // Use serde_json to build valid JSON with arbitrary body text.
+        let body = "fn main() { println!(\"hello\"); }";
+        let json_val = serde_json::json!({
+            "type": "tool_use",
+            "name": "write",
+            "input": {
+                "filePath": "/out/foo.rs",
+                "text": body
+            }
+        });
+        let line = json_val.to_string();
+        let summary = extract_tool_summary_from_stream_json(&line).unwrap();
+        assert!(summary.starts_with("[tool_use:write]"));
+        assert!(summary.contains("filePath=/out/foo.rs"));
+        // Body text must NOT appear in the summary
+        assert!(!summary.contains("fn main"));
+        assert!(!summary.contains("text="));
+    }
+
+    #[test]
+    fn test_write_tool_includes_chars_and_lines_metadata() {
+        let body = "line one\nline two\nline three";
+        let json_val = serde_json::json!({
+            "type": "tool_use",
+            "name": "write",
+            "input": {
+                "filePath": "/out/foo.rs",
+                "text": body
+            }
+        });
+        let line = json_val.to_string();
+        let summary = extract_tool_summary_from_stream_json(&line).unwrap();
+        assert!(summary.contains(&format!("chars={}", body.len())));
+        assert!(summary.contains("lines=3"));
+    }
+
+    #[test]
+    fn test_edit_tool_includes_filepath_no_old_new_string() {
+        let line = r#"{"type":"tool_use","name":"edit","input":{"filePath":"/src/lib.rs","old_string":"foo","new_string":"bar baz qux"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:edit]"));
+        assert!(summary.contains("filePath=/src/lib.rs"));
+        // Raw body strings must not appear
+        assert!(!summary.contains("old_string="));
+        assert!(!summary.contains("new_string="));
+        assert!(!summary.contains("bar baz qux"));
+    }
+
+    #[test]
+    fn test_edit_tool_new_string_body_shows_metadata() {
+        let new_string = "replacement content here";
+        let line = format!(
+            r#"{{"type":"tool_use","name":"edit","input":{{"filePath":"/f.rs","old_string":"x","new_string":"{}"}}}}"#,
+            new_string
+        );
+        let summary = extract_tool_summary_from_stream_json(&line).unwrap();
+        assert!(summary.contains(&format!("chars={}", new_string.len())));
+    }
+
+    #[test]
+    fn test_non_file_tool_still_includes_text_field() {
+        // Ensure non-file tools (e.g. a hypothetical "search" tool) still show text=...
+        let line =
+            r#"{"type":"tool_use","name":"bash","input":{"command":"echo hi","text":"some info"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.contains("text=some info"));
     }
 
     #[test]
