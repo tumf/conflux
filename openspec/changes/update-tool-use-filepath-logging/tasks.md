@@ -9,3 +9,7 @@
 ## Future Work
 
 - Decide whether and how to normalize file paths in summaries (repo-relative vs absolute) and propose a dedicated change if needed.
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Clean the git working tree before re-running acceptance (no modified/tracked files, including `src/stream_json_textifier.rs`).

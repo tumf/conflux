@@ -745,7 +745,8 @@ mod tests {
     #[test]
     fn test_non_file_tool_still_includes_text_field() {
         // Ensure non-file tools (e.g. a hypothetical "search" tool) still show text=...
-        let line = r#"{"type":"tool_use","name":"bash","input":{"command":"echo hi","text":"some info"}}"#;
+        let line =
+            r#"{"type":"tool_use","name":"bash","input":{"command":"echo hi","text":"some info"}}"#;
         let summary = extract_tool_summary_from_stream_json(line).unwrap();
         assert!(summary.contains("text=some info"));
     }
