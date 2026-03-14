@@ -9,3 +9,7 @@
 ## Future Work
 
 - Consider standardizing summary field ordering and field naming across all tools if operators want machine-parsable log summaries later.
+
+## Acceptance #1 Failure Follow-up
+
+- [ ] Clean the working tree (commit or stash `src/stream_json_textifier.rs`) before running acceptance again.

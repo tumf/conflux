@@ -205,15 +205,11 @@ fn extract_tool_use_summary(value: &serde_json::Value) -> Option<String> {
                     let total = todos.len();
                     let done = todos
                         .iter()
-                        .filter(|t| {
-                            t.get("status").and_then(|s| s.as_str()) == Some("completed")
-                        })
+                        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
                         .count();
                     let in_progress = todos
                         .iter()
-                        .filter(|t| {
-                            t.get("status").and_then(|s| s.as_str()) == Some("in_progress")
-                        })
+                        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress"))
                         .count();
                     parts.push(format!("todos={}", total));
                     if done > 0 {
