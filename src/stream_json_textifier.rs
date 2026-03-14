@@ -130,28 +130,44 @@ fn extract_tool_use_summary(value: &serde_json::Value) -> Option<String> {
     // {"type":"tool_use","name":"bash","id":"...","input":{...}}
     let name = value.get("name")?.as_str()?;
     let input = value.get("input")?;
+    // Normalize tool name to lowercase for case-insensitive matching.
+    let name_lower = name.to_ascii_lowercase();
 
     let mut parts = Vec::new();
     parts.push(format!("[tool_use:{}]", name));
 
-    let is_file_tool = matches!(name, "read" | "write" | "edit");
-    let is_write_edit = matches!(name, "write" | "edit");
-
     if let Some(obj) = input.as_object() {
-        if is_file_tool {
-            // For file tools, always include the file path (prefer filePath, fall back to path)
-            let file_path = obj
-                .get("filePath")
-                .or_else(|| obj.get("path"))
-                .and_then(|v| v.as_str());
-            if let Some(fp) = file_path {
-                let truncated = truncate_string(fp, 100);
-                parts.push(format!("filePath={}", truncated));
+        match name_lower.as_str() {
+            "read" => {
+                // File path (prefer filePath, fall back to path).
+                let file_path = obj
+                    .get("filePath")
+                    .or_else(|| obj.get("file_path"))
+                    .or_else(|| obj.get("path"))
+                    .and_then(|v| v.as_str());
+                if let Some(fp) = file_path {
+                    parts.push(format!("filePath={}", truncate_string(fp, 100)));
+                }
+                // Optional offset/limit for partial reads.
+                if let Some(offset) = obj.get("offset").and_then(|v| v.as_i64()) {
+                    parts.push(format!("offset={}", offset));
+                }
+                if let Some(limit) = obj.get("limit").and_then(|v| v.as_i64()) {
+                    parts.push(format!("limit={}", limit));
+                }
             }
-
-            if is_write_edit {
-                // For write/edit: do NOT include raw body content (text/content/old_string/new_string).
-                // Instead, emit safe metadata: chars=<n> lines=<n> derived from body fields.
+            "write" | "edit" | "multiedit" => {
+                // File path.
+                let file_path = obj
+                    .get("filePath")
+                    .or_else(|| obj.get("file_path"))
+                    .or_else(|| obj.get("path"))
+                    .and_then(|v| v.as_str());
+                if let Some(fp) = file_path {
+                    parts.push(format!("filePath={}", truncate_string(fp, 100)));
+                }
+                // Do NOT include raw body content (text/content/old_string/new_string).
+                // Emit safe metadata: chars=<n> lines=<n> derived from body fields.
                 let body_text = obj
                     .get("text")
                     .or_else(|| obj.get("content"))
@@ -162,28 +178,79 @@ fn extract_tool_use_summary(value: &serde_json::Value) -> Option<String> {
                     parts.push(format!("lines={}", body.lines().count()));
                 }
             }
-        } else {
-            // Non-file tools: use generic key field extraction
-            let key_fields = [
-                "command",
-                "url",
-                "path",
-                "query",
-                "selector",
-                "text",
-                "filePath",
-                "pattern",
-                "description",
-            ];
-
-            for key in &key_fields {
-                if let Some(val) = obj.get(*key) {
-                    let val_str = match val {
-                        serde_json::Value::String(s) => s.clone(),
-                        _ => val.to_string(),
-                    };
-                    let truncated = truncate_string(&val_str, 100);
-                    parts.push(format!("{}={}", key, truncated));
+            "grep" => {
+                if let Some(pattern) = obj.get("pattern").and_then(|v| v.as_str()) {
+                    parts.push(format!("pattern={}", truncate_string(pattern, 80)));
+                }
+                if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
+                    parts.push(format!("path={}", truncate_string(path, 80)));
+                }
+                if let Some(glob) = obj.get("glob").and_then(|v| v.as_str()) {
+                    parts.push(format!("glob={}", truncate_string(glob, 80)));
+                }
+                if let Some(mode) = obj.get("output_mode").and_then(|v| v.as_str()) {
+                    parts.push(format!("output_mode={}", mode));
+                }
+            }
+            "glob" => {
+                if let Some(pattern) = obj.get("pattern").and_then(|v| v.as_str()) {
+                    parts.push(format!("pattern={}", truncate_string(pattern, 80)));
+                }
+                if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
+                    parts.push(format!("path={}", truncate_string(path, 80)));
+                }
+            }
+            "todowrite" => {
+                if let Some(todos) = obj.get("todos").and_then(|v| v.as_array()) {
+                    let total = todos.len();
+                    let done = todos
+                        .iter()
+                        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
+                        .count();
+                    let in_progress = todos
+                        .iter()
+                        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress"))
+                        .count();
+                    parts.push(format!("todos={}", total));
+                    if done > 0 {
+                        parts.push(format!("completed={}", done));
+                    }
+                    if in_progress > 0 {
+                        parts.push(format!("in_progress={}", in_progress));
+                    }
+                }
+            }
+            "webfetch" => {
+                if let Some(url) = obj.get("url").and_then(|v| v.as_str()) {
+                    parts.push(format!("url={}", truncate_string(url, 100)));
+                }
+                if let Some(prompt) = obj.get("prompt").and_then(|v| v.as_str()) {
+                    parts.push(format!("prompt={}", truncate_string(prompt, 60)));
+                }
+            }
+            _ => {
+                // Generic bounded fallback for unknown tools: extract a fixed set of
+                // safe scalar fields so logs remain informative without leaking payloads.
+                let key_fields = [
+                    "command",
+                    "url",
+                    "path",
+                    "query",
+                    "selector",
+                    "text",
+                    "filePath",
+                    "pattern",
+                    "description",
+                ];
+                for key in &key_fields {
+                    if let Some(val) = obj.get(*key) {
+                        let val_str = match val {
+                            serde_json::Value::String(s) => s.clone(),
+                            _ => val.to_string(),
+                        };
+                        let truncated = truncate_string(&val_str, 100);
+                        parts.push(format!("{}={}", key, truncated));
+                    }
                 }
             }
         }
@@ -771,5 +838,139 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(result[0].starts_with("[tool_result:tool_789]"));
         assert!(result[0].contains("File not found"));
+    }
+
+    // ── non-Bash dedicated tool formatters ────────────────────────────────────
+
+    #[test]
+    fn test_glob_tool_shows_pattern_and_path() {
+        let line =
+            r#"{"type":"tool_use","name":"glob","input":{"pattern":"**/*.rs","path":"/src"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:glob]"));
+        assert!(summary.contains("pattern=**/*.rs"));
+        assert!(summary.contains("path=/src"));
+    }
+
+    #[test]
+    fn test_glob_tool_without_path() {
+        let line = r#"{"type":"tool_use","name":"glob","input":{"pattern":"*.toml"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:glob]"));
+        assert!(summary.contains("pattern=*.toml"));
+        assert!(!summary.contains("path="));
+    }
+
+    #[test]
+    fn test_grep_tool_shows_pattern_path_and_glob() {
+        let line = r#"{"type":"tool_use","name":"grep","input":{"pattern":"fn main","path":"/src","glob":"*.rs","output_mode":"files_with_matches"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:grep]"));
+        assert!(summary.contains("pattern=fn main"));
+        assert!(summary.contains("path=/src"));
+        assert!(summary.contains("glob=*.rs"));
+        assert!(summary.contains("output_mode=files_with_matches"));
+    }
+
+    #[test]
+    fn test_todowrite_tool_shows_todo_counts() {
+        let line = r#"{"type":"tool_use","name":"todowrite","input":{"todos":[{"content":"Task A","status":"completed"},{"content":"Task B","status":"in_progress"},{"content":"Task C","status":"pending"}]}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:todowrite]"));
+        assert!(summary.contains("todos=3"));
+        assert!(summary.contains("completed=1"));
+        assert!(summary.contains("in_progress=1"));
+    }
+
+    #[test]
+    fn test_todowrite_no_completed_or_inprogress_omits_those_fields() {
+        let line = r#"{"type":"tool_use","name":"todowrite","input":{"todos":[{"content":"Task A","status":"pending"},{"content":"Task B","status":"pending"}]}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.contains("todos=2"));
+        assert!(!summary.contains("completed="));
+        assert!(!summary.contains("in_progress="));
+    }
+
+    #[test]
+    fn test_webfetch_tool_shows_url_and_prompt() {
+        let line = r#"{"type":"tool_use","name":"webfetch","input":{"url":"https://example.com/docs","prompt":"Extract API endpoints"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:webfetch]"));
+        assert!(summary.contains("url=https://example.com/docs"));
+        assert!(summary.contains("prompt=Extract API endpoints"));
+    }
+
+    #[test]
+    fn test_read_tool_includes_offset_and_limit() {
+        let line = r#"{"type":"tool_use","name":"read","input":{"filePath":"/src/main.rs","offset":100,"limit":50}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:read]"));
+        assert!(summary.contains("filePath=/src/main.rs"));
+        assert!(summary.contains("offset=100"));
+        assert!(summary.contains("limit=50"));
+    }
+
+    // ── case-insensitive tool name matching ───────────────────────────────────
+
+    #[test]
+    fn test_read_tool_mixed_case_matches_dedicated_formatter() {
+        let line = r#"{"type":"tool_use","name":"Read","input":{"filePath":"/src/lib.rs"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        // Header preserves original casing; formatter still applies.
+        assert!(summary.starts_with("[tool_use:Read]"));
+        assert!(summary.contains("filePath=/src/lib.rs"));
+        // Must not leak any raw body (nothing to leak here, but ensure path shows up).
+        assert!(summary.contains("filePath="));
+    }
+
+    #[test]
+    fn test_grep_tool_uppercase_matches_dedicated_formatter() {
+        let line = r#"{"type":"tool_use","name":"Grep","input":{"pattern":"TODO","path":"/src"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:Grep]"));
+        assert!(summary.contains("pattern=TODO"));
+        assert!(summary.contains("path=/src"));
+    }
+
+    #[test]
+    fn test_todowrite_mixed_case_matches_dedicated_formatter() {
+        let line = r#"{"type":"tool_use","name":"TodoWrite","input":{"todos":[{"content":"X","status":"completed"}]}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:TodoWrite]"));
+        assert!(summary.contains("todos=1"));
+        assert!(summary.contains("completed=1"));
+    }
+
+    #[test]
+    fn test_bash_uppercase_uses_generic_fallback() {
+        let line = r#"{"type":"tool_use","name":"Bash","input":{"command":"ls -la"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:Bash]"));
+        assert!(summary.contains("command=ls -la"));
+    }
+
+    #[test]
+    fn test_unknown_tool_uses_generic_fallback_with_safe_fields() {
+        let line = r#"{"type":"tool_use","name":"UnknownTool","input":{"query":"search term","description":"some tool","secret_body":"sensitive data"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:UnknownTool]"));
+        assert!(summary.contains("query=search term"));
+        assert!(summary.contains("description=some tool"));
+        // Fields not in the safe list must not appear.
+        assert!(!summary.contains("secret_body"));
+        assert!(!summary.contains("sensitive data"));
+    }
+
+    #[test]
+    fn test_write_tool_body_safety_omits_raw_content() {
+        let line = r#"{"type":"tool_use","name":"write","input":{"filePath":"/out/file.txt","content":"secret content here"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:write]"));
+        assert!(summary.contains("filePath=/out/file.txt"));
+        // Raw body must not appear; only safe metadata.
+        assert!(!summary.contains("secret content here"));
+        assert!(!summary.contains("content="));
+        assert!(summary.contains("chars="));
+        assert!(summary.contains("lines="));
     }
 }
