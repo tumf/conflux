@@ -12,4 +12,4 @@
 
 ## Acceptance #1 Failure Follow-up
 
-- [ ] Clean the working tree (commit or stash `src/stream_json_textifier.rs`) before running acceptance again.
+- [x] Clean the working tree (commit or stash `src/stream_json_textifier.rs`) before running acceptance again.
