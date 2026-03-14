@@ -228,6 +228,20 @@ fn extract_tool_use_summary(value: &serde_json::Value) -> Option<String> {
                     parts.push(format!("prompt={}", truncate_string(prompt, 60)));
                 }
             }
+            "skill" => {
+                // Prefer input.name (spec canonical field); fall back to input.skill
+                // for compatibility with callers that use the parameter field name.
+                let skill_name = obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| obj.get("skill").and_then(|v| v.as_str()));
+                if let Some(skill_name) = skill_name {
+                    parts.push(format!("name={}", truncate_string(skill_name, 80)));
+                }
+                if let Some(args) = obj.get("args").and_then(|v| v.as_str()) {
+                    parts.push(format!("args={}", truncate_string(args, 80)));
+                }
+            }
             _ => {
                 // Generic bounded fallback for unknown tools: extract a fixed set of
                 // safe scalar fields so logs remain informative without leaking payloads.
@@ -959,6 +973,85 @@ mod tests {
         // Fields not in the safe list must not appear.
         assert!(!summary.contains("secret_body"));
         assert!(!summary.contains("sensitive data"));
+    }
+
+    // ── skill tool dedicated formatter ────────────────────────────────────────
+
+    #[test]
+    fn test_skill_tool_shows_skill_name() {
+        let line = r#"{"type":"tool_use","name":"skill","input":{"skill":"commit","args":"-m 'Fix bug'"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:skill]"));
+        assert!(summary.contains("name=commit"));
+        assert!(summary.contains("args=-m 'Fix bug'"));
+    }
+
+    #[test]
+    fn test_skill_tool_without_args() {
+        let line = r#"{"type":"tool_use","name":"skill","input":{"skill":"pdf"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:skill]"));
+        assert!(summary.contains("name=pdf"));
+        assert!(!summary.contains("args="));
+    }
+
+    #[test]
+    fn test_skill_tool_mixed_case_matches_dedicated_formatter() {
+        let line =
+            r#"{"type":"tool_use","name":"Skill","input":{"skill":"commit","args":"--dry-run"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        // Header preserves original casing; formatter still applies.
+        assert!(summary.starts_with("[tool_use:Skill]"));
+        assert!(summary.contains("name=commit"));
+        assert!(summary.contains("args=--dry-run"));
+    }
+
+    #[test]
+    fn test_assistant_message_skill_tool_block_shows_dedicated_summary() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Skill","input":{"skill":"review-pr","args":"123"}}]}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:Skill]"));
+        assert!(summary.contains("name=review-pr"));
+        assert!(summary.contains("args=123"));
+    }
+
+    #[test]
+    fn test_skill_tool_truncates_long_args() {
+        let long_args = "x".repeat(150);
+        let json_val = serde_json::json!({
+            "type": "tool_use",
+            "name": "skill",
+            "input": {
+                "skill": "my-skill",
+                "args": long_args
+            }
+        });
+        let line = json_val.to_string();
+        let summary = extract_tool_summary_from_stream_json(&line).unwrap();
+        assert!(summary.starts_with("[tool_use:skill]"));
+        assert!(summary.contains("name=my-skill"));
+        assert!(summary.contains("..."));
+    }
+
+    #[test]
+    fn test_skill_tool_input_name_field_top_level() {
+        // Spec scenario: top-level tool_use with input.name
+        let line =
+            r#"{"type":"tool_use","name":"skill","input":{"name":"commit","args":"-m 'Fix bug'"}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:skill]"));
+        assert!(summary.contains("name=commit"));
+        assert!(summary.contains("args=-m 'Fix bug'"));
+    }
+
+    #[test]
+    fn test_skill_tool_input_name_field_assistant_block() {
+        // Spec scenario: assistant message tool_use block with input.name
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Skill","input":{"name":"review-pr","args":"123"}}]}}"#;
+        let summary = extract_tool_summary_from_stream_json(line).unwrap();
+        assert!(summary.starts_with("[tool_use:Skill]"));
+        assert!(summary.contains("name=review-pr"));
+        assert!(summary.contains("args=123"));
     }
 
     #[test]
