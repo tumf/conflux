@@ -1237,6 +1237,11 @@ impl Orchestrator {
             });
         }
 
+        // Track start-time rejections so we can report clearly when no work started.
+        let total_requested = changes.len();
+        let rejected_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let track_rejected = rejected_count.clone();
+
         // Run with a simple logging event handler for CLI mode
         let result = service
             .run_parallel(changes.to_vec(), Some(cancel_token), move |event| {
@@ -1247,6 +1252,21 @@ impl Orchestrator {
                     let _ = tx.send(event.clone());
                 }
                 match event {
+                    ParallelEvent::ParallelStartRejected {
+                        ref change_ids,
+                        ref reason,
+                    } => {
+                        // Immediately surface the rejection so the user knows these changes
+                        // will not run, even before the overall completion message.
+                        eprintln!(
+                            "WARNING: {} change(s) rejected at start-time ({}): {}",
+                            change_ids.len(),
+                            reason,
+                            change_ids.join(", ")
+                        );
+                        track_rejected
+                            .fetch_add(change_ids.len(), std::sync::atomic::Ordering::SeqCst);
+                    }
                     ParallelEvent::ApplyStarted { change_id, command } => {
                         info!("Apply started for {}", change_id);
                         println!("[{} apply] {}", change_id, command);
@@ -1346,6 +1366,17 @@ impl Orchestrator {
         }
 
         result?;
+
+        // Report clearly when all requested changes were rejected before any work started.
+        let n_rejected = rejected_count.load(std::sync::atomic::Ordering::SeqCst);
+        if n_rejected >= total_requested && total_requested > 0 {
+            eprintln!(
+                "ERROR: No changes started: all {} requested change(s) were rejected by \
+                 start-time eligibility filter (uncommitted or not in HEAD). \
+                 Commit your changes before running in parallel mode.",
+                total_requested
+            );
+        }
 
         Ok(())
     }

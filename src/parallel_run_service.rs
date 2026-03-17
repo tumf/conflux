@@ -265,6 +265,14 @@ impl ParallelRunService {
                     message,
                 })
                 .await;
+            // Send explicit rejection event so callers can reconcile user-visible state
+            // (e.g. TUI resets Queued rows, CLI reports zero-start)
+            let _ = event_tx
+                .send(ParallelEvent::ParallelStartRejected {
+                    change_ids: skipped.clone(),
+                    reason: "uncommitted or not in HEAD".to_string(),
+                })
+                .await;
         }
 
         if changes.is_empty() {
@@ -779,5 +787,141 @@ mod tests {
         // change-a should be skipped due to uncommitted files
         assert_eq!(committed_ids, vec!["change-b".to_string()]);
         assert_eq!(skipped, vec!["change-a".to_string()]);
+    }
+
+    /// Regression test: prepare_parallel_execution must emit a ParallelStartRejected event
+    /// for each batch of rejected changes so that callers can reconcile user-visible state.
+    #[tokio::test]
+    async fn test_prepare_parallel_execution_emits_rejection_event() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        if !init_git_repo(&temp_dir).await {
+            return;
+        }
+
+        // Commit change-a, leave change-b uncommitted.
+        let base_dir = temp_dir.path().join("openspec/changes");
+        std::fs::create_dir_all(base_dir.join("change-a")).unwrap();
+        std::fs::write(base_dir.join("change-a/proposal.md"), "test").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "add change-a"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        // change-b is not committed (only on disk).
+        std::fs::create_dir_all(base_dir.join("change-b")).unwrap();
+        std::fs::write(base_dir.join("change-b/proposal.md"), "test").unwrap();
+
+        let service =
+            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let changes = vec![
+            create_test_change("change-a", vec![]),
+            create_test_change("change-b", vec![]),
+        ];
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
+
+        let result = service
+            .prepare_parallel_execution(changes, &event_tx)
+            .await
+            .expect("prepare_parallel_execution");
+
+        // change-a should pass; change-b should be rejected.
+        assert!(result.is_some(), "change-a should still be eligible");
+        let committed = result.unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].id, "change-a");
+
+        drop(event_tx);
+
+        let mut got_rejection_event = false;
+        while let Some(event) = event_rx.recv().await {
+            if let ParallelEvent::ParallelStartRejected { change_ids, .. } = event {
+                assert!(
+                    change_ids.contains(&"change-b".to_string()),
+                    "rejection event should include change-b"
+                );
+                got_rejection_event = true;
+            }
+        }
+        assert!(
+            got_rejection_event,
+            "expected a ParallelStartRejected event for the uncommitted change"
+        );
+    }
+
+    /// Regression: when ALL requested changes are rejected, prepare_parallel_execution must
+    /// still emit the rejection event (and return None).
+    #[tokio::test]
+    async fn test_prepare_parallel_execution_all_rejected_emits_rejection_event() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        if !init_git_repo(&temp_dir).await {
+            return;
+        }
+
+        // Make an initial commit that contains `openspec/changes` but neither change-a nor
+        // change-b. This ensures `git ls-tree HEAD:openspec/changes` succeeds and returns an
+        // empty list so that both requested changes are correctly identified as "not in HEAD".
+        let base_dir = temp_dir.path().join("openspec/changes");
+        let placeholder = base_dir.join("placeholder");
+        std::fs::create_dir_all(&placeholder).unwrap();
+        std::fs::write(placeholder.join("proposal.md"), "placeholder").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Add both changes as uncommitted (not in the initial commit).
+        for id in &["change-a", "change-b"] {
+            std::fs::create_dir_all(base_dir.join(id)).unwrap();
+            std::fs::write(base_dir.join(id).join("proposal.md"), "test").unwrap();
+        }
+
+        let service =
+            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let changes = vec![
+            create_test_change("change-a", vec![]),
+            create_test_change("change-b", vec![]),
+        ];
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
+
+        let result = service
+            .prepare_parallel_execution(changes, &event_tx)
+            .await
+            .expect("prepare_parallel_execution");
+
+        assert!(
+            result.is_none(),
+            "all changes were uncommitted so result should be None"
+        );
+
+        drop(event_tx);
+
+        let mut got_rejection_event = false;
+        let mut rejected_ids: Vec<String> = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            if let ParallelEvent::ParallelStartRejected { change_ids, .. } = event {
+                rejected_ids = change_ids;
+                got_rejection_event = true;
+            }
+        }
+        assert!(
+            got_rejection_event,
+            "expected a ParallelStartRejected event even when all changes are rejected"
+        );
+        let mut rejected_ids = rejected_ids;
+        rejected_ids.sort();
+        assert_eq!(rejected_ids, vec!["change-a", "change-b"]);
     }
 }
