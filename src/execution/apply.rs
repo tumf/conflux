@@ -178,9 +178,20 @@ pub fn check_task_progress(workspace_path: &Path, change_id: &str) -> Result<Tas
         let archive_tasks_path = archive_root.join(latest_dir).join("tasks.md");
         if archive_tasks_path.exists() {
             let progress = crate::task_parser::parse_file(&archive_tasks_path, Some(change_id))?;
-            debug!(
-                "Tasks file found in archive for {}: {}/{} complete",
-                change_id, progress.completed, progress.total
+            // Warn when using archive fallback: the active change directory is gone and we
+            // are reading task progress from a previously archived copy.  In a resumed
+            // workspace this can make the apply loop exit immediately ("already complete")
+            // even though the workspace has not actually run apply.  Callers that reach
+            // this branch for workspaces in Archived/Merged state should have been
+            // short-circuited by workspace-state detection before invoking check_task_progress.
+            warn!(
+                "Tasks file for '{}' not found in active change directory; \
+                 falling back to archived copy at '{}' ({}/{} tasks complete). \
+                 This is expected for Archiving state but unexpected for fresh workspaces.",
+                change_id,
+                archive_tasks_path.display(),
+                progress.completed,
+                progress.total
             );
             return Ok(progress);
         }

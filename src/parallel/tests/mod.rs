@@ -8,3 +8,5 @@ mod conflict;
 mod executor;
 #[cfg(test)]
 mod manual_resolve;
+#[cfg(test)]
+mod workspace_resume;
