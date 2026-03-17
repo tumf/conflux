@@ -12,8 +12,7 @@ use crate::execution::state::{detect_workspace_state, WorkspaceState};
 use crate::parallel::workspace::get_or_create_workspace;
 use crate::parallel::ParallelEvent;
 use crate::vcs::{
-    VcsBackend, VcsError, VcsResult, VcsWarning, Workspace, WorkspaceInfo, WorkspaceManager,
-    WorkspaceStatus,
+    VcsBackend, VcsResult, VcsWarning, Workspace, WorkspaceInfo, WorkspaceManager, WorkspaceStatus,
 };
 use async_trait::async_trait;
 use std::collections::HashSet;
