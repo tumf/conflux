@@ -929,7 +929,6 @@ mod tests {
             got_rejection_event,
             "expected a ParallelStartRejected event even when all changes are rejected"
         );
-        let mut rejected_ids = rejected_ids;
         rejected_ids.sort();
         assert_eq!(rejected_ids, vec!["change-a", "change-b"]);
     }
