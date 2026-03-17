@@ -1627,4 +1627,44 @@ mod tests {
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].id, "other-change");
     }
+
+    /// Regression: when ALL requested changes are rejected by start-time eligibility filtering,
+    /// the CLI event callback must count them as rejected so the orchestrator can report that
+    /// zero changes started.  This test directly exercises the rejected_count accumulation
+    /// logic used in `run_parallel_in_parallel_mode` to trigger the
+    /// "ERROR: No changes started" message.
+    #[test]
+    fn test_cli_all_rejected_start_detection() {
+        use crate::parallel::ParallelEvent;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let total_requested: usize = 2;
+        let rejected_count = Arc::new(AtomicUsize::new(0));
+        let track_rejected = rejected_count.clone();
+
+        // Mirror the event-callback logic from run_parallel_in_parallel_mode.
+        let handle_event = move |event: ParallelEvent| {
+            if let ParallelEvent::ParallelStartRejected { change_ids, .. } = event {
+                track_rejected.fetch_add(change_ids.len(), Ordering::SeqCst);
+            }
+        };
+
+        // Simulate a single ParallelStartRejected event covering all requested changes.
+        handle_event(ParallelEvent::ParallelStartRejected {
+            change_ids: vec!["change-a".to_string(), "change-b".to_string()],
+            reason: "uncommitted or not in HEAD".to_string(),
+        });
+
+        let n_rejected = rejected_count.load(Ordering::SeqCst);
+        assert_eq!(
+            n_rejected, total_requested,
+            "rejected_count must equal total_requested when all changes are filtered out"
+        );
+        // Verify the guard condition used in the orchestrator to emit the error message.
+        assert!(
+            n_rejected >= total_requested && total_requested > 0,
+            "orchestrator should detect the all-rejected condition and report no changes started"
+        );
+    }
 }

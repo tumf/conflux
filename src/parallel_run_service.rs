@@ -306,7 +306,16 @@ impl ParallelRunService {
         // Prepare changes using the common helper (sends warning event if needed)
         let changes = match self.prepare_parallel_execution(changes, &event_tx).await? {
             Some(changes) => changes,
-            None => return Ok(()),
+            None => {
+                // All changes were rejected before execution started.
+                // The forwarding task has not been spawned yet, so drain any buffered
+                // rejection events directly and forward them to the caller before returning.
+                drop(event_tx);
+                while let Some(event) = event_rx.recv().await {
+                    event_handler(event);
+                }
+                return Ok(());
+            }
         };
 
         info!(
@@ -923,5 +932,68 @@ mod tests {
         let mut rejected_ids = rejected_ids;
         rejected_ids.sort();
         assert_eq!(rejected_ids, vec!["change-a", "change-b"]);
+    }
+
+    /// Regression: when ALL requested changes are rejected, `run_parallel` (the callback-based
+    /// public API used by CLI) must forward the ParallelStartRejected event to the caller
+    /// even on the early-return path where no forwarding task has been spawned yet.
+    ///
+    /// Before the fix, `run_parallel` returned `Ok(())` immediately after
+    /// `prepare_parallel_execution` returned `None`, silently dropping the buffered events.
+    #[tokio::test]
+    async fn test_run_parallel_all_rejected_forwards_event_to_callback() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        if !init_git_repo(&temp_dir).await {
+            return;
+        }
+
+        // Make an initial commit that does not contain change-a or change-b.
+        let base_dir = temp_dir.path().join("openspec/changes");
+        let placeholder = base_dir.join("placeholder");
+        std::fs::create_dir_all(&placeholder).unwrap();
+        std::fs::write(placeholder.join("proposal.md"), "placeholder").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Add both changes as uncommitted (not in HEAD).
+        for id in &["change-a", "change-b"] {
+            std::fs::create_dir_all(base_dir.join(id)).unwrap();
+            std::fs::write(base_dir.join(id).join("proposal.md"), "test").unwrap();
+        }
+
+        let service =
+            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let changes = vec![
+            create_test_change("change-a", vec![]),
+            create_test_change("change-b", vec![]),
+        ];
+
+        let collected_events: std::sync::Arc<std::sync::Mutex<Vec<ParallelEvent>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected_events_clone = collected_events.clone();
+
+        service
+            .run_parallel(changes, None, move |event| {
+                collected_events_clone.lock().unwrap().push(event);
+            })
+            .await
+            .expect("run_parallel should succeed even when all changes are rejected");
+
+        let events = collected_events.lock().unwrap();
+        let got_rejection = events
+            .iter()
+            .any(|e| matches!(e, ParallelEvent::ParallelStartRejected { .. }));
+        assert!(
+            got_rejection,
+            "ParallelStartRejected must be forwarded to the callback when all changes are rejected at start time"
+        );
     }
 }

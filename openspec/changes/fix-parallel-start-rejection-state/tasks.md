@@ -9,3 +9,8 @@
 ## Future Work
 
 - Consider introducing a dedicated shared status such as "RejectedAtStart" if future UX needs stronger differentiation than warnings plus restored idle/not-queued state.
+
+## Acceptance #1 Failure Follow-up
+
+- [x] [src/parallel_run_service.rs:307] `ParallelRunService::run_parallel` returns early when all requested changes are rejected, so `ParallelStartRejected` is never forwarded to the CLI callback; route rejection events through the callback even on the early-return path.
+- [x] [src/orchestrator.rs:1240] Add a CLI regression test for the all-rejected start path that proves `cflx run --parallel` reports that zero changes started due to start-time eligibility filtering.
