@@ -17,6 +17,7 @@ use tracing::{error, info, warn};
 use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
+use crate::execution::state::{detect_workspace_state, WorkspaceState};
 use crate::vcs::WorkspaceStatus;
 
 use super::cleanup::WorkspaceCleanupGuard;
@@ -88,8 +89,8 @@ impl ParallelExecutor {
             OrchestratorError::AgentCommand(format!("Failed to acquire semaphore: {}", e))
         })?;
 
-        // Create or reuse workspace
-        let workspace_val = workspace::get_or_create_workspace(
+        // Create or reuse workspace; was_resumed=true means an existing workspace was reused.
+        let (workspace_val, was_resumed) = workspace::get_or_create_workspace(
             self.workspace_manager.as_mut(),
             &change_id,
             &base_revision,
@@ -126,6 +127,102 @@ impl ParallelExecutor {
         // Spawn apply + acceptance + archive task
         join_set.spawn(async move {
             let _permit = permit; // Hold permit until task completes
+
+            // Detect workspace state for resumed workspaces and route accordingly.
+            // A new workspace always starts fresh (Created state).
+            // A resumed workspace may be in any state; we must not blindly run the full
+            // pipeline for terminal states (Archived, Merged) or already-applied states.
+            let effective_state = if was_resumed {
+                match detect_workspace_state(
+                    &change_id,
+                    &workspace.path,
+                    base_branch.as_deref().unwrap_or("main"),
+                )
+                .await
+                {
+                    Ok(state) => {
+                        let state_label = format!("{:?}", state);
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::Log(
+                                    LogEntry::info(format!(
+                                        "Resuming existing workspace for {} (detected state: {})",
+                                        change_id, state_label
+                                    ))
+                                    .with_change_id(&change_id),
+                                ))
+                                .await;
+                        }
+                        state
+                    }
+                    Err(e) => {
+                        warn!(
+                            "State detection failed for '{}': {}, treating as Created",
+                            change_id, e
+                        );
+                        WorkspaceState::Created
+                    }
+                }
+            } else {
+                WorkspaceState::Created
+            };
+
+            // Early return for terminal states: Archived and Merged workspaces must not
+            // re-enter the apply/acceptance/archive pipeline.  Doing so silently creates
+            // duplicate apply commits or masks already-complete work as a fresh start.
+            match &effective_state {
+                WorkspaceState::Merged => {
+                    info!(
+                        "Change '{}' workspace already merged to base, skipping all processing",
+                        change_id
+                    );
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::Log(
+                                LogEntry::info(format!(
+                                    "Change {} skipped: workspace already merged to base branch",
+                                    change_id
+                                ))
+                                .with_change_id(&change_id),
+                            ))
+                            .await;
+                    }
+                    // cancel_monitor has not been spawned yet at this point,
+                    // so we return without aborting it.
+                    return WorkspaceResult {
+                        change_id,
+                        workspace_name: workspace.name,
+                        final_revision: None,
+                        error: None,
+                    };
+                }
+                WorkspaceState::Archived => {
+                    info!(
+                        "Change '{}' workspace already archived, skipping apply/acceptance/archive",
+                        change_id
+                    );
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::Log(
+                                LogEntry::info(format!(
+                                    "Change {} skipped: workspace already archived (not yet merged)",
+                                    change_id
+                                ))
+                                .with_change_id(&change_id),
+                            ))
+                            .await;
+                    }
+                    // cancel_monitor has not been spawned yet at this point,
+                    // so we return without aborting it.
+                    return WorkspaceResult {
+                        change_id,
+                        workspace_name: workspace.name,
+                        final_revision: None,
+                        error: None,
+                    };
+                }
+                _ => {}
+            }
 
             // Create agent for acceptance testing
             let mut agent =
@@ -166,8 +263,33 @@ impl ParallelExecutor {
                 }
             });
 
-            // Apply+Acceptance loop: retry apply when acceptance fails
+            // Apply+Acceptance loop: retry apply when acceptance fails.
+            // For workspaces in Applied or Archiving state the apply step already
+            // ran in a previous execution; skip the apply loop body and proceed
+            // directly to the acceptance + archive stages so we avoid creating a
+            // spurious duplicate "Apply: <change_id>" commit.
+            let skip_apply = matches!(
+                effective_state,
+                WorkspaceState::Applied | WorkspaceState::Archiving
+            );
+
             let _apply_revision = loop {
+                // Skip apply for workspaces that were already applied in a previous run.
+                if skip_apply {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::Log(
+                                LogEntry::info(format!(
+                                    "Skipping apply for {} (workspace already in {:?} state)",
+                                    change_id, effective_state
+                                ))
+                                .with_change_id(&change_id),
+                            ))
+                            .await;
+                    }
+                    break String::new();
+                }
+
                 // Check if this change has been stopped (single-change stop)
                 if let Some(ref queue) = dynamic_queue {
                     if queue.is_stopped(&change_id).await {

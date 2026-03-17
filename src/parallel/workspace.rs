@@ -19,6 +19,12 @@ use tracing::info;
 /// - Checks for existing workspaces if no_resume is false
 /// - Creates new workspaces when needed
 /// - Sends appropriate events for workspace creation/resumption
+///
+/// Returns `(workspace, was_resumed)` where `was_resumed` is `true` when an
+/// existing workspace was reused and `false` when a new workspace was created.
+/// Callers that need to resume from a known state should use the `was_resumed`
+/// flag to call [`crate::execution::state::detect_workspace_state`] and route
+/// accordingly.
 pub async fn get_or_create_workspace(
     workspace_manager: &mut dyn WorkspaceManager,
     change_id: &str,
@@ -26,7 +32,7 @@ pub async fn get_or_create_workspace(
     no_resume: bool,
     force_recreate_worktree: &HashSet<String>,
     event_tx: &Option<mpsc::Sender<ParallelEvent>>,
-) -> Result<Workspace> {
+) -> Result<(Workspace, bool)> {
     // Check for existing workspace (resume scenario)
     if !no_resume && !force_recreate_worktree.contains(change_id) {
         if let Ok(Some(workspace_info)) = workspace_manager.find_existing_workspace(change_id).await
@@ -44,7 +50,7 @@ pub async fn get_or_create_workspace(
                     },
                 )
                 .await;
-                return Ok(ws);
+                return Ok((ws, true));
             }
         }
     }
@@ -63,5 +69,5 @@ pub async fn get_or_create_workspace(
     )
     .await;
 
-    Ok(ws)
+    Ok((ws, false))
 }
