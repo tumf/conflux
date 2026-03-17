@@ -1237,6 +1237,11 @@ impl Orchestrator {
             });
         }
 
+        // Track start-time rejections so we can report clearly when no work started.
+        let total_requested = changes.len();
+        let rejected_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let track_rejected = rejected_count.clone();
+
         // Run with a simple logging event handler for CLI mode
         let result = service
             .run_parallel(changes.to_vec(), Some(cancel_token), move |event| {
@@ -1247,6 +1252,21 @@ impl Orchestrator {
                     let _ = tx.send(event.clone());
                 }
                 match event {
+                    ParallelEvent::ParallelStartRejected {
+                        ref change_ids,
+                        ref reason,
+                    } => {
+                        // Immediately surface the rejection so the user knows these changes
+                        // will not run, even before the overall completion message.
+                        eprintln!(
+                            "WARNING: {} change(s) rejected at start-time ({}): {}",
+                            change_ids.len(),
+                            reason,
+                            change_ids.join(", ")
+                        );
+                        track_rejected
+                            .fetch_add(change_ids.len(), std::sync::atomic::Ordering::SeqCst);
+                    }
                     ParallelEvent::ApplyStarted { change_id, command } => {
                         info!("Apply started for {}", change_id);
                         println!("[{} apply] {}", change_id, command);
@@ -1346,6 +1366,17 @@ impl Orchestrator {
         }
 
         result?;
+
+        // Report clearly when all requested changes were rejected before any work started.
+        let n_rejected = rejected_count.load(std::sync::atomic::Ordering::SeqCst);
+        if n_rejected >= total_requested && total_requested > 0 {
+            eprintln!(
+                "ERROR: No changes started: all {} requested change(s) were rejected by \
+                 start-time eligibility filter (uncommitted or not in HEAD). \
+                 Commit your changes before running in parallel mode.",
+                total_requested
+            );
+        }
 
         Ok(())
     }
@@ -1595,5 +1626,45 @@ mod tests {
         let eligible = orchestrator.filter_stalled_changes(&changes);
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].id, "other-change");
+    }
+
+    /// Regression: when ALL requested changes are rejected by start-time eligibility filtering,
+    /// the CLI event callback must count them as rejected so the orchestrator can report that
+    /// zero changes started.  This test directly exercises the rejected_count accumulation
+    /// logic used in `run_parallel_in_parallel_mode` to trigger the
+    /// "ERROR: No changes started" message.
+    #[test]
+    fn test_cli_all_rejected_start_detection() {
+        use crate::parallel::ParallelEvent;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let total_requested: usize = 2;
+        let rejected_count = Arc::new(AtomicUsize::new(0));
+        let track_rejected = rejected_count.clone();
+
+        // Mirror the event-callback logic from run_parallel_in_parallel_mode.
+        let handle_event = move |event: ParallelEvent| {
+            if let ParallelEvent::ParallelStartRejected { change_ids, .. } = event {
+                track_rejected.fetch_add(change_ids.len(), Ordering::SeqCst);
+            }
+        };
+
+        // Simulate a single ParallelStartRejected event covering all requested changes.
+        handle_event(ParallelEvent::ParallelStartRejected {
+            change_ids: vec!["change-a".to_string(), "change-b".to_string()],
+            reason: "uncommitted or not in HEAD".to_string(),
+        });
+
+        let n_rejected = rejected_count.load(Ordering::SeqCst);
+        assert_eq!(
+            n_rejected, total_requested,
+            "rejected_count must equal total_requested when all changes are filtered out"
+        );
+        // Verify the guard condition used in the orchestrator to emit the error message.
+        assert!(
+            n_rejected >= total_requested && total_requested > 0,
+            "orchestrator should detect the all-rejected condition and report no changes started"
+        );
     }
 }

@@ -378,6 +378,15 @@ pub enum ExecutionEvent {
     // General events
     /// Warning message (non-fatal)
     Warning { title: String, message: String },
+    /// Changes rejected at parallel start-time eligibility filter
+    ///
+    /// Sent when backend filtering excludes one or more changes before parallel execution
+    /// starts. Callers should use this to restore a consistent non-running state for the
+    /// rejected changes (e.g. reset Queued rows in TUI, report zero-start in CLI).
+    ParallelStartRejected {
+        change_ids: Vec<String>,
+        reason: String,
+    },
     /// Log message
     Log(LogEntry),
     /// Processing stopping (graceful stop initiated)

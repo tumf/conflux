@@ -1410,6 +1410,9 @@ impl AppState {
             // Message events
             OrchestratorEvent::Log(entry) => self.handle_log(entry),
             OrchestratorEvent::Warning { title, message } => self.handle_warning(title, message),
+            OrchestratorEvent::ParallelStartRejected { change_ids, reason } => {
+                self.handle_parallel_start_rejected(change_ids, reason)
+            }
             OrchestratorEvent::Error { message } => self.handle_error(message),
 
             // Remote server incremental update (applies non-regression rule)
@@ -1505,6 +1508,14 @@ impl AppState {
                 self.orchestration_elapsed = Some(started.elapsed());
             }
             return;
+        }
+
+        // Safety net: reset any changes still in Queued state (e.g. rejected before start
+        // that were not cleared by an earlier ParallelStartRejected event).
+        for change in &mut self.changes {
+            if matches!(change.queue_status, QueueStatus::Queued) {
+                change.queue_status = QueueStatus::NotQueued;
+            }
         }
 
         self.mode = AppMode::Select;
@@ -2088,6 +2099,30 @@ impl AppState {
             });
         }
         self.add_log(LogEntry::warn(message));
+    }
+
+    /// Reset backend-rejected changes from Queued to NotQueued with an explanatory log entry.
+    ///
+    /// Called when `ParallelStartRejected` is received, meaning backend eligibility filtering
+    /// excluded one or more changes before execution started. Any such change that was left in
+    /// `Queued` state by the TUI start/resume path is reset to `NotQueued` so the row no longer
+    /// appears as if it is about to run.
+    fn handle_parallel_start_rejected(&mut self, change_ids: Vec<String>, reason: String) {
+        let mut reset_ids = Vec::new();
+        for change in &mut self.changes {
+            if change_ids.contains(&change.id) && matches!(change.queue_status, QueueStatus::Queued)
+            {
+                change.queue_status = QueueStatus::NotQueued;
+                reset_ids.push(change.id.clone());
+            }
+        }
+        if !reset_ids.is_empty() {
+            self.add_log(LogEntry::warn(format!(
+                "Not started ({}): {}",
+                reason,
+                reset_ids.join(", ")
+            )));
+        }
     }
 
     fn handle_error(&mut self, message: String) {
@@ -3863,5 +3898,124 @@ mod tests {
         assert!(json.contains("project_id"));
         assert!(json.contains("operation"));
         assert!(json.contains("iteration"));
+    }
+
+    // ── Regression tests for fix-parallel-start-rejection-state ─────────────
+
+    /// TUI stale-eligibility regression: when a change becomes uncommitted after
+    /// the last refresh but before parallel start, the backend sends
+    /// ParallelStartRejected and the TUI must clear the Queued row.
+    #[test]
+    fn test_parallel_start_rejected_clears_queued_status() {
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Simulate what start_processing / resume_processing does:
+        // mark change-a as Queued (it was selected before backend rejected it).
+        app.changes[0].queue_status = QueueStatus::Queued;
+        // change-b is not queued.
+        app.mode = AppMode::Running;
+
+        // Backend rejects change-a at start time.
+        app.handle_orchestrator_event(OrchestratorEvent::ParallelStartRejected {
+            change_ids: vec!["change-a".to_string()],
+            reason: "uncommitted or not in HEAD".to_string(),
+        });
+
+        // change-a must no longer be Queued.
+        let a = app.changes.iter().find(|c| c.id == "change-a").unwrap();
+        assert_eq!(
+            a.queue_status,
+            QueueStatus::NotQueued,
+            "change-a should have been reset from Queued to NotQueued"
+        );
+
+        // change-b was never Queued; its status should be unchanged.
+        let b = app.changes.iter().find(|c| c.id == "change-b").unwrap();
+        assert_eq!(b.queue_status, QueueStatus::NotQueued);
+
+        // A warning log entry should explain the rejection.
+        assert!(
+            app.logs
+                .iter()
+                .any(|log| log.message.contains("Not started")),
+            "expected a 'Not started' log entry"
+        );
+    }
+
+    /// Verify that ParallelStartRejected does NOT affect changes that are NOT in Queued state.
+    #[test]
+    fn test_parallel_start_rejected_does_not_affect_non_queued() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        // change-a is Applying (already running), not merely Queued.
+        app.changes[0].queue_status = QueueStatus::Applying;
+        app.mode = AppMode::Running;
+
+        app.handle_orchestrator_event(OrchestratorEvent::ParallelStartRejected {
+            change_ids: vec!["change-a".to_string()],
+            reason: "uncommitted or not in HEAD".to_string(),
+        });
+
+        // Applying should not be disturbed.
+        let a = app.changes.iter().find(|c| c.id == "change-a").unwrap();
+        assert_eq!(a.queue_status, QueueStatus::Applying);
+    }
+
+    /// Safety-net regression: AllCompleted must reset any lingering Queued changes so that
+    /// stale Queued state never survives into Select mode.
+    #[test]
+    fn test_all_completed_resets_remaining_queued() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].queue_status = QueueStatus::Queued;
+        app.mode = AppMode::Running;
+
+        app.handle_orchestrator_event(OrchestratorEvent::AllCompleted);
+
+        assert_eq!(app.mode, AppMode::Select);
+        let a = app.changes.iter().find(|c| c.id == "change-a").unwrap();
+        assert_eq!(
+            a.queue_status,
+            QueueStatus::NotQueued,
+            "Queued change should be reset to NotQueued after AllCompleted"
+        );
+    }
+
+    /// Resume-processing regression: F5 from Stopped mode that encounters a now-uncommitted
+    /// change should result in Queued→NotQueued when ParallelStartRejected arrives.
+    #[test]
+    fn test_resume_then_parallel_start_rejected_resets_queued() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Enter Stopped mode with change-a execution-marked.
+        app.mode = AppMode::Stopped;
+        app.changes[0].selected = true;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+
+        // User presses F5: resume_processing sets change-a to Queued.
+        let cmd = app.resume_processing();
+        assert!(cmd.is_some(), "resume_processing should return a command");
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+        assert_eq!(app.mode, AppMode::Running);
+
+        // Backend rejects change-a (became uncommitted between last refresh and F5).
+        app.handle_orchestrator_event(OrchestratorEvent::ParallelStartRejected {
+            change_ids: vec!["change-a".to_string()],
+            reason: "uncommitted or not in HEAD".to_string(),
+        });
+
+        // change-a must not remain Queued.
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+        assert!(
+            app.logs
+                .iter()
+                .any(|log| log.message.contains("Not started")),
+            "expected a rejection log entry"
+        );
     }
 }
