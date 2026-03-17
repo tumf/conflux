@@ -1,7 +1,6 @@
 ---
 agent: build
 description: Implement an approved OpenSpec change and keep tasks in sync.
-model: anthropic/claude-sonnet-4-5
 ---
 
 change_id: $1

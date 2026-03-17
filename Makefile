@@ -1,8 +1,12 @@
-.PHONY: install build bump-minor bump-patch bump-major index index-full setup fmt lint test check openapi check-openapi
+.PHONY: install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test check openapi check-openapi
 
 # Build the project
 build:
 	cargo build --release
+
+# Clean build artifacts
+clean:
+	cargo clean
 
 # Install the binary locally
 install:
@@ -66,19 +70,19 @@ check: fmt lint test
 # Bump patch version (0.0.x -> 0.0.x+1) using cargo-release
 bump-patch:
 	@echo "Bumping patch version..."
-	cargo release patch --execute --no-confirm --no-publish
+	./scripts/bump.sh patch
 	@echo "Patch version bumped and tagged successfully"
 
 # Bump minor version (0.x.0 -> 0.x+1.0) using cargo-release
 bump-minor:
 	@echo "Bumping minor version..."
-	cargo release minor --execute --no-confirm --no-publish
+	./scripts/bump.sh minor
 	@echo "Minor version bumped and tagged successfully"
 
 # Bump major version (x.0.0 -> x+1.0.0) using cargo-release
 bump-major:
 	@echo "Bumping major version..."
-	cargo release major --execute --no-confirm --no-publish
+	./scripts/bump.sh major
 	@echo "Major version bumped and tagged successfully"
 
 # Generate OpenAPI specification

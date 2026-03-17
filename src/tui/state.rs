@@ -25,6 +25,79 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+fn apply_remote_status(change: &mut ChangeState, status: &str) {
+    // Avoid regressing active/terminal states based on laggy remote snapshots.
+    let current = change.queue_status.clone();
+
+    let next = match status {
+        "applying" => Some(QueueStatus::Applying),
+        "archiving" => Some(QueueStatus::Archiving),
+        "accepting" => Some(QueueStatus::Accepting),
+        "resolving" => Some(QueueStatus::Resolving),
+        "archived" => Some(QueueStatus::Archived),
+        "merged" => Some(QueueStatus::Merged),
+        "merge_wait" => Some(QueueStatus::MergeWait),
+        "resolve_wait" => Some(QueueStatus::ResolveWait),
+        "blocked" => Some(QueueStatus::Blocked),
+        "queued" => Some(QueueStatus::Queued),
+        "idle" => Some(QueueStatus::NotQueued),
+        "error" => Some(QueueStatus::Error("remote".to_string())),
+        _ => None,
+    };
+
+    let Some(next) = next else {
+        return;
+    };
+
+    // Don't downgrade active states to queued/idle.
+    if matches!(
+        current,
+        QueueStatus::Applying
+            | QueueStatus::Archiving
+            | QueueStatus::Accepting
+            | QueueStatus::Resolving
+    ) && matches!(next, QueueStatus::Queued | QueueStatus::NotQueued)
+    {
+        return;
+    }
+
+    // Only set queued/idle if we're not already in a terminal state.
+    if matches!(next, QueueStatus::Queued | QueueStatus::NotQueued)
+        && matches!(
+            current,
+            QueueStatus::Archived | QueueStatus::Merged | QueueStatus::Error(_)
+        )
+    {
+        return;
+    }
+
+    // Transition bookkeeping for elapsed time.
+    if matches!(next, QueueStatus::Applying) && change.started_at.is_none() {
+        change.started_at = Some(Instant::now());
+        change.elapsed_time = None;
+    }
+
+    if !matches!(
+        next,
+        QueueStatus::Applying
+            | QueueStatus::Archiving
+            | QueueStatus::Accepting
+            | QueueStatus::Resolving
+    ) && matches!(
+        current,
+        QueueStatus::Applying
+            | QueueStatus::Archiving
+            | QueueStatus::Accepting
+            | QueueStatus::Resolving
+    ) {
+        if let Some(started) = change.started_at {
+            change.elapsed_time = Some(started.elapsed());
+        }
+    }
+
+    change.queue_status = next;
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -1065,11 +1138,28 @@ impl AppState {
     ///
     /// Returns the most recent log entry that matches the given change_id.
     /// Used for displaying log previews in the change list.
+    ///
+    /// In remote mode, change IDs have the form `"<project_id>::<project_name>/<change_id>"`.
+    /// Log entries from the remote server may have `change_id` set to the bare `project_id`
+    /// (when no specific change is known). This method also matches those project-level logs
+    /// by checking if the `change_id` argument starts with `"<entry.change_id>::"`.
     pub fn get_latest_log_for_change(&self, change_id: &str) -> Option<&LogEntry> {
-        self.logs
-            .iter()
-            .rev()
-            .find(|entry| entry.change_id.as_deref() == Some(change_id))
+        self.logs.iter().rev().find(|entry| {
+            if let Some(entry_cid) = entry.change_id.as_deref() {
+                // Exact match (local mode and remote mode with full change_id)
+                if entry_cid == change_id {
+                    return true;
+                }
+                // Project-level log match: entry has project_id, change_id starts with that project_id
+                // Remote change IDs have the form "<project_id>::<project_name>/<change_id>"
+                // Remote logs with only project_id set as change_id will match via this prefix check.
+                let prefix = format!("{}::", entry_cid);
+                if change_id.starts_with(&prefix) {
+                    return true;
+                }
+            }
+            false
+        })
     }
 
     /// Add a log entry
@@ -1321,6 +1411,44 @@ impl AppState {
             OrchestratorEvent::Log(entry) => self.handle_log(entry),
             OrchestratorEvent::Warning { title, message } => self.handle_warning(title, message),
             OrchestratorEvent::Error { message } => self.handle_error(message),
+
+            // Remote server incremental update (applies non-regression rule)
+            OrchestratorEvent::RemoteChangeUpdate {
+                id,
+                completed_tasks,
+                total_tasks,
+                status,
+                iteration_number,
+            } => {
+                let mut status_log: Option<String> = None;
+                if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
+                    // Non-regression rule: never decrease completed_tasks
+                    if completed_tasks >= change.completed_tasks {
+                        change.completed_tasks = completed_tasks;
+                    }
+                    // Always update total so the denominator stays accurate
+                    change.total_tasks = total_tasks;
+
+                    // Status update (remote mode)
+                    if let Some(status) = status.as_deref() {
+                        let before = change.queue_status.clone();
+                        apply_remote_status(change, status);
+                        if before != change.queue_status {
+                            status_log = Some(format!(
+                                "Remote status: {} -> {}",
+                                id,
+                                change.queue_status.display()
+                            ));
+                        }
+                    }
+
+                    // Apply monotonic non-regression rule for iteration_number
+                    change.update_iteration_monotonic(iteration_number);
+                }
+                if let Some(line) = status_log {
+                    self.add_log(LogEntry::info(line));
+                }
+            }
 
             // Ignore other parallel-specific events that don't affect TUI state
             _ => {
@@ -3400,5 +3528,340 @@ mod tests {
             !app.resolve_queue_set.contains("change-a"),
             "Change should not be added to resolve queue when not resolving"
         );
+    }
+
+    #[test]
+    fn test_remote_change_update_increases_progress() {
+        let changes = vec![create_test_change("MyProj/feat", 1, 5)];
+        let mut app = AppState::new(changes);
+
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 3,
+            total_tasks: 5,
+            status: None,
+            iteration_number: None,
+        });
+
+        assert_eq!(app.changes[0].completed_tasks, 3);
+        assert_eq!(app.changes[0].total_tasks, 5);
+    }
+
+    #[test]
+    fn test_remote_change_update_non_regression_rule() {
+        // completed_tasks should NOT decrease (non-regression rule)
+        let changes = vec![create_test_change("MyProj/feat", 4, 5)];
+        let mut app = AppState::new(changes);
+
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 2, // lower than current 4
+            total_tasks: 5,
+            status: None,
+            iteration_number: None,
+        });
+
+        // completed_tasks must not decrease
+        assert_eq!(
+            app.changes[0].completed_tasks, 4,
+            "Non-regression rule: completed_tasks must not decrease"
+        );
+    }
+
+    #[test]
+    fn test_remote_change_update_not_found() {
+        // Update for unknown change ID should be a no-op
+        let changes = vec![create_test_change("MyProj/other", 1, 5)];
+        let mut app = AppState::new(changes);
+
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(), // does not exist
+            completed_tasks: 3,
+            total_tasks: 5,
+            status: None,
+            iteration_number: None,
+        });
+
+        // State should be unchanged
+        assert_eq!(app.changes[0].completed_tasks, 1);
+    }
+
+    #[test]
+    fn test_remote_change_update_iteration_non_regression_rule() {
+        // iteration_number should NOT decrease (monotonic non-regression rule)
+        let changes = vec![create_test_change("MyProj/feat", 1, 5)];
+        let mut app = AppState::new(changes);
+
+        // First update: set iteration to 3
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 2,
+            total_tasks: 5,
+            status: None,
+            iteration_number: Some(3),
+        });
+        assert_eq!(
+            app.changes[0].iteration_number,
+            Some(3),
+            "iteration_number should be 3 after first update"
+        );
+
+        // Second update: attempt to decrease iteration to 2 (should be rejected)
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 3,
+            total_tasks: 5,
+            status: None,
+            iteration_number: Some(2), // lower than current 3
+        });
+
+        // iteration_number must not decrease
+        assert_eq!(
+            app.changes[0].iteration_number,
+            Some(3),
+            "iteration_number must not decrease (non-regression rule): iteration=3 display should not regress to iteration=2"
+        );
+    }
+
+    #[test]
+    fn test_remote_change_update_iteration_increases() {
+        // iteration_number should increase when a higher value arrives
+        let changes = vec![create_test_change("MyProj/feat", 1, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set iteration to 2
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 2,
+            total_tasks: 5,
+            status: None,
+            iteration_number: Some(2),
+        });
+        assert_eq!(app.changes[0].iteration_number, Some(2));
+
+        // Update with higher iteration 4 (should be accepted)
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 3,
+            total_tasks: 5,
+            status: None,
+            iteration_number: Some(4),
+        });
+
+        assert_eq!(
+            app.changes[0].iteration_number,
+            Some(4),
+            "iteration_number should increase when a higher value arrives"
+        );
+    }
+
+    #[test]
+    fn test_remote_change_update_iteration_none_no_op() {
+        // iteration_number = None should not change existing iteration_number
+        let changes = vec![create_test_change("MyProj/feat", 1, 5)];
+        let mut app = AppState::new(changes);
+
+        // Set iteration to 3
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 2,
+            total_tasks: 5,
+            status: None,
+            iteration_number: Some(3),
+        });
+
+        // Update with None iteration (should be a no-op for iteration_number)
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 3,
+            total_tasks: 5,
+            status: None,
+            iteration_number: None,
+        });
+
+        // iteration_number should remain 3
+        assert_eq!(
+            app.changes[0].iteration_number,
+            Some(3),
+            "iteration_number should not change when None is received"
+        );
+    }
+
+    /// Verify that a remote Log event is added to the TUI log panel (state.logs).
+    #[test]
+    fn test_remote_log_event_added_to_log_panel() {
+        use crate::tui::events::{LogEntry, LogLevel, OrchestratorEvent};
+
+        let changes = vec![create_test_change("proj/change-a", 0, 3)];
+        let mut app = AppState::new(changes);
+
+        let initial_log_count = app.logs.len();
+
+        // Build a LogEntry simulating what the remote WS translator creates from RemoteStateUpdate::Log
+        let entry = LogEntry {
+            timestamp: "12:00:00".to_string(),
+            created_at: chrono::Utc::now(),
+            message: "remote stdout: cargo build succeeded".to_string(),
+            color: ratatui::style::Color::Reset,
+            level: LogLevel::Info,
+            change_id: Some("change-a".to_string()),
+            operation: None,
+            iteration: None,
+            workspace_path: None,
+        };
+
+        app.handle_orchestrator_event(OrchestratorEvent::Log(entry.clone()));
+
+        // The log entry should be appended to state.logs
+        assert!(
+            app.logs.len() > initial_log_count,
+            "Expected log count to increase after remote Log event"
+        );
+
+        let last = app.logs.last().expect("Should have at least one log entry");
+        assert_eq!(last.message, entry.message, "Log message should match");
+        assert_eq!(
+            last.change_id, entry.change_id,
+            "Log change_id should match"
+        );
+    }
+
+    /// Verify that multiple remote Log events accumulate in the log panel.
+    #[test]
+    fn test_multiple_remote_log_events_accumulate() {
+        use crate::tui::events::{LogEntry, LogLevel, OrchestratorEvent};
+
+        let changes = vec![];
+        let mut app = AppState::new(changes);
+
+        let initial_count = app.logs.len();
+
+        for i in 0..5 {
+            let entry = LogEntry {
+                timestamp: format!("12:00:{:02}", i),
+                created_at: chrono::Utc::now(),
+                message: format!("remote log line {}", i),
+                color: ratatui::style::Color::Reset,
+                level: LogLevel::Info,
+                change_id: None,
+                operation: None,
+                iteration: None,
+                workspace_path: None,
+            };
+            app.handle_orchestrator_event(OrchestratorEvent::Log(entry));
+        }
+
+        assert_eq!(
+            app.logs.len(),
+            initial_count + 5,
+            "All 5 remote log entries should be present in log panel"
+        );
+    }
+
+    /// Verify that get_latest_log_for_change matches remote project-level logs
+    /// where change_id is the project_id and the queried change_id has the
+    /// format "<project_id>::<project_name>/<change_id>".
+    #[test]
+    fn test_get_latest_log_for_change_project_id_prefix_match() {
+        use crate::tui::events::{LogEntry, LogLevel, OrchestratorEvent};
+
+        let remote_change_id = "proj-abc123::my-project@main/change-a";
+        let changes = vec![create_test_change(remote_change_id, 0, 3)];
+        let mut app = AppState::new(changes);
+
+        // Simulate a project-level remote log where change_id = project_id
+        let project_id = "proj-abc123";
+        let entry = LogEntry {
+            timestamp: "12:00:00".to_string(),
+            created_at: chrono::Utc::now(),
+            message: "Remote project stdout: building...".to_string(),
+            color: ratatui::style::Color::Reset,
+            level: LogLevel::Info,
+            change_id: Some(project_id.to_string()),
+            operation: None,
+            iteration: None,
+            workspace_path: None,
+        };
+
+        app.handle_orchestrator_event(OrchestratorEvent::Log(entry.clone()));
+
+        // The log should be found when querying by the full remote change_id
+        // because the entry's change_id (project_id) is a prefix of the change_id
+        let found = app.get_latest_log_for_change(remote_change_id);
+        assert!(
+            found.is_some(),
+            "Expected to find log for remote change via project_id prefix matching"
+        );
+        assert_eq!(
+            found.unwrap().message,
+            entry.message,
+            "Log message should match"
+        );
+    }
+
+    /// Verify that get_latest_log_for_change still performs exact match for local changes.
+    #[test]
+    fn test_get_latest_log_for_change_exact_match_local() {
+        use crate::tui::events::{LogEntry, LogLevel, OrchestratorEvent};
+
+        let change_id = "my-local-change";
+        let changes = vec![create_test_change(change_id, 0, 3)];
+        let mut app = AppState::new(changes);
+
+        let entry = LogEntry {
+            timestamp: "12:00:00".to_string(),
+            created_at: chrono::Utc::now(),
+            message: "Local apply log".to_string(),
+            color: ratatui::style::Color::Reset,
+            level: LogLevel::Info,
+            change_id: Some(change_id.to_string()),
+            operation: Some("apply".to_string()),
+            iteration: Some(1),
+            workspace_path: None,
+        };
+
+        app.handle_orchestrator_event(OrchestratorEvent::Log(entry.clone()));
+
+        let found = app.get_latest_log_for_change(change_id);
+        assert!(found.is_some(), "Expected to find log by exact change_id");
+        assert_eq!(found.unwrap().message, entry.message);
+
+        // Should not match a different change_id
+        let not_found = app.get_latest_log_for_change("other-change");
+        assert!(
+            not_found.is_none(),
+            "Should not match a different change_id"
+        );
+    }
+
+    /// Verify RemoteLogEntry round-trip with all new fields (project_id, operation, iteration).
+    #[test]
+    fn test_remote_log_entry_with_project_id_round_trip() {
+        use crate::remote::types::RemoteLogEntry;
+
+        let entry = RemoteLogEntry {
+            message: "stdout: tests passed".to_string(),
+            level: "info".to_string(),
+            change_id: None,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            project_id: Some("proj-abc123".to_string()),
+            operation: Some("apply".to_string()),
+            iteration: Some(2),
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: RemoteLogEntry = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.message, entry.message);
+        assert_eq!(decoded.change_id, entry.change_id);
+        assert_eq!(decoded.project_id, entry.project_id);
+        assert_eq!(decoded.operation, entry.operation);
+        assert_eq!(decoded.iteration, entry.iteration);
+        // change_id is None so decoded value is None
+        assert_eq!(decoded.change_id, None);
+        // New fields appear in JSON when Some
+        assert!(json.contains("project_id"));
+        assert!(json.contains("operation"));
+        assert!(json.contains("iteration"));
     }
 }

@@ -34,7 +34,10 @@ The primary interface is the interactive TUI dashboard:
 cflx
 ```
 
-Use `@` to approve changes, `Space` to select them, then `F5` to start processing.
+In the TUI:
+- Use `@` to approve changes
+- Use `Space` to select changes
+- Press `F5` to start processing
 
 ### 4. Run Headless (Non-Interactive)
 
@@ -44,12 +47,13 @@ Process all pending changes without the TUI:
 cflx run
 ```
 
-This will:
-1. List all changes via `openspec list`
+The `cflx run` command will:
+1. List pending changes via `openspec list`
 2. Analyze dependencies and select the next change
 3. Apply changes using the configured AI agent command
-4. Archive completed changes
-5. Repeat until all changes are processed
+4. Run acceptance (if configured)
+5. Archive completed changes
+6. Repeat until all changes are processed
 
 ## Common Usage Patterns
 
@@ -71,20 +75,58 @@ cflx run --change add-feature-x,fix-bug-y,refactor-z
 cflx run --config /path/to/config.jsonc
 ```
 
-### Preview Parallel Execution Groups
+## Parallel Execution
+
+Run independent changes in parallel using Git worktrees:
 
 ```bash
+# Preview parallelization groups without executing
 cflx run --parallel --dry-run
+
+# Execute in parallel
+cflx run --parallel
 ```
 
-### Enable Parallel Execution
+Resume behavior:
 
 ```bash
-# Auto-detect VCS backend
+# Parallel mode automatically reuses existing workspaces
 cflx run --parallel
 
-# Limit concurrent workspaces
-cflx run --parallel --max-concurrent 5
+# Force a fresh start (discard existing workspaces)
+cflx run --parallel --no-resume
+```
+
+## Web Monitoring
+
+Enable the web monitoring server alongside the TUI or headless run:
+
+```bash
+# TUI with web monitoring (OS auto-assigns port)
+cflx --web
+
+# Headless run with web monitoring
+cflx run --web
+
+# Custom port and bind address
+cflx --web --web-port 9000 --web-bind 0.0.0.0
+```
+
+Access the dashboard at `http://localhost:<port>/` (port shown in startup log).
+
+## Remote TUI (Server Mode)
+
+If you're running the multi-project server daemon, you can point the TUI at it:
+
+```bash
+# Connect the TUI to a remote Conflux server
+cflx --server http://host:9876
+
+# With bearer-token auth
+cflx --server http://host:9876 --server-token "$TOKEN"
+
+# Or read token from environment variable
+cflx --server http://host:9876 --server-token-env CFLX_SERVER_TOKEN
 ```
 
 ## Workflow Examples
@@ -92,11 +134,16 @@ cflx run --parallel --max-concurrent 5
 ### Example 1: Automated Full Run (Headless)
 
 ```bash
-# Run orchestration loop
 cflx run
 ```
 
-### Example 2: Step-by-Step Processing
+### Example 2: Interactive TUI Workflow
+
+```bash
+cflx
+```
+
+### Example 3: Step-by-Step Processing
 
 ```bash
 # Process first change
@@ -109,28 +156,14 @@ openspec list
 cflx run --change change-2
 ```
 
-### Example 3: Resume After Interruption
+### Example 4: Resume After Interruption
 
 ```bash
 # Run orchestrator (interrupted mid-run)
 cflx run
 
-# Resume (parallel mode automatically reuses existing workspaces)
-cflx run --parallel
-```
-
-### Example 4: TUI Workflow
-
-```bash
-# Launch TUI
-cflx
-
-# In TUI:
-# 1. Press @ to approve a change
-# 2. Press Space to select it for processing
-# 3. Press F5 to start
-# 4. Monitor progress in real time
-# 5. Press Ctrl+C to quit
+# If interrupted, just run again - workspaces are automatically resumed
+cflx run
 ```
 
 ### Example 5: Parallel Execution with Web Monitoring
@@ -148,7 +181,7 @@ cflx --web
 ### GitHub Actions
 
 ```yaml
-name: OpenSpec Orchestrator
+name: Conflux Orchestrator
 
 on:
   schedule:
@@ -161,7 +194,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - name: Install dependencies
+      - name: Install Conflux
         run: cargo install --path .
 
       - name: Run orchestrator
@@ -185,6 +218,7 @@ ENTRYPOINT ["cflx"]
 ```
 
 Run:
+
 ```bash
 docker build -t cflx .
 docker run -v $(pwd):/workspace cflx run
@@ -209,24 +243,21 @@ RUST_LOG=trace cflx run --change test-change
 ### 1. Use the TUI for Interactive Work
 
 ```bash
-# Launch TUI (most user-friendly)
 cflx
-
-# Approve, select, and start changes interactively
 ```
 
 ### 2. Use Headless Mode for Automation
 
 ```bash
-# Fully non-interactive run
 cflx run
 ```
 
 ### 3. Incremental Processing
 
 For safety, process one change at a time:
+
 ```bash
-for change in $(openspec list | grep -oP '^\s*-\s+\K[^\s]+'); do
+for change in $(openspec list --json | jq -r '.[].id'); do
   cflx run --change "$change"
   if [ $? -ne 0 ]; then
     echo "Failed on $change"
@@ -238,21 +269,30 @@ done
 ### 4. Preview Before Running (Parallel Mode)
 
 ```bash
-# Preview parallelization groups without executing
 cflx run --parallel --dry-run
-
-# If looks good, execute
 cflx run --parallel
+```
+
+### 5. Monitor with Web UI
+
+```bash
+cflx --web
+cflx run --web
+```
+
+### 6. Check Spec Conflicts Early
+
+```bash
+cflx check-conflicts
 ```
 
 ## Tips
 
-- **TUI**: Default mode — use `cflx` for interactive orchestration
-- **Headless**: Use `cflx run` for CI/CD and automated pipelines
-- **Configuration**: Run `cflx init` to generate a `.cflx.jsonc` config file
-- **Parallel**: Use `cflx run --parallel` to process independent changes simultaneously
-- **Debugging**: Use `RUST_LOG=debug` for detailed execution logs
-- **Web monitoring**: Add `--web` to enable the HTTP dashboard
+- Default mode is the TUI: `cflx`
+- Use `cflx run` for CI/CD and automated pipelines
+- Use `cflx run --parallel` for independent changes
+- Add `--web` for the HTTP dashboard
+- Use `RUST_LOG=debug` for detailed logs
 
 ## Common Patterns
 
@@ -265,8 +305,11 @@ cflx run --parallel
 cd /path/to/project
 cflx run
 
-if [ $? -eq 0 ]; then
-  echo "Orchestration completed" | mail -s "OpenSpec Orchestrator" admin@example.com
+STATUS=$?
+if [ $STATUS -eq 0 ]; then
+  echo "Orchestration completed successfully"
+else
+  echo "Orchestration failed with status $STATUS"
 fi
 ```
 
@@ -277,17 +320,9 @@ fi
 cflx run --change urgent-fix,critical-update
 ```
 
-### Pattern 3: Progress Notification
+### Pattern 3: Parallel with Monitoring
 
 ```bash
-cflx run
-STATUS=$?
-
-if [ $STATUS -eq 0 ]; then
-  curl -X POST https://hooks.slack.com/... \
-    -d '{"text":"✅ OpenSpec orchestration completed"}'
-else
-  curl -X POST https://hooks.slack.com/... \
-    -d '{"text":"❌ OpenSpec orchestration failed"}'
-fi
+# Run parallel with web monitoring
+cflx run --parallel --web --web-bind 0.0.0.0
 ```

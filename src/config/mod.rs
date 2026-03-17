@@ -151,6 +151,11 @@ impl Default for MergeStallDetectionConfig {
 /// Orchestrator configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OrchestratorConfig {
+    /// Server daemon configuration (used only by `cflx server` subcommand).
+    /// When present in global config, its values are applied before CLI overrides.
+    #[serde(default)]
+    pub server: Option<ServerConfig>,
+
     /// Command template for applying changes.
     /// Supports `{change_id}` placeholder.
     #[serde(default)]
@@ -343,6 +348,201 @@ pub struct OrchestratorConfig {
     pub command_strict_process_cleanup: Option<bool>,
 }
 
+/// Authentication mode for the server daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerAuthMode {
+    /// No authentication (only safe for loopback addresses)
+    #[default]
+    None,
+    /// Bearer token authentication (required for non-loopback addresses)
+    BearerToken,
+}
+
+/// Authentication configuration for the server daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerAuthConfig {
+    /// Authentication mode
+    #[serde(default)]
+    pub mode: ServerAuthMode,
+    /// Bearer token for authentication (required when mode = bearer_token)
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Environment variable name to read the bearer token from.
+    /// If set, the token is resolved from the environment variable at startup.
+    /// Takes precedence over `token` when both are set.
+    #[serde(default)]
+    pub token_env: Option<String>,
+}
+
+impl Default for ServerAuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: ServerAuthMode::None,
+            token: None,
+            token_env: None,
+        }
+    }
+}
+
+impl ServerAuthConfig {
+    /// Resolve the effective bearer token.
+    /// If `token_env` is set, read the token from the named environment variable.
+    /// If `token_env` is not set (or the variable is unset/empty), fall back to `token`.
+    pub fn resolve_token(&self) -> Option<String> {
+        if let Some(env_var) = &self.token_env {
+            if let Ok(val) = std::env::var(env_var) {
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+        self.token.clone()
+    }
+}
+
+fn default_server_bind() -> String {
+    defaults::DEFAULT_SERVER_BIND.to_string()
+}
+
+fn default_server_port() -> u16 {
+    defaults::DEFAULT_SERVER_PORT
+}
+
+fn default_server_max_concurrent_total() -> usize {
+    defaults::DEFAULT_SERVER_MAX_CONCURRENT_TOTAL
+}
+
+fn default_server_data_dir() -> std::path::PathBuf {
+    defaults::default_server_data_dir()
+}
+
+/// Server daemon configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// Bind address for the server (default: 127.0.0.1)
+    #[serde(default = "default_server_bind")]
+    pub bind: String,
+
+    /// Port for the server (default: 9876)
+    #[serde(default = "default_server_port")]
+    pub port: u16,
+
+    /// Authentication configuration
+    #[serde(default)]
+    pub auth: ServerAuthConfig,
+
+    /// Maximum number of concurrent project executions globally
+    #[serde(default = "default_server_max_concurrent_total")]
+    pub max_concurrent_total: usize,
+
+    /// Directory for persistent server data (projects registry, etc.)
+    #[serde(default = "default_server_data_dir")]
+    pub data_dir: std::path::PathBuf,
+
+    /// DEPRECATED: `server.resolve_command` is no longer supported.
+    /// Use the top-level `resolve_command` in your config file instead.
+    /// Setting this field will cause a configuration error at startup.
+    #[serde(default)]
+    pub resolve_command: Option<String>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_server_bind(),
+            port: default_server_port(),
+            auth: ServerAuthConfig::default(),
+            max_concurrent_total: default_server_max_concurrent_total(),
+            data_dir: default_server_data_dir(),
+            resolve_command: None,
+        }
+    }
+}
+
+impl ServerConfig {
+    /// Check if the bind address is loopback (127.0.0.0/8 or ::1).
+    pub fn is_loopback_bind(&self) -> bool {
+        let addr = self.bind.trim();
+        // IPv4 loopback: 127.x.x.x
+        if addr.starts_with("127.") || addr == "localhost" {
+            return true;
+        }
+        // IPv6 loopback
+        if addr == "::1" || addr == "[::1]" {
+            return true;
+        }
+        false
+    }
+
+    /// Validate the server configuration.
+    /// Returns error if non-loopback bind is used without bearer token authentication,
+    /// or if the deprecated `server.resolve_command` field is set.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        // Check for deprecated server.resolve_command field
+        if self.resolve_command.is_some() {
+            return Err(crate::error::OrchestratorError::ConfigLoad(
+                "Configuration error: `server.resolve_command` is no longer supported. \
+                Please remove it from your config and use the top-level `resolve_command` instead."
+                    .to_string(),
+            ));
+        }
+
+        if !self.is_loopback_bind() {
+            match self.auth.mode {
+                ServerAuthMode::BearerToken => {
+                    // Accept token from token_env (env var resolution) or token field
+                    if self
+                        .auth
+                        .resolve_token()
+                        .as_deref()
+                        .unwrap_or("")
+                        .is_empty()
+                    {
+                        return Err(crate::error::OrchestratorError::ConfigLoad(
+                            "Server: non-loopback bind requires auth.token or auth.token_env to be set when auth.mode=bearer_token".to_string(),
+                        ));
+                    }
+                }
+                ServerAuthMode::None => {
+                    return Err(crate::error::OrchestratorError::ConfigLoad(
+                        "Server: non-loopback bind requires auth.mode=bearer_token with a token"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply CLI overrides (bind, port, auth_token, max_concurrent_total, data_dir).
+    pub fn apply_cli_overrides(
+        &mut self,
+        bind: Option<&str>,
+        port: Option<u16>,
+        auth_token: Option<&str>,
+        max_concurrent_total: Option<usize>,
+        data_dir: Option<&std::path::Path>,
+    ) {
+        if let Some(b) = bind {
+            self.bind = b.to_string();
+        }
+        if let Some(p) = port {
+            self.port = p;
+        }
+        if let Some(token) = auth_token {
+            self.auth.mode = ServerAuthMode::BearerToken;
+            self.auth.token = Some(token.to_string());
+        }
+        if let Some(max) = max_concurrent_total {
+            self.max_concurrent_total = max;
+        }
+        if let Some(dir) = data_dir {
+            self.data_dir = dir.to_path_buf();
+        }
+    }
+}
+
 /// Acceptance prompt mode.
 /// Full is deprecated and now behaves identically to ContextOnly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -367,6 +567,11 @@ impl OrchestratorConfig {
     /// Merge another config into this one, with the other config taking priority
     /// for fields that are `Some`.
     pub fn merge(&mut self, other: Self) {
+        // Server config
+        if other.server.is_some() {
+            self.server = other.server;
+        }
+
         // Command fields
         if other.apply_command.is_some() {
             self.apply_command = other.apply_command;
@@ -743,6 +948,66 @@ impl OrchestratorConfig {
     /// Parse JSONC content (JSON with Comments)
     pub fn parse_jsonc(content: &str) -> Result<Self> {
         jsonc::parse(content)
+    }
+
+    /// Load only the server configuration from global config files (no project config).
+    /// Used by `cflx server` to load the `server` section from global config.
+    ///
+    /// Priority (lowest to highest):
+    /// 1. Platform default config
+    /// 2. XDG default config (~/.config/cflx/config.jsonc)
+    /// 3. XDG env config ($XDG_CONFIG_HOME/cflx/config.jsonc)
+    ///
+    /// Project config (`.cflx.jsonc`) is intentionally excluded — server mode is directory-independent.
+    #[allow(dead_code)]
+    pub fn load_server_config_from_global() -> ServerConfig {
+        let (server_config, _) = Self::load_server_config_and_resolve_command_from_global();
+        server_config
+    }
+
+    /// Load server configuration and top-level `resolve_command` from global config files.
+    /// Used by `cflx server` to get both the `server` section and the top-level `resolve_command`.
+    ///
+    /// Returns `(ServerConfig, Option<resolve_command>)`.
+    ///
+    /// Priority (lowest to highest):
+    /// 1. Platform default config
+    /// 2. XDG default config (~/.config/cflx/config.jsonc)
+    /// 3. XDG env config ($XDG_CONFIG_HOME/cflx/config.jsonc)
+    ///
+    /// Project config (`.cflx.jsonc`) is intentionally excluded — server mode is directory-independent.
+    pub fn load_server_config_and_resolve_command_from_global() -> (ServerConfig, Option<String>) {
+        let mut merged = OrchestratorConfig::default();
+
+        // 1. Platform default config
+        if let Some(platform_path) = get_platform_config_path() {
+            if platform_path.exists() {
+                if let Ok(c) = Self::load_from_file(&platform_path) {
+                    merged.merge(c);
+                }
+            }
+        }
+
+        // 2. XDG default config (~/.config)
+        if let Some(xdg_default_path) = get_xdg_default_config_path() {
+            if xdg_default_path.exists() {
+                if let Ok(c) = Self::load_from_file(&xdg_default_path) {
+                    merged.merge(c);
+                }
+            }
+        }
+
+        // 3. XDG env config ($XDG_CONFIG_HOME)
+        if let Some(xdg_env_path) = get_xdg_env_config_path() {
+            if xdg_env_path.exists() {
+                if let Ok(c) = Self::load_from_file(&xdg_env_path) {
+                    merged.merge(c);
+                }
+            }
+        }
+
+        let resolve_command = merged.resolve_command.clone();
+        (merged.server.unwrap_or_default(), resolve_command)
     }
 
     /// Load configuration with merge-based priority:
@@ -2405,6 +2670,261 @@ mod tests {
             config.get_apply_command().unwrap(),
             "xdg-env-agent apply {change_id}",
             "Expected XDG env config to take priority over XDG default config"
+        );
+    }
+
+    // ── ServerConfig validation tests ──
+
+    #[test]
+    fn test_server_config_validate_loopback_no_auth_ok() {
+        // Loopback bind without auth is allowed
+        let config = ServerConfig {
+            bind: "127.0.0.1".to_string(),
+            auth: ServerAuthConfig {
+                mode: ServerAuthMode::None,
+                token: None,
+                token_env: None,
+            },
+            ..ServerConfig::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "Loopback bind without auth should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_server_config_validate_loopback_with_auth_ok() {
+        // Loopback bind with auth is also allowed
+        let config = ServerConfig {
+            bind: "127.0.0.1".to_string(),
+            auth: ServerAuthConfig {
+                mode: ServerAuthMode::BearerToken,
+                token: Some("secret".to_string()),
+                token_env: None,
+            },
+            ..ServerConfig::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "Loopback bind with auth should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_server_config_validate_non_loopback_no_auth_fails() {
+        // Non-loopback bind without auth must fail
+        let config = ServerConfig {
+            bind: "0.0.0.0".to_string(),
+            auth: ServerAuthConfig {
+                mode: ServerAuthMode::None,
+                token: None,
+                token_env: None,
+            },
+            ..ServerConfig::default()
+        };
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "Non-loopback bind without auth should be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("bearer_token"),
+            "Error message should mention bearer_token requirement"
+        );
+    }
+
+    #[test]
+    fn test_server_config_validate_non_loopback_bearer_token_ok() {
+        // Non-loopback bind with valid bearer token is allowed
+        let config = ServerConfig {
+            bind: "0.0.0.0".to_string(),
+            auth: ServerAuthConfig {
+                mode: ServerAuthMode::BearerToken,
+                token: Some("my-secret-token".to_string()),
+                token_env: None,
+            },
+            ..ServerConfig::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "Non-loopback bind with valid bearer token should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_server_config_validate_non_loopback_bearer_token_empty_fails() {
+        // Non-loopback bind with empty bearer token must fail
+        let config = ServerConfig {
+            bind: "0.0.0.0".to_string(),
+            auth: ServerAuthConfig {
+                mode: ServerAuthMode::BearerToken,
+                token: Some("".to_string()),
+                token_env: None,
+            },
+            ..ServerConfig::default()
+        };
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "Non-loopback bind with empty token should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_server_config_is_loopback_bind() {
+        // Test various loopback and non-loopback addresses
+        let loopback_cases = ["127.0.0.1", "127.0.0.2", "127.1.2.3", "localhost", "::1"];
+        for addr in &loopback_cases {
+            let config = ServerConfig {
+                bind: addr.to_string(),
+                ..ServerConfig::default()
+            };
+            assert!(config.is_loopback_bind(), "'{}' should be loopback", addr);
+        }
+
+        let non_loopback_cases = ["0.0.0.0", "192.168.1.1", "10.0.0.1", "::"];
+        for addr in &non_loopback_cases {
+            let config = ServerConfig {
+                bind: addr.to_string(),
+                ..ServerConfig::default()
+            };
+            assert!(
+                !config.is_loopback_bind(),
+                "'{}' should not be loopback",
+                addr
+            );
+        }
+    }
+
+    // ── ServerConfig::apply_cli_overrides data_dir tests ──
+
+    #[test]
+    fn test_server_config_apply_cli_overrides_data_dir() {
+        // Verify that --data-dir CLI override sets data_dir on ServerConfig
+        let mut config = ServerConfig::default();
+        let custom_dir = std::path::Path::new("/var/lib/cflx");
+
+        config.apply_cli_overrides(None, None, None, None, Some(custom_dir));
+
+        assert_eq!(
+            config.data_dir,
+            std::path::PathBuf::from("/var/lib/cflx"),
+            "data_dir should be overridden by CLI --data-dir option"
+        );
+    }
+
+    #[test]
+    fn test_server_config_apply_cli_overrides_data_dir_not_set_uses_default() {
+        // When --data-dir is not provided, data_dir remains the default value
+        let mut config = ServerConfig::default();
+        let default_data_dir = config.data_dir.clone();
+
+        config.apply_cli_overrides(None, None, None, None, None);
+
+        assert_eq!(
+            config.data_dir, default_data_dir,
+            "data_dir should remain the default when CLI --data-dir is not specified"
+        );
+    }
+
+    #[test]
+    fn test_server_config_apply_cli_overrides_data_dir_with_other_overrides() {
+        // Verify that data_dir override works correctly alongside other CLI overrides
+        let mut config = ServerConfig::default();
+        let custom_dir = std::path::Path::new("/tmp/cflx-server");
+
+        config.apply_cli_overrides(
+            Some("0.0.0.0"),
+            Some(8080),
+            Some("my-token"),
+            Some(10),
+            Some(custom_dir),
+        );
+
+        assert_eq!(config.bind, "0.0.0.0");
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.auth.mode, ServerAuthMode::BearerToken);
+        assert_eq!(config.auth.token, Some("my-token".to_string()));
+        assert_eq!(config.max_concurrent_total, 10);
+        assert_eq!(
+            config.data_dir,
+            std::path::PathBuf::from("/tmp/cflx-server"),
+            "data_dir should be overridden when provided alongside other CLI overrides"
+        );
+    }
+
+    // ── server.resolve_command deprecation tests ──
+
+    #[test]
+    fn test_server_config_validate_rejects_deprecated_resolve_command() {
+        // Verify that setting server.resolve_command causes a configuration error
+        let config = ServerConfig {
+            resolve_command: Some("echo resolve".to_string()),
+            ..Default::default()
+        };
+
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "validate() should return Err when server.resolve_command is set"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("server.resolve_command"),
+            "Error message should mention 'server.resolve_command', got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("top-level `resolve_command`"),
+            "Error message should mention the top-level resolve_command as alternative, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_server_config_validate_accepts_config_without_resolve_command() {
+        // Verify that server.resolve_command = None passes validation (loopback bind)
+        let config = ServerConfig::default();
+        assert!(
+            config.resolve_command.is_none(),
+            "Default ServerConfig should not have resolve_command set"
+        );
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "validate() should succeed when server.resolve_command is not set"
+        );
+    }
+
+    #[test]
+    fn test_parse_server_config_with_resolve_command_is_parsed_but_rejected_at_validate() {
+        // Verify that server.resolve_command in config JSON is deserialized
+        // but then rejected by validate()
+        let jsonc = r#"{
+            "server": {
+                "resolve_command": "echo resolve"
+            }
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        let server_config = config.server.unwrap_or_default();
+        assert_eq!(
+            server_config.resolve_command,
+            Some("echo resolve".to_string()),
+            "server.resolve_command should be deserialized from JSON"
+        );
+        // But validate() should reject it
+        let result = server_config.validate();
+        assert!(
+            result.is_err(),
+            "validate() should reject server.resolve_command"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("server.resolve_command"),
+            "Error should mention server.resolve_command, got: {}",
+            err_msg
         );
     }
 }

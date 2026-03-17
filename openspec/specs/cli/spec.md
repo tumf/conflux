@@ -1532,3 +1532,142 @@ TUI のログファイル出力は常時有効でなければならず（MUST）
 - **WHEN** ユーザーが `cflx tui --logs /tmp/debug.log` を実行する
 - **THEN** CLI は不明なオプションとしてエラーを表示する
 - **AND** 終了コードは非0である
+
+### Requirement: server サブコマンド
+CLI は `cflx server` サブコマンドを提供し、サーバモードを起動しなければならない（SHALL）。
+
+#### Scenario: server サブコマンドで起動する
+- **WHEN** ユーザーが `cflx server` を実行する
+- **THEN** サーバモードが起動する
+- **AND** カレントディレクトリの変更一覧は読み込まない
+
+### Requirement: リモートサーバ指定フラグ
+CLI は `--server <endpoint>` を受け付け、TUI をリモートサーバ接続モードで起動しなければならない（SHALL）。
+
+#### Scenario: リモートエンドポイントで TUI を起動する
+- **WHEN** ユーザーが `cflx --server http://127.0.0.1:9876` を実行する
+- **THEN** TUI はローカルの change 一覧を読まずにリモート状態を表示する
+
+### Requirement: リモートサーバ認証トークン
+CLI は bearer token を指定するための `--server-token` または `--server-token-env` を受け付けなければならない（SHALL）。
+
+#### Scenario: bearer token を付与して接続する
+- **GIVEN** `--server-token` が指定されている
+- **WHEN** TUI がリモートサーバへ接続する
+- **THEN** Authorization header に bearer token が付与される
+
+### Requirement: server データディレクトリの CLI 上書き
+CLI は `cflx server --data-dir <PATH>` を受け付け、サーバの `data_dir` を指定パスに上書きしなければならない（SHALL）。
+`--data-dir` が未指定の場合、サーバはグローバル設定の `server.data_dir` または既定値を使用しなければならない（SHALL）。
+
+#### Scenario: `--data-dir` を指定して起動する
+- **WHEN** ユーザーが `cflx server --data-dir /var/lib/cflx` を実行する
+- **THEN** サーバは `data_dir=/var/lib/cflx` を使用する
+
+#### Scenario: `--data-dir` 未指定で起動する
+- **GIVEN** グローバル設定に `server.data_dir=/tmp/cflx-server` がある
+- **WHEN** ユーザーが `cflx server` を実行する
+- **THEN** サーバは `data_dir=/tmp/cflx-server` を使用する
+
+### Requirement: server の resolve_command フラグは受け付けない
+CLI は `cflx server --resolve-command` を受け付けてはならない（MUST NOT）。
+
+#### Scenario: `--resolve-command` は不明なオプションとして扱われる
+- **WHEN** ユーザーが `cflx server --resolve-command "true"` を実行する
+- **THEN** CLI は不明なオプションとしてエラーを表示する
+- **AND** 終了コードは非0である
+
+### Requirement: Project サブコマンドによるサーバプロジェクト管理
+CLI は `cflx project` 配下でサーバのプロジェクト管理 API を操作できなければならない（SHALL）。
+`add` は `remote_url` と `branch` を送信し、`remove` は `project_id` を削除し、`status` はプロジェクト一覧または指定 ID の情報を取得し、`sync` は git/sync を実行しなければならない（SHALL）。
+
+#### Scenario: プロジェクト追加を実行する
+- **WHEN** ユーザーが `cflx project add <remote_url> <branch>` を実行する
+- **THEN** CLI は `POST /api/v1/projects` を呼び出す
+- **AND** サーバが返す `project_id` を表示する
+
+#### Scenario: プロジェクト一覧を取得する
+- **WHEN** ユーザーが `cflx project status` を実行する
+- **THEN** CLI は `GET /api/v1/projects` を呼び出す
+- **AND** 取得したプロジェクト一覧を表示する
+
+#### Scenario: プロジェクトの同期を実行する
+- **WHEN** ユーザーが `cflx project sync <project_id>` を実行する
+- **THEN** CLI は `POST /api/v1/projects/{id}/git/sync` を呼び出す
+- **AND** サーバの同期結果を表示する
+
+### Requirement: Project サブコマンドの接続先解決と認証非対応
+`cflx project` は `--server` 未指定時にグローバル設定の `server.bind` と `server.port` を用いて接続先を決定しなければならない（MUST）。
+今回の `cflx project` はサーバクライアント認証を扱わず、認証が必要な設定が指定された場合は実行前にエラーで停止しなければならない（MUST）。
+
+#### Scenario: --server 未指定時はグローバル設定から接続先を解決する
+- **GIVEN** グローバル設定に `server.bind` と `server.port` がある
+- **WHEN** ユーザーが `cflx project status` を実行する
+- **THEN** CLI は `http://<bind>:<port>` を接続先として使用する
+
+#### Scenario: 認証指定がある場合はエラーで停止する
+- **GIVEN** `--server-token` または `--server-token-env` が指定されている
+- **WHEN** ユーザーが `cflx project` サブコマンドを実行する
+- **THEN** CLI は認証非対応である旨を示すエラーを表示し、リクエストを送信しない
+
+### Requirement: service Subcommand Manages Background Server
+
+The CLI SHALL provide a `service` subcommand group for managing `cflx server` as a background service.
+
+Supported operations MUST include: `install`, `uninstall`, `status`, `start`, `stop`, `restart`.
+
+#### Scenario: Service commands are discoverable
+- **WHEN** a user runs `cflx service --help`
+- **THEN** help text lists `install`, `uninstall`, `status`, `start`, `stop`, `restart`
+
+#### Scenario: Service command rejects unknown operation
+- **WHEN** a user runs `cflx service unknown`
+- **THEN** the CLI reports an unknown subcommand error
+
+### Requirement: project sync --all による全件同期
+CLI は `cflx project sync --all` をサポートし、登録済みプロジェクトをすべて `git/sync` で同期しなければならない（SHALL）。
+同期は各プロジェクトの結果を個別に出力し、1 件でも失敗があれば非 0 で終了しなければならない（MUST）。
+
+#### Scenario: 全プロジェクトを同期する
+- **GIVEN** サーバに 2 件以上のプロジェクトが登録されている
+- **WHEN** ユーザーが `cflx project sync --all` を実行する
+- **THEN** CLI は `GET /api/v1/projects` で一覧を取得する
+- **AND** 各プロジェクトに対して `POST /api/v1/projects/{id}/git/sync` を順に呼び出す
+- **AND** 各プロジェクトの同期結果が表示される
+
+#### Scenario: 失敗が含まれる場合は非 0 で終了する
+- **GIVEN** 同期対象のうち 1 件が失敗する
+- **WHEN** ユーザーが `cflx project sync --all` を実行する
+- **THEN** CLI は他のプロジェクトの同期を継続する
+- **AND** 最終的な終了コードは非 0 になる
+
+#### Scenario: 対象が 0 件の場合はスキップする
+- **GIVEN** サーバに登録済みプロジェクトが存在しない
+- **WHEN** ユーザーが `cflx project sync --all` を実行する
+- **THEN** CLI は同期対象が無い旨を表示する
+- **AND** 同期リクエストは送信されない
+
+### Requirement: project add のブランチ表記を URL から解決する
+CLI は `cflx project add` において、`https://github.com/<org>/<repo>/tree/<branch>` と `https://github.com/<org>/<repo>#<branch>` のブランチ表記を受け入れなければならない（SHALL）。
+URL にブランチ表記が含まれる場合、CLI は `remote_url` をリポジトリのベース URL に正規化し、ブランチは抽出した値として扱わなければならない（MUST）。
+
+#### Scenario: /tree/<branch> の URL を受け入れる
+- **WHEN** ユーザーが `cflx project add https://github.com/org/repo/tree/develop` を実行する
+- **THEN** CLI は `remote_url=https://github.com/org/repo` と `branch=develop` を使用する
+
+#### Scenario: #<branch> の URL を受け入れる
+- **WHEN** ユーザーが `cflx project add https://github.com/org/repo#develop` を実行する
+- **THEN** CLI は `remote_url=https://github.com/org/repo` と `branch=develop` を使用する
+
+### Requirement: project add のデフォルトブランチ解決
+`cflx project add` でブランチが明示されない場合、CLI はリモートのデフォルトブランチを解決して使用しなければならない（MUST）。
+明示的なブランチ引数が指定されている場合、URL 内のブランチ表記よりも引数の値を優先しなければならない（MUST）。
+
+#### Scenario: ブランチ省略時にデフォルトブランチを使用する
+- **GIVEN** リモートのデフォルトブランチが `main` である
+- **WHEN** ユーザーが `cflx project add https://github.com/org/repo` を実行する
+- **THEN** CLI は `branch=main` を使用する
+
+#### Scenario: 引数指定が URL のブランチ表記を上書きする
+- **WHEN** ユーザーが `cflx project add https://github.com/org/repo/tree/develop main` を実行する
+- **THEN** CLI は `branch=main` を使用する

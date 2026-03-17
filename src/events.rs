@@ -417,6 +417,19 @@ pub enum ExecutionEvent {
     /// Change stop failed (single-change stop)
     #[allow(dead_code)]
     ChangeStopFailed { change_id: String, error: String },
+    /// Incremental update from a remote server WebSocket (applies non-regression rule)
+    RemoteChangeUpdate {
+        /// Change ID as displayed in TUI (may be "project/change-id" for remote mode)
+        id: String,
+        /// Updated number of completed tasks
+        completed_tasks: u32,
+        /// Updated total number of tasks
+        total_tasks: u32,
+        /// Updated remote status (optional)
+        status: Option<String>,
+        /// Iteration number (applies monotonic non-regression rule)
+        iteration_number: Option<u32>,
+    },
 }
 
 /// Helper to send events through the channel.

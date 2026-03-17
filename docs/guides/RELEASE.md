@@ -52,11 +52,15 @@ make bump-major
 ```
 
 This will:
-1. Validate you're on main/master branch with clean working tree
+1. Validate you have a clean working tree
 2. Update version in Cargo.toml and Cargo.lock
 3. Create commit with message `chore(release): release vX.Y.Z`
 4. Create annotated git tag `vX.Y.Z`
 5. Push commit and tag to origin
+
+On non-main branches, the bump targets create a pre-release version by appending a branch-derived suffix,
+e.g. `v1.0.0-develop`. This is useful for producing draft releases and build artifacts without publishing
+Homebrew updates.
 
 GitHub Actions will then automatically:
 1. Build binaries for all platforms

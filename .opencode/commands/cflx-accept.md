@@ -1,4 +1,5 @@
 ---
+agent: build
 description: Run Conflux acceptance review (prompt provided by orchestrator)
 ---
 
@@ -14,14 +15,15 @@ IMPORTANT:
 
 Review the implementation to verify it meets the specification requirements.
 
-External dependency policy (mock-first):
+External dependency policy (production-first; mocks/stubs are test-only):
 - Any requirement that AI cannot resolve or verify autonomously is an external dependency
-- External dependencies that CAN be mocked/stubbed/fixtured MUST be mocked to enable verification without external credentials
-- Only truly non-mockable external dependencies (requiring real external systems, human decisions, or long-wait verification) may be moved to Out of Scope / Future Work (without checkboxes)
-- Missing secrets (API keys, credentials) MUST NOT be treated as a reason to output CONTINUE
-- If verification requires secrets and no mock exists, output FAIL with specific follow-up tasks:
-  * Implement mock/stub/fixture for the external dependency, OR
-  * Move to Out of Scope as non-mockable (remove checkbox)
+- Production code MUST NOT rely on mocks/stubs/fakes as the default runtime implementation.
+- Mocks/stubs/fakes are permitted ONLY in unit tests (and other test-only code paths such as `#[cfg(test)]` or `tests/`).
+- External dependencies SHOULD be verified via unit tests that mock the external system, but the production implementation MUST still exist and be wired into the real execution flow.
+- Missing secrets (API keys, credentials) MUST NOT be treated as a reason to output CONTINUE.
+- If verification would require secrets:
+  * Output FAIL with follow-up tasks that keep the real implementation and move mocking to tests (e.g., add a client interface, add unit tests with mocks/fixtures, and document configuration).
+  * If the feature truly requires a live external system at runtime, output FAIL with follow-up tasks to add clear fail-fast behavior + actionable configuration docs (do NOT ship a stub as the implementation).
 
 Permission Error Acceptance:
 - If tasks.md contains a "## Future Work" section with permission-related tasks:
@@ -57,8 +59,11 @@ Required checks (only run if no valid Implementation Blocker exists):
 4. Implementation matches the specification in openspec/changes/<change_id>/specs/
 5. Integration check: confirm the feature is actually executed in the real flow.
 6. Dead code check: if code exists but is not invoked by the CLI/TUI/parallel flow described in spec, it is a FAIL.
-7. Regression check: verify that existing features unrelated to this change are not broken.
-8. Evidence: cite at least one file path + function/method where the integration happens.
+7. No stubbed runtime check: FAIL if the real execution path uses a mock/stub/fake/placeholder implementation.
+   - Examples of disallowed runtime placeholders: `todo!()`, `unimplemented!()`, always-empty returns, `Fake*`/`Mock*`/`Stub*` clients in non-test code, or feature-flagged mocks enabled by default.
+   - Mocks/stubs/fakes are allowed only in test-only code paths (`#[cfg(test)]`, `tests/`).
+8. Regression check: verify that existing features unrelated to this change are not broken.
+9. Evidence: cite at least one file path + function/method where the integration happens.
 
 FINDINGS format requirements:
 - Each finding MUST include concrete evidence (file path, function name, line number if relevant)

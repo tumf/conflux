@@ -1,7 +1,6 @@
 ---
 agent: build
 description: Archive a deployed OpenSpec change and update specs.
-model: anthropic/claude-sonnet-4-5
 ---
 change_id: $1
 
