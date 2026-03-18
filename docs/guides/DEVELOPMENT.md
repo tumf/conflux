@@ -82,10 +82,9 @@ RUST_LOG=conflux::agent=debug,conflux::hooks=debug cargo run -- run
 ```
 src/
 ├── main.rs           # Entry point (default: TUI mode)
-├── cli.rs            # CLI argument parsing (run, tui, init, approve)
+├── cli.rs            # CLI argument parsing (run, tui, init)
 ├── config.rs         # Configuration file parsing (JSONC)
 ├── agent.rs          # AI agent runner (configurable commands)
-├── approval.rs       # Approval workflow (checksum validation)
 ├── history.rs        # Apply attempt history tracking
 ├── hooks.rs          # Lifecycle hooks execution
 ├── jj_workspace.rs   # Parallel execution with jj workspaces
@@ -108,7 +107,6 @@ src/
 | CLI | `cli.rs` | Parse command-line arguments and dispatch to subcommands |
 | Config | `config.rs` | Load and parse JSONC configuration files |
 | Agent | `agent.rs` | Execute AI agent commands with placeholder substitution |
-| Approval | `approval.rs` | Manage change approval with checksum validation |
 | History | `history.rs` | Track apply attempts per change for retry context |
 | Hooks | `hooks.rs` | Execute lifecycle hooks at various workflow stages |
 | JjWorkspace | `jj_workspace.rs` | Manage jj workspaces for parallel execution |
@@ -203,7 +201,7 @@ The prek hook configuration is defined in `.pre-commit-config.yaml` (prek is ful
 ### Adding a new CLI subcommand
 
 1. Add the subcommand to `Commands` enum in `cli.rs`
-2. Create argument struct if needed (e.g., `ApproveArgs`)
+2. Create argument struct if needed (e.g., `RunArgs`)
 3. Handle the subcommand in `main.rs`
 4. Document in README.md and README.ja.md
 
