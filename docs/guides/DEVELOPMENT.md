@@ -81,39 +81,46 @@ RUST_LOG=conflux::agent=debug,conflux::hooks=debug cargo run -- run
 
 ```
 src/
-├── main.rs           # Entry point (default: TUI mode)
-├── cli.rs            # CLI argument parsing (run, tui, init, approve)
-├── config.rs         # Configuration file parsing (JSONC)
-├── agent.rs          # AI agent runner (configurable commands)
-├── approval.rs       # Approval workflow (checksum validation)
-├── history.rs        # Apply attempt history tracking
-├── hooks.rs          # Lifecycle hooks execution
-├── jj_workspace.rs   # Parallel execution with jj workspaces
-├── templates.rs      # Configuration templates (claude, opencode, codex)
-├── task_parser.rs    # Task file parsing and progress calculation
-├── error.rs          # Error types (OrchestratorError)
-├── openspec.rs       # OpenSpec wrapper (list, archive)
-├── opencode.rs       # OpenCode runner (legacy, kept for compatibility)
-├── progress.rs       # Progress display (indicatif)
-├── tui.rs            # Interactive TUI dashboard (ratatui)
-└── orchestrator.rs   # Main orchestration loop
+├── main.rs                 # Entry point (default: TUI mode)
+├── cli.rs                  # CLI argument parsing (run, tui, init)
+├── config/                 # Configuration file parsing (JSONC)
+├── agent/                  # AI agent runner (configurable commands)
+├── history.rs              # Apply attempt history tracking
+├── hooks.rs                # Lifecycle hooks execution
+├── orchestrator.rs         # Main orchestration loop (serial)
+├── orchestration/          # Orchestration sub-steps (apply, archive, selection, hooks)
+├── execution/              # Execution state and apply/archive runners
+├── parallel/               # Parallel execution across jj/git workspaces
+├── vcs/                    # VCS abstraction (git commands, workspace ops)
+├── templates.rs            # Configuration templates (claude, opencode, codex)
+├── task_parser.rs          # Task file parsing and progress calculation
+├── error.rs                # Error types (OrchestratorError)
+├── openspec.rs             # OpenSpec wrapper (list, archive)
+├── progress.rs             # Progress display (indicatif)
+├── tui/                    # Interactive TUI dashboard (ratatui)
+├── server/                 # HTTP/WebSocket server for remote control
+├── remote/                 # Remote client and WebSocket types
+└── web/                    # Web API types and WebSocket protocol
 ```
 
 ## Architecture Overview
 
 ### Core Components
 
-| Component | File | Responsibility |
-|-----------|------|----------------|
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
 | CLI | `cli.rs` | Parse command-line arguments and dispatch to subcommands |
-| Config | `config.rs` | Load and parse JSONC configuration files |
-| Agent | `agent.rs` | Execute AI agent commands with placeholder substitution |
-| Approval | `approval.rs` | Manage change approval with checksum validation |
+| Config | `config/` | Load and parse JSONC configuration files |
+| Agent | `agent/` | Execute AI agent commands with placeholder substitution |
 | History | `history.rs` | Track apply attempts per change for retry context |
 | Hooks | `hooks.rs` | Execute lifecycle hooks at various workflow stages |
-| JjWorkspace | `jj_workspace.rs` | Manage jj workspaces for parallel execution |
 | Orchestrator | `orchestrator.rs` | Main loop: list changes, select next, apply/archive |
-| TUI | `tui.rs` | Interactive terminal dashboard using ratatui |
+| Orchestration | `orchestration/` | Sub-steps: change selection, apply, archive, hook dispatch |
+| Execution | `execution/` | Apply/archive runners and execution state |
+| Parallel | `parallel/` | Parallel execution across jj/git workspaces |
+| VCS | `vcs/` | VCS abstraction layer (git commands, workspace operations) |
+| TUI | `tui/` | Interactive terminal dashboard using ratatui |
+| Server | `server/` | HTTP/WebSocket server for remote control |
 | OpenSpec | `openspec.rs` | Wrapper for OpenSpec CLI commands |
 
 ### Data Flow
@@ -188,14 +195,14 @@ The prek hook configuration is defined in `.pre-commit-config.yaml` (prek is ful
 ### Adding a new hook
 
 1. Add the hook variant to `HookType` enum in `hooks.rs`
-2. Add the field to `HooksConfig` struct in `config.rs`
+2. Add the field to `HooksConfig` struct in `config/mod.rs`
 3. Call `execute_hook()` at the appropriate place in `orchestrator.rs`
 4. Update templates in `templates.rs` with commented example
 5. Document in README.md
 
 ### Adding a new configuration option
 
-1. Add the field to `OrchestratorConfig` in `config.rs`
+1. Add the field to `OrchestratorConfig` in `config/mod.rs`
 2. Handle the option in the relevant component
 3. Update templates in `templates.rs`
 4. Document in README.md
@@ -203,15 +210,15 @@ The prek hook configuration is defined in `.pre-commit-config.yaml` (prek is ful
 ### Adding a new CLI subcommand
 
 1. Add the subcommand to `Commands` enum in `cli.rs`
-2. Create argument struct if needed (e.g., `ApproveArgs`)
+2. Create argument struct if needed (e.g., `RunArgs`)
 3. Handle the subcommand in `main.rs`
 4. Document in README.md and README.ja.md
 
 ### Adding support for a new VCS for parallel execution
 
-1. Create a new module (e.g., `git_worktree.rs`) similar to `jj_workspace.rs`
+1. Add a new backend under `vcs/` following the existing git implementation
 2. Implement workspace creation, merge, and cleanup operations
-3. Add detection logic in orchestrator to choose the appropriate backend
+3. Add detection logic in `orchestrator.rs` to choose the appropriate backend
 4. Update documentation
 
 ## Command Template Escaping

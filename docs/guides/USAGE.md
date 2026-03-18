@@ -35,7 +35,6 @@ cflx
 ```
 
 In the TUI:
-- Use `@` to approve changes
 - Use `Space` to select changes
 - Press `F5` to start processing
 
