@@ -9,3 +9,8 @@
 ## Future Work
 
 - Review deeper audit/reference docs outside the main user onboarding surface if we later want the entire repository to be free of historical approval terminology.
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Update `docs/guides/DEVELOPMENT.md` architecture sections (`Project Structure` and `Core Components`) to reflect the current codebase modules and remove non-existent entries (for example `config.rs`, `jj_workspace.rs`, and single-file `tui.rs`).
+- [x] Re-verify task 4 completion criteria after the development guide reflects current workflow architecture and interfaces.
