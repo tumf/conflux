@@ -484,7 +484,8 @@ pub struct ServiceArgs {
 
 /// Arguments for the `install-skills` subcommand
 #[derive(Parser, Debug)]
-#[command(long_about = "Install agent skills into the standard .agents/skills location.
+#[command(
+    long_about = "Install agent skills into the standard .agents/skills location.
 
 SOURCE forms:
   self              Bundled skills from the repository's top-level skills/ directory
@@ -499,7 +500,8 @@ SCOPE:
 EXAMPLES:
   cflx install-skills self
   cflx install-skills self --global
-  cflx install-skills local:../my-skills")]
+  cflx install-skills local:../my-skills"
+)]
 pub struct InstallSkillsArgs {
     /// Source of skills: 'self' for bundled skills, or 'local:<path>' for a local directory
     pub source: String,

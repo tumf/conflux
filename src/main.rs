@@ -45,9 +45,9 @@ mod test_support;
 
 use clap::Parser;
 use cli::{Cli, Commands, ProjectCommands, TuiArgs};
-use install_skills::{run_install_skills, InstallSkillsOptions};
 use config::OrchestratorConfig;
 use error::Result;
+use install_skills::{run_install_skills, InstallSkillsOptions};
 use orchestrator::Orchestrator;
 use std::path::Path;
 use tracing::{error, info, warn, Level};

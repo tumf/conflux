@@ -1,6 +1,7 @@
 use agent_skills_rs::{
-    discover_skills, install_skill, DiscoveryConfig, InstallConfig, LockManager,
+    discover_skills, install_skill,
     types::{Source, SourceType},
+    DiscoveryConfig, InstallConfig, LockManager,
 };
 use anyhow::{bail, Result};
 use std::path::PathBuf;
@@ -58,10 +59,13 @@ fn parse_source(source_str: &str, project_root: &std::path::Path) -> Result<Sour
 ///
 /// Returns `(skills_dir, lock_path)`.
 /// For project scope, paths are resolved relative to `project_root`.
-fn resolve_install_paths(global: bool, project_root: &std::path::Path) -> Result<(PathBuf, PathBuf)> {
+fn resolve_install_paths(
+    global: bool,
+    project_root: &std::path::Path,
+) -> Result<(PathBuf, PathBuf)> {
     if global {
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+        let home =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
         Ok((
             home.join(".agents").join("skills"),
             home.join(".agents").join(".skill-lock.json"),

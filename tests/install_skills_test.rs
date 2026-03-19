@@ -105,10 +105,16 @@ fn test_global_scope_install_uses_home_agents_dir() {
     result.unwrap();
 
     let skill_path = fake_home.path().join(".agents/skills/test-skill");
-    assert!(skill_path.exists(), "Expected global skill at {skill_path:?}");
+    assert!(
+        skill_path.exists(),
+        "Expected global skill at {skill_path:?}"
+    );
 
     let lock_path = fake_home.path().join(".agents/.skill-lock.json");
-    assert!(lock_path.exists(), "Expected global lock file at {lock_path:?}");
+    assert!(
+        lock_path.exists(),
+        "Expected global lock file at {lock_path:?}"
+    );
 }
 
 #[test]
