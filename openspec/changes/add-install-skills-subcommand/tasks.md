@@ -11,3 +11,7 @@
 
 - Consider command introspection output for machine-readable command discovery if Conflux later adopts a schema or commands API similar to `agent-exec`.
 - Consider follow-up commands for uninstall, update, or listing installed skills.
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Remove `.agents/.skill-lock.json` from this change (or replace it with deterministic, non-environment-dependent fixture data) so the change does not commit absolute temp paths or timestamp-dependent test artifacts.
