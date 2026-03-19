@@ -134,6 +134,21 @@ pub enum Commands {
     ///   cflx service restart    # Restart the service
     ///   cflx service uninstall  # Remove the service
     Service(ServiceArgs),
+
+    /// Install agent skills into .agents/skills
+    ///
+    /// Installs bundled or local agent skills into the standard .agents/skills location.
+    ///
+    /// SOURCE forms:
+    ///   self              Install bundled skills from the top-level skills/ directory
+    ///   local:<path>      Install skills from a local path
+    ///
+    /// EXAMPLES:
+    ///   cflx install-skills self                   # Install bundled skills (project scope)
+    ///   cflx install-skills self --global          # Install bundled skills (global scope)
+    ///   cflx install-skills local:../my-skills     # Install from local path (project scope)
+    #[command(name = "install-skills")]
+    InstallSkills(InstallSkillsArgs),
 }
 
 /// Arguments for the run subcommand
@@ -465,6 +480,35 @@ pub enum ServiceSubcommand {
 pub struct ServiceArgs {
     #[command(subcommand)]
     pub command: ServiceSubcommand,
+}
+
+/// Arguments for the `install-skills` subcommand
+#[derive(Parser, Debug)]
+#[command(
+    long_about = "Install agent skills into the standard .agents/skills location.
+
+SOURCE forms:
+  self              Bundled skills from the repository's top-level skills/ directory
+  local:<path>      Skills from a local directory path
+
+SCOPE:
+  Project scope (default): installs to ./.agents/skills
+                            lock file:  ./.agents/.skill-lock.json
+  Global scope (--global):  installs to ~/.agents/skills
+                            lock file:  ~/.agents/.skill-lock.json
+
+EXAMPLES:
+  cflx install-skills self
+  cflx install-skills self --global
+  cflx install-skills local:../my-skills"
+)]
+pub struct InstallSkillsArgs {
+    /// Source of skills: 'self' for bundled skills, or 'local:<path>' for a local directory
+    pub source: String,
+
+    /// Install into global scope (~/.agents/skills) instead of project scope (./.agents/skills)
+    #[arg(long)]
+    pub global: bool,
 }
 
 /// Check if git directory exists
@@ -1173,6 +1217,68 @@ mod tests {
             _ => panic!("Expected Project subcommand"),
         }
     }
+    // ── install-skills subcommand tests ──────────────────────────────────────
+
+    #[test]
+    fn test_install_skills_self_source() {
+        let cli = Cli::parse_from(["cflx", "install-skills", "self"]);
+        match cli.command {
+            Some(Commands::InstallSkills(args)) => {
+                assert_eq!(args.source, "self");
+                assert!(!args.global);
+            }
+            _ => panic!("Expected InstallSkills subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_install_skills_self_global() {
+        let cli = Cli::parse_from(["cflx", "install-skills", "self", "--global"]);
+        match cli.command {
+            Some(Commands::InstallSkills(args)) => {
+                assert_eq!(args.source, "self");
+                assert!(args.global);
+            }
+            _ => panic!("Expected InstallSkills subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_install_skills_local_source() {
+        let cli = Cli::parse_from(["cflx", "install-skills", "local:../my-skills"]);
+        match cli.command {
+            Some(Commands::InstallSkills(args)) => {
+                assert_eq!(args.source, "local:../my-skills");
+                assert!(!args.global);
+            }
+            _ => panic!("Expected InstallSkills subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_install_skills_local_source_global() {
+        let cli = Cli::parse_from(["cflx", "install-skills", "local:/some/path", "--global"]);
+        match cli.command {
+            Some(Commands::InstallSkills(args)) => {
+                assert_eq!(args.source, "local:/some/path");
+                assert!(args.global);
+            }
+            _ => panic!("Expected InstallSkills subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_install_skills_unsupported_scheme_is_accepted_by_cli() {
+        // CLI accepts any string; unsupported schemes are rejected at the install flow level
+        let cli = Cli::parse_from(["cflx", "install-skills", "git:https://example.com"]);
+        match cli.command {
+            Some(Commands::InstallSkills(args)) => {
+                assert_eq!(args.source, "git:https://example.com");
+            }
+            _ => panic!("Expected InstallSkills subcommand"),
+        }
+    }
+
     #[test]
     fn test_tui_help_displays_key_bindings() {
         // Regression test: Ensure TUI help output contains key bindings

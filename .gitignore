@@ -3,3 +3,4 @@ error.log
 /src/.tldr/
 .tldr/
 /.leann/
+.agents/.skill-lock.json
