@@ -11,6 +11,7 @@
 
 // Public modules for OpenAPI generator
 pub mod events;
+pub mod install_skills;
 pub mod tui;
 
 #[cfg(feature = "web-monitoring")]

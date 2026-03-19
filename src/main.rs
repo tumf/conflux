@@ -2,6 +2,7 @@ mod acceptance;
 mod agent;
 mod ai_command_runner;
 mod analyzer;
+mod install_skills;
 
 mod cli;
 mod command_queue;
@@ -44,6 +45,7 @@ mod test_support;
 
 use clap::Parser;
 use cli::{Cli, Commands, ProjectCommands, TuiArgs};
+use install_skills::{run_install_skills, InstallSkillsOptions};
 use config::OrchestratorConfig;
 use error::Result;
 use orchestrator::Orchestrator;
@@ -897,6 +899,19 @@ async fn main() -> Result<()> {
                 ServiceSubcommand::Restart => service::restart(),
             };
             if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+
+        // install-skills subcommand: install agent skills
+        Some(Commands::InstallSkills(args)) => {
+            let opts = InstallSkillsOptions {
+                source_str: args.source.clone(),
+                global: args.global,
+                project_root: None, // use CWD at runtime
+            };
+            if let Err(e) = run_install_skills(opts) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
