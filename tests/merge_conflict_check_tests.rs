@@ -36,7 +36,7 @@ async fn test_git_merge_tree_conflict_detection() {
     let repo_path = temp_dir.path();
 
     // Initialize git repo
-    run_git(&["init"], repo_path).await.unwrap();
+    run_git(&["init", "-b", "main"], repo_path).await.unwrap();
     run_git(&["config", "user.name", "Test User"], repo_path)
         .await
         .unwrap();
@@ -131,7 +131,7 @@ async fn test_git_merge_tree_clean_merge() {
     let repo_path = temp_dir.path();
 
     // Initialize git repo
-    run_git(&["init"], repo_path).await.unwrap();
+    run_git(&["init", "-b", "main"], repo_path).await.unwrap();
     run_git(&["config", "user.name", "Test User"], repo_path)
         .await
         .unwrap();
