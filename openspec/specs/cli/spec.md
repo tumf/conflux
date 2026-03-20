@@ -47,7 +47,14 @@ The `run` subcommand SHALL execute the OpenSpec change workflow orchestration lo
 - **AND** `a` and `c` exist but `nonexistent` does not
 - **THEN** a warning message "Specified change 'nonexistent' not found, skipping" is displayed
 - **AND** only `a` and `c` are processed
-- **AND** the snapshot log shows only `a` and `c`
+- **AND** the snapshot log shows only `a`, `c`
+
+#### Scenario: Successful run exits promptly
+
+- **GIVEN** orchestration completes successfully and no restart was explicitly requested
+- **WHEN** `cflx run` logs successful completion
+- **THEN** the command exits promptly with status code 0
+- **AND** it does not wait for an additional stop signal before terminating
 
 ### Requirement: Orchestration loop runs apply and archive
 `run` サブコマンドは OpenSpec change workflow のオーケストレーションループを実行しなければならない（SHALL）。
