@@ -6,7 +6,8 @@ info:
     name: Conflux
     url: https://github.com/anomalyco/conflux
   license:
-    name: ''
+    name: MIT
+    identifier: MIT
   version: 0.5.3
 paths:
   /api/changes:

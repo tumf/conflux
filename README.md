@@ -932,7 +932,7 @@ Priority: CLI argument > Environment variable > Default value
 ## Installation
 
 ```bash
-cargo install --path .
+cargo install cflx
 ```
 
 This will build and install the orchestrator to your Cargo bin directory (typically `~/.cargo/bin`).

@@ -429,7 +429,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "conflux"
+name = "cflx"
 version = "0.5.3"
 dependencies = [
  "agent-skills-rs",

@@ -5,7 +5,7 @@
 ### 1. Install
 
 ```bash
-cargo install --path .
+cargo install cflx
 ```
 
 ### 2. Initialize Configuration

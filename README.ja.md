@@ -34,7 +34,7 @@ OpenSpec変更ワークフロー（list → 依存関係分析 → apply → arc
 
 ```bash
 # 1. インストール
-cargo install --path .
+cargo install cflx
 
 # 2. 設定ファイルを初期化（デフォルト: Claude Codeエージェント）
 cflx init

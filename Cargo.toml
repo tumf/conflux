@@ -1,8 +1,39 @@
 [package]
-name = "conflux"
+name = "cflx"
 version = "0.5.3"
 edition = "2021"
 default-run = "cflx"
+description = "Conflux – a spec-driven parallel coding orchestrator that runs AI agents on git worktrees"
+license = "MIT"
+repository = "https://github.com/tumf/conflux"
+homepage = "https://github.com/tumf/conflux"
+documentation = "https://github.com/tumf/conflux#readme"
+keywords = ["ai", "codegen", "orchestration", "git", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+  ".agents/**",
+  ".claude/**",
+  ".codex/**",
+  ".github/**",
+  ".leann/**",
+  ".opencode/**",
+  ".serena/**",
+  ".tldrignore",
+  ".wt/**",
+  ".pre-commit-config.yaml",
+  ".node-version",
+  ".setup-completed",
+  "docs/**",
+  "openspec/**",
+  "reports/**",
+  "scripts/**",
+  "skills/**",
+  "release.toml",
+  "dist-workspace.toml",
+  "AGENTS.md",
+  "CLAUDE.md",
+  "README.ja.md",
+]
 
 [lib]
 name = "conflux"

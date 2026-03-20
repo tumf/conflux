@@ -1,4 +1,4 @@
-.PHONY: install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test check openapi check-openapi
+.PHONY: install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test check openapi check-openapi publish
 
 # Build the project
 build:
@@ -11,6 +11,10 @@ clean:
 # Install the binary locally
 install:
 	cargo install --path .
+
+# Install from crates.io
+install-crates:
+	cargo install cflx
 
 # Create fast indexes (LEANN + TLDR warm cache) - runs in parallel
 index:
@@ -88,6 +92,16 @@ openapi:
 	@mkdir -p docs
 	cargo run --bin openapi-gen --features web-monitoring > docs/openapi.yaml
 	@echo "OpenAPI specification generated at docs/openapi.yaml"
+
+# Publish to crates.io (requires `cargo login` beforehand)
+publish: check
+	@echo "Publishing to crates.io..."
+	cargo publish
+	@echo "Published! Install with: cargo install cflx"
+
+publish-dry-run: check
+	@echo "Running crates.io dry-run..."
+	cargo publish --dry-run
 
 # Check if OpenAPI specification is up to date
 check-openapi:
