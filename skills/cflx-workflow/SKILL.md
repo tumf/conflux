@@ -41,7 +41,7 @@ The orchestrator specifies the operation. Parse the invocation to determine:
 
 1. **Read Proposal**
    ```bash
-   python3 "$SKILL_ROOT/scripts/cflx.py" show <change-id>
+   python3 "<SKILL_ROOT>/scripts/cflx.py" show <change-id>
    ```
    - Read `openspec/changes/<id>/proposal.md`
    - Read `openspec/changes/<id>/design.md` (if exists)
@@ -284,8 +284,8 @@ Recommended:
 
 2. **Validate Change Status**
    ```bash
-   python3 "$SKILL_ROOT/scripts/cflx.py" list
-   python3 "$SKILL_ROOT/scripts/cflx.py" show <id>
+   python3 "<SKILL_ROOT>/scripts/cflx.py" list
+   python3 "<SKILL_ROOT>/scripts/cflx.py" show <id>
    ```
    - Ensure change exists
    - Ensure not already archived
@@ -293,7 +293,7 @@ Recommended:
 
 3. **Run Archive**
    ```bash
-   python3 "$SKILL_ROOT/scripts/cflx.py" archive <id> --yes
+   python3 "<SKILL_ROOT>/scripts/cflx.py" archive <id> --yes
    ```
    - Use `--skip-specs` only for tooling-only changes
 
@@ -301,7 +301,7 @@ Recommended:
    - Confirm moved to `changes/archive/`
    - Confirm specs updated
    ```bash
-   python3 "$SKILL_ROOT/scripts/cflx.py" validate --strict
+   python3 "<SKILL_ROOT>/scripts/cflx.py" validate --strict
    ```
 
 ### Archive Completion Criteria
@@ -316,31 +316,31 @@ Recommended:
 
 ```bash
 # List changes
-python3 "$SKILL_ROOT/scripts/cflx.py" list
+python3 "<SKILL_ROOT>/scripts/cflx.py" list
 
 # List specs
-python3 "$SKILL_ROOT/scripts/cflx.py" list --specs
+python3 "<SKILL_ROOT>/scripts/cflx.py" list --specs
 
 # Show change details
-python3 "$SKILL_ROOT/scripts/cflx.py" show <id>
+python3 "<SKILL_ROOT>/scripts/cflx.py" show <id>
 
 # Show JSON output
-python3 "$SKILL_ROOT/scripts/cflx.py" show <id> --json
+python3 "<SKILL_ROOT>/scripts/cflx.py" show <id> --json
 
 # Show deltas only
-python3 "$SKILL_ROOT/scripts/cflx.py" show <id> --json --deltas-only
+python3 "<SKILL_ROOT>/scripts/cflx.py" show <id> --json --deltas-only
 
 # Validate change
-python3 "$SKILL_ROOT/scripts/cflx.py" validate <id> --strict
+python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict
 
 # Validate all
-python3 "$SKILL_ROOT/scripts/cflx.py" validate --strict
+python3 "<SKILL_ROOT>/scripts/cflx.py" validate --strict
 
 # Archive change
-python3 "$SKILL_ROOT/scripts/cflx.py" archive <id> --yes
+python3 "<SKILL_ROOT>/scripts/cflx.py" archive <id> --yes
 
 # Archive without spec updates
-python3 "$SKILL_ROOT/scripts/cflx.py" archive <id> --yes --skip-specs
+python3 "<SKILL_ROOT>/scripts/cflx.py" archive <id> --yes --skip-specs
 ```
 
 ## Autonomous Decision Framework
