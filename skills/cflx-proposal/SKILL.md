@@ -89,7 +89,7 @@ If the answer is already inferable from the repository and current conversation,
 **Research existing code**:
 ```bash
 # Review existing specs
- python3 "$SKILL_ROOT/scripts/cflx.py" list --specs
+ python3 "<SKILL_ROOT>/scripts/cflx.py" list --specs
 
 # Check related code
 rg "<keyword>"
@@ -231,7 +231,7 @@ Create `openspec/changes/<id>/specs/<capability>/spec.md`:
 
 Run validation:
 ```bash
- python3 "$SKILL_ROOT/scripts/cflx.py" validate <id> --strict
+ python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict
 ```
 
 **If validation fails**:
@@ -318,26 +318,26 @@ When designing tasks, follow mock-first approach:
 
 ## Built-in Tools
 
-Use `python3 "$SKILL_ROOT/scripts/cflx.py"` for all Conflux operations:
+Use `python3 "<SKILL_ROOT>/scripts/cflx.py"` for all Conflux operations (`<SKILL_ROOT>` is a placeholder for the skill's base directory path):
 
 ```bash
 # List existing changes
-python3 "$SKILL_ROOT/scripts/cflx.py" list
+python3 "<SKILL_ROOT>/scripts/cflx.py" list
 
 # List specs
-python3 "$SKILL_ROOT/scripts/cflx.py" list --specs
+python3 "<SKILL_ROOT>/scripts/cflx.py" list --specs
 
 # Show change details
-python3 "$SKILL_ROOT/scripts/cflx.py" show <id>
+python3 "<SKILL_ROOT>/scripts/cflx.py" show <id>
 
 # Validate proposal
-python3 "$SKILL_ROOT/scripts/cflx.py" validate <id> --strict
+python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict
 
 # Validate proposal with implementation-evidence warnings
-python3 "$SKILL_ROOT/scripts/cflx.py" validate <id> --strict --evidence warn
+python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict --evidence warn
 
 # Validate proposal with implementation-evidence errors
-python3 "$SKILL_ROOT/scripts/cflx.py" validate <id> --strict --evidence error
+python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict --evidence error
 ```
 
 ## Best Practices
