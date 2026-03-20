@@ -441,6 +441,10 @@ async fn main() -> Result<()> {
             let force_stop_flag = Arc::new(AtomicBool::new(false));
             let restart_requested = Arc::new(AtomicBool::new(false));
 
+            // Handle for the web control bridge task; aborted on run completion.
+            #[cfg(feature = "web-monitoring")]
+            let mut web_bridge_handle: Option<tokio::task::JoinHandle<()>> = None;
+
             // Set web state for broadcasting updates and wire control channel
             #[cfg(feature = "web-monitoring")]
             if let Some(web_state) = &web_state_arc {
@@ -461,7 +465,7 @@ async fn main() -> Result<()> {
                 let bridge_force_stop = force_stop_flag.clone();
                 let bridge_restart = restart_requested.clone();
                 let bridge_web_state = web_state.clone();
-                tokio::spawn(async move {
+                web_bridge_handle = Some(tokio::spawn(async move {
                     loop {
                         if let Some(control_cmd) = control_rx.recv().await {
                             use crate::events::ExecutionEvent;
@@ -539,7 +543,7 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                });
+                }));
             }
 
             // Signal handler flags (shared across all iterations)
@@ -666,28 +670,8 @@ async fn main() -> Result<()> {
                         info!("Continuing after error due to retry request");
                     }
                     Ok(()) => {
-                        // Successful completion or graceful stop
+                        // Successful completion — exit run mode immediately
                         info!("Orchestrator completed successfully");
-
-                        // Wait for restart request in stopped state (to support resume from stop)
-                        loop {
-                            // Check if restart was requested
-                            if restart_requested.load(Ordering::SeqCst) {
-                                info!("Restart requested after stop, will restart orchestrator");
-                                break;
-                            }
-
-                            // Check if force stop or signal was received (exit on those)
-                            if force_stop_flag.load(Ordering::SeqCst)
-                                || signal_stop.load(Ordering::SeqCst)
-                            {
-                                info!("Stop signal received, exiting");
-                                break; // Exit outer loop below
-                            }
-
-                            // Wait a bit before checking again (100ms polling interval)
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        }
                     }
                 }
 
@@ -703,6 +687,13 @@ async fn main() -> Result<()> {
 
                 // No restart requested, exit loop
                 break;
+            }
+
+            // Abort run-scoped web bridge task explicitly so cleanup does not
+            // depend on Tokio runtime teardown ordering.
+            #[cfg(feature = "web-monitoring")]
+            if let Some(handle) = web_bridge_handle {
+                handle.abort();
             }
         }
 

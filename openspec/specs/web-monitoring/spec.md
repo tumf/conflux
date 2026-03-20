@@ -5,6 +5,7 @@
 Provides HTTP-based monitoring capabilities for the orchestrator, including REST API endpoints, WebSocket real-time updates, and a web dashboard UI. Enables both TUI and Web UI to maintain state parity through a unified state model and event stream architecture.
 ## Requirements
 ### Requirement: HTTP Server Lifecycle
+
 オーケストレーターは、オーケストレーション状態を監視するための任意のHTTPサーバーを提供しなければならない（SHALL）。
 
 #### Scenario: Server enabled via CLI flag
@@ -28,6 +29,13 @@ Provides HTTP-based monitoring capabilities for the orchestrator, including REST
 - **THEN** HTTPサーバーはアクティブな接続を穏やかに閉じる
 - **AND** オーケストレーターは進行中のリクエスト完了を待機する
 - **AND** オーケストレーターは正常に終了する
+
+#### Scenario: Run mode success shuts down web monitoring
+- **GIVEN** ユーザーが `cflx run --web` を実行している
+- **AND** オーケストレーションが成功裏に完了する
+- **WHEN** run モードが成功終了へ遷移する
+- **THEN** run モードが起動したHTTPサーバーと関連バックグラウンドタスクは停止する
+- **AND** プロセスは追加の外部シグナルなしで正常終了する
 
 ### Requirement: Configuration Options
 オーケストレーターは、CLIと設定ファイルでWeb監視のパラメータを設定できなければならない（SHALL）。
