@@ -44,7 +44,7 @@ mod worktree_ops;
 mod test_support;
 
 use clap::Parser;
-use cli::{Cli, Commands, ProjectCommands, TuiArgs};
+use cli::{install_skills_legacy_error, Cli, Commands, ProjectCommands, TuiArgs};
 use config::OrchestratorConfig;
 use error::Result;
 use install_skills::{run_install_skills, InstallSkillsOptions};
@@ -897,6 +897,10 @@ async fn main() -> Result<()> {
 
         // install-skills subcommand: install agent skills
         Some(Commands::InstallSkills(args)) => {
+            if let Some(src) = &args.legacy_source {
+                eprintln!("{}", install_skills_legacy_error(src));
+                std::process::exit(1);
+            }
             let opts = InstallSkillsOptions {
                 global: args.global,
                 project_root: None, // use CWD at runtime

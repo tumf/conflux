@@ -9,3 +9,9 @@
 ## Future Work
 
 - Reintroduce configurable source selection in a separate proposal only if a real non-bundled workflow emerges.
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Ensure the working tree is clean before acceptance (`git status --porcelain` is currently non-empty due to `src/cli.rs`).
+- [x] Make legacy source invocations (`cflx install-skills self`, `cflx install-skills local:...`) print migration guidance that explicitly recommends `cflx install-skills` or `cflx install-skills --global` (current output only shows `Usage: cflx install-skills [OPTIONS]`).
+- [x] Add/adjust CLI regression tests to assert the legacy-invocation error text includes the new migration guidance (task 3 is currently marked complete without this evidence).

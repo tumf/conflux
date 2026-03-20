@@ -498,6 +498,21 @@ pub struct InstallSkillsArgs {
     /// Install into global scope (~/.agents/skills) instead of project scope (./.agents/skills)
     #[arg(long)]
     pub global: bool,
+
+    /// Hidden positional argument to detect and reject legacy source forms (e.g. "self", "local:...").
+    #[arg(hide = true)]
+    pub legacy_source: Option<String>,
+}
+
+/// Return a migration guidance error message when a legacy source argument is detected.
+pub fn install_skills_legacy_error(src: &str) -> String {
+    format!(
+        "error: unrecognized argument '{src}'\n\n\
+         The source argument is no longer accepted.\n\
+         Use:\n  \
+         cflx install-skills           # project scope\n  \
+         cflx install-skills --global  # global scope"
+    )
 }
 
 /// Check if git directory exists
@@ -1231,17 +1246,45 @@ mod tests {
     }
 
     #[test]
-    fn test_install_skills_legacy_self_arg_rejected() {
-        // Legacy positional argument "self" must be rejected by clap
-        let result = Cli::try_parse_from(["cflx", "install-skills", "self"]);
-        assert!(result.is_err(), "Expected parse failure for legacy 'self' argument");
+    fn test_install_skills_legacy_self_arg_captured() {
+        // Legacy "self" positional argument is captured so we can emit migration guidance
+        let cli = Cli::parse_from(["cflx", "install-skills", "self"]);
+        match cli.command {
+            Some(Commands::InstallSkills(args)) => {
+                assert_eq!(args.legacy_source.as_deref(), Some("self"));
+                let msg = install_skills_legacy_error("self");
+                assert!(
+                    msg.contains("cflx install-skills"),
+                    "Migration guidance must mention 'cflx install-skills'"
+                );
+                assert!(
+                    msg.contains("--global"),
+                    "Migration guidance must mention '--global'"
+                );
+            }
+            _ => panic!("Expected InstallSkills subcommand"),
+        }
     }
 
     #[test]
-    fn test_install_skills_legacy_local_arg_rejected() {
-        // Legacy positional argument "local:..." must be rejected by clap
-        let result = Cli::try_parse_from(["cflx", "install-skills", "local:../my-skills"]);
-        assert!(result.is_err(), "Expected parse failure for legacy 'local:' argument");
+    fn test_install_skills_legacy_local_arg_captured() {
+        // Legacy "local:..." positional argument is captured so we can emit migration guidance
+        let cli = Cli::parse_from(["cflx", "install-skills", "local:../my-skills"]);
+        match cli.command {
+            Some(Commands::InstallSkills(args)) => {
+                assert_eq!(args.legacy_source.as_deref(), Some("local:../my-skills"));
+                let msg = install_skills_legacy_error("local:../my-skills");
+                assert!(
+                    msg.contains("cflx install-skills"),
+                    "Migration guidance must mention 'cflx install-skills'"
+                );
+                assert!(
+                    msg.contains("--global"),
+                    "Migration guidance must mention '--global'"
+                );
+            }
+            _ => panic!("Expected InstallSkills subcommand"),
+        }
     }
 
     #[test]
