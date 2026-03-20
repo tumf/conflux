@@ -14,6 +14,7 @@ use std::process::Command;
 
 use crate::error::{OrchestratorError, Result};
 
+#[cfg(target_os = "macos")]
 const SERVICE_LABEL: &str = "com.conflux.cflx-server";
 
 /// Validate the effective global ServerConfig (same policy as `cflx server`).
@@ -174,6 +175,8 @@ mod platform {
 
 #[cfg(target_os = "linux")]
 mod platform {
+    use std::path::Path;
+
     use super::*;
 
     const SERVICE_NAME: &str = "cflx-server";
@@ -188,7 +191,7 @@ mod platform {
             .join(format!("{SERVICE_NAME}.service")))
     }
 
-    fn generate_unit(exe: &PathBuf) -> String {
+    fn generate_unit(exe: &Path) -> String {
         format!(
             "[Unit]\n\
              Description=Conflux Server Daemon\n\
