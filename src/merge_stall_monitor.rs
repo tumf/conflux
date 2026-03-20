@@ -185,7 +185,7 @@ mod tests {
 
     async fn init_git_repo(dir: &Path) -> Result<()> {
         Command::new("git")
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(dir)
             .output()
             .await
