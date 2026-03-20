@@ -112,7 +112,10 @@ impl Orchestrator {
     ) -> Result<Self> {
         let config = OrchestratorConfig::load(config_path.as_deref())?;
         log_deduplicator::configure_logging(config.get_logging());
-        let hooks = HookRunner::new(config.get_hooks());
+        let hooks = HookRunner::with_output_handler(
+            config.get_hooks(),
+            Arc::new(LogOutputHandler::new()),
+        );
         // CLI override takes precedence over config file value
         let max_iterations = max_iterations_override.unwrap_or_else(|| config.get_max_iterations());
         let agent = AgentRunner::new(config.clone());
@@ -216,7 +219,10 @@ impl Orchestrator {
         config: OrchestratorConfig,
     ) -> Result<Self> {
         log_deduplicator::configure_logging(config.get_logging());
-        let hooks = HookRunner::new(config.get_hooks());
+        let hooks = HookRunner::with_output_handler(
+            config.get_hooks(),
+            Arc::new(LogOutputHandler::new()),
+        );
         let max_iterations = config.get_max_iterations();
         let agent = AgentRunner::new(config.clone());
         let stall_detector = StallDetector::new(config.get_stall_detection());

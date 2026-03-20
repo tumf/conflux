@@ -6,9 +6,11 @@
 use crate::config::expand;
 use crate::error::{OrchestratorError, Result};
 use crate::events::{ExecutionEvent, LogEntry};
+use crate::orchestration::output::OutputHandler;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -18,6 +20,9 @@ use tracing::{debug, error, info, warn};
 
 /// Default timeout for hook execution in seconds
 pub const DEFAULT_HOOK_TIMEOUT: u64 = 60;
+
+/// Maximum bytes of hook output to display before truncating
+pub const HOOK_OUTPUT_TRUNCATE_BYTES: usize = 1024;
 
 /// Types of hooks that can be executed
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -467,12 +472,29 @@ impl HookContext {
     }
 }
 
+/// Truncate hook output to `limit` bytes, respecting UTF-8 char boundaries.
+///
+/// Returns `(display_slice, was_truncated)`.
+fn truncate_hook_output(s: &str, limit: usize) -> (&str, bool) {
+    if s.len() <= limit {
+        return (s, false);
+    }
+    // Walk back from `limit` to find a valid char boundary
+    let mut boundary = limit;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    (&s[..boundary], true)
+}
+
 /// Hook runner that executes hooks based on configuration
 #[derive(Clone)]
 pub struct HookRunner {
     config: HooksConfig,
-    /// Optional event sender for hook logs
+    /// Optional event sender for hook logs (TUI/parallel mode)
     event_tx: Option<mpsc::Sender<ExecutionEvent>>,
+    /// Optional output handler for CLI-visible hook logs
+    output_handler: Option<Arc<dyn OutputHandler>>,
 }
 
 impl std::fmt::Debug for HookRunner {
@@ -480,6 +502,7 @@ impl std::fmt::Debug for HookRunner {
         f.debug_struct("HookRunner")
             .field("config", &self.config)
             .field("event_tx", &self.event_tx.is_some())
+            .field("output_handler", &self.output_handler.is_some())
             .finish()
     }
 }
@@ -490,6 +513,22 @@ impl HookRunner {
         Self {
             config,
             event_tx: None,
+            output_handler: None,
+        }
+    }
+
+    /// Create a HookRunner with the given configuration and output handler for CLI-visible logs.
+    ///
+    /// Use this in CLI (`cflx run`) mode so hook command invocations and captured output
+    /// are surfaced in the user-visible log stream.
+    pub fn with_output_handler(
+        config: HooksConfig,
+        output_handler: Arc<dyn OutputHandler>,
+    ) -> Self {
+        Self {
+            config,
+            event_tx: None,
+            output_handler: Some(output_handler),
         }
     }
 
@@ -498,6 +537,7 @@ impl HookRunner {
         Self {
             config,
             event_tx: Some(event_tx),
+            output_handler: None,
         }
     }
 
@@ -507,6 +547,7 @@ impl HookRunner {
         Self {
             config: HooksConfig::default(),
             event_tx: None,
+            output_handler: None,
         }
     }
 
@@ -540,31 +581,61 @@ impl HookRunner {
         );
         debug!("Hook timeout: {}s", hook_config.timeout);
 
-        // Send log entry for hook command execution
+        // Emit hook command to all configured log sinks (event channel and/or output handler)
+        let cmd_msg = format!("Running {} hook: {}", hook_type, command);
         if let Some(ref tx) = self.event_tx {
-            let log_msg = format!("Running {} hook: {}", hook_type, command);
-            let _ = tx.send(ExecutionEvent::Log(LogEntry::info(log_msg))).await;
+            let _ = tx
+                .send(ExecutionEvent::Log(LogEntry::info(cmd_msg.clone())))
+                .await;
+        }
+        if let Some(ref handler) = self.output_handler {
+            handler.on_info(&cmd_msg);
         }
 
         match self
             .execute_hook(hook_type, &command, &env_vars, timeout_duration)
             .await
         {
-            Ok((success, output)) => {
-                // Send hook output to logs if available
-                if let Some(ref tx) = self.event_tx {
-                    if !output.is_empty() {
-                        let truncated_output = if output.len() > 1024 {
-                            format!("{}... (truncated)", &output[..1024])
-                        } else {
-                            output.clone()
-                        };
+            Ok((success, stdout, stderr)) => {
+                // Emit captured stdout – always, regardless of exit status
+                if !stdout.is_empty() {
+                    let (display, was_truncated) =
+                        truncate_hook_output(&stdout, HOOK_OUTPUT_TRUNCATE_BYTES);
+                    let mut msg = format!("{} hook stdout: {}", hook_type, display);
+                    if was_truncated {
+                        msg.push_str(&format!(
+                            "\n[... {} bytes truncated]",
+                            stdout.len() - HOOK_OUTPUT_TRUNCATE_BYTES
+                        ));
+                    }
+                    if let Some(ref tx) = self.event_tx {
                         let _ = tx
-                            .send(ExecutionEvent::Log(LogEntry::info(format!(
-                                "{} hook output: {}",
-                                hook_type, truncated_output
-                            ))))
+                            .send(ExecutionEvent::Log(LogEntry::info(msg.clone())))
                             .await;
+                    }
+                    if let Some(ref handler) = self.output_handler {
+                        handler.on_stdout(&msg);
+                    }
+                }
+
+                // Emit captured stderr – always, regardless of exit status
+                if !stderr.is_empty() {
+                    let (display, was_truncated) =
+                        truncate_hook_output(&stderr, HOOK_OUTPUT_TRUNCATE_BYTES);
+                    let mut msg = format!("{} hook stderr: {}", hook_type, display);
+                    if was_truncated {
+                        msg.push_str(&format!(
+                            "\n[... {} bytes truncated]",
+                            stderr.len() - HOOK_OUTPUT_TRUNCATE_BYTES
+                        ));
+                    }
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx
+                            .send(ExecutionEvent::Log(LogEntry::warn(msg.clone())))
+                            .await;
+                    }
+                    if let Some(ref handler) = self.output_handler {
+                        handler.on_stderr(&msg);
                     }
                 }
 
@@ -600,15 +671,17 @@ impl HookRunner {
         }
     }
 
-    /// Execute a hook command with the given environment variables and timeout
-    /// Returns (success, output) where output is combined stdout+stderr
+    /// Execute a hook command with the given environment variables and timeout.
+    ///
+    /// Returns `(success, stdout, stderr)` with stdout and stderr captured separately
+    /// so callers can emit them with appropriate labels and log levels.
     async fn execute_hook(
         &self,
         hook_type: HookType,
         command: &str,
         env_vars: &HashMap<String, String>,
         timeout_duration: Duration,
-    ) -> Result<(bool, String)> {
+    ) -> Result<(bool, String, String)> {
         let mut cmd = if cfg!(target_os = "windows") {
             debug!(
                 module = module_path!(),
@@ -657,33 +730,27 @@ impl HookRunner {
                     message: format!("Failed to wait for hook process: {}", e),
                 })?;
 
-                // Read stdout and stderr
-                let mut output = String::new();
-                if let Some(mut stdout) = stdout {
-                    let mut stdout_buf = Vec::new();
-                    if (stdout.read_to_end(&mut stdout_buf).await).is_ok() {
-                        if let Ok(s) = String::from_utf8(stdout_buf) {
-                            if !s.is_empty() {
-                                output.push_str(&s);
-                            }
+                // Read stdout and stderr separately to preserve stream identity
+                let mut stdout_output = String::new();
+                if let Some(mut stdout_pipe) = stdout {
+                    let mut buf = Vec::new();
+                    if (stdout_pipe.read_to_end(&mut buf).await).is_ok() {
+                        if let Ok(s) = String::from_utf8(buf) {
+                            stdout_output = s;
                         }
                     }
                 }
-                if let Some(mut stderr) = stderr {
-                    let mut stderr_buf = Vec::new();
-                    if (stderr.read_to_end(&mut stderr_buf).await).is_ok() {
-                        if let Ok(s) = String::from_utf8(stderr_buf) {
-                            if !s.is_empty() {
-                                if !output.is_empty() {
-                                    output.push('\n');
-                                }
-                                output.push_str(&s);
-                            }
+                let mut stderr_output = String::new();
+                if let Some(mut stderr_pipe) = stderr {
+                    let mut buf = Vec::new();
+                    if (stderr_pipe.read_to_end(&mut buf).await).is_ok() {
+                        if let Ok(s) = String::from_utf8(buf) {
+                            stderr_output = s;
                         }
                     }
                 }
 
-                Ok((status.success(), output))
+                Ok((status.success(), stdout_output, stderr_output))
             }
             Err(_) => Err(OrchestratorError::HookTimeout {
                 hook_type: hook_type.to_string(),
@@ -1292,12 +1359,12 @@ mod tests {
             log_messages[0]
         );
 
-        // If there's output, it should be logged
+        // If there's output, it should be logged with the "stdout" label
         if log_messages.len() > 1 {
             assert!(
                 log_messages[1].contains("Hello from hook")
-                    || log_messages[1].contains("on_start hook output"),
-                "Expected output log, got: {}",
+                    || log_messages[1].contains("on_start hook stdout"),
+                "Expected stdout output log, got: {}",
                 log_messages[1]
             );
         }
@@ -1313,5 +1380,239 @@ mod tests {
         // Should work without event_tx (no logs sent)
         let result = runner.run_hook(HookType::OnStart, &context).await;
         assert!(result.is_ok());
+    }
+
+    // === Regression tests for CLI hook output visibility ===
+
+    use std::sync::{Arc, Mutex};
+
+    /// Minimal OutputHandler that records all messages for test assertions.
+    #[derive(Default, Clone)]
+    struct RecordingOutputHandler {
+        messages: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl RecordingOutputHandler {
+        fn new() -> Self {
+            Self {
+                messages: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn all(&self) -> Vec<(String, String)> {
+            self.messages.lock().unwrap().clone()
+        }
+
+        fn kinds(&self) -> Vec<String> {
+            self.all().into_iter().map(|(k, _)| k).collect()
+        }
+
+        fn content(&self) -> Vec<String> {
+            self.all().into_iter().map(|(_, v)| v).collect()
+        }
+    }
+
+    impl crate::orchestration::output::OutputHandler for RecordingOutputHandler {
+        fn on_stdout(&self, line: &str) {
+            self.messages
+                .lock()
+                .unwrap()
+                .push(("stdout".into(), line.to_string()));
+        }
+
+        fn on_stderr(&self, line: &str) {
+            self.messages
+                .lock()
+                .unwrap()
+                .push(("stderr".into(), line.to_string()));
+        }
+
+        fn on_info(&self, message: &str) {
+            self.messages
+                .lock()
+                .unwrap()
+                .push(("info".into(), message.to_string()));
+        }
+
+        fn on_warn(&self, message: &str) {
+            self.messages
+                .lock()
+                .unwrap()
+                .push(("warn".into(), message.to_string()));
+        }
+
+        fn on_error(&self, message: &str) {
+            self.messages
+                .lock()
+                .unwrap()
+                .push(("error".into(), message.to_string()));
+        }
+
+        fn on_success(&self, message: &str) {
+            self.messages
+                .lock()
+                .unwrap()
+                .push(("success".into(), message.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_hook_stdout_visible_via_output_handler() {
+        // Hook that writes to stdout; output must appear in the output_handler stream.
+        let json = r#"{"on_start": "echo 'hello stdout'"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let handler = RecordingOutputHandler::new();
+        let runner = HookRunner::with_output_handler(config, Arc::new(handler.clone()));
+
+        let result = runner.run_hook(HookType::OnStart, &HookContext::default()).await;
+        assert!(result.is_ok());
+
+        let content = handler.content();
+        // Command log must appear first
+        assert!(
+            content.iter().any(|m| m.contains("Running on_start hook")),
+            "Command log not found: {:?}",
+            content
+        );
+        // stdout output must appear
+        assert!(
+            content
+                .iter()
+                .any(|m| m.contains("on_start hook stdout") && m.contains("hello stdout")),
+            "stdout output not found: {:?}",
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cli_hook_stderr_visible_via_output_handler() {
+        // Hook that writes only to stderr; output must appear in the output_handler stream.
+        let json = r#"{"on_start": "echo 'hello stderr' >&2"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let handler = RecordingOutputHandler::new();
+        let runner = HookRunner::with_output_handler(config, Arc::new(handler.clone()));
+
+        let result = runner.run_hook(HookType::OnStart, &HookContext::default()).await;
+        assert!(result.is_ok());
+
+        let content = handler.content();
+        assert!(
+            content
+                .iter()
+                .any(|m| m.contains("on_start hook stderr") && m.contains("hello stderr")),
+            "stderr output not found: {:?}",
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cli_hook_output_visible_even_on_failure() {
+        // Hook exits non-zero but output must still be shown before the failure.
+        let json =
+            r#"{"on_start": {"command": "echo 'output before fail'; exit 1", "continue_on_failure": true}}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let handler = RecordingOutputHandler::new();
+        let runner = HookRunner::with_output_handler(config, Arc::new(handler.clone()));
+
+        // continue_on_failure=true so run_hook returns Ok
+        let result = runner.run_hook(HookType::OnStart, &HookContext::default()).await;
+        assert!(result.is_ok(), "expected Ok with continue_on_failure=true");
+
+        let content = handler.content();
+        assert!(
+            content
+                .iter()
+                .any(|m| m.contains("output before fail")),
+            "output before failure not shown: {:?}",
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cli_hook_global_hooks_no_change_id() {
+        // on_start / on_finish have no change_id; output must still surface.
+        let json = r#"{"on_finish": "echo 'run finished'"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let handler = RecordingOutputHandler::new();
+        let runner = HookRunner::with_output_handler(config, Arc::new(handler.clone()));
+
+        // Build a context with no change_id (as on_start/on_finish use)
+        let ctx = HookContext::new(3, 3, 0, false).with_status("completed");
+
+        let result = runner.run_hook(HookType::OnFinish, &ctx).await;
+        assert!(result.is_ok());
+
+        let content = handler.content();
+        assert!(
+            content
+                .iter()
+                .any(|m| m.contains("Running on_finish hook")),
+            "on_finish command log not shown: {:?}",
+            content
+        );
+        assert!(
+            content
+                .iter()
+                .any(|m| m.contains("run finished")),
+            "on_finish stdout not shown: {:?}",
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cli_hook_truncated_output_marked_explicitly() {
+        // Generate output that exceeds HOOK_OUTPUT_TRUNCATE_BYTES to verify the explicit marker.
+        let big_output = "x".repeat(HOOK_OUTPUT_TRUNCATE_BYTES + 100);
+        let json = format!(r#"{{"on_start": "printf '{}'" }}"#, big_output);
+        let config: HooksConfig = serde_json::from_str(&json).unwrap();
+        let handler = RecordingOutputHandler::new();
+        let runner = HookRunner::with_output_handler(config, Arc::new(handler.clone()));
+
+        let result = runner.run_hook(HookType::OnStart, &HookContext::default()).await;
+        assert!(result.is_ok());
+
+        let content = handler.content();
+        let has_truncation_marker = content.iter().any(|m| m.contains("bytes truncated"));
+        assert!(
+            has_truncation_marker,
+            "Expected explicit truncation marker in output: {:?}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_truncate_hook_output_below_limit() {
+        let s = "hello";
+        let (result, truncated) = truncate_hook_output(s, 1024);
+        assert_eq!(result, "hello");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_truncate_hook_output_at_limit() {
+        let s = "a".repeat(1024);
+        let (result, truncated) = truncate_hook_output(&s, 1024);
+        assert_eq!(result.len(), 1024);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_truncate_hook_output_above_limit() {
+        let s = "b".repeat(2000);
+        let (result, truncated) = truncate_hook_output(&s, 1024);
+        assert_eq!(result.len(), 1024);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_truncate_hook_output_multibyte_boundary() {
+        // "日" is 3 bytes; 1025 bytes of "日" repeated would split a multi-byte char
+        let s = "日".repeat(400); // 1200 bytes total
+        let (result, truncated) = truncate_hook_output(&s, 1024);
+        // Result must be valid UTF-8 (no partial multi-byte chars)
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+        assert!(truncated);
+        // Should be at most 1024 bytes and a valid char boundary
+        assert!(result.len() <= 1024);
     }
 }
