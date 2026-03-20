@@ -1403,10 +1403,6 @@ mod tests {
             self.messages.lock().unwrap().clone()
         }
 
-        fn kinds(&self) -> Vec<String> {
-            self.all().into_iter().map(|(k, _)| k).collect()
-        }
-
         fn content(&self) -> Vec<String> {
             self.all().into_iter().map(|(_, v)| v).collect()
         }
@@ -1464,7 +1460,9 @@ mod tests {
         let handler = RecordingOutputHandler::new();
         let runner = HookRunner::with_output_handler(config, Arc::new(handler.clone()));
 
-        let result = runner.run_hook(HookType::OnStart, &HookContext::default()).await;
+        let result = runner
+            .run_hook(HookType::OnStart, &HookContext::default())
+            .await;
         assert!(result.is_ok());
 
         let content = handler.content();
@@ -1492,7 +1490,9 @@ mod tests {
         let handler = RecordingOutputHandler::new();
         let runner = HookRunner::with_output_handler(config, Arc::new(handler.clone()));
 
-        let result = runner.run_hook(HookType::OnStart, &HookContext::default()).await;
+        let result = runner
+            .run_hook(HookType::OnStart, &HookContext::default())
+            .await;
         assert!(result.is_ok());
 
         let content = handler.content();
@@ -1508,21 +1508,20 @@ mod tests {
     #[tokio::test]
     async fn test_cli_hook_output_visible_even_on_failure() {
         // Hook exits non-zero but output must still be shown before the failure.
-        let json =
-            r#"{"on_start": {"command": "echo 'output before fail'; exit 1", "continue_on_failure": true}}"#;
+        let json = r#"{"on_start": {"command": "echo 'output before fail'; exit 1", "continue_on_failure": true}}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
         let handler = RecordingOutputHandler::new();
         let runner = HookRunner::with_output_handler(config, Arc::new(handler.clone()));
 
         // continue_on_failure=true so run_hook returns Ok
-        let result = runner.run_hook(HookType::OnStart, &HookContext::default()).await;
+        let result = runner
+            .run_hook(HookType::OnStart, &HookContext::default())
+            .await;
         assert!(result.is_ok(), "expected Ok with continue_on_failure=true");
 
         let content = handler.content();
         assert!(
-            content
-                .iter()
-                .any(|m| m.contains("output before fail")),
+            content.iter().any(|m| m.contains("output before fail")),
             "output before failure not shown: {:?}",
             content
         );
@@ -1544,16 +1543,12 @@ mod tests {
 
         let content = handler.content();
         assert!(
-            content
-                .iter()
-                .any(|m| m.contains("Running on_finish hook")),
+            content.iter().any(|m| m.contains("Running on_finish hook")),
             "on_finish command log not shown: {:?}",
             content
         );
         assert!(
-            content
-                .iter()
-                .any(|m| m.contains("run finished")),
+            content.iter().any(|m| m.contains("run finished")),
             "on_finish stdout not shown: {:?}",
             content
         );
@@ -1568,7 +1563,9 @@ mod tests {
         let handler = RecordingOutputHandler::new();
         let runner = HookRunner::with_output_handler(config, Arc::new(handler.clone()));
 
-        let result = runner.run_hook(HookType::OnStart, &HookContext::default()).await;
+        let result = runner
+            .run_hook(HookType::OnStart, &HookContext::default())
+            .await;
         assert!(result.is_ok());
 
         let content = handler.content();
