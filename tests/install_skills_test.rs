@@ -2,7 +2,7 @@
 ///
 /// These tests verify that `run_install_skills` correctly writes skills to
 /// the expected directories and updates the matching lock file for both
-/// project-scope and global-scope installs.
+/// project-scope and global-scope installs using bundled skills.
 use std::fs;
 use std::sync::Mutex;
 
@@ -38,7 +38,6 @@ fn test_project_scope_install_creates_agents_skills_dir() {
     create_test_skills_dir(&workdir);
 
     let opts = InstallSkillsOptions {
-        source_str: "self".to_string(),
         global: false,
         project_root: Some(workdir.path().to_path_buf()),
     };
@@ -60,7 +59,6 @@ fn test_project_scope_install_updates_lock_file() {
     create_test_skills_dir(&workdir);
 
     let opts = InstallSkillsOptions {
-        source_str: "self".to_string(),
         global: false,
         project_root: Some(workdir.path().to_path_buf()),
     };
@@ -90,7 +88,6 @@ fn test_global_scope_install_uses_home_agents_dir() {
     std::env::set_var("HOME", fake_home.path());
 
     let opts = InstallSkillsOptions {
-        source_str: "self".to_string(),
         global: true,
         project_root: Some(workdir.path().to_path_buf()),
     };
@@ -129,7 +126,6 @@ fn test_global_scope_lock_entry_exists() {
     std::env::set_var("HOME", fake_home.path());
 
     let opts = InstallSkillsOptions {
-        source_str: "self".to_string(),
         global: true,
         project_root: Some(workdir.path().to_path_buf()),
     };
@@ -148,68 +144,4 @@ fn test_global_scope_lock_entry_exists() {
         entry.is_some(),
         "Global lock entry for 'test-skill' should exist"
     );
-}
-
-// ---------------------------------------------------------------------------
-// local:<path> source tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_local_path_source_install() {
-    let workdir = TempDir::new().unwrap();
-
-    // Create skills in a custom path (not the default "skills/")
-    let custom_skills_dir = workdir.path().join("custom-skills");
-    let skill_dir = custom_skills_dir.join("my-skill");
-    fs::create_dir_all(&skill_dir).unwrap();
-    fs::write(
-        skill_dir.join("SKILL.md"),
-        "---\nname: my-skill\ndescription: My custom skill\n---\n\n# My Skill\n",
-    )
-    .unwrap();
-
-    let source_str = format!("local:{}", custom_skills_dir.display());
-    let opts = InstallSkillsOptions {
-        source_str,
-        global: false,
-        project_root: Some(workdir.path().to_path_buf()),
-    };
-    run_install_skills(opts).unwrap();
-
-    let skill_path = workdir.path().join(".agents/skills/my-skill");
-    assert!(skill_path.exists(), "Expected skill at {skill_path:?}");
-
-    let lock_path = workdir.path().join(".agents/.skill-lock.json");
-    assert!(lock_path.exists(), "Lock file should exist");
-}
-
-// ---------------------------------------------------------------------------
-// Error handling tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_unsupported_source_scheme_returns_error() {
-    let opts = InstallSkillsOptions {
-        source_str: "git:https://example.com/repo".to_string(),
-        global: false,
-        project_root: None,
-    };
-    let result = run_install_skills(opts);
-    assert!(result.is_err(), "Should fail for unsupported scheme");
-    let msg = result.unwrap_err().to_string();
-    assert!(
-        msg.contains("self") && msg.contains("local:<path>"),
-        "Error should mention allowed schemes, got: {msg}"
-    );
-}
-
-#[test]
-fn test_local_empty_path_returns_error() {
-    let opts = InstallSkillsOptions {
-        source_str: "local:".to_string(),
-        global: false,
-        project_root: None,
-    };
-    let result = run_install_skills(opts);
-    assert!(result.is_err(), "Should fail for empty local path");
 }
