@@ -867,14 +867,10 @@ Options:
 
 **Install-skills subcommand:**
 
-Install bundled or local agent skills into the standard `.agents/skills` directory.
+Install bundled agent skills from the repository's `skills/` directory into the standard `.agents/skills` location.
 
 ```
-cflx install-skills <SOURCE> [--global]
-
-SOURCE forms:
-  self              Install bundled skills from the top-level skills/ directory
-  local:<path>      Install skills from a local file path
+cflx install-skills [--global]
 ```
 
 Options:
@@ -885,19 +881,13 @@ Options:
 Examples:
 ```bash
 # Install bundled skills (project scope -> ./.agents/skills)
-cflx install-skills self
+cflx install-skills
 
 # Install bundled skills (global scope -> ~/.agents/skills)
-cflx install-skills self --global
-
-# Install from a local path (project scope)
-cflx install-skills local:../my-skills
-
-# Install from a local path (global scope)
-cflx install-skills local:../my-skills --global
+cflx install-skills --global
 ```
 
-The `self` source discovers skills from the repository's top-level `skills/` directory. Skills must have a `SKILL.md` file with `name` and `description` frontmatter fields. A lock file (`.agents/.skill-lock.json` or `~/.agents/.skill-lock.json`) is updated after each install to track installed skill versions.
+Skills are discovered from the repository's top-level `skills/` directory. Each skill must have a `SKILL.md` file with `name` and `description` frontmatter fields. A lock file (`.agents/.skill-lock.json` or `~/.agents/.skill-lock.json`) is updated after each install to track installed skill versions.
 
 Priority: CLI argument > Environment variable > Default value
 

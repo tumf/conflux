@@ -898,7 +898,6 @@ async fn main() -> Result<()> {
         // install-skills subcommand: install agent skills
         Some(Commands::InstallSkills(args)) => {
             let opts = InstallSkillsOptions {
-                source_str: args.source.clone(),
                 global: args.global,
                 project_root: None, // use CWD at runtime
             };
