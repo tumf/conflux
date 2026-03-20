@@ -523,6 +523,7 @@ Commands:
   init             Initialize a new configuration file
   check-conflicts  Check for conflicts between spec delta files across changes
   server           Start the multi-project server daemon
+  service          Manage `cflx server` as a background service
 
 Options:
   -c, --config <PATH>          Path to custom configuration file (JSONC format)
@@ -852,6 +853,43 @@ The web dashboard provides a visual overview of orchestration progress:
 | Cannot access from another device | Use `--web-bind 0.0.0.0` to allow external connections (local network only) |
 | CORS errors in browser console | This is normal for cross-origin requests; the server handles CORS headers |
 
+### Background Service
+
+Use `cflx service` to install and manage `cflx server` as a user-level background service.
+
+- macOS: `launchd` user agent
+- Linux: `systemd --user` service
+- Windows: Scheduled Task
+
+```
+cflx service <install|uninstall|status|start|stop|restart>
+```
+
+Examples:
+
+```bash
+# Install and enable the service
+cflx service install
+
+# Start or restart the background server
+cflx service start
+cflx service restart
+
+# Check service status
+cflx service status
+
+# Stop or remove the service
+cflx service stop
+cflx service uninstall
+```
+
+Notes:
+
+- `install`, `start`, and `restart` validate the effective global `server` configuration before touching the service manager.
+- macOS writes a plist under `~/Library/LaunchAgents/com.conflux.cflx-server.plist`.
+- Linux writes a unit file under `~/.config/systemd/user/cflx-server.service`.
+- Configure persistent server settings in your global config file before installing, for example `~/.config/cflx/config.jsonc`.
+
 **Init subcommand options:**
 ```
 Options:
@@ -867,14 +905,10 @@ Options:
 
 **Install-skills subcommand:**
 
-Install bundled or local agent skills into the standard `.agents/skills` directory.
+Install bundled agent skills from the repository's `skills/` directory into the standard `.agents/skills` location.
 
 ```
-cflx install-skills <SOURCE> [--global]
-
-SOURCE forms:
-  self              Install bundled skills from the top-level skills/ directory
-  local:<path>      Install skills from a local file path
+cflx install-skills [--global]
 ```
 
 Options:
@@ -885,19 +919,13 @@ Options:
 Examples:
 ```bash
 # Install bundled skills (project scope -> ./.agents/skills)
-cflx install-skills self
+cflx install-skills
 
 # Install bundled skills (global scope -> ~/.agents/skills)
-cflx install-skills self --global
-
-# Install from a local path (project scope)
-cflx install-skills local:../my-skills
-
-# Install from a local path (global scope)
-cflx install-skills local:../my-skills --global
+cflx install-skills --global
 ```
 
-The `self` source discovers skills from the repository's top-level `skills/` directory. Skills must have a `SKILL.md` file with `name` and `description` frontmatter fields. A lock file (`.agents/.skill-lock.json` or `~/.agents/.skill-lock.json`) is updated after each install to track installed skill versions.
+Skills are discovered from the repository's top-level `skills/` directory. Each skill must have a `SKILL.md` file with `name` and `description` frontmatter fields. A lock file (`.agents/.skill-lock.json` or `~/.agents/.skill-lock.json`) is updated after each install to track installed skill versions.
 
 Priority: CLI argument > Environment variable > Default value
 
@@ -942,192 +970,12 @@ This will build and install the orchestrator to your Cargo bin directory (typica
 | Document | Description |
 |----------|-------------|
 | [Usage Examples](docs/guides/USAGE.md) | Quick start and usage examples |
+| [Contributing Guide](CONTRIBUTING.md) | Local development setup and contributor workflow |
 | [Development Guide](docs/guides/DEVELOPMENT.md) | Build instructions and project structure |
 | [Release Guide](docs/guides/RELEASE.md) | How to create releases |
 | [API Specification](docs/openapi.yaml) | OpenAPI spec for web monitoring |
 
 Internal documentation (parallel execution audit) is available in `docs/audit/`.
-
-## Project Structure
-
-```
-src/
-  lib.rs                    # Library crate root
-  main.rs                   # Entry point, CLI dispatching
-  cli.rs                    # CLI argument parsing (clap)
-  error.rs                  # Error types (thiserror)
-  openspec.rs               # OpenSpec CLI wrapper
-  orchestrator.rs           # Main orchestration loop
-  progress.rs               # Progress display (indicatif)
-  hooks.rs                  # Lifecycle hook execution
-  task_parser.rs            # Native tasks.md parser
-  templates.rs              # Configuration templates
-  acceptance.rs             # Acceptance test output parsing
-  ai_command_runner.rs      # Common AI command runner (unified stagger state)
-  analyzer.rs               # Change dependency analyzer
-  command_queue.rs          # Command queue with stagger and retry
-  events.rs                 # Unified event system
-  history.rs                # Apply/archive/resolve history
-  error_history.rs          # Error history tracking
-  merge_stall_monitor.rs    # Merge stall detection monitor
-  parallel_run_service.rs   # Parallel execution service
-  permission.rs             # Permission auto-reject detection
-  process_manager.rs        # Cross-platform child process management
-  serial_run_service.rs     # Serial execution service
-  spec_delta.rs             # Spec delta parsing and conflict detection
-  spec_test_annotations.rs  # Spec test annotation support
-  stall.rs                  # Stall detection utilities
-  worktree_ops.rs           # Common worktree operations (TUI and Web)
-
-  bin/
-    openapi_gen.rs          # OpenAPI spec generator binary
-
-  agent/                    # AI agent command execution
-    mod.rs                  # Agent runner module
-    runner.rs               # Agent runner implementation
-    output.rs               # Output line types
-    prompt.rs               # Prompt building functions
-    history_ops.rs          # History management operations
-    tests.rs                # Agent module tests
-
-  execution/                # Shared execution logic
-    mod.rs                  # Execution module root
-    apply.rs                # Apply operation logic
-    archive.rs              # Archive operation logic
-    state.rs                # Workspace state detection
-    types.rs                # Common type definitions
-
-  orchestration/            # Shared orchestration logic
-    mod.rs                  # Common CLI/TUI orchestration
-    acceptance.rs           # Shared acceptance operations
-    apply.rs                # Shared apply operations
-    archive.rs              # Shared archive operations
-    hooks.rs                # Hook context helpers
-    output.rs               # Output handler trait
-    selection.rs            # Shared change selection logic
-    state.rs                # Shared state management
-
-  config/                   # Configuration
-    mod.rs                  # Configuration module root
-    defaults.rs             # Default values
-    expand.rs               # Environment variable expansion
-    jsonc.rs                # JSONC parser
-
-  vcs/                      # Version Control abstraction
-    mod.rs                  # VCS module root
-    commands.rs             # Common VCS interface
-    git/                    # Git backend
-      mod.rs                # Git module root
-      commands/             # Git command implementations
-        mod.rs              # Git commands module root
-        basic.rs            # Basic git operations
-        commit.rs           # Commit operations
-        merge.rs            # Merge operations
-        worktree.rs         # Worktree management
-
-  parallel/                 # Parallel execution
-    mod.rs                  # Parallel module root
-    executor.rs             # Parallel change executor
-    events.rs               # Progress reporting events
-    conflict.rs             # Conflict detection/resolution
-    cleanup.rs              # Workspace cleanup
-    dynamic_queue.rs        # Dynamic queue for runtime change additions
-    merge.rs                # Merge operations for parallel execution
-    output_bridge.rs        # Bridge between OutputHandler and ParallelEvent
-    types.rs                # Common types for parallel execution
-    workspace.rs            # Workspace creation and management
-    tests/                  # Parallel module tests
-      mod.rs                # Test module root
-      auto_resolve.rs       # Auto-resolve tests
-      conflict.rs           # Conflict detection tests
-      executor.rs           # Executor tests
-      manual_resolve.rs     # Manual resolve tests
-
-  remote/                   # Remote server client (TUI)
-    mod.rs                  # HTTP and WebSocket client module
-    client.rs               # HTTP client for remote server
-    mapper.rs               # Remote type to local type mapping
-    types.rs                # Remote communication type definitions
-    ws.rs                   # WebSocket client for real-time updates
-
-  server/                   # Server daemon (multi-project management)
-    mod.rs                  # Server daemon module
-    api.rs                  # REST API handlers
-    registry.rs             # Project registry with persistence
-    runner.rs               # Server-side project runner
-
-  web/                      # Web monitoring
-    mod.rs                  # Web monitoring module
-    api.rs                  # REST API handlers
-    state.rs                # Web monitoring state management
-    url.rs                  # URL conversion utilities
-    websocket.rs            # WebSocket handler for real-time updates
-
-  tui/                      # Terminal User Interface
-    mod.rs                  # TUI module
-    render.rs               # Terminal rendering
-    runner.rs               # TUI main loop
-    state.rs                # TUI state management
-    types.rs                # TUI type definitions
-    type_impls.rs           # TUI type implementations
-    events.rs               # TUI event handling
-    command_handlers.rs     # TuiCommand handlers
-    key_handlers.rs         # Key event handlers
-    orchestrator.rs         # TUI orchestrator execution logic
-    terminal.rs             # Terminal helper functions
-    queue.rs                # Dynamic queue for runtime change additions
-    worktrees.rs            # Worktree view management
-    log_deduplicator.rs     # Log deduplication
-    qr.rs                   # QR code generation for Web UI URL
-    utils.rs                # TUI utility functions
-
-tests/
-  e2e_tests.rs                        # End-to-end tests
-  merge_conflict_check_tests.rs       # Merge conflict detection tests
-  opencode_command_validation.rs      # OpenCode command validation tests
-  process_cleanup_test.rs             # Process cleanup tests
-```
-
-## Development
-
-See [Development Guide](docs/guides/DEVELOPMENT.md) for build instructions, testing, and full project structure.
-
-### Git Hooks
-
-This project uses [prek](https://prek.j178.dev/) for managing Git hooks (a Rust-based alternative to pre-commit).
-
-**Migration from pre-commit:**
-
-If you were previously using pre-commit, uninstall it first:
-
-```bash
-pre-commit uninstall
-```
-
-**Setup:**
-
-```bash
-# Install prek
-brew install prek
-
-# Install hooks
-prek install
-```
-
-**Usage:**
-
-```bash
-# Run all hooks on all files
-prek run --all-files
-
-# Run specific hooks
-prek run rustfmt clippy
-
-# List available hooks
-prek list
-```
-
-The configuration is defined in `.pre-commit-config.yaml` (prek is fully compatible with pre-commit configuration format). The `prek run --all-files` command also auto-runs `make openapi` and stages `docs/openapi.yaml`.
 
 ## Future Enhancements
 
@@ -1145,4 +993,4 @@ MIT
 
 ## Contributing
 
-Contributions welcome! Please open an issue or pull request.
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, Git hooks, and repository structure.

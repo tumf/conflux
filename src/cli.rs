@@ -137,16 +137,11 @@ pub enum Commands {
 
     /// Install agent skills into .agents/skills
     ///
-    /// Installs bundled or local agent skills into the standard .agents/skills location.
-    ///
-    /// SOURCE forms:
-    ///   self              Install bundled skills from the top-level skills/ directory
-    ///   local:<path>      Install skills from a local path
+    /// Installs bundled agent skills into the standard .agents/skills location.
     ///
     /// EXAMPLES:
-    ///   cflx install-skills self                   # Install bundled skills (project scope)
-    ///   cflx install-skills self --global          # Install bundled skills (global scope)
-    ///   cflx install-skills local:../my-skills     # Install from local path (project scope)
+    ///   cflx install-skills           # Install bundled skills (project scope)
+    ///   cflx install-skills --global  # Install bundled skills (global scope)
     #[command(name = "install-skills")]
     InstallSkills(InstallSkillsArgs),
 }
@@ -485,11 +480,9 @@ pub struct ServiceArgs {
 /// Arguments for the `install-skills` subcommand
 #[derive(Parser, Debug)]
 #[command(
-    long_about = "Install agent skills into the standard .agents/skills location.
+    long_about = "Install bundled agent skills into the standard .agents/skills location.
 
-SOURCE forms:
-  self              Bundled skills from the repository's top-level skills/ directory
-  local:<path>      Skills from a local directory path
+Skills are always sourced from the repository's top-level skills/ directory.
 
 SCOPE:
   Project scope (default): installs to ./.agents/skills
@@ -498,17 +491,28 @@ SCOPE:
                             lock file:  ~/.agents/.skill-lock.json
 
 EXAMPLES:
-  cflx install-skills self
-  cflx install-skills self --global
-  cflx install-skills local:../my-skills"
+  cflx install-skills
+  cflx install-skills --global"
 )]
 pub struct InstallSkillsArgs {
-    /// Source of skills: 'self' for bundled skills, or 'local:<path>' for a local directory
-    pub source: String,
-
     /// Install into global scope (~/.agents/skills) instead of project scope (./.agents/skills)
     #[arg(long)]
     pub global: bool,
+
+    /// Hidden positional argument to detect and reject legacy source forms (e.g. "self", "local:...").
+    #[arg(hide = true)]
+    pub legacy_source: Option<String>,
+}
+
+/// Return a migration guidance error message when a legacy source argument is detected.
+pub fn install_skills_legacy_error(src: &str) -> String {
+    format!(
+        "error: unrecognized argument '{src}'\n\n\
+         The source argument is no longer accepted.\n\
+         Use:\n  \
+         cflx install-skills           # project scope\n  \
+         cflx install-skills --global  # global scope"
+    )
 }
 
 /// Check if git directory exists
@@ -1220,60 +1224,64 @@ mod tests {
     // ── install-skills subcommand tests ──────────────────────────────────────
 
     #[test]
-    fn test_install_skills_self_source() {
+    fn test_install_skills_no_args() {
+        let cli = Cli::parse_from(["cflx", "install-skills"]);
+        match cli.command {
+            Some(Commands::InstallSkills(args)) => {
+                assert!(!args.global);
+            }
+            _ => panic!("Expected InstallSkills subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_install_skills_global_flag() {
+        let cli = Cli::parse_from(["cflx", "install-skills", "--global"]);
+        match cli.command {
+            Some(Commands::InstallSkills(args)) => {
+                assert!(args.global);
+            }
+            _ => panic!("Expected InstallSkills subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_install_skills_legacy_self_arg_captured() {
+        // Legacy "self" positional argument is captured so we can emit migration guidance
         let cli = Cli::parse_from(["cflx", "install-skills", "self"]);
         match cli.command {
             Some(Commands::InstallSkills(args)) => {
-                assert_eq!(args.source, "self");
-                assert!(!args.global);
+                assert_eq!(args.legacy_source.as_deref(), Some("self"));
+                let msg = install_skills_legacy_error("self");
+                assert!(
+                    msg.contains("cflx install-skills"),
+                    "Migration guidance must mention 'cflx install-skills'"
+                );
+                assert!(
+                    msg.contains("--global"),
+                    "Migration guidance must mention '--global'"
+                );
             }
             _ => panic!("Expected InstallSkills subcommand"),
         }
     }
 
     #[test]
-    fn test_install_skills_self_global() {
-        let cli = Cli::parse_from(["cflx", "install-skills", "self", "--global"]);
-        match cli.command {
-            Some(Commands::InstallSkills(args)) => {
-                assert_eq!(args.source, "self");
-                assert!(args.global);
-            }
-            _ => panic!("Expected InstallSkills subcommand"),
-        }
-    }
-
-    #[test]
-    fn test_install_skills_local_source() {
+    fn test_install_skills_legacy_local_arg_captured() {
+        // Legacy "local:..." positional argument is captured so we can emit migration guidance
         let cli = Cli::parse_from(["cflx", "install-skills", "local:../my-skills"]);
         match cli.command {
             Some(Commands::InstallSkills(args)) => {
-                assert_eq!(args.source, "local:../my-skills");
-                assert!(!args.global);
-            }
-            _ => panic!("Expected InstallSkills subcommand"),
-        }
-    }
-
-    #[test]
-    fn test_install_skills_local_source_global() {
-        let cli = Cli::parse_from(["cflx", "install-skills", "local:/some/path", "--global"]);
-        match cli.command {
-            Some(Commands::InstallSkills(args)) => {
-                assert_eq!(args.source, "local:/some/path");
-                assert!(args.global);
-            }
-            _ => panic!("Expected InstallSkills subcommand"),
-        }
-    }
-
-    #[test]
-    fn test_install_skills_unsupported_scheme_is_accepted_by_cli() {
-        // CLI accepts any string; unsupported schemes are rejected at the install flow level
-        let cli = Cli::parse_from(["cflx", "install-skills", "git:https://example.com"]);
-        match cli.command {
-            Some(Commands::InstallSkills(args)) => {
-                assert_eq!(args.source, "git:https://example.com");
+                assert_eq!(args.legacy_source.as_deref(), Some("local:../my-skills"));
+                let msg = install_skills_legacy_error("local:../my-skills");
+                assert!(
+                    msg.contains("cflx install-skills"),
+                    "Migration guidance must mention 'cflx install-skills'"
+                );
+                assert!(
+                    msg.contains("--global"),
+                    "Migration guidance must mention '--global'"
+                );
             }
             _ => panic!("Expected InstallSkills subcommand"),
         }
