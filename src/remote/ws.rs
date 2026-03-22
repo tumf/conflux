@@ -14,7 +14,7 @@ use super::types::RemoteStateUpdate;
 /// Connect to the remote server's WebSocket endpoint and stream state updates.
 ///
 /// # Arguments
-/// * `ws_url`  – WebSocket URL (e.g., `"ws://host:9876/api/v1/ws"`)
+/// * `ws_url`  – WebSocket URL (e.g., `"ws://host:39876/api/v1/ws"`)
 /// * `token`   – Optional bearer token. Sent as an `Authorization` header in the
 ///   HTTP upgrade request.
 /// * `tx`      – Channel sender; received [`RemoteStateUpdate`] messages are forwarded here.
