@@ -34,8 +34,8 @@ fn create_test_skills_dir(base: &TempDir) {
 
 #[test]
 fn test_project_scope_install_creates_agents_skills_dir() {
+    // Embedded skills are preferred; no skills/ directory needed.
     let workdir = TempDir::new().unwrap();
-    create_test_skills_dir(&workdir);
 
     let opts = InstallSkillsOptions {
         global: false,
@@ -43,10 +43,11 @@ fn test_project_scope_install_creates_agents_skills_dir() {
     };
     run_install_skills(opts).unwrap();
 
-    let skill_path = workdir.path().join(".agents/skills/test-skill");
+    // Embedded cflx-proposal skill must be installed.
+    let skill_path = workdir.path().join(".agents/skills/cflx-proposal");
     assert!(
         skill_path.exists(),
-        "Expected skill directory at {skill_path:?}"
+        "Expected embedded skill directory at {skill_path:?}"
     );
 
     let lock_path = workdir.path().join(".agents/.skill-lock.json");
@@ -55,8 +56,8 @@ fn test_project_scope_install_creates_agents_skills_dir() {
 
 #[test]
 fn test_project_scope_install_updates_lock_file() {
+    // Embedded skills are preferred; lock entry source_type must be "self".
     let workdir = TempDir::new().unwrap();
-    create_test_skills_dir(&workdir);
 
     let opts = InstallSkillsOptions {
         global: false,
@@ -66,10 +67,10 @@ fn test_project_scope_install_updates_lock_file() {
 
     let lock_path = workdir.path().join(".agents/.skill-lock.json");
     let lock_manager = LockManager::new(lock_path);
-    let entry = lock_manager.get_entry("test-skill").unwrap();
-    assert!(entry.is_some(), "Lock entry for 'test-skill' should exist");
+    let entry = lock_manager.get_entry("cflx-proposal").unwrap();
+    assert!(entry.is_some(), "Lock entry for 'cflx-proposal' should exist");
     let entry = entry.unwrap();
-    assert_eq!(entry.source_type, "local");
+    assert_eq!(entry.source_type, "self");
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +81,6 @@ fn test_project_scope_install_updates_lock_file() {
 fn test_global_scope_install_uses_home_agents_dir() {
     let workdir = TempDir::new().unwrap();
     let fake_home = TempDir::new().unwrap();
-    create_test_skills_dir(&workdir);
 
     let _guard = HOME_MUTEX.lock().unwrap();
 
@@ -101,10 +101,11 @@ fn test_global_scope_install_uses_home_agents_dir() {
 
     result.unwrap();
 
-    let skill_path = fake_home.path().join(".agents/skills/test-skill");
+    // Embedded cflx-proposal skill must be installed to the global directory.
+    let skill_path = fake_home.path().join(".agents/skills/cflx-proposal");
     assert!(
         skill_path.exists(),
-        "Expected global skill at {skill_path:?}"
+        "Expected global embedded skill at {skill_path:?}"
     );
 
     let lock_path = fake_home.path().join(".agents/.skill-lock.json");
@@ -118,7 +119,6 @@ fn test_global_scope_install_uses_home_agents_dir() {
 fn test_global_scope_lock_entry_exists() {
     let workdir = TempDir::new().unwrap();
     let fake_home = TempDir::new().unwrap();
-    create_test_skills_dir(&workdir);
 
     let _guard = HOME_MUTEX.lock().unwrap();
 
@@ -139,10 +139,10 @@ fn test_global_scope_lock_entry_exists() {
 
     let lock_path = fake_home.path().join(".agents/.skill-lock.json");
     let lock_manager = LockManager::new(lock_path);
-    let entry = lock_manager.get_entry("test-skill").unwrap();
+    let entry = lock_manager.get_entry("cflx-proposal").unwrap();
     assert!(
         entry.is_some(),
-        "Global lock entry for 'test-skill' should exist"
+        "Global lock entry for 'cflx-proposal' should exist"
     );
 }
 
@@ -223,9 +223,56 @@ fn test_embedded_install_without_skills_dir() {
         "cflx-workflow must have references/cflx-archive.md"
     );
     assert!(
-        skills_base
-            .join("cflx-run/references/cflx-run.md")
-            .exists(),
+        skills_base.join("cflx-run/references/cflx-run.md").exists(),
         "cflx-run must have references/cflx-run.md"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression test: embedded skills win even when a local skills/ directory exists
+// ---------------------------------------------------------------------------
+
+/// Verify that `run_install_skills` always installs embedded skills even when a
+/// local `skills/` directory exists at the project root.
+#[test]
+fn test_embedded_wins_when_local_skills_dir_exists() {
+    let workdir = TempDir::new().unwrap();
+    // Create a local skills/ directory with a synthetic skill.
+    create_test_skills_dir(&workdir);
+    assert!(
+        workdir.path().join("skills").exists(),
+        "Precondition: skills/ must exist"
+    );
+
+    let opts = InstallSkillsOptions {
+        global: false,
+        project_root: Some(workdir.path().to_path_buf()),
+    };
+    run_install_skills(opts).unwrap();
+
+    let skills_base = workdir.path().join(".agents/skills");
+    let lock_path = workdir.path().join(".agents/.skill-lock.json");
+    let lock_manager = LockManager::new(lock_path);
+
+    // Embedded cflx-proposal must be installed (not the local test-skill).
+    let cflx_proposal_dir = skills_base.join("cflx-proposal");
+    assert!(
+        cflx_proposal_dir.exists(),
+        "Embedded cflx-proposal must be installed even when skills/ dir exists"
+    );
+
+    let entry = lock_manager.get_entry("cflx-proposal").unwrap();
+    assert!(entry.is_some(), "Lock entry for cflx-proposal must exist");
+    assert_eq!(
+        entry.unwrap().source_type,
+        "self",
+        "cflx-proposal must have source_type 'self', not 'local'"
+    );
+
+    // The local test-skill must NOT be installed.
+    let test_skill_dir = skills_base.join("test-skill");
+    assert!(
+        !test_skill_dir.exists(),
+        "Local test-skill must NOT be installed when embedded skills are available"
     );
 }

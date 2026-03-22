@@ -42,8 +42,9 @@ fn resolve_install_paths(
 
 /// Execute the install-skills command.
 ///
-/// Prefers embedded skills compiled into the binary. Falls back to local `skills/`
-/// directory discovery when a `skills/` directory exists at `project_root` (dev mode).
+/// Prefers embedded skills compiled into the binary at build time.
+/// Falls back to local `skills/` directory discovery only when embedded skills
+/// are unavailable (e.g. during library-only builds or testing without embed).
 pub fn run_install_skills(opts: InstallSkillsOptions) -> Result<()> {
     let project_root = match opts.project_root {
         Some(ref p) => p.clone(),
@@ -55,7 +56,27 @@ pub fn run_install_skills(opts: InstallSkillsOptions) -> Result<()> {
     let install_config = InstallConfig::new(canonical_dir);
     let lock_manager = LockManager::new(lock_path);
 
-    // Use local skills/ directory when it exists (dev fallback); otherwise use embedded.
+    // Prefer embedded skills compiled into the binary at build time.
+    let embedded_skills = get_cflx_embedded_skills()?;
+    if !embedded_skills.is_empty() {
+        let source = Source {
+            source_type: SourceType::Self_,
+            url: None,
+            subpath: None,
+            skill_filter: None,
+            ref_: None,
+        };
+        for skill in &embedded_skills {
+            println!("Installing skill: {}", skill.name);
+            let result = install_skill(skill, &install_config)?;
+            lock_manager.update_entry(&skill.name, &source, &result.path)?;
+            println!("  -> {}", result.path.display());
+        }
+        println!("Successfully installed {} skill(s).", embedded_skills.len());
+        return Ok(());
+    }
+
+    // Dev fallback: use local skills/ directory when embedded skills are unavailable.
     let local_skills_dir = project_root.join("skills");
     if local_skills_dir.is_dir() {
         let source = Source {
@@ -81,26 +102,7 @@ pub fn run_install_skills(opts: InstallSkillsOptions) -> Result<()> {
         return Ok(());
     }
 
-    // Embedded path: use skills compiled into the binary at build time.
-    let source = Source {
-        source_type: SourceType::Self_,
-        url: None,
-        subpath: None,
-        skill_filter: None,
-        ref_: None,
-    };
-    let skills = get_cflx_embedded_skills()?;
-    if skills.is_empty() {
-        println!("No bundled skills available.");
-        return Ok(());
-    }
-    for skill in &skills {
-        println!("Installing skill: {}", skill.name);
-        let result = install_skill(skill, &install_config)?;
-        lock_manager.update_entry(&skill.name, &source, &result.path)?;
-        println!("  -> {}", result.path.display());
-    }
-    println!("Successfully installed {} skill(s).", skills.len());
+    println!("No bundled skills available.");
     Ok(())
 }
 

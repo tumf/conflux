@@ -10,8 +10,15 @@
 - [x] 1.8 Ensure existing `tests/install_skills_test.rs` tests pass without modification — they exercise the dev fallback path via `project_root` + `skills/` (verification: `cargo test --test install_skills_test`)
 - [x] 1.9 Run full test suite and clippy (verification: `cargo test && cargo clippy -- -D warnings`)
 
+## Acceptance #1 Failure Follow-up
+
+- [x] Make `run_install_skills` prefer embedded skills first, and fall back to local `skills/` discovery only when embedded skills are unavailable.
+- [x] Update `install-skills` CLI long help text to describe embedded-by-default behavior and conditional local fallback.
+- [x] Add a regression test that verifies embedded skills are selected even when a local `skills/` directory exists.
+
 ## Future Work
 
 - Embed `.skill` binary manifest files once binary embedding is supported in `agent-skills-rs`
 - Remove dev fallback path if embedded-only distribution is confirmed sufficient
 - Consider `build.rs` auto-discovery to reduce manual `include_str!` maintenance
+- Ensure the working tree is clean before rerunning acceptance (human step: `git status` check before acceptance run)

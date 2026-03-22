@@ -482,7 +482,10 @@ pub struct ServiceArgs {
 #[command(
     long_about = "Install bundled agent skills into the standard .agents/skills location.
 
-Skills are always sourced from the repository's top-level skills/ directory.
+Skills are embedded into the cflx binary at compile time and installed directly
+without requiring a skills/ directory to be present. When no embedded skills are
+available (uncommon), the command falls back to discovering skills from a local
+skills/ directory at the project root.
 
 SCOPE:
   Project scope (default): installs to ./.agents/skills

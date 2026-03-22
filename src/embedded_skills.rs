@@ -3,16 +3,12 @@ use agent_skills_rs::types::Skill;
 use anyhow::Result;
 
 // cflx-proposal skill files
-const CFLX_PROPOSAL_SKILL_MD: &str =
-    include_str!("../skills/cflx-proposal/SKILL.md");
-const CFLX_PROPOSAL_SCRIPT: &str =
-    include_str!("../skills/cflx-proposal/scripts/cflx.py");
+const CFLX_PROPOSAL_SKILL_MD: &str = include_str!("../skills/cflx-proposal/SKILL.md");
+const CFLX_PROPOSAL_SCRIPT: &str = include_str!("../skills/cflx-proposal/scripts/cflx.py");
 
 // cflx-workflow skill files
-const CFLX_WORKFLOW_SKILL_MD: &str =
-    include_str!("../skills/cflx-workflow/SKILL.md");
-const CFLX_WORKFLOW_SCRIPT: &str =
-    include_str!("../skills/cflx-workflow/scripts/cflx.py");
+const CFLX_WORKFLOW_SKILL_MD: &str = include_str!("../skills/cflx-workflow/SKILL.md");
+const CFLX_WORKFLOW_SCRIPT: &str = include_str!("../skills/cflx-workflow/scripts/cflx.py");
 const CFLX_WORKFLOW_REF_ACCEPT: &str =
     include_str!("../skills/cflx-workflow/references/cflx-accept.md");
 const CFLX_WORKFLOW_REF_APPLY: &str =
@@ -21,10 +17,8 @@ const CFLX_WORKFLOW_REF_ARCHIVE: &str =
     include_str!("../skills/cflx-workflow/references/cflx-archive.md");
 
 // cflx-run skill files
-const CFLX_RUN_SKILL_MD: &str =
-    include_str!("../skills/cflx-run/SKILL.md");
-const CFLX_RUN_REF: &str =
-    include_str!("../skills/cflx-run/references/cflx-run.md");
+const CFLX_RUN_SKILL_MD: &str = include_str!("../skills/cflx-run/SKILL.md");
+const CFLX_RUN_REF: &str = include_str!("../skills/cflx-run/references/cflx-run.md");
 
 /// Return all cflx bundled skills with their auxiliary files embedded at compile time.
 pub fn get_cflx_embedded_skills() -> Result<Vec<Skill>> {
@@ -65,8 +59,14 @@ mod tests {
     fn test_embedded_skills_names() {
         let skills = get_cflx_embedded_skills().unwrap();
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"cflx-proposal"), "Expected cflx-proposal skill");
-        assert!(names.contains(&"cflx-workflow"), "Expected cflx-workflow skill");
+        assert!(
+            names.contains(&"cflx-proposal"),
+            "Expected cflx-proposal skill"
+        );
+        assert!(
+            names.contains(&"cflx-workflow"),
+            "Expected cflx-workflow skill"
+        );
         assert!(names.contains(&"cflx-run"), "Expected cflx-run skill");
     }
 
@@ -86,15 +86,21 @@ mod tests {
             "cflx-workflow must have scripts/cflx.py"
         );
         assert!(
-            workflow.auxiliary_files.contains_key("references/cflx-accept.md"),
+            workflow
+                .auxiliary_files
+                .contains_key("references/cflx-accept.md"),
             "cflx-workflow must have references/cflx-accept.md"
         );
         assert!(
-            workflow.auxiliary_files.contains_key("references/cflx-apply.md"),
+            workflow
+                .auxiliary_files
+                .contains_key("references/cflx-apply.md"),
             "cflx-workflow must have references/cflx-apply.md"
         );
         assert!(
-            workflow.auxiliary_files.contains_key("references/cflx-archive.md"),
+            workflow
+                .auxiliary_files
+                .contains_key("references/cflx-archive.md"),
             "cflx-workflow must have references/cflx-archive.md"
         );
 
