@@ -530,7 +530,7 @@ Options:
   --web                        Enable web monitoring server for remote status viewing
   --web-port <PORT>            Port for web monitoring server (default: 0 = auto-assign by OS)
   --web-bind <ADDR>            Bind address for web monitoring server (default: 127.0.0.1)
-  --server <URL>               Connect TUI to a remote Conflux server (e.g., http://host:9876)
+  --server <URL>               Connect TUI to a remote Conflux server (e.g., http://host:39876)
   --server-token <TOKEN>       Bearer token for remote server authentication
   --server-token-env <VAR>     Environment variable holding the bearer token
   -h, --help                   Print help

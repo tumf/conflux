@@ -109,11 +109,11 @@ mod tests {
 
     #[test]
     fn test_server_base_url_localhost() {
-        let url = server_base_url("127.0.0.1", 9876);
-        assert_eq!(url, "http://localhost:9876");
+        let url = server_base_url("127.0.0.1", 39876);
+        assert_eq!(url, "http://localhost:39876");
 
-        let url = server_base_url("localhost", 9876);
-        assert_eq!(url, "http://localhost:9876");
+        let url = server_base_url("localhost", 39876);
+        assert_eq!(url, "http://localhost:39876");
     }
 
     #[test]

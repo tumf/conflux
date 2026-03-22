@@ -75,7 +75,7 @@ async fn load_remote_changes(args: &TuiArgs) -> Result<Vec<openspec::Change>> {
 /// Priority:
 /// 1. Explicit `--server <url>` argument
 /// 2. Global config `server.bind` / `server.port`
-/// 3. Default: `http://127.0.0.1:9876`
+/// 3. Default: `http://127.0.0.1:39876`
 fn resolve_project_server_url(explicit: Option<&str>) -> String {
     if let Some(url) = explicit {
         return url.to_string();
@@ -968,7 +968,7 @@ mod project_command_tests {
         assert_eq!(url, "http://custom:1234");
     }
 
-    /// Without global config the URL falls back to the default (127.0.0.1:9876).
+    /// Without global config the URL falls back to the default (127.0.0.1:39876).
     #[test]
     fn test_resolve_project_server_url_default_fallback() {
         let url = resolve_project_server_url(None);
@@ -990,7 +990,7 @@ mod project_command_tests {
     /// Without global config the auth mode defaults to None, so the guard passes.
     #[test]
     fn test_check_project_auth_default_no_auth_passes() {
-        let result = check_project_auth_not_required("http://127.0.0.1:9876", false);
+        let result = check_project_auth_not_required("http://127.0.0.1:39876", false);
         assert!(result.is_ok(), "Should pass when auth mode is None");
     }
 }

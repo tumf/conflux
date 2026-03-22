@@ -530,7 +530,7 @@ cflx
   --web                            Web監視サーバーを有効化
   --web-port <PORT>                Webサーバーポート（デフォルト: 0 = OSが自動割当）
   --web-bind <ADDR>                Webサーバーバインドアドレス（デフォルト: 127.0.0.1）
-  --server <URL>                   リモートConfluxサーバーへの接続URL（例: http://host:9876）
+  --server <URL>                   リモートConfluxサーバーへの接続URL（例: http://host:39876）
   --server-token <TOKEN>           リモートサーバー認証用ベアラートークン
   --server-token-env <VAR>         ベアラートークンを保持する環境変数名
   -h, --help                       ヘルプを表示

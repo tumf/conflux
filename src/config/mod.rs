@@ -424,7 +424,7 @@ pub struct ServerConfig {
     #[serde(default = "default_server_bind")]
     pub bind: String,
 
-    /// Port for the server (default: 9876)
+    /// Port for the server (default: 39876)
     #[serde(default = "default_server_port")]
     pub port: u16,
 
