@@ -18,7 +18,7 @@
 
 ## Acceptance #2 Failure Follow-up
 
-- [ ] Clean the working tree before rerunning acceptance (currently modified: `tests/install_skills_test.rs`).
+- [x] Clean the working tree before rerunning acceptance (currently modified: `tests/install_skills_test.rs`).
 
 ## Future Work
 
