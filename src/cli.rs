@@ -62,7 +62,7 @@ pub struct Cli {
     #[arg(long, default_value = "127.0.0.1")]
     pub web_bind: String,
 
-    /// Remote server endpoint URL (e.g., http://host:9876). When set, TUI connects to
+    /// Remote server endpoint URL (e.g., http://host:39876). When set, TUI connects to
     /// a remote Conflux server instead of the local workspace.
     #[arg(long)]
     pub server: Option<String>,
@@ -247,8 +247,8 @@ REMOTE SERVER:
 EXAMPLES:
   cflx tui                                        # Launch TUI (default when no subcommand)
   cflx tui --web                                  # TUI with web monitoring enabled
-  cflx tui --server http://host:9876              # Connect to remote server
-  cflx tui --server http://host:9876 --server-token mytoken  # With bearer auth")]
+  cflx tui --server http://host:39876              # Connect to remote server
+  cflx tui --server http://host:39876 --server-token mytoken  # With bearer auth")]
 pub struct TuiArgs {
     /// Path to custom configuration file (JSONC format)
     #[arg(long, short = 'c')]
@@ -266,7 +266,7 @@ pub struct TuiArgs {
     #[arg(long, default_value = "127.0.0.1")]
     pub web_bind: String,
 
-    /// Remote server endpoint URL (e.g., http://host:9876). When set, TUI connects to
+    /// Remote server endpoint URL (e.g., http://host:39876). When set, TUI connects to
     /// a remote Conflux server instead of the local workspace.
     #[arg(long)]
     pub server: Option<String>,
@@ -324,8 +324,8 @@ SECURITY:
   The server will refuse to start if --auth-token is not provided for non-loopback binds.
 
 EXAMPLES:
-  cflx server                                    # Start on 127.0.0.1:9876
-  cflx server --port 9876                        # Explicit port
+  cflx server                                    # Start on 127.0.0.1:39876
+  cflx server --port 39876                       # Explicit port
   cflx server --bind 0.0.0.0 --auth-token mytoken  # Public bind with auth
   cflx server --data-dir /var/lib/cflx           # Custom data directory")]
 pub struct ServerArgs {
@@ -337,7 +337,7 @@ pub struct ServerArgs {
     #[arg(long)]
     pub bind: Option<String>,
 
-    /// Port for the server (overrides global config; default from global config or 9876)
+    /// Port for the server (overrides global config; default from global config or 39876)
     #[arg(long)]
     pub port: Option<u16>,
 
@@ -360,7 +360,7 @@ pub struct ServerArgs {
 
 Connects to a Conflux server and manages projects via the REST API.
 When --server is not specified, the URL is resolved from the global
-configuration (server.bind / server.port, defaulting to 127.0.0.1:9876).
+configuration (server.bind / server.port, defaulting to 127.0.0.1:39876).
 
 Authentication is not supported by this command. If the server requires
 bearer token authentication, an explicit error is returned.
@@ -371,9 +371,9 @@ EXAMPLES:
   cflx project status <project-id>
   cflx project remove <project-id>
   cflx project sync <project-id>
-  cflx project --server http://host:9876 status")]
+  cflx project --server http://host:39876 status")]
 pub struct ProjectArgs {
-    /// Remote server endpoint URL (e.g., http://host:9876).
+    /// Remote server endpoint URL (e.g., http://host:39876).
     /// When not set, resolved from global config server.bind/server.port.
     #[arg(long)]
     pub server: Option<String>,
@@ -447,8 +447,8 @@ pub struct ProjectSyncArgs {
     /// Project ID to sync. Mutually exclusive with --all.
     pub project_id: Option<String>,
 
-    /// Remote server endpoint URL (default: http://127.0.0.1:9876)
-    #[arg(long, default_value = "http://127.0.0.1:9876")]
+    /// Remote server endpoint URL (default: http://127.0.0.1:39876)
+    #[arg(long, default_value = "http://127.0.0.1:39876")]
     pub server: String,
 }
 
@@ -910,8 +910,8 @@ mod tests {
     #[test]
     fn test_top_level_server_option() {
         // Regression: `cflx --server http://...` must not fail with "unexpected argument"
-        let cli = Cli::try_parse_from(["cflx", "--server", "http://127.0.0.1:9876"]).unwrap();
-        assert_eq!(cli.server, Some("http://127.0.0.1:9876".to_string()));
+        let cli = Cli::try_parse_from(["cflx", "--server", "http://127.0.0.1:39876"]).unwrap();
+        assert_eq!(cli.server, Some("http://127.0.0.1:39876".to_string()));
         assert!(cli.command.is_none());
     }
 
@@ -920,12 +920,12 @@ mod tests {
         let cli = Cli::try_parse_from([
             "cflx",
             "--server",
-            "http://host:9876",
+            "http://host:39876",
             "--server-token",
             "mytoken",
         ])
         .unwrap();
-        assert_eq!(cli.server, Some("http://host:9876".to_string()));
+        assert_eq!(cli.server, Some("http://host:39876".to_string()));
         assert_eq!(cli.server_token, Some("mytoken".to_string()));
     }
 
@@ -934,12 +934,12 @@ mod tests {
         let cli = Cli::try_parse_from([
             "cflx",
             "--server",
-            "http://host:9876",
+            "http://host:39876",
             "--server-token-env",
             "MY_TOKEN_VAR",
         ])
         .unwrap();
-        assert_eq!(cli.server, Some("http://host:9876".to_string()));
+        assert_eq!(cli.server, Some("http://host:39876".to_string()));
         assert_eq!(cli.server_token_env, Some("MY_TOKEN_VAR".to_string()));
     }
 
@@ -1132,10 +1132,10 @@ mod tests {
 
     #[test]
     fn test_project_server_flag() {
-        let cli = Cli::parse_from(["cflx", "project", "--server", "http://host:9876", "status"]);
+        let cli = Cli::parse_from(["cflx", "project", "--server", "http://host:39876", "status"]);
         match cli.command {
             Some(Commands::Project(args)) => {
-                assert_eq!(args.server, Some("http://host:9876".to_string()));
+                assert_eq!(args.server, Some("http://host:39876".to_string()));
             }
             _ => panic!("Expected Project subcommand"),
         }
@@ -1192,7 +1192,7 @@ mod tests {
         match cli.command {
             Some(Commands::Project(args)) => match args.command {
                 ProjectCommands::Sync(sync_args) => {
-                    assert_eq!(sync_args.server, "http://127.0.0.1:9876");
+                    assert_eq!(sync_args.server, "http://127.0.0.1:39876");
                 }
                 _ => panic!("Expected Sync"),
             },

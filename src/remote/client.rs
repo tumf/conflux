@@ -191,7 +191,7 @@ where
 /// Supports bearer token authentication via the `Authorization: Bearer <token>` header.
 #[derive(Debug, Clone)]
 pub struct RemoteClient {
-    /// Base URL of the remote server (e.g., "http://host:9876")
+    /// Base URL of the remote server (e.g., "http://host:39876")
     base_url: String,
     /// Optional bearer token for authentication
     token: Option<String>,
@@ -203,7 +203,7 @@ impl RemoteClient {
     /// Create a new remote client.
     ///
     /// # Arguments
-    /// * `base_url` – Base URL of the remote server (e.g., `"http://host:9876"`)
+    /// * `base_url` – Base URL of the remote server (e.g., `"http://host:39876"`)
     /// * `token` – Optional bearer token. When `Some`, an `Authorization: Bearer <token>`
     ///   header is added to every request.
     pub fn new(base_url: impl Into<String>, token: Option<String>) -> Self {
@@ -559,8 +559,8 @@ mod tests {
 
     #[test]
     fn test_ws_url_http() {
-        let client = RemoteClient::new("http://localhost:9876", None);
-        assert_eq!(client.ws_url(), "ws://localhost:9876/api/v1/ws");
+        let client = RemoteClient::new("http://localhost:39876", None);
+        assert_eq!(client.ws_url(), "ws://localhost:39876/api/v1/ws");
     }
 
     #[test]
@@ -571,8 +571,8 @@ mod tests {
 
     #[test]
     fn test_ws_url_no_scheme() {
-        let client = RemoteClient::new("localhost:9876", None);
-        assert_eq!(client.ws_url(), "localhost:9876/api/v1/ws");
+        let client = RemoteClient::new("localhost:39876", None);
+        assert_eq!(client.ws_url(), "localhost:39876/api/v1/ws");
     }
 
     #[test]
@@ -606,13 +606,13 @@ mod tests {
     /// This test checks the internal logic rather than making a real HTTP request.
     #[test]
     fn test_client_with_token_stores_token() {
-        let client = RemoteClient::new("http://localhost:9876", Some("secret123".to_string()));
+        let client = RemoteClient::new("http://localhost:39876", Some("secret123".to_string()));
         assert_eq!(client.token(), Some("secret123"));
     }
 
     #[test]
     fn test_client_without_token() {
-        let client = RemoteClient::new("http://localhost:9876", None);
+        let client = RemoteClient::new("http://localhost:39876", None);
         assert_eq!(client.token(), None);
     }
 

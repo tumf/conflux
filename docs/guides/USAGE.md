@@ -119,13 +119,13 @@ If you're running the multi-project server daemon, you can point the TUI at it:
 
 ```bash
 # Connect the TUI to a remote Conflux server
-cflx --server http://host:9876
+cflx --server http://host:39876
 
 # With bearer-token auth
-cflx --server http://host:9876 --server-token "$TOKEN"
+cflx --server http://host:39876 --server-token "$TOKEN"
 
 # Or read token from environment variable
-cflx --server http://host:9876 --server-token-env CFLX_SERVER_TOKEN
+cflx --server http://host:39876 --server-token-env CFLX_SERVER_TOKEN
 ```
 
 ## Workflow Examples

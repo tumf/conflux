@@ -848,7 +848,7 @@ The orchestrator SHALL support configuring the maximum number of acceptance CONT
 
 `server` セクションは最低限以下のキーを受け付ける:
 - `bind`（既定: `127.0.0.1`）
-- `port`（既定: `9876`）
+- `port`（既定: `39876`）
 - `max_concurrent_total`
 - `auth.mode`（`none` または `bearer_token`）
 - `auth.token` または `auth.token_env`

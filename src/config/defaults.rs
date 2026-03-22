@@ -149,7 +149,7 @@ pub const DEFAULT_MERGE_STALL_CHECK_INTERVAL_SECONDS: u64 = 60;
 pub const DEFAULT_SERVER_BIND: &str = "127.0.0.1";
 
 /// Default server port
-pub const DEFAULT_SERVER_PORT: u16 = 9876;
+pub const DEFAULT_SERVER_PORT: u16 = 39876;
 
 /// Default maximum concurrent project executions (server mode)
 pub const DEFAULT_SERVER_MAX_CONCURRENT_TOTAL: usize = 4;
