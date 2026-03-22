@@ -145,3 +145,87 @@ fn test_global_scope_lock_entry_exists() {
         "Global lock entry for 'test-skill' should exist"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Embedded install tests (no skills/ directory present)
+// ---------------------------------------------------------------------------
+
+/// Verify that `run_install_skills` succeeds in a directory with no `skills/` subdirectory
+/// by falling back to the skills embedded at compile time.
+#[test]
+fn test_embedded_install_without_skills_dir() {
+    // workdir has NO skills/ directory — forces embedded path
+    let workdir = TempDir::new().unwrap();
+    assert!(
+        !workdir.path().join("skills").exists(),
+        "Precondition: skills/ must not exist"
+    );
+
+    let opts = InstallSkillsOptions {
+        global: false,
+        project_root: Some(workdir.path().to_path_buf()),
+    };
+    run_install_skills(opts).unwrap();
+
+    let skills_base = workdir.path().join(".agents/skills");
+    let lock_path = workdir.path().join(".agents/.skill-lock.json");
+
+    assert!(lock_path.exists(), "Lock file must be created");
+
+    let lock_manager = LockManager::new(lock_path);
+
+    // All three bundled skills must be installed
+    for name in &["cflx-proposal", "cflx-workflow", "cflx-run"] {
+        let skill_dir = skills_base.join(name);
+        assert!(
+            skill_dir.exists(),
+            "Expected embedded skill directory for {name} at {skill_dir:?}"
+        );
+        assert!(
+            skill_dir.join("SKILL.md").exists(),
+            "{name}: SKILL.md must exist"
+        );
+
+        let entry = lock_manager.get_entry(name).unwrap();
+        assert!(entry.is_some(), "Lock entry for '{name}' must exist");
+        assert_eq!(
+            entry.unwrap().source_type,
+            "self",
+            "{name} lock entry source_type must be 'self'"
+        );
+    }
+
+    // Verify auxiliary files are present for each skill
+    assert!(
+        skills_base.join("cflx-proposal/scripts/cflx.py").exists(),
+        "cflx-proposal must have scripts/cflx.py"
+    );
+    assert!(
+        skills_base.join("cflx-workflow/scripts/cflx.py").exists(),
+        "cflx-workflow must have scripts/cflx.py"
+    );
+    assert!(
+        skills_base
+            .join("cflx-workflow/references/cflx-accept.md")
+            .exists(),
+        "cflx-workflow must have references/cflx-accept.md"
+    );
+    assert!(
+        skills_base
+            .join("cflx-workflow/references/cflx-apply.md")
+            .exists(),
+        "cflx-workflow must have references/cflx-apply.md"
+    );
+    assert!(
+        skills_base
+            .join("cflx-workflow/references/cflx-archive.md")
+            .exists(),
+        "cflx-workflow must have references/cflx-archive.md"
+    );
+    assert!(
+        skills_base
+            .join("cflx-run/references/cflx-run.md")
+            .exists(),
+        "cflx-run must have references/cflx-run.md"
+    );
+}

@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 // Public modules for OpenAPI generator
+pub mod embedded_skills;
 pub mod events;
 pub mod install_skills;
 pub mod tui;

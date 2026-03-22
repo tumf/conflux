@@ -2,6 +2,7 @@ mod acceptance;
 mod agent;
 mod ai_command_runner;
 mod analyzer;
+mod embedded_skills;
 mod install_skills;
 
 mod cli;

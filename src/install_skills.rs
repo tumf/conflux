@@ -6,6 +6,8 @@ use agent_skills_rs::{
 use anyhow::Result;
 use std::path::PathBuf;
 
+use crate::embedded_skills::get_cflx_embedded_skills;
+
 /// Options for the install-skills command.
 pub struct InstallSkillsOptions {
     /// When true, install to ~/.agents/skills; otherwise ./.agents/skills
@@ -40,7 +42,8 @@ fn resolve_install_paths(
 
 /// Execute the install-skills command.
 ///
-/// Always installs from the bundled repository `skills/` directory.
+/// Prefers embedded skills compiled into the binary. Falls back to local `skills/`
+/// directory discovery when a `skills/` directory exists at `project_root` (dev mode).
 pub fn run_install_skills(opts: InstallSkillsOptions) -> Result<()> {
     let project_root = match opts.project_root {
         Some(ref p) => p.clone(),
@@ -48,34 +51,55 @@ pub fn run_install_skills(opts: InstallSkillsOptions) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Cannot determine current directory: {e}"))?,
     };
 
+    let (canonical_dir, lock_path) = resolve_install_paths(opts.global, &project_root)?;
+    let install_config = InstallConfig::new(canonical_dir);
+    let lock_manager = LockManager::new(lock_path);
+
+    // Use local skills/ directory when it exists (dev fallback); otherwise use embedded.
+    let local_skills_dir = project_root.join("skills");
+    if local_skills_dir.is_dir() {
+        let source = Source {
+            source_type: SourceType::Local,
+            url: Some(local_skills_dir.to_string_lossy().into_owned()),
+            subpath: None,
+            skill_filter: None,
+            ref_: None,
+        };
+        let config = DiscoveryConfig::default();
+        let skills = discover_skills(&source, &config)?;
+        if skills.is_empty() {
+            println!("No skills found in skills/ directory.");
+            return Ok(());
+        }
+        for skill in &skills {
+            println!("Installing skill: {}", skill.name);
+            let result = install_skill(skill, &install_config)?;
+            lock_manager.update_entry(&skill.name, &source, &result.path)?;
+            println!("  -> {}", result.path.display());
+        }
+        println!("Successfully installed {} skill(s).", skills.len());
+        return Ok(());
+    }
+
+    // Embedded path: use skills compiled into the binary at build time.
     let source = Source {
-        source_type: SourceType::Local,
-        url: Some(project_root.join("skills").to_string_lossy().into_owned()),
+        source_type: SourceType::Self_,
+        url: None,
         subpath: None,
         skill_filter: None,
         ref_: None,
     };
-
-    let (canonical_dir, lock_path) = resolve_install_paths(opts.global, &project_root)?;
-
-    let config = DiscoveryConfig::default();
-    let skills = discover_skills(&source, &config)?;
-
+    let skills = get_cflx_embedded_skills()?;
     if skills.is_empty() {
-        println!("No skills found in skills/ directory.");
+        println!("No bundled skills available.");
         return Ok(());
     }
-
-    let install_config = InstallConfig::new(canonical_dir);
-    let lock_manager = LockManager::new(lock_path);
-
     for skill in &skills {
         println!("Installing skill: {}", skill.name);
         let result = install_skill(skill, &install_config)?;
         lock_manager.update_entry(&skill.name, &source, &result.path)?;
         println!("  -> {}", result.path.display());
     }
-
     println!("Successfully installed {} skill(s).", skills.len());
     Ok(())
 }
