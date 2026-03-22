@@ -16,6 +16,10 @@
 - [x] Update `install-skills` CLI long help text to describe embedded-by-default behavior and conditional local fallback.
 - [x] Add a regression test that verifies embedded skills are selected even when a local `skills/` directory exists.
 
+## Acceptance #2 Failure Follow-up
+
+- [ ] Clean the working tree before rerunning acceptance (currently modified: `tests/install_skills_test.rs`).
+
 ## Future Work
 
 - Embed `.skill` binary manifest files once binary embedding is supported in `agent-skills-rs`

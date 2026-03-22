@@ -68,7 +68,10 @@ fn test_project_scope_install_updates_lock_file() {
     let lock_path = workdir.path().join(".agents/.skill-lock.json");
     let lock_manager = LockManager::new(lock_path);
     let entry = lock_manager.get_entry("cflx-proposal").unwrap();
-    assert!(entry.is_some(), "Lock entry for 'cflx-proposal' should exist");
+    assert!(
+        entry.is_some(),
+        "Lock entry for 'cflx-proposal' should exist"
+    );
     let entry = entry.unwrap();
     assert_eq!(entry.source_type, "self");
 }
