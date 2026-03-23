@@ -126,14 +126,22 @@ mod platform {
                 "Service not installed. Run `cflx service install` first.".to_string(),
             ));
         }
-        let status = Command::new("launchctl")
-            .args(["load", "-w"])
-            .arg(&path)
-            .status()?;
-        if !status.success() {
-            return Err(OrchestratorError::ConfigLoad(
-                "launchctl load failed".to_string(),
-            ));
+        // Check if the service is already loaded in launchd
+        let already_loaded = Command::new("launchctl")
+            .args(["list", SERVICE_LABEL])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !already_loaded {
+            let status = Command::new("launchctl")
+                .args(["load", "-w"])
+                .arg(&path)
+                .status()?;
+            if !status.success() {
+                return Err(OrchestratorError::ConfigLoad(
+                    "launchctl load failed".to_string(),
+                ));
+            }
         }
         println!("Service started.");
         Ok(())
