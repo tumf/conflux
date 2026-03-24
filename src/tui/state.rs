@@ -1816,6 +1816,14 @@ impl AppState {
     fn handle_resolve_failed(&mut self, change_id: String, error: String) {
         self.is_resolving = false;
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            if change.queue_status == QueueStatus::Merged {
+                // Already successfully merged; ignore spurious ResolveFailed to prevent regression.
+                self.add_log(LogEntry::info(format!(
+                    "Ignoring ResolveFailed for '{}': already Merged",
+                    change_id
+                )));
+                return;
+            }
             change.queue_status = QueueStatus::MergeWait;
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
@@ -2396,6 +2404,7 @@ impl AppState {
                         | QueueStatus::Archiving
                         | QueueStatus::Resolving
                         | QueueStatus::ResolveWait
+                        | QueueStatus::Merged
                 ) {
                     change.queue_status = QueueStatus::MergeWait;
                 }
@@ -2669,6 +2678,7 @@ mod guards {
 mod tests {
     use super::*;
     use crate::tui::events::OrchestratorEvent;
+    use std::collections::HashSet;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -4016,6 +4026,75 @@ mod tests {
                 .iter()
                 .any(|log| log.message.contains("Not started")),
             "expected a rejection log entry"
+        );
+    }
+
+    /// Regression: ResolveFailed must not demote an already-Merged change back to MergeWait.
+    #[test]
+    fn test_handle_resolve_failed_does_not_demote_merged() {
+        let changes = vec![create_test_change("change-a", 1, 1)];
+        let mut app = AppState::new(changes);
+
+        // Simulate that the change has already reached Merged state.
+        app.changes[0].queue_status = QueueStatus::Merged;
+
+        // A spurious ResolveFailed event arrives after the merge succeeded.
+        app.handle_orchestrator_event(OrchestratorEvent::ResolveFailed {
+            change_id: "change-a".to_string(),
+            error: "archive check failed".to_string(),
+        });
+
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::Merged,
+            "ResolveFailed must not demote a Merged change to MergeWait"
+        );
+        assert!(
+            app.logs
+                .iter()
+                .any(|log| log.message.contains("already Merged")),
+            "expected an info log about ignoring ResolveFailed"
+        );
+    }
+
+    /// Regression: apply_merge_wait_status must not regress a Merged change to MergeWait.
+    #[test]
+    fn test_apply_merge_wait_status_does_not_demote_merged() {
+        let changes = vec![create_test_change("change-a", 1, 1)];
+        let mut app = AppState::new(changes);
+
+        // Simulate that the change has already reached Merged state.
+        app.changes[0].queue_status = QueueStatus::Merged;
+
+        // Simulate auto-refresh calling apply_merge_wait_status with change-a in the set.
+        let mut merge_wait_ids = HashSet::new();
+        merge_wait_ids.insert("change-a".to_string());
+        app.apply_merge_wait_status(&merge_wait_ids);
+
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::Merged,
+            "apply_merge_wait_status must not demote a Merged change to MergeWait"
+        );
+    }
+
+    /// Regression: auto_clear_merge_wait must not transition a Merged change to Queued.
+    #[test]
+    fn test_auto_clear_merge_wait_does_not_affect_merged() {
+        let changes = vec![create_test_change("change-a", 1, 1)];
+        let mut app = AppState::new(changes);
+
+        // Simulate Merged state.
+        app.changes[0].queue_status = QueueStatus::Merged;
+
+        // Call auto_clear_merge_wait with empty worktree sets (no worktree present).
+        let empty: HashSet<String> = HashSet::new();
+        app.auto_clear_merge_wait(&empty, &empty);
+
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::Merged,
+            "auto_clear_merge_wait must not transition a Merged change to Queued"
         );
     }
 }
