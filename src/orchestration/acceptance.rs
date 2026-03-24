@@ -127,8 +127,41 @@ where
     let mut output_collector = OutputCollector::new();
     let mut full_stdout = String::new();
 
-    // Stream output until channel closes
-    while let Some(line) = output_rx.recv().await {
+    // Grace period after detecting an acceptance marker before terminating the process.
+    // This handles the case where the agent process (e.g., opencode) does not exit
+    // promptly after emitting ACCEPTANCE: PASS/FAIL/etc., for example because
+    // child processes (MCP servers) keep stdout/stderr pipes open.
+    const MARKER_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
+    // Stream output until channel closes or acceptance marker detected + grace period
+    let mut marker_detected = false;
+    let mut marker_deadline: Option<tokio::time::Instant> = None;
+
+    loop {
+        let recv_future = output_rx.recv();
+
+        let line = if let Some(deadline) = marker_deadline {
+            // After marker detection, apply a timeout for remaining output
+            match tokio::time::timeout_at(deadline, recv_future).await {
+                Ok(Some(line)) => line,
+                Ok(None) => break, // Channel closed normally
+                Err(_) => {
+                    // Grace period expired — terminate the process
+                    warn!(
+                        "Acceptance marker grace period expired for {}, terminating process",
+                        change.id
+                    );
+                    let _ = child.terminate();
+                    break;
+                }
+            }
+        } else {
+            match recv_future.await {
+                Some(line) => line,
+                None => break, // Channel closed normally
+            }
+        };
+
         // Check for cancellation
         if cancel_check() {
             warn!("Acceptance test cancelled for: {}", change.id);
@@ -144,6 +177,26 @@ where
                 full_stdout.push_str(&s);
                 full_stdout.push('\n');
                 output.on_stdout(&s);
+
+                // Detect acceptance marker in stdout to start grace period.
+                // This prevents indefinite blocking when the agent process
+                // does not exit after emitting the acceptance verdict.
+                if !marker_detected {
+                    let normalized = crate::acceptance::strip_markdown_decorations(s.trim());
+                    if normalized.starts_with("ACCEPTANCE: PASS")
+                        || normalized.starts_with("ACCEPTANCE: FAIL")
+                        || normalized.starts_with("ACCEPTANCE: CONTINUE")
+                        || normalized.starts_with("ACCEPTANCE: BLOCKED")
+                    {
+                        marker_detected = true;
+                        marker_deadline = Some(tokio::time::Instant::now() + MARKER_GRACE_PERIOD);
+                        info!(
+                            "Acceptance marker detected for {}, starting {}s grace period",
+                            change.id,
+                            MARKER_GRACE_PERIOD.as_secs()
+                        );
+                    }
+                }
             }
             OutputLine::Stderr(s) => {
                 output_collector.add_stderr(&s);

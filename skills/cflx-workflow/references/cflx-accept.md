@@ -87,6 +87,11 @@ Output format (output exactly ONCE at the end):
 - If checks fail: Output "ACCEPTANCE: FAIL" followed by FINDINGS and tasks.md update
 - If verification cannot complete in this session: Output "ACCEPTANCE: CONTINUE"
 
+CRITICAL formatting rule: The verdict marker (e.g. "ACCEPTANCE: PASS") MUST be on its own line
+with NOTHING else on that line. Do NOT append any text after the marker on the same line.
+Bad:  "ACCEPTANCE: PASSAll criteria verified"
+Good: "ACCEPTANCE: PASS" (followed by a newline, then any explanation on subsequent lines)
+
 CRITICAL - When outputting FAIL:
 1. List ALL issues discovered in the FINDINGS section
 2. After listing all findings, update openspec/changes/<change_id>/tasks.md:

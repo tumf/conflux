@@ -216,7 +216,9 @@ If apply determines the change is currently impossible to implement (for example
 
 ### Output Format
 
-Output exactly ONE of these at the end:
+Output exactly ONE verdict marker at the end.
+
+**CRITICAL formatting rule**: The marker line (e.g. `ACCEPTANCE: PASS`) MUST be on its own line with NOTHING else on that line — no trailing text, no inline explanation. The orchestrator parses this marker by line; any text appended to the same line (e.g. `ACCEPTANCE: PASSAll criteria verified`) will break detection.
 
 **PASS**:
 ```

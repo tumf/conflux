@@ -72,16 +72,19 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
 
         // Strip markdown decorations (**, *, _, etc.) before matching
         let normalized = strip_markdown_decorations(trimmed);
-        if normalized == "ACCEPTANCE: PASS" {
+        // Use starts_with instead of exact match to handle cases where
+        // the AI agent output concatenates text after the status keyword
+        // without a newline (e.g., "ACCEPTANCE: PASSAll criteria verified").
+        if normalized.starts_with("ACCEPTANCE: PASS") {
             acceptance_status = Some("pass");
             break;
-        } else if normalized == "ACCEPTANCE: FAIL" {
+        } else if normalized.starts_with("ACCEPTANCE: FAIL") {
             acceptance_status = Some("fail");
             break;
-        } else if normalized == "ACCEPTANCE: CONTINUE" {
+        } else if normalized.starts_with("ACCEPTANCE: CONTINUE") {
             acceptance_status = Some("continue");
             break;
-        } else if normalized == "ACCEPTANCE: BLOCKED" {
+        } else if normalized.starts_with("ACCEPTANCE: BLOCKED") {
             acceptance_status = Some("blocked");
             break;
         }
@@ -106,7 +109,7 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
 
 /// Strip markdown decorations from a string.
 /// Removes bold (**), italic (*), underline (_), and other common markdown formatting.
-fn strip_markdown_decorations(text: &str) -> String {
+pub(crate) fn strip_markdown_decorations(text: &str) -> String {
     // Simple approach: remove all common markdown decoration characters
     text.replace("**", "")
         .replace(['*', '_'], "")
@@ -382,6 +385,49 @@ ACCEPTANCE: PASS
 "#;
         // Both are inside unclosed code block, default to Continue
         assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_pass_with_trailing_text() {
+        // Regression: AI agent output may concatenate text after the status
+        // keyword without a newline, e.g. "ACCEPTANCE: PASSAll acceptance criteria verified:"
+        let output = "ACCEPTANCE: PASSAll acceptance criteria verified:\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_pass_with_trailing_text_in_context() {
+        // Full context from real log output
+        let output = r#"Some prior output
+ACCEPTANCE: PASSAll acceptance criteria verified:
+
+1. Git working tree is clean
+"#;
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_fail_with_trailing_text() {
+        let output = "ACCEPTANCE: FAILSome additional context\nFINDINGS:\n- Issue 1\n";
+        match parse_acceptance_output(output) {
+            AcceptanceResult::Fail { findings } => {
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0], "Issue 1");
+            }
+            _ => panic!("Expected Fail"),
+        }
+    }
+
+    #[test]
+    fn test_parse_continue_with_trailing_text() {
+        let output = "ACCEPTANCE: CONTINUENeeds further investigation\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_blocked_with_trailing_text() {
+        let output = "ACCEPTANCE: BLOCKEDWaiting for dependency\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Blocked);
     }
 
     #[test]
