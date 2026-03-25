@@ -2396,6 +2396,7 @@ impl AppState {
                         | QueueStatus::Resolving
                         | QueueStatus::ResolveWait
                         | QueueStatus::Merged
+                        | QueueStatus::Blocked
                 ) {
                     change.queue_status = QueueStatus::MergeWait;
                 }
@@ -4066,6 +4067,27 @@ mod tests {
             app.changes[0].queue_status,
             QueueStatus::Merged,
             "apply_merge_wait_status must not demote a Merged change to MergeWait"
+        );
+    }
+
+    /// Regression: apply_merge_wait_status must not demote a Blocked change to MergeWait.
+    #[test]
+    fn test_apply_merge_wait_status_does_not_demote_blocked() {
+        let changes = vec![create_test_change("change-a", 1, 1)];
+        let mut app = AppState::new(changes);
+
+        // Simulate that the change is in Blocked state due to unresolved dependencies.
+        app.changes[0].queue_status = QueueStatus::Blocked;
+
+        // Simulate auto-refresh calling apply_merge_wait_status with change-a in the set.
+        let mut merge_wait_ids = HashSet::new();
+        merge_wait_ids.insert("change-a".to_string());
+        app.apply_merge_wait_status(&merge_wait_ids);
+
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::Blocked,
+            "apply_merge_wait_status must not demote a Blocked change to MergeWait"
         );
     }
 
