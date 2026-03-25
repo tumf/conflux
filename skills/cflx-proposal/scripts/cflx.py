@@ -49,6 +49,7 @@ class OpenSpecManager:
     _EVIDENCE_HINTS = (
         "src/",
         "tests/",
+        "test/",
         "uv run ",
         "pytest",
         "make ",
@@ -60,7 +61,20 @@ class OpenSpecManager:
         ".js",
         ".rs",
         ".go",
+        ".spec",
+        ".test",
         " --once",
+        # Node.js ecosystem
+        "npm test",
+        "npm run ",
+        "npx ",
+        "yarn ",
+        "pnpm ",
+        # Rust ecosystem
+        "cargo test",
+        "cargo build",
+        # Go ecosystem
+        "go test",
     )
 
     def __init__(self, root_dir: str = "."):
