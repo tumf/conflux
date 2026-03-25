@@ -975,18 +975,13 @@ impl AppState {
             return None;
         }
 
-        // Exclude MergeWait and ResolveWait from StartProcessing
-        // These changes require explicit resolve operation (M key)
+        // Only NotQueued changes can be transitioned to Queued by StartProcessing.
+        // Active states (Applying, Accepting, Archiving, Blocked, Queued) and terminal
+        // states (Merged, Error, MergeWait, ResolveWait, Archived) are excluded.
         let selected: Vec<String> = self
             .changes
             .iter()
-            .filter(|c| {
-                c.selected
-                    && !matches!(
-                        c.queue_status,
-                        QueueStatus::MergeWait | QueueStatus::ResolveWait
-                    )
-            })
+            .filter(|c| c.selected && matches!(c.queue_status, QueueStatus::NotQueued))
             .map(|c| c.id.clone())
             .collect();
 
@@ -997,10 +992,7 @@ impl AppState {
                 .filter(|c| {
                     c.selected
                         && !c.is_parallel_eligible
-                        && !matches!(
-                            c.queue_status,
-                            QueueStatus::MergeWait | QueueStatus::ResolveWait
-                        )
+                        && matches!(c.queue_status, QueueStatus::NotQueued)
                 })
                 .map(|c| c.id.clone())
                 .collect();
@@ -1018,14 +1010,9 @@ impl AppState {
             return None;
         }
 
-        // Mark selected changes as queued (excluding MergeWait/ResolveWait)
+        // Mark selected NotQueued changes as Queued
         for change in &mut self.changes {
-            if change.selected
-                && !matches!(
-                    change.queue_status,
-                    QueueStatus::MergeWait | QueueStatus::ResolveWait
-                )
-            {
+            if change.selected && matches!(change.queue_status, QueueStatus::NotQueued) {
                 change.queue_status = QueueStatus::Queued;
             }
         }
@@ -1510,10 +1497,13 @@ impl AppState {
             return;
         }
 
-        // Safety net: reset any changes still in Queued state (e.g. rejected before start
-        // that were not cleared by an earlier ParallelStartRejected event).
+        // Safety net: reset any changes still in Queued or Blocked state (e.g. rejected
+        // before start or blocked by dependency failures that were not cleared earlier).
         for change in &mut self.changes {
-            if matches!(change.queue_status, QueueStatus::Queued) {
+            if matches!(
+                change.queue_status,
+                QueueStatus::Queued | QueueStatus::Blocked
+            ) {
                 change.queue_status = QueueStatus::NotQueued;
             }
         }
@@ -1544,6 +1534,7 @@ impl AppState {
                     | QueueStatus::Accepting
                     | QueueStatus::Archiving
                     | QueueStatus::Queued
+                    | QueueStatus::Blocked
             ) {
                 // Record elapsed time before resetting status (for in-flight changes)
                 if let Some(started) = change.started_at {
@@ -4096,5 +4087,94 @@ mod tests {
             QueueStatus::Merged,
             "auto_clear_merge_wait must not transition a Merged change to Queued"
         );
+    }
+
+    #[test]
+    fn test_start_processing_does_not_queue_blocked_changes() {
+        // Regression: Blocked+selected changes must NOT be transitioned to Queued by F5
+        let changes = vec![
+            create_test_change("applying", 0, 1),
+            create_test_change("blocked-b", 0, 1),
+            create_test_change("blocked-c", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Simulate: A is Applying, B and C are Blocked+selected (execution marks present)
+        app.changes[0].queue_status = QueueStatus::Applying;
+        app.changes[0].selected = false;
+        app.changes[1].queue_status = QueueStatus::Blocked;
+        app.changes[1].selected = true;
+        app.changes[2].queue_status = QueueStatus::Blocked;
+        app.changes[2].selected = true;
+
+        // Press F5 (start_processing) – should return None (no NotQueued changes)
+        let result = app.start_processing();
+
+        assert!(
+            result.is_none(),
+            "start_processing must return None when only Blocked changes are selected"
+        );
+        assert_eq!(
+            app.changes[1].queue_status,
+            QueueStatus::Blocked,
+            "Blocked change B must remain Blocked after start_processing"
+        );
+        assert_eq!(
+            app.changes[2].queue_status,
+            QueueStatus::Blocked,
+            "Blocked change C must remain Blocked after start_processing"
+        );
+    }
+
+    #[test]
+    fn test_handle_stopped_resets_blocked_to_not_queued() {
+        // Regression: Blocked changes must be reset to NotQueued when processing stops
+        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Applying;
+        app.changes[0].selected = true;
+        app.changes[1].queue_status = QueueStatus::Blocked;
+        app.changes[1].selected = true;
+
+        app.handle_orchestrator_event(OrchestratorEvent::Stopped);
+
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::NotQueued,
+            "Applying change must be reset to NotQueued on Stopped"
+        );
+        assert_eq!(
+            app.changes[1].queue_status,
+            QueueStatus::NotQueued,
+            "Blocked change must be reset to NotQueued on Stopped"
+        );
+        assert_eq!(app.mode, AppMode::Stopped);
+    }
+
+    #[test]
+    fn test_handle_all_completed_resets_blocked_to_not_queued() {
+        // Regression: Blocked changes must be reset to NotQueued when all processing completes
+        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Queued;
+        app.changes[0].selected = true;
+        app.changes[1].queue_status = QueueStatus::Blocked;
+        app.changes[1].selected = true;
+
+        app.handle_orchestrator_event(OrchestratorEvent::AllCompleted);
+
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::NotQueued,
+            "Queued change must be reset to NotQueued on AllCompleted"
+        );
+        assert_eq!(
+            app.changes[1].queue_status,
+            QueueStatus::NotQueued,
+            "Blocked change must be reset to NotQueued on AllCompleted"
+        );
+        assert_eq!(app.mode, AppMode::Select);
     }
 }
