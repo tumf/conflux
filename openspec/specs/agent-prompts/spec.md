@@ -203,3 +203,6 @@ acceptance は以下を満たさなければならない（MUST）。
 - **GIVEN** tasks.md に妥当な Implementation Blocker が記録されている
 - **WHEN** acceptance が blocker を評価する
 - **THEN** acceptance は `ACCEPTANCE: BLOCKED` を出力する
+
+
+#
