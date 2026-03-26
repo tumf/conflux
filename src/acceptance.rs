@@ -447,4 +447,52 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
         let output = "**ACCEPTANCE: BLOCKED**\n";
         assert_eq!(parse_acceptance_output(output), AcceptanceResult::Blocked);
     }
+
+    // Characterization tests: document the exact contract that
+    // src/orchestration/acceptance.rs relies on after the refactor.
+
+    #[test]
+    fn test_parse_fail_findings_excludes_preamble() {
+        // parse_acceptance_output for FAIL extracts only items from the
+        // FINDINGS section — preamble lines before the marker are NOT included.
+        let output =
+            "preamble line\nACCEPTANCE: FAIL\nFINDINGS:\n- Finding 1\n- Finding 2\npostamble";
+        match parse_acceptance_output(output) {
+            AcceptanceResult::Fail { findings } => {
+                assert_eq!(findings, vec!["Finding 1", "Finding 2"]);
+                assert!(!findings.iter().any(|f| f.contains("preamble")));
+            }
+            _ => panic!("Expected Fail"),
+        }
+    }
+
+    #[test]
+    fn test_parse_fail_findings_from_findings_section_only() {
+        // Findings come exclusively from lines prefixed with "- " after
+        // "FINDINGS:". This is the single authoritative source used in
+        // AcceptanceResult::Fail after the refactor.
+        let output =
+            "ACCEPTANCE: FAIL\nFINDINGS:\n- src/foo.rs:10 missing test\n- src/bar.rs:5 dead code\n";
+        match parse_acceptance_output(output) {
+            AcceptanceResult::Fail { findings } => {
+                assert_eq!(findings.len(), 2);
+                assert_eq!(findings[0], "src/foo.rs:10 missing test");
+                assert_eq!(findings[1], "src/bar.rs:5 dead code");
+            }
+            _ => panic!("Expected Fail"),
+        }
+    }
+
+    #[test]
+    fn test_parse_fail_empty_findings_when_no_section() {
+        // When ACCEPTANCE: FAIL appears without a FINDINGS section,
+        // parse_acceptance_output returns an empty findings vec.
+        let output = "ACCEPTANCE: FAIL\nSome explanation without a FINDINGS: header\n";
+        match parse_acceptance_output(output) {
+            AcceptanceResult::Fail { findings } => {
+                assert!(findings.is_empty());
+            }
+            _ => panic!("Expected Fail"),
+        }
+    }
 }
