@@ -948,9 +948,9 @@ pub async fn run_orchestrator_parallel(
         // ChangesRefreshed display sync (apply_display_statuses_from_reducer) does
         // not regress these rows from Queued back to NotQueued before analysis starts.
         for id in &change_ids_vec {
-            state.apply_command(
-                crate::orchestration::state::ReducerCommand::AddToQueue(id.clone()),
-            );
+            state.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+                id.clone(),
+            ));
         }
     }
 
