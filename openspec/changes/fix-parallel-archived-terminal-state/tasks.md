@@ -14,4 +14,4 @@
 
 ## Acceptance #1 Failure Follow-up
 
-- [ ] 全変更ファイル (`src/orchestration/state.rs`, `src/orchestrator.rs`, `src/tui/orchestrator.rs`) およびプロポーザルディレクトリ (`openspec/changes/fix-parallel-archived-terminal-state/`) を git commit する
+- [x] 全変更ファイル (`src/orchestration/state.rs`, `src/orchestrator.rs`, `src/tui/orchestrator.rs`) およびプロポーザルディレクトリ (`openspec/changes/fix-parallel-archived-terminal-state/`) を git commit する
