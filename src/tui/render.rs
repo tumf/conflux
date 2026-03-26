@@ -424,8 +424,17 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                         QueueStatus::NotQueued | QueueStatus::Queued
                     );
                 let is_parallel_blocked = show_uncommitted_badge;
+                // Determine if this is the focused/cursor row before computing colors.
+                let is_selected_row = i == app.cursor_index;
+                // When a blocked row is focused its foreground must remain readable against the
+                // DarkGray highlight background. Use Gray (visible) instead of DarkGray (invisible).
+                let blocked_fg = if is_selected_row {
+                    Color::Gray
+                } else {
+                    Color::DarkGray
+                };
                 let (checkbox, checkbox_color) = if is_parallel_blocked {
-                    ("[ ]", Color::DarkGray)
+                    ("[ ]", blocked_fg)
                 } else {
                     get_checkbox_display(&change.queue_status, change.selected)
                 };
@@ -433,7 +442,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 let cursor = if i == app.cursor_index { "►" } else { " " };
                 let worktree_badge = if change.has_worktree { " WT" } else { "" };
                 let worktree_color = if is_parallel_blocked {
-                    Color::DarkGray
+                    blocked_fg
                 } else {
                     Color::Green
                 };
@@ -445,9 +454,8 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 };
 
                 // Use brighter colors for selected row to ensure visibility on DarkGray background
-                let is_selected_row = i == app.cursor_index;
                 let dim_color = if is_parallel_blocked {
-                    Color::DarkGray
+                    blocked_fg
                 } else if is_selected_row {
                     Color::Gray // Brighter than DarkGray for visibility on selected row
                 } else {
@@ -455,7 +463,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 };
 
                 let name_color = if is_parallel_blocked {
-                    Color::DarkGray
+                    blocked_fg
                 } else {
                     Color::White
                 };
@@ -704,8 +712,17 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                         QueueStatus::NotQueued | QueueStatus::Queued
                     );
                 let is_parallel_blocked = show_uncommitted_badge;
+                // Determine if this is the focused/cursor row before computing colors.
+                let is_selected_row = i == app.cursor_index;
+                // When a blocked row is focused its foreground must remain readable against the
+                // DarkGray highlight background. Use Gray (visible) instead of DarkGray (invisible).
+                let blocked_fg = if is_selected_row {
+                    Color::Gray
+                } else {
+                    Color::DarkGray
+                };
                 let (checkbox, checkbox_color) = if is_parallel_blocked {
-                    ("[ ]", Color::DarkGray)
+                    ("[ ]", blocked_fg)
                 } else {
                     get_checkbox_display(&change.queue_status, change.selected)
                 };
@@ -713,7 +730,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 let cursor = if i == app.cursor_index { "►" } else { " " };
                 let worktree_badge = if change.has_worktree { " WT" } else { "" };
                 let worktree_color = if is_parallel_blocked {
-                    Color::DarkGray
+                    blocked_fg
                 } else {
                     Color::Green
                 };
@@ -725,9 +742,8 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 };
 
                 // Use brighter colors for selected row to ensure visibility on DarkGray background
-                let is_selected_row = i == app.cursor_index;
                 let dim_color = if is_parallel_blocked {
-                    Color::DarkGray
+                    blocked_fg
                 } else if is_selected_row {
                     Color::Gray // Brighter than DarkGray for visibility on selected row
                 } else {
@@ -735,7 +751,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 };
 
                 let name_color = if is_parallel_blocked {
-                    Color::DarkGray
+                    blocked_fg
                 } else {
                     Color::White
                 };
@@ -2059,6 +2075,92 @@ mod tests {
         let content = buffer_to_string(&buffer);
 
         assert!(content.contains("UNCOMMITED"));
+    }
+
+    // Select-mode layout: header=3 rows, list starts at y=3 (border), first item at y=4.
+    // List left border is at x=0, spans start at x=1.
+    // Checkbox "[ ] " = 4 chars, cursor "► " = 2 chars → display_id starts at x=7.
+    const SELECT_FIRST_ROW_Y: u16 = 4;
+    const CHANGE_ID_X: u16 = 7; // x of the first character of display_id in the list
+
+    #[test]
+    fn test_focused_blocked_row_has_readable_fg_select_mode() {
+        // Focused blocked row should use Gray (not DarkGray) so it's readable on the
+        // DarkGray highlight background.
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.parallel_mode = true;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].is_parallel_eligible = false;
+        app.cursor_index = 0; // cursor on the blocked row
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let cell = buffer.cell((CHANGE_ID_X, SELECT_FIRST_ROW_Y)).unwrap();
+        assert_eq!(
+            cell.style().fg,
+            Some(Color::Gray),
+            "Focused blocked row name should use Gray fg for readability on DarkGray highlight"
+        );
+    }
+
+    #[test]
+    fn test_unfocused_blocked_row_remains_dimmed_select_mode() {
+        // Unfocused blocked row should keep DarkGray to remain visually de-emphasized.
+        let mut app = create_test_app(vec![
+            create_test_change("change-a"),
+            create_test_change("change-b"),
+        ]);
+        app.parallel_mode = true;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].is_parallel_eligible = false;
+        app.cursor_index = 1; // cursor on change-b, not on the blocked row
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let cell = buffer.cell((CHANGE_ID_X, SELECT_FIRST_ROW_Y)).unwrap();
+        assert_eq!(
+            cell.style().fg,
+            Some(Color::DarkGray),
+            "Unfocused blocked row name should stay DarkGray to remain de-emphasized"
+        );
+    }
+
+    #[test]
+    fn test_focused_blocked_row_has_readable_fg_running_mode() {
+        // Same contrast rule applies in Running view.
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Running;
+        app.parallel_mode = true;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].is_parallel_eligible = false;
+        app.cursor_index = 0;
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let cell = buffer.cell((CHANGE_ID_X, SELECT_FIRST_ROW_Y)).unwrap();
+        assert_eq!(
+            cell.style().fg,
+            Some(Color::Gray),
+            "Focused blocked row name should use Gray fg in Running view too"
+        );
+    }
+
+    #[test]
+    fn test_unfocused_blocked_row_remains_dimmed_running_mode() {
+        let mut app = create_test_app(vec![
+            create_test_change("change-a"),
+            create_test_change("change-b"),
+        ]);
+        app.mode = AppMode::Running;
+        app.parallel_mode = true;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].is_parallel_eligible = false;
+        app.cursor_index = 1;
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let cell = buffer.cell((CHANGE_ID_X, SELECT_FIRST_ROW_Y)).unwrap();
+        assert_eq!(
+            cell.style().fg,
+            Some(Color::DarkGray),
+            "Unfocused blocked row name should stay DarkGray in Running view"
+        );
     }
 
     #[test]
