@@ -846,6 +846,10 @@ impl OrchestratorState {
                 let rt = self.runtime_entry(change_id);
                 if matches!(rt.activity, ActivityState::Resolving) {
                     rt.activity = ActivityState::Idle;
+                    // Successful resolve means the change is now merged. Setting terminal
+                    // prevents a subsequent ChangesRefreshed from resurrecting ResolveWait
+                    // via apply_observation (which skips terminal entries).
+                    rt.terminal = TerminalState::Merged;
                 }
                 self.resolve_wait_queue.retain(|id| id != change_id);
             }
@@ -854,6 +858,9 @@ impl OrchestratorState {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && matches!(rt.activity, ActivityState::Resolving) {
                     rt.activity = ActivityState::Idle;
+                    // Restore MergeWait so the row returns to "merge wait" rather than
+                    // appearing as "queued" after a failed manual resolve attempt.
+                    rt.wait_state = WaitState::MergeWait;
                 }
             }
 
@@ -1429,14 +1436,14 @@ mod tests {
         });
         assert_eq!(state.display_status("c"), "resolving");
 
-        // ResolveCompleted → Idle
+        // ResolveCompleted → Merged (terminal): successful resolve means the change is merged.
         state.apply_execution_event(&ExecutionEvent::ResolveCompleted {
             change_id: "c".to_string(),
             worktree_change_ids: None,
         });
-        assert_eq!(state.display_status("c"), "not queued");
+        assert_eq!(state.display_status("c"), "merged");
 
-        // MergeCompleted → Merged (terminal)
+        // MergeCompleted is idempotent once already terminal (parallel orchestrator path).
         state.apply_execution_event(&ExecutionEvent::MergeCompleted {
             change_id: "c".to_string(),
             revision: "rev".to_string(),
@@ -1449,6 +1456,102 @@ mod tests {
             error: "late".to_string(),
         });
         assert_eq!(state.display_status("c"), "merged");
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: stale ResolveWait must not survive ResolveCompleted + refresh
+    // -----------------------------------------------------------------------
+    //
+    // Scenario: base dirtiness caused MergeWait, user triggered manual resolve
+    // (ResolveMerge command → ResolveWait), resolve succeeded, but the row was
+    // previously stuck at "resolve pending" because ResolveCompleted was not
+    // applied to the shared reducer before the next ChangesRefreshed.
+
+    #[test]
+    fn test_resolve_completed_clears_resolve_wait_and_survives_refresh() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+
+        // Step 1: change reaches MergeWait (base dirty, parallel archive path).
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "c".to_string(),
+            reason: "base dirty".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "merge wait");
+
+        // Step 2: user triggers manual resolve → reducer transitions to ResolveWait.
+        state.apply_command(ReducerCommand::ResolveMerge("c".to_string()));
+        assert_eq!(state.display_status("c"), "resolve pending");
+
+        // Step 3: resolve task starts.
+        state.apply_execution_event(&ExecutionEvent::ResolveStarted {
+            change_id: "c".to_string(),
+            command: "resolve".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "resolving");
+
+        // Step 4: resolve succeeds → must transition to merged, not stall at resolve pending.
+        state.apply_execution_event(&ExecutionEvent::ResolveCompleted {
+            change_id: "c".to_string(),
+            worktree_change_ids: None,
+        });
+        assert_eq!(state.display_status("c"), "merged");
+
+        // Step 5: a subsequent ChangesRefreshed (workspace still shows the archived worktree)
+        // must NOT regress the row back to "resolve pending" or "merge wait".
+        state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+            changes: vec![],
+            committed_change_ids: Default::default(),
+            uncommitted_file_change_ids: Default::default(),
+            worktree_change_ids: Default::default(),
+            worktree_paths: Default::default(),
+            worktree_not_ahead_ids: Default::default(),
+            // Change still appears in merge_wait_ids from workspace scan.
+            merge_wait_ids: ["c".to_string()].into_iter().collect(),
+        });
+        assert_eq!(
+            state.display_status("c"),
+            "merged",
+            "row must not regress to resolve pending after successful resolve + refresh"
+        );
+    }
+
+    #[test]
+    fn test_resolve_failed_restores_merge_wait() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+
+        // Reach ResolveWait via the same path.
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "c".to_string(),
+            reason: "base dirty".to_string(),
+        });
+        state.apply_command(ReducerCommand::ResolveMerge("c".to_string()));
+        state.apply_execution_event(&ExecutionEvent::ResolveStarted {
+            change_id: "c".to_string(),
+            command: "resolve".to_string(),
+        });
+
+        // Resolve fails → must return to merge wait, not stay queued/idle.
+        state.apply_execution_event(&ExecutionEvent::ResolveFailed {
+            change_id: "c".to_string(),
+            error: "conflict".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "merge wait");
+
+        // A subsequent RefreshFailed-after-terminal must not regress a Merged entry.
+        let mut state2 = OrchestratorState::new(vec!["c".to_string()], 0);
+        state2.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "c".to_string(),
+            revision: "rev".to_string(),
+        });
+        state2.apply_execution_event(&ExecutionEvent::ResolveFailed {
+            change_id: "c".to_string(),
+            error: "late".to_string(),
+        });
+        assert_eq!(state2.display_status("c"), "merged");
     }
 
     // -----------------------------------------------------------------------
