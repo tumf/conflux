@@ -115,12 +115,60 @@ git log --oneline --decorate -n 10
 git diff HEAD~1..HEAD
 ```
 
-Review checklist:
+### Canonical Spec Diff Inspection
+
+After reviewing commits, inspect the canonical spec diffs under `openspec/specs/**` to verify that spec promotion occurred correctly:
+
+```bash
+# Identify all canonical spec files that changed in this run
+git diff HEAD~1..HEAD -- openspec/specs/
+
+# For a more targeted view of a specific spec
+git diff HEAD~1..HEAD -- openspec/specs/<spec-name>/spec.md
+```
+
+If multiple changes were archived in a single run, use the archived change directories to identify which canonical specs each change was responsible for:
+
+```bash
+# List archived changes to know what landed
+ls openspec/changes/archive/
+
+# For each archived change, identify its spec deltas
+python3 openspec/scripts/cflx.py show <change-id> --json --deltas-only 2>/dev/null || \
+  cat openspec/changes/archive/<change-id>/proposal.md
+```
+
+### Review Checklist
 
 - Confirm the branch is still the expected base branch.
 - Confirm the resulting merge or commits look correct.
-- Summarize which changes landed.
+- Identify which changes were archived during this run.
+- **For each archived change that landed**: name the canonical spec files changed by that change and confirm they appear in the `openspec/specs/**` diff. This per-change mapping is required in the run summary.
+- **Anomaly flag — spec-only change with empty canonical diff**: If a landed change is classified as `spec-only` and the canonical `openspec/specs/**` diff shows no files attributable to that change, report this as anomalous. Do not treat the run as fully healthy until the missing spec promotion is explained.
 - Call out any failures, skipped changes, or conflicts reported by Conflux.
+
+### Worked Example: Combining Commit and Spec Review
+
+A thorough post-run review uses two complementary layers:
+
+**Layer 1 — Commit review** answers "what code or documentation landed?":
+
+```bash
+git log --oneline --decorate -n 10
+git diff HEAD~1..HEAD
+```
+
+This confirms that the expected commits are present and that no unexpected files were changed.
+
+**Layer 2 — Canonical spec review** answers "which specs were promoted and are they correct?":
+
+```bash
+git diff HEAD~1..HEAD -- openspec/specs/
+```
+
+For each archived change, cross-check the spec delta in the change proposal against what actually appeared in the canonical specs diff. If the proposal said a spec would be added or updated but `git diff` shows no canonical spec change, this is a promotion gap and must be investigated before the run is signed off as healthy.
+
+A complete run summary names each landed change and, for each one, lists the canonical spec files it touched (or explicitly notes that none were expected).
 
 ## Failure Handling
 
@@ -177,6 +225,7 @@ git log --oneline -n 5
 cflx run
 git status
 git log --oneline --decorate -n 10
+git diff HEAD~1..HEAD -- openspec/specs/
 ```
 
 ## Reference Files
