@@ -1060,9 +1060,9 @@ impl AppState {
         if let Some(shared) = &self.shared_orchestrator_state {
             if let Ok(mut guard) = shared.try_write() {
                 for id in &selected {
-                    guard.apply_command(
-                        crate::orchestration::state::ReducerCommand::AddToQueue(id.clone()),
-                    );
+                    guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+                        id.clone(),
+                    ));
                 }
             }
         }
@@ -1116,9 +1116,9 @@ impl AppState {
         if let Some(shared) = &self.shared_orchestrator_state {
             if let Ok(mut guard) = shared.try_write() {
                 for id in &marked_ids {
-                    guard.apply_command(
-                        crate::orchestration::state::ReducerCommand::AddToQueue(id.clone()),
-                    );
+                    guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+                        id.clone(),
+                    ));
                 }
             }
         }
@@ -1172,9 +1172,9 @@ impl AppState {
         if let Some(shared) = &self.shared_orchestrator_state {
             if let Ok(mut guard) = shared.try_write() {
                 for id in &error_ids {
-                    guard.apply_command(
-                        crate::orchestration::state::ReducerCommand::AddToQueue(id.clone()),
-                    );
+                    guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+                        id.clone(),
+                    ));
                 }
             }
         }
@@ -4545,10 +4545,7 @@ mod tests {
             });
         }
         // Reducer should show "blocked"; queue_intent is still Queued underneath.
-        assert_eq!(
-            shared.blocking_read().display_status("change-a"),
-            "blocked"
-        );
+        assert_eq!(shared.blocking_read().display_status("change-a"), "blocked");
     }
 
     /// After DependencyResolved the reducer restores "queued" display because queue_intent

@@ -10,3 +10,7 @@
 
 - Manually verify the fix in an interactive TUI session with a known dependency chain after implementation.
 - Audit remote/Web queue-intent synchronization separately if similar local-only queue writes remain outside the parallel TUI path.
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Commit the uncommitted rustfmt formatting changes in `src/orchestration/state.rs` and `src/tui/state.rs` so the working tree is clean

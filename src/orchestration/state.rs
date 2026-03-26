@@ -587,10 +587,7 @@ impl OrchestratorState {
                 // Permanently completed changes (Archived, Merged) cannot be re-queued.
                 {
                     let rt = self.runtime_entry(&change_id);
-                    if matches!(
-                        rt.terminal,
-                        TerminalState::Archived | TerminalState::Merged
-                    ) {
+                    if matches!(rt.terminal, TerminalState::Archived | TerminalState::Merged) {
                         return ReduceOutcome::NoOp;
                     }
                     // Already queued and not in a retryable terminal state – no-op.
