@@ -1733,3 +1733,6 @@ The `run` subcommand SHALL display hook execution details in the same user-visib
 - **GIVEN** the same hook configuration is used in serial CLI run and another existing execution path that already emits hook logs
 - **WHEN** the hook executes in serial CLI run
 - **THEN** users can see the hook command and any captured output without needing debug-only tracing configuration
+
+
+#
