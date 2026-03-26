@@ -871,3 +871,6 @@ The orchestrator SHALL support configuring the maximum number of acceptance CONT
 - **GIVEN** 設定のマージ結果にトップレベルの `resolve_command` が存在する
 - **WHEN** サーバが auto_resolve を実行する
 - **THEN** `resolve_command` が使用される
+
+
+#
