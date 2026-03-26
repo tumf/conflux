@@ -100,7 +100,27 @@ ls <relevant-directory>
 - In strict mode, include at least one spec delta under `openspec/changes/<id>/specs/<capability>/spec.md`.
 - For bugfix-only proposals (no intended new behavior), add a minimal `## MODIFIED Requirements` delta with at least one `### Requirement:` and one `#### Scenario:`.
 
-### 2. Evaluate Split Boundaries (Default: Split)
+### 2. Classify Change Type
+
+Every proposal MUST include a `Change Type` field in `proposal.md`. Use this decision table:
+
+| Type | When to use |
+|------|-------------|
+| `spec-only` | The proposal's primary output is a canonical spec update. No new runtime code, CLI wiring, or tests are required. All tasks are specification or documentation work. |
+| `implementation` | The proposal drives source code changes, tests, CLI wiring, or runtime behavior. Spec deltas describe what the code must satisfy. |
+| `hybrid` | The proposal combines spec authoring with implementation work — for example, adding a new spec capability and immediately implementing it in the same change. |
+
+**When to split instead of using `hybrid`**:
+- If the spec authoring and the implementation can be reviewed and deployed independently, split into two proposals.
+- Use `hybrid` only when spec and code must ship atomically to preserve correctness.
+
+Add the following line to `proposal.md` metadata (near the top, after the title):
+
+```markdown
+**Change Type**: spec-only   <!-- or: implementation | hybrid -->
+```
+
+### 3. Evaluate Split Boundaries (Default: Split)
 
 Before writing anything, evaluate whether the request should be split into multiple independent change proposals.
 
@@ -145,7 +165,7 @@ Create `openspec/changes/<id>/proposal.md`:
 
 Create `openspec/changes/<id>/tasks.md`:
 
-**Task format**:
+**Task format for `implementation` or `hybrid` proposals**:
 ```markdown
 ## Implementation Tasks
 
@@ -158,6 +178,21 @@ Create `openspec/changes/<id>/tasks.md`:
 - Items requiring external systems
 - Long-wait verification tasks
 ```
+
+**Task format for `spec-only` proposals** — use `## Specification Tasks` instead of `## Implementation Tasks`, and include a one-line expected canonical outcome for each delta:
+```markdown
+## Specification Tasks
+
+- [ ] Promote `specs/capability-name/spec.md` delta to canonical spec
+  - Expected canonical result: <what the canonical spec will contain after archive>
+- [ ] Review and validate delta scenarios for completeness
+
+## Future Work
+
+- Human sign-off on canonical promotion
+```
+
+> **Note**: For `spec-only` proposals, each spec delta should include a short comment describing how the canonical spec changes after archive. This allows acceptance to evaluate archive-readiness without expecting runtime integration evidence.
 
 **Guidelines**:
 - Break into small, verifiable steps
