@@ -1,3 +1,7 @@
+## Purpose
+
+Provide a single, reducer-owned model for tracking the runtime lifecycle of each change across serial and parallel execution modes. All display status is derived from this shared state; consumers never own an independent lifecycle copy.
+
 ## Requirements
 
 ### Requirement: Reducer-Owned Change Runtime State
@@ -11,6 +15,7 @@ The runtime state MUST distinguish at least the following concerns:
 - wait reason
 - terminal result
 - workspace observation summary
+- execution mode (Serial or Parallel)
 
 Display status exposed to consumers MAY be derived from this runtime state, but consumers SHALL NOT own an independent lifecycle copy.
 
@@ -25,11 +30,10 @@ Display status exposed to consumers MAY be derived from this runtime state, but 
 
 #### Scenario: Runtime state distinguishes merge wait from archived result
 
-- **GIVEN** archive has completed for a change
-- **AND** merge is deferred because the worktree is not ready to merge
-- **WHEN** the reducer applies the merge-deferred input
-- **THEN** the runtime state records terminal archived result
-- **AND** the wait reason becomes merge-wait
+- **GIVEN** archive has completed for a change in parallel execution mode
+- **WHEN** the reducer applies the `ChangeArchived` event
+- **THEN** the wait reason becomes merge-wait
+- **AND** the terminal state remains `None` (not yet terminal)
 - **AND** the derived display status is `merge wait`
 
 ### Requirement: Reducer Input Precedence and Idempotency
@@ -81,3 +85,35 @@ The system SHALL own the resolve wait queue in shared orchestration state rather
 - **WHEN** the system rebuilds state from workspace observation alone
 - **THEN** the reducer may recover `MergeWait`
 - **AND** the reducer does not recover `ResolveWait` unless the shared resolve wait queue contains that change
+
+### Requirement: Execution Mode Determines Archive Terminal Semantics
+
+The system SHALL support two execution modes — Serial and Parallel — that determine how `ChangeArchived` events affect terminal state.
+
+In Serial mode, `ChangeArchived` SHALL set the terminal state to `Archived` (a terminal state from which no further transitions occur).
+
+In Parallel mode, `ChangeArchived` SHALL set the wait state to `MergeWait` (a non-terminal state) to allow the subsequent merge step to transition the change to `Merged`.
+
+#### Scenario: Serial mode treats archive as terminal
+
+- **GIVEN** the orchestrator is running in Serial execution mode
+- **WHEN** a change receives a `ChangeArchived` event
+- **THEN** the terminal state becomes `Archived`
+- **AND** the derived display status is `archived`
+- **AND** subsequent `MergeCompleted` events for this change are ignored
+
+#### Scenario: Parallel mode treats archive as merge-wait
+
+- **GIVEN** the orchestrator is running in Parallel execution mode
+- **WHEN** a change receives a `ChangeArchived` event
+- **THEN** the wait state becomes `MergeWait`
+- **AND** the terminal state remains `None`
+- **AND** the derived display status is `merge wait`
+
+#### Scenario: Parallel mode archive then merge completes lifecycle
+
+- **GIVEN** the orchestrator is running in Parallel execution mode
+- **AND** a change has received a `ChangeArchived` event (currently in `MergeWait`)
+- **WHEN** a `MergeCompleted` event is received for the change
+- **THEN** the terminal state becomes `Merged`
+- **AND** the derived display status is `merged`
