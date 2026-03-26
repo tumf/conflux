@@ -217,8 +217,7 @@ where
     let stdout_tail = output_collector.stdout_tail();
     let stderr_tail = output_collector.stderr_tail();
 
-    // TODO: Use actual command output (tail_findings) instead of parsing
-    // Build findings from last N lines of output
+    // Build tail findings for history recording (last N lines, used in AcceptanceAttempt).
     let tail_findings = build_acceptance_tail_findings(stdout_tail.clone(), stderr_tail.clone());
 
     // Check if command failed
@@ -259,12 +258,16 @@ where
             output.on_info("Acceptance test: PASS");
             (AcceptanceResult::Pass, true)
         }
-        crate::acceptance::AcceptanceResult::Fail { .. } => {
+        crate::acceptance::AcceptanceResult::Fail {
+            findings: parsed_findings,
+        } => {
             info!("Acceptance test failed for: {}", change.id);
             output.on_warn("Acceptance test: FAIL");
+            // Use findings parsed from the FINDINGS section of the output so that
+            // the verdict and its findings share a single data source (full_stdout).
             (
                 AcceptanceResult::Fail {
-                    findings: tail_findings.clone(),
+                    findings: parsed_findings,
                 },
                 false,
             )
@@ -369,5 +372,51 @@ mod tests {
         );
 
         assert_eq!(findings, vec!["actual error", "another line"]);
+    }
+
+    // Characterization tests: document the difference between tail_findings
+    // and parse_acceptance_output findings so the refactor is clearly motivated.
+
+    #[test]
+    fn test_tail_findings_includes_preamble_parse_does_not() {
+        // tail_findings includes all non-marker lines (preamble, postamble, items).
+        // parse_acceptance_output findings includes only FINDINGS section items.
+        // The refactor unifies the FAIL path to use parse_acceptance_output findings.
+        let stdout = "preamble\nACCEPTANCE: FAIL\nFINDINGS:\n- Finding 1\n- Finding 2\npostamble"
+            .to_string();
+
+        let tail = build_acceptance_tail_findings(Some(stdout.clone()), None);
+        // tail includes preamble, finding items, postamble
+        assert!(tail.iter().any(|l| l.contains("preamble")));
+        assert!(tail.iter().any(|l| l.contains("postamble")));
+        assert!(tail.iter().any(|l| l.contains("Finding 1")));
+
+        // parse_acceptance_output returns only the FINDINGS section items
+        match crate::acceptance::parse_acceptance_output(&stdout) {
+            crate::acceptance::AcceptanceResult::Fail { findings } => {
+                assert_eq!(findings, vec!["Finding 1", "Finding 2"]);
+                assert!(!findings.iter().any(|f| f.contains("preamble")));
+                assert!(!findings.iter().any(|f| f.contains("postamble")));
+            }
+            _ => panic!("Expected Fail"),
+        }
+    }
+
+    #[test]
+    fn test_parse_findings_is_preferred_source_for_fail_result() {
+        // After the refactor: for AcceptanceResult::Fail, findings come from
+        // parse_acceptance_output (FINDINGS section), not from build_acceptance_tail_findings.
+        let stdout =
+            "ACCEPTANCE: FAIL\nFINDINGS:\n- src/foo.rs:10 issue A\n- src/bar.rs:5 issue B\n"
+                .to_string();
+
+        match crate::acceptance::parse_acceptance_output(&stdout) {
+            crate::acceptance::AcceptanceResult::Fail { findings } => {
+                assert_eq!(findings.len(), 2);
+                assert_eq!(findings[0], "src/foo.rs:10 issue A");
+                assert_eq!(findings[1], "src/bar.rs:5 issue B");
+            }
+            _ => panic!("Expected Fail"),
+        }
     }
 }
