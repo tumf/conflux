@@ -940,10 +940,18 @@ pub async fn run_orchestrator_parallel(
         let change_ids_vec: Vec<String> = change_ids.clone();
         let mut state = shared_state.write().await;
         *state = crate::orchestration::state::OrchestratorState::with_mode(
-            change_ids_vec,
+            change_ids_vec.clone(),
             config.get_max_iterations(),
             crate::orchestration::state::ExecutionMode::Parallel,
         );
+        // Re-apply queue intent for each selected change so that the initial
+        // ChangesRefreshed display sync (apply_display_statuses_from_reducer) does
+        // not regress these rows from Queued back to NotQueued before analysis starts.
+        for id in &change_ids_vec {
+            state.apply_command(
+                crate::orchestration::state::ReducerCommand::AddToQueue(id.clone()),
+            );
+        }
     }
 
     // Create shared queue change timestamp for debouncing

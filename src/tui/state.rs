@@ -4512,6 +4512,69 @@ mod tests {
         );
     }
 
+    /// Regression: after run_orchestrator_parallel resets shared state with with_mode(), it must
+    /// re-apply AddToQueue so that the subsequent ChangesRefreshed display sync does not regress
+    /// the TUI's Queued rows back to NotQueued.
+    #[test]
+    fn test_parallel_start_state_reset_preserves_queued_rows() {
+        use crate::orchestration::state::{OrchestratorState, ReducerCommand};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].selected = true;
+        app.changes[0].is_parallel_eligible = true;
+        app.parallel_mode = true;
+
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            0,
+        )));
+        app.set_shared_state(shared.clone());
+
+        // F5 – queues the change in TUI and syncs the reducer.
+        let cmd = app.start_processing();
+        assert!(cmd.is_some());
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+
+        // Simulate run_orchestrator_parallel replacing shared state (the regression source).
+        // Without the fix this would clear queue_intent back to NotQueued.
+        {
+            let mut guard = shared.blocking_write();
+            *guard = OrchestratorState::with_mode(
+                vec!["change-a".to_string()],
+                0,
+                crate::orchestration::state::ExecutionMode::Parallel,
+            );
+            // The fix: re-apply AddToQueue after the state reset.
+            guard.apply_command(ReducerCommand::AddToQueue("change-a".to_string()));
+        }
+
+        // Simulate the initial ChangesRefreshed that fires at parallel startup.
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ChangesRefreshed {
+                changes: vec![],
+                committed_change_ids: HashSet::new(),
+                uncommitted_file_change_ids: HashSet::new(),
+                worktree_change_ids: HashSet::new(),
+                worktree_paths: HashMap::new(),
+                worktree_not_ahead_ids: HashSet::new(),
+                merge_wait_ids: HashSet::new(),
+            });
+        }
+
+        // Display sync from the reducer must keep the row as Queued.
+        let display_map = shared.blocking_read().all_display_statuses();
+        app.apply_display_statuses_from_reducer(&display_map);
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::Queued,
+            "state reset followed by AddToQueue must preserve Queued through ChangesRefreshed"
+        );
+    }
+
     /// DependencyBlocked sets Blocked in both TUI and reducer; DependencyResolved restores
     /// Queued display because the reducer still holds queue_intent = Queued.
     #[test]
