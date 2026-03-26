@@ -4,6 +4,7 @@
 
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
+use crate::orchestration::state::ReducerCommand;
 use crate::tui::events::{LogEntry, OrchestratorEvent, TuiCommand};
 use crate::tui::orchestrator::{run_orchestrator, run_orchestrator_parallel};
 use crate::tui::queue::DynamicQueue;
@@ -194,6 +195,11 @@ pub async fn handle_tui_command(
             return Ok(handle);
         }
         TuiCommand::AddToQueue(id) => {
+            // Apply reducer command first, then push to dynamic queue.
+            shared_state
+                .write()
+                .await
+                .apply_command(ReducerCommand::AddToQueue(id.clone()));
             // Push to dynamic queue for orchestrator to pick up
             if ctx.dynamic_queue.push(id.clone()).await {
                 ctx.app
@@ -204,6 +210,11 @@ pub async fn handle_tui_command(
             }
         }
         TuiCommand::RemoveFromQueue(id) => {
+            // Apply reducer command first, then remove from dynamic queue.
+            shared_state
+                .write()
+                .await
+                .apply_command(ReducerCommand::RemoveFromQueue(id.clone()));
             // Remove from dynamic queue so orchestrator won't process it
             let removed_from_dynamic = ctx.dynamic_queue.remove(&id).await;
             let removed_from_pending = ctx.dynamic_queue.mark_removed(id.clone()).await;
@@ -517,6 +528,11 @@ pub async fn handle_tui_command(
             });
         }
         TuiCommand::StopChange(id) => {
+            // Apply reducer command first so shared state reflects stopped intent.
+            shared_state
+                .write()
+                .await
+                .apply_command(ReducerCommand::StopChange(id.clone()));
             // Stop a single active change (serial/parallel modes)
             // For serial mode: set a flag that orchestrator checks before each operation
             // For parallel mode: cancel the workspace task for this change
@@ -526,6 +542,11 @@ pub async fn handle_tui_command(
             ctx.dynamic_queue.mark_stopped(id.clone()).await;
         }
         TuiCommand::ResolveMerge(id) => {
+            // Apply reducer command first so shared state reflects resolve intent.
+            shared_state
+                .write()
+                .await
+                .apply_command(ReducerCommand::ResolveMerge(id.clone()));
             let resolve_tx = ctx.tx.clone();
             let resolve_repo_root = ctx.repo_root.to_path_buf();
             let resolve_config = ctx.config.clone();

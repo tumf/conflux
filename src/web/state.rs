@@ -141,15 +141,11 @@ impl OrchestratorStateSnapshot {
         // Enrich with data from shared state if available
         if let Some(shared) = shared_state {
             for status in &mut change_statuses {
-                // Set queue_status based on shared state tracking
-                if shared.is_archived(&status.id) {
-                    status.queue_status = Some("archived".to_string());
-                } else if shared.is_pending(&status.id) {
-                    if shared.current_change_id() == Some(&status.id) {
-                        status.queue_status = Some("applying".to_string());
-                    } else {
-                        status.queue_status = Some("queued".to_string());
-                    }
+                // Derive queue_status from reducer display_status (single source of truth).
+                // "not queued" maps to None to keep the JSON payload minimal.
+                let display = shared.display_status(&status.id);
+                if display != "not queued" {
+                    status.queue_status = Some(display.to_string());
                 }
 
                 // Set iteration_number from apply_count if available
@@ -1666,5 +1662,61 @@ mod tests {
         let state = web_state.get_state().await;
         assert!(!state.is_resolving, "is_resolving should be false");
         assert_eq!(state.changes[0].queue_status, Some("error".to_string()));
+    }
+
+    /// Phase 6.3: verify that from_changes_with_shared_state derives queue_status from the reducer
+    /// display_status without changing the JSON API payload shape.
+    #[test]
+    fn test_web_snapshot_uses_reducer_display_status_without_payload_change() {
+        use crate::orchestration::state::{OrchestratorState, ReducerCommand};
+
+        let mut shared = OrchestratorState::new(
+            vec![
+                "ch-queued".to_string(),
+                "ch-notqueued".to_string(),
+                "ch-archived".to_string(),
+            ],
+            0,
+        );
+        // Seed changes that the reducer knows about
+        let changes = vec![
+            create_test_change("ch-queued", 0, 3),
+            create_test_change("ch-notqueued", 0, 3),
+            create_test_change("ch-archived", 3, 3),
+        ];
+
+        // Seed change_runtime entries
+        shared.apply_command(ReducerCommand::AddToQueue("ch-queued".to_string()));
+
+        // Drive ch-archived through the terminal state
+        shared.apply_command(ReducerCommand::AddToQueue("ch-archived".to_string()));
+        shared.apply_execution_event(&crate::events::ExecutionEvent::ChangeArchived(
+            "ch-archived".to_string(),
+        ));
+
+        let snapshot =
+            OrchestratorStateSnapshot::from_changes_with_shared_state(&changes, Some(&shared));
+
+        let queued = snapshot
+            .changes
+            .iter()
+            .find(|c| c.id == "ch-queued")
+            .unwrap();
+        let notqueued = snapshot
+            .changes
+            .iter()
+            .find(|c| c.id == "ch-notqueued")
+            .unwrap();
+        let archived = snapshot
+            .changes
+            .iter()
+            .find(|c| c.id == "ch-archived")
+            .unwrap();
+
+        // Reducer-derived queue_status values must match display_status output
+        assert_eq!(queued.queue_status, Some("queued".to_string()));
+        // "not queued" maps to None to keep payload minimal (no API shape change)
+        assert_eq!(notqueued.queue_status, None);
+        assert_eq!(archived.queue_status, Some("archived".to_string()));
     }
 }
