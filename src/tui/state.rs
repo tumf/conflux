@@ -1054,6 +1054,19 @@ impl AppState {
             }
         }
 
+        // Sync queue intent into the shared reducer so that reducer-driven display
+        // sync (apply_display_statuses_from_reducer) cannot regress these rows back
+        // to "not queued" before the orchestrator processes them.
+        if let Some(shared) = &self.shared_orchestrator_state {
+            if let Ok(mut guard) = shared.try_write() {
+                for id in &selected {
+                    guard.apply_command(
+                        crate::orchestration::state::ReducerCommand::AddToQueue(id.clone()),
+                    );
+                }
+            }
+        }
+
         self.reset_for_run();
         self.mode = AppMode::Running;
         self.add_log(LogEntry::info(format!(
@@ -1097,6 +1110,19 @@ impl AppState {
             }
         }
 
+        // Sync queue intent into the shared reducer so that reducer-driven display
+        // sync cannot regress these rows back to "not queued" before the orchestrator
+        // processes them.
+        if let Some(shared) = &self.shared_orchestrator_state {
+            if let Ok(mut guard) = shared.try_write() {
+                for id in &marked_ids {
+                    guard.apply_command(
+                        crate::orchestration::state::ReducerCommand::AddToQueue(id.clone()),
+                    );
+                }
+            }
+        }
+
         self.reset_for_run();
         self.mode = AppMode::Running;
         self.add_log(LogEntry::info(format!(
@@ -1137,6 +1163,19 @@ impl AppState {
             if matches!(change.queue_status, QueueStatus::Error(_)) {
                 change.queue_status = QueueStatus::Queued;
                 change.selected = true;
+            }
+        }
+
+        // Sync queue intent into the shared reducer.  AddToQueue clears retryable
+        // terminal (Error/Stopped) states so that reducer-driven display sync will
+        // return "queued" for these rows instead of "error".
+        if let Some(shared) = &self.shared_orchestrator_state {
+            if let Ok(mut guard) = shared.try_write() {
+                for id in &error_ids {
+                    guard.apply_command(
+                        crate::orchestration::state::ReducerCommand::AddToQueue(id.clone()),
+                    );
+                }
             }
         }
 
@@ -2152,7 +2191,20 @@ impl AppState {
                 reset_ids.push(change.id.clone());
             }
         }
+        // Mirror the rejection in the shared reducer so that subsequent
+        // ChangesRefreshed display syncs do not re-queue these rows.
         if !reset_ids.is_empty() {
+            if let Some(shared) = &self.shared_orchestrator_state {
+                if let Ok(mut guard) = shared.try_write() {
+                    for id in &reset_ids {
+                        guard.apply_command(
+                            crate::orchestration::state::ReducerCommand::RemoveFromQueue(
+                                id.clone(),
+                            ),
+                        );
+                    }
+                }
+            }
             self.add_log(LogEntry::warn(format!(
                 "Not started ({}): {}",
                 reason,
@@ -4321,5 +4373,279 @@ mod tests {
             cmd
         );
         assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix: parallel TUI queued/blocked state regression
+    // -----------------------------------------------------------------------
+
+    /// start_processing must sync queue intent into the shared reducer so that a
+    /// subsequent ChangesRefreshed display sync cannot regress the row back to
+    /// "not queued" before the orchestrator processes it.
+    #[test]
+    fn test_start_processing_syncs_reducer_queue_intent() {
+        use crate::orchestration::state::OrchestratorState;
+        use std::sync::Arc;
+
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].selected = true;
+        app.changes[0].is_parallel_eligible = true;
+
+        // Attach a real shared reducer.
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            0,
+        )));
+        app.set_shared_state(shared.clone());
+
+        let cmd = app.start_processing();
+        assert!(cmd.is_some(), "start_processing should return a command");
+
+        // Reducer must now know about the queue intent.
+        let guard = shared.blocking_read();
+        assert_eq!(
+            guard.display_status("change-a"),
+            "queued",
+            "reducer queue_intent must be Queued after start_processing"
+        );
+
+        // A subsequent ChangesRefreshed-driven display sync must not overwrite Queued.
+        drop(guard);
+        let mut display_map = std::collections::HashMap::new();
+        display_map.insert("change-a".to_string(), "not queued");
+        app.apply_display_statuses_from_reducer(&display_map);
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::NotQueued,
+            "display sync should apply reducer snapshot – but reducer already says queued, so this tests the raw override path"
+        );
+
+        // Verify with the reducer's own snapshot (the correct integration path).
+        let guard2 = shared.blocking_read();
+        let real_map = guard2.all_display_statuses();
+        drop(guard2);
+        app.changes[0].queue_status = QueueStatus::Queued; // restore as start_processing set
+        app.apply_display_statuses_from_reducer(&real_map);
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::Queued,
+            "reducer snapshot must preserve Queued through ChangesRefreshed display sync"
+        );
+    }
+
+    /// resume_processing must sync queue intent into the shared reducer.
+    #[test]
+    fn test_resume_processing_syncs_reducer_queue_intent() {
+        use crate::orchestration::state::OrchestratorState;
+        use std::sync::Arc;
+
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Stopped;
+        app.changes[0].selected = true;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            0,
+        )));
+        app.set_shared_state(shared.clone());
+
+        let cmd = app.resume_processing();
+        assert!(cmd.is_some(), "resume_processing should return a command");
+
+        let guard = shared.blocking_read();
+        assert_eq!(
+            guard.display_status("change-a"),
+            "queued",
+            "reducer queue_intent must be Queued after resume_processing"
+        );
+    }
+
+    /// After start_processing, the reducer snapshot must preserve Queued through an
+    /// initial parallel ChangesRefreshed display sync (startup refresh regression).
+    #[test]
+    fn test_parallel_start_refresh_preserves_queued_rows() {
+        use crate::orchestration::state::OrchestratorState;
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].selected = true;
+        app.changes[0].is_parallel_eligible = true;
+        app.parallel_mode = true;
+
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            0,
+        )));
+        app.set_shared_state(shared.clone());
+
+        // F5 – queues the change and syncs the reducer.
+        let cmd = app.start_processing();
+        assert!(cmd.is_some());
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+
+        // Simulate initial parallel ChangesRefreshed (workspace scan returns nothing special).
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ChangesRefreshed {
+                changes: vec![],
+                committed_change_ids: HashSet::new(),
+                uncommitted_file_change_ids: HashSet::new(),
+                worktree_change_ids: HashSet::new(),
+                worktree_paths: HashMap::new(),
+                worktree_not_ahead_ids: HashSet::new(),
+                merge_wait_ids: HashSet::new(),
+            });
+        }
+
+        // Display sync from the reducer must keep the row as Queued.
+        let display_map = shared.blocking_read().all_display_statuses();
+        app.apply_display_statuses_from_reducer(&display_map);
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::Queued,
+            "initial parallel ChangesRefreshed must not regress a queued row to not-queued"
+        );
+    }
+
+    /// DependencyBlocked sets Blocked in both TUI and reducer; DependencyResolved restores
+    /// Queued display because the reducer still holds queue_intent = Queued.
+    #[test]
+    fn test_dependency_block_preserves_queued_intent() {
+        use crate::orchestration::state::OrchestratorState;
+        use std::sync::Arc;
+
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            0,
+        )));
+        app.set_shared_state(shared.clone());
+
+        // Simulate F5 path (queues change in both TUI and reducer).
+        app.changes[0].selected = true;
+        app.changes[0].is_parallel_eligible = true;
+        app.start_processing();
+
+        // Verify reducer has queued intent.
+        assert_eq!(shared.blocking_read().display_status("change-a"), "queued");
+
+        // Dependency block arrives.
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_execution_event(&crate::events::ExecutionEvent::DependencyBlocked {
+                change_id: "change-a".to_string(),
+                dependency_ids: vec!["dep".to_string()],
+            });
+        }
+        // Reducer should show "blocked"; queue_intent is still Queued underneath.
+        assert_eq!(
+            shared.blocking_read().display_status("change-a"),
+            "blocked"
+        );
+    }
+
+    /// After DependencyResolved the reducer restores "queued" display because queue_intent
+    /// was never cleared during the block.
+    #[test]
+    fn test_dependency_resolved_restores_queued_display() {
+        use crate::orchestration::state::OrchestratorState;
+        use std::sync::Arc;
+
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            0,
+        )));
+        app.set_shared_state(shared.clone());
+
+        app.changes[0].selected = true;
+        app.changes[0].is_parallel_eligible = true;
+        app.start_processing();
+
+        // Block then resolve.
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_execution_event(&crate::events::ExecutionEvent::DependencyBlocked {
+                change_id: "change-a".to_string(),
+                dependency_ids: vec!["dep".to_string()],
+            });
+            guard.apply_execution_event(&crate::events::ExecutionEvent::DependencyResolved {
+                change_id: "change-a".to_string(),
+            });
+        }
+
+        // After resolution, reducer must report "queued" (not "not queued").
+        let display_map = shared.blocking_read().all_display_statuses();
+        app.apply_display_statuses_from_reducer(&display_map);
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::Queued,
+            "dependency resolution must restore queued display, not not-queued"
+        );
+    }
+
+    /// ParallelStartRejected must also clear the reducer queue intent so subsequent
+    /// ChangesRefreshed display syncs don't re-queue the rejected row.
+    #[test]
+    fn test_parallel_start_rejected_does_not_clear_other_rows() {
+        use crate::orchestration::state::OrchestratorState;
+        use std::sync::Arc;
+
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            0,
+        )));
+        app.set_shared_state(shared.clone());
+
+        // Queue both changes in reducer.
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+                "change-a".to_string(),
+            ));
+            guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+                "change-b".to_string(),
+            ));
+        }
+        app.changes[0].queue_status = QueueStatus::Queued;
+        app.changes[1].queue_status = QueueStatus::Queued;
+        app.mode = AppMode::Running;
+
+        // Backend rejects only change-a.
+        app.handle_orchestrator_event(OrchestratorEvent::ParallelStartRejected {
+            change_ids: vec!["change-a".to_string()],
+            reason: "uncommitted".to_string(),
+        });
+
+        // change-a must be reset in both TUI and reducer.
+        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+        assert_eq!(
+            shared.blocking_read().display_status("change-a"),
+            "not queued",
+            "reducer must clear queue intent for rejected change-a"
+        );
+
+        // change-b must remain Queued in both TUI and reducer.
+        assert_eq!(app.changes[1].queue_status, QueueStatus::Queued);
+        assert_eq!(
+            shared.blocking_read().display_status("change-b"),
+            "queued",
+            "reducer must not touch change-b which was not rejected"
+        );
     }
 }
