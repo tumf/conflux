@@ -117,3 +117,6 @@ In Parallel mode, `ChangeArchived` SHALL set the wait state to `MergeWait` (a no
 - **WHEN** a `MergeCompleted` event is received for the change
 - **THEN** the terminal state becomes `Merged`
 - **AND** the derived display status is `merged`
+
+
+#
