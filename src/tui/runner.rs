@@ -747,6 +747,22 @@ async fn run_tui_loop(
 
         // Handle orchestrator events
         while let Ok(event) = rx.try_recv() {
+            // Apply ChangesRefreshed events to shared state so the reducer's
+            // observation reconcile path (apply_observation) is kept up-to-date.
+            // Phase 5.1: workspace observations drive the shared reducer.
+            // Phase 6.1: TUI derives queue_status from the reducer display snapshot.
+            if matches!(
+                &event,
+                crate::events::ExecutionEvent::ChangesRefreshed { .. }
+            ) {
+                let display_map = {
+                    let mut state = shared_state.write().await;
+                    state.apply_execution_event(&event);
+                    state.all_display_statuses()
+                };
+                app.apply_display_statuses_from_reducer(&display_map);
+            }
+
             // Forward execution events to web state (web-monitoring feature only)
             #[cfg(feature = "web-monitoring")]
             if let Some(ref web_state) = web_state {

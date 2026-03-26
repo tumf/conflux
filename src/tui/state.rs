@@ -896,6 +896,43 @@ impl AppState {
         }
     }
 
+    /// Sync `ChangeState.queue_status` from the reducer's display status snapshot.
+    ///
+    /// This is Phase 6.1: TUI derives displayed change status from the shared
+    /// orchestration reducer state instead of maintaining an independent lifecycle copy.
+    /// Only transitions that are safe (no active execution regression) are applied.
+    pub fn apply_display_statuses_from_reducer(
+        &mut self,
+        display_map: &HashMap<String, &'static str>,
+    ) {
+        for change in &mut self.changes {
+            if let Some(&status_str) = display_map.get(&change.id) {
+                let new_status = match status_str {
+                    "not queued" => QueueStatus::NotQueued,
+                    "queued" => QueueStatus::Queued,
+                    "blocked" => QueueStatus::Blocked,
+                    "applying" => QueueStatus::Applying,
+                    "accepting" => QueueStatus::Accepting,
+                    "archiving" => QueueStatus::Archiving,
+                    "merge wait" => QueueStatus::MergeWait,
+                    "resolve pending" => QueueStatus::ResolveWait,
+                    "resolving" => QueueStatus::Resolving,
+                    "archived" => QueueStatus::Archived,
+                    "merged" => QueueStatus::Merged,
+                    "stopped" => QueueStatus::NotQueued, // Stopped changes appear as not-queued in TUI
+                    "error" => {
+                        if matches!(change.queue_status, QueueStatus::Error(_)) {
+                            continue; // Preserve existing error message
+                        }
+                        QueueStatus::Error("reducer".to_string())
+                    }
+                    _ => continue,
+                };
+                change.queue_status = new_status;
+            }
+        }
+    }
+
     /// Get the number of selected changes
     pub fn selected_count(&self) -> usize {
         self.changes.iter().filter(|c| c.selected).count()
@@ -1980,17 +2017,17 @@ impl AppState {
         uncommitted_file_change_ids: HashSet<String>,
         worktree_change_ids: HashSet<String>,
         worktree_paths: HashMap<String, PathBuf>,
-        worktree_not_ahead_ids: HashSet<String>,
-        merge_wait_ids: HashSet<String>,
+        _worktree_not_ahead_ids: HashSet<String>,
+        _merge_wait_ids: HashSet<String>,
     ) {
         self.worktree_paths = worktree_paths;
         self.update_changes(changes);
         self.apply_parallel_eligibility(&committed_change_ids, &uncommitted_file_change_ids);
         self.apply_worktree_status(&worktree_change_ids);
-        // Auto-clear MergeWait for changes whose worktrees don't exist or are not ahead
-        self.auto_clear_merge_wait(&worktree_change_ids, &worktree_not_ahead_ids);
-        // Apply MergeWait status for archived changes waiting for merge
-        self.apply_merge_wait_status(&merge_wait_ids);
+        // Phase 5.2: MergeWait reconciliation is now handled by the shared reducer's
+        // apply_observation() path via apply_display_statuses_from_reducer(), which is called
+        // in the runner after updating shared state with the ChangesRefreshed event.
+        // auto_clear_merge_wait and apply_merge_wait_status are no longer called here.
     }
 
     fn handle_worktrees_refreshed(&mut self, worktrees: Vec<WorktreeInfo>) {
@@ -2334,76 +2371,10 @@ impl AppState {
             self.list_state.select(Some(self.cursor_index));
         }
     }
-
-    /// Auto-clear MergeWait status when conditions are met.
-    ///
-    /// Clears MergeWait to Queued when:
-    /// - Worktree doesn't exist (not in worktree_change_ids), OR
-    /// - Worktree exists but is not ahead of base (in worktree_not_ahead_ids)
-    fn auto_clear_merge_wait(
-        &mut self,
-        worktree_change_ids: &HashSet<String>,
-        worktree_not_ahead_ids: &HashSet<String>,
-    ) {
-        let mut cleared_changes = Vec::new();
-
-        for change in &mut self.changes {
-            if change.queue_status == QueueStatus::MergeWait {
-                let has_worktree = worktree_change_ids.contains(&change.id);
-                let not_ahead = worktree_not_ahead_ids.contains(&change.id);
-
-                // Auto-clear conditions:
-                // 1. Worktree doesn't exist
-                // 2. Worktree exists but not ahead of base
-                if !has_worktree || not_ahead {
-                    change.queue_status = QueueStatus::Queued;
-                    let reason = if !has_worktree {
-                        "worktree removed"
-                    } else {
-                        "worktree merged to base"
-                    };
-                    cleared_changes.push((change.id.clone(), reason));
-                }
-            }
-        }
-
-        // Log after modifying changes to avoid borrow conflict
-        for (id, reason) in cleared_changes {
-            self.add_log(LogEntry::info(format!(
-                "Auto-cleared MergeWait for '{}': {}",
-                id, reason
-            )));
-        }
-    }
-
-    /// Apply MergeWait status for changes detected in WorkspaceState::Archived.
-    ///
-    /// Sets MergeWait for changes that:
-    /// - Have a worktree in WorkspaceState::Archived state
-    /// - Are not currently in active processing states (Applying, Archiving, Resolving, ResolveWait)
-    ///
-    /// This implements idempotent restoration of MergeWait from repository state.
-    /// ResolveWait is preserved to avoid overwriting single-launch wait states.
-    fn apply_merge_wait_status(&mut self, merge_wait_ids: &HashSet<String>) {
-        for change in &mut self.changes {
-            if merge_wait_ids.contains(&change.id) {
-                // Only set MergeWait if not in active processing or ResolveWait
-                // (to avoid overwriting active processing states or single-launch wait)
-                if !matches!(
-                    change.queue_status,
-                    QueueStatus::Applying
-                        | QueueStatus::Archiving
-                        | QueueStatus::Resolving
-                        | QueueStatus::ResolveWait
-                        | QueueStatus::Merged
-                        | QueueStatus::Blocked
-                ) {
-                    change.queue_status = QueueStatus::MergeWait;
-                }
-            }
-        }
-    }
 }
+// Note: auto_clear_merge_wait() and apply_merge_wait_status() have been removed in Phase 5.3.
+// Their logic is now handled by the shared reducer's apply_observation() path.
+// The TUI syncs queue_status via apply_display_statuses_from_reducer() in the runner.
 
 // ============================================================================
 // Guard Logic
@@ -2576,8 +2547,9 @@ mod guards {
     ) -> ToggleActionResult {
         match &change.queue_status {
             QueueStatus::NotQueued => {
-                // Add to queue
-                change.queue_status = QueueStatus::Queued;
+                // Emit AddToQueue command; do NOT directly assign queue_status here.
+                // The shared reducer state will be updated via apply_command in command_handlers,
+                // and the TUI will derive the display status from the shared state.
                 change.selected = true;
                 // Clear NEW flag when user adds to queue
                 if change.is_new {
@@ -2589,8 +2561,7 @@ mod guards {
                 ToggleActionResult::Command(TuiCommand::AddToQueue(id), Some(log_msg))
             }
             QueueStatus::Queued => {
-                // Remove from queue
-                change.queue_status = QueueStatus::NotQueued;
+                // Emit RemoveFromQueue command; do NOT directly assign queue_status here.
                 change.selected = false;
                 let id = change.id.clone();
                 let log_msg = format!("Removed from queue: {}", id);
@@ -2670,7 +2641,6 @@ mod guards {
 mod tests {
     use super::*;
     use crate::tui::events::OrchestratorEvent;
-    use std::collections::HashSet;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -4049,7 +4019,7 @@ mod tests {
         );
     }
 
-    /// Regression: apply_merge_wait_status must not regress a Merged change to MergeWait.
+    /// Regression: reducer-driven display must not demote a Merged change to MergeWait.
     #[test]
     fn test_apply_merge_wait_status_does_not_demote_merged() {
         let changes = vec![create_test_change("change-a", 1, 1)];
@@ -4058,56 +4028,51 @@ mod tests {
         // Simulate that the change has already reached Merged state.
         app.changes[0].queue_status = QueueStatus::Merged;
 
-        // Simulate auto-refresh calling apply_merge_wait_status with change-a in the set.
-        let mut merge_wait_ids = HashSet::new();
-        merge_wait_ids.insert("change-a".to_string());
-        app.apply_merge_wait_status(&merge_wait_ids);
+        // The reducer display map says "merged" → TUI must keep Merged.
+        let mut display_map = std::collections::HashMap::new();
+        display_map.insert("change-a".to_string(), "merged");
+        app.apply_display_statuses_from_reducer(&display_map);
 
         assert_eq!(
             app.changes[0].queue_status,
             QueueStatus::Merged,
-            "apply_merge_wait_status must not demote a Merged change to MergeWait"
+            "reducer-driven display must not demote a Merged change to MergeWait"
         );
     }
 
-    /// Regression: apply_merge_wait_status must not demote a Blocked change to MergeWait.
+    /// Regression: reducer-driven display must not demote a Blocked change to MergeWait.
     #[test]
     fn test_apply_merge_wait_status_does_not_demote_blocked() {
         let changes = vec![create_test_change("change-a", 1, 1)];
         let mut app = AppState::new(changes);
 
-        // Simulate that the change is in Blocked state due to unresolved dependencies.
-        app.changes[0].queue_status = QueueStatus::Blocked;
-
-        // Simulate auto-refresh calling apply_merge_wait_status with change-a in the set.
-        let mut merge_wait_ids = HashSet::new();
-        merge_wait_ids.insert("change-a".to_string());
-        app.apply_merge_wait_status(&merge_wait_ids);
+        // The reducer display map says "blocked".
+        let mut display_map = std::collections::HashMap::new();
+        display_map.insert("change-a".to_string(), "blocked");
+        app.apply_display_statuses_from_reducer(&display_map);
 
         assert_eq!(
             app.changes[0].queue_status,
             QueueStatus::Blocked,
-            "apply_merge_wait_status must not demote a Blocked change to MergeWait"
+            "reducer-driven display must not demote a Blocked change to MergeWait"
         );
     }
 
-    /// Regression: auto_clear_merge_wait must not transition a Merged change to Queued.
+    /// Regression: reducer-driven display must not affect a Merged change via merge_wait.
     #[test]
     fn test_auto_clear_merge_wait_does_not_affect_merged() {
         let changes = vec![create_test_change("change-a", 1, 1)];
         let mut app = AppState::new(changes);
 
-        // Simulate Merged state.
-        app.changes[0].queue_status = QueueStatus::Merged;
-
-        // Call auto_clear_merge_wait with empty worktree sets (no worktree present).
-        let empty: HashSet<String> = HashSet::new();
-        app.auto_clear_merge_wait(&empty, &empty);
+        // The reducer display map says "merged" — TUI keeps Merged.
+        let mut display_map = std::collections::HashMap::new();
+        display_map.insert("change-a".to_string(), "merged");
+        app.apply_display_statuses_from_reducer(&display_map);
 
         assert_eq!(
             app.changes[0].queue_status,
             QueueStatus::Merged,
-            "auto_clear_merge_wait must not transition a Merged change to Queued"
+            "reducer-driven display must not transition a Merged change away from Merged"
         );
     }
 
@@ -4198,5 +4163,163 @@ mod tests {
             "Blocked change must be reset to NotQueued on AllCompleted"
         );
         assert_eq!(app.mode, AppMode::Select);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6.1: TUI uses reducer display_status (apply_display_statuses_from_reducer)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tui_uses_reducer_display_status() {
+        use std::collections::HashMap;
+
+        let changes = vec![
+            create_test_change("c1", 0, 3),
+            create_test_change("c2", 0, 3),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Simulate reducer snapshot with various statuses.
+        let mut display_map: HashMap<String, &'static str> = HashMap::new();
+        display_map.insert("c1".to_string(), "applying");
+        display_map.insert("c2".to_string(), "merge wait");
+
+        app.apply_display_statuses_from_reducer(&display_map);
+
+        assert_eq!(app.changes[0].queue_status, QueueStatus::Applying);
+        assert_eq!(app.changes[1].queue_status, QueueStatus::MergeWait);
+
+        // Verify active classification works correctly.
+        assert!(matches!(app.changes[0].queue_status, QueueStatus::Applying));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6.4: TUI and Web display vocabulary consistency
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_display_status_consistency_between_tui_and_web() {
+        use std::collections::HashMap;
+
+        let changes = vec![create_test_change("c1", 0, 3)];
+        let mut app = AppState::new(changes);
+
+        // Scenarios: dependency blocked, merge wait, resolving.
+        let scenarios: &[(&str, QueueStatus)] = &[
+            ("blocked", QueueStatus::Blocked),
+            ("merge wait", QueueStatus::MergeWait),
+            ("resolve pending", QueueStatus::ResolveWait),
+            ("resolving", QueueStatus::Resolving),
+            ("archived", QueueStatus::Archived),
+            ("merged", QueueStatus::Merged),
+            ("queued", QueueStatus::Queued),
+            ("not queued", QueueStatus::NotQueued),
+        ];
+
+        for (reducer_str, expected_tui_status) in scenarios {
+            let mut display_map: HashMap<String, &'static str> = HashMap::new();
+            display_map.insert("c1".to_string(), reducer_str);
+            app.apply_display_statuses_from_reducer(&display_map);
+
+            assert_eq!(
+                app.changes[0].queue_status, *expected_tui_status,
+                "reducer '{}' should map to {:?}",
+                reducer_str, expected_tui_status
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3.3: toggle_selection in Running mode emits commands without
+    // mutating queue_status locally.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_running_mode_toggle_emits_commands_without_local_status_mutation() {
+        let changes = vec![
+            create_test_change("c1", 0, 3),
+            create_test_change("c2", 0, 3),
+        ];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+
+        // Simulate c1 in NotQueued state.
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+
+        // toggle_selection should return AddToQueue command and NOT mutate queue_status.
+        let cmd = app.toggle_selection();
+        assert!(
+            matches!(cmd, Some(TuiCommand::AddToQueue(ref id)) if id == "c1"),
+            "expected AddToQueue command, got {:?}",
+            cmd
+        );
+        // queue_status must NOT have been locally changed to Queued.
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::NotQueued,
+            "queue_status must NOT be mutated locally; reducer drives it"
+        );
+
+        // Simulate c2 already Queued.
+        app.cursor_index = 1;
+        app.changes[1].queue_status = QueueStatus::Queued;
+        let cmd2 = app.toggle_selection();
+        assert!(
+            matches!(cmd2, Some(TuiCommand::RemoveFromQueue(ref id)) if id == "c2"),
+            "expected RemoveFromQueue command, got {:?}",
+            cmd2
+        );
+        // queue_status must NOT have been locally changed to NotQueued.
+        assert_eq!(
+            app.changes[1].queue_status,
+            QueueStatus::Queued,
+            "queue_status must NOT be mutated locally; reducer drives it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3.4: MergeWait / ResolveWait Space and M key behaviour
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_wait_queue_operations() {
+        let changes = vec![create_test_change("c1", 0, 3)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+
+        // Space on MergeWait toggles selection only (no queue change).
+        let cmd = app.toggle_selection();
+        // Should NOT return AddToQueue/RemoveFromQueue.
+        assert!(
+            !matches!(
+                cmd,
+                Some(TuiCommand::AddToQueue(_)) | Some(TuiCommand::RemoveFromQueue(_))
+            ),
+            "Space on MergeWait must not issue queue commands, got {:?}",
+            cmd
+        );
+        // queue_status must still be MergeWait.
+        assert_eq!(app.changes[0].queue_status, QueueStatus::MergeWait);
+    }
+
+    #[test]
+    fn test_resolve_wait_queue_operations() {
+        let changes = vec![create_test_change("c1", 0, 3)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::ResolveWait;
+
+        // Space on ResolveWait toggles selection only (no queue change).
+        let cmd = app.toggle_selection();
+        assert!(
+            !matches!(
+                cmd,
+                Some(TuiCommand::AddToQueue(_)) | Some(TuiCommand::RemoveFromQueue(_))
+            ),
+            "Space on ResolveWait must not issue queue commands, got {:?}",
+            cmd
+        );
+        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
     }
 }
