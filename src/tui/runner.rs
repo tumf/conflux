@@ -747,14 +747,22 @@ async fn run_tui_loop(
 
         // Handle orchestrator events
         while let Ok(event) = rx.try_recv() {
-            // Apply ChangesRefreshed events to shared state so the reducer's
-            // observation reconcile path (apply_observation) is kept up-to-date.
-            // Phase 5.1: workspace observations drive the shared reducer.
+            // Apply resolve lifecycle events and ChangesRefreshed to shared state.
+            //
+            // Phase 5.1: workspace observations drive the shared reducer (ChangesRefreshed).
+            // Phase 5.2: manual resolve lifecycle events must also update shared reducer so
+            //   that ResolveWait is cleared before the next ChangesRefreshed sync; otherwise
+            //   apply_observation keeps the stale ResolveWait and apply_display_statuses_from_reducer
+            //   regresses a locally-Merged row back to "resolve pending".
             // Phase 6.1: TUI derives queue_status from the reducer display snapshot.
-            if matches!(
+            let apply_to_reducer = matches!(
                 &event,
                 crate::events::ExecutionEvent::ChangesRefreshed { .. }
-            ) {
+                    | crate::events::ExecutionEvent::ResolveStarted { .. }
+                    | crate::events::ExecutionEvent::ResolveCompleted { .. }
+                    | crate::events::ExecutionEvent::ResolveFailed { .. }
+            );
+            if apply_to_reducer {
                 let display_map = {
                     let mut state = shared_state.write().await;
                     state.apply_execution_event(&event);

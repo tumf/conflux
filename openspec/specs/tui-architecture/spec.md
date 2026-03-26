@@ -167,6 +167,8 @@ When `ResolveCompleted` is received and the resolve wait queue is not empty, the
 
 When `ResolveFailed` is received, the TUI SHALL NOT auto-start the next resolve; queued changes remain in `ResolveWait` until user action resumes.
 
+Manual resolve completion MUST update the shared reducer-owned display state before the next refresh-derived status synchronization so that successful merge completion is not overwritten by stale `ResolveWait`.
+
 #### Scenario: Release MergeWait when worktree does not exist
 - **GIVEN** a change is in `MergeWait`
 - **AND** the corresponding worktree does not exist
@@ -216,6 +218,13 @@ When `ResolveFailed` is received, the TUI SHALL NOT auto-start the next resolve;
 - **AND** a resolve operation fails
 - **WHEN** `ResolveFailed` is processed
 - **THEN** the next resolve SHALL NOT start automatically
+
+#### Scenario: Successful manual resolve is not regressed by refresh
+- **GIVEN** a change was previously shown as `ResolveWait`
+- **AND** manual resolve completes successfully and the change becomes merged
+- **WHEN** the next TUI auto-refresh synchronizes reducer-derived display status
+- **THEN** the row remains `Merged` or is removed according to retention rules
+- **AND** the row does not return to `resolve pending`
 
 ### Requirement: Log Entry Structure and Display
 
