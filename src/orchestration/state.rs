@@ -584,13 +584,29 @@ impl OrchestratorState {
     pub fn apply_command(&mut self, cmd: ReducerCommand) -> ReduceOutcome {
         match cmd {
             ReducerCommand::AddToQueue(change_id) => {
-                // Idempotent: if already queued or in an active/terminal state, no-op.
-                let rt = self.runtime_entry(&change_id);
-                if rt.is_terminal() || rt.is_active() || rt.queue_intent == QueueIntent::Queued {
-                    return ReduceOutcome::NoOp;
+                // Permanently completed changes (Archived, Merged) cannot be re-queued.
+                {
+                    let rt = self.runtime_entry(&change_id);
+                    if matches!(rt.terminal, TerminalState::Archived | TerminalState::Merged) {
+                        return ReduceOutcome::NoOp;
+                    }
+                    // Already queued and not in a retryable terminal state – no-op.
+                    if !rt.is_terminal()
+                        && (rt.is_active() || rt.queue_intent == QueueIntent::Queued)
+                    {
+                        return ReduceOutcome::NoOp;
+                    }
+                    // Clear retryable terminal states (Error, Stopped) so the change can
+                    // re-enter the queue.  This preserves the pending-set membership so the
+                    // orchestrator can schedule the retry.
+                    if rt.is_terminal() {
+                        rt.terminal = TerminalState::None;
+                        rt.activity = ActivityState::Idle;
+                        rt.wait_state = WaitState::None;
+                    }
+                    rt.queue_intent = QueueIntent::Queued;
+                    rt.wait_state = WaitState::None;
                 }
-                rt.queue_intent = QueueIntent::Queued;
-                rt.wait_state = WaitState::None;
                 // Ensure dynamic change is tracked in pending set.
                 self.add_dynamic_change(change_id.clone());
                 ReduceOutcome::Changed(ReducerEffect::QueueIntentSet {
@@ -1729,5 +1745,134 @@ mod tests {
             command: "cmd".to_string(),
         });
         assert_eq!(state.display_status("c"), "merged");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix: parallel TUI queued/blocked state regression – reducer unit tests
+    // -----------------------------------------------------------------------
+
+    /// AddToQueue on a change in Error terminal state must clear the terminal and
+    /// set queue_intent = Queued so that the TUI retry path works correctly.
+    #[test]
+    fn test_add_to_queue_retries_error_terminal() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+
+        // Drive the change to an error terminal state.
+        state.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "c".to_string(),
+            error: "apply failed".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "error");
+        assert!(state.is_terminal_change("c"));
+
+        // AddToQueue (retry) must clear the error terminal.
+        let outcome = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert!(
+            matches!(outcome, ReduceOutcome::Changed(_)),
+            "AddToQueue on error change must be Changed, not NoOp"
+        );
+        assert_eq!(
+            state.display_status("c"),
+            "queued",
+            "after retry, change must display as queued"
+        );
+        assert!(
+            !state.is_terminal_change("c"),
+            "error terminal must be cleared by AddToQueue"
+        );
+    }
+
+    /// AddToQueue on a Stopped terminal change must clear the terminal and re-queue.
+    #[test]
+    fn test_add_to_queue_retries_stopped_terminal() {
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+
+        // Simulate a stop.
+        let outcome = state.apply_command(ReducerCommand::StopChange("c".to_string()));
+        // StopChange on a fresh (non-terminal) change produces a terminal.
+        assert!(matches!(outcome, ReduceOutcome::Changed(_)));
+        assert_eq!(state.display_status("c"), "stopped");
+
+        // Retry via AddToQueue.
+        let outcome2 = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert!(
+            matches!(outcome2, ReduceOutcome::Changed(_)),
+            "AddToQueue on stopped change must be Changed, not NoOp"
+        );
+        assert_eq!(state.display_status("c"), "queued");
+        assert!(!state.is_terminal_change("c"));
+    }
+
+    /// AddToQueue on an Archived change must be a no-op (cannot re-queue a completed change).
+    #[test]
+    fn test_add_to_queue_noop_on_archived() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
+        assert_eq!(state.display_status("c"), "archived");
+
+        let outcome = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert!(
+            matches!(outcome, ReduceOutcome::NoOp),
+            "AddToQueue on archived change must be NoOp"
+        );
+        assert_eq!(state.display_status("c"), "archived");
+    }
+
+    /// After AddToQueue + DependencyBlocked + DependencyResolved, the display must
+    /// return to "queued" (queue_intent is preserved through the block/resolve cycle).
+    #[test]
+    fn test_dependency_resolved_restores_queued_after_block() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert_eq!(state.display_status("c"), "queued");
+
+        state.apply_execution_event(&ExecutionEvent::DependencyBlocked {
+            change_id: "c".to_string(),
+            dependency_ids: vec!["dep".to_string()],
+        });
+        assert_eq!(state.display_status("c"), "blocked");
+
+        state.apply_execution_event(&ExecutionEvent::DependencyResolved {
+            change_id: "c".to_string(),
+        });
+        assert_eq!(
+            state.display_status("c"),
+            "queued",
+            "DependencyResolved must restore queued (not not-queued)"
+        );
+    }
+
+    /// ChangesRefreshed must not overwrite queue_intent = Queued with "not queued".
+    #[test]
+    fn test_changes_refreshed_preserves_queue_intent() {
+        use crate::events::ExecutionEvent;
+        use std::collections::{HashMap, HashSet};
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert_eq!(state.display_status("c"), "queued");
+
+        // Simulate initial parallel ChangesRefreshed with no special observations.
+        state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+            changes: vec![],
+            committed_change_ids: HashSet::new(),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::new(),
+            worktree_paths: HashMap::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::new(),
+        });
+
+        assert_eq!(
+            state.display_status("c"),
+            "queued",
+            "ChangesRefreshed must not overwrite queue_intent = Queued"
+        );
     }
 }
