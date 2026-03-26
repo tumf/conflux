@@ -60,6 +60,23 @@
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
+// Execution mode – determines terminal states for the state machine
+// ============================================================================
+
+/// Execution mode that determines how the state machine handles terminal states.
+///
+/// - **Serial**: `ChangeArchived` is the terminal state (no merge step).
+/// - **Parallel**: `ChangeArchived` transitions to `MergeWait`; `MergeCompleted` is the terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ExecutionMode {
+    /// Serial execution: archive is the final step.
+    #[default]
+    Serial,
+    /// Parallel execution: archive is followed by a merge step.
+    Parallel,
+}
+
+// ============================================================================
 // ChangeRuntimeState types (Phase 1 – reducer-owned state)
 // ============================================================================
 
@@ -307,12 +324,25 @@ pub struct OrchestratorState {
 
     /// Reducer-owned resolve-wait queue (FIFO list of change_ids awaiting resolve).
     resolve_wait_queue: Vec<String>,
+
+    /// Execution mode: Serial or Parallel.
+    /// Determines how `ChangeArchived` events are handled.
+    execution_mode: ExecutionMode,
 }
 
 #[allow(dead_code)] // Public API for future use by TUI/Web states
 impl OrchestratorState {
-    /// Create a new orchestrator state with the given initial changes.
+    /// Create a new orchestrator state with the given initial changes and execution mode.
     pub fn new(change_ids: Vec<String>, max_iterations: u32) -> Self {
+        Self::with_mode(change_ids, max_iterations, ExecutionMode::Serial)
+    }
+
+    /// Create a new orchestrator state for a specific execution mode.
+    pub fn with_mode(
+        change_ids: Vec<String>,
+        max_iterations: u32,
+        execution_mode: ExecutionMode,
+    ) -> Self {
         let initial_set: HashSet<String> = change_ids.iter().cloned().collect();
         let pending_set = initial_set.clone();
         let total = change_ids.len();
@@ -336,6 +366,7 @@ impl OrchestratorState {
             current_change_id: None,
             change_runtime,
             resolve_wait_queue: Vec::new(),
+            execution_mode,
         }
     }
 
@@ -745,11 +776,22 @@ impl OrchestratorState {
             }
             ExecutionEvent::ChangeArchived(change_id) => {
                 self.mark_archived(change_id);
+                let mode = self.execution_mode;
                 let rt = self.runtime_entry(change_id);
-                rt.terminal = TerminalState::Archived;
                 rt.activity = ActivityState::Idle;
-                rt.wait_state = WaitState::None;
-                rt.queue_intent = QueueIntent::NotQueued;
+
+                match mode {
+                    ExecutionMode::Serial => {
+                        // Serial: archive is terminal.
+                        rt.terminal = TerminalState::Archived;
+                        rt.wait_state = WaitState::None;
+                        rt.queue_intent = QueueIntent::NotQueued;
+                    }
+                    ExecutionMode::Parallel => {
+                        // Parallel: archive triggers merge wait, not terminal yet.
+                        rt.wait_state = WaitState::MergeWait;
+                    }
+                }
             }
             ExecutionEvent::ArchiveFailed { change_id, error } => {
                 let rt = self.runtime_entry(change_id);
@@ -863,6 +905,14 @@ impl OrchestratorState {
 impl Default for OrchestratorState {
     fn default() -> Self {
         Self::new(Vec::new(), 0)
+    }
+}
+
+impl OrchestratorState {
+    /// Get the execution mode.
+    #[allow(dead_code)]
+    pub fn execution_mode(&self) -> ExecutionMode {
+        self.execution_mode
     }
 }
 
@@ -1512,5 +1562,172 @@ mod tests {
         assert_eq!(state.display_status("c"), "not queued");
         assert!(state.is_pending("c")); // legacy: still in pending set
         assert!(!state.is_archived("c"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Execution mode tests: Serial vs Parallel state machine
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_serial_mode_change_archived_is_terminal() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        // Default is Serial mode.
+        assert_eq!(state.execution_mode(), ExecutionMode::Serial);
+
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
+        assert_eq!(state.display_status("c"), "archived");
+        assert!(state.is_terminal_change("c"));
+
+        // MergeCompleted after terminal Archived in serial mode is a no-op.
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "c".to_string(),
+            revision: "rev".to_string(),
+        });
+        assert_eq!(
+            state.display_status("c"),
+            "archived",
+            "Serial: MergeCompleted must not override Archived terminal"
+        );
+    }
+
+    #[test]
+    fn test_parallel_mode_change_archived_transitions_to_merge_wait() {
+        use crate::events::ExecutionEvent;
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+        assert_eq!(state.execution_mode(), ExecutionMode::Parallel);
+
+        // Apply → Archive
+        state.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: "c".to_string(),
+            command: "cmd".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::ApplyCompleted {
+            change_id: "c".to_string(),
+            revision: "rev1".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::ArchiveStarted {
+            change_id: "c".to_string(),
+            command: "archive".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
+
+        // In parallel mode, ChangeArchived should NOT be terminal.
+        assert_eq!(
+            state.display_status("c"),
+            "merge wait",
+            "Parallel: ChangeArchived must transition to merge wait, not terminal archived"
+        );
+        assert!(
+            !state.is_terminal_change("c"),
+            "Parallel: change must not be terminal after archive"
+        );
+
+        // MergeCompleted should now succeed.
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "c".to_string(),
+            revision: "merge-rev".to_string(),
+        });
+        assert_eq!(
+            state.display_status("c"),
+            "merged",
+            "Parallel: MergeCompleted must transition to merged terminal"
+        );
+        assert!(state.is_terminal_change("c"));
+    }
+
+    #[test]
+    fn test_parallel_mode_full_lifecycle() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["a".to_string(), "b".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        // Queue and process 'a'
+        state.apply_command(ReducerCommand::AddToQueue("a".to_string()));
+        state.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: "a".to_string(),
+            command: "cmd".to_string(),
+        });
+        assert_eq!(state.display_status("a"), "applying");
+
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("a".to_string()));
+        assert_eq!(state.display_status("a"), "merge wait");
+        assert!(!state.is_terminal_change("a"));
+
+        // Merge 'a'
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "a".to_string(),
+            revision: "rev-a".to_string(),
+        });
+        assert_eq!(state.display_status("a"), "merged");
+        assert!(state.is_terminal_change("a"));
+
+        // 'b' is still not queued
+        assert_eq!(state.display_status("b"), "not queued");
+        assert!(!state.is_terminal_change("b"));
+    }
+
+    #[test]
+    fn test_parallel_mode_merge_deferred_then_completed() {
+        use crate::events::ExecutionEvent;
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+
+        // Archive the change
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
+        assert_eq!(state.display_status("c"), "merge wait");
+
+        // Merge deferred (base dirty)
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "c".to_string(),
+            reason: "base dirty".to_string(),
+        });
+        // Still in merge wait (MergeDeferred sets MergeWait, but already there)
+        assert_eq!(state.display_status("c"), "merge wait");
+
+        // Eventually merge succeeds
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "c".to_string(),
+            revision: "rev".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "merged");
+        assert!(state.is_terminal_change("c"));
+    }
+
+    #[test]
+    fn test_parallel_mode_late_events_do_not_regress_merged() {
+        use crate::events::ExecutionEvent;
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+
+        // Full lifecycle to merged
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "c".to_string(),
+            revision: "rev".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "merged");
+
+        // Late events must not regress
+        state.apply_execution_event(&ExecutionEvent::ResolveFailed {
+            change_id: "c".to_string(),
+            error: "late".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "merged");
+
+        state.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: "c".to_string(),
+            command: "cmd".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "merged");
     }
 }

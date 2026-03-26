@@ -646,7 +646,7 @@ impl Orchestrator {
         );
         self.initial_change_ids = Some(snapshot_ids.clone());
 
-        // Initialize shared orchestration state with filtered changes
+        // Initialize shared orchestration state with filtered changes (serial mode)
         let change_ids: Vec<String> = filtered_initial.iter().map(|c| c.id.clone()).collect();
         *self.shared_state.write().await = OrchestratorState::new(change_ids, self.max_iterations);
 
@@ -1188,6 +1188,16 @@ impl Orchestrator {
         // Store snapshot of change IDs
         let snapshot_ids: HashSet<String> = changes.iter().map(|c| c.id.clone()).collect();
         self.initial_change_ids = Some(snapshot_ids);
+
+        // Initialize shared orchestration state with parallel execution mode
+        {
+            let change_ids: Vec<String> = changes.iter().map(|c| c.id.clone()).collect();
+            *self.shared_state.write().await = OrchestratorState::with_mode(
+                change_ids,
+                self.max_iterations,
+                crate::orchestration::state::ExecutionMode::Parallel,
+            );
+        }
 
         // Use ParallelRunService for the common parallel execution flow
         let repo_root = std::env::current_dir()?;

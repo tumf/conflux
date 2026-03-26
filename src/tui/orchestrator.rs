@@ -935,6 +935,17 @@ pub async fn run_orchestrator_parallel(
     // Check if Git is available for parallel execution
     service.check_vcs_available().await?;
 
+    // Set execution mode to Parallel in shared state
+    {
+        let change_ids_vec: Vec<String> = change_ids.clone();
+        let mut state = shared_state.write().await;
+        *state = crate::orchestration::state::OrchestratorState::with_mode(
+            change_ids_vec,
+            config.get_max_iterations(),
+            crate::orchestration::state::ExecutionMode::Parallel,
+        );
+    }
+
     // Create shared queue change timestamp for debouncing
     let shared_queue_change = Arc::new(tokio::sync::Mutex::new(None::<std::time::Instant>));
 
