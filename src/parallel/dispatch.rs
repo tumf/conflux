@@ -197,29 +197,65 @@ impl ParallelExecutor {
                     };
                 }
                 WorkspaceState::Archived => {
+                    // The workspace is already past the archive step.  We must hand it
+                    // off to merge handling rather than silently returning a no-op result
+                    // with final_revision=None (which would cause the change to disappear
+                    // from the queue lifecycle and never reach MergeWait).
                     info!(
-                        "Change '{}' workspace already archived, skipping apply/acceptance/archive",
+                        "Change '{}' workspace already archived on resume, handing off to merge",
                         change_id
                     );
-                    if let Some(ref tx) = event_tx {
-                        let _ = tx
-                            .send(ParallelEvent::Log(
-                                LogEntry::info(format!(
-                                    "Change {} skipped: workspace already archived (not yet merged)",
-                                    change_id
-                                ))
-                                .with_change_id(&change_id),
-                            ))
-                            .await;
+                    // Get the current HEAD revision of the worktree — this is the
+                    // archive commit that the merge step needs.
+                    let resume_revision =
+                        crate::vcs::git::commands::get_current_commit(&workspace.path).await;
+                    match resume_revision {
+                        Ok(rev) => {
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::Log(
+                                        LogEntry::info(format!(
+                                            "Change {} resumed: workspace already archived, entering merge handling",
+                                            change_id
+                                        ))
+                                        .with_change_id(&change_id),
+                                    ))
+                                    .await;
+                                // Emit the same ChangeArchived event as the normal archive
+                                // success path so that downstream state machines (TUI,
+                                // output bridge) treat this resume identically.
+                                let _ = tx
+                                    .send(ParallelEvent::ChangeArchived(change_id.clone()))
+                                    .await;
+                            }
+                            // cancel_monitor has not been spawned yet at this point,
+                            // so we return without aborting it.
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: Some(rev),
+                                error: None,
+                            };
+                        }
+                        Err(e) => {
+                            // Could not read the revision — treat as a transient error so
+                            // the orchestrator can surface it rather than silently dropping
+                            // the change from the queue.
+                            warn!(
+                                "Change '{}' archived on resume but revision read failed: {}",
+                                change_id, e
+                            );
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!(
+                                    "Archived resume: failed to read workspace revision: {}",
+                                    e
+                                )),
+                            };
+                        }
                     }
-                    // cancel_monitor has not been spawned yet at this point,
-                    // so we return without aborting it.
-                    return WorkspaceResult {
-                        change_id,
-                        workspace_name: workspace.name,
-                        final_revision: None,
-                        error: None,
-                    };
                 }
                 _ => {}
             }
