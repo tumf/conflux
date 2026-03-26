@@ -305,12 +305,14 @@ Recommended:
    ```bash
    python3 "<SKILL_ROOT>/scripts/cflx.py" validate --strict
    ```
+   - **Review canonical spec diff** — run `git diff openspec/specs/` and verify each touched `openspec/specs/**` file shows the expected requirement changes. Do not rely solely on `Specs updated: [...]` output.
 
 ### Archive Completion Criteria
 
 - Change moved to `openspec/changes/archive/<id>/`
 - Canonical specs updated (unless `--skip-specs`)
 - Validation passes with `--strict`
+- `git diff openspec/specs/` confirms expected requirement additions, replacements, or removals for each touched spec
 
 **For detailed guidance**, read [references/cflx-archive.md](references/cflx-archive.md).
 

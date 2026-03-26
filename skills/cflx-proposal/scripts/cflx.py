@@ -12,6 +12,16 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 
+# Add skills directory to sys.path so the shared promotion module is importable
+_SKILLS_DIR = Path(__file__).resolve().parent.parent.parent
+if str(_SKILLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SKILLS_DIR))
+from shared.cflx_spec_promotion import (  # noqa: E402
+    delta_to_canonical as _shared_delta_to_canonical,
+    merge_spec_delta as _shared_merge_spec_delta,
+    simulate_promotion,
+)
+
 
 EvidenceMode = Literal["off", "warn", "error"]
 
@@ -480,6 +490,12 @@ class OpenSpecManager:
                 warnings
             )
 
+        # Simulate spec promotion before moving anything; fail early on no-op / missing targets
+        if not skip_specs:
+            sim_errors = self._simulate_spec_promotion(change_dir)
+            if sim_errors:
+                return False, "Spec promotion simulation failed:\n" + "\n".join(sim_errors)
+
         # Create archive directory if needed
         self.archive_dir.mkdir(parents=True, exist_ok=True)
 
@@ -500,8 +516,33 @@ class OpenSpecManager:
 
         return True, f"Archived to {archive_dest.relative_to(self.root_dir)}"
 
+    def _simulate_spec_promotion(self, change_dir: Path) -> List[str]:
+        """Simulate spec promotion and return errors without writing any files."""
+        errors: List[str] = []
+        specs_dir = change_dir / "specs"
+        if not specs_dir.exists():
+            return errors
+
+        for spec_dir in specs_dir.iterdir():
+            if not spec_dir.is_dir():
+                continue
+            spec_file = spec_dir / "spec.md"
+            if not spec_file.exists():
+                continue
+            canonical_spec = self.specs_dir / spec_dir.name / "spec.md"
+            canonical_content = (
+                canonical_spec.read_text(encoding="utf-8")
+                if canonical_spec.exists()
+                else None
+            )
+            delta_content = spec_file.read_text(encoding="utf-8")
+            _, sim_errors = simulate_promotion(canonical_content, delta_content)
+            for err in sim_errors:
+                errors.append(f"{spec_dir.name}: {err}")
+        return errors
+
     def _update_specs_from_change(self, change_dir: Path) -> List[str]:
-        """Update canonical specs from change deltas."""
+        """Update canonical specs from change deltas (simulation already passed)."""
         updated = []
         specs_dir = change_dir / "specs"
 
@@ -522,45 +563,18 @@ class OpenSpecManager:
 
             delta_content = spec_file.read_text(encoding="utf-8")
 
-            # If canonical spec exists, merge; otherwise create
             if canonical_spec.exists():
                 canonical_content = canonical_spec.read_text(encoding="utf-8")
-                merged_content = self._merge_spec_delta(canonical_content, delta_content)
+                merged_content, _ = _shared_merge_spec_delta(canonical_content, delta_content)
                 canonical_spec.write_text(merged_content, encoding="utf-8")
             else:
-                # Extract requirements from delta
-                canonical_spec.write_text(self._delta_to_canonical(delta_content), encoding="utf-8")
+                canonical_spec.write_text(
+                    _shared_delta_to_canonical(delta_content), encoding="utf-8"
+                )
 
             updated.append(spec_dir.name)
 
         return updated
-
-    def _merge_spec_delta(self, canonical: str, delta: str) -> str:
-        """Merge delta into canonical spec."""
-        # Simple implementation: append deltas
-        # In a real implementation, this would be more sophisticated
-        result = canonical
-
-        # Extract ADDED requirements
-        added_section = re.search(r"## ADDED Requirements(.+?)(?=## |$)", delta, re.DOTALL)
-        if added_section:
-            result += "\n\n" + added_section.group(1).strip()
-
-        # Extract MODIFIED requirements (replace matching sections)
-        # This is simplified - real implementation would need proper merging
-
-        return result
-
-    def _delta_to_canonical(self, delta: str) -> str:
-        """Convert delta format to canonical spec format."""
-        # Remove delta markers
-        canonical = re.sub(
-            r"^## (ADDED|MODIFIED|REMOVED) Requirements",
-            "## Requirements",
-            delta,
-            flags=re.MULTILINE,
-        )
-        return canonical
 
 
 def print_changes(changes: List[Dict], show_specs: bool = False):
