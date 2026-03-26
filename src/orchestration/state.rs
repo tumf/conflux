@@ -1036,20 +1036,26 @@ mod tests {
         assert!(valid.invariants_hold());
 
         // Invalid: terminal + active activity.
-        let mut invalid = ChangeRuntimeState::default();
-        invalid.terminal = TerminalState::Merged;
-        invalid.activity = ActivityState::Applying;
+        let invalid = ChangeRuntimeState {
+            terminal: TerminalState::Merged,
+            activity: ActivityState::Applying,
+            ..Default::default()
+        };
         assert!(!invalid.invariants_hold());
 
         // Invalid: ResolveWait + Resolving.
-        let mut invalid2 = ChangeRuntimeState::default();
-        invalid2.wait_state = WaitState::ResolveWait;
-        invalid2.activity = ActivityState::Resolving;
+        let invalid2 = ChangeRuntimeState {
+            wait_state: WaitState::ResolveWait,
+            activity: ActivityState::Resolving,
+            ..Default::default()
+        };
         assert!(!invalid2.invariants_hold());
 
         // Valid: MergeWait + Idle.
-        let mut ok = ChangeRuntimeState::default();
-        ok.wait_state = WaitState::MergeWait;
+        let ok = ChangeRuntimeState {
+            wait_state: WaitState::MergeWait,
+            ..Default::default()
+        };
         assert!(ok.invariants_hold());
     }
 

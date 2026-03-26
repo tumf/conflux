@@ -2641,7 +2641,6 @@ mod guards {
 mod tests {
     use super::*;
     use crate::tui::events::OrchestratorEvent;
-    use std::collections::HashSet;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
