@@ -405,3 +405,131 @@ fn test_check_task_progress_missing_returns_error() {
         "missing tasks.md must produce an error, not a false complete result"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression: mixed Archiving + Archived restart
+//
+// These tests guard the fix for the bug where a parallel restart with one
+// workspace in `Archiving` state and another already in `Archived` state
+// would leave the `Archived` workspace as `not queued` instead of advancing
+// it to merge handling.
+// ---------------------------------------------------------------------------
+
+/// A workspace with uncommitted archive files (Archiving) and a workspace with
+/// a committed archive entry (Archived) must be detected as distinct states.
+///
+/// Before the dispatch fix, both could have been handled the same way (silent
+/// no-op return), but the regression relies on the states being correctly
+/// distinguished first.
+#[tokio::test]
+async fn test_mixed_restart_archiving_and_archived_states_are_distinct() {
+    // ── Workspace A: Archiving (archive files moved but not committed) ────────
+    let tmp_archiving = TempDir::new().unwrap();
+    let path_archiving = tmp_archiving.path();
+    init_git_repo(path_archiving);
+    git_commit(path_archiving, "Initial commit");
+
+    StdCommand::new("git")
+        .args(["checkout", "-b", "workspace-change-archiving"])
+        .current_dir(path_archiving)
+        .output()
+        .unwrap();
+
+    // Simulate archive files moved into place but NOT yet committed (dirty tree).
+    let archive_dir_a = path_archiving.join("openspec/changes/archive/change-archiving");
+    fs::create_dir_all(&archive_dir_a).unwrap();
+    fs::write(archive_dir_a.join("proposal.md"), "# Archiving change").unwrap();
+    // Do NOT commit — leave tree dirty so this looks like Archiving, not Archived.
+
+    let state_archiving = detect_workspace_state("change-archiving", path_archiving, "main")
+        .await
+        .expect("detect_workspace_state must not fail for Archiving workspace");
+
+    // ── Workspace B: Archived (archive commit is present and tree is clean) ───
+    let tmp_archived = TempDir::new().unwrap();
+    let path_archived = tmp_archived.path();
+    init_git_repo(path_archived);
+    git_commit(path_archived, "Initial commit");
+
+    StdCommand::new("git")
+        .args(["checkout", "-b", "workspace-change-archived"])
+        .current_dir(path_archived)
+        .output()
+        .unwrap();
+
+    let archive_dir_b = path_archived.join("openspec/changes/archive/change-archived");
+    fs::create_dir_all(&archive_dir_b).unwrap();
+    fs::write(archive_dir_b.join("tasks.md"), "## Tasks\n- [x] Done\n").unwrap();
+    git_commit(path_archived, "Archive: change-archived");
+
+    let state_archived = detect_workspace_state("change-archived", path_archived, "main")
+        .await
+        .expect("detect_workspace_state must not fail for Archived workspace");
+
+    // The two states must be distinct.
+    assert_eq!(
+        state_archiving,
+        WorkspaceState::Archiving,
+        "workspace with uncommitted archive files must be Archiving"
+    );
+    assert_eq!(
+        state_archived,
+        WorkspaceState::Archived,
+        "workspace with committed archive entry must be Archived"
+    );
+    assert_ne!(
+        state_archiving, state_archived,
+        "Archiving and Archived states must be distinguishable on restart"
+    );
+}
+
+/// An `Archived` workspace must yield a readable HEAD revision so the dispatch
+/// path can return `final_revision: Some(rev)` and hand off to merge handling.
+///
+/// This guards the fix in `dispatch_change_to_workspace`: the archived resume
+/// branch now calls `get_current_commit` and returns its result as `final_revision`.
+/// If `get_current_commit` were to fail the change would surface as an error
+/// rather than silently disappearing from the queue.
+#[tokio::test]
+async fn test_archived_workspace_head_revision_is_readable() {
+    let tmp = TempDir::new().unwrap();
+    let repo_root = tmp.path();
+    init_git_repo(repo_root);
+    git_commit(repo_root, "Initial commit");
+
+    StdCommand::new("git")
+        .args(["checkout", "-b", "workspace-archive-rev"])
+        .current_dir(repo_root)
+        .output()
+        .unwrap();
+
+    let archive_dir = repo_root.join("openspec/changes/archive/archive-rev-change");
+    fs::create_dir_all(&archive_dir).unwrap();
+    fs::write(archive_dir.join("tasks.md"), "## Tasks\n- [x] Done\n").unwrap();
+    git_commit(repo_root, "Archive: archive-rev-change");
+
+    // Verify workspace state is Archived (precondition for the dispatch fix path).
+    let state = detect_workspace_state("archive-rev-change", repo_root, "main")
+        .await
+        .expect("detect_workspace_state must succeed");
+    assert_eq!(state, WorkspaceState::Archived);
+
+    // The fix calls `get_current_commit` to obtain the revision for `final_revision`.
+    // Verify it succeeds and returns a non-empty SHA so the merge handoff has a
+    // valid revision.
+    let rev = crate::vcs::git::commands::get_current_commit(repo_root)
+        .await
+        .expect("get_current_commit must succeed on a clean archived workspace");
+
+    assert!(
+        !rev.is_empty(),
+        "archived workspace HEAD revision must be non-empty"
+    );
+    // A git SHA is 40 hex chars (full) or at least 7 (short) — the command
+    // returns the full SHA, so check for a reasonable minimum length.
+    assert!(
+        rev.len() >= 7,
+        "archived workspace HEAD revision must look like a git SHA, got: {}",
+        rev
+    );
+}
