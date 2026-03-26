@@ -124,6 +124,13 @@ However, for `ResolveWait`/`MergeWait` rows, the following SHALL be satisfied:
 
 The TUI MUST display `ResolveWait` as `resolve pending` to clearly indicate it is not a target for queue operations.
 
+In parallel mode, once the user explicitly queues a `NotQueued` change for execution (for example via `F5` after marking it), refresh-derived state reconciliation MUST preserve the queued display state until one of the following occurs:
+- execution for that change actually starts,
+- the backend explicitly rejects startup for that change, or
+- the user explicitly dequeues the change.
+
+Auto-refresh, reducer display synchronization, and eligibility reconciliation MUST NOT regress such a queued row back to `not queued` before backend analysis/dispatch begins.
+
 #### Scenario: Remove from queue with Space key
 - **WHEN** the user dequeues a [x] change with the Space key in Running mode
 - **THEN** the status changes to `QueueStatus::NotQueued` and is removed from DynamicQueue
@@ -147,6 +154,21 @@ The TUI MUST display `ResolveWait` as `resolve pending` to clearly indicate it i
 - **THEN** the change status SHALL remain `MergeWait`
 - **AND** DynamicQueue SHALL NOT be modified for the change
 - **AND** Space operation toggles only the execution mark
+
+#### Scenario: Queued row is preserved before analysis starts
+- **GIVEN** the TUI is in parallel mode
+- **AND** a change is marked for execution from `NotQueued`
+- **AND** the user presses `F5`
+- **WHEN** the initial refresh-driven reducer display synchronization runs before backend analysis starts
+- **THEN** the change status SHALL remain `Queued`
+- **AND** the row SHALL NOT return to `not queued`
+
+#### Scenario: Startup rejection can clear queued row before execution
+- **GIVEN** the TUI is in parallel mode
+- **AND** a change was explicitly queued by the user
+- **WHEN** backend startup rejects that change before execution begins
+- **THEN** the change status MAY return to `NotQueued`
+- **AND** the rejection reason SHALL be logged
 
 ### Requirement: Event-Driven State Updates
 
