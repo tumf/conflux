@@ -175,6 +175,20 @@ If apply determines the change is currently impossible to implement (for example
 
 **CRITICAL**: Output exactly ONE verdict at the end.
 
+### Spec-Only Change Detection
+
+Before running checks, read `proposal.md` and detect the `Change Type` field:
+- If `Change Type: spec-only` → apply **Spec-Only Acceptance** path (checks 4–7 are replaced)
+- Otherwise → apply the standard implementation acceptance path
+
+**Spec-Only Acceptance** (replaces checks 4–7 for spec-only changes):
+- **Archive simulation**: For each spec delta in `openspec/changes/<id>/specs/<capability>/spec.md`, simulate whether archiving would produce a net change to `openspec/specs/<capability>/spec.md`.
+  - FAIL if delta would be a no-op (e.g., MODIFIED target not found in canonical spec, or delta is empty).
+  - FAIL if delta contains only `MODIFIED`/`REMOVED` sections and the canonical target is missing.
+- **Spec tasks**: All `## Specification Tasks` entries must be `[x]` or in Future Work. Absence of runtime code is NOT a failure.
+- **No runtime evidence required**: Do NOT fail because source files, tests, or CLI wiring are absent. The change type is spec-only by design.
+- **Evidence citation**: cite the spec delta file path and expected canonical promotion target.
+
 ### Required Checks
 
 1. **Git Working Tree Clean**
@@ -188,31 +202,36 @@ If apply determines the change is currently impossible to implement (for example
     - All tasks marked `[x]` or in Future Work section
     - No checkboxes in excluded sections
     - Reject any task marked `[x]` without corresponding repo evidence
+    - For spec-only: `openspec/` edits ARE the implementation artifact; no runtime evidence required
 
 3. **Spec Matching**
    - Implementation matches specification in `specs/`
    - All scenarios are satisfied
 
-4. **Integration Check**
+4. **Integration Check** *(skip for spec-only)*
     - Feature is executed in real flow
     - Called from CLI/TUI/API as specified
 
-5. **Dead Code Check**
+5. **Dead Code Check** *(skip for spec-only)*
    - All implemented code is invoked
    - No orphan functions/classes
 
-6. **Regression Check**
+6. **No Stubbed Runtime Check** *(skip for spec-only)*
+   - Real execution path must not use mock/stub/fake/placeholder
+
+7. **Regression Check**
    - Existing features still work
    - No unintended side effects
 
-7. **Evidence Citation**
+8. **Evidence Citation**
     - Cite file path + function/method for integration
-    - Provide concrete verification evidence
+    - For spec-only: cite spec delta path + canonical promotion target
 
-8. **Checklist Truthfulness Check**
+9. **Checklist Truthfulness Check**
    - FAIL if `tasks.md` claims completion but the corresponding code/tests/entrypoints do not exist
    - FAIL if a change was archived/spec-promoted while implementation tasks were marked complete without repository evidence
-   - FAIL if the only evidence for an implementation task is `openspec/` edits
+   - FAIL if the only evidence for an *implementation* task is `openspec/` edits
+   - Exception: for `spec-only` changes, `openspec/` spec delta edits ARE the expected artifact
 
 ### Output Format
 

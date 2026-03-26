@@ -288,6 +288,20 @@ class OpenSpecManager:
 
         return len(errors) == 0, errors, warnings
 
+    VALID_CHANGE_TYPES = {"spec-only", "implementation", "hybrid"}
+
+    def _extract_change_type(self, proposal_content: str) -> Optional[str]:
+        """Extract Change Type value from proposal.md content."""
+        match = re.search(
+            r"^\*\*Change Type\*\*\s*:\s*(.+)$|^Change Type\s*:\s*(.+)$",
+            proposal_content,
+            re.MULTILINE | re.IGNORECASE,
+        )
+        if match:
+            value = (match.group(1) or match.group(2)).strip().strip("`").lower()
+            return value
+        return None
+
     def _validate_change_dir(
         self, change_dir: Path, strict: bool, evidence_mode: EvidenceMode
     ) -> Tuple[List[str], List[str]]:
@@ -312,6 +326,20 @@ class OpenSpecManager:
             if not re.search(r"^#\s+.+$", content, re.MULTILINE):
                 errors.append(f"{change_id}: proposal.md missing title heading")
 
+            # Validate Change Type field
+            change_type = self._extract_change_type(content)
+            if strict:
+                if change_type is None:
+                    errors.append(
+                        f"{change_id}: proposal.md missing 'Change Type' field "
+                        f"(must be one of: {', '.join(sorted(self.VALID_CHANGE_TYPES))})"
+                    )
+                elif change_type not in self.VALID_CHANGE_TYPES:
+                    errors.append(
+                        f"{change_id}: proposal.md has invalid Change Type '{change_type}' "
+                        f"(must be one of: {', '.join(sorted(self.VALID_CHANGE_TYPES))})"
+                    )
+
         # Validate tasks format
         if tasks_file.exists():
             task_errors, task_warnings = self._validate_tasks_file(
@@ -329,6 +357,14 @@ class OpenSpecManager:
             if specs_dir.exists() and specs_dir.is_dir():
                 spec_errors = self._validate_specs_dir(specs_dir, change_id)
                 errors.extend(spec_errors)
+
+                # Archive-risk warning for spec-only proposals with only MODIFIED/REMOVED deltas
+                if proposal_file.exists():
+                    proposal_content = proposal_file.read_text(encoding="utf-8")
+                    detected_type = self._extract_change_type(proposal_content)
+                    if detected_type == "spec-only":
+                        risk_warnings = self._check_archive_risk(specs_dir, change_id)
+                        warnings.extend(risk_warnings)
             elif strict:
                 errors.append(f"{change_id}: No spec deltas found (required in strict mode)")
 
@@ -468,6 +504,33 @@ class OpenSpecManager:
                 )
 
         return errors
+
+    def _check_archive_risk(self, specs_dir: Path, change_id: str) -> List[str]:
+        """Emit archive-risk warnings for spec-only proposals with only MODIFIED/REMOVED deltas."""
+        warnings = []
+        has_added = False
+        has_risky = False
+
+        for spec_dir in specs_dir.iterdir():
+            if not spec_dir.is_dir():
+                continue
+            spec_file = spec_dir / "spec.md"
+            if not spec_file.exists():
+                continue
+            content = spec_file.read_text(encoding="utf-8")
+            if "## ADDED Requirements" in content:
+                has_added = True
+            if "## MODIFIED Requirements" in content or "## REMOVED Requirements" in content:
+                has_risky = True
+
+        if has_risky and not has_added:
+            warnings.append(
+                f"{change_id}: ARCHIVE-RISK WARNING — spec-only proposal relies solely on "
+                "MODIFIED/REMOVED deltas. These require successful canonical promotion rather "
+                "than simple append behavior. Verify canonical promotion behavior before acceptance."
+            )
+
+        return warnings
 
     def archive_change(self, change_id: str, skip_specs: bool = False) -> Tuple[bool, str]:
         """Archive a deployed change."""
