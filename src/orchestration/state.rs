@@ -818,7 +818,11 @@ impl OrchestratorState {
             }
 
             // Merge / resolve events (parallel mode)
-            ExecutionEvent::MergeDeferred { change_id, auto_resumable, .. } => {
+            ExecutionEvent::MergeDeferred {
+                change_id,
+                auto_resumable,
+                ..
+            } => {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.is_active() {
                     if *auto_resumable {

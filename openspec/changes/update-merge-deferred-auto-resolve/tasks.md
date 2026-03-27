@@ -8,3 +8,7 @@
 ## Future Work
 
 - 実運用で `MergeDeferred` 理由分類のログ粒度が不足する場合は observability 改善を別提案で行う
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Commit or revert the 4 uncommitted cosmetic formatting changes so the working tree is clean: `src/events.rs`, `src/orchestration/state.rs`, `src/parallel/queue_state.rs`, `src/tui/state.rs` (run `cargo fmt && git add -u && git commit` or `git checkout -- <files>`)

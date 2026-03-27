@@ -314,12 +314,12 @@ impl ParallelExecutor {
             let change_ids = vec![change_id.clone()];
             let archive_paths = vec![workspace_info.path.clone()];
 
-            match self.attempt_merge(&revisions, &change_ids, &archive_paths).await {
+            match self
+                .attempt_merge(&revisions, &change_ids, &archive_paths)
+                .await
+            {
                 Ok(super::merge::MergeAttempt::Merged) => {
-                    info!(
-                        "Deferred merge succeeded for '{}' on retry",
-                        change_id
-                    );
+                    info!("Deferred merge succeeded for '{}' on retry", change_id);
                     self.merge_deferred_changes.remove(&change_id);
 
                     // Run on_merged hook.
@@ -332,10 +332,7 @@ impl ParallelExecutor {
                                     .map(|c| (c.completed_tasks, c.total_tasks))
                                     .unwrap_or((0, 0)),
                                 Err(e) => {
-                                    warn!(
-                                        "Failed to fetch task counts for on_merged hook: {}",
-                                        e
-                                    );
+                                    warn!("Failed to fetch task counts for on_merged hook: {}", e);
                                     (0, 0)
                                 }
                             };
@@ -400,10 +397,7 @@ impl ParallelExecutor {
                     .await;
                 }
                 Err(e) => {
-                    error!(
-                        "Deferred merge retry error for '{}': {}",
-                        change_id, e
-                    );
+                    error!("Deferred merge retry error for '{}': {}", change_id, e);
                     // Keep in deferred set; another merge/resolve completion will trigger again.
                 }
             }

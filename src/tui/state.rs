@@ -1394,9 +1394,11 @@ impl AppState {
             OrchestratorEvent::ResolveFailed { change_id, error } => {
                 self.handle_resolve_failed(change_id, error)
             }
-            OrchestratorEvent::MergeDeferred { change_id, reason, auto_resumable } => {
-                self.handle_merge_deferred(change_id, reason, auto_resumable)
-            }
+            OrchestratorEvent::MergeDeferred {
+                change_id,
+                reason,
+                auto_resumable,
+            } => self.handle_merge_deferred(change_id, reason, auto_resumable),
             OrchestratorEvent::AcceptanceStarted { change_id, command } => {
                 self.handle_acceptance_started(change_id, command)
             }

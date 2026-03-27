@@ -304,7 +304,11 @@ pub enum ExecutionEvent {
     /// (base dirty, merge in progress) that will resolve automatically once a preceding
     /// merge or resolve completes.  `false` means manual intervention is required.
     #[allow(dead_code)]
-    MergeDeferred { change_id: String, reason: String, auto_resumable: bool },
+    MergeDeferred {
+        change_id: String,
+        reason: String,
+        auto_resumable: bool,
+    },
     /// Merge resolution started for a change
     ResolveStarted { change_id: String, command: String },
     /// Merge resolution completed for a change
