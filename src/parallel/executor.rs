@@ -348,7 +348,7 @@ pub async fn execute_archive_in_workspace(
         let history = archive_history.lock().await;
         history.format_context(change_id)
     };
-    let full_prompt = crate::agent::build_archive_prompt(user_prompt, &history_context);
+    let full_prompt = crate::agent::build_archive_prompt(change_id, user_prompt, &history_context);
 
     // Expand change_id and prompt in archive command
     let command = OrchestratorConfig::expand_change_id(archive_cmd_template, change_id);

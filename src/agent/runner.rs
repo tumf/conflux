@@ -145,7 +145,8 @@ impl AgentRunner {
         let history_context = self.apply_history.format_context(change_id);
 
         // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
-        let full_prompt = build_apply_prompt(user_prompt, &history_context, &acceptance_tail);
+        let full_prompt =
+            build_apply_prompt(change_id, user_prompt, &history_context, &acceptance_tail);
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
@@ -203,7 +204,8 @@ impl AgentRunner {
         let history_context = self.apply_history.format_context(change_id);
 
         // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
-        let full_prompt = build_apply_prompt(user_prompt, &history_context, &acceptance_tail);
+        let full_prompt =
+            build_apply_prompt(change_id, user_prompt, &history_context, &acceptance_tail);
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
@@ -274,7 +276,7 @@ impl AgentRunner {
         let history_context = self.archive_history.format_context(change_id);
 
         // Build full prompt: user_prompt + history_context
-        let full_prompt = build_archive_prompt(user_prompt, &history_context);
+        let full_prompt = build_archive_prompt(change_id, user_prompt, &history_context);
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
@@ -328,7 +330,7 @@ impl AgentRunner {
         let history_context = self.archive_history.format_context(change_id);
 
         // Build full prompt: user_prompt + history_context
-        let full_prompt = build_archive_prompt(user_prompt, &history_context);
+        let full_prompt = build_archive_prompt(change_id, user_prompt, &history_context);
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
@@ -380,7 +382,8 @@ impl AgentRunner {
         let history_context = self.apply_history.format_context(change_id);
 
         // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
-        let full_prompt = build_apply_prompt(user_prompt, &history_context, &acceptance_tail);
+        let full_prompt =
+            build_apply_prompt(change_id, user_prompt, &history_context, &acceptance_tail);
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
@@ -428,7 +431,8 @@ impl AgentRunner {
         let history_context = self.apply_history.format_context(change_id);
 
         // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
-        let full_prompt = build_apply_prompt(user_prompt, &history_context, &acceptance_tail);
+        let full_prompt =
+            build_apply_prompt(change_id, user_prompt, &history_context, &acceptance_tail);
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
@@ -904,7 +908,7 @@ impl AgentRunner {
         let history_context = self.archive_history.format_context(change_id);
 
         // Build full prompt: user_prompt + history_context
-        let full_prompt = build_archive_prompt(user_prompt, &history_context);
+        let full_prompt = build_archive_prompt(change_id, user_prompt, &history_context);
 
         let command = OrchestratorConfig::expand_change_id(template, change_id);
         let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);

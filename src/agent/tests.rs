@@ -213,7 +213,7 @@ fn test_build_apply_prompt_with_all_parts() {
     let user_prompt = "Focus on implementation.";
     let history_context = "Previous attempt failed.";
     let acceptance_tail = "";
-    let result = build_apply_prompt(user_prompt, history_context, acceptance_tail);
+    let result = build_apply_prompt("my-change", user_prompt, history_context, acceptance_tail);
 
     assert!(result.contains("Focus on implementation."));
     assert!(result.contains("Previous attempt failed."));
@@ -224,7 +224,7 @@ fn test_build_apply_prompt_with_empty_user_prompt() {
     let user_prompt = "";
     let history_context = "Previous attempt failed.";
     let acceptance_tail = "";
-    let result = build_apply_prompt(user_prompt, history_context, acceptance_tail);
+    let result = build_apply_prompt("my-change", user_prompt, history_context, acceptance_tail);
 
     assert!(result.contains("Previous attempt failed."));
 }
@@ -234,7 +234,7 @@ fn test_build_apply_prompt_with_empty_history() {
     let user_prompt = "Focus on implementation.";
     let history_context = "";
     let acceptance_tail = "";
-    let result = build_apply_prompt(user_prompt, history_context, acceptance_tail);
+    let result = build_apply_prompt("my-change", user_prompt, history_context, acceptance_tail);
 
     assert!(result.contains("Focus on implementation."));
 }
@@ -244,9 +244,11 @@ fn test_build_apply_prompt_with_only_system_prompt() {
     let user_prompt = "";
     let history_context = "";
     let acceptance_tail = "";
-    let result = build_apply_prompt(user_prompt, history_context, acceptance_tail);
+    let result = build_apply_prompt("my-change", user_prompt, history_context, acceptance_tail);
 
-    assert_eq!(result, APPLY_SYSTEM_PROMPT);
+    assert!(result.contains("load skills: cflx-workflow"));
+    assert!(result.contains("Apply change id: my-change"));
+    assert!(result.contains(APPLY_SYSTEM_PROMPT));
 }
 
 #[test]
@@ -255,7 +257,7 @@ fn test_build_apply_prompt_with_acceptance_tail() {
     let history_context = "<last_apply attempt=\"1\">\nstatus: failed\n</last_apply>";
     let acceptance_tail =
         "<last_acceptance_output>\nTest failure detected\n</last_acceptance_output>";
-    let result = build_apply_prompt(user_prompt, history_context, acceptance_tail);
+    let result = build_apply_prompt("my-change", user_prompt, history_context, acceptance_tail);
 
     // Check all parts are present
     assert!(result.contains("Focus on implementation."));
@@ -308,8 +310,10 @@ fn test_apply_system_prompt_content() {
 fn test_build_archive_prompt_with_all_parts() {
     let user_prompt = "Please archive this change";
     let history_context = "<last_archive attempt=\"1\">\nstatus: failed\n</last_archive>";
-    let result = build_archive_prompt(user_prompt, history_context);
+    let result = build_archive_prompt("my-change", user_prompt, history_context);
 
+    assert!(result.contains("load skills: cflx-workflow"));
+    assert!(result.contains("Archive change id: my-change"));
     assert!(result.contains("Please archive this change"));
     assert!(result.contains("<last_archive attempt=\"1\">"));
     assert!(result.contains("status: failed"));
@@ -319,7 +323,7 @@ fn test_build_archive_prompt_with_all_parts() {
 fn test_build_archive_prompt_with_empty_user_prompt() {
     let user_prompt = "";
     let history_context = "<last_archive attempt=\"1\">\nstatus: failed\n</last_archive>";
-    let result = build_archive_prompt(user_prompt, history_context);
+    let result = build_archive_prompt("my-change", user_prompt, history_context);
 
     // Should only contain history
     assert!(result.contains("<last_archive attempt=\"1\">"));
@@ -330,18 +334,19 @@ fn test_build_archive_prompt_with_empty_user_prompt() {
 fn test_build_archive_prompt_with_empty_history() {
     let user_prompt = "Please archive this change";
     let history_context = "";
-    let result = build_archive_prompt(user_prompt, history_context);
+    let result = build_archive_prompt("my-change", user_prompt, history_context);
 
-    // Should only contain user prompt
-    assert_eq!(result, "Please archive this change");
+    assert!(result.contains("load skills: cflx-workflow"));
+    assert!(result.contains("Archive change id: my-change"));
+    assert!(result.contains("Please archive this change"));
 }
 
 #[test]
 fn test_build_archive_prompt_both_empty() {
     let user_prompt = "";
     let history_context = "";
-    let result = build_archive_prompt(user_prompt, history_context);
+    let result = build_archive_prompt("my-change", user_prompt, history_context);
 
-    // Should be empty
-    assert!(result.is_empty());
+    assert!(result.contains("load skills: cflx-workflow"));
+    assert!(result.contains("Archive change id: my-change"));
 }

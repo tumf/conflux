@@ -4,11 +4,12 @@
 /// Kept only for compatibility in tests; actual prompt is sourced from OpenCode command files.
 pub const APPLY_SYSTEM_PROMPT: &str = "";
 
-/// Build apply prompt from user prompt, history context, and acceptance tail
-/// Format: user_prompt + APPLY_SYSTEM_PROMPT + acceptance_tail_context + history_context
+/// Build apply prompt from change metadata, user prompt, history context, and acceptance tail
+/// Format: fixed prelude + user_prompt + APPLY_SYSTEM_PROMPT + acceptance_tail_context + history_context
 ///
 /// # Arguments
 ///
+/// * `change_id` - Change identifier
 /// * `user_prompt` - User-customizable apply prompt
 /// * `history_context` - Previous apply attempts context
 /// * `acceptance_tail_context` - Acceptance output tail context (optional)
@@ -18,20 +19,22 @@ pub const APPLY_SYSTEM_PROMPT: &str = "";
 /// The acceptance_tail_context should be built using `build_last_acceptance_output_context`
 /// and should only be provided for the first apply attempt after acceptance failure.
 pub fn build_apply_prompt(
+    change_id: &str,
     user_prompt: &str,
     history_context: &str,
     acceptance_tail_context: &str,
 ) -> String {
     let mut parts = Vec::new();
 
+    parts.push("load skills: cflx-workflow".to_string());
+    parts.push(format!("Apply change id: {}", change_id));
+
     if !user_prompt.is_empty() {
         parts.push(user_prompt.to_string());
     }
 
-    // System prompt is always included
     parts.push(APPLY_SYSTEM_PROMPT.to_string());
 
-    // Acceptance tail context (if acceptance failed and this is the first apply retry)
     if !acceptance_tail_context.is_empty() {
         parts.push(acceptance_tail_context.to_string());
     }
@@ -43,10 +46,13 @@ pub fn build_apply_prompt(
     parts.join("\n\n")
 }
 
-/// Build archive prompt from user prompt and history context
-/// Format: user_prompt + history_context
-pub fn build_archive_prompt(user_prompt: &str, history_context: &str) -> String {
+/// Build archive prompt from change metadata, user prompt, and history context
+/// Format: fixed prelude + user_prompt + history_context
+pub fn build_archive_prompt(change_id: &str, user_prompt: &str, history_context: &str) -> String {
     let mut parts = Vec::new();
+
+    parts.push("load skills: cflx-workflow".to_string());
+    parts.push(format!("Archive change id: {}", change_id));
 
     if !user_prompt.is_empty() {
         parts.push(user_prompt.to_string());
@@ -99,6 +105,9 @@ pub fn build_acceptance_prompt_context_only(
     diff_context: &str,
 ) -> String {
     let mut parts = Vec::new();
+
+    parts.push("load skills: cflx-workflow".to_string());
+    parts.push(format!("Acceptance id:{}", change_id));
 
     // Change metadata first so downstream templates can reference it.
     parts.push(format!("change_id: {}", change_id));
@@ -297,6 +306,12 @@ mod tests {
         );
 
         // Find positions of each marker
+        let skill_pos = result
+            .find("load skills: cflx-workflow")
+            .expect("Skill prelude should be present");
+        let acceptance_id_pos = result
+            .find("Acceptance id:test-change")
+            .expect("Acceptance id prelude should be present");
         let metadata_pos = result
             .find("change_id: test-change")
             .expect("Change metadata should be present");
@@ -313,7 +328,15 @@ mod tests {
             .find("HISTORY_CONTEXT_MARKER")
             .expect("History context should be present");
 
-        // Verify order: metadata < diff < last_output < user < history
+        // Verify order: prelude < metadata < diff < last_output < user < history
+        assert!(
+            skill_pos < acceptance_id_pos,
+            "Skill prelude should come before acceptance id"
+        );
+        assert!(
+            acceptance_id_pos < metadata_pos,
+            "Acceptance id should come before change metadata"
+        );
         assert!(
             metadata_pos < diff_pos,
             "Change metadata should come before diff context"
@@ -349,7 +372,9 @@ mod tests {
             diff_context,
         );
 
-        // Should contain change metadata and user prompt
+        // Should contain prelude, change metadata and user prompt
+        assert!(result.contains("load skills: cflx-workflow"));
+        assert!(result.contains("Acceptance id:test-change"));
         assert!(result.contains("change_id: test-change"));
         assert!(result.contains("proposal_path: openspec/changes/test-change/proposal.md"));
         assert!(result.contains("USER_PROMPT"));

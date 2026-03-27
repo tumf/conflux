@@ -237,7 +237,12 @@ Before running checks, read `proposal.md` and detect the `Change Type` field:
 
 Output exactly ONE verdict marker at the end.
 
-**CRITICAL formatting rule**: The marker line (e.g. `ACCEPTANCE: PASS`) MUST be on its own line with NOTHING else on that line — no trailing text, no inline explanation. The orchestrator parses this marker by line; any text appended to the same line (e.g. `ACCEPTANCE: PASSAll criteria verified`) will break detection.
+**CRITICAL final output rule**:
+- Do not use markdown code fences in final verdict output.
+- The verdict marker line (e.g. `ACCEPTANCE: PASS`) MUST be on its own line with NOTHING else on that line.
+- If the result is PASS, output exactly `ACCEPTANCE: PASS` on its own line.
+- If the result is CONTINUE, output exactly `ACCEPTANCE: CONTINUE` on its own line.
+- Any trailing/inline text on the marker line (e.g. `ACCEPTANCE: PASSAll criteria verified`) is invalid and breaks orchestrator detection.
 
 **PASS**:
 ```
