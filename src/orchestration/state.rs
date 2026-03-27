@@ -818,10 +818,25 @@ impl OrchestratorState {
             }
 
             // Merge / resolve events (parallel mode)
-            ExecutionEvent::MergeDeferred { change_id, .. } => {
+            ExecutionEvent::MergeDeferred {
+                change_id,
+                auto_resumable,
+                ..
+            } => {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.is_active() {
-                    rt.wait_state = WaitState::MergeWait;
+                    if *auto_resumable {
+                        // Auto-resumable: will be retried after a preceding merge/resolve
+                        // completes. Use ResolveWait so workspace-refresh reconciliation
+                        // does not regress it back to MergeWait.
+                        rt.wait_state = WaitState::ResolveWait;
+                        if !self.resolve_wait_queue.contains(change_id) {
+                            self.resolve_wait_queue.push(change_id.clone());
+                        }
+                    } else {
+                        // Manual intervention required.
+                        rt.wait_state = WaitState::MergeWait;
+                    }
                 }
             }
             ExecutionEvent::MergeCompleted { change_id, .. } => {
@@ -1422,10 +1437,11 @@ mod tests {
 
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
-        // MergeDeferred → MergeWait
+        // MergeDeferred (manual, not auto-resumable) → MergeWait
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "c".to_string(),
             reason: "base dirty".to_string(),
+            auto_resumable: false,
         });
         assert_eq!(state.display_status("c"), "merge wait");
 
@@ -1473,10 +1489,11 @@ mod tests {
 
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
-        // Step 1: change reaches MergeWait (base dirty, parallel archive path).
+        // Step 1: change reaches MergeWait via manual-intervention deferral.
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "c".to_string(),
             reason: "base dirty".to_string(),
+            auto_resumable: false,
         });
         assert_eq!(state.display_status("c"), "merge wait");
 
@@ -1523,10 +1540,11 @@ mod tests {
 
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
-        // Reach ResolveWait via the same path.
+        // Reach MergeWait via manual-intervention deferral, then promote to ResolveWait.
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "c".to_string(),
             reason: "base dirty".to_string(),
+            auto_resumable: false,
         });
         state.apply_command(ReducerCommand::ResolveMerge("c".to_string()));
         state.apply_execution_event(&ExecutionEvent::ResolveStarted {
@@ -1804,12 +1822,13 @@ mod tests {
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
         assert_eq!(state.display_status("c"), "merge wait");
 
-        // Merge deferred (base dirty)
+        // Merge deferred (manual, not auto-resumable)
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "c".to_string(),
             reason: "base dirty".to_string(),
+            auto_resumable: false,
         });
-        // Still in merge wait (MergeDeferred sets MergeWait, but already there)
+        // Manual deferral: stays in merge wait.
         assert_eq!(state.display_status("c"), "merge wait");
 
         // Eventually merge succeeds
@@ -1848,6 +1867,93 @@ mod tests {
             command: "cmd".to_string(),
         });
         assert_eq!(state.display_status("c"), "merged");
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: auto-resumable MergeDeferred must not stay in MergeWait
+    // -----------------------------------------------------------------------
+
+    /// `MergeDeferred(auto_resumable=true)` must set ResolveWait, not MergeWait.
+    /// This prevents the "stuck after prior merge" scenario where a change
+    /// appears to need manual M-press even though it can be resolved automatically.
+    #[test]
+    fn test_auto_resumable_merge_deferred_sets_resolve_wait() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["b".to_string()], 0);
+
+        // change-b gets a MergeDeferred that is auto-resumable (dirty base caused by
+        // change-a's merge being in progress).
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "b".to_string(),
+            reason: "Merge in progress (MERGE_HEAD exists)".to_string(),
+            auto_resumable: true,
+        });
+
+        // Must NOT land in merge wait (which would require manual M press).
+        assert_eq!(
+            state.display_status("b"),
+            "resolve pending",
+            "auto-resumable deferred change must enter ResolveWait, not MergeWait"
+        );
+    }
+
+    /// Workspace refresh after auto-resumable deferral must not regress to MergeWait.
+    #[test]
+    fn test_auto_resumable_deferred_survives_workspace_refresh() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["b".to_string()], 0);
+
+        // Auto-resumable deferral → ResolveWait.
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "b".to_string(),
+            reason: "Working tree has uncommitted changes".to_string(),
+            auto_resumable: true,
+        });
+        assert_eq!(state.display_status("b"), "resolve pending");
+
+        // Subsequent ChangesRefreshed sees the workspace as archived (still waiting).
+        // It must NOT regress the auto-resolve intent back to merge wait.
+        state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+            changes: vec![],
+            committed_change_ids: Default::default(),
+            uncommitted_file_change_ids: Default::default(),
+            worktree_change_ids: Default::default(),
+            worktree_paths: Default::default(),
+            worktree_not_ahead_ids: Default::default(),
+            merge_wait_ids: ["b".to_string()].into_iter().collect(),
+        });
+
+        assert_eq!(
+            state.display_status("b"),
+            "resolve pending",
+            "workspace refresh must not regress auto-resumable deferred change to merge wait"
+        );
+    }
+
+    /// After auto-resumable deferral, MergeCompleted (from retry) drives change to Merged.
+    #[test]
+    fn test_auto_resumable_deferred_then_merge_completed() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["b".to_string()], 0);
+
+        // Auto-resumable deferral.
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "b".to_string(),
+            reason: "Merge in progress (MERGE_HEAD exists)".to_string(),
+            auto_resumable: true,
+        });
+        assert_eq!(state.display_status("b"), "resolve pending");
+
+        // Scheduler retries and merge succeeds.
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "b".to_string(),
+            revision: "abc123".to_string(),
+        });
+        assert_eq!(state.display_status("b"), "merged");
+        assert!(state.is_terminal_change("b"));
     }
 
     // -----------------------------------------------------------------------

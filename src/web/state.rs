@@ -603,13 +603,14 @@ impl WebState {
                 ExecutionEvent::MergeDeferred {
                     change_id,
                     reason: _,
+                    auto_resumable,
                 } => {
                     // Read is_resolving before mutable borrow
                     let is_resolving = state.is_resolving;
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        // If resolve is running, transition to resolve pending
-                        // Otherwise, maintain merge wait
-                        change.queue_status = if is_resolving {
+                        // If resolve is running, or the deferral is auto-resumable,
+                        // transition to resolve pending; otherwise maintain merge wait.
+                        change.queue_status = if is_resolving || *auto_resumable {
                             Some("resolve pending".to_string())
                         } else {
                             Some("merge wait".to_string())
@@ -1556,6 +1557,7 @@ mod tests {
             .apply_execution_event(&ExecutionEvent::MergeDeferred {
                 change_id: "change-a".to_string(),
                 reason: "test reason".to_string(),
+                auto_resumable: true,
             })
             .await;
 
@@ -1573,11 +1575,12 @@ mod tests {
         let changes = vec![create_test_change("change-a", 5, 10)];
         let web_state = WebState::new(&changes);
 
-        // Send MergeDeferred event without starting resolve
+        // Send MergeDeferred event without starting resolve (manual intervention required)
         web_state
             .apply_execution_event(&ExecutionEvent::MergeDeferred {
                 change_id: "change-a".to_string(),
                 reason: "test reason".to_string(),
+                auto_resumable: false,
             })
             .await;
 
@@ -1586,7 +1589,7 @@ mod tests {
         assert_eq!(
             state.changes[0].queue_status,
             Some("merge wait".to_string()),
-            "queue_status should be 'merge wait' when resolve is not running"
+            "queue_status should be 'merge wait' when resolve is not running and not auto-resumable"
         );
         assert!(!state.is_resolving, "is_resolving should be false");
     }

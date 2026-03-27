@@ -174,6 +174,10 @@ impl ParallelExecutor {
                         )
                         .await;
                     }
+
+                    // A merge just completed: auto-resumable deferred changes may now be
+                    // unblocked (the base was dirty because this merge was in progress).
+                    self.retry_deferred_merges().await;
                 }
                 Ok(MergeAttempt::Deferred(reason)) => {
                     // Merge deferred, preserve workspace and transition to MergeWait
@@ -194,6 +198,9 @@ impl ParallelExecutor {
                         ParallelEvent::MergeDeferred {
                             change_id: workspace_result.change_id.clone(),
                             reason,
+                            // All current deferral reasons (dirty base, archive incomplete)
+                            // are temporary and can be resolved automatically.
+                            auto_resumable: true,
                         },
                     )
                     .await;
@@ -374,6 +381,10 @@ impl ParallelExecutor {
                     },
                 )
                 .await;
+
+                // A resolve just completed: auto-resumable deferred changes may now be
+                // unblocked (the base was dirty because this resolve was in progress).
+                self.retry_deferred_merges().await;
 
                 Ok(())
             }

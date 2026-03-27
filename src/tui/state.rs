@@ -1394,9 +1394,11 @@ impl AppState {
             OrchestratorEvent::ResolveFailed { change_id, error } => {
                 self.handle_resolve_failed(change_id, error)
             }
-            OrchestratorEvent::MergeDeferred { change_id, reason } => {
-                self.handle_merge_deferred(change_id, reason)
-            }
+            OrchestratorEvent::MergeDeferred {
+                change_id,
+                reason,
+                auto_resumable,
+            } => self.handle_merge_deferred(change_id, reason, auto_resumable),
             OrchestratorEvent::AcceptanceStarted { change_id, command } => {
                 self.handle_acceptance_started(change_id, command)
             }
@@ -1904,7 +1906,7 @@ impl AppState {
         self.add_log(LogEntry::error(message));
     }
 
-    fn handle_merge_deferred(&mut self, change_id: String, reason: String) {
+    fn handle_merge_deferred(&mut self, change_id: String, reason: String, auto_resumable: bool) {
         if self.is_resolving {
             // Check if this is the currently resolving change
             let is_current_resolving = self
@@ -1935,8 +1937,19 @@ impl AppState {
                     )));
                 }
             }
+        } else if auto_resumable {
+            // Resolve is not running but deferral is auto-resumable (e.g. dirty base due to
+            // another merge in progress).  Show as ResolveWait so the user can see it will
+            // be re-evaluated automatically; do NOT add to the manual resolve queue.
+            if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+                change.queue_status = QueueStatus::ResolveWait;
+            }
+            self.add_log(LogEntry::warn(format!(
+                "Merge deferred for '{}' (auto-resumable, awaiting re-evaluation): {}",
+                change_id, reason
+            )));
         } else {
-            // Resolve is not running: maintain MergeWait
+            // Resolve is not running and manual intervention is required: MergeWait.
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                 change.queue_status = QueueStatus::MergeWait;
             }
@@ -3482,6 +3495,7 @@ mod tests {
         app.handle_merge_deferred(
             "change-b".to_string(),
             "Base branch has uncommitted changes".to_string(),
+            true,
         );
 
         // change-b should transition to ResolveWait
@@ -3510,6 +3524,7 @@ mod tests {
         app.handle_merge_deferred(
             "change-a".to_string(),
             "Base branch has uncommitted changes".to_string(),
+            true,
         );
 
         // change-a should remain Resolving (not transition to ResolveWait)
@@ -3544,6 +3559,7 @@ mod tests {
         app.handle_merge_deferred(
             "change-b".to_string(),
             "Base branch has uncommitted changes".to_string(),
+            true,
         );
 
         // change-b should transition to ResolveWait
@@ -3570,22 +3586,59 @@ mod tests {
         // change-a is archived (typical state before merge deferred)
         app.changes[0].queue_status = QueueStatus::Archived;
 
-        // Simulate MergeDeferred event for change-a when not resolving
+        // Simulate MergeDeferred event for change-a when not resolving (manual intervention)
         app.handle_merge_deferred(
             "change-a".to_string(),
             "Base branch has uncommitted changes".to_string(),
+            false, // manual intervention required
         );
 
         // change-a should transition to MergeWait
         assert_eq!(
             app.changes[0].queue_status,
             QueueStatus::MergeWait,
-            "MergeDeferred when not resolving should transition to MergeWait"
+            "MergeDeferred (manual) when not resolving should transition to MergeWait"
         );
         // change-a should NOT be added to resolve queue
         assert!(
             !app.resolve_queue_set.contains("change-a"),
             "Change should not be added to resolve queue when not resolving"
+        );
+    }
+
+    // Regression: auto-resumable MergeDeferred must not appear as MergeWait in TUI.
+    // Before this fix, all MergeDeferred events that arrived when no resolve was active
+    // set the TUI status to MergeWait, making the change look "stuck" until the user
+    // manually pressed M.
+
+    #[test]
+    fn test_auto_resumable_merge_deferred_shows_resolve_wait_not_merge_wait() {
+        let changes = vec![create_test_change("change-b", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // No resolve in progress.
+        app.is_resolving = false;
+        app.changes[0].queue_status = QueueStatus::Archived;
+
+        // Auto-resumable deferral (e.g. change-a's merge was in progress when change-b tried).
+        app.handle_merge_deferred(
+            "change-b".to_string(),
+            "Merge in progress (MERGE_HEAD exists)".to_string(),
+            true, // auto_resumable
+        );
+
+        // Must show ResolveWait, NOT MergeWait.
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::ResolveWait,
+            "auto-resumable MergeDeferred must display as ResolveWait, not MergeWait"
+        );
+
+        // Must NOT be added to the manual resolve queue
+        // (the scheduler will retry automatically, no M press needed).
+        assert!(
+            !app.resolve_queue_set.contains("change-b"),
+            "auto-resumable deferred change must not enter the manual resolve queue"
         );
     }
 

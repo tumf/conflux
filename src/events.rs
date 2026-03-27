@@ -299,9 +299,16 @@ pub enum ExecutionEvent {
         #[allow(dead_code)]
         revision: String,
     },
-    /// Merge deferred due to dirty base
+    /// Merge deferred due to dirty base or incomplete archive.
+    /// `auto_resumable` is `true` when the deferral is caused by a temporary condition
+    /// (base dirty, merge in progress) that will resolve automatically once a preceding
+    /// merge or resolve completes.  `false` means manual intervention is required.
     #[allow(dead_code)]
-    MergeDeferred { change_id: String, reason: String },
+    MergeDeferred {
+        change_id: String,
+        reason: String,
+        auto_resumable: bool,
+    },
     /// Merge resolution started for a change
     ResolveStarted { change_id: String, command: String },
     /// Merge resolution completed for a change
