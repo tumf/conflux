@@ -264,6 +264,152 @@ impl ParallelExecutor {
         }
     }
 
+    /// Retry merge for all auto-resumable deferred changes.
+    ///
+    /// Called after a merge or resolve succeeds, since the previously blocking
+    /// condition (dirty base, another merge in progress) may now be resolved.
+    /// For each change in `merge_deferred_changes`:
+    /// - If merge now succeeds → send `MergeCompleted`, run hook, cleanup workspace.
+    /// - If still deferred    → send `MergeDeferred(auto_resumable=true)` again; keep in set.
+    /// - On error             → log and keep in set for the next retry opportunity.
+    pub(super) async fn retry_deferred_merges(&mut self) {
+        if self.merge_deferred_changes.is_empty() {
+            return;
+        }
+
+        let deferred: Vec<String> = self.merge_deferred_changes.iter().cloned().collect();
+
+        for change_id in deferred {
+            // Locate the preserved workspace for this change.
+            let workspace_info = match self
+                .workspace_manager
+                .find_existing_workspace(&change_id)
+                .await
+            {
+                Ok(Some(ws)) => ws,
+                Ok(None) => {
+                    warn!(
+                        "No workspace found for deferred change '{}', skipping retry",
+                        change_id
+                    );
+                    // Remove from deferred set; the workspace is gone, nothing to retry.
+                    self.merge_deferred_changes.remove(&change_id);
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to find workspace for deferred change '{}': {}",
+                        change_id, e
+                    );
+                    continue;
+                }
+            };
+
+            info!(
+                "Retrying deferred merge for '{}' (workspace: {})",
+                change_id, workspace_info.workspace_name
+            );
+
+            let revisions = vec![workspace_info.workspace_name.clone()];
+            let change_ids = vec![change_id.clone()];
+            let archive_paths = vec![workspace_info.path.clone()];
+
+            match self.attempt_merge(&revisions, &change_ids, &archive_paths).await {
+                Ok(super::merge::MergeAttempt::Merged) => {
+                    info!(
+                        "Deferred merge succeeded for '{}' on retry",
+                        change_id
+                    );
+                    self.merge_deferred_changes.remove(&change_id);
+
+                    // Run on_merged hook.
+                    if let Some(ref hooks) = self.hooks {
+                        let (completed_tasks, total_tasks) =
+                            match crate::openspec::list_changes_native() {
+                                Ok(changes) => changes
+                                    .iter()
+                                    .find(|c| c.id == change_id)
+                                    .map(|c| (c.completed_tasks, c.total_tasks))
+                                    .unwrap_or((0, 0)),
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to fetch task counts for on_merged hook: {}",
+                                        e
+                                    );
+                                    (0, 0)
+                                }
+                            };
+                        let ws_path = workspace_info.path.to_string_lossy().to_string();
+                        let hook_ctx = crate::hooks::HookContext::new(0, 0, 0, false)
+                            .with_change(&change_id, completed_tasks, total_tasks)
+                            .with_apply_count(0)
+                            .with_parallel_context(&ws_path, None);
+                        if let Err(e) = hooks
+                            .run_hook(crate::hooks::HookType::OnMerged, &hook_ctx)
+                            .await
+                        {
+                            warn!(
+                                "on_merged hook failed for deferred retry of '{}': {}",
+                                change_id, e
+                            );
+                        }
+                    }
+
+                    // Clean up workspace.
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::CleanupStarted {
+                            workspace: workspace_info.workspace_name.clone(),
+                        },
+                    )
+                    .await;
+                    if let Err(e) = self
+                        .workspace_manager
+                        .cleanup_workspace(&workspace_info.workspace_name)
+                        .await
+                    {
+                        warn!(
+                            "Failed to cleanup workspace '{}' after deferred merge retry: {}",
+                            workspace_info.workspace_name, e
+                        );
+                    } else {
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::CleanupCompleted {
+                                workspace: workspace_info.workspace_name.clone(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+                Ok(super::merge::MergeAttempt::Deferred(reason)) => {
+                    // Still blocked; send another auto-resumable event so TUI stays in
+                    // ResolveWait rather than regressing to an unknown state.
+                    info!(
+                        "Deferred merge still blocked for '{}': {}",
+                        change_id, reason
+                    );
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::MergeDeferred {
+                            change_id: change_id.clone(),
+                            reason,
+                            auto_resumable: true,
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    error!(
+                        "Deferred merge retry error for '{}': {}",
+                        change_id, e
+                    );
+                    // Keep in deferred set; another merge/resolve completion will trigger again.
+                }
+            }
+        }
+    }
+
     /// Check dynamic queue for newly added changes and update queued list.
     ///
     /// # Arguments
