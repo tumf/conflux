@@ -11,3 +11,8 @@
 ## Future Work
 
 - server mode と通常 worktree 作成経路の完全共通化（重複処理を helper に集約）
+
+## Acceptance #5 Failure Follow-up
+
+- [ ] `src/server/api.rs` の未コミット変更を整理して git working tree を clean にする
+- [ ] clean な状態で acceptance を再実行し、前回指摘（dirty working tree）が解消されたことを確認する

@@ -717,7 +717,9 @@ pub async fn add_project(
 
     // Step 6: Execute repo-root .wt/setup in the new worktree (if present).
     // Failure is treated as add_project failure and triggers rollback.
-    if let Err(e) = crate::vcs::git::commands::run_worktree_setup(&worktree_path, &worktree_path).await {
+    if let Err(e) =
+        crate::vcs::git::commands::run_worktree_setup(&worktree_path, &worktree_path).await
+    {
         error!(
             "worktree setup failed: project_id={} worktree={:?} error={}",
             project_id, worktree_path, e
@@ -1696,7 +1698,8 @@ mod tests {
     #[tokio::test]
     async fn test_add_project_setup_failure_returns_422_and_rolls_back_registry() {
         let temp_dir = TempDir::new().unwrap();
-        let origin = create_local_git_repo_with_setup(temp_dir.path(), Some("#!/bin/sh\nexit 42\n"));
+        let origin =
+            create_local_git_repo_with_setup(temp_dir.path(), Some("#!/bin/sh\nexit 42\n"));
         let remote_url = format!("file://{}", origin.to_str().unwrap());
         let expected_project_id = crate::server::registry::generate_project_id(&remote_url, "main");
 
