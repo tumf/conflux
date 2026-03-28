@@ -15,6 +15,7 @@ interface WSMessage {
   /** Whether git/sync is available (resolve_command is configured) */
   sync_available?: boolean;
   data?: FullState;
+  /** Log entry payload (when type === 'log') */
   entry?: RemoteLogEntry;
 }
 
