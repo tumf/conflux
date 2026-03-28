@@ -1594,6 +1594,20 @@ impl AppState {
             }
         }
 
+        // If any change is still Resolving, keep Running mode so the user can
+        // continue to add changes to the queue via Space key.
+        let has_resolving = self
+            .changes
+            .iter()
+            .any(|c| c.queue_status == QueueStatus::Resolving);
+        if has_resolving {
+            info!("AllCompleted received but resolve still in progress; staying in Running mode");
+            self.add_log(LogEntry::info(
+                "All changes processed, waiting for resolve to complete",
+            ));
+            return;
+        }
+
         self.mode = AppMode::Select;
         self.current_change = None;
         self.stop_mode = StopMode::None;
@@ -1602,6 +1616,43 @@ impl AppState {
             self.orchestration_elapsed = Some(started.elapsed());
         }
         self.add_log(LogEntry::success("All changes processed successfully"));
+    }
+
+    /// Transition to `AppMode::Select` if no active changes remain.
+    ///
+    /// "Active" means any change is still in a processing queue status:
+    /// Queued, Blocked, Applying, Accepting, Archiving, Resolving, or ResolveWait.
+    ///
+    /// Called after resolve completion/failure to handle the deferred transition
+    /// that `handle_all_completed()` skipped while resolves were still in flight.
+    fn try_transition_to_select(&mut self) {
+        if !matches!(self.mode, AppMode::Running) {
+            return;
+        }
+
+        let has_active = self.changes.iter().any(|c| {
+            matches!(
+                c.queue_status,
+                QueueStatus::Queued
+                    | QueueStatus::Blocked
+                    | QueueStatus::Applying
+                    | QueueStatus::Accepting
+                    | QueueStatus::Archiving
+                    | QueueStatus::Resolving
+                    | QueueStatus::ResolveWait
+            )
+        });
+
+        if !has_active {
+            info!("No active changes remaining after resolve; transitioning to Select");
+            self.mode = AppMode::Select;
+            self.current_change = None;
+            self.stop_mode = StopMode::None;
+            if let Some(started) = self.orchestration_started_at {
+                self.orchestration_elapsed = Some(started.elapsed());
+            }
+            self.add_log(LogEntry::success("All changes processed successfully"));
+        }
     }
 
     fn handle_stopped(&mut self) {
@@ -1619,6 +1670,7 @@ impl AppState {
                 QueueStatus::Applying
                     | QueueStatus::Accepting
                     | QueueStatus::Archiving
+                    | QueueStatus::Resolving
                     | QueueStatus::Queued
                     | QueueStatus::Blocked
             ) {
@@ -1807,6 +1859,8 @@ impl AppState {
             }
             Some(TuiCommand::ResolveMerge(next_change_id))
         } else {
+            // No more resolves queued; check if we should transition to Select
+            self.try_transition_to_select();
             None
         }
     }
@@ -1912,6 +1966,9 @@ impl AppState {
             message: message.clone(),
         });
         self.add_log(LogEntry::error(message));
+
+        // Check if we should transition to Select after resolve failure
+        self.try_transition_to_select();
     }
 
     fn handle_merge_deferred(&mut self, change_id: String, reason: String, auto_resumable: bool) {
@@ -4802,6 +4859,158 @@ mod tests {
             shared.blocking_read().display_status("change-b"),
             "queued",
             "reducer must not touch change-b which was not rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Resolving mode transition tests (fix-resolving-mode-transition)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_all_completed_keeps_running_when_resolving() {
+        // When AllCompleted arrives while a change is Resolving,
+        // AppMode must remain Running so the user can add changes via Space.
+        let changes = vec![
+            create_test_change("change-a", 3, 3),
+            create_test_change("change-b", 2, 4),
+        ];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Resolving;
+
+        app.handle_all_completed();
+
+        assert_eq!(
+            app.mode,
+            AppMode::Running,
+            "Should stay Running while Resolving changes exist"
+        );
+    }
+
+    #[test]
+    fn test_resolve_completed_transitions_to_select_when_no_active() {
+        // After the last Resolving change completes and no other active changes remain,
+        // the mode should transition to Select.
+        let changes = vec![
+            create_test_change("change-a", 3, 3),
+            create_test_change("change-b", 2, 4),
+        ];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Merged; // already done
+        app.changes[1].queue_status = QueueStatus::Resolving;
+        app.is_resolving = true;
+
+        // Simulate resolve completion
+        app.handle_resolve_completed("change-b".to_string(), None);
+
+        assert_eq!(
+            app.mode,
+            AppMode::Select,
+            "Should transition to Select when no active changes remain after resolve"
+        );
+    }
+
+    #[test]
+    fn test_resolve_completed_stays_running_when_other_active() {
+        // If another change is still active (e.g. Applying), mode stays Running.
+        let changes = vec![
+            create_test_change("change-a", 1, 3),
+            create_test_change("change-b", 2, 4),
+        ];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Applying; // still active
+        app.changes[1].queue_status = QueueStatus::Resolving;
+        app.is_resolving = true;
+
+        app.handle_resolve_completed("change-b".to_string(), None);
+
+        assert_eq!(
+            app.mode,
+            AppMode::Running,
+            "Should stay Running when other active changes remain"
+        );
+    }
+
+    #[test]
+    fn test_resolve_failed_transitions_to_select_when_no_active() {
+        // After resolve failure, if no other active changes remain, transition to Select.
+        let changes = vec![create_test_change("change-a", 3, 3)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.is_resolving = true;
+
+        app.handle_resolve_failed("change-a".to_string(), "conflict".to_string());
+
+        // change-a goes to MergeWait (not active for transition purposes
+        // since MergeWait is not in the active set)
+        assert_eq!(
+            app.mode,
+            AppMode::Select,
+            "Should transition to Select after resolve failure with no active changes"
+        );
+    }
+
+    #[test]
+    fn test_stopped_resets_resolving_changes() {
+        // When Stop is triggered, Resolving changes must be reset to NotQueued.
+        let changes = vec![
+            create_test_change("change-a", 3, 3),
+            create_test_change("change-b", 2, 4),
+        ];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].selected = true;
+        app.changes[1].queue_status = QueueStatus::Merged;
+
+        app.handle_stopped();
+
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::NotQueued,
+            "Resolving change must be reset to NotQueued on Stop"
+        );
+        // selected should be preserved
+        assert!(
+            app.changes[0].selected,
+            "selected flag should be preserved on Stop"
+        );
+        assert_eq!(app.mode, AppMode::Stopped);
+    }
+
+    #[test]
+    fn test_try_transition_to_select_no_op_when_not_running() {
+        // try_transition_to_select should be a no-op when not in Running mode.
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Stopped;
+
+        app.try_transition_to_select();
+
+        assert_eq!(
+            app.mode,
+            AppMode::Stopped,
+            "Should remain Stopped when try_transition_to_select is called"
+        );
+    }
+
+    #[test]
+    fn test_try_transition_to_select_stays_running_with_active() {
+        // try_transition_to_select should not transition when active changes exist.
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Applying;
+
+        app.try_transition_to_select();
+
+        assert_eq!(
+            app.mode,
+            AppMode::Running,
+            "Should stay Running with active Applying change"
         );
     }
 }
