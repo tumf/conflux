@@ -1,6 +1,13 @@
 {
   // Conflux Configuration - Project-specific overrides
 
+  // Web monitoring server configuration
+  "web": {
+    "port": 51823,
+    "bind": "127.0.0.1",
+    "refresh_interval_secs": 5
+  },
+
   // Lifecycle hooks
   "hooks": {
     // Rebuild indexes after merge completion
