@@ -209,6 +209,7 @@ function App() {
     onDelete: handleDeleteClick,
     onAddProject: () => setIsAddProjectOpen(true),
     isLoading,
+    syncAvailable: store.state.syncAvailable,
   };
 
   return (
