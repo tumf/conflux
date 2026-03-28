@@ -14,6 +14,8 @@ interface WSMessage {
   worktrees?: FullState['worktrees'];
   /** Whether git/sync is available (resolve_command is configured) */
   sync_available?: boolean;
+  /** Global orchestration status */
+  orchestration_status?: FullState['orchestration_status'];
   data?: FullState;
   /** Log entry payload (when type === 'log') */
   entry?: RemoteLogEntry;
@@ -81,6 +83,7 @@ export class WebSocketClient {
                 changes,
                 worktrees: message.worktrees,
                 sync_available: message.sync_available,
+                orchestration_status: message.orchestration_status,
               };
               this.listeners.onStateUpdate?.(state);
             } else if (message.type === 'log' && message.entry) {

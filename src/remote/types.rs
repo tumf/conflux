@@ -139,6 +139,10 @@ impl From<crate::tui::types::WorktreeInfo> for RemoteWorktreeInfo {
     }
 }
 
+fn default_orchestration_status() -> String {
+    "idle".to_string()
+}
+
 /// A state update message received over WebSocket
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -152,6 +156,9 @@ pub enum RemoteStateUpdate {
         /// Whether git/sync is available (resolve_command is configured)
         #[serde(default)]
         sync_available: bool,
+        /// Global orchestration status: "idle", "running", or "stopped"
+        #[serde(default = "default_orchestration_status")]
+        orchestration_status: String,
     },
     /// Incremental update for a single change
     ChangeUpdate { change: RemoteChange },
@@ -434,6 +441,7 @@ mod tests {
             projects: vec![],
             worktrees: Some(worktrees_map),
             sync_available: true,
+            orchestration_status: "idle".to_string(),
         };
 
         let json = serde_json::to_string(&update).unwrap();

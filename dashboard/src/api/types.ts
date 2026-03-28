@@ -3,6 +3,7 @@
  */
 
 export type ProjectStatus = 'idle' | 'running' | 'stopped';
+export type OrchestrationStatus = 'idle' | 'running' | 'stopped';
 export type ChangeStatus =
   | 'idle'
   | 'queued'
@@ -82,4 +83,6 @@ export interface FullState {
   worktrees?: Record<string, WorktreeInfo[]>;
   /** Whether git/sync is available (resolve_command is configured on server) */
   sync_available?: boolean;
+  /** Global orchestration status */
+  orchestration_status?: OrchestrationStatus;
 }
