@@ -2,7 +2,7 @@
  * WebSocket Hook: Connect ws client to application store
  */
 
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { wsClient } from '../api/wsClient';
 import { FullState } from '../api/types';
 
@@ -14,30 +14,29 @@ export interface UseWebSocketOptions {
 
 export function useWebSocket(options: UseWebSocketOptions = {}) {
   const { onStateUpdate, onConnectionChange, onError } = options;
+  const callbacksRef = useRef(options);
+  callbacksRef.current = options;
 
   useEffect(() => {
-    // Register listeners
-    if (onStateUpdate) {
-      wsClient.on('stateUpdate', onStateUpdate);
-    }
-    if (onConnectionChange) {
-      wsClient.on('connectionChange', onConnectionChange);
-    }
-    if (onError) {
-      wsClient.on('error', onError);
-    }
-
-    // Connect
-    wsClient.connect().catch((err) => {
-      console.error('Failed to connect WebSocket:', err);
-      onError?.(err);
+    wsClient.on('stateUpdate', (state: FullState) => {
+      callbacksRef.current.onStateUpdate?.(state);
+    });
+    wsClient.on('connectionChange', (status: 'connected' | 'reconnecting' | 'disconnected') => {
+      callbacksRef.current.onConnectionChange?.(status);
+    });
+    wsClient.on('error', (error: Error) => {
+      callbacksRef.current.onError?.(error);
     });
 
-    // Cleanup on unmount
+    wsClient.connect().catch((err) => {
+      console.error('Failed to connect WebSocket:', err);
+      callbacksRef.current.onError?.(err);
+    });
+
     return () => {
       wsClient.disconnect();
     };
-  }, [onStateUpdate, onConnectionChange, onError]);
+  }, []);
 
   return {
     isConnected: () => wsClient.isConnected(),

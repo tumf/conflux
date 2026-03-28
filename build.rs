@@ -36,9 +36,26 @@ fn main() {
             }
         }
 
+        // Detect generated asset filenames and expose as env vars
+        let assets_dir = Path::new("dashboard/dist/assets");
+        if assets_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(assets_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.ends_with(".js") {
+                        println!("cargo:rustc-env=DASHBOARD_JS={}", name);
+                    } else if name.ends_with(".css") {
+                        println!("cargo:rustc-env=DASHBOARD_CSS={}", name);
+                    }
+                }
+            }
+        }
+
         // Rerun if dashboard source changes
         println!("cargo:rerun-if-changed=dashboard/src");
         println!("cargo:rerun-if-changed=dashboard/package.json");
+        println!("cargo:rerun-if-changed=dashboard/dist/assets");
     }
 
     // Re-run if build script changes

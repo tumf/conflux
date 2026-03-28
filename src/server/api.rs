@@ -1433,16 +1433,22 @@ async fn dashboard_assets(Path(filename): Path<String>) -> Response {
     // This simple approach requires manual asset mapping.
     // For production, prefer a build.rs that generates asset routes dynamically.
     let response = match filename.as_str() {
-        "index-BmQZulK5.css" => (
+        env!("DASHBOARD_CSS") => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
-            include_str!("../../dashboard/dist/assets/index-BmQZulK5.css"),
+            include_str!(concat!(
+                "../../dashboard/dist/assets/",
+                env!("DASHBOARD_CSS")
+            )),
         )
             .into_response(),
-        "index-D3mkuSJD.js" => (
+        env!("DASHBOARD_JS") => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
-            include_str!("../../dashboard/dist/assets/index-D3mkuSJD.js"),
+            include_str!(concat!(
+                "../../dashboard/dist/assets/",
+                env!("DASHBOARD_JS")
+            )),
         )
             .into_response(),
         _ => {
@@ -1454,44 +1460,39 @@ async fn dashboard_assets(Path(filename): Path<String>) -> Response {
     response
 }
 
-/// Dashboard static files (favicon, icons, etc.)
-async fn dashboard_static(Path(filename): Path<String>) -> Response {
-    let content_type = if filename.ends_with(".svg") {
-        "image/svg+xml"
-    } else {
-        "application/octet-stream"
-    };
+/// Dashboard favicon.svg
+async fn dashboard_favicon() -> Response {
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("image/svg+xml"),
+        )],
+        include_str!("../../dashboard/dist/favicon.svg"),
+    )
+        .into_response()
+}
 
-    let response = match filename.as_str() {
-        "favicon.svg" => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
-            include_str!("../../dashboard/dist/favicon.svg"),
-        )
-            .into_response(),
-        "icons.svg" => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
-            include_str!("../../dashboard/dist/icons.svg"),
-        )
-            .into_response(),
-        _ => {
-            debug!("Dashboard static file not found: {}", filename);
-            (StatusCode::NOT_FOUND, "File not found").into_response()
-        }
-    };
-
-    response
+/// Dashboard icons.svg
+async fn dashboard_icons() -> Response {
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("image/svg+xml"),
+        )],
+        include_str!("../../dashboard/dist/icons.svg"),
+    )
+        .into_response()
 }
 
 // ─────────────────────────────── Router builder ────────────────────────────────
 
 /// Build the API v1 router with authentication middleware.
 pub fn build_router(app_state: AppState) -> Router {
-    let api_routes = Router::new()
+    let authenticated_routes = Router::new()
         .route("/projects", get(list_projects).post(add_project))
         .route("/projects/state", get(projects_state))
-        .route("/ws", get(ws_handler))
         .route("/projects/{id}", delete(delete_project))
         .route("/projects/{id}/git/pull", post(git_pull))
         .route("/projects/{id}/git/push", post(git_push))
@@ -1503,15 +1504,23 @@ pub fn build_router(app_state: AppState) -> Router {
             app_state.clone(),
             auth_middleware,
         ))
+        .with_state(app_state.clone());
+
+    let public_api_routes = Router::new()
+        .route("/ws", get(ws_handler))
         .with_state(app_state);
+
+    let api_routes = Router::new()
+        .merge(authenticated_routes)
+        .merge(public_api_routes);
 
     // Dashboard routes (no authentication required)
     let dashboard_routes = Router::new()
         .route("/", get(dashboard_index))
-        .route("/assets/:path", get(dashboard_assets))
-        .route("/favicon.svg", get(dashboard_static))
-        .route("/icons.svg", get(dashboard_static))
-        .route("/:path", get(dashboard_index))
+        .route("/assets/{path}", get(dashboard_assets))
+        .route("/favicon.svg", get(dashboard_favicon))
+        .route("/icons.svg", get(dashboard_icons))
+        .route("/{path}", get(dashboard_index))
         .fallback(get(dashboard_index));
 
     Router::new()
