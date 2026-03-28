@@ -3,15 +3,15 @@
  */
 
 export type ProjectStatus = 'idle' | 'running' | 'stopped';
-export type ChangeStatus = 
-  | 'idle' 
-  | 'queued' 
-  | 'applying' 
-  | 'accepting' 
-  | 'archiving' 
-  | 'resolving' 
-  | 'archived' 
-  | 'merged' 
+export type ChangeStatus =
+  | 'idle'
+  | 'queued'
+  | 'applying'
+  | 'accepting'
+  | 'archiving'
+  | 'resolving'
+  | 'archived'
+  | 'merged'
   | 'error';
 
 export interface RemoteProject {
