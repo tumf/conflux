@@ -38,6 +38,8 @@ export interface RemoteChange {
   last_modified: string;
   status: ChangeStatus;
   iteration_number: number | null;
+  /** Whether this change is selected for execution */
+  selected: boolean;
 }
 
 export interface RemoteLogEntry {

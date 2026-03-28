@@ -114,6 +114,9 @@ pub struct ProjectRegistry {
     project_locks: HashMap<String, Arc<Mutex<()>>>,
     /// Global semaphore for max_concurrent_total
     global_semaphore: Arc<tokio::sync::Semaphore>,
+    /// In-memory per-project per-change selection state: project_id -> (change_id -> selected).
+    /// Not persisted; all changes default to `true` on server restart.
+    change_selections: HashMap<String, HashMap<String, bool>>,
 }
 
 impl ProjectRegistry {
@@ -164,6 +167,7 @@ impl ProjectRegistry {
             projects,
             project_locks,
             global_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_total)),
+            change_selections: HashMap::new(),
         })
     }
 
@@ -247,6 +251,89 @@ impl ProjectRegistry {
     /// Get the data directory path (used by API handlers to locate bare clones).
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
+    }
+
+    // ─────────────── Change selection state ───────────────
+
+    /// Get the selected state of a change. Returns `true` if the change has not been seen before
+    /// (new changes default to selected).
+    #[allow(dead_code)]
+    pub fn is_change_selected(&self, project_id: &str, change_id: &str) -> bool {
+        self.change_selections
+            .get(project_id)
+            .and_then(|m| m.get(change_id))
+            .copied()
+            .unwrap_or(true)
+    }
+
+    /// Ensure a change is tracked in the selection map, defaulting to `true` if absent.
+    #[allow(dead_code)]
+    pub fn ensure_change_selected(&mut self, project_id: &str, change_id: &str) {
+        self.change_selections
+            .entry(project_id.to_string())
+            .or_default()
+            .entry(change_id.to_string())
+            .or_insert(true);
+    }
+
+    /// Toggle the selected state of a single change. Returns the new value.
+    /// If the change was not previously tracked, it is treated as `true` and toggled to `false`.
+    pub fn toggle_change_selected(&mut self, project_id: &str, change_id: &str) -> bool {
+        let entry = self
+            .change_selections
+            .entry(project_id.to_string())
+            .or_default()
+            .entry(change_id.to_string())
+            .or_insert(true);
+        *entry = !*entry;
+        debug!(
+            project_id,
+            change_id,
+            selected = *entry,
+            "Toggled change selection"
+        );
+        *entry
+    }
+
+    /// Toggle all changes for a project. If any change is unselected, select all; otherwise
+    /// deselect all. `known_change_ids` is the current list of change IDs for the project so
+    /// that all are covered even if not yet tracked.
+    ///
+    /// Returns the new selected value applied to all changes.
+    pub fn toggle_all_changes(&mut self, project_id: &str, known_change_ids: &[String]) -> bool {
+        let selections = self
+            .change_selections
+            .entry(project_id.to_string())
+            .or_default();
+
+        // Ensure all known changes are tracked
+        for cid in known_change_ids {
+            selections.entry(cid.clone()).or_insert(true);
+        }
+
+        // If any change is false, select all; otherwise deselect all.
+        let any_unselected = selections.values().any(|&v| !v);
+        let new_value = any_unselected;
+
+        for val in selections.values_mut() {
+            *val = new_value;
+        }
+
+        debug!(
+            project_id,
+            new_selected = new_value,
+            count = known_change_ids.len(),
+            "Toggled all change selections"
+        );
+        new_value
+    }
+
+    /// Get all change selections for a project.
+    pub fn change_selections_for_project(
+        &self,
+        project_id: &str,
+    ) -> Option<&HashMap<String, bool>> {
+        self.change_selections.get(project_id)
     }
 }
 

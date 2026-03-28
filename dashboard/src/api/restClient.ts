@@ -149,3 +149,26 @@ export async function refreshWorktrees(projectId: string): Promise<WorktreeInfo[
     method: 'POST',
   });
 }
+
+/**
+ * Toggle the selected state of a single change
+ */
+export async function toggleChangeSelection(
+  projectId: string,
+  changeId: string,
+): Promise<{ change_id: string; selected: boolean }> {
+  return fetchAPI(`/projects/${projectId}/changes/${changeId}/toggle`, {
+    method: 'POST',
+  });
+}
+
+/**
+ * Toggle all changes for a project (select all / deselect all)
+ */
+export async function toggleAllChangeSelection(
+  projectId: string,
+): Promise<{ selected: boolean; count: number }> {
+  return fetchAPI(`/projects/${projectId}/changes/toggle-all`, {
+    method: 'POST',
+  });
+}

@@ -19,6 +19,14 @@ pub struct RemoteChange {
     pub status: String,
     /// Iteration number (for apply/archive/acceptance operations)
     pub iteration_number: Option<u32>,
+    /// Whether this change is selected for execution
+    #[serde(default = "default_selected")]
+    pub selected: bool,
+}
+
+/// Default value for `selected` field (true) to ensure backward compatibility.
+fn default_selected() -> bool {
+    true
 }
 
 /// A project group from the remote server

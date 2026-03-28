@@ -61,6 +61,7 @@ mod tests {
             last_modified: "2024-01-01T00:00:00Z".to_string(),
             status: "applying".to_string(),
             iteration_number: None,
+            selected: true,
         }
     }
 
