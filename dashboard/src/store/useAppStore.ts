@@ -17,6 +17,8 @@ export interface AppState {
   logsByProjectId: Record<string, RemoteLogEntry[]>;
   connectionStatus: ConnectionStatus;
   worktreesByProjectId: Record<string, WorktreeInfo[]>;
+  /** Whether git/sync is available (resolve_command is configured on server) */
+  syncAvailable: boolean;
 }
 
 export type AppAction =
@@ -33,6 +35,7 @@ const initialState: AppState = {
   logsByProjectId: {},
   connectionStatus: 'disconnected',
   worktreesByProjectId: {},
+  syncAvailable: false,
 };
 
 export function appReducer(state: AppState, action: AppAction): AppState {
@@ -41,6 +44,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       const newState: AppState = {
         ...state,
         projects: action.payload.projects,
+        syncAvailable: action.payload.sync_available ?? false,
       };
       // Update worktrees if included in full_state
       if (action.payload.worktrees) {

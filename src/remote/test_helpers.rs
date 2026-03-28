@@ -133,7 +133,8 @@ pub fn full_state_json(project_id: &str, project_name: &str, changes_json: &[Str
                     "error": null,
                     "changes": [{changes}]
                 }}
-            ]
+            ],
+            "sync_available": false
         }}"#
     )
 }

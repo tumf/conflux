@@ -11,6 +11,8 @@ interface ProjectCardProps {
   onGitSync: (projectId: string) => void;
   onDelete: (projectId: string) => void;
   isLoading: boolean;
+  /** Whether git/sync is available (resolve_command configured on server) */
+  syncAvailable: boolean;
 }
 
 const statusConfig: Record<string, { dot: string; text: string; bg: string }> = {
@@ -28,6 +30,7 @@ export function ProjectCard({
   onGitSync,
   onDelete,
   isLoading,
+  syncAvailable,
 }: ProjectCardProps) {
   const [repo, branch] = [project.repo, project.branch];
   const cfg = statusConfig[project.status] ?? statusConfig.idle;
@@ -89,9 +92,10 @@ export function ProjectCard({
 
         <button
           onClick={(e) => { e.stopPropagation(); onGitSync(project.id); }}
-          disabled={isLoading}
+          disabled={isLoading || !syncAvailable}
           className="flex flex-1 items-center justify-center gap-1 rounded-md bg-[#1e3a5f]/60 px-2 py-1.5 text-xs font-medium text-[#3b82f6] transition-colors hover:bg-[#1e3a5f]/80 disabled:cursor-not-allowed disabled:opacity-40"
           aria-label={`Sync ${repo}@${branch}`}
+          title={!syncAvailable ? 'resolve_command is not configured' : undefined}
         >
           <RefreshCw className="size-3" />
           Sync

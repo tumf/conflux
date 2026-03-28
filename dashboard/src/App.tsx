@@ -1,4 +1,5 @@
 import React, { useState, useCallback } from 'react';
+import { Plus } from 'lucide-react';
 import { Toaster, toast } from 'sonner';
 import { Header } from './components/Header';
 import { ProjectsPanel } from './components/ProjectsPanel';
@@ -41,6 +42,7 @@ function App() {
     onStateUpdate: (state) => store.setFullState(state),
     onLogEntry: (entry) => store.appendLog(entry),
     onConnectionChange: (status) => store.setConnectionStatus(status),
+    onLogEntry: (entry) => store.appendLog(entry),
     onError: (error) => {
       console.error('WebSocket error:', error);
       toast.error(`Connection error: ${error.message}`);
@@ -206,8 +208,8 @@ function App() {
     onStop: handleStop,
     onGitSync: handleGitSync,
     onDelete: handleDeleteClick,
-    onAddProject: () => setIsAddProjectOpen(true),
     isLoading,
+    syncAvailable: store.state.syncAvailable,
   };
 
   return (
@@ -217,8 +219,15 @@ function App() {
       <div className="flex flex-1 overflow-hidden">
         {/* Desktop layout */}
         <aside className="hidden w-72 shrink-0 flex-col border-r border-[#27272a] md:flex">
-          <div className="border-b border-[#27272a] px-3 py-2">
+          <div className="flex items-center justify-between border-b border-[#27272a] px-3 py-2">
             <span className="text-xs font-medium text-[#52525b] uppercase tracking-wider">Projects</span>
+            <button
+              onClick={() => setIsAddProjectOpen(true)}
+              className="rounded p-0.5 text-[#52525b] transition-colors hover:text-[#6366f1]"
+              aria-label="Add project"
+            >
+              <Plus className="size-4" />
+            </button>
           </div>
           <div className="flex-1 overflow-y-auto">
             <ProjectsPanel {...panelProps} />
@@ -309,7 +318,23 @@ function App() {
           </div>
 
           <div className="flex-1 overflow-hidden">
-            {activeTab === 'projects' && <ProjectsPanel {...panelProps} />}
+            {activeTab === 'projects' && (
+              <div className="flex h-full flex-col">
+                <div className="flex items-center justify-between border-b border-[#27272a] px-3 py-2">
+                  <span className="text-xs font-medium text-[#52525b] uppercase tracking-wider">Projects</span>
+                  <button
+                    onClick={() => setIsAddProjectOpen(true)}
+                    className="rounded p-0.5 text-[#52525b] transition-colors hover:text-[#6366f1]"
+                    aria-label="Add project"
+                  >
+                    <Plus className="size-4" />
+                  </button>
+                </div>
+                <div className="flex-1 overflow-y-auto">
+                  <ProjectsPanel {...panelProps} />
+                </div>
+              </div>
+            )}
             {activeTab === 'changes' && (
               <ChangesPanel
                 projects={store.state.projects}

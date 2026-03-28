@@ -149,6 +149,9 @@ pub enum RemoteStateUpdate {
         /// Per-project worktree information (project_id -> worktrees)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worktrees: Option<std::collections::HashMap<String, Vec<RemoteWorktreeInfo>>>,
+        /// Whether git/sync is available (resolve_command is configured)
+        #[serde(default)]
+        sync_available: bool,
     },
     /// Incremental update for a single change
     ChangeUpdate { change: RemoteChange },
@@ -430,6 +433,7 @@ mod tests {
         let update = RemoteStateUpdate::FullState {
             projects: vec![],
             worktrees: Some(worktrees_map),
+            sync_available: true,
         };
 
         let json = serde_json::to_string(&update).unwrap();
