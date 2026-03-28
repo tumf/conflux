@@ -1667,6 +1667,32 @@ mod tests {
         assert_eq!(state.changes[0].queue_status, Some("error".to_string()));
     }
 
+    /// Auto-resumable MergeDeferred when resolve is NOT running must show "resolve pending"
+    /// (not "merge wait") so that the Web dashboard indicates the change will be retried
+    /// automatically.
+    #[tokio::test]
+    async fn test_auto_resumable_merge_deferred_without_resolve_shows_resolve_pending() {
+        let changes = vec![create_test_change("change-b", 5, 10)];
+        let web_state = WebState::new(&changes);
+
+        // No ResolveStarted → is_resolving is false.
+        // Send auto-resumable MergeDeferred (e.g. MERGE_HEAD exists from another merge).
+        web_state
+            .apply_execution_event(&ExecutionEvent::MergeDeferred {
+                change_id: "change-b".to_string(),
+                reason: "Merge in progress (MERGE_HEAD exists)".to_string(),
+                auto_resumable: true,
+            })
+            .await;
+
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].queue_status,
+            Some("resolve pending".to_string()),
+            "auto-resumable MergeDeferred must show 'resolve pending' even when resolve is not running"
+        );
+    }
+
     /// Phase 6.3: verify that from_changes_with_shared_state derives queue_status from the reducer
     /// display_status without changing the JSON API payload shape.
     #[test]
