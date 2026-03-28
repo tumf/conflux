@@ -66,7 +66,7 @@ export function WorktreesPanel({
         </div>
       ) : (
         <div className="space-y-1.5 p-3">
-          {worktrees.map((wt) => (
+          {[...worktrees].sort((a, b) => (a.is_main === b.is_main ? 0 : a.is_main ? -1 : 1)).map((wt) => (
             <WorktreeRow
               key={wt.branch || wt.path}
               worktree={wt}
