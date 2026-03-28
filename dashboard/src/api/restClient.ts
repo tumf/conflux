@@ -47,28 +47,28 @@ async function fetchAPI<T>(
 export async function fetchProjectsState(): Promise<{
   projects: RemoteProject[];
 }> {
-  return fetchAPI('/state', { method: 'GET' });
+  return fetchAPI('/projects/state', { method: 'GET' });
 }
 
 /**
  * Run a project
  */
 export async function controlRun(projectId: string): Promise<void> {
-  return fetchAPI(`/projects/${projectId}/run`, { method: 'POST' });
+  return fetchAPI(`/projects/${projectId}/control/run`, { method: 'POST' });
 }
 
 /**
  * Stop a project
  */
 export async function controlStop(projectId: string): Promise<void> {
-  return fetchAPI(`/projects/${projectId}/stop`, { method: 'POST' });
+  return fetchAPI(`/projects/${projectId}/control/stop`, { method: 'POST' });
 }
 
 /**
  * Git sync (pull + push) a project
  */
 export async function gitSync(projectId: string): Promise<void> {
-  return fetchAPI(`/projects/${projectId}/git-sync`, { method: 'POST' });
+  return fetchAPI(`/projects/${projectId}/git/sync`, { method: 'POST' });
 }
 
 /**

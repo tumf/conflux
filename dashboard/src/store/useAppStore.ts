@@ -34,7 +34,7 @@ const initialState: AppState = {
   changes: [],
 };
 
-function appReducer(state: AppState, action: AppAction): AppState {
+export function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case 'SET_FULL_STATE': {
       return {

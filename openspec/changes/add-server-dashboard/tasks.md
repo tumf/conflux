@@ -49,3 +49,9 @@
 
 - [x] 8.1 `cflx server` 起動後にプロジェクトを追加し、`http://localhost:39876/dashboard` でダッシュボードが表示されることを確認する（verification: ブラウザで UI が表示され WebSocket 接続が確立されること）
 - [x] 8.2 Run / Stop / Git Sync / Delete の各操作が UI から実行でき、状態が反映されることを確認する（verification: 各操作後に toast が表示され次の FullState でステータスが更新されること）
+
+## Acceptance #2 Failure Follow-up
+
+- [x] REST クライアントのエンドポイントを server API の実装と一致させる（`/projects/state`, `/projects/{id}/control/run`, `/projects/{id}/control/stop`, `/projects/{id}/git/sync`）（verification: `dashboard/src/api/restClient.ts` の呼び出し URL が修正されたこと）
+- [x] `/dashboard/assets/{filename}` の静的アセット配信を実装し、JS/CSS を index.html ではなく正しい content-type で返す（verification: `src/server/api.rs` に `dashboard_assets` ハンドラと `/dashboard/assets/:path` ルートが追加され、ビルド成功すること）
+- [x] `useAppStore` の `SET_FULL_STATE` を検証するフロントエンドテスト（Vitest 等）を追加し、タスク 3.1 の完了根拠を作る（verification: `dashboard/src/store/useAppStore.test.ts` が存在し `npm run test` で 8 個のテストが全て通ること）

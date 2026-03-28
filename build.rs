@@ -12,25 +12,14 @@ fn main() {
     // Build dashboard frontend if dashboard directory exists
     let dashboard_dir = Path::new("dashboard");
     if dashboard_dir.exists() {
-        let build_script = if cfg!(target_os = "windows") {
-            dashboard_dir.join("build.sh")
-        } else {
-            dashboard_dir.join("build.sh")
-        };
+        let build_script = dashboard_dir.join("build.sh");
 
         if build_script.exists() {
             println!("Building dashboard...");
-            let output = if cfg!(target_os = "windows") {
-                Command::new("bash")
-                    .arg(build_script.to_str().unwrap())
-                    .current_dir(&dashboard_dir)
-                    .output()
-            } else {
-                Command::new("bash")
-                    .arg(build_script.to_str().unwrap())
-                    .current_dir(&dashboard_dir)
-                    .output()
-            };
+            let output = Command::new("bash")
+                .arg(build_script.to_str().unwrap())
+                .current_dir(dashboard_dir)
+                .output();
 
             match output {
                 Ok(output) => {
