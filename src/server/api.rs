@@ -178,14 +178,28 @@ pub async fn list_projects(State(state): State<AppState>) -> Response {
 /// dashboard or client (including the TUI): projects (remote_url + branch) each
 /// with the list of OpenSpec changes discovered in that project's worktree.
 pub async fn projects_state(State(state): State<AppState>) -> Response {
-    let (entries, data_dir) = {
+    let (entries, data_dir, all_selections) = {
         let registry = state.registry.read().await;
-        (registry.list(), registry.data_dir().to_path_buf())
+        let entries = registry.list();
+        let data_dir = registry.data_dir().to_path_buf();
+        let all_selections: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, bool>,
+        > = entries
+            .iter()
+            .filter_map(|e| {
+                registry
+                    .change_selections_for_project(&e.id)
+                    .map(|s| (e.id.clone(), s.clone()))
+            })
+            .collect();
+        (entries, data_dir, all_selections)
     };
 
     let mut projects = Vec::new();
     for entry in &entries {
-        projects.push(build_remote_project_snapshot_async(&data_dir, entry).await);
+        let selections = all_selections.get(&entry.id);
+        projects.push(build_remote_project_snapshot_async(&data_dir, entry, selections).await);
     }
 
     let sync_available = state.resolve_command.is_some();
@@ -225,14 +239,24 @@ async fn handle_ws(
         tokio::select! {
             _ = interval.tick() => {
                 // Snapshot
-                let (entries, data_dir) = {
+                let (entries, data_dir, all_selections) = {
                     let reg = registry.read().await;
-                    (reg.list(), reg.data_dir().to_path_buf())
+                    let entries = reg.list();
+                    let data_dir = reg.data_dir().to_path_buf();
+                    let all_selections: std::collections::HashMap<String, std::collections::HashMap<String, bool>> = entries
+                        .iter()
+                        .filter_map(|e| {
+                            reg.change_selections_for_project(&e.id)
+                                .map(|s| (e.id.clone(), s.clone()))
+                        })
+                        .collect();
+                    (entries, data_dir, all_selections)
                 };
 
                 let mut snapshot = Vec::new();
                 for entry in &entries {
-                    snapshot.push(build_remote_project_snapshot_async(&data_dir, entry).await);
+                    let selections = all_selections.get(&entry.id);
+                    snapshot.push(build_remote_project_snapshot_async(&data_dir, entry, selections).await);
                 }
 
                 // Collect worktree information for each project
@@ -306,6 +330,7 @@ async fn handle_ws(
 async fn build_remote_project_snapshot_async(
     data_dir: &std::path::Path,
     entry: &ProjectEntry,
+    change_selections: Option<&std::collections::HashMap<String, bool>>,
 ) -> RemoteProject {
     let name = project_display_name(&entry.remote_url, &entry.branch);
     let repo = extract_repo_name(&entry.remote_url);
@@ -314,7 +339,16 @@ async fn build_remote_project_snapshot_async(
         .join(&entry.id)
         .join(&entry.branch);
 
-    let changes = list_remote_changes_in_worktree(&worktree_path, &entry.id, &entry.branch).await;
+    let mut changes =
+        list_remote_changes_in_worktree(&worktree_path, &entry.id, &entry.branch).await;
+
+    // Apply selected state from registry (defaults to true if not tracked)
+    for change in &mut changes {
+        change.selected = change_selections
+            .and_then(|m| m.get(&change.id))
+            .copied()
+            .unwrap_or(true);
+    }
 
     let status_str = match entry.status {
         ProjectStatus::Idle => "idle",
@@ -462,6 +496,7 @@ async fn list_remote_changes_in_worktree(
             last_modified,
             status,
             iteration_number,
+            selected: true,
         });
     }
 
@@ -1330,6 +1365,72 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
 
 // ─────────────────────────── /api/v1/projects/:id/control ─────────────────────
 
+// ──────────────── Change selection toggle ────────────────────────────────────
+
+/// POST /api/v1/projects/:id/changes/:change_id/toggle
+///
+/// Toggles the `selected` state of a single change. Returns the new state.
+pub async fn toggle_change_selection(
+    State(state): State<AppState>,
+    Path((project_id, change_id)): Path<(String, String)>,
+) -> Response {
+    let mut registry = state.registry.write().await;
+    if registry.get(&project_id).is_none() {
+        return error_response(StatusCode::NOT_FOUND, "Project not found");
+    }
+    let new_selected = registry.toggle_change_selected(&project_id, &change_id);
+    info!(
+        project_id = %project_id,
+        change_id = %change_id,
+        selected = new_selected,
+        "Change selection toggled"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "change_id": change_id, "selected": new_selected })),
+    )
+        .into_response()
+}
+
+/// POST /api/v1/projects/:id/changes/toggle-all
+///
+/// Toggles all changes for a project. If any change is unselected, selects all;
+/// otherwise deselects all. Returns the new selected state.
+pub async fn toggle_all_change_selection(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Response {
+    let mut registry = state.registry.write().await;
+    let entry = match registry.get(&project_id) {
+        Some(e) => e.clone(),
+        None => return error_response(StatusCode::NOT_FOUND, "Project not found"),
+    };
+
+    // List current change IDs from disk
+    let data_dir = registry.data_dir().to_path_buf();
+    let worktree_path = data_dir
+        .join("worktrees")
+        .join(&entry.id)
+        .join(&entry.branch);
+    let changes = list_remote_changes_in_worktree(&worktree_path, &entry.id, &entry.branch).await;
+    let change_ids: Vec<String> = changes.iter().map(|c| c.id.clone()).collect();
+
+    let new_selected = registry.toggle_all_changes(&project_id, &change_ids);
+    info!(
+        project_id = %project_id,
+        selected = new_selected,
+        count = change_ids.len(),
+        "All change selections toggled"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "selected": new_selected, "count": change_ids.len() })),
+    )
+        .into_response()
+}
+
+// ─────────────────────────────── Control ──────────────────────────────────────
+
 /// Stub runner call recorder for unit testing.
 #[allow(clippy::type_complexity)]
 pub static CONTROL_CALLS: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<(String, String)>>>> =
@@ -1936,6 +2037,14 @@ pub fn build_router(app_state: AppState) -> Router {
         .route("/projects/{id}/git/pull", post(git_pull))
         .route("/projects/{id}/git/push", post(git_push))
         .route("/projects/{id}/git/sync", post(git_sync))
+        .route(
+            "/projects/{id}/changes/{change_id}/toggle",
+            post(toggle_change_selection),
+        )
+        .route(
+            "/projects/{id}/changes/toggle-all",
+            post(toggle_all_change_selection),
+        )
         .route(
             "/projects/{id}/worktrees",
             get(server_list_worktrees).post(server_create_worktree),
