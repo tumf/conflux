@@ -1,5 +1,6 @@
-import React from 'react';
+import React, { useCallback } from 'react';
 import { RemoteChange } from '../api/types';
+import { toggleChangeSelection } from '../api/restClient';
 
 interface ChangeRowProps {
   change: RemoteChange;
@@ -43,10 +44,50 @@ export function ChangeRow({ change }: ChangeRowProps) {
   const cfg = statusConfig[change.status] ?? statusConfig.idle;
   const barColor = progressBarColor[change.status] ?? progressBarColor.idle;
 
+  const handleToggle = useCallback(
+    (e: React.MouseEvent) => {
+      e.stopPropagation();
+      toggleChangeSelection(change.project, change.id).catch(console.error);
+    },
+    [change.project, change.id],
+  );
+
   return (
-    <div className="space-y-2 rounded-md border border-[#27272a] bg-[#111113] p-3">
+    <div
+      className={`space-y-2 rounded-md border p-3 ${
+        change.selected
+          ? 'border-[#27272a] bg-[#111113]'
+          : 'border-[#27272a]/50 bg-[#111113]/50 opacity-60'
+      }`}
+    >
       <div className="flex items-center justify-between gap-2">
-        <span className="truncate font-mono text-xs text-[#a1a1aa]">{change.id}</span>
+        <div className="flex items-center gap-2 min-w-0">
+          <button
+            type="button"
+            role="checkbox"
+            aria-checked={change.selected}
+            aria-label={`Select change ${change.id}`}
+            onClick={handleToggle}
+            className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors ${
+              change.selected
+                ? 'border-[#3b82f6] bg-[#3b82f6] text-white'
+                : 'border-[#52525b] bg-transparent text-transparent hover:border-[#71717a]'
+            }`}
+          >
+            {change.selected && (
+              <svg className="h-3 w-3" viewBox="0 0 12 12" fill="none">
+                <path
+                  d="M2.5 6L5 8.5L9.5 3.5"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            )}
+          </button>
+          <span className="truncate font-mono text-xs text-[#a1a1aa]">{change.id}</span>
+        </div>
         <span className={`shrink-0 rounded px-1.5 py-0.5 text-xs font-medium ${cfg.color} ${cfg.bg}`}>
           {statusDisplay}
         </span>

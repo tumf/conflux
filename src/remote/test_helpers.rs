@@ -108,7 +108,8 @@ pub fn remote_change_json(
             "total_tasks": {total_tasks},
             "last_modified": "2024-01-01T00:00:00Z",
             "status": "{status}",
-            "iteration_number": {iter}
+            "iteration_number": {iter},
+            "selected": true
         }}"#
     )
 }
@@ -185,6 +186,7 @@ pub fn make_remote_change(id: &str, project: &str) -> RemoteChange {
         last_modified: "2024-01-01T00:00:00Z".to_string(),
         status: "queued".to_string(),
         iteration_number: None,
+        selected: true,
     }
 }
 
