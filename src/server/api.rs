@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{ws::Message, ws::WebSocket, ws::WebSocketUpgrade, Path, State},
-    http::{Request, StatusCode},
+    http::{header, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -1394,6 +1394,26 @@ async fn apply_control(
     }
 }
 
+// ─────────────────────────────── Dashboard handlers ────────────────────────────
+
+/// Dashboard index HTML - returns the built dashboard HTML file
+/// This handler serves the dashboard SPA. In production, Vite's `base: "/dashboard/"`
+/// directive ensures correct asset paths for nested routing.
+async fn dashboard_index() -> Response {
+    // The dashboard is built into dashboard/dist/index.html during cargo build
+    // We embed it as a static string for maximum portability
+    let html = include_str!("../../dashboard/dist/index.html");
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        )],
+        html,
+    )
+        .into_response()
+}
+
 // ─────────────────────────────── Router builder ────────────────────────────────
 
 /// Build the API v1 router with authentication middleware.
@@ -1415,7 +1435,15 @@ pub fn build_router(app_state: AppState) -> Router {
         ))
         .with_state(app_state);
 
-    Router::new().nest("/api/v1", api_routes)
+    // Dashboard routes (no authentication required)
+    let dashboard_routes = Router::new()
+        .route("/", get(dashboard_index))
+        .route("/:path", get(dashboard_index))
+        .fallback(get(dashboard_index));
+
+    Router::new()
+        .nest("/api/v1", api_routes)
+        .nest("/dashboard", dashboard_routes)
 }
 
 #[cfg(test)]
