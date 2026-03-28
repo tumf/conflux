@@ -142,6 +142,14 @@ fn error_response(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(ErrorResponse { error: msg.into() })).into_response()
 }
 
+/// Response for `GET /api/v1/projects/state` including top-level metadata.
+#[derive(Debug, Serialize)]
+struct ProjectsStateResponse {
+    projects: Vec<RemoteProject>,
+    /// Whether git/sync is available (resolve_command is configured)
+    sync_available: bool,
+}
+
 // ─────────────────────────────── /api/v1/version ──────────────────────────────
 
 /// GET /api/v1/version - return backend version string
@@ -180,7 +188,16 @@ pub async fn projects_state(State(state): State<AppState>) -> Response {
         projects.push(build_remote_project_snapshot_async(&data_dir, entry).await);
     }
 
-    (StatusCode::OK, Json(projects)).into_response()
+    let sync_available = state.resolve_command.is_some();
+
+    (
+        StatusCode::OK,
+        Json(ProjectsStateResponse {
+            projects,
+            sync_available,
+        }),
+    )
+        .into_response()
 }
 
 /// GET /api/v1/ws - WebSocket stream of remote state updates
@@ -192,13 +209,15 @@ pub async fn projects_state(State(state): State<AppState>) -> Response {
 pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
     let registry = state.registry.clone();
     let log_rx = state.log_tx.subscribe();
-    ws.on_upgrade(move |socket| handle_ws(socket, registry, log_rx))
+    let sync_available = state.resolve_command.is_some();
+    ws.on_upgrade(move |socket| handle_ws(socket, registry, log_rx, sync_available))
 }
 
 async fn handle_ws(
     mut socket: WebSocket,
     registry: SharedRegistry,
     mut log_rx: tokio::sync::broadcast::Receiver<RemoteLogEntry>,
+    sync_available: bool,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
 
@@ -239,7 +258,7 @@ async fn handle_ws(
                     Some(worktrees_map)
                 };
 
-                if let Ok(payload) = serde_json::to_string(&RemoteStateUpdate::FullState { projects: snapshot, worktrees }) {
+                if let Ok(payload) = serde_json::to_string(&RemoteStateUpdate::FullState { projects: snapshot, worktrees, sync_available }) {
                     if socket.send(Message::Text(payload.into())).await.is_err() {
                         break;
                     }
