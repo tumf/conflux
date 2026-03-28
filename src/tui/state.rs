@@ -745,10 +745,13 @@ impl AppState {
     /// - Otherwise, unmark all eligible changes
     ///
     /// Running mode excludes active rows to avoid emitting stop requests.
+    /// Running mode emits `AddToQueue`/`RemoveFromQueue` commands for
+    /// `NotQueued`/`Queued` rows (same semantics as single-row Space).
+    /// `MergeWait`/`ResolveWait` rows only toggle the execution mark.
     /// In parallel mode, uncommitted changes remain excluded.
-    pub fn toggle_all_marks(&mut self) {
+    pub fn toggle_all_marks(&mut self) -> Vec<TuiCommand> {
         if !self.has_bulk_toggle_targets() {
-            return;
+            return Vec::new();
         }
 
         // If any eligible unmarked change exists, we mark all; otherwise unmark all.
@@ -758,6 +761,8 @@ impl AppState {
             .any(|change| !change.selected && self.can_bulk_toggle_change(change));
 
         let target_state = has_unmarked;
+        let is_running = matches!(self.mode, AppMode::Running);
+        let mut commands = Vec::new();
 
         // Toggle all eligible changes to the target state.
         for i in 0..self.changes.len() {
@@ -772,6 +777,25 @@ impl AppState {
                     self.changes[i].is_new = false;
                     self.new_change_count = self.new_change_count.saturating_sub(1);
                 }
+
+                // In Running mode, emit queue commands for NotQueued/Queued rows
+                // (same semantics as single-row Space toggle).
+                // MergeWait/ResolveWait only toggle the execution mark.
+                if is_running {
+                    match &self.changes[i].queue_status {
+                        QueueStatus::NotQueued if target_state => {
+                            let id = self.changes[i].id.clone();
+                            self.add_log(LogEntry::info(format!("Added to queue: {}", id)));
+                            commands.push(TuiCommand::AddToQueue(id));
+                        }
+                        QueueStatus::Queued if !target_state => {
+                            let id = self.changes[i].id.clone();
+                            self.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
+                            commands.push(TuiCommand::RemoveFromQueue(id));
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
 
@@ -785,6 +809,8 @@ impl AppState {
             "Toggled all: {} {} change(s)",
             count, action
         )));
+
+        commands
     }
 
     /// Trigger merge resolution for the selected change when applicable.
@@ -3017,6 +3043,184 @@ mod tests {
         assert!(!app.changes[1].selected);
         assert!(!app.changes[2].selected);
         assert!(!app.changes[3].selected);
+    }
+
+    #[test]
+    fn test_bulk_toggle_running_mode_emits_add_to_queue_commands() {
+        // When bulk toggle marks NotQueued rows in Running mode,
+        // it must emit AddToQueue commands (same as single-row Space).
+        let changes = vec![
+            create_test_change("a", 0, 1),
+            create_test_change("b", 0, 1),
+            create_test_change("c", 0, 1),
+        ];
+
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[1].queue_status = QueueStatus::NotQueued;
+        app.changes[2].queue_status = QueueStatus::NotQueued;
+
+        let commands = app.toggle_all_marks();
+
+        // All three should be marked
+        assert!(app.changes[0].selected);
+        assert!(app.changes[1].selected);
+        assert!(app.changes[2].selected);
+
+        // Must emit AddToQueue for each NotQueued row
+        assert_eq!(commands.len(), 3);
+        assert!(matches!(&commands[0], TuiCommand::AddToQueue(id) if id == "a"));
+        assert!(matches!(&commands[1], TuiCommand::AddToQueue(id) if id == "b"));
+        assert!(matches!(&commands[2], TuiCommand::AddToQueue(id) if id == "c"));
+    }
+
+    #[test]
+    fn test_bulk_toggle_running_mode_emits_remove_from_queue_commands() {
+        // When all eligible rows are Queued and marked, bulk toggle must
+        // unmark them and emit RemoveFromQueue commands.
+        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
+
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Queued;
+        app.changes[0].selected = true;
+        app.changes[1].queue_status = QueueStatus::Queued;
+        app.changes[1].selected = true;
+
+        let commands = app.toggle_all_marks();
+
+        // Both should be unmarked
+        assert!(!app.changes[0].selected);
+        assert!(!app.changes[1].selected);
+
+        // Must emit RemoveFromQueue for each Queued row
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(&commands[0], TuiCommand::RemoveFromQueue(id) if id == "a"));
+        assert!(matches!(&commands[1], TuiCommand::RemoveFromQueue(id) if id == "b"));
+    }
+
+    #[test]
+    fn test_bulk_toggle_running_mode_no_commands_for_wait_states() {
+        // MergeWait/ResolveWait rows should only toggle execution mark,
+        // NOT emit queue commands.
+        let changes = vec![
+            create_test_change("not-queued", 0, 1),
+            create_test_change("merge-wait", 0, 1),
+            create_test_change("resolve-wait", 0, 1),
+        ];
+
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[1].queue_status = QueueStatus::MergeWait;
+        app.changes[2].queue_status = QueueStatus::ResolveWait;
+
+        let commands = app.toggle_all_marks();
+
+        // All eligible rows should be marked
+        assert!(app.changes[0].selected);
+        assert!(app.changes[1].selected);
+        assert!(app.changes[2].selected);
+
+        // Wait state queue_status must remain unchanged
+        assert_eq!(app.changes[1].queue_status, QueueStatus::MergeWait);
+        assert_eq!(app.changes[2].queue_status, QueueStatus::ResolveWait);
+
+        // Only the NotQueued row should emit AddToQueue
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(&commands[0], TuiCommand::AddToQueue(id) if id == "not-queued"));
+    }
+
+    #[test]
+    fn test_bulk_toggle_running_mode_excludes_active_rows_from_commands() {
+        // Active rows (Applying, Accepting, etc.) must NOT be toggled
+        // and must NOT receive stop requests via bulk toggle.
+        let changes = vec![
+            create_test_change("applying", 0, 1),
+            create_test_change("not-queued", 0, 1),
+        ];
+
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Applying;
+        app.changes[1].queue_status = QueueStatus::NotQueued;
+
+        let commands = app.toggle_all_marks();
+
+        // Active row must NOT be selected
+        assert!(!app.changes[0].selected);
+        // NotQueued row should be selected
+        assert!(app.changes[1].selected);
+
+        // Only one command: AddToQueue for the non-active row
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(&commands[0], TuiCommand::AddToQueue(id) if id == "not-queued"));
+        // No StopChange command should appear
+        assert!(!commands
+            .iter()
+            .any(|c| matches!(c, TuiCommand::StopChange(_))));
+    }
+
+    #[test]
+    fn test_bulk_toggle_running_mode_mixed_queued_and_not_queued() {
+        // When there's a mix of Queued and NotQueued, and at least one
+        // unmarked row exists, all should be marked and NotQueued rows
+        // get AddToQueue. (Queued rows already selected stay as-is.)
+        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
+
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Queued;
+        app.changes[0].selected = true; // already marked
+        app.changes[1].queue_status = QueueStatus::NotQueued;
+        app.changes[1].selected = false; // not yet marked
+
+        let commands = app.toggle_all_marks();
+
+        // Both should be marked (a stays marked, b becomes marked)
+        assert!(app.changes[0].selected);
+        assert!(app.changes[1].selected);
+
+        // Only the newly toggled NotQueued row should emit AddToQueue
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(&commands[0], TuiCommand::AddToQueue(id) if id == "b"));
+    }
+
+    #[test]
+    fn test_bulk_toggle_select_mode_returns_no_commands() {
+        // In Select mode, toggle_all_marks should NOT emit any queue commands.
+        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
+
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Select;
+
+        let commands = app.toggle_all_marks();
+
+        assert!(app.changes[0].selected);
+        assert!(app.changes[1].selected);
+        assert!(
+            commands.is_empty(),
+            "Select mode must not emit queue commands"
+        );
+    }
+
+    #[test]
+    fn test_bulk_toggle_stopped_mode_returns_no_commands() {
+        // In Stopped mode, toggle_all_marks should NOT emit any queue commands.
+        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
+
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Stopped;
+
+        let commands = app.toggle_all_marks();
+
+        assert!(app.changes[0].selected);
+        assert!(app.changes[1].selected);
+        assert!(
+            commands.is_empty(),
+            "Stopped mode must not emit queue commands"
+        );
     }
 
     #[test]
