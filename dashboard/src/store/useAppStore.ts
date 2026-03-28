@@ -67,8 +67,13 @@ export function appReducer(state: AppState, action: AppAction): AppState {
     }
 
     case 'APPEND_LOG': {
-      const { project_id, ...logEntry } = action.payload;
-      const logs = state.logsByProjectId[project_id] || [];
+      const logEntry = action.payload;
+      const projectId = logEntry.project_id;
+      if (!projectId) {
+        // Log entries without a project_id are not stored per-project
+        return state;
+      }
+      const logs = state.logsByProjectId[projectId] || [];
       const newLogs = [...logs, logEntry];
       // Keep only last 500 logs per project
       const trimmedLogs = newLogs.slice(-500);
@@ -77,7 +82,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         ...state,
         logsByProjectId: {
           ...state.logsByProjectId,
-          [project_id]: trimmedLogs,
+          [projectId]: trimmedLogs,
         },
       };
     }

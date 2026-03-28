@@ -276,6 +276,7 @@ async fn build_remote_project_snapshot_async(
     entry: &ProjectEntry,
 ) -> RemoteProject {
     let name = project_display_name(&entry.remote_url, &entry.branch);
+    let repo = extract_repo_name(&entry.remote_url);
     let worktree_path = data_dir
         .join("worktrees")
         .join(&entry.id)
@@ -283,11 +284,34 @@ async fn build_remote_project_snapshot_async(
 
     let changes = list_remote_changes_in_worktree(&worktree_path, &entry.id, &entry.branch).await;
 
+    let status_str = match entry.status {
+        ProjectStatus::Idle => "idle",
+        ProjectStatus::Running => "running",
+        ProjectStatus::Stopped => "stopped",
+    };
+    let is_busy = matches!(entry.status, ProjectStatus::Running);
+
     RemoteProject {
         id: entry.id.clone(),
         name,
+        repo,
+        branch: entry.branch.clone(),
+        status: status_str.to_string(),
+        is_busy,
+        error: None,
         changes,
     }
+}
+
+/// Extract the repository name from a remote URL (last path segment without .git suffix).
+fn extract_repo_name(remote_url: &str) -> String {
+    remote_url
+        .trim_end_matches('/')
+        .split('/')
+        .next_back()
+        .unwrap_or(remote_url)
+        .trim_end_matches(".git")
+        .to_string()
 }
 
 fn project_display_name(remote_url: &str, branch: &str) -> String {

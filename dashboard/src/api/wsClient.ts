@@ -2,14 +2,16 @@
  * WebSocket Client for Real-time State Updates
  */
 
-import { FullState } from './types';
+import { FullState, RemoteChange, RemoteProject } from './types';
 
 export type ConnectionStatus = 'connected' | 'reconnecting' | 'disconnected';
 
 interface WSMessage {
   type: 'full_state' | 'ping' | 'pong';
-  projects?: FullState['projects'];
-  data?: FullState;
+  /** Server sends projects with nested changes */
+  projects?: RemoteProject[];
+  /** Per-project worktree information */
+  worktrees?: FullState['worktrees'];
 }
 
 export class WebSocketClient {
@@ -53,13 +55,18 @@ export class WebSocketClient {
             const message = JSON.parse(event.data);
             console.debug('WS message received:', message.type);
 
-            if (message.type === 'full_state' || message.type === 'change_update' || message.type === 'log') {
-              // Handle full_state: either message.data (old format) or direct fields (new format)
-              if (message.type === 'full_state') {
-                const state: FullState = message.data ?? { projects: message.projects ?? [] };
-                this.listeners.onStateUpdate?.(state);
-              }
-              // Ignore other types for now - just log them
+            if (message.type === 'full_state') {
+              const projects: RemoteProject[] = message.projects ?? [];
+              // Flatten changes from nested project structure
+              const changes: RemoteChange[] = projects.flatMap(
+                (project) => project.changes ?? [],
+              );
+              const state: FullState = {
+                projects,
+                changes,
+                worktrees: message.worktrees,
+              };
+              this.listeners.onStateUpdate?.(state);
             }
           } catch (err) {
             console.error('Failed to parse WS message:', err, 'raw:', event.data?.substring?.(0, 100));

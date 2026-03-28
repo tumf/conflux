@@ -80,6 +80,11 @@ mod tests {
             RemoteProject {
                 id: "proj-1".to_string(),
                 name: "Project One".to_string(),
+                repo: "Project One".to_string(),
+                branch: "main".to_string(),
+                status: "idle".to_string(),
+                is_busy: false,
+                error: None,
                 changes: vec![
                     make_remote_change("change-a", "proj-1", 1, 3),
                     make_remote_change("change-b", "proj-1", 0, 2),
@@ -88,6 +93,11 @@ mod tests {
             RemoteProject {
                 id: "proj-2".to_string(),
                 name: "Project Two".to_string(),
+                repo: "Project Two".to_string(),
+                branch: "main".to_string(),
+                status: "idle".to_string(),
+                is_busy: false,
+                error: None,
                 changes: vec![make_remote_change("change-c", "proj-2", 3, 3)],
             },
         ];
