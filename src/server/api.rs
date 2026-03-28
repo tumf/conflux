@@ -289,6 +289,7 @@ async fn build_remote_project_snapshot_async(
     entry: &ProjectEntry,
 ) -> RemoteProject {
     let name = project_display_name(&entry.remote_url, &entry.branch);
+    let repo = extract_repo_name(&entry.remote_url);
     let worktree_path = data_dir
         .join("worktrees")
         .join(&entry.id)
@@ -296,21 +297,48 @@ async fn build_remote_project_snapshot_async(
 
     let changes = list_remote_changes_in_worktree(&worktree_path, &entry.id, &entry.branch).await;
 
+    let status_str = match entry.status {
+        ProjectStatus::Idle => "idle",
+        ProjectStatus::Running => "running",
+        ProjectStatus::Stopped => "stopped",
+    };
+    let is_busy = matches!(entry.status, ProjectStatus::Running);
+
     RemoteProject {
         id: entry.id.clone(),
         name,
+        repo,
+        branch: entry.branch.clone(),
+        status: status_str.to_string(),
+        is_busy,
+        error: None,
         changes,
     }
 }
 
-fn project_display_name(remote_url: &str, branch: &str) -> String {
-    // Keep it short but recognizable: repo@branch
-    let repo = remote_url
+/// Extract the repository name from a remote URL (last path segment without .git suffix).
+///
+/// For standard git remotes ending in `.git`, the `.git` suffix is stripped.
+/// For unusual URLs, falls back to the best available non-empty label.
+fn extract_repo_name(remote_url: &str) -> String {
+    let basename = remote_url
         .trim_end_matches('/')
         .split('/')
         .next_back()
         .unwrap_or(remote_url)
         .trim_end_matches(".git");
+
+    if basename.is_empty() {
+        // Fallback: use the full URL rather than an empty string
+        remote_url.to_string()
+    } else {
+        basename.to_string()
+    }
+}
+
+fn project_display_name(remote_url: &str, branch: &str) -> String {
+    // Keep it short but recognizable: repo@branch
+    let repo = extract_repo_name(remote_url);
     format!("{}@{}", repo, branch)
 }
 
@@ -3898,5 +3926,84 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "Worktree endpoints should require authentication"
         );
+    }
+
+    // ── extract_repo_name tests ──
+
+    #[test]
+    fn test_extract_repo_name_standard_https() {
+        assert_eq!(
+            extract_repo_name("https://github.com/owner/my-repo.git"),
+            "my-repo"
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_https_without_git_suffix() {
+        assert_eq!(
+            extract_repo_name("https://github.com/owner/my-repo"),
+            "my-repo"
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_ssh_url() {
+        assert_eq!(
+            extract_repo_name("git@github.com:owner/my-repo.git"),
+            "my-repo"
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_trailing_slash() {
+        assert_eq!(
+            extract_repo_name("https://github.com/owner/my-repo/"),
+            "my-repo"
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_bare_name() {
+        assert_eq!(extract_repo_name("my-repo"), "my-repo");
+    }
+
+    #[test]
+    fn test_extract_repo_name_empty_falls_back_to_url() {
+        // An edge case: URL that reduces to empty after trimming
+        // This shouldn't normally happen, but the function should not return empty
+        let result = extract_repo_name("https://example.com/");
+        assert!(!result.is_empty(), "Should not produce an empty repo name");
+    }
+
+    #[test]
+    fn test_extract_repo_name_just_git_suffix() {
+        assert_eq!(
+            extract_repo_name("https://example.com/.git"),
+            "https://example.com/.git",
+            "A URL ending in .git with no basename should fall back to the full URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remote_project_snapshot_serialization_has_dashboard_fields() {
+        // Verify that the RemoteProject JSON includes repo, branch, status, is_busy fields
+        let project = RemoteProject {
+            id: "abc123".to_string(),
+            name: "my-repo@main".to_string(),
+            repo: "my-repo".to_string(),
+            branch: "main".to_string(),
+            status: "idle".to_string(),
+            is_busy: false,
+            error: None,
+            changes: vec![],
+        };
+
+        let json = serde_json::to_value(&project).unwrap();
+        assert_eq!(json["repo"], "my-repo");
+        assert_eq!(json["branch"], "main");
+        assert_eq!(json["status"], "idle");
+        assert_eq!(json["is_busy"], false);
+        assert!(json.get("error").is_none() || json["error"].is_null());
+        assert_eq!(json["name"], "my-repo@main");
     }
 }

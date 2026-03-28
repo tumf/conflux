@@ -16,29 +16,38 @@ export type ChangeStatus =
 
 export interface RemoteProject {
   id: string;
+  /** Display name in "repo@branch" format */
+  name: string;
   repo: string;
   branch: string;
   status: ProjectStatus;
   is_busy: boolean;
   error: string | null;
+  /** Changes nested within this project (from server) */
+  changes: RemoteChange[];
 }
 
 export interface RemoteChange {
   id: string;
-  project_id: string;
-  title: string;
-  status: ChangeStatus;
-  iteration_number: number;
+  /** Project identifier this change belongs to */
+  project: string;
   completed_tasks: number;
   total_tasks: number;
-  error: string | null;
+  /** ISO 8601 timestamp of last modification */
+  last_modified: string;
+  status: ChangeStatus;
+  iteration_number: number | null;
 }
 
 export interface RemoteLogEntry {
-  project_id: string;
-  timestamp: number; // Unix epoch ms
-  level: 'info' | 'warn' | 'error';
   message: string;
+  level: 'info' | 'warn' | 'error' | 'success';
+  change_id: string | null;
+  /** ISO 8601 timestamp */
+  timestamp: string;
+  project_id: string | null;
+  operation: string | null;
+  iteration: number | null;
 }
 
 /** Merge conflict information for a worktree */
@@ -66,13 +75,9 @@ export interface WorktreeInfo {
   is_merging: boolean;
 }
 
-export interface RemoteStateUpdate {
-  projects: RemoteProject[];
-  changes: RemoteChange[];
-}
-
 export interface FullState {
   projects: RemoteProject[];
+  /** Flattened changes extracted from projects for easy access */
   changes: RemoteChange[];
   worktrees?: Record<string, WorktreeInfo[]>;
 }

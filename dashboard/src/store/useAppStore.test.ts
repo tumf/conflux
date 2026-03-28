@@ -15,25 +15,31 @@ describe('useAppStore - SET_FULL_STATE', () => {
       logsByProjectId: {},
       connectionStatus: 'disconnected',
       changes: [],
+      worktreesByProjectId: {},
     };
 
     const fullState = {
       projects: [
         {
           id: 'test-project-1',
-          remote_url: 'https://github.com/example/repo',
+          name: 'repo@main',
+          repo: 'repo',
           branch: 'main',
           status: 'idle' as const,
+          is_busy: false,
+          error: null,
           changes: [],
         },
       ],
       changes: [
         {
           id: 'change-1',
-          project_id: 'test-project-1',
+          project: 'test-project-1',
           status: 'idle' as const,
           completed_tasks: 0,
           total_tasks: 0,
+          last_modified: '2024-01-01T00:00:00Z',
+          iteration_number: null,
         },
       ],
     };
@@ -56,9 +62,12 @@ describe('useAppStore - SET_FULL_STATE', () => {
       projects: [
         {
           id: 'old-project',
-          remote_url: 'https://github.com/old/repo',
+          name: 'old-repo@main',
+          repo: 'old-repo',
           branch: 'main',
-          status: 'idle',
+          status: 'idle' as const,
+          is_busy: false,
+          error: null,
           changes: [],
         },
       ],
@@ -66,15 +75,19 @@ describe('useAppStore - SET_FULL_STATE', () => {
       logsByProjectId: {},
       connectionStatus: 'connected',
       changes: [],
+      worktreesByProjectId: {},
     };
 
     const newFullState = {
       projects: [
         {
           id: 'new-project',
-          remote_url: 'https://github.com/new/repo',
+          name: 'new-repo@develop',
+          repo: 'new-repo',
           branch: 'develop',
-          status: 'running',
+          status: 'running' as const,
+          is_busy: true,
+          error: null,
           changes: [],
         },
       ],
@@ -102,9 +115,12 @@ describe('useAppStore - SET_FULL_STATE', () => {
       projects: [
         {
           id: 'project-1',
-          remote_url: 'https://github.com/example/repo',
+          name: 'repo@main',
+          repo: 'repo',
           branch: 'main',
-          status: 'idle',
+          status: 'idle' as const,
+          is_busy: false,
+          error: null,
           changes: [],
         },
       ],
@@ -112,6 +128,7 @@ describe('useAppStore - SET_FULL_STATE', () => {
       logsByProjectId: {},
       connectionStatus: 'connected',
       changes: [],
+      worktreesByProjectId: {},
     };
 
     const emptyFullState = {
@@ -139,13 +156,17 @@ describe('useAppStore - APPEND_LOG', () => {
       logsByProjectId: {},
       connectionStatus: 'disconnected',
       changes: [],
+      worktreesByProjectId: {},
     };
 
     const logEntry = {
-      project_id: 'project-1',
-      timestamp: new Date().toISOString(),
-      level: 'info' as const,
       message: 'Test log',
+      level: 'info' as const,
+      change_id: null,
+      timestamp: new Date().toISOString(),
+      project_id: 'project-1',
+      operation: null,
+      iteration: null,
     };
 
     const action: AppAction = {
@@ -165,20 +186,28 @@ describe('useAppStore - APPEND_LOG', () => {
       selectedProjectId: null,
       logsByProjectId: {
         'project-1': Array.from({ length: 500 }, (_, i) => ({
-          timestamp: new Date().toISOString(),
-          level: 'info' as const,
           message: `Log ${i}`,
+          level: 'info' as const,
+          change_id: null,
+          timestamp: new Date().toISOString(),
+          project_id: 'project-1',
+          operation: null,
+          iteration: null,
         })),
       },
       connectionStatus: 'disconnected',
       changes: [],
+      worktreesByProjectId: {},
     };
 
     const newLogEntry = {
-      project_id: 'project-1',
-      timestamp: new Date().toISOString(),
-      level: 'info' as const,
       message: 'New log entry',
+      level: 'info' as const,
+      change_id: null,
+      timestamp: new Date().toISOString(),
+      project_id: 'project-1',
+      operation: null,
+      iteration: null,
     };
 
     const action: AppAction = {
@@ -201,6 +230,7 @@ describe('useAppStore - SET_CONNECTION_STATUS', () => {
       logsByProjectId: {},
       connectionStatus: 'disconnected',
       changes: [],
+      worktreesByProjectId: {},
     };
 
     const action: AppAction = {
@@ -222,6 +252,7 @@ describe('useAppStore - SELECT_PROJECT', () => {
       logsByProjectId: {},
       connectionStatus: 'disconnected',
       changes: [],
+      worktreesByProjectId: {},
     };
 
     const action: AppAction = {
@@ -241,6 +272,7 @@ describe('useAppStore - SELECT_PROJECT', () => {
       logsByProjectId: {},
       connectionStatus: 'disconnected',
       changes: [],
+      worktreesByProjectId: {},
     };
 
     const action: AppAction = {

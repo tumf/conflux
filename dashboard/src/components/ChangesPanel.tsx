@@ -1,13 +1,13 @@
 import React from 'react';
-import { RemoteChange } from '../api/types';
+import { RemoteChange, RemoteProject } from '../api/types';
 import { ChangeRow } from './ChangeRow';
 
 interface ChangesPanelProps {
-  changes: RemoteChange[];
+  projects: RemoteProject[];
   selectedProjectId: string | null;
 }
 
-export function ChangesPanel({ changes, selectedProjectId }: ChangesPanelProps) {
+export function ChangesPanel({ projects, selectedProjectId }: ChangesPanelProps) {
   if (!selectedProjectId) {
     return (
       <div className="flex flex-1 items-center justify-center p-8">
@@ -16,9 +16,8 @@ export function ChangesPanel({ changes, selectedProjectId }: ChangesPanelProps) 
     );
   }
 
-  const projectChanges = changes.filter(
-    (change) => change.project_id === selectedProjectId,
-  );
+  const project = projects.find((p) => p.id === selectedProjectId);
+  const projectChanges: RemoteChange[] = project?.changes ?? [];
 
   if (projectChanges.length === 0) {
     return (

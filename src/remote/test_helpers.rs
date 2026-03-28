@@ -126,6 +126,11 @@ pub fn full_state_json(project_id: &str, project_name: &str, changes_json: &[Str
                 {{
                     "id": "{project_id}",
                     "name": "{project_name}",
+                    "repo": "{project_name}",
+                    "branch": "main",
+                    "status": "idle",
+                    "is_busy": false,
+                    "error": null,
                     "changes": [{changes}]
                 }}
             ]
@@ -187,6 +192,11 @@ pub fn make_remote_project(id: &str, name: &str, changes: Vec<RemoteChange>) -> 
     RemoteProject {
         id: id.to_string(),
         name: name.to_string(),
+        repo: name.to_string(),
+        branch: "main".to_string(),
+        status: "idle".to_string(),
+        is_busy: false,
+        error: None,
         changes,
     }
 }
