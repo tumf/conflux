@@ -2,16 +2,18 @@
  * WebSocket Client for Real-time State Updates
  */
 
-import { FullState, RemoteChange, RemoteProject } from './types';
+import { FullState, RemoteChange, RemoteLogEntry, RemoteProject } from './types';
 
 export type ConnectionStatus = 'connected' | 'reconnecting' | 'disconnected';
 
 interface WSMessage {
-  type: 'full_state' | 'ping' | 'pong';
+  type: 'full_state' | 'log' | 'change_update' | 'ping' | 'pong';
   /** Server sends projects with nested changes */
   projects?: RemoteProject[];
   /** Per-project worktree information */
   worktrees?: FullState['worktrees'];
+  data?: FullState;
+  entry?: RemoteLogEntry;
 }
 
 export class WebSocketClient {
@@ -19,10 +21,12 @@ export class WebSocketClient {
   private url: string;
   private listeners: {
     onStateUpdate?: (state: FullState) => void;
+    onLogEntry?: (entry: RemoteLogEntry) => void;
     onConnectionChange?: (status: ConnectionStatus) => void;
     onError?: (error: Error) => void;
   } = {};
 
+  private connectAborted = false;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private reconnectDelays = [1000, 2000, 4000, 8000, 16000]; // ms, then max 30s
@@ -41,9 +45,17 @@ export class WebSocketClient {
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
+        this.connectAborted = false;
         this.ws = new WebSocket(this.url);
 
         this.ws.onopen = () => {
+          if (this.connectAborted) {
+            // disconnect() was called while CONNECTING; close cleanly now
+            this.ws?.close();
+            this.ws = null;
+            resolve();
+            return;
+          }
           this.reconnectAttempts = 0;
           this.notifyConnectionChange('connected');
           this.startPingTimer();
@@ -67,6 +79,8 @@ export class WebSocketClient {
                 worktrees: message.worktrees,
               };
               this.listeners.onStateUpdate?.(state);
+            } else if (message.type === 'log' && message.entry) {
+              this.listeners.onLogEntry?.(message.entry);
             }
           } catch (err) {
             console.error('Failed to parse WS message:', err, 'raw:', event.data?.substring?.(0, 100));
@@ -94,6 +108,8 @@ export class WebSocketClient {
    * Disconnect from the WebSocket server
    */
   disconnect(): void {
+    this.connectAborted = true;
+
     if (this.reconnectTimeoutId !== null) {
       clearTimeout(this.reconnectTimeoutId);
       this.reconnectTimeoutId = null;
@@ -103,11 +119,22 @@ export class WebSocketClient {
       this.pingTimeoutId = null;
     }
     if (this.ws) {
+      const { readyState } = this.ws;
+      // Suppress reconnection and error handlers regardless of state
       this.ws.onerror = null;
       this.ws.onclose = null;
       this.ws.onmessage = null;
-      this.ws.close();
-      this.ws = null;
+
+      if (readyState === WebSocket.CONNECTING) {
+        // Do NOT call close() here — it would trigger "closed before established"
+        // The onopen handler will see connectAborted and close cleanly
+      } else if (readyState === WebSocket.OPEN) {
+        this.ws.close();
+        this.ws = null;
+      } else {
+        // CLOSING or CLOSED — no action needed
+        this.ws = null;
+      }
     }
     this.notifyConnectionChange('disconnected');
   }
@@ -116,11 +143,13 @@ export class WebSocketClient {
    * Register a listener
    */
   on(
-    event: 'stateUpdate' | 'connectionChange' | 'error',
+    event: 'stateUpdate' | 'logEntry' | 'connectionChange' | 'error',
     callback: (data: any) => void,
   ): void {
     if (event === 'stateUpdate') {
       this.listeners.onStateUpdate = callback;
+    } else if (event === 'logEntry') {
+      this.listeners.onLogEntry = callback;
     } else if (event === 'connectionChange') {
       this.listeners.onConnectionChange = callback;
     } else if (event === 'error') {

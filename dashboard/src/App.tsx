@@ -39,6 +39,7 @@ function App() {
 
   useWebSocket({
     onStateUpdate: (state) => store.setFullState(state),
+    onLogEntry: (entry) => store.appendLog(entry),
     onConnectionChange: (status) => store.setConnectionStatus(status),
     onError: (error) => {
       console.error('WebSocket error:', error);
@@ -82,9 +83,11 @@ function App() {
     }
   }, []);
 
-  const handleDeleteClick = useCallback((projectId: string, projectName: string) => {
-    setDeleteTarget({ id: projectId, name: projectName });
-  }, []);
+  const handleDeleteClick = useCallback((projectId: string) => {
+    const project = store.state.projects.find((p) => p.id === projectId);
+    const name = project ? `${project.repo}/${project.branch}` : projectId;
+    setDeleteTarget({ id: projectId, name });
+  }, [store.state.projects]);
 
   const handleDeleteConfirm = useCallback(async () => {
     if (!deleteTarget) return;
@@ -256,7 +259,7 @@ function App() {
               <div className="flex-1 overflow-y-auto">
                 {desktopCenterTab === 'changes' ? (
                   <ChangesPanel
-                    changes={store.state.changes}
+                    projects={store.state.projects}
                     selectedProjectId={store.state.selectedProjectId}
                   />
                 ) : (
@@ -309,7 +312,7 @@ function App() {
             {activeTab === 'projects' && <ProjectsPanel {...panelProps} />}
             {activeTab === 'changes' && (
               <ChangesPanel
-                changes={store.state.changes}
+                projects={store.state.projects}
                 selectedProjectId={store.state.selectedProjectId}
               />
             )}
