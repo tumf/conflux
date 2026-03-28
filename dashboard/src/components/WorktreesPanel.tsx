@@ -10,6 +10,8 @@ interface WorktreesPanelProps {
   onDelete: (branchName: string) => void;
   onCreate: () => void;
   onRefresh: () => void;
+  onClickWorktree?: (branch: string) => void;
+  selectedWorktreeBranch?: string | null;
   isLoading: boolean;
 }
 
@@ -20,6 +22,8 @@ export function WorktreesPanel({
   onDelete,
   onCreate,
   onRefresh,
+  onClickWorktree,
+  selectedWorktreeBranch,
   isLoading,
 }: WorktreesPanelProps) {
   if (!selectedProjectId) {
@@ -68,6 +72,8 @@ export function WorktreesPanel({
               worktree={wt}
               onMerge={onMerge}
               onDelete={onDelete}
+              onClickWorktree={onClickWorktree}
+              isSelected={selectedWorktreeBranch === wt.branch}
               isLoading={isLoading}
             />
           ))}

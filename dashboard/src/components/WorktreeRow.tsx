@@ -6,10 +6,12 @@ interface WorktreeRowProps {
   worktree: WorktreeInfo;
   onMerge?: (branchName: string) => void;
   onDelete?: (branchName: string) => void;
+  onClickWorktree?: (branch: string) => void;
+  isSelected?: boolean;
   isLoading?: boolean;
 }
 
-export function WorktreeRow({ worktree, onMerge, onDelete, isLoading }: WorktreeRowProps) {
+export function WorktreeRow({ worktree, onMerge, onDelete, onClickWorktree, isSelected, isLoading }: WorktreeRowProps) {
   const canMerge =
     !worktree.is_main &&
     !worktree.is_detached &&
@@ -21,8 +23,21 @@ export function WorktreeRow({ worktree, onMerge, onDelete, isLoading }: Worktree
 
   const label = worktree.branch || worktree.head;
 
+  const handleRowClick = () => {
+    if (!worktree.is_main) {
+      onClickWorktree?.(worktree.branch);
+    }
+  };
+
   return (
-    <div className="flex items-center justify-between gap-2 rounded-md border border-[#27272a] bg-[#111113] p-3">
+    <div
+      onClick={handleRowClick}
+      className={`flex items-center justify-between gap-2 rounded-md border p-3 transition-colors ${
+        isSelected
+          ? 'border-[#6366f1] bg-[#1e1b4b]/30'
+          : 'border-[#27272a] bg-[#111113] hover:border-[#3f3f46]'
+      } ${!worktree.is_main ? 'cursor-pointer' : ''}`}
+    >
       <div className="flex min-w-0 flex-1 items-center gap-2">
         <GitBranch className="size-3.5 shrink-0 text-[#52525b]" />
         <span className="truncate font-mono text-xs text-[#a1a1aa]">{label}</span>

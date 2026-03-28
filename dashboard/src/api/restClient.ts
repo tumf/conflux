@@ -2,7 +2,7 @@
  * REST API Client for Conflux Server
  */
 
-import { RemoteProject, WorktreeInfo } from './types';
+import { RemoteProject, WorktreeInfo, FileTreeEntry, FileContentResponse } from './types';
 
 const API_BASE = '/api/v1';
 
@@ -171,4 +171,30 @@ export async function toggleAllChangeSelection(
   return fetchAPI(`/projects/${projectId}/changes/toggle-all`, {
     method: 'POST',
   });
+}
+
+/**
+ * Fetch file tree for a project
+ */
+export async function fetchFileTree(
+  projectId: string,
+  root: string = 'base',
+): Promise<FileTreeEntry[]> {
+  return fetchAPI(`/projects/${projectId}/files/tree?root=${encodeURIComponent(root)}`, {
+    method: 'GET',
+  });
+}
+
+/**
+ * Fetch file content for a project
+ */
+export async function fetchFileContent(
+  projectId: string,
+  root: string,
+  path: string,
+): Promise<FileContentResponse> {
+  return fetchAPI(
+    `/projects/${projectId}/files/content?root=${encodeURIComponent(root)}&path=${encodeURIComponent(path)}`,
+    { method: 'GET' },
+  );
 }

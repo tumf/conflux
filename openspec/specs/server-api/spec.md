@@ -141,3 +141,6 @@ WebSocket `full_state` メッセージに `orchestration_status` フィールド
 ### Requirement: per-project-run-stop-buttons
 
 `ProjectCard` の Run/Stop/Retry ボタンを削除する。グローバル Header のボタンに置き換えられた。
+
+
+#
