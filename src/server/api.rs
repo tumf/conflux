@@ -715,6 +715,37 @@ pub async fn add_project(
         );
     }
 
+    // Step 6: Execute repo-root .wt/setup in the new worktree (if present).
+    // Failure is treated as add_project failure and triggers rollback.
+    if let Err(e) =
+        crate::vcs::git::commands::run_worktree_setup(&worktree_path, &worktree_path).await
+    {
+        error!(
+            "worktree setup failed: project_id={} worktree={:?} error={}",
+            project_id, worktree_path, e
+        );
+
+        // Best-effort cleanup for partially provisioned project files.
+        if let Err(cleanup_err) = std::fs::remove_dir_all(&worktree_path) {
+            error!(
+                "Failed to cleanup worktree after setup failure: project_id={} path={:?} error={}",
+                project_id, worktree_path, cleanup_err
+            );
+        }
+        if let Err(cleanup_err) = std::fs::remove_dir_all(&local_repo_path) {
+            error!(
+                "Failed to cleanup bare clone after setup failure: project_id={} path={:?} error={}",
+                project_id, local_repo_path, cleanup_err
+            );
+        }
+
+        rollback(&state, project_id).await;
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("worktree setup failed: {}", e),
+        );
+    }
+
     info!("Project added with clone and worktree: id={}", project_id);
     (StatusCode::CREATED, Json(ProjectResponse::from(entry))).into_response()
 }
@@ -1486,8 +1517,12 @@ mod tests {
     }
 
     /// Creates a local bare git repository with a `main` branch and one commit.
+    /// Optional `setup_script` is committed at `.wt/setup` in the source repo.
     /// Returns the path to the bare repo (usable as a `file://` URL).
-    fn create_local_git_repo(parent: &std::path::Path) -> std::path::PathBuf {
+    fn create_local_git_repo_with_setup(
+        parent: &std::path::Path,
+        setup_script: Option<&str>,
+    ) -> std::path::PathBuf {
         let repo_path = parent.join("test-origin");
         // Create a normal repo, add a commit, then convert to bare-compatible source.
         let src = parent.join("test-src");
@@ -1508,6 +1543,13 @@ mod tests {
             .output()
             .unwrap();
         std::fs::write(src.join("README.md"), "hello").unwrap();
+
+        if let Some(script) = setup_script {
+            let wt_dir = src.join(".wt");
+            std::fs::create_dir_all(&wt_dir).unwrap();
+            std::fs::write(wt_dir.join("setup"), script).unwrap();
+        }
+
         std::process::Command::new("git")
             .args(["add", "."])
             .current_dir(&src)
@@ -1529,6 +1571,10 @@ mod tests {
             .output()
             .unwrap();
         repo_path
+    }
+
+    fn create_local_git_repo(parent: &std::path::Path) -> std::path::PathBuf {
+        create_local_git_repo_with_setup(parent, None)
     }
 
     #[tokio::test]
@@ -1553,6 +1599,159 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_add_project_runs_repo_root_setup_when_present() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo_with_setup(
+            temp_dir.path(),
+            Some("#!/bin/sh\nprintf \"%s\" \"$ROOT_WORKTREE_PATH\" > .setup-root-path\n"),
+        );
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let router = make_router(&temp_dir, None);
+
+        let body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let project_id = json["id"].as_str().expect("Response must contain id");
+
+        let worktree_path = temp_dir
+            .path()
+            .join("worktrees")
+            .join(project_id)
+            .join("main");
+        let marker_path = worktree_path.join(".setup-root-path");
+
+        assert!(
+            marker_path.exists(),
+            "repo-root .wt/setup should create marker file at {:?}",
+            marker_path
+        );
+
+        let recorded_root = std::fs::read_to_string(&marker_path).unwrap();
+        assert_eq!(
+            recorded_root,
+            worktree_path.to_string_lossy(),
+            "ROOT_WORKTREE_PATH should point to worktree repo root"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_project_without_repo_root_setup_succeeds_without_marker() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let router = make_router(&temp_dir, None);
+
+        let body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let project_id = json["id"].as_str().expect("Response must contain id");
+
+        let marker_path = temp_dir
+            .path()
+            .join("worktrees")
+            .join(project_id)
+            .join("main")
+            .join(".setup-root-path");
+        assert!(
+            !marker_path.exists(),
+            "No setup marker should exist when repo-root .wt/setup is absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_project_setup_failure_returns_422_and_rolls_back_registry() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin =
+            create_local_git_repo_with_setup(temp_dir.path(), Some("#!/bin/sh\nexit 42\n"));
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+        let expected_project_id = crate::server::registry::generate_project_id(&remote_url, "main");
+
+        let state = make_state(&temp_dir, None);
+        let router = build_router(state.clone());
+
+        let body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let error_message = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error_message.contains("worktree setup failed"),
+            "error should mention setup failure, got: {}",
+            json
+        );
+
+        let registry = state.registry.read().await;
+        assert!(
+            registry.list().is_empty(),
+            "Registry should be empty after setup failure rollback"
+        );
+
+        let local_repo_path = temp_dir.path().join(&expected_project_id);
+        let worktree_path = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&expected_project_id)
+            .join("main");
+        assert!(
+            !local_repo_path.exists(),
+            "Bare clone should be cleaned up after setup failure"
+        );
+        assert!(
+            !worktree_path.exists(),
+            "Worktree should be cleaned up after setup failure"
+        );
     }
 
     #[tokio::test]
@@ -1819,7 +2018,9 @@ mod tests {
 
         // Set an environment variable for the token
         let env_var_name = "CFLX_TEST_SERVER_TOKEN_UNIQUE_12345";
-        env::set_var(env_var_name, "env-token-value");
+        unsafe {
+            env::set_var(env_var_name, "env-token-value");
+        }
 
         let auth = ServerAuthConfig {
             mode: crate::config::ServerAuthMode::BearerToken,
@@ -1829,7 +2030,9 @@ mod tests {
         // token_env takes precedence over token
         assert_eq!(auth.resolve_token(), Some("env-token-value".to_string()));
 
-        env::remove_var(env_var_name);
+        unsafe {
+            env::remove_var(env_var_name);
+        }
     }
 
     #[test]
@@ -1839,7 +2042,9 @@ mod tests {
 
         let env_var_name = "CFLX_TEST_SERVER_TOKEN_UNSET_UNIQUE_99999";
         // Ensure the env var is NOT set
-        env::remove_var(env_var_name);
+        unsafe {
+            env::remove_var(env_var_name);
+        }
 
         let auth = ServerAuthConfig {
             mode: crate::config::ServerAuthMode::BearerToken,
