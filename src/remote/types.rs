@@ -71,12 +71,75 @@ pub struct ProjectEntry {
     pub created_at: String,
 }
 
+/// Worktree information for server-mode API responses.
+///
+/// This type is used by the Server Mode `/api/v1/projects/{id}/worktrees` endpoints
+/// and WebSocket `full_state` messages. It mirrors `tui::types::WorktreeInfo` but is
+/// tailored for remote (server-mode) communication with `path` serialized as a String
+/// and an additional `label` field for display purposes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RemoteWorktreeInfo {
+    /// Worktree filesystem path (as string for serialization)
+    pub path: String,
+    /// Human-readable label (typically the branch name or change id)
+    pub label: String,
+    /// Current HEAD commit (short hash)
+    pub head: String,
+    /// Branch name (empty if detached)
+    pub branch: String,
+    /// Whether HEAD is detached
+    pub is_detached: bool,
+    /// Whether this is the main worktree
+    pub is_main: bool,
+    /// Whether a merge operation is in progress
+    pub is_merging: bool,
+    /// Whether this worktree has commits ahead of the base branch
+    pub has_commits_ahead: bool,
+    /// Merge conflict information (None if no conflicts)
+    pub merge_conflict: Option<RemoteWorktreeMergeConflict>,
+}
+
+/// Merge conflict details for a remote worktree
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RemoteWorktreeMergeConflict {
+    /// List of files with merge conflicts
+    pub conflict_files: Vec<String>,
+}
+
+impl From<crate::tui::types::WorktreeInfo> for RemoteWorktreeInfo {
+    fn from(wt: crate::tui::types::WorktreeInfo) -> Self {
+        let label = if wt.branch.is_empty() {
+            format!("detached@{}", &wt.head[..7.min(wt.head.len())])
+        } else {
+            wt.branch.clone()
+        };
+        Self {
+            path: wt.path.to_string_lossy().to_string(),
+            label,
+            head: wt.head,
+            branch: wt.branch,
+            is_detached: wt.is_detached,
+            is_main: wt.is_main,
+            is_merging: wt.is_merging,
+            has_commits_ahead: wt.has_commits_ahead,
+            merge_conflict: wt.merge_conflict.map(|mc| RemoteWorktreeMergeConflict {
+                conflict_files: mc.conflict_files,
+            }),
+        }
+    }
+}
+
 /// A state update message received over WebSocket
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteStateUpdate {
     /// Full state snapshot (sent on connect or full refresh)
-    FullState { projects: Vec<RemoteProject> },
+    FullState {
+        projects: Vec<RemoteProject>,
+        /// Per-project worktree information (project_id -> worktrees)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktrees: Option<std::collections::HashMap<String, Vec<RemoteWorktreeInfo>>>,
+    },
     /// Incremental update for a single change
     ChangeUpdate { change: RemoteChange },
     /// A change was removed
@@ -114,7 +177,7 @@ mod tests {
 
         let update: RemoteStateUpdate = serde_json::from_str(&json).unwrap();
         match update {
-            RemoteStateUpdate::FullState { projects } => {
+            RemoteStateUpdate::FullState { projects, .. } => {
                 assert_eq!(projects.len(), 1);
                 assert_eq!(projects[0].id, "proj-1");
             }
@@ -245,6 +308,150 @@ mod tests {
                 assert_eq!(decoded_entry.timestamp, entry.timestamp);
             }
             _ => panic!("Expected Log variant"),
+        }
+    }
+
+    /// Verify RemoteWorktreeInfo conversion from WorktreeInfo.
+    #[test]
+    fn test_remote_worktree_info_from_worktree_info() {
+        let wt = crate::tui::types::WorktreeInfo {
+            path: std::path::PathBuf::from("/repo/wt1"),
+            head: "abc123def456".to_string(),
+            branch: "feature-1".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: true,
+            is_merging: false,
+        };
+
+        let remote: RemoteWorktreeInfo = wt.into();
+        assert_eq!(remote.path, "/repo/wt1");
+        assert_eq!(remote.label, "feature-1");
+        assert_eq!(remote.head, "abc123def456");
+        assert_eq!(remote.branch, "feature-1");
+        assert!(!remote.is_detached);
+        assert!(!remote.is_main);
+        assert!(remote.has_commits_ahead);
+        assert!(remote.merge_conflict.is_none());
+    }
+
+    /// Verify RemoteWorktreeInfo conversion for detached HEAD.
+    #[test]
+    fn test_remote_worktree_info_detached_head() {
+        let wt = crate::tui::types::WorktreeInfo {
+            path: std::path::PathBuf::from("/repo"),
+            head: "abc1234".to_string(),
+            branch: "".to_string(),
+            is_detached: true,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: false,
+            is_merging: false,
+        };
+
+        let remote: RemoteWorktreeInfo = wt.into();
+        assert_eq!(remote.label, "detached@abc1234");
+        assert!(remote.is_detached);
+    }
+
+    /// Verify RemoteWorktreeInfo conversion with merge conflicts.
+    #[test]
+    fn test_remote_worktree_info_with_conflicts() {
+        let wt = crate::tui::types::WorktreeInfo {
+            path: std::path::PathBuf::from("/repo/wt1"),
+            head: "abc123".to_string(),
+            branch: "feature-1".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: Some(crate::tui::types::MergeConflictInfo {
+                conflict_files: vec!["file1.rs".to_string(), "file2.rs".to_string()],
+            }),
+            has_commits_ahead: true,
+            is_merging: false,
+        };
+
+        let remote: RemoteWorktreeInfo = wt.into();
+        assert!(remote.merge_conflict.is_some());
+        let conflict = remote.merge_conflict.unwrap();
+        assert_eq!(conflict.conflict_files.len(), 2);
+        assert_eq!(conflict.conflict_files[0], "file1.rs");
+    }
+
+    /// Verify RemoteWorktreeInfo serialization round-trip.
+    #[test]
+    fn test_remote_worktree_info_serialization_round_trip() {
+        let info = RemoteWorktreeInfo {
+            path: "/repo/wt1".to_string(),
+            label: "feature-1".to_string(),
+            head: "abc123".to_string(),
+            branch: "feature-1".to_string(),
+            is_detached: false,
+            is_main: false,
+            is_merging: false,
+            has_commits_ahead: true,
+            merge_conflict: None,
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let decoded: RemoteWorktreeInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, info);
+    }
+
+    /// Verify FullState with worktrees field serialization.
+    #[test]
+    fn test_full_state_with_worktrees() {
+        let mut worktrees_map = std::collections::HashMap::new();
+        worktrees_map.insert(
+            "proj-1".to_string(),
+            vec![RemoteWorktreeInfo {
+                path: "/repo/wt1".to_string(),
+                label: "main".to_string(),
+                head: "abc123".to_string(),
+                branch: "main".to_string(),
+                is_detached: false,
+                is_main: true,
+                is_merging: false,
+                has_commits_ahead: false,
+                merge_conflict: None,
+            }],
+        );
+
+        let update = RemoteStateUpdate::FullState {
+            projects: vec![],
+            worktrees: Some(worktrees_map),
+        };
+
+        let json = serde_json::to_string(&update).unwrap();
+        assert!(json.contains("worktrees"));
+
+        let decoded: RemoteStateUpdate = serde_json::from_str(&json).unwrap();
+        match decoded {
+            RemoteStateUpdate::FullState { worktrees, .. } => {
+                assert!(worktrees.is_some());
+                let wts = worktrees.unwrap();
+                assert_eq!(wts.len(), 1);
+                assert!(wts.contains_key("proj-1"));
+            }
+            _ => panic!("Expected FullState"),
+        }
+    }
+
+    /// Verify FullState without worktrees field (backward compatibility).
+    #[test]
+    fn test_full_state_without_worktrees_backward_compatible() {
+        // Old-style JSON without worktrees field should still deserialize
+        let json = r#"{
+            "type": "full_state",
+            "projects": []
+        }"#;
+
+        let update: RemoteStateUpdate = serde_json::from_str(json).unwrap();
+        match update {
+            RemoteStateUpdate::FullState { worktrees, .. } => {
+                assert!(worktrees.is_none());
+            }
+            _ => panic!("Expected FullState"),
         }
     }
 

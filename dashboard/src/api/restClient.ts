@@ -2,7 +2,7 @@
  * REST API Client for Conflux Server
  */
 
-import { RemoteProject } from './types';
+import { RemoteProject, WorktreeInfo } from './types';
 
 const API_BASE = '/api/v1';
 
@@ -85,5 +85,60 @@ export async function addProject(remoteUrl: string, branch: string): Promise<voi
   return fetchAPI('/projects', {
     method: 'POST',
     body: JSON.stringify({ remote_url: remoteUrl, branch }),
+  });
+}
+
+/**
+ * List worktrees for a project
+ */
+export async function listWorktrees(projectId: string): Promise<WorktreeInfo[]> {
+  return fetchAPI(`/projects/${projectId}/worktrees`, { method: 'GET' });
+}
+
+/**
+ * Create a new worktree for a project
+ */
+export async function createWorktree(
+  projectId: string,
+  changeId: string,
+): Promise<WorktreeInfo> {
+  return fetchAPI(`/projects/${projectId}/worktrees/create`, {
+    method: 'POST',
+    body: JSON.stringify({ change_id: changeId }),
+  });
+}
+
+/**
+ * Delete a worktree by branch name
+ */
+export async function deleteWorktree(
+  projectId: string,
+  branchName: string,
+): Promise<void> {
+  return fetchAPI(`/projects/${projectId}/worktrees/delete`, {
+    method: 'POST',
+    body: JSON.stringify({ branch_name: branchName }),
+  });
+}
+
+/**
+ * Merge a worktree branch into the base branch
+ */
+export async function mergeWorktree(
+  projectId: string,
+  branchName: string,
+): Promise<void> {
+  return fetchAPI(`/projects/${projectId}/worktrees/merge`, {
+    method: 'POST',
+    body: JSON.stringify({ branch_name: branchName }),
+  });
+}
+
+/**
+ * Refresh worktrees (re-scan from git)
+ */
+export async function refreshWorktrees(projectId: string): Promise<WorktreeInfo[]> {
+  return fetchAPI(`/projects/${projectId}/worktrees/refresh`, {
+    method: 'POST',
   });
 }

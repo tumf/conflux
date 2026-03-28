@@ -1,10 +1,11 @@
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => {
-  const proxyTarget = process.env.VITE_API_PROXY_TARGET;
+  const env = loadEnv(mode, __dirname, 'CFLX_');
+  const proxyTarget = env.CFLX_API_PROXY_TARGET;
 
   return {
     plugins: [react()],
@@ -18,9 +19,9 @@ export default defineConfig(({ mode }) => {
       sourcemap: false,
     },
     base: proxyTarget ? '/' : '/dashboard/',
-    ...(proxyTarget && {
-      server: {
-        allowedHosts: true,
+    server: {
+      allowedHosts: true,
+      ...(proxyTarget && {
         proxy: {
           '/api': {
             target: proxyTarget,
@@ -29,7 +30,7 @@ export default defineConfig(({ mode }) => {
             ws: true,
           },
         },
-      },
-    }),
+      }),
+    },
   };
 })

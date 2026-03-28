@@ -152,7 +152,7 @@ mod tests {
         let msg = recv_with_timeout(&mut rx, 3, "full_state").await;
 
         match msg {
-            super::super::types::RemoteStateUpdate::FullState { projects } => {
+            super::super::types::RemoteStateUpdate::FullState { projects, .. } => {
                 assert_eq!(projects.len(), 1);
                 assert_eq!(projects[0].id, "proj-1");
                 assert_eq!(projects[0].changes.len(), 1);
