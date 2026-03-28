@@ -21,6 +21,7 @@ export class WebSocketClient {
     onError?: (error: Error) => void;
   } = {};
 
+  private connectAborted = false;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private reconnectDelays = [1000, 2000, 4000, 8000, 16000]; // ms, then max 30s
@@ -39,9 +40,17 @@ export class WebSocketClient {
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
+        this.connectAborted = false;
         this.ws = new WebSocket(this.url);
 
         this.ws.onopen = () => {
+          if (this.connectAborted) {
+            // disconnect() was called while CONNECTING; close cleanly now
+            this.ws?.close();
+            this.ws = null;
+            resolve();
+            return;
+          }
           this.reconnectAttempts = 0;
           this.notifyConnectionChange('connected');
           this.startPingTimer();
@@ -87,6 +96,8 @@ export class WebSocketClient {
    * Disconnect from the WebSocket server
    */
   disconnect(): void {
+    this.connectAborted = true;
+
     if (this.reconnectTimeoutId !== null) {
       clearTimeout(this.reconnectTimeoutId);
       this.reconnectTimeoutId = null;
@@ -96,11 +107,22 @@ export class WebSocketClient {
       this.pingTimeoutId = null;
     }
     if (this.ws) {
+      const { readyState } = this.ws;
+      // Suppress reconnection and error handlers regardless of state
       this.ws.onerror = null;
       this.ws.onclose = null;
       this.ws.onmessage = null;
-      this.ws.close();
-      this.ws = null;
+
+      if (readyState === WebSocket.CONNECTING) {
+        // Do NOT call close() here — it would trigger "closed before established"
+        // The onopen handler will see connectAborted and close cleanly
+      } else if (readyState === WebSocket.OPEN) {
+        this.ws.close();
+        this.ws = null;
+      } else {
+        // CLOSING or CLOSED — no action needed
+        this.ws = null;
+      }
     }
     this.notifyConnectionChange('disconnected');
   }
