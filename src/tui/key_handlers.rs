@@ -470,9 +470,14 @@ pub async fn handle_key_event(
         (KeyCode::Char('x'), _) => {
             // Toggle all marks in Changes view.
             // Eligibility and mode constraints are enforced in AppState::toggle_all_marks.
+            // In Running mode, queue commands (AddToQueue/RemoveFromQueue) are emitted
+            // for eligible NotQueued/Queued rows, matching single-row Space semantics.
             use crate::tui::types::ViewMode;
             if ctx.app.view_mode == ViewMode::Changes {
-                ctx.app.toggle_all_marks();
+                let commands = ctx.app.toggle_all_marks();
+                for cmd in commands {
+                    let _ = ctx.cmd_tx.send(cmd).await;
+                }
             }
         }
 
