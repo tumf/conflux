@@ -41,6 +41,7 @@ function App() {
     onStateUpdate: (state) => store.setFullState(state),
     onLogEntry: (entry) => store.appendLog(entry),
     onConnectionChange: (status) => store.setConnectionStatus(status),
+    onLogEntry: (entry) => store.appendLog(entry),
     onError: (error) => {
       console.error('WebSocket error:', error);
       toast.error(`Connection error: ${error.message}`);

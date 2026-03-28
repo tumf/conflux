@@ -13,6 +13,7 @@ interface WSMessage {
   /** Per-project worktree information */
   worktrees?: FullState['worktrees'];
   data?: FullState;
+  /** Log entry payload (when type === 'log') */
   entry?: RemoteLogEntry;
 }
 
