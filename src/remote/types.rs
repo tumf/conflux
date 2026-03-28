@@ -26,8 +26,18 @@ pub struct RemoteChange {
 pub struct RemoteProject {
     /// Project identifier (e.g., repo URL + branch)
     pub id: String,
-    /// Human-readable project name
+    /// Human-readable project name (format: "repo@branch")
     pub name: String,
+    /// Repository name (extracted from remote_url)
+    pub repo: String,
+    /// Branch name
+    pub branch: String,
+    /// Execution status: "idle", "running", or "stopped"
+    pub status: String,
+    /// Whether the project is currently executing
+    pub is_busy: bool,
+    /// Error message, if any
+    pub error: Option<String>,
     /// Changes belonging to this project
     pub changes: Vec<RemoteChange>,
 }

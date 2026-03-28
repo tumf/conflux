@@ -17,7 +17,7 @@ export function ChangesPanel({ changes, selectedProjectId }: ChangesPanelProps) 
   }
 
   const projectChanges = changes.filter(
-    (change) => change.project_id === selectedProjectId,
+    (change) => change.project === selectedProjectId,
   );
 
   if (projectChanges.length === 0) {
