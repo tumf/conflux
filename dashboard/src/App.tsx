@@ -3,9 +3,12 @@ import { Toaster, toast } from 'sonner';
 import { Header } from './components/Header';
 import { ProjectsPanel } from './components/ProjectsPanel';
 import { ChangesPanel } from './components/ChangesPanel';
+import { WorktreesPanel } from './components/WorktreesPanel';
 import { LogsPanel } from './components/LogsPanel';
 import { DeleteDialog } from './components/DeleteDialog';
+import { DeleteWorktreeDialog } from './components/DeleteWorktreeDialog';
 import { AddProjectDialog } from './components/AddProjectDialog';
+import { CreateWorktreeDialog } from './components/CreateWorktreeDialog';
 import { useAppStore } from './store/useAppStore';
 import { useWebSocket } from './hooks/useWebSocket';
 import {
@@ -14,17 +17,25 @@ import {
   gitSync,
   deleteProject as deleteProjectAPI,
   addProject as addProjectAPI,
+  createWorktree as createWorktreeAPI,
+  deleteWorktree as deleteWorktreeAPI,
+  mergeWorktree as mergeWorktreeAPI,
+  refreshWorktrees as refreshWorktreesAPI,
   APIError,
 } from './api/restClient';
 
-type TabName = 'projects' | 'changes' | 'logs';
+type TabName = 'projects' | 'changes' | 'worktrees' | 'logs';
+type DesktopCenterTab = 'changes' | 'worktrees';
 
 function App() {
   const store = useAppStore();
   const [activeTab, setActiveTab] = useState<TabName>('projects');
+  const [desktopCenterTab, setDesktopCenterTab] = useState<DesktopCenterTab>('changes');
   const [isLoading, setIsLoading] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
   const [isAddProjectOpen, setIsAddProjectOpen] = useState(false);
+  const [isCreateWorktreeOpen, setIsCreateWorktreeOpen] = useState(false);
+  const [deleteWorktreeTarget, setDeleteWorktreeTarget] = useState<string | null>(null);
 
   useWebSocket({
     onStateUpdate: (state) => store.setFullState(state),
@@ -102,11 +113,86 @@ function App() {
     }
   }, []);
 
+  // Worktree handlers
+  const handleCreateWorktree = useCallback(async (changeId: string) => {
+    const projectId = store.state.selectedProjectId;
+    if (!projectId) return;
+    setIsLoading(true);
+    try {
+      await createWorktreeAPI(projectId, changeId);
+      toast.success('Worktree created');
+      setIsCreateWorktreeOpen(false);
+      // Refresh worktree list
+      const updated = await refreshWorktreesAPI(projectId);
+      store.setWorktrees(projectId, updated);
+    } catch (err) {
+      toast.error(`Failed to create worktree: ${err instanceof APIError ? err.message : String(err)}`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [store]);
+
+  const handleDeleteWorktreeClick = useCallback((branchName: string) => {
+    setDeleteWorktreeTarget(branchName);
+  }, []);
+
+  const handleDeleteWorktreeConfirm = useCallback(async () => {
+    const projectId = store.state.selectedProjectId;
+    if (!projectId || !deleteWorktreeTarget) return;
+    setIsLoading(true);
+    try {
+      await deleteWorktreeAPI(projectId, deleteWorktreeTarget);
+      toast.success('Worktree deleted');
+      setDeleteWorktreeTarget(null);
+      // Refresh worktree list
+      const updated = await refreshWorktreesAPI(projectId);
+      store.setWorktrees(projectId, updated);
+    } catch (err) {
+      toast.error(`Failed to delete worktree: ${err instanceof APIError ? err.message : String(err)}`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [store, deleteWorktreeTarget]);
+
+  const handleMergeWorktree = useCallback(async (branchName: string) => {
+    const projectId = store.state.selectedProjectId;
+    if (!projectId) return;
+    setIsLoading(true);
+    try {
+      await mergeWorktreeAPI(projectId, branchName);
+      toast.success('Branch merged successfully');
+      // Refresh worktree list
+      const updated = await refreshWorktreesAPI(projectId);
+      store.setWorktrees(projectId, updated);
+    } catch (err) {
+      toast.error(`Failed to merge: ${err instanceof APIError ? err.message : String(err)}`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [store]);
+
+  const handleRefreshWorktrees = useCallback(async () => {
+    const projectId = store.state.selectedProjectId;
+    if (!projectId) return;
+    setIsLoading(true);
+    try {
+      const updated = await refreshWorktreesAPI(projectId);
+      store.setWorktrees(projectId, updated);
+    } catch (err) {
+      toast.error(`Failed to refresh worktrees: ${err instanceof APIError ? err.message : String(err)}`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [store]);
+
   const selectedProject = store.state.projects.find(
     (p) => p.id === store.state.selectedProjectId,
   );
   const selectedProjectLogs = store.state.selectedProjectId
     ? store.state.logsByProjectId[store.state.selectedProjectId] || []
+    : [];
+  const selectedProjectWorktrees = store.state.selectedProjectId
+    ? store.state.worktreesByProjectId[store.state.selectedProjectId] || []
     : [];
 
   const panelProps = {
@@ -151,14 +237,39 @@ function App() {
 
           <div className="flex flex-1 overflow-hidden">
             <div className="flex w-72 shrink-0 flex-col border-r border-[#27272a]">
-              <div className="border-b border-[#27272a] px-3 py-2">
-                <span className="text-xs font-medium text-[#52525b] uppercase tracking-wider">Changes</span>
+              {/* Tab switcher for Changes/Worktrees */}
+              <div className="flex border-b border-[#27272a]">
+                {(['changes', 'worktrees'] as DesktopCenterTab[]).map((tab) => (
+                  <button
+                    key={tab}
+                    onClick={() => setDesktopCenterTab(tab)}
+                    className={`flex-1 py-2 text-xs font-medium transition-colors ${
+                      desktopCenterTab === tab
+                        ? 'border-b-2 border-[#6366f1] text-[#fafafa]'
+                        : 'text-[#52525b] hover:text-[#a1a1aa]'
+                    }`}
+                  >
+                    {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                  </button>
+                ))}
               </div>
               <div className="flex-1 overflow-y-auto">
-                <ChangesPanel
-                  changes={store.state.changes}
-                  selectedProjectId={store.state.selectedProjectId}
-                />
+                {desktopCenterTab === 'changes' ? (
+                  <ChangesPanel
+                    changes={store.state.changes}
+                    selectedProjectId={store.state.selectedProjectId}
+                  />
+                ) : (
+                  <WorktreesPanel
+                    worktrees={selectedProjectWorktrees}
+                    selectedProjectId={store.state.selectedProjectId}
+                    onMerge={handleMergeWorktree}
+                    onDelete={handleDeleteWorktreeClick}
+                    onCreate={() => setIsCreateWorktreeOpen(true)}
+                    onRefresh={handleRefreshWorktrees}
+                    isLoading={isLoading}
+                  />
+                )}
               </div>
             </div>
 
@@ -179,7 +290,7 @@ function App() {
         {/* Mobile layout */}
         <div className="flex flex-1 flex-col md:hidden">
           <div className="flex border-b border-[#27272a]">
-            {(['projects', 'changes', 'logs'] as TabName[]).map((tab) => (
+            {(['projects', 'changes', 'worktrees', 'logs'] as TabName[]).map((tab) => (
               <button
                 key={tab}
                 onClick={() => setActiveTab(tab)}
@@ -202,6 +313,17 @@ function App() {
                 selectedProjectId={store.state.selectedProjectId}
               />
             )}
+            {activeTab === 'worktrees' && (
+              <WorktreesPanel
+                worktrees={selectedProjectWorktrees}
+                selectedProjectId={store.state.selectedProjectId}
+                onMerge={handleMergeWorktree}
+                onDelete={handleDeleteWorktreeClick}
+                onCreate={() => setIsCreateWorktreeOpen(true)}
+                onRefresh={handleRefreshWorktrees}
+                isLoading={isLoading}
+              />
+            )}
             {activeTab === 'logs' && (
               <LogsPanel
                 logs={selectedProjectLogs}
@@ -220,10 +342,25 @@ function App() {
         isLoading={isLoading}
       />
 
+      <DeleteWorktreeDialog
+        isOpen={deleteWorktreeTarget !== null}
+        branchName={deleteWorktreeTarget || ''}
+        onConfirm={handleDeleteWorktreeConfirm}
+        onCancel={() => setDeleteWorktreeTarget(null)}
+        isLoading={isLoading}
+      />
+
       <AddProjectDialog
         isOpen={isAddProjectOpen}
         onSubmit={handleAddProject}
         onCancel={() => setIsAddProjectOpen(false)}
+        isLoading={isLoading}
+      />
+
+      <CreateWorktreeDialog
+        isOpen={isCreateWorktreeOpen}
+        onSubmit={handleCreateWorktree}
+        onCancel={() => setIsCreateWorktreeOpen(false)}
         isLoading={isLoading}
       />
 

@@ -67,6 +67,7 @@ export class WebSocketClient {
         };
 
         this.ws.onerror = (event) => {
+          if (this.ws?.readyState === WebSocket.CLOSED || this.ws?.readyState === WebSocket.CLOSING) return;
           const error = new Error(`WebSocket error: ${event}`);
           this.listeners.onError?.(error);
           console.error('WebSocket error:', event);
@@ -95,6 +96,9 @@ export class WebSocketClient {
       this.pingTimeoutId = null;
     }
     if (this.ws) {
+      this.ws.onerror = null;
+      this.ws.onclose = null;
+      this.ws.onmessage = null;
       this.ws.close();
       this.ws = null;
     }
