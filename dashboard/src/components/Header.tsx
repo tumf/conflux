@@ -1,5 +1,6 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { ConnectionStatus } from '../api/wsClient';
+import { fetchVersion } from '../api/restClient';
 
 interface HeaderProps {
   connectionStatus: ConnectionStatus;
@@ -13,6 +14,15 @@ const statusConfig: Record<ConnectionStatus, { color: string; label: string }> =
 
 export function Header({ connectionStatus }: HeaderProps) {
   const { color, label } = statusConfig[connectionStatus];
+  const [version, setVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchVersion()
+      .then((data) => setVersion(data.version))
+      .catch(() => {
+        // Silently ignore fetch failures — version is not displayed
+      });
+  }, []);
 
   return (
     <header className="border-b border-[#27272a] bg-[#111113] px-5 py-3">
@@ -24,6 +34,9 @@ export function Header({ connectionStatus }: HeaderProps) {
             </svg>
           </div>
           <span className="text-sm font-semibold tracking-tight text-[#fafafa]">Conflux</span>
+          {version && (
+            <span className="text-xs text-[#52525b]">{version}</span>
+          )}
         </div>
         <div className="flex items-center gap-1.5">
           <div className={`size-1.5 rounded-full ${color}`} aria-hidden="true" />

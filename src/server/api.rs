@@ -142,6 +142,19 @@ fn error_response(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(ErrorResponse { error: msg.into() })).into_response()
 }
 
+// ─────────────────────────────── /api/v1/version ──────────────────────────────
+
+/// GET /api/v1/version - return backend version string
+pub async fn get_version() -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "version": format!("v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER"))
+        })),
+    )
+        .into_response()
+}
+
 // ─────────────────────────────── /api/v1/projects ─────────────────────────────
 
 /// GET /api/v1/projects - list all projects
@@ -1903,6 +1916,7 @@ pub fn build_router(app_state: AppState) -> Router {
 
     let public_api_routes = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/version", get(get_version))
         .with_state(app_state);
 
     let api_routes = Router::new()
