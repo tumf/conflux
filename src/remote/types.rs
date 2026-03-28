@@ -28,6 +28,17 @@ pub struct RemoteProject {
     pub id: String,
     /// Human-readable project name
     pub name: String,
+    /// Repository name derived from the remote URL (without .git suffix)
+    pub repo: String,
+    /// Branch name
+    pub branch: String,
+    /// Current project status: "idle", "running", "stopped"
+    pub status: String,
+    /// Whether the project is currently busy (running)
+    pub is_busy: bool,
+    /// Error message if the project is in an error state
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Changes belonging to this project
     pub changes: Vec<RemoteChange>,
 }

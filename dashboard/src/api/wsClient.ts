@@ -2,14 +2,16 @@
  * WebSocket Client for Real-time State Updates
  */
 
-import { FullState } from './types';
+import { FullState, RemoteLogEntry } from './types';
 
 export type ConnectionStatus = 'connected' | 'reconnecting' | 'disconnected';
 
 interface WSMessage {
-  type: 'full_state' | 'ping' | 'pong';
+  type: 'full_state' | 'log' | 'change_update' | 'ping' | 'pong';
   projects?: FullState['projects'];
+  worktrees?: FullState['worktrees'];
   data?: FullState;
+  entry?: RemoteLogEntry;
 }
 
 export class WebSocketClient {
@@ -17,6 +19,7 @@ export class WebSocketClient {
   private url: string;
   private listeners: {
     onStateUpdate?: (state: FullState) => void;
+    onLogEntry?: (entry: RemoteLogEntry) => void;
     onConnectionChange?: (status: ConnectionStatus) => void;
     onError?: (error: Error) => void;
   } = {};
@@ -53,13 +56,14 @@ export class WebSocketClient {
             const message = JSON.parse(event.data);
             console.debug('WS message received:', message.type);
 
-            if (message.type === 'full_state' || message.type === 'change_update' || message.type === 'log') {
-              // Handle full_state: either message.data (old format) or direct fields (new format)
-              if (message.type === 'full_state') {
-                const state: FullState = message.data ?? { projects: message.projects ?? [] };
-                this.listeners.onStateUpdate?.(state);
-              }
-              // Ignore other types for now - just log them
+            if (message.type === 'full_state') {
+              const state: FullState = message.data ?? {
+                projects: message.projects ?? [],
+                worktrees: message.worktrees,
+              };
+              this.listeners.onStateUpdate?.(state);
+            } else if (message.type === 'log' && message.entry) {
+              this.listeners.onLogEntry?.(message.entry);
             }
           } catch (err) {
             console.error('Failed to parse WS message:', err, 'raw:', event.data?.substring?.(0, 100));
@@ -109,11 +113,13 @@ export class WebSocketClient {
    * Register a listener
    */
   on(
-    event: 'stateUpdate' | 'connectionChange' | 'error',
+    event: 'stateUpdate' | 'logEntry' | 'connectionChange' | 'error',
     callback: (data: any) => void,
   ): void {
     if (event === 'stateUpdate') {
       this.listeners.onStateUpdate = callback;
+    } else if (event === 'logEntry') {
+      this.listeners.onLogEntry = callback;
     } else if (event === 'connectionChange') {
       this.listeners.onConnectionChange = callback;
     } else if (event === 'error') {

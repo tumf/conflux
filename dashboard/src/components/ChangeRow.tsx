@@ -36,7 +36,7 @@ export function ChangeRow({ change }: ChangeRowProps) {
       : 0;
 
   const statusDisplay =
-    change.iteration_number > 0
+    change.iteration_number != null && change.iteration_number > 0
       ? `${change.status}:${change.iteration_number}`
       : change.status;
 
@@ -69,8 +69,8 @@ export function ChangeRow({ change }: ChangeRowProps) {
         </div>
       </div>
 
-      {change.error && (
-        <p className="text-xs text-[#ef4444]">{change.error}</p>
+      {change.status === 'error' && (
+        <p className="text-xs text-[#ef4444]">Error</p>
       )}
     </div>
   );
