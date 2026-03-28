@@ -378,7 +378,7 @@ async fn run_tui_loop(
             while let Some(update) = ws_msg_rx.recv().await {
                 use crate::remote::types::RemoteStateUpdate;
                 match update {
-                    RemoteStateUpdate::FullState { projects } => {
+                    RemoteStateUpdate::FullState { projects, .. } => {
                         // Update the project id->name mapping
                         project_name_map.clear();
                         for proj in &projects {
