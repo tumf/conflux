@@ -1,8 +1,3 @@
-/**
- * ChangeRow Component
- * Displays a single change with progress and status
- */
-
 import React from 'react';
 import { RemoteChange } from '../api/types';
 
@@ -10,25 +5,28 @@ interface ChangeRowProps {
   change: RemoteChange;
 }
 
-const getStatusColor = (status: string): string => {
-  switch (status) {
-    case 'idle':
-      return 'bg-slate-600';
-    case 'queued':
-      return 'bg-blue-600';
-    case 'applying':
-    case 'accepting':
-    case 'archiving':
-    case 'resolving':
-      return 'bg-amber-600';
-    case 'archived':
-    case 'merged':
-      return 'bg-green-600';
-    case 'error':
-      return 'bg-red-600';
-    default:
-      return 'bg-gray-600';
-  }
+const statusConfig: Record<string, { color: string; bg: string }> = {
+  idle: { color: 'text-[#71717a]', bg: 'bg-[#27272a]' },
+  queued: { color: 'text-[#3b82f6]', bg: 'bg-[#1e3a5f]/50' },
+  applying: { color: 'text-[#f59e0b]', bg: 'bg-[#451a03]/50' },
+  accepting: { color: 'text-[#f59e0b]', bg: 'bg-[#451a03]/50' },
+  archiving: { color: 'text-[#f59e0b]', bg: 'bg-[#451a03]/50' },
+  resolving: { color: 'text-[#f59e0b]', bg: 'bg-[#451a03]/50' },
+  archived: { color: 'text-[#22c55e]', bg: 'bg-[#052e16]/50' },
+  merged: { color: 'text-[#22c55e]', bg: 'bg-[#052e16]/50' },
+  error: { color: 'text-[#ef4444]', bg: 'bg-[#450a0a]/50' },
+};
+
+const progressBarColor: Record<string, string> = {
+  idle: 'bg-[#3f3f46]',
+  queued: 'bg-[#3b82f6]',
+  applying: 'bg-[#f59e0b]',
+  accepting: 'bg-[#f59e0b]',
+  archiving: 'bg-[#f59e0b]',
+  resolving: 'bg-[#f59e0b]',
+  archived: 'bg-[#22c55e]',
+  merged: 'bg-[#22c55e]',
+  error: 'bg-[#ef4444]',
 };
 
 export function ChangeRow({ change }: ChangeRowProps) {
@@ -42,25 +40,26 @@ export function ChangeRow({ change }: ChangeRowProps) {
       ? `${change.status}:${change.iteration_number}`
       : change.status;
 
+  const cfg = statusConfig[change.status] ?? statusConfig.idle;
+  const barColor = progressBarColor[change.status] ?? progressBarColor.idle;
+
   return (
-    <div className="space-y-2 rounded bg-color-surface-secondary p-3">
-      <div className="flex items-center justify-between">
-        <h4 className="font-semibold text-color-text">{change.id}</h4>
-        <span className={`rounded px-2 py-1 text-xs font-bold text-white ${getStatusColor(change.status)}`}>
+    <div className="space-y-2 rounded-md border border-[#27272a] bg-[#111113] p-3">
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate font-mono text-xs text-[#a1a1aa]">{change.id}</span>
+        <span className={`shrink-0 rounded px-1.5 py-0.5 text-xs font-medium ${cfg.color} ${cfg.bg}`}>
           {statusDisplay}
         </span>
       </div>
 
       <div className="space-y-1">
-        <div className="flex items-center justify-between text-sm">
-          <span className="text-color-text-secondary">Progress</span>
-          <span className="text-color-text">
-            {change.completed_tasks}/{change.total_tasks}
-          </span>
+        <div className="flex justify-between text-xs text-[#52525b]">
+          <span>{change.completed_tasks}/{change.total_tasks} tasks</span>
+          <span>{progress}%</span>
         </div>
-        <div className="h-2 w-full rounded bg-color-border">
+        <div className="h-1 w-full overflow-hidden rounded-full bg-[#27272a]">
           <div
-            className="h-2 rounded bg-color-accent transition-all"
+            className={`h-1 rounded-full transition-all duration-300 ${barColor}`}
             style={{ width: `${progress}%` }}
             role="progressbar"
             aria-valuenow={progress}
@@ -71,7 +70,7 @@ export function ChangeRow({ change }: ChangeRowProps) {
       </div>
 
       {change.error && (
-        <p className="text-sm text-color-error">{change.error}</p>
+        <p className="text-xs text-[#ef4444]">{change.error}</p>
       )}
     </div>
   );

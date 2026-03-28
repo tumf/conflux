@@ -1,8 +1,3 @@
-/**
- * ProjectsPanel Component
- * Lists all projects with project cards
- */
-
 import React from 'react';
 import { RemoteProject } from '../api/types';
 import { ProjectCard } from './ProjectCard';
@@ -31,13 +26,13 @@ export function ProjectsPanel({
   if (projects.length === 0) {
     return (
       <div className="flex flex-1 items-center justify-center p-8">
-        <p className="text-color-text-secondary">No projects configured</p>
+        <p className="text-sm text-[#52525b]">No projects configured</p>
       </div>
     );
   }
 
   return (
-    <div className="flex-1 space-y-3 p-4">
+    <div className="space-y-2 p-3">
       {projects.map((project) => (
         <ProjectCard
           key={project.id}

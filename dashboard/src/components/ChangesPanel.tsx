@@ -1,8 +1,3 @@
-/**
- * ChangesPanel Component
- * Displays changes for the selected project
- */
-
 import React from 'react';
 import { RemoteChange } from '../api/types';
 import { ChangeRow } from './ChangeRow';
@@ -16,7 +11,7 @@ export function ChangesPanel({ changes, selectedProjectId }: ChangesPanelProps) 
   if (!selectedProjectId) {
     return (
       <div className="flex flex-1 items-center justify-center p-8">
-        <p className="text-color-text-secondary">Select a project to view changes</p>
+        <p className="text-sm text-[#52525b]">Select a project to view changes</p>
       </div>
     );
   }
@@ -28,13 +23,13 @@ export function ChangesPanel({ changes, selectedProjectId }: ChangesPanelProps) 
   if (projectChanges.length === 0) {
     return (
       <div className="flex flex-1 items-center justify-center p-8">
-        <p className="text-color-text-secondary">No changes for this project</p>
+        <p className="text-sm text-[#52525b]">No changes</p>
       </div>
     );
   }
 
   return (
-    <div className="flex-1 space-y-2 p-4">
+    <div className="space-y-1.5 p-3">
       {projectChanges.map((change) => (
         <ChangeRow key={change.id} change={change} />
       ))}
