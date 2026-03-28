@@ -1210,30 +1210,31 @@ pub async fn execute_worktree_command(
             )
         })?;
 
-    // Execute command in worktree directory
-    let output = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(&req.command)
+    // Execute command in worktree directory via login shell ($SHELL -l -c)
+    // so user's PATH from .zprofile/.profile is available even when cflx
+    // is started from non-login environments (launchd, systemd, cron).
+    let mut shell_cmd = crate::shell_command::build_login_shell_command(&req.command);
+    shell_cmd
         .current_dir(&worktree.path)
-        .output()
-        .await
-        .map_err(|e| {
-            let duration_ms = start.elapsed().as_millis();
-            error!(
-                request_id = %request_id,
-                operation = "command",
-                worktree_name = %worktree_name,
-                error = %e,
-                duration_ms = duration_ms,
-                "Failed to execute command"
-            );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to execute command: {}", e),
-                }),
-            )
-        })?;
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let output = shell_cmd.output().await.map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "command",
+            worktree_name = %worktree_name,
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to execute command"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to execute command: {}", e),
+            }),
+        )
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
