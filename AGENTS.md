@@ -32,9 +32,12 @@ Conflux automates the OpenSpec change workflow (list → dependency analysis →
 cargo build                    # debug
 cargo build --release          # release
 
+# Build dashboard frontend (runs automatically during cargo build)
+cd dashboard && npm install && npm run build
+
 # Lint
 cargo fmt --check              # check formatting
-cargo fmt                      # apply formatting
+cargo fmt                       # apply formatting
 cargo clippy -- -D warnings    # lints with warnings as errors
 
 # Test

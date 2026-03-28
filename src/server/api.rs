@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{ws::Message, ws::WebSocket, ws::WebSocketUpgrade, Path, State},
-    http::{Request, StatusCode},
+    http::{header, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -1394,6 +1394,96 @@ async fn apply_control(
     }
 }
 
+// ─────────────────────────────── Dashboard handlers ────────────────────────────
+
+/// Dashboard index HTML - returns the built dashboard HTML file
+/// This handler serves the dashboard SPA. In production, Vite's `base: "/dashboard/"`
+/// directive ensures correct asset paths for nested routing.
+async fn dashboard_index() -> Response {
+    // The dashboard is built into dashboard/dist/index.html during cargo build
+    // We embed it as a static string for maximum portability
+    let html = include_str!("../../dashboard/dist/index.html");
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        )],
+        html,
+    )
+        .into_response()
+}
+
+/// Dashboard asset handler - serves CSS, JS, and other static files
+/// Vite generates assets with hashed filenames in the assets/ directory
+async fn dashboard_assets(Path(filename): Path<String>) -> Response {
+    // Map asset filenames to embedded content
+    let content_type = if filename.ends_with(".js") {
+        "application/javascript"
+    } else if filename.ends_with(".css") {
+        "text/css"
+    } else if filename.ends_with(".svg") {
+        "image/svg+xml"
+    } else if filename.ends_with(".json") {
+        "application/json"
+    } else {
+        "application/octet-stream"
+    };
+
+    // This simple approach requires manual asset mapping.
+    // For production, prefer a build.rs that generates asset routes dynamically.
+    let response = match filename.as_str() {
+        "index-BmQZulK5.css" => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
+            include_str!("../../dashboard/dist/assets/index-BmQZulK5.css"),
+        )
+            .into_response(),
+        "index-D3mkuSJD.js" => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
+            include_str!("../../dashboard/dist/assets/index-D3mkuSJD.js"),
+        )
+            .into_response(),
+        _ => {
+            error!("Dashboard asset not found: {}", filename);
+            (StatusCode::NOT_FOUND, "Asset not found").into_response()
+        }
+    };
+
+    response
+}
+
+/// Dashboard static files (favicon, icons, etc.)
+async fn dashboard_static(Path(filename): Path<String>) -> Response {
+    let content_type = if filename.ends_with(".svg") {
+        "image/svg+xml"
+    } else {
+        "application/octet-stream"
+    };
+
+    let response = match filename.as_str() {
+        "favicon.svg" => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
+            include_str!("../../dashboard/dist/favicon.svg"),
+        )
+            .into_response(),
+        "icons.svg" => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
+            include_str!("../../dashboard/dist/icons.svg"),
+        )
+            .into_response(),
+        _ => {
+            debug!("Dashboard static file not found: {}", filename);
+            (StatusCode::NOT_FOUND, "File not found").into_response()
+        }
+    };
+
+    response
+}
+
 // ─────────────────────────────── Router builder ────────────────────────────────
 
 /// Build the API v1 router with authentication middleware.
@@ -1415,7 +1505,18 @@ pub fn build_router(app_state: AppState) -> Router {
         ))
         .with_state(app_state);
 
-    Router::new().nest("/api/v1", api_routes)
+    // Dashboard routes (no authentication required)
+    let dashboard_routes = Router::new()
+        .route("/", get(dashboard_index))
+        .route("/assets/:path", get(dashboard_assets))
+        .route("/favicon.svg", get(dashboard_static))
+        .route("/icons.svg", get(dashboard_static))
+        .route("/:path", get(dashboard_index))
+        .fallback(get(dashboard_index));
+
+    Router::new()
+        .nest("/api/v1", api_routes)
+        .nest("/dashboard", dashboard_routes)
 }
 
 #[cfg(test)]
