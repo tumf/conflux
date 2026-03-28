@@ -9,6 +9,7 @@ import {
   FullState,
   WorktreeInfo,
   OrchestrationStatus,
+  FileBrowseContext,
 } from '../api/types';
 import { ConnectionStatus } from '../api/wsClient';
 
@@ -22,6 +23,8 @@ export interface AppState {
   syncAvailable: boolean;
   /** Global orchestration status */
   orchestrationStatus: OrchestrationStatus;
+  /** File browser context (change or worktree selection) */
+  fileBrowseContext: FileBrowseContext | null;
 }
 
 export type AppAction =
@@ -30,7 +33,8 @@ export type AppAction =
   | { type: 'SET_CONNECTION_STATUS'; payload: ConnectionStatus }
   | { type: 'SELECT_PROJECT'; payload: string | null }
   | { type: 'CLEAR_LOGS'; payload: string }
-  | { type: 'SET_WORKTREES'; payload: { projectId: string; worktrees: WorktreeInfo[] } };
+  | { type: 'SET_WORKTREES'; payload: { projectId: string; worktrees: WorktreeInfo[] } }
+  | { type: 'SET_FILE_BROWSE_CONTEXT'; payload: FileBrowseContext | null };
 
 const initialState: AppState = {
   projects: [],
@@ -40,6 +44,7 @@ const initialState: AppState = {
   worktreesByProjectId: {},
   syncAvailable: false,
   orchestrationStatus: 'idle',
+  fileBrowseContext: null,
 };
 
 export function appReducer(state: AppState, action: AppAction): AppState {
@@ -116,6 +121,13 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       };
     }
 
+    case 'SET_FILE_BROWSE_CONTEXT': {
+      return {
+        ...state,
+        fileBrowseContext: action.payload,
+      };
+    }
+
     default:
       return state;
   }
@@ -148,6 +160,10 @@ export function useAppStore() {
     dispatch({ type: 'SET_WORKTREES', payload: { projectId, worktrees } });
   }, []);
 
+  const setFileBrowseContext = useCallback((ctx: FileBrowseContext | null) => {
+    dispatch({ type: 'SET_FILE_BROWSE_CONTEXT', payload: ctx });
+  }, []);
+
   return {
     state,
     setFullState,
@@ -156,5 +172,6 @@ export function useAppStore() {
     selectProject,
     clearLogs,
     setWorktrees,
+    setFileBrowseContext,
   };
 }

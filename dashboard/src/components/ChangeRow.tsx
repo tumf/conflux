@@ -4,6 +4,8 @@ import { toggleChangeSelection } from '../api/restClient';
 
 interface ChangeRowProps {
   change: RemoteChange;
+  onClickChange?: (changeId: string) => void;
+  isSelected?: boolean;
 }
 
 const statusConfig: Record<string, { color: string; bg: string }> = {
@@ -30,7 +32,7 @@ const progressBarColor: Record<string, string> = {
   error: 'bg-[#ef4444]',
 };
 
-export function ChangeRow({ change }: ChangeRowProps) {
+export function ChangeRow({ change, onClickChange, isSelected }: ChangeRowProps) {
   const progress =
     change.total_tasks > 0
       ? Math.round((change.completed_tasks / change.total_tasks) * 100)
@@ -52,12 +54,19 @@ export function ChangeRow({ change }: ChangeRowProps) {
     [change.project, change.id],
   );
 
+  const handleRowClick = useCallback(() => {
+    onClickChange?.(change.id);
+  }, [change.id, onClickChange]);
+
   return (
     <div
-      className={`space-y-2 rounded-md border p-3 ${
-        change.selected
-          ? 'border-[#27272a] bg-[#111113]'
-          : 'border-[#27272a]/50 bg-[#111113]/50 opacity-60'
+      onClick={handleRowClick}
+      className={`space-y-2 rounded-md border p-3 cursor-pointer transition-colors ${
+        isSelected
+          ? 'border-[#6366f1] bg-[#1e1b4b]/30'
+          : change.selected
+            ? 'border-[#27272a] bg-[#111113] hover:border-[#3f3f46]'
+            : 'border-[#27272a]/50 bg-[#111113]/50 opacity-60 hover:border-[#3f3f46]'
       }`}
     >
       <div className="flex items-center justify-between gap-2">

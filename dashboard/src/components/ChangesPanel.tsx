@@ -5,9 +5,11 @@ import { ChangeRow } from './ChangeRow';
 interface ChangesPanelProps {
   projects: RemoteProject[];
   selectedProjectId: string | null;
+  onClickChange?: (changeId: string) => void;
+  selectedChangeId?: string | null;
 }
 
-export function ChangesPanel({ projects, selectedProjectId }: ChangesPanelProps) {
+export function ChangesPanel({ projects, selectedProjectId, onClickChange, selectedChangeId }: ChangesPanelProps) {
   if (!selectedProjectId) {
     return (
       <div className="flex flex-1 items-center justify-center p-8">
@@ -30,7 +32,12 @@ export function ChangesPanel({ projects, selectedProjectId }: ChangesPanelProps)
   return (
     <div className="space-y-1.5 p-3">
       {projectChanges.map((change) => (
-        <ChangeRow key={change.id} change={change} />
+        <ChangeRow
+          key={change.id}
+          change={change}
+          onClickChange={onClickChange}
+          isSelected={selectedChangeId === change.id}
+        />
       ))}
     </div>
   );

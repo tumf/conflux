@@ -88,3 +88,29 @@ export interface FullState {
   /** Global orchestration status */
   orchestration_status?: OrchestrationStatus;
 }
+
+// ─── File Viewer Types ───────────────────────────────────────────────────────
+
+/** A single entry in the file tree returned by the server */
+export interface FileTreeEntry {
+  name: string;
+  path: string;
+  type: 'file' | 'directory';
+  children?: FileTreeEntry[];
+}
+
+/** Response from the file content API */
+export interface FileContentResponse {
+  path: string;
+  content: string | null;
+  size: number;
+  truncated: boolean;
+  binary: boolean;
+}
+
+/** Context for the file browser: which root to browse */
+export interface FileBrowseContext {
+  type: 'change' | 'worktree';
+  changeId?: string;
+  worktreeBranch?: string;
+}

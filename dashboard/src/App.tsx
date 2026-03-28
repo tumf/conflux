@@ -6,6 +6,7 @@ import { ProjectsPanel } from './components/ProjectsPanel';
 import { ChangesPanel } from './components/ChangesPanel';
 import { WorktreesPanel } from './components/WorktreesPanel';
 import { LogsPanel } from './components/LogsPanel';
+import { FileViewPanel } from './components/FileViewPanel';
 import { DeleteDialog } from './components/DeleteDialog';
 import { DeleteWorktreeDialog } from './components/DeleteWorktreeDialog';
 import { AddProjectDialog } from './components/AddProjectDialog';
@@ -25,13 +26,15 @@ import {
   APIError,
 } from './api/restClient';
 
-type TabName = 'projects' | 'changes' | 'worktrees' | 'logs';
+type TabName = 'projects' | 'changes' | 'worktrees' | 'logs' | 'files';
 type DesktopCenterTab = 'changes' | 'worktrees';
+type DesktopRightTab = 'logs' | 'files';
 
 function App() {
   const store = useAppStore();
   const [activeTab, setActiveTab] = useState<TabName>('projects');
   const [desktopCenterTab, setDesktopCenterTab] = useState<DesktopCenterTab>('changes');
+  const [desktopRightTab, setDesktopRightTab] = useState<DesktopRightTab>('logs');
   const [isLoading, setIsLoading] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
   const [isAddProjectOpen, setIsAddProjectOpen] = useState(false);
@@ -177,6 +180,18 @@ function App() {
     }
   }, [store]);
 
+  const handleClickChange = useCallback((changeId: string) => {
+    store.setFileBrowseContext({ type: 'change', changeId });
+    setDesktopRightTab('files');
+    setActiveTab('files');
+  }, [store]);
+
+  const handleClickWorktree = useCallback((branch: string) => {
+    store.setFileBrowseContext({ type: 'worktree', worktreeBranch: branch });
+    setDesktopRightTab('files');
+    setActiveTab('files');
+  }, [store]);
+
   const handleRefreshWorktrees = useCallback(async () => {
     const projectId = store.state.selectedProjectId;
     if (!projectId) return;
@@ -275,6 +290,8 @@ function App() {
                   <ChangesPanel
                     projects={store.state.projects}
                     selectedProjectId={store.state.selectedProjectId}
+                    onClickChange={handleClickChange}
+                    selectedChangeId={store.state.fileBrowseContext?.type === 'change' ? store.state.fileBrowseContext.changeId : null}
                   />
                 ) : (
                   <WorktreesPanel
@@ -284,6 +301,8 @@ function App() {
                     onDelete={handleDeleteWorktreeClick}
                     onCreate={() => setIsCreateWorktreeOpen(true)}
                     onRefresh={handleRefreshWorktrees}
+                    onClickWorktree={handleClickWorktree}
+                    selectedWorktreeBranch={store.state.fileBrowseContext?.type === 'worktree' ? store.state.fileBrowseContext.worktreeBranch : null}
                     isLoading={isLoading}
                   />
                 )}
@@ -291,14 +310,34 @@ function App() {
             </div>
 
             <div className="flex flex-1 flex-col overflow-hidden">
-              <div className="border-b border-[#27272a] px-3 py-2">
-                <span className="text-xs font-medium text-[#52525b] uppercase tracking-wider">Logs</span>
+              {/* Right pane tab switcher: Logs / Files */}
+              <div className="flex border-b border-[#27272a]">
+                {(['logs', 'files'] as DesktopRightTab[]).map((tab) => (
+                  <button
+                    key={tab}
+                    onClick={() => setDesktopRightTab(tab)}
+                    className={`flex-1 py-2 text-xs font-medium transition-colors ${
+                      desktopRightTab === tab
+                        ? 'border-b-2 border-[#6366f1] text-[#fafafa]'
+                        : 'text-[#52525b] hover:text-[#a1a1aa]'
+                    }`}
+                  >
+                    {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                  </button>
+                ))}
               </div>
               <div className="flex-1 overflow-y-auto">
-                <LogsPanel
-                  logs={selectedProjectLogs}
-                  selectedProjectId={store.state.selectedProjectId}
-                />
+                {desktopRightTab === 'logs' ? (
+                  <LogsPanel
+                    logs={selectedProjectLogs}
+                    selectedProjectId={store.state.selectedProjectId}
+                  />
+                ) : (
+                  <FileViewPanel
+                    projectId={store.state.selectedProjectId}
+                    context={store.state.fileBrowseContext}
+                  />
+                )}
               </div>
             </div>
           </div>
@@ -307,7 +346,7 @@ function App() {
         {/* Mobile layout */}
         <div className="flex flex-1 flex-col md:hidden">
           <div className="flex border-b border-[#27272a]">
-            {(['projects', 'changes', 'worktrees', 'logs'] as TabName[]).map((tab) => (
+            {(['projects', 'changes', 'worktrees', 'logs', 'files'] as TabName[]).map((tab) => (
               <button
                 key={tab}
                 onClick={() => setActiveTab(tab)}
@@ -344,6 +383,8 @@ function App() {
               <ChangesPanel
                 projects={store.state.projects}
                 selectedProjectId={store.state.selectedProjectId}
+                onClickChange={handleClickChange}
+                selectedChangeId={store.state.fileBrowseContext?.type === 'change' ? store.state.fileBrowseContext.changeId : null}
               />
             )}
             {activeTab === 'worktrees' && (
@@ -354,6 +395,8 @@ function App() {
                 onDelete={handleDeleteWorktreeClick}
                 onCreate={() => setIsCreateWorktreeOpen(true)}
                 onRefresh={handleRefreshWorktrees}
+                onClickWorktree={handleClickWorktree}
+                selectedWorktreeBranch={store.state.fileBrowseContext?.type === 'worktree' ? store.state.fileBrowseContext.worktreeBranch : null}
                 isLoading={isLoading}
               />
             )}
@@ -361,6 +404,12 @@ function App() {
               <LogsPanel
                 logs={selectedProjectLogs}
                 selectedProjectId={store.state.selectedProjectId}
+              />
+            )}
+            {activeTab === 'files' && (
+              <FileViewPanel
+                projectId={store.state.selectedProjectId}
+                context={store.state.fileBrowseContext}
               />
             )}
           </div>
