@@ -2,16 +2,18 @@
  * WebSocket Client for Real-time State Updates
  */
 
-import { FullState, RemoteChange, RemoteProject } from './types';
+import { FullState, RemoteChange, RemoteLogEntry, RemoteProject } from './types';
 
 export type ConnectionStatus = 'connected' | 'reconnecting' | 'disconnected';
 
 interface WSMessage {
-  type: 'full_state' | 'ping' | 'pong';
+  type: 'full_state' | 'log' | 'change_update' | 'ping' | 'pong';
   /** Server sends projects with nested changes */
   projects?: RemoteProject[];
   /** Per-project worktree information */
   worktrees?: FullState['worktrees'];
+  data?: FullState;
+  entry?: RemoteLogEntry;
 }
 
 export class WebSocketClient {
@@ -19,6 +21,7 @@ export class WebSocketClient {
   private url: string;
   private listeners: {
     onStateUpdate?: (state: FullState) => void;
+    onLogEntry?: (entry: RemoteLogEntry) => void;
     onConnectionChange?: (status: ConnectionStatus) => void;
     onError?: (error: Error) => void;
   } = {};
@@ -67,6 +70,8 @@ export class WebSocketClient {
                 worktrees: message.worktrees,
               };
               this.listeners.onStateUpdate?.(state);
+            } else if (message.type === 'log' && message.entry) {
+              this.listeners.onLogEntry?.(message.entry);
             }
           } catch (err) {
             console.error('Failed to parse WS message:', err, 'raw:', event.data?.substring?.(0, 100));
@@ -116,11 +121,13 @@ export class WebSocketClient {
    * Register a listener
    */
   on(
-    event: 'stateUpdate' | 'connectionChange' | 'error',
+    event: 'stateUpdate' | 'logEntry' | 'connectionChange' | 'error',
     callback: (data: any) => void,
   ): void {
     if (event === 'stateUpdate') {
       this.listeners.onStateUpdate = callback;
+    } else if (event === 'logEntry') {
+      this.listeners.onLogEntry = callback;
     } else if (event === 'connectionChange') {
       this.listeners.onConnectionChange = callback;
     } else if (event === 'error') {

@@ -69,7 +69,9 @@ export function ChangeRow({ change }: ChangeRowProps) {
         </div>
       </div>
 
-      {/* Error display reserved for future use */}
+      {change.status === 'error' && (
+        <p className="text-xs text-[#ef4444]">Error</p>
+      )}
     </div>
   );
 }

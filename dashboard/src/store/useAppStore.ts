@@ -5,7 +5,6 @@
 import { useReducer, useCallback } from 'react';
 import {
   RemoteProject,
-  RemoteChange,
   RemoteLogEntry,
   FullState,
   WorktreeInfo,
@@ -17,7 +16,6 @@ export interface AppState {
   selectedProjectId: string | null;
   logsByProjectId: Record<string, RemoteLogEntry[]>;
   connectionStatus: ConnectionStatus;
-  changes: RemoteChange[];
   worktreesByProjectId: Record<string, WorktreeInfo[]>;
 }
 
@@ -34,7 +32,6 @@ const initialState: AppState = {
   selectedProjectId: null,
   logsByProjectId: {},
   connectionStatus: 'disconnected',
-  changes: [],
   worktreesByProjectId: {},
 };
 
@@ -44,7 +41,6 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       const newState: AppState = {
         ...state,
         projects: action.payload.projects,
-        changes: action.payload.changes,
       };
       // Update worktrees if included in full_state
       if (action.payload.worktrees) {
