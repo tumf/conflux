@@ -8,6 +8,7 @@ import {
   RemoteChange,
   RemoteLogEntry,
   FullState,
+  WorktreeInfo,
 } from '../api/types';
 import { ConnectionStatus } from '../api/wsClient';
 
@@ -17,6 +18,7 @@ export interface AppState {
   logsByProjectId: Record<string, RemoteLogEntry[]>;
   connectionStatus: ConnectionStatus;
   changes: RemoteChange[];
+  worktreesByProjectId: Record<string, WorktreeInfo[]>;
 }
 
 export type AppAction =
@@ -24,7 +26,8 @@ export type AppAction =
   | { type: 'APPEND_LOG'; payload: RemoteLogEntry }
   | { type: 'SET_CONNECTION_STATUS'; payload: ConnectionStatus }
   | { type: 'SELECT_PROJECT'; payload: string | null }
-  | { type: 'CLEAR_LOGS'; payload: string };
+  | { type: 'CLEAR_LOGS'; payload: string }
+  | { type: 'SET_WORKTREES'; payload: { projectId: string; worktrees: WorktreeInfo[] } };
 
 const initialState: AppState = {
   projects: [],
@@ -32,15 +35,34 @@ const initialState: AppState = {
   logsByProjectId: {},
   connectionStatus: 'disconnected',
   changes: [],
+  worktreesByProjectId: {},
 };
 
 export function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case 'SET_FULL_STATE': {
-      return {
+      const newState: AppState = {
         ...state,
         projects: action.payload.projects,
         changes: action.payload.changes,
+      };
+      // Update worktrees if included in full_state
+      if (action.payload.worktrees) {
+        newState.worktreesByProjectId = {
+          ...state.worktreesByProjectId,
+          ...action.payload.worktrees,
+        };
+      }
+      return newState;
+    }
+
+    case 'SET_WORKTREES': {
+      return {
+        ...state,
+        worktreesByProjectId: {
+          ...state.worktreesByProjectId,
+          [action.payload.projectId]: action.payload.worktrees,
+        },
       };
     }
 
@@ -112,6 +134,10 @@ export function useAppStore() {
     dispatch({ type: 'CLEAR_LOGS', payload: projectId });
   }, []);
 
+  const setWorktrees = useCallback((projectId: string, worktrees: WorktreeInfo[]) => {
+    dispatch({ type: 'SET_WORKTREES', payload: { projectId, worktrees } });
+  }, []);
+
   return {
     state,
     setFullState,
@@ -119,5 +145,6 @@ export function useAppStore() {
     setConnectionStatus,
     selectProject,
     clearLogs,
+    setWorktrees,
   };
 }
