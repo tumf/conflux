@@ -5,6 +5,7 @@ import { ProjectsPanel } from './components/ProjectsPanel';
 import { ChangesPanel } from './components/ChangesPanel';
 import { LogsPanel } from './components/LogsPanel';
 import { DeleteDialog } from './components/DeleteDialog';
+import { AddProjectDialog } from './components/AddProjectDialog';
 import { useAppStore } from './store/useAppStore';
 import { useWebSocket } from './hooks/useWebSocket';
 import {
@@ -12,6 +13,7 @@ import {
   controlStop,
   gitSync,
   deleteProject as deleteProjectAPI,
+  addProject as addProjectAPI,
   APIError,
 } from './api/restClient';
 
@@ -22,6 +24,7 @@ function App() {
   const [activeTab, setActiveTab] = useState<TabName>('projects');
   const [isLoading, setIsLoading] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
+  const [isAddProjectOpen, setIsAddProjectOpen] = useState(false);
 
   useWebSocket({
     onStateUpdate: (state) => store.setFullState(state),
@@ -86,6 +89,19 @@ function App() {
     }
   }, [deleteTarget]);
 
+  const handleAddProject = useCallback(async (remoteUrl: string, branch: string) => {
+    setIsLoading(true);
+    try {
+      await addProjectAPI(remoteUrl, branch);
+      toast.success('Project added');
+      setIsAddProjectOpen(false);
+    } catch (err) {
+      toast.error(`Failed to add project: ${err instanceof APIError ? err.message : String(err)}`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
   const selectedProject = store.state.projects.find(
     (p) => p.id === store.state.selectedProjectId,
   );
@@ -101,6 +117,7 @@ function App() {
     onStop: handleStop,
     onGitSync: handleGitSync,
     onDelete: handleDeleteClick,
+    onAddProject: () => setIsAddProjectOpen(true),
     isLoading,
   };
 
@@ -200,6 +217,13 @@ function App() {
         projectName={deleteTarget?.name || ''}
         onConfirm={handleDeleteConfirm}
         onCancel={() => setDeleteTarget(null)}
+        isLoading={isLoading}
+      />
+
+      <AddProjectDialog
+        isOpen={isAddProjectOpen}
+        onSubmit={handleAddProject}
+        onCancel={() => setIsAddProjectOpen(false)}
         isLoading={isLoading}
       />
 

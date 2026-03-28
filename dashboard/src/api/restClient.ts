@@ -77,3 +77,13 @@ export async function gitSync(projectId: string): Promise<void> {
 export async function deleteProject(projectId: string): Promise<void> {
   return fetchAPI(`/projects/${projectId}`, { method: 'DELETE' });
 }
+
+/**
+ * Add a new project
+ */
+export async function addProject(remoteUrl: string, branch: string): Promise<void> {
+  return fetchAPI('/projects', {
+    method: 'POST',
+    body: JSON.stringify({ remote_url: remoteUrl, branch }),
+  });
+}
