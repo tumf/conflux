@@ -11,6 +11,7 @@
   // Lifecycle hooks
   "hooks": {
     // Rebuild indexes after merge completion
-    "on_merged": "make bump-patch && make index"
+    //"on_merged": "make bump-patch && make index"
+    "on_merged": "make bump-patch"
   }
 }
