@@ -170,6 +170,14 @@ info "Updating version in Cargo.toml..."
 sed -i.bak -E "s/^version = \".*\"/version = \"$NEW_VERSION\"/" "$CARGO_TOML"
 rm -f "${CARGO_TOML}.bak"
 
+# Update docs/openapi.yaml
+OPENAPI_FILE="docs/openapi.yaml"
+if [[ -f "$OPENAPI_FILE" ]]; then
+	info "Updating version in $OPENAPI_FILE..."
+	sed -i.bak -E "s/^(  version: ).*/\1$NEW_VERSION/" "$OPENAPI_FILE"
+	rm -f "${OPENAPI_FILE}.bak"
+fi
+
 # Update Cargo.lock
 info "Updating Cargo.lock..."
 cargo check --quiet
@@ -178,7 +186,7 @@ success "Files updated"
 
 # Git operations
 info "Creating git commit..."
-git add Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock docs/openapi.yaml
 git commit -m "chore(release): release v$NEW_VERSION"
 
 info "Creating git tag..."
