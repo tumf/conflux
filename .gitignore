@@ -4,3 +4,4 @@ error.log
 .tldr/
 /.leann/
 .agents/.skill-lock.json
+.playwright-cli/
