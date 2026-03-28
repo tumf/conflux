@@ -28,6 +28,7 @@ mod serial_run_service;
 #[cfg(feature = "web-monitoring")]
 mod server;
 mod service;
+mod shell_command;
 mod spec_delta;
 #[cfg(test)]
 mod spec_test_annotations;

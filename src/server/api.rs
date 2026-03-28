@@ -925,10 +925,9 @@ pub async fn delete_project(
 
 // ─────────────────────────────── /api/v1/projects/:id/git ─────────────────────
 
-/// Execute the configured `resolve_command` in the given working directory.
-///
-/// Returns `(ran, exit_code)` where `ran` is true if the command was attempted,
-/// and `exit_code` is `Some(code)` if the command completed.
+/// Build a resolve command argv by parsing the template with shlex and substituting
+/// `{prompt}` placeholders. Retained for test coverage.
+#[cfg(test)]
 fn build_resolve_command_argv(
     resolve_command_template: &str,
     prompt: &str,
@@ -950,23 +949,17 @@ async fn run_resolve_command(
     work_dir: &std::path::Path,
     prompt: &str,
 ) -> (bool, Option<i32>) {
-    // Parse into argv (quote-aware), then substitute placeholders at the argv level.
-    // This ensures `{prompt}` becomes a single argument even if it contains spaces.
-    let argv = match build_resolve_command_argv(resolve_command_template, prompt) {
-        Ok(v) => v,
-        Err(e) => {
-            error!(
-                "Failed to build resolve_command argv: template='{}' error='{}'",
-                resolve_command_template, e
-            );
-            return (true, Some(-1));
-        }
-    };
+    // Substitute {prompt} placeholder in the template, then shell-escape the prompt
+    // value so the login shell receives it as a safe string.
+    let escaped_prompt = shlex::try_quote(prompt).unwrap_or_else(|_| prompt.into());
+    let command_str = resolve_command_template.replace("{prompt}", &escaped_prompt);
 
-    let mut cmd = tokio::process::Command::new(&argv[0]);
-    if argv.len() > 1 {
-        cmd.args(&argv[1..]);
-    }
+    info!(
+        "Running resolve_command via login shell: command='{}'",
+        command_str
+    );
+
+    let mut cmd = crate::shell_command::build_login_shell_command(&command_str);
     cmd.current_dir(work_dir);
 
     match cmd.status().await {
@@ -3769,6 +3762,37 @@ mod tests {
                 "a b c".to_string(),
                 "a b c-suffix".to_string(),
             ]
+        );
+    }
+
+    // ── resolve_command login shell tests ──
+
+    #[tokio::test]
+    async fn test_run_resolve_command_uses_login_shell() {
+        // Verify that run_resolve_command executes via the user's login shell,
+        // making PATH-dependent commands available even in non-login environments.
+        let temp_dir = TempDir::new().unwrap();
+        let (ran, exit_code) =
+            super::run_resolve_command("echo hello", temp_dir.path(), "test prompt").await;
+        assert!(ran, "resolve_command should have been attempted");
+        assert_eq!(
+            exit_code,
+            Some(0),
+            "echo command should succeed via login shell"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_resolve_command_substitutes_prompt() {
+        // Verify that {prompt} placeholder is substituted in the command string.
+        let temp_dir = TempDir::new().unwrap();
+        let (ran, exit_code) =
+            super::run_resolve_command("echo {prompt}", temp_dir.path(), "test_marker").await;
+        assert!(ran, "resolve_command should have been attempted");
+        assert_eq!(
+            exit_code,
+            Some(0),
+            "echo with prompt substitution should succeed"
         );
     }
 

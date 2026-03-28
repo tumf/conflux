@@ -13,7 +13,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
@@ -682,28 +681,14 @@ impl HookRunner {
         env_vars: &HashMap<String, String>,
         timeout_duration: Duration,
     ) -> Result<(bool, String, String)> {
-        let mut cmd = if cfg!(target_os = "windows") {
-            debug!(
-                module = module_path!(),
-                "Executing {} hook command: cmd /C {}", hook_type, command
-            );
-            let mut c = Command::new("cmd");
-            c.arg("/C").arg(command);
-            c
-        } else {
-            // Use /bin/sh directly instead of user's $SHELL to avoid job control issues
-            // (e.g., zsh's "suspended (tty output)" when running as background process)
-            debug!(
-                module = module_path!(),
-                "Executing {} hook command: /bin/sh -c {}", hook_type, command
-            );
-            let mut c = Command::new("/bin/sh");
-            c.arg("-c").arg(command);
-            c
-        };
+        // Use login shell ($SHELL -l -c) so user's PATH from .zprofile/.profile
+        // is available, even when cflx is started from launchd/systemd/cron.
+        let mut cmd = crate::shell_command::build_login_shell_command(command);
 
-        // Inherit environment and set hook-specific variables
-        cmd.env_clear().envs(std::env::vars());
+        debug!(
+            module = module_path!(),
+            "Executing {} hook command via login shell: {}", hook_type, command
+        );
         for (key, value) in env_vars {
             cmd.env(key, value);
         }
