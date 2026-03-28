@@ -468,7 +468,8 @@ pub async fn handle_key_event(
             }
         }
         (KeyCode::Char('x'), _) => {
-            // Toggle all marks (only in Select or Stopped mode)
+            // Toggle all marks in Changes view.
+            // Eligibility and mode constraints are enforced in AppState::toggle_all_marks.
             use crate::tui::types::ViewMode;
             if ctx.app.view_mode == ViewMode::Changes {
                 ctx.app.toggle_all_marks();

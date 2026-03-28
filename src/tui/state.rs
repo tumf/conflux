@@ -713,65 +713,73 @@ impl AppState {
         }
     }
 
+    fn can_bulk_toggle_change(&self, change: &ChangeState) -> bool {
+        if matches!(self.mode, AppMode::Running) && change.queue_status.is_active() {
+            return false;
+        }
+
+        guards::validate_change_toggleable(
+            change.is_parallel_eligible,
+            self.parallel_mode,
+            &change.queue_status,
+            &change.id,
+        )
+        .is_allowed()
+    }
+
+    /// Returns true when at least one change can be targeted by bulk toggle.
+    pub fn has_bulk_toggle_targets(&self) -> bool {
+        matches!(
+            self.mode,
+            AppMode::Select | AppMode::Stopped | AppMode::Running
+        ) && self
+            .changes
+            .iter()
+            .any(|change| self.can_bulk_toggle_change(change))
+    }
+
     /// Toggle all marks (select/unselect all eligible changes)
     ///
-    /// In Select/Stopped modes:
-    /// - If any unmarked change exists, mark all eligible changes
-    /// - Otherwise, unmark all changes
+    /// In Select/Stopped/Running modes:
+    /// - If any eligible unmarked change exists, mark all eligible changes
+    /// - Otherwise, unmark all eligible changes
     ///
-    /// Only eligible changes can be toggled:
-    /// - In parallel mode, uncommitted changes are excluded
-    /// - MergeWait and ResolveWait changes can be marked but won't affect queue
+    /// Running mode excludes active rows to avoid emitting stop requests.
+    /// In parallel mode, uncommitted changes remain excluded.
     pub fn toggle_all_marks(&mut self) {
-        // Only allow in Select or Stopped mode
-        if !matches!(self.mode, AppMode::Select | AppMode::Stopped) {
+        if !self.has_bulk_toggle_targets() {
             return;
         }
 
-        // Determine if we should mark all or unmark all
-        // If any eligible unmarked change exists, we mark all; otherwise unmark all
-        let has_unmarked = self.changes.iter().any(|change| {
-            !change.selected
-                && guards::validate_change_toggleable(
-                    change.is_parallel_eligible,
-                    self.parallel_mode,
-                    &change.queue_status,
-                    &change.id,
-                )
-                .is_allowed()
-        });
+        // If any eligible unmarked change exists, we mark all; otherwise unmark all.
+        let has_unmarked = self
+            .changes
+            .iter()
+            .any(|change| !change.selected && self.can_bulk_toggle_change(change));
 
         let target_state = has_unmarked;
 
-        // Toggle all eligible changes to the target state
-        for change in &mut self.changes {
-            // Check if this change can be toggled
-            if guards::validate_change_toggleable(
-                change.is_parallel_eligible,
-                self.parallel_mode,
-                &change.queue_status,
-                &change.id,
-            )
-            .is_allowed()
-            {
-                // Only update if different from target state
-                if change.selected != target_state {
-                    change.selected = target_state;
-                    // Clear NEW flag when user interacts with the change
-                    if change.is_new {
-                        change.is_new = false;
-                        self.new_change_count = self.new_change_count.saturating_sub(1);
-                    }
+        // Toggle all eligible changes to the target state.
+        for i in 0..self.changes.len() {
+            if !self.can_bulk_toggle_change(&self.changes[i]) {
+                continue;
+            }
+
+            if self.changes[i].selected != target_state {
+                self.changes[i].selected = target_state;
+                // Clear NEW flag when user interacts with the change
+                if self.changes[i].is_new {
+                    self.changes[i].is_new = false;
+                    self.new_change_count = self.new_change_count.saturating_sub(1);
                 }
             }
         }
 
-        // Log the action
         let action = if target_state { "marked" } else { "unmarked" };
         let count = self
             .changes
             .iter()
-            .filter(|c| c.selected == target_state)
+            .filter(|change| self.can_bulk_toggle_change(change) && change.selected == target_state)
             .count();
         self.add_log(LogEntry::info(format!(
             "Toggled all: {} {} change(s)",
@@ -2920,17 +2928,52 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle_all_marks_running_mode_does_nothing() {
-        // Test that toggle all does nothing in Running mode
+    fn test_toggle_all_marks_running_mode_toggles_non_active_rows_only() {
+        let changes = vec![
+            create_test_change("resolving", 0, 1),
+            create_test_change("not-queued", 0, 1),
+            create_test_change("merge-wait", 0, 1),
+            create_test_change("resolve-wait", 0, 1),
+        ];
+
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.is_resolving = true;
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[1].queue_status = QueueStatus::NotQueued;
+        app.changes[2].queue_status = QueueStatus::MergeWait;
+        app.changes[3].queue_status = QueueStatus::ResolveWait;
+
+        app.toggle_all_marks();
+        assert!(!app.changes[0].selected, "active row must stay unchanged");
+        assert!(app.changes[1].selected);
+        assert!(app.changes[2].selected);
+        assert!(app.changes[3].selected);
+
+        // Wait states must keep queue_status unchanged.
+        assert_eq!(app.changes[2].queue_status, QueueStatus::MergeWait);
+        assert_eq!(app.changes[3].queue_status, QueueStatus::ResolveWait);
+
+        // Second toggle unmarks only non-active rows.
+        app.toggle_all_marks();
+        assert!(!app.changes[0].selected, "active row must stay unchanged");
+        assert!(!app.changes[1].selected);
+        assert!(!app.changes[2].selected);
+        assert!(!app.changes[3].selected);
+    }
+
+    #[test]
+    fn test_has_bulk_toggle_targets_running_mode_requires_non_active_rows() {
         let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
 
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Applying;
+        app.changes[1].queue_status = QueueStatus::Resolving;
+        assert!(!app.has_bulk_toggle_targets());
 
-        // Toggle all should do nothing in Running mode
-        app.toggle_all_marks();
-        assert!(!app.changes[0].selected);
-        assert!(!app.changes[1].selected);
+        app.changes[1].queue_status = QueueStatus::ResolveWait;
+        assert!(app.has_bulk_toggle_targets());
     }
 
     #[test]

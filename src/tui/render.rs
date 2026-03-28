@@ -625,8 +625,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
     if has_queue && !app.is_resolving {
         keys.push("F5: run");
     }
-    // Show toggle all hint only in Select or Stopped mode (not in Running/Stopping/Error)
-    if matches!(app.mode, AppMode::Select | AppMode::Stopped) {
+    if app.has_bulk_toggle_targets() {
         keys.push("x: toggle all");
     }
     keys.push("Tab: worktrees");
@@ -980,8 +979,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             }
         }
     }
-    // Show toggle all hint only in Select or Stopped mode (not in Running/Stopping/Error)
-    if matches!(app.mode, AppMode::Select | AppMode::Stopped) {
+    if app.has_bulk_toggle_targets() {
         keys.push("x: toggle all");
     }
     keys.push("Tab: worktrees");
@@ -2906,15 +2904,30 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle_all_hint_not_shown_in_running_mode() {
+    fn test_toggle_all_hint_shown_in_running_mode_with_non_active_target() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::NotQueued;
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            content.contains("x: toggle all"),
+            "Should show 'x: toggle all' hint in Running mode when non-active target exists"
+        );
+    }
+
+    #[test]
+    fn test_toggle_all_hint_not_shown_in_running_mode_without_non_active_targets() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Resolving;
 
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
         assert!(
             !content.contains("x: toggle all"),
-            "Should NOT show 'x: toggle all' hint in Running mode"
+            "Should NOT show 'x: toggle all' hint in Running mode when all changes are active"
         );
     }
 
