@@ -24,3 +24,6 @@ The server-mode dashboard state endpoints SHALL provide each project with explic
 **When** the server constructs the dashboard project snapshot
 **Then** it falls back to the best available non-empty repo label
 **And** the project payload still allows the dashboard to avoid rendering only `/`
+
+
+#
