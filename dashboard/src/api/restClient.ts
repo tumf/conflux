@@ -42,6 +42,13 @@ async function fetchAPI<T>(
 }
 
 /**
+ * Fetch backend version
+ */
+export async function fetchVersion(): Promise<{ version: string }> {
+  return fetchAPI('/version', { method: 'GET' });
+}
+
+/**
  * Fetch current state: projects and changes
  */
 export async function fetchProjectsState(): Promise<{
