@@ -4003,6 +4003,74 @@ mod tests {
         );
     }
 
+    // ── Version endpoint tests ──
+
+    #[tokio::test]
+    async fn test_get_version_returns_200() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/version")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_version_no_auth_required() {
+        let temp_dir = TempDir::new().unwrap();
+        // Configure a bearer token — version endpoint must still return 200 without it
+        let router = make_router(&temp_dir, Some("secret-token"));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/version")
+            // No Authorization header
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /api/v1/version must succeed without authentication even when auth is configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_version_response_format() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/version")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Response must contain a non-empty "version" field
+        let version = json["version"]
+            .as_str()
+            .expect("Response must contain 'version' field as a string");
+        assert!(
+            !version.is_empty(),
+            "version field must not be empty, got: {:?}",
+            version
+        );
+    }
+
     #[tokio::test]
     async fn test_remote_project_snapshot_serialization_has_dashboard_fields() {
         // Verify that the RemoteProject JSON includes repo, branch, status, is_busy fields
