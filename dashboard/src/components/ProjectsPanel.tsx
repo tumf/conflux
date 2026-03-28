@@ -13,6 +13,8 @@ interface ProjectsPanelProps {
   onDelete: (projectId: string) => void;
   onAddProject: () => void;
   isLoading: boolean;
+  /** Whether git/sync is available (resolve_command configured on server) */
+  syncAvailable: boolean;
 }
 
 export function ProjectsPanel({
@@ -25,6 +27,7 @@ export function ProjectsPanel({
   onDelete,
   onAddProject,
   isLoading,
+  syncAvailable,
 }: ProjectsPanelProps) {
   return (
     <div className="space-y-2 p-3">
@@ -52,6 +55,7 @@ export function ProjectsPanel({
             onGitSync={onGitSync}
             onDelete={onDelete}
             isLoading={isLoading}
+            syncAvailable={syncAvailable}
           />
         ))
       )}
