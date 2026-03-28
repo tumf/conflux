@@ -13,6 +13,11 @@ tag-name = "v{{version}}"
 tag-message = "Release v{{version}}"
 pre-release-commit-message = "chore(release): release v{{version}}"
 
+[[pre-release-replacements]]
+file = "docs/openapi.yaml"
+search = "  version: .*"
+replace = "  version: {{version}}"
+
 # Signing (disabled by default, enable when needed)
 sign-commit = false
 sign-tag = false
