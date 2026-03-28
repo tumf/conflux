@@ -844,6 +844,20 @@ impl AppState {
             // Resolve is running: add to queue and transition to ResolveWait
             if self.add_to_resolve_queue(&change_id) {
                 self.changes[self.cursor_index].queue_status = QueueStatus::ResolveWait;
+
+                // Sync resolve intent into the shared reducer so that
+                // apply_display_statuses_from_reducer() cannot regress the
+                // status back to "merge wait" on the next ChangesRefreshed.
+                if let Some(shared) = &self.shared_orchestrator_state {
+                    if let Ok(mut guard) = shared.try_write() {
+                        guard.apply_command(
+                            crate::orchestration::state::ReducerCommand::ResolveMerge(
+                                change_id.clone(),
+                            ),
+                        );
+                    }
+                }
+
                 self.add_log(LogEntry::info(format!(
                     "Queued '{}' for resolve (position: {})",
                     change_id,
@@ -1432,7 +1446,7 @@ impl AppState {
                 change_id,
                 reason,
                 auto_resumable,
-            } => self.handle_merge_deferred(change_id, reason, auto_resumable),
+            } => return self.handle_merge_deferred(change_id, reason, auto_resumable),
             OrchestratorEvent::AcceptanceStarted { change_id, command } => {
                 self.handle_acceptance_started(change_id, command)
             }
@@ -1997,7 +2011,12 @@ impl AppState {
         self.try_transition_to_select();
     }
 
-    fn handle_merge_deferred(&mut self, change_id: String, reason: String, auto_resumable: bool) {
+    fn handle_merge_deferred(
+        &mut self,
+        change_id: String,
+        reason: String,
+        auto_resumable: bool,
+    ) -> Option<TuiCommand> {
         if self.is_resolving {
             // Check if this is the currently resolving change
             let is_current_resolving = self
@@ -2028,17 +2047,20 @@ impl AppState {
                     )));
                 }
             }
+            None
         } else if auto_resumable {
-            // Resolve is not running but deferral is auto-resumable (e.g. dirty base due to
-            // another merge in progress).  Show as ResolveWait so the user can see it will
-            // be re-evaluated automatically; do NOT add to the manual resolve queue.
+            // Resolve is not running and deferral is auto-resumable (e.g. dirty base due to
+            // another merge in progress).  Transition to ResolveWait, add to resolve queue,
+            // and return ResolveMerge to start resolve immediately.
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                 change.queue_status = QueueStatus::ResolveWait;
             }
+            self.add_to_resolve_queue(&change_id);
             self.add_log(LogEntry::warn(format!(
-                "Merge deferred for '{}' (auto-resumable, awaiting re-evaluation): {}",
+                "Merge deferred for '{}' (auto-resumable, starting resolve): {}",
                 change_id, reason
             )));
+            Some(TuiCommand::ResolveMerge(change_id))
         } else {
             // Resolve is not running and manual intervention is required: MergeWait.
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
@@ -2048,6 +2070,7 @@ impl AppState {
                 "Merge deferred for {}: {}",
                 change_id, reason
             )));
+            None
         }
     }
 
@@ -3760,6 +3783,122 @@ mod tests {
         assert!(app.has_queued_resolves());
     }
 
+    /// Regression test: resolve_merge() in the queued path must sync intent to the shared
+    /// reducer so that the display_status is "resolve pending" (not "merge wait").
+    #[test]
+    fn test_resolve_merge_queues_syncs_reducer() {
+        use crate::orchestration::state::{OrchestratorState, WorkspaceObservation};
+        use std::sync::Arc;
+
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Set up shared orchestrator state with both changes.
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            0,
+        )));
+
+        // Pre-condition: change-b must be in MergeWait in the reducer
+        // (simulates workspace detected as Archived).
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_observation("change-b", WorkspaceObservation::WorkspaceArchived);
+        }
+
+        app.set_shared_state(shared.clone());
+
+        // change-a is currently resolving
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.is_resolving = true;
+
+        // change-b is in MergeWait
+        app.changes[1].queue_status = QueueStatus::MergeWait;
+        app.cursor_index = 1;
+        app.mode = AppMode::Running;
+
+        // Queue change-b for resolve via M key
+        let cmd = app.resolve_merge();
+        assert!(cmd.is_none());
+        assert_eq!(app.changes[1].queue_status, QueueStatus::ResolveWait);
+
+        // Verify the shared reducer reflects "resolve pending" for change-b
+        let display_map = shared.blocking_read().all_display_statuses();
+        assert_eq!(
+            display_map.get("change-b"),
+            Some(&"resolve pending"),
+            "reducer must reflect 'resolve pending' after queued resolve_merge()"
+        );
+    }
+
+    /// Regression test: after queuing a resolve via M key, a ChangesRefreshed event
+    /// with the change still in merge_wait_ids must NOT regress ResolveWait back to MergeWait.
+    #[test]
+    fn test_resolve_wait_survives_changes_refreshed() {
+        use crate::orchestration::state::{OrchestratorState, WorkspaceObservation};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Set up shared orchestrator state.
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            0,
+        )));
+        // Pre-condition: change-b is in MergeWait in the reducer.
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_observation("change-b", WorkspaceObservation::WorkspaceArchived);
+        }
+        app.set_shared_state(shared.clone());
+
+        // change-a is currently resolving
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.is_resolving = true;
+
+        // change-b is in MergeWait; user presses M to queue resolve
+        app.changes[1].queue_status = QueueStatus::MergeWait;
+        app.cursor_index = 1;
+        app.mode = AppMode::Running;
+
+        let cmd = app.resolve_merge();
+        assert!(cmd.is_none());
+        assert_eq!(app.changes[1].queue_status, QueueStatus::ResolveWait);
+
+        // Simulate a ChangesRefreshed event where workspace still reports change-b
+        // as Archived (which would normally set MergeWait in the reducer).
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ChangesRefreshed {
+                changes: vec![],
+                committed_change_ids: HashSet::new(),
+                uncommitted_file_change_ids: HashSet::new(),
+                worktree_change_ids: HashSet::new(),
+                worktree_paths: HashMap::new(),
+                worktree_not_ahead_ids: HashSet::new(),
+                merge_wait_ids: ["change-b".to_string()].into_iter().collect(),
+            });
+        }
+
+        // apply_display_statuses_from_reducer should preserve ResolveWait
+        let display_map = shared.blocking_read().all_display_statuses();
+        app.apply_display_statuses_from_reducer(&display_map);
+
+        assert_eq!(
+            app.changes[1].queue_status,
+            QueueStatus::ResolveWait,
+            "ResolveWait must survive ChangesRefreshed + apply_display_statuses_from_reducer"
+        );
+    }
+
     #[test]
     fn test_resolve_merge_starts_immediately_when_not_resolving() {
         let changes = vec![create_test_change("change-a", 0, 1)];
@@ -3925,7 +4064,7 @@ mod tests {
         app.changes[0].queue_status = QueueStatus::Archived;
 
         // Auto-resumable deferral (e.g. change-a's merge was in progress when change-b tried).
-        app.handle_merge_deferred(
+        let cmd = app.handle_merge_deferred(
             "change-b".to_string(),
             "Merge in progress (MERGE_HEAD exists)".to_string(),
             true, // auto_resumable
@@ -3938,11 +4077,100 @@ mod tests {
             "auto-resumable MergeDeferred must display as ResolveWait, not MergeWait"
         );
 
-        // Must NOT be added to the manual resolve queue
-        // (the scheduler will retry automatically, no M press needed).
+        // Must be added to the resolve queue and return ResolveMerge command
+        // so resolve starts immediately without manual M key press.
         assert!(
-            !app.resolve_queue_set.contains("change-b"),
-            "auto-resumable deferred change must not enter the manual resolve queue"
+            app.resolve_queue_set.contains("change-b"),
+            "auto-resumable deferred change must be added to the resolve queue"
+        );
+        assert!(
+            matches!(cmd, Some(TuiCommand::ResolveMerge(ref id)) if id == "change-b"),
+            "auto-resumable deferred must return ResolveMerge command"
+        );
+    }
+
+    /// When resolve is not active and MergeDeferred(auto_resumable=true) arrives,
+    /// handle_merge_deferred must return ResolveMerge to start resolve immediately.
+    /// This verifies the fix for resolve pending changes that remained stuck.
+    #[test]
+    fn test_auto_resumable_merge_deferred_starts_resolve_when_idle() {
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        // No resolve is running.
+        app.is_resolving = false;
+        app.changes[0].queue_status = QueueStatus::Merged;
+        app.changes[1].queue_status = QueueStatus::Archived;
+
+        // change-b receives auto-resumable MergeDeferred while no resolve is active.
+        let cmd = app.handle_merge_deferred(
+            "change-b".to_string(),
+            "Base is dirty: Merge in progress (MERGE_HEAD exists)".to_string(),
+            true,
+        );
+
+        // Status must be ResolveWait.
+        assert_eq!(
+            app.changes[1].queue_status,
+            QueueStatus::ResolveWait,
+            "change must transition to ResolveWait"
+        );
+
+        // Must return ResolveMerge to trigger immediate resolve start.
+        assert!(
+            matches!(cmd, Some(TuiCommand::ResolveMerge(ref id)) if id == "change-b"),
+            "must return ResolveMerge command to start resolve immediately"
+        );
+
+        // Must be in resolve queue.
+        assert!(
+            app.resolve_queue_set.contains("change-b"),
+            "change must be in resolve queue"
+        );
+    }
+
+    /// When resolve IS active and MergeDeferred(auto_resumable=true) arrives,
+    /// the change must be queued but no ResolveMerge command is returned.
+    #[test]
+    fn test_auto_resumable_merge_deferred_queues_when_resolving() {
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Resolve IS running for change-a.
+        app.is_resolving = true;
+        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[1].queue_status = QueueStatus::Archived;
+
+        // change-b receives auto-resumable MergeDeferred while resolve is active.
+        let cmd = app.handle_merge_deferred(
+            "change-b".to_string(),
+            "Merge in progress (MERGE_HEAD exists)".to_string(),
+            true,
+        );
+
+        // Status must be ResolveWait.
+        assert_eq!(
+            app.changes[1].queue_status,
+            QueueStatus::ResolveWait,
+            "change must transition to ResolveWait"
+        );
+
+        // Must NOT return a command (resolve is already running).
+        assert!(
+            cmd.is_none(),
+            "must not return ResolveMerge when resolve is already active"
+        );
+
+        // Must be in the resolve queue for later processing.
+        assert!(
+            app.resolve_queue_set.contains("change-b"),
+            "change must be queued for resolve"
         );
     }
 

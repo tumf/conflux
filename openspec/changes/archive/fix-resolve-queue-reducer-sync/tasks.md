@@ -1,0 +1,6 @@
+## Implementation Tasks
+
+- [x] Task 1: Sync resolve intent to shared reducer in `resolve_merge()` queued path (file: `src/tui/state.rs`, method: `resolve_merge()`, lines ~843-858; add `shared_orchestrator_state.try_write().apply_command(ReducerCommand::ResolveMerge(...))` following the pattern at lines 1094-1101; verification: `cargo test test_resolve_merge_queues_when_resolving`)
+- [x] Task 2: Add test verifying reducer state after queued resolve (file: `src/tui/state.rs` `#[cfg(test)]` module; create a test that sets up `shared_orchestrator_state`, calls `resolve_merge()` with `is_resolving=true`, and asserts reducer `display_status` is `"resolve pending"` not `"merge wait"`; verification: `cargo test test_resolve_merge_queues_syncs_reducer`)
+- [x] Task 3: Add test verifying `apply_display_statuses_from_reducer` preserves `ResolveWait` after `ChangesRefreshed` (file: `src/tui/state.rs` `#[cfg(test)]` module; simulate `ChangesRefreshed` with `merge_wait_ids` containing the change, then call `apply_display_statuses_from_reducer` and assert status remains `ResolveWait`; verification: `cargo test test_resolve_wait_survives_changes_refreshed`)
+- [x] Task 4: Run full test suite and clippy (verification: `cargo test && cargo clippy -- -D warnings && cargo fmt --check`)
