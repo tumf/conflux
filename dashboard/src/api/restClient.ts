@@ -58,17 +58,17 @@ export async function fetchProjectsState(): Promise<{
 }
 
 /**
- * Run a project
+ * Start global orchestration (run all projects with selected changes)
  */
-export async function controlRun(projectId: string): Promise<void> {
-  return fetchAPI(`/projects/${projectId}/control/run`, { method: 'POST' });
+export async function controlRun(): Promise<void> {
+  return fetchAPI('/control/run', { method: 'POST' });
 }
 
 /**
- * Stop a project
+ * Stop global orchestration (stop all running projects)
  */
-export async function controlStop(projectId: string): Promise<void> {
-  return fetchAPI(`/projects/${projectId}/control/stop`, { method: 'POST' });
+export async function controlStop(): Promise<void> {
+  return fetchAPI('/control/stop', { method: 'POST' });
 }
 
 /**

@@ -8,6 +8,7 @@ import {
   RemoteLogEntry,
   FullState,
   WorktreeInfo,
+  OrchestrationStatus,
 } from '../api/types';
 import { ConnectionStatus } from '../api/wsClient';
 
@@ -19,6 +20,8 @@ export interface AppState {
   worktreesByProjectId: Record<string, WorktreeInfo[]>;
   /** Whether git/sync is available (resolve_command is configured on server) */
   syncAvailable: boolean;
+  /** Global orchestration status */
+  orchestrationStatus: OrchestrationStatus;
 }
 
 export type AppAction =
@@ -36,6 +39,7 @@ const initialState: AppState = {
   connectionStatus: 'disconnected',
   worktreesByProjectId: {},
   syncAvailable: false,
+  orchestrationStatus: 'idle',
 };
 
 export function appReducer(state: AppState, action: AppAction): AppState {
@@ -45,6 +49,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         ...state,
         projects: action.payload.projects,
         syncAvailable: action.payload.sync_available ?? false,
+        orchestrationStatus: action.payload.orchestration_status ?? 'idle',
       };
       // Update worktrees if included in full_state
       if (action.payload.worktrees) {

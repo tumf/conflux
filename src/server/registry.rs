@@ -29,6 +29,30 @@ pub enum ProjectStatus {
     Stopped,
 }
 
+/// Global orchestration status for the server.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationStatus {
+    /// No orchestration running (initial state).
+    #[default]
+    Idle,
+    /// Orchestration is running across projects.
+    Running,
+    /// Orchestration has been stopped.
+    Stopped,
+}
+
+impl OrchestrationStatus {
+    /// Return the string representation for JSON/WebSocket serialization.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OrchestrationStatus::Idle => "idle",
+            OrchestrationStatus::Running => "running",
+            OrchestrationStatus::Stopped => "stopped",
+        }
+    }
+}
+
 /// A managed project entry in the registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectEntry {

@@ -22,7 +22,7 @@ use tracing::{debug, error, info};
 use crate::execution::state::{detect_workspace_state, WorkspaceState};
 use crate::remote::types::{RemoteChange, RemoteLogEntry, RemoteProject, RemoteStateUpdate};
 use crate::server::registry::{
-    server_worktree_branch, ProjectEntry, ProjectStatus, SharedRegistry,
+    server_worktree_branch, OrchestrationStatus, ProjectEntry, ProjectStatus, SharedRegistry,
 };
 use crate::server::runner::{ProjectRunRequest, SharedRunners};
 use crate::task_parser;
@@ -45,6 +45,8 @@ pub struct AppState {
     pub resolve_command: Option<String>,
     /// Broadcast channel for streaming log entries to WebSocket clients
     pub log_tx: tokio::sync::broadcast::Sender<RemoteLogEntry>,
+    /// Global orchestration status (Idle/Running/Stopped)
+    pub orchestration_status: Arc<tokio::sync::RwLock<OrchestrationStatus>>,
 }
 
 // ─────────────────────────────── Auth middleware ──────────────────────────────
@@ -82,12 +84,6 @@ pub async fn auth_middleware(
 pub struct AddProjectRequest {
     pub remote_url: String,
     pub branch: String,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct ControlRunRequest {
-    /// Optional list of change IDs to run (server will pass to `cflx run --change`).
-    pub changes: Option<Vec<String>>,
 }
 
 /// Request body for git/pull and git/push (kept for backward compatibility).
@@ -224,7 +220,16 @@ pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> 
     let registry = state.registry.clone();
     let log_rx = state.log_tx.subscribe();
     let sync_available = state.resolve_command.is_some();
-    ws.on_upgrade(move |socket| handle_ws(socket, registry, log_rx, sync_available))
+    let orchestration_status = state.orchestration_status.clone();
+    ws.on_upgrade(move |socket| {
+        handle_ws(
+            socket,
+            registry,
+            log_rx,
+            sync_available,
+            orchestration_status,
+        )
+    })
 }
 
 async fn handle_ws(
@@ -232,6 +237,7 @@ async fn handle_ws(
     registry: SharedRegistry,
     mut log_rx: tokio::sync::broadcast::Receiver<RemoteLogEntry>,
     sync_available: bool,
+    orchestration_status: Arc<tokio::sync::RwLock<OrchestrationStatus>>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
 
@@ -282,7 +288,8 @@ async fn handle_ws(
                     Some(worktrees_map)
                 };
 
-                if let Ok(payload) = serde_json::to_string(&RemoteStateUpdate::FullState { projects: snapshot, worktrees, sync_available }) {
+                let orch_status = orchestration_status.read().await.as_str().to_string();
+                if let Ok(payload) = serde_json::to_string(&RemoteStateUpdate::FullState { projects: snapshot, worktrees, sync_available, orchestration_status: orch_status }) {
                     if socket.send(Message::Text(payload.into())).await.is_err() {
                         break;
                     }
@@ -865,6 +872,32 @@ pub async fn add_project(
     }
 
     info!("Project added with clone and worktree: id={}", project_id);
+
+    // Task 8: Auto-enqueue if orchestration is currently running.
+    // When a new project is added during Running state, automatically spawn a runner for it.
+    {
+        let orch_status = state.orchestration_status.read().await;
+        if *orch_status == OrchestrationStatus::Running {
+            let changes = list_change_ids_in_worktree(&worktree_path).await;
+            if !changes.is_empty() {
+                info!(
+                    "Auto-enqueuing new project during Running state: project_id={} changes={:?}",
+                    project_id, changes
+                );
+                if CONTROL_CALLS.get().is_none() {
+                    if let Err(e) =
+                        start_single_project_run(&state, &project_id, worktree_path, changes).await
+                    {
+                        error!(
+                            "Failed to auto-enqueue new project: project_id={} err={}",
+                            project_id, e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     (StatusCode::CREATED, Json(ProjectResponse::from(entry))).into_response()
 }
 
@@ -1363,7 +1396,7 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
         .into_response()
 }
 
-// ─────────────────────────── /api/v1/projects/:id/control ─────────────────────
+// ─────────────────────────── /api/v1/control (global) ─────────────────────────
 
 // ──────────────── Change selection toggle ────────────────────────────────────
 
@@ -1436,102 +1469,68 @@ pub async fn toggle_all_change_selection(
 pub static CONTROL_CALLS: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<(String, String)>>>> =
     std::sync::OnceLock::new();
 
-/// POST /api/v1/projects/:id/control/run
-pub async fn control_run(
-    State(state): State<AppState>,
-    Path(project_id): Path<String>,
-    payload: Option<Json<ControlRunRequest>>,
-) -> Response {
-    let changes = payload.and_then(|Json(p)| p.changes);
-    apply_control(&state, &project_id, "run", ProjectStatus::Running, changes).await
-}
-
-/// POST /api/v1/projects/:id/control/stop
-pub async fn control_stop(
-    State(state): State<AppState>,
-    Path(project_id): Path<String>,
-) -> Response {
-    apply_control(&state, &project_id, "stop", ProjectStatus::Stopped, None).await
-}
-
-/// POST /api/v1/projects/:id/control/retry
-pub async fn control_retry(
-    State(state): State<AppState>,
-    Path(project_id): Path<String>,
-    payload: Option<Json<ControlRunRequest>>,
-) -> Response {
-    let changes = payload.and_then(|Json(p)| p.changes);
-    apply_control(
-        &state,
-        &project_id,
-        "retry",
-        ProjectStatus::Running,
-        changes,
-    )
-    .await
-}
-
-async fn apply_control(
-    state: &AppState,
-    project_id: &str,
-    action: &str,
-    new_status: ProjectStatus,
-    changes: Option<Vec<String>>,
-) -> Response {
+/// POST /api/v1/control/run - Start orchestration across all projects.
+///
+/// For each project, collects changes with `selected: true` (currently all changes
+/// are implicitly selected since the change-selection feature is not yet implemented)
+/// and spawns a runner with those change IDs.
+///
+/// Projects with no changes are skipped.
+pub async fn global_control_run(State(state): State<AppState>) -> Response {
     // Record the call for test verification
     if let Some(calls) = CONTROL_CALLS.get() {
         calls
             .lock()
             .unwrap()
-            .push((project_id.to_string(), action.to_string()));
+            .push(("_global_".to_string(), "run".to_string()));
     }
 
-    let (lock, semaphore, worktree_path) = {
+    let current_status = { state.orchestration_status.read().await.clone() };
+    if current_status == OrchestrationStatus::Running {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "action": "run",
+                "orchestration_status": "running",
+                "message": "Orchestration is already running"
+            })),
+        )
+            .into_response();
+    }
+
+    // Set status to Running
+    {
+        let mut status = state.orchestration_status.write().await;
+        *status = OrchestrationStatus::Running;
+    }
+
+    let (entries, data_dir) = {
         let registry = state.registry.read().await;
-        let Some(entry) = registry.get(project_id) else {
-            return error_response(
-                StatusCode::NOT_FOUND,
-                format!("Project not found: {}", project_id),
-            );
-        };
-        let lock = match registry.project_lock(project_id) {
-            Some(l) => l,
-            None => {
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Missing project lock")
-            }
-        };
-        let semaphore = registry.global_semaphore();
+        (registry.list(), registry.data_dir().to_path_buf())
+    };
 
-        let data_dir = registry.data_dir().to_path_buf();
-        let wt = data_dir
+    let mut started_count = 0u32;
+    let mut skipped_count = 0u32;
+
+    for entry in &entries {
+        let worktree_path = data_dir
             .join("worktrees")
-            .join(project_id)
+            .join(&entry.id)
             .join(&entry.branch);
-        (lock, semaphore, wt)
-    };
 
-    // Acquire global semaphore (max_concurrent_total)
-    let _sem_permit = match semaphore.acquire().await {
-        Ok(p) => p,
-        Err(_) => {
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Server is at maximum concurrent capacity",
-            )
+        // Collect all change IDs from the project worktree (all are implicitly selected for now)
+        let changes = list_change_ids_in_worktree(&worktree_path).await;
+        if changes.is_empty() {
+            skipped_count += 1;
+            continue;
         }
-    };
 
-    // Acquire per-project exclusive lock
-    let _guard = lock.lock().await;
-
-    // Apply action
-    if action == "run" || action == "retry" {
         // In unit tests we use CONTROL_CALLS as a stub signal; do not spawn real processes.
         if CONTROL_CALLS.get().is_none() {
             let req = ProjectRunRequest {
-                project_id: project_id.to_string(),
+                project_id: entry.id.clone(),
                 worktree_path,
-                changes,
+                changes: Some(changes),
             };
 
             if let Err(e) = crate::server::runner::start_project_run(
@@ -1542,40 +1541,177 @@ async fn apply_control(
             )
             .await
             {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to start run: {}", e),
-                );
+                error!("Failed to start run for project_id={}: {}", entry.id, e);
+                continue;
+            }
+        } else {
+            // Record per-project call for tests
+            if let Some(calls) = CONTROL_CALLS.get() {
+                calls
+                    .lock()
+                    .unwrap()
+                    .push((entry.id.clone(), "run".to_string()));
             }
         }
-    } else if action == "stop" {
-        crate::server::runner::stop_project_run(&state.runners, project_id.to_string()).await;
+
+        // Update project status to Running
+        let mut registry = state.registry.write().await;
+        let _ = registry.set_status(&entry.id, ProjectStatus::Running);
+
+        started_count += 1;
     }
 
-    let mut registry = state.registry.write().await;
-    match registry.set_status(project_id, new_status.clone()) {
-        Ok(()) => {
-            let status_str = match new_status {
-                ProjectStatus::Running => "running",
-                ProjectStatus::Stopped => "stopped",
-                ProjectStatus::Idle => "idle",
-            };
-            info!(
-                "Control action '{}' applied to project_id={}",
-                action, project_id
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "action": action,
-                    "project_id": project_id,
-                    "status": status_str
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    info!(
+        "Global run: started {} projects, skipped {} (no changes)",
+        started_count, skipped_count
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "action": "run",
+            "orchestration_status": "running",
+            "started": started_count,
+            "skipped": skipped_count
+        })),
+    )
+        .into_response()
+}
+
+/// POST /api/v1/control/stop - Stop orchestration across all projects.
+///
+/// Gracefully stops all running project runners and sets orchestration status to Stopped.
+pub async fn global_control_stop(State(state): State<AppState>) -> Response {
+    // Record the call for test verification
+    if let Some(calls) = CONTROL_CALLS.get() {
+        calls
+            .lock()
+            .unwrap()
+            .push(("_global_".to_string(), "stop".to_string()));
     }
+
+    // Set status to Stopped
+    {
+        let mut status = state.orchestration_status.write().await;
+        *status = OrchestrationStatus::Stopped;
+    }
+
+    let entries = {
+        let registry = state.registry.read().await;
+        registry.list()
+    };
+
+    let mut stopped_count = 0u32;
+
+    for entry in &entries {
+        if entry.status == ProjectStatus::Running {
+            crate::server::runner::stop_project_run(&state.runners, entry.id.clone()).await;
+
+            let mut registry = state.registry.write().await;
+            let _ = registry.set_status(&entry.id, ProjectStatus::Stopped);
+
+            stopped_count += 1;
+        }
+    }
+
+    info!("Global stop: stopped {} projects", stopped_count);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "action": "stop",
+            "orchestration_status": "stopped",
+            "stopped": stopped_count
+        })),
+    )
+        .into_response()
+}
+
+/// GET /api/v1/control/status - Get current orchestration status.
+pub async fn global_control_status(State(state): State<AppState>) -> Response {
+    let status = state.orchestration_status.read().await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "orchestration_status": status.as_str()
+        })),
+    )
+        .into_response()
+}
+
+/// List change IDs in a project worktree (all active changes are treated as selected).
+async fn list_change_ids_in_worktree(worktree_path: &std::path::Path) -> Vec<String> {
+    let changes_dir = worktree_path.join("openspec/changes");
+    if !changes_dir.exists() {
+        return Vec::new();
+    }
+
+    let entries = match std::fs::read_dir(&changes_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut change_ids = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let dir_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if dir_name == "archive" || dir_name.starts_with('.') {
+            continue;
+        }
+        // Only include changes with a proposal.md
+        if path.join("proposal.md").exists() {
+            change_ids.push(dir_name.to_string());
+        }
+    }
+
+    change_ids.sort();
+    change_ids
+}
+
+// ─────────────────────────── Deprecated per-project control (removed) ─────────
+
+// Per-project control endpoints (/projects/{id}/control/run|stop|retry) have been
+// removed. Use the global /api/v1/control/run and /api/v1/control/stop endpoints
+// instead. The global endpoints manage all projects as a single orchestration unit.
+
+// ─────────────────────────── Internal: per-project run (used by global control) ─
+
+/// Start a single project run (used internally by global_control_run and add_project auto-enqueue).
+async fn start_single_project_run(
+    state: &AppState,
+    project_id: &str,
+    worktree_path: std::path::PathBuf,
+    changes: Vec<String>,
+) -> std::result::Result<(), String> {
+    let req = ProjectRunRequest {
+        project_id: project_id.to_string(),
+        worktree_path,
+        changes: if changes.is_empty() {
+            None
+        } else {
+            Some(changes)
+        },
+    };
+
+    crate::server::runner::start_project_run(
+        &state.runners,
+        state.registry.clone(),
+        req,
+        state.log_tx.clone(),
+    )
+    .await
+    .map_err(|e| format!("Failed to start run: {}", e))?;
+
+    let mut registry = state.registry.write().await;
+    let _ = registry.set_status(project_id, ProjectStatus::Running);
+
+    Ok(())
 }
 
 // ─────────────────────────── /api/v1/projects/:id/worktrees ───────────────────
@@ -2061,9 +2197,9 @@ pub fn build_router(app_state: AppState) -> Router {
             "/projects/{id}/worktrees/{branch}/merge",
             post(server_merge_worktree),
         )
-        .route("/projects/{id}/control/run", post(control_run))
-        .route("/projects/{id}/control/stop", post(control_stop))
-        .route("/projects/{id}/control/retry", post(control_retry))
+        .route("/control/run", post(global_control_run))
+        .route("/control/stop", post(global_control_stop))
+        .route("/control/status", get(global_control_status))
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
             auth_middleware,
@@ -2113,6 +2249,9 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: None,
             log_tx,
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
         }
     }
 
@@ -2549,13 +2688,16 @@ mod tests {
             max_concurrent_total: max_concurrent,
             resolve_command: None,
             log_tx,
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
         }
     }
 
-    // ── Control tests ──
+    // ── Global Control tests ──
 
     #[tokio::test]
-    async fn test_control_run_records_call() {
+    async fn test_global_control_run_records_call() {
         let temp_dir = TempDir::new().unwrap();
         let state = make_state(&temp_dir, None);
 
@@ -2563,7 +2705,7 @@ mod tests {
         CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
         CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
 
-        let entry = state
+        let _entry = state
             .registry
             .write()
             .await
@@ -2574,7 +2716,34 @@ mod tests {
 
         let req = Request::builder()
             .method(Method::POST)
-            .uri(format!("/api/v1/projects/{}/control/run", entry.id))
+            .uri("/api/v1/control/run")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let calls = CONTROL_CALLS.get().unwrap().lock().unwrap();
+        // Global run records a "_global_" + "run" call
+        assert!(calls
+            .iter()
+            .any(|(id, action)| id == "_global_" && action == "run"));
+    }
+
+    #[tokio::test]
+    async fn test_global_control_stop_records_call() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+
+        // Initialize call recorder
+        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
+
+        let router = build_router(state.clone());
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/control/stop")
             .body(Body::empty())
             .unwrap();
 
@@ -2584,21 +2753,72 @@ mod tests {
         let calls = CONTROL_CALLS.get().unwrap().lock().unwrap();
         assert!(calls
             .iter()
-            .any(|(id, action)| id == &entry.id && action == "run"));
+            .any(|(id, action)| id == "_global_" && action == "stop"));
+    }
+
+    #[tokio::test]
+    async fn test_global_control_status_returns_idle_by_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/control/status")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["orchestration_status"], "idle");
+    }
+
+    #[tokio::test]
+    async fn test_per_project_control_routes_removed() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let router = build_router(state.clone());
+
+        // Old per-project control/run should return 404 (route not found)
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/control/run", entry.id))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // axum returns 405 Method Not Allowed for unmatched routes under existing paths,
+        // or 404 for completely unmatched routes
+        assert!(
+            resp.status() == StatusCode::NOT_FOUND
+                || resp.status() == StatusCode::METHOD_NOT_ALLOWED,
+            "Old per-project control/run route should be removed, got: {}",
+            resp.status()
+        );
     }
 
     // ── Semaphore (max_concurrent_total) tests ──
 
     #[tokio::test]
     async fn test_max_concurrent_total_semaphore_respected() {
-        use std::sync::Arc as StdArc;
-
         let temp_dir = TempDir::new().unwrap();
         // Create registry with max_concurrent_total = 2
         let state = make_state_with_limit(&temp_dir, None, 2);
 
         // Add two projects
-        let entry1 = state
+        let _entry1 = state
             .registry
             .write()
             .await
@@ -2635,7 +2855,6 @@ mod tests {
         assert_eq!(semaphore.available_permits(), 0, "Both permits taken");
 
         // Try to acquire a third — this would block (verify non-blocking attempt fails)
-        // Use try_acquire which returns immediately
         let result = semaphore.try_acquire();
         assert!(
             result.is_err(),
@@ -2651,25 +2870,6 @@ mod tests {
             semaphore.available_permits(),
             2,
             "Permits should be returned after release"
-        );
-
-        // CONTROL_CALLS interaction: verify control route acquires semaphore
-        // (simulated by the fact that the route code runs against this registry)
-        CONTROL_CALLS.get_or_init(|| StdArc::new(std::sync::Mutex::new(Vec::new())));
-        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
-
-        // Execute control/run on project1 — should succeed (permits available)
-        let router = build_router(state.clone());
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(format!("/api/v1/projects/{}/control/run", entry1.id))
-            .body(Body::empty())
-            .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "control/run should succeed when permits available"
         );
     }
 
@@ -3338,6 +3538,9 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: Some("echo resolve".to_string()),
             log_tx,
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
         };
 
         let branch = "main";
@@ -3484,6 +3687,9 @@ mod tests {
             // This resolve_command now comes from top-level config (not server.resolve_command)
             resolve_command: Some("echo resolve".to_string()),
             log_tx,
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
         };
 
         let branch = "main";
@@ -3713,6 +3919,9 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: None, // Not configured — must cause 422
             log_tx,
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
         };
         let router = build_router(state_with_project);
 
@@ -3769,6 +3978,9 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: None, // Will trigger 422 (resolve_command not configured)
             log_tx,
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
         };
         let router = build_router(state);
 
@@ -3819,6 +4031,9 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: Some("true".to_string()),
             log_tx,
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
         };
         let router = build_router(state);
 

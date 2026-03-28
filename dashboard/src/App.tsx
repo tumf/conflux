@@ -42,18 +42,18 @@ function App() {
     onStateUpdate: (state) => store.setFullState(state),
     onLogEntry: (entry) => store.appendLog(entry),
     onConnectionChange: (status) => store.setConnectionStatus(status),
-    onLogEntry: (entry) => store.appendLog(entry),
     onError: (error) => {
       console.error('WebSocket error:', error);
       toast.error(`Connection error: ${error.message}`);
     },
   });
 
-  const handleRun = useCallback(async (projectId: string) => {
+  // Global Run handler (starts orchestration across all projects)
+  const handleRun = useCallback(async () => {
     setIsLoading(true);
     try {
-      await controlRun(projectId);
-      toast.success('Project started');
+      await controlRun();
+      toast.success('Orchestration started');
     } catch (err) {
       toast.error(`Failed to start: ${err instanceof APIError ? err.message : String(err)}`);
     } finally {
@@ -61,11 +61,12 @@ function App() {
     }
   }, []);
 
-  const handleStop = useCallback(async (projectId: string) => {
+  // Global Stop handler (stops orchestration across all projects)
+  const handleStop = useCallback(async () => {
     setIsLoading(true);
     try {
-      await controlStop(projectId);
-      toast.success('Project stopped');
+      await controlStop();
+      toast.success('Orchestration stopped');
     } catch (err) {
       toast.error(`Failed to stop: ${err instanceof APIError ? err.message : String(err)}`);
     } finally {
@@ -204,8 +205,6 @@ function App() {
     projects: store.state.projects,
     selectedProjectId: store.state.selectedProjectId,
     onSelectProject: store.selectProject,
-    onRun: handleRun,
-    onStop: handleStop,
     onGitSync: handleGitSync,
     onDelete: handleDeleteClick,
     isLoading,
@@ -214,7 +213,13 @@ function App() {
 
   return (
     <div className="flex h-screen flex-col bg-[#09090b] text-[#fafafa]">
-      <Header connectionStatus={store.state.connectionStatus} />
+      <Header
+        connectionStatus={store.state.connectionStatus}
+        orchestrationStatus={store.state.orchestrationStatus}
+        onRun={handleRun}
+        onStop={handleStop}
+        isLoading={isLoading}
+      />
 
       <div className="flex flex-1 overflow-hidden">
         {/* Desktop layout */}

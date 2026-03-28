@@ -56,6 +56,9 @@ pub async fn run_server(config: ServerConfig, resolve_command: Option<String>) -
         max_concurrent_total: config.max_concurrent_total,
         resolve_command,
         log_tx,
+        orchestration_status: std::sync::Arc::new(tokio::sync::RwLock::new(
+            registry::OrchestrationStatus::default(),
+        )),
     };
 
     // Build router.

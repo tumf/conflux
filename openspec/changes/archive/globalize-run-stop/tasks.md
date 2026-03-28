@@ -1,0 +1,17 @@
+## Implementation Tasks
+
+- [x] Task 1: `OrchestrationStatus` enum (Idle/Running/Stopped) を定義 (`src/server/registry.rs`) (verification: `cargo build`)
+- [x] Task 2: `AppState` にグローバル `orchestration_status: Arc<RwLock<OrchestrationStatus>>` を追加 (`src/server/api.rs`, `src/server/mod.rs`) (verification: `cargo build`)
+- [x] Task 3: `POST /api/v1/control/run` エンドポイントを追加 — 全プロジェクトの selected change を対象に runner を spawn (`src/server/api.rs`) (verification: cargo build + test)
+- [x] Task 4: `POST /api/v1/control/stop` エンドポイントを追加 — 全 running プロジェクトを graceful stop (`src/server/api.rs`) (verification: cargo build + test)
+- [x] Task 5: per-project `control/run`, `control/stop`, `control/retry` ルートとハンドラを削除 (`src/server/api.rs`) (verification: `cargo build`、旧エンドポイントに 404 が返る)
+- [x] Task 6: WebSocket `full_state` に `orchestration_status` フィールドを追加 (`src/server/api.rs`, `src/remote/types.rs`) (verification: WebSocket メッセージに status が含まれる)
+- [x] Task 7: グローバル Run 時に各プロジェクトの change ID リストを収集し `cflx run --change <ids>` として runner を spawn (`src/server/api.rs`) (verification: change のみが実行される)
+- [x] Task 8: Running 中に新規プロジェクト追加時、自動的に runner を spawn するロジックを追加 (`src/server/api.rs`) (verification: Running 中にプロジェクト追加→自動実行開始)
+- [x] Task 9: ダッシュボード TypeScript 型に `orchestration_status` を追加 (`dashboard/src/api/types.ts`) (verification: TypeScript コンパイル)
+- [x] Task 10: `restClient.ts` の `controlRun`/`controlStop` をグローバルエンドポイントに変更 (`dashboard/src/api/restClient.ts`) (verification: TypeScript コンパイル)
+- [x] Task 11: `Header` コンポーネントにグローバル Run/Stop ボタンと orchestration_status 表示を追加 (`dashboard/src/components/Header.tsx`) (verification: `cd dashboard && npm run build`)
+- [x] Task 12: `ProjectCard` から Run/Stop ボタンを削除 (`dashboard/src/components/ProjectCard.tsx`) (verification: `cd dashboard && npm run build`)
+- [x] Task 13: `App.tsx` の `handleRun`/`handleStop` をグローバル API に変更し、per-project の props を削除 (`dashboard/src/App.tsx`) (verification: `cd dashboard && npm run build`)
+- [x] Task 14: `cargo clippy -- -D warnings` と `cargo fmt --check` が通ることを確認 (verification: CI lint と同等)
+- [x] Task 15: `cd dashboard && npm run build` が通ることを確認 (verification: ダッシュボードビルド成功)

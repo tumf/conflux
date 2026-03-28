@@ -1,13 +1,11 @@
 import React from 'react';
-import { Play, Square, RefreshCw, Trash2 } from 'lucide-react';
+import { RefreshCw, Trash2 } from 'lucide-react';
 import { RemoteProject } from '../api/types';
 
 interface ProjectCardProps {
   project: RemoteProject;
   isSelected: boolean;
   onSelect: (projectId: string) => void;
-  onRun: (projectId: string) => void;
-  onStop: (projectId: string) => void;
   onGitSync: (projectId: string) => void;
   onDelete: (projectId: string) => void;
   isLoading: boolean;
@@ -25,8 +23,6 @@ export function ProjectCard({
   project,
   isSelected,
   onSelect,
-  onRun,
-  onStop,
   onGitSync,
   onDelete,
   isLoading,
@@ -70,26 +66,6 @@ export function ProjectCard({
       </div>
 
       <div className="flex gap-1.5">
-        <button
-          onClick={(e) => { e.stopPropagation(); onRun(project.id); }}
-          disabled={isLoading || project.status === 'running'}
-          className="flex flex-1 items-center justify-center gap-1 rounded-md bg-[#166534]/60 px-2 py-1.5 text-xs font-medium text-[#22c55e] transition-colors hover:bg-[#166534]/80 disabled:cursor-not-allowed disabled:opacity-40"
-          aria-label={`Run ${repo}@${branch}`}
-        >
-          <Play className="size-3" />
-          Run
-        </button>
-
-        <button
-          onClick={(e) => { e.stopPropagation(); onStop(project.id); }}
-          disabled={isLoading || project.status !== 'running'}
-          className="flex flex-1 items-center justify-center gap-1 rounded-md bg-[#450a0a]/60 px-2 py-1.5 text-xs font-medium text-[#ef4444] transition-colors hover:bg-[#450a0a]/80 disabled:cursor-not-allowed disabled:opacity-40"
-          aria-label={`Stop ${repo}@${branch}`}
-        >
-          <Square className="size-3" />
-          Stop
-        </button>
-
         <button
           onClick={(e) => { e.stopPropagation(); onGitSync(project.id); }}
           disabled={isLoading || !syncAvailable}

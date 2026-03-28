@@ -6,8 +6,6 @@ interface ProjectsPanelProps {
   projects: RemoteProject[];
   selectedProjectId: string | null;
   onSelectProject: (projectId: string) => void;
-  onRun: (projectId: string) => void;
-  onStop: (projectId: string) => void;
   onGitSync: (projectId: string) => void;
   onDelete: (projectId: string) => void;
   isLoading: boolean;
@@ -19,8 +17,6 @@ export function ProjectsPanel({
   projects,
   selectedProjectId,
   onSelectProject,
-  onRun,
-  onStop,
   onGitSync,
   onDelete,
   isLoading,
@@ -39,8 +35,6 @@ export function ProjectsPanel({
             project={project}
             isSelected={selectedProjectId === project.id}
             onSelect={onSelectProject}
-            onRun={onRun}
-            onStop={onStop}
             onGitSync={onGitSync}
             onDelete={onDelete}
             isLoading={isLoading}

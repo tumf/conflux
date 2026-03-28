@@ -488,22 +488,17 @@ impl RemoteClient {
         }
     }
 
-    /// Start processing changes for a project on the remote server.
+    /// Start global orchestration across all projects on the remote server.
     ///
-    /// Calls `POST /api/v1/projects/{id}/control/run`.
-    pub async fn control_run(&self, project_id: &str, changes: Option<Vec<String>>) -> Result<()> {
-        let url = format!(
-            "{}/api/v1/projects/{}/control/run",
-            self.base_url, project_id
-        );
+    /// Calls `POST /api/v1/control/run`.
+    pub async fn control_run(
+        &self,
+        _project_id: &str,
+        _changes: Option<Vec<String>>,
+    ) -> Result<()> {
+        let url = format!("{}/api/v1/control/run", self.base_url);
         let req = self.http.post(&url);
         let req = self.authorized(req);
-
-        let req = if let Some(changes) = changes {
-            req.json(&serde_json::json!({"changes": changes}))
-        } else {
-            req
-        };
 
         let resp = req.send().await.map_err(|e| {
             OrchestratorError::Io(std::io::Error::other(format!(
@@ -522,15 +517,12 @@ impl RemoteClient {
         Ok(())
     }
 
-    /// Stop processing for a project on the remote server.
+    /// Stop global orchestration across all projects on the remote server.
     ///
-    /// Calls `POST /api/v1/projects/{id}/control/stop`.
+    /// Calls `POST /api/v1/control/stop`.
     #[allow(dead_code)]
-    pub async fn control_stop(&self, project_id: &str) -> Result<()> {
-        let url = format!(
-            "{}/api/v1/projects/{}/control/stop",
-            self.base_url, project_id
-        );
+    pub async fn control_stop(&self, _project_id: &str) -> Result<()> {
+        let url = format!("{}/api/v1/control/stop", self.base_url);
         let req = self.http.post(&url);
         let req = self.authorized(req);
 
