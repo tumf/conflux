@@ -130,6 +130,7 @@ pub fn full_state_json(project_id: &str, project_name: &str, changes_json: &[Str
                     "branch": "main",
                     "status": "idle",
                     "is_busy": false,
+                    "error": null,
                     "changes": [{changes}]
                 }}
             ]

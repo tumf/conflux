@@ -16,34 +16,38 @@ export type ChangeStatus =
 
 export interface RemoteProject {
   id: string;
+  /** Display name in "repo@branch" format */
   name: string;
   repo: string;
   branch: string;
   status: ProjectStatus;
   is_busy: boolean;
   error: string | null;
+  /** Changes nested within this project (from server) */
   changes: RemoteChange[];
 }
 
 export interface RemoteChange {
   id: string;
-  /** Project identifier - matches `project` field from Rust RemoteChange */
+  /** Project identifier this change belongs to */
   project: string;
-  status: string;
-  iteration_number: number | null;
   completed_tasks: number;
   total_tasks: number;
+  /** ISO 8601 timestamp of last modification */
   last_modified: string;
+  status: ChangeStatus;
+  iteration_number: number | null;
 }
 
 export interface RemoteLogEntry {
   message: string;
-  level: string;
+  level: 'info' | 'warn' | 'error' | 'success';
   change_id: string | null;
+  /** ISO 8601 timestamp */
   timestamp: string;
-  project_id?: string | null;
-  operation?: string | null;
-  iteration?: number | null;
+  project_id: string | null;
+  operation: string | null;
+  iteration: number | null;
 }
 
 /** Merge conflict information for a worktree */
@@ -73,5 +77,7 @@ export interface WorktreeInfo {
 
 export interface FullState {
   projects: RemoteProject[];
+  /** Flattened changes extracted from projects for easy access */
+  changes: RemoteChange[];
   worktrees?: Record<string, WorktreeInfo[]>;
 }

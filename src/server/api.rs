@@ -142,6 +142,19 @@ fn error_response(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(ErrorResponse { error: msg.into() })).into_response()
 }
 
+// ─────────────────────────────── /api/v1/version ──────────────────────────────
+
+/// GET /api/v1/version - return backend version string
+pub async fn get_version() -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "version": format!("v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_NUMBER"))
+        })),
+    )
+        .into_response()
+}
+
 // ─────────────────────────────── /api/v1/projects ─────────────────────────────
 
 /// GET /api/v1/projects - list all projects
@@ -275,8 +288,8 @@ async fn build_remote_project_snapshot_async(
     data_dir: &std::path::Path,
     entry: &ProjectEntry,
 ) -> RemoteProject {
+    let name = project_display_name(&entry.remote_url, &entry.branch);
     let repo = extract_repo_name(&entry.remote_url);
-    let name = format!("{}@{}", repo, entry.branch);
     let worktree_path = data_dir
         .join("worktrees")
         .join(&entry.id)
@@ -289,6 +302,7 @@ async fn build_remote_project_snapshot_async(
         ProjectStatus::Running => "running",
         ProjectStatus::Stopped => "stopped",
     };
+    let is_busy = matches!(entry.status, ProjectStatus::Running);
 
     RemoteProject {
         id: entry.id.clone(),
@@ -296,13 +310,13 @@ async fn build_remote_project_snapshot_async(
         repo,
         branch: entry.branch.clone(),
         status: status_str.to_string(),
-        is_busy: entry.status == ProjectStatus::Running,
+        is_busy,
         error: None,
         changes,
     }
 }
 
-/// Extract a human-readable repository name from a remote URL.
+/// Extract the repository name from a remote URL (last path segment without .git suffix).
 ///
 /// For standard git remotes ending in `.git`, the `.git` suffix is stripped.
 /// For unusual URLs, falls back to the best available non-empty label.
@@ -320,6 +334,12 @@ fn extract_repo_name(remote_url: &str) -> String {
     } else {
         basename.to_string()
     }
+}
+
+fn project_display_name(remote_url: &str, branch: &str) -> String {
+    // Keep it short but recognizable: repo@branch
+    let repo = extract_repo_name(remote_url);
+    format!("{}@{}", repo, branch)
 }
 
 async fn list_remote_changes_in_worktree(
@@ -1924,6 +1944,7 @@ pub fn build_router(app_state: AppState) -> Router {
 
     let public_api_routes = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/version", get(get_version))
         .with_state(app_state);
 
     let api_routes = Router::new()

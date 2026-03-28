@@ -2,13 +2,15 @@
  * WebSocket Client for Real-time State Updates
  */
 
-import { FullState, RemoteLogEntry } from './types';
+import { FullState, RemoteChange, RemoteLogEntry, RemoteProject } from './types';
 
 export type ConnectionStatus = 'connected' | 'reconnecting' | 'disconnected';
 
 interface WSMessage {
   type: 'full_state' | 'log' | 'change_update' | 'ping' | 'pong';
-  projects?: FullState['projects'];
+  /** Server sends projects with nested changes */
+  projects?: RemoteProject[];
+  /** Per-project worktree information */
   worktrees?: FullState['worktrees'];
   data?: FullState;
   entry?: RemoteLogEntry;
@@ -57,8 +59,14 @@ export class WebSocketClient {
             console.debug('WS message received:', message.type);
 
             if (message.type === 'full_state') {
-              const state: FullState = message.data ?? {
-                projects: message.projects ?? [],
+              const projects: RemoteProject[] = message.projects ?? [];
+              // Flatten changes from nested project structure
+              const changes: RemoteChange[] = projects.flatMap(
+                (project) => project.changes ?? [],
+              );
+              const state: FullState = {
+                projects,
+                changes,
                 worktrees: message.worktrees,
               };
               this.listeners.onStateUpdate?.(state);
