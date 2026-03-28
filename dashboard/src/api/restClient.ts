@@ -109,7 +109,7 @@ export async function createWorktree(
   projectId: string,
   changeId: string,
 ): Promise<WorktreeInfo> {
-  return fetchAPI(`/projects/${projectId}/worktrees/create`, {
+  return fetchAPI(`/projects/${projectId}/worktrees`, {
     method: 'POST',
     body: JSON.stringify({ change_id: changeId }),
   });
