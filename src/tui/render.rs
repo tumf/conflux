@@ -306,18 +306,21 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         .filter(|c| c.queue_status.is_active())
         .count();
 
-    // Per spec (update-tui-status-display):
-    // - Ready: when in Select mode
-    // - Running <count>: when changes are processing (count > 0)
-    // - No status: in Stopped and Error modes
+    // Per spec (update-tui-header-loop-state):
+    // - Select mode: Ready
+    // - Running mode: Running / Running <count>
+    // - Stopping mode: Stopping
+    // - Stopped/Error modes: no status label
     let (mode_text, mode_color, show_status) = match app.mode {
-        AppMode::Select | AppMode::Running | AppMode::Stopping => {
+        AppMode::Select => ("Ready".to_string(), Color::Cyan, true),
+        AppMode::Running => {
             if active_count > 0 {
                 (format!("Running {}", active_count), Color::Yellow, true)
             } else {
-                ("Ready".to_string(), Color::Cyan, true)
+                ("Running".to_string(), Color::Yellow, true)
             }
         }
+        AppMode::Stopping => ("Stopping".to_string(), Color::Yellow, true),
         AppMode::Stopped | AppMode::Error => {
             // Hide status in Stopped and Error modes per spec
             (String::new(), Color::White, false)
@@ -2435,7 +2438,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_mode_shows_running_when_resolving() {
+    fn test_select_mode_shows_ready_even_when_resolving_exists() {
         let mut app = create_test_app(vec![
             create_test_change("change-a"),
             create_test_change("change-b"),
@@ -2449,13 +2452,60 @@ mod tests {
         let content = buffer_to_string(&buffer);
 
         assert!(
-            content.contains("[Running 1]"),
-            "Header should show 'Running 1' in Select mode when resolving, but got:\n{}",
+            content.contains("[Ready]"),
+            "Header should show 'Ready' in Select mode, but got:\n{}",
+            content
+        );
+        assert!(
+            !content.contains("[Running 1]"),
+            "Header should not show '[Running 1]' in Select mode, but got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_running_mode_shows_running_without_count_when_no_in_flight() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Queued;
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        assert!(
+            content.contains("[Running]"),
+            "Header should show '[Running]' in Running mode with zero in-flight, but got:\n{}",
+            content
+        );
+        assert!(
+            !content.contains("[Running 1]"),
+            "Header should not show count when in-flight is zero, but got:\n{}",
             content
         );
         assert!(
             !content.contains("[Ready]"),
-            "Header should not show '[Ready]' while resolving, but got:\n{}",
+            "Header should not show '[Ready]' in Running mode, but got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_stopping_mode_header_shows_stopping() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Stopping;
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        assert!(
+            content.contains("[Stopping]"),
+            "Header should show '[Stopping]' in Stopping mode, but got:\n{}",
+            content
+        );
+        assert!(
+            !content.contains("[Ready]"),
+            "Header should not show '[Ready]' in Stopping mode, but got:\n{}",
             content
         );
     }

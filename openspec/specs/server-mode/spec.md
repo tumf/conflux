@@ -66,14 +66,6 @@ TBD - created by archiving change add-server-daemon. Update Purpose after archiv
 - **WHEN** 複数プロジェクトの実行要求が同時に発生する
 - **THEN** 実行中のワーカー数は常に 4 以下になる
 
-### Requirement: `~/.wt/setup` を参照しない
-サーバモードは `~/.wt/setup` を読み込んだり実行したりしてはならない（MUST NOT）。
-
-#### Scenario: `~/.wt/setup` が存在しても無視される
-- **GIVEN** `~/.wt/setup` が存在する
-- **WHEN** サーバが起動またはプロジェクト操作を行う
-- **THEN** `~/.wt/setup` は参照されない
-
 ### Requirement: プロジェクト追加時の自動クローン
 サーバは `POST /api/v1/projects` の成功時に、指定された `remote_url` と `branch` を検証し、サーバの `data_dir` 配下にローカル clone と作業ツリーを準備しなければならない（MUST）。
 
