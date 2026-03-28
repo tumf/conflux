@@ -24,9 +24,7 @@ export function WorktreeRow({ worktree, onMerge, onDelete, onClickWorktree, isSe
   const label = worktree.branch || worktree.head;
 
   const handleRowClick = () => {
-    if (!worktree.is_main) {
-      onClickWorktree?.(worktree.branch);
-    }
+    onClickWorktree?.(worktree.branch);
   };
 
   return (
@@ -36,7 +34,7 @@ export function WorktreeRow({ worktree, onMerge, onDelete, onClickWorktree, isSe
         isSelected
           ? 'border-[#6366f1] bg-[#1e1b4b]/30'
           : 'border-[#27272a] bg-[#111113] hover:border-[#3f3f46]'
-      } ${!worktree.is_main ? 'cursor-pointer' : ''}`}
+      } cursor-pointer`}
     >
       <div className="flex min-w-0 flex-1 items-center gap-2">
         <GitBranch className="size-3.5 shrink-0 text-[#52525b]" />
