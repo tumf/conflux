@@ -3742,6 +3742,61 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Fix: manual resolve dirty-base classification (fix-resolve-dirty-base-transition)
+    // -----------------------------------------------------------------------
+
+    /// Manual resolve blocked by MERGE_HEAD (another resolve in progress) →
+    /// ResolveFailed is NOT sent; instead MergeDeferred(auto_resumable=true) →
+    /// TUI shows ResolveWait ("resolve pending").
+    #[test]
+    fn test_manual_resolve_merge_in_progress_tui_shows_resolve_wait() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Change starts in MergeWait (from a previous manual-intervention deferral).
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = false;
+
+        // User presses M → resolve_merge transitions to ResolveWait.
+        // (In real flow, ReducerCommand::ResolveMerge is applied first.)
+        // Then the dirty-base check finds MERGE_HEAD → auto-resumable MergeDeferred.
+        app.handle_merge_deferred(
+            "change-a".to_string(),
+            "Base is dirty: Merge in progress (MERGE_HEAD exists)".to_string(),
+            true,
+        );
+
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::ResolveWait,
+            "manual resolve blocked by merge-in-progress must show ResolveWait"
+        );
+    }
+
+    /// Manual resolve blocked by uncommitted changes → ResolveFailed → MergeWait.
+    #[test]
+    fn test_manual_resolve_uncommitted_changes_tui_shows_merge_wait() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Change starts in MergeWait.
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.is_resolving = false;
+
+        // Dirty-base check finds uncommitted changes → ResolveFailed.
+        app.handle_resolve_failed(
+            "change-a".to_string(),
+            "Base is dirty: Working tree has uncommitted changes".to_string(),
+        );
+
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::MergeWait,
+            "manual resolve blocked by uncommitted changes must show MergeWait"
+        );
+    }
+
     #[test]
     fn test_remote_change_update_increases_progress() {
         let changes = vec![create_test_change("MyProj/feat", 1, 5)];

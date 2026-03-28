@@ -871,11 +871,20 @@ impl OrchestratorState {
             ExecutionEvent::ResolveFailed { change_id, .. } => {
                 // Resolve failure does NOT regress a terminal state.
                 let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal() && matches!(rt.activity, ActivityState::Resolving) {
-                    rt.activity = ActivityState::Idle;
-                    // Restore MergeWait so the row returns to "merge wait" rather than
-                    // appearing as "queued" after a failed manual resolve attempt.
-                    rt.wait_state = WaitState::MergeWait;
+                if !rt.is_terminal() {
+                    // Reset activity if we were actively resolving.
+                    if matches!(rt.activity, ActivityState::Resolving) {
+                        rt.activity = ActivityState::Idle;
+                    }
+                    // Restore MergeWait when the failure happened during Resolving,
+                    // or before ResolveStarted was sent (early dirty-base check
+                    // while still in ResolveWait from ReducerCommand::ResolveMerge).
+                    if matches!(rt.activity, ActivityState::Idle)
+                        && matches!(rt.wait_state, WaitState::ResolveWait | WaitState::None)
+                    {
+                        rt.wait_state = WaitState::MergeWait;
+                        self.resolve_wait_queue.retain(|id| id != change_id);
+                    }
                 }
             }
 
@@ -1951,6 +1960,115 @@ mod tests {
         state.apply_execution_event(&ExecutionEvent::MergeCompleted {
             change_id: "b".to_string(),
             revision: "abc123".to_string(),
+        });
+        assert_eq!(state.display_status("b"), "merged");
+        assert!(state.is_terminal_change("b"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix: manual resolve dirty-base classification (fix-resolve-dirty-base-transition)
+    // -----------------------------------------------------------------------
+
+    /// Manual resolve blocked by another merge in progress → MergeDeferred(auto_resumable=true)
+    /// → ResolveWait ("resolve pending"), eligible for automatic retry.
+    #[test]
+    fn test_manual_resolve_blocked_by_merge_in_progress_becomes_resolve_pending() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+
+        // Change starts in MergeWait.
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "c".to_string(),
+            reason: "base dirty".to_string(),
+            auto_resumable: false,
+        });
+        assert_eq!(state.display_status("c"), "merge wait");
+
+        // User requests resolve → ResolveWait.
+        state.apply_command(ReducerCommand::ResolveMerge("c".to_string()));
+        assert_eq!(state.display_status("c"), "resolve pending");
+
+        // Dirty-base check discovers MERGE_HEAD → auto-resumable MergeDeferred.
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "c".to_string(),
+            reason: "Merge in progress (MERGE_HEAD exists)".to_string(),
+            auto_resumable: true,
+        });
+        assert_eq!(
+            state.display_status("c"),
+            "resolve pending",
+            "auto-resumable dirty base must stay as resolve pending"
+        );
+    }
+
+    /// Manual resolve blocked by uncommitted changes → ResolveFailed → MergeWait.
+    #[test]
+    fn test_manual_resolve_blocked_by_uncommitted_changes_stays_merge_wait() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+
+        // Change starts in MergeWait.
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "c".to_string(),
+            reason: "base dirty".to_string(),
+            auto_resumable: false,
+        });
+        assert_eq!(state.display_status("c"), "merge wait");
+
+        // User requests resolve → ResolveWait.
+        state.apply_command(ReducerCommand::ResolveMerge("c".to_string()));
+        assert_eq!(state.display_status("c"), "resolve pending");
+
+        // Dirty-base check discovers uncommitted changes → ResolveFailed.
+        // Note: No ResolveStarted was sent (early exit).
+        state.apply_execution_event(&ExecutionEvent::ResolveFailed {
+            change_id: "c".to_string(),
+            error: "Base is dirty: Working tree has uncommitted changes".to_string(),
+        });
+        assert_eq!(
+            state.display_status("c"),
+            "merge wait",
+            "uncommitted-changes dirty base must revert to merge wait"
+        );
+    }
+
+    /// After auto-resumable deferral from manual resolve, a preceding resolve
+    /// completes (ResolveCompleted for another change) → the deferred change is
+    /// retried via retry_deferred_merges → MergeCompleted → Merged.
+    #[test]
+    fn test_auto_resumable_deferred_resolve_auto_retries_after_preceding_completes() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["a".to_string(), "b".to_string()], 0);
+
+        // change-a is being resolved actively.
+        state.apply_execution_event(&ExecutionEvent::ResolveStarted {
+            change_id: "a".to_string(),
+            command: "resolve a".to_string(),
+        });
+        assert_eq!(state.display_status("a"), "resolving");
+
+        // change-b tries manual resolve → blocked by MERGE_HEAD → auto-resumable.
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "b".to_string(),
+            reason: "Merge in progress (MERGE_HEAD exists)".to_string(),
+            auto_resumable: true,
+        });
+        assert_eq!(state.display_status("b"), "resolve pending");
+
+        // change-a resolve completes.
+        state.apply_execution_event(&ExecutionEvent::ResolveCompleted {
+            change_id: "a".to_string(),
+            worktree_change_ids: None,
+        });
+        assert_eq!(state.display_status("a"), "merged");
+
+        // retry_deferred_merges retries change-b and succeeds → MergeCompleted.
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "b".to_string(),
+            revision: "rev-b".to_string(),
         });
         assert_eq!(state.display_status("b"), "merged");
         assert!(state.is_terminal_change("b"));

@@ -566,11 +566,25 @@ pub async fn handle_tui_command(
 
                 match crate::parallel::base_dirty_reason(&resolve_repo_root).await {
                     Ok(Some(reason)) => {
-                        finish_resolve(OrchestratorEvent::ResolveFailed {
-                            change_id: id.clone(),
-                            error: format!("Base is dirty: {}", reason),
-                        })
-                        .await;
+                        let auto_resumable =
+                            crate::parallel::is_dirty_reason_auto_resumable(&reason);
+                        if auto_resumable {
+                            // Another merge/resolve is in progress; transition to
+                            // resolve pending so the change is retried automatically.
+                            finish_resolve(OrchestratorEvent::MergeDeferred {
+                                change_id: id.clone(),
+                                reason: format!("Base is dirty: {}", reason),
+                                auto_resumable: true,
+                            })
+                            .await;
+                        } else {
+                            // Uncommitted changes or other manual-repair condition.
+                            finish_resolve(OrchestratorEvent::ResolveFailed {
+                                change_id: id.clone(),
+                                error: format!("Base is dirty: {}", reason),
+                            })
+                            .await;
+                        }
                         return;
                     }
                     Err(e) => {
