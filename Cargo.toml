@@ -51,7 +51,7 @@ required-features = ["web-monitoring"]
 
 [features]
 default = ["web-monitoring"]
-web-monitoring = ["axum", "tower", "tower-http", "qrcode", "local-ip-address", "utoipa", "utoipa-swagger-ui", "portable-pty"]
+web-monitoring = ["axum", "tower", "tower-http", "qrcode", "local-ip-address", "utoipa", "utoipa-swagger-ui", "portable-pty", "rusqlite"]
 
 [dependencies]
 tokio = { version = "1", features = ["full", "process"] }
