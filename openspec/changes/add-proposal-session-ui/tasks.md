@@ -30,3 +30,7 @@
 - [x] Add UI tests for `ElicitationDialog` render + submit/decline/cancel behavior so Task 9 verification is true
 - [x] Add UI/integration tests for multi-session tab switching so Task 14 verification is true
 - [x] Remove the dead `onFinalizeStreaming` integration or wire it into the real streaming completion flow and cover it with tests
+
+## Acceptance #3 Failure Follow-up
+
+- [x] Remove the still-unused `FINALIZE_STREAMING_MESSAGE` reducer/store API or wire it into the real WebSocket completion flow and cover that path with tests

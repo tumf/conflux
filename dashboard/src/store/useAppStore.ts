@@ -59,7 +59,6 @@ export type AppAction =
   | { type: 'SET_ACTIVE_PROPOSAL_SESSION'; payload: string | null }
   | { type: 'APPEND_CHAT_MESSAGE'; payload: { sessionId: string; message: ProposalChatMessage } }
   | { type: 'APPEND_STREAMING_CHUNK'; payload: { messageId: string; content: string } }
-  | { type: 'FINALIZE_STREAMING_MESSAGE'; payload: { sessionId: string; messageId: string } }
   | { type: 'UPDATE_TOOL_CALL'; payload: { sessionId: string; messageId: string; toolCall: ToolCallInfo } }
   | { type: 'UPDATE_TOOL_CALL_STATUS'; payload: { sessionId: string; messageId: string; toolCallId: string; status: ToolCallStatus } }
   | { type: 'SET_ELICITATION'; payload: ElicitationRequest | null }
@@ -248,38 +247,6 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       };
     }
 
-    case 'FINALIZE_STREAMING_MESSAGE': {
-      const { sessionId, messageId } = action.payload;
-      const streamedContent = state.streamingContent[messageId];
-      if (!streamedContent) return state;
-
-      const msgs = state.chatMessagesBySessionId[sessionId] || [];
-      // Check if message already exists (was added via assistant_message)
-      const exists = msgs.some((m) => m.id === messageId);
-      const newStreamingContent = { ...state.streamingContent };
-      delete newStreamingContent[messageId];
-
-      if (exists) {
-        return { ...state, streamingContent: newStreamingContent, isAgentResponding: false };
-      }
-
-      const finalMessage: ProposalChatMessage = {
-        id: messageId,
-        role: 'assistant',
-        content: streamedContent,
-        timestamp: new Date().toISOString(),
-      };
-      return {
-        ...state,
-        chatMessagesBySessionId: {
-          ...state.chatMessagesBySessionId,
-          [sessionId]: [...msgs, finalMessage],
-        },
-        streamingContent: newStreamingContent,
-        isAgentResponding: false,
-      };
-    }
-
     case 'UPDATE_TOOL_CALL': {
       const { sessionId, messageId, toolCall } = action.payload;
       const msgs = state.chatMessagesBySessionId[sessionId] || [];
@@ -394,10 +361,6 @@ export function useAppStore() {
     dispatch({ type: 'APPEND_STREAMING_CHUNK', payload: { messageId, content } });
   }, []);
 
-  const finalizeStreamingMessage = useCallback((sessionId: string, messageId: string) => {
-    dispatch({ type: 'FINALIZE_STREAMING_MESSAGE', payload: { sessionId, messageId } });
-  }, []);
-
   const updateToolCall = useCallback((sessionId: string, messageId: string, toolCall: ToolCallInfo) => {
     dispatch({ type: 'UPDATE_TOOL_CALL', payload: { sessionId, messageId, toolCall } });
   }, []);
@@ -430,7 +393,6 @@ export function useAppStore() {
     setActiveProposalSession,
     appendChatMessage,
     appendStreamingChunk,
-    finalizeStreamingMessage,
     updateToolCall,
     updateToolCallStatus,
     setElicitation,
