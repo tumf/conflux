@@ -117,6 +117,9 @@ pub struct ProjectRegistry {
     /// In-memory per-project per-change selection state: project_id -> (change_id -> selected).
     /// Not persisted; all changes default to `true` on server restart.
     change_selections: HashMap<String, HashMap<String, bool>>,
+    /// In-memory per-project error state for changes.
+    /// Not persisted; all changes default to non-error on server restart.
+    error_changes: HashMap<String, HashMap<String, String>>,
 }
 
 impl ProjectRegistry {
@@ -168,6 +171,7 @@ impl ProjectRegistry {
             project_locks,
             global_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_total)),
             change_selections: HashMap::new(),
+            error_changes: HashMap::new(),
         })
     }
 
@@ -277,46 +281,61 @@ impl ProjectRegistry {
     }
 
     /// Toggle the selected state of a single change. Returns the new value.
-    /// If the change was not previously tracked, it is treated as `true` and toggled to `false`.
+    /// If the change was not previously tracked, non-error changes are treated as `true`
+    /// and error changes are treated as `false`.
     pub fn toggle_change_selected(&mut self, project_id: &str, change_id: &str) -> bool {
+        let is_error = self.is_change_error(project_id, change_id);
+        let default_selected = !is_error;
         let entry = self
             .change_selections
             .entry(project_id.to_string())
             .or_default()
             .entry(change_id.to_string())
-            .or_insert(true);
+            .or_insert(default_selected);
         *entry = !*entry;
         debug!(
             project_id,
             change_id,
             selected = *entry,
+            is_error,
             "Toggled change selection"
         );
         *entry
     }
 
-    /// Toggle all changes for a project. If any change is unselected, select all; otherwise
-    /// deselect all. `known_change_ids` is the current list of change IDs for the project so
-    /// that all are covered even if not yet tracked.
+    /// Toggle all changes for a project. If any eligible change is unselected, select all;
+    /// otherwise deselect all. `known_change_ids` is the current list of change IDs for the
+    /// project so that all are covered even if not yet tracked.
     ///
-    /// Returns the new selected value applied to all changes.
+    /// Error changes default to `false` until they are explicitly re-marked, so bulk toggle
+    /// follows the same semantics as individual toggle.
+    ///
+    /// Returns the new selected value applied to all tracked changes.
     pub fn toggle_all_changes(&mut self, project_id: &str, known_change_ids: &[String]) -> bool {
+        let default_selections: Vec<(String, bool)> = known_change_ids
+            .iter()
+            .map(|cid| (cid.clone(), !self.is_change_error(project_id, cid)))
+            .collect();
         let selections = self
             .change_selections
             .entry(project_id.to_string())
             .or_default();
 
-        // Ensure all known changes are tracked
-        for cid in known_change_ids {
-            selections.entry(cid.clone()).or_insert(true);
+        // Ensure all known changes are tracked with the same defaults as single-change toggles.
+        for (cid, default_selected) in default_selections {
+            selections.entry(cid).or_insert(default_selected);
         }
 
-        // If any change is false, select all; otherwise deselect all.
-        let any_unselected = selections.values().any(|&v| !v);
+        // If any tracked change is false, select all; otherwise deselect all.
+        let any_unselected = known_change_ids
+            .iter()
+            .any(|cid| !selections.get(cid).copied().unwrap_or(true));
         let new_value = any_unselected;
 
-        for val in selections.values_mut() {
-            *val = new_value;
+        for cid in known_change_ids {
+            if let Some(val) = selections.get_mut(cid) {
+                *val = new_value;
+            }
         }
 
         debug!(
@@ -334,6 +353,46 @@ impl ProjectRegistry {
         project_id: &str,
     ) -> Option<&HashMap<String, bool>> {
         self.change_selections.get(project_id)
+    }
+
+    /// Mark a change as errored and clear its selection.
+    pub fn mark_change_error(&mut self, project_id: &str, change_id: &str, error: String) {
+        self.error_changes
+            .entry(project_id.to_string())
+            .or_default()
+            .insert(change_id.to_string(), error);
+        self.change_selections
+            .entry(project_id.to_string())
+            .or_default()
+            .insert(change_id.to_string(), false);
+        debug!(
+            project_id,
+            change_id, "Marked change as error and cleared selection"
+        );
+    }
+
+    /// Get all tracked error changes for a project.
+    pub fn error_changes_for_project(&self, project_id: &str) -> Option<&HashMap<String, String>> {
+        self.error_changes.get(project_id)
+    }
+
+    /// Clear the tracked error state for a change.
+    pub fn clear_change_error(&mut self, project_id: &str, change_id: &str) {
+        if let Some(project_errors) = self.error_changes.get_mut(project_id) {
+            project_errors.remove(change_id);
+            if project_errors.is_empty() {
+                self.error_changes.remove(project_id);
+            }
+        }
+        debug!(project_id, change_id, "Cleared change error state");
+    }
+
+    /// Returns true when the change is currently tracked as errored.
+    pub fn is_change_error(&self, project_id: &str, change_id: &str) -> bool {
+        self.error_changes
+            .get(project_id)
+            .and_then(|m| m.get(change_id))
+            .is_some()
     }
 }
 
@@ -529,5 +588,67 @@ mod tests {
         let _p2 = sem.acquire().await.unwrap();
         assert_eq!(sem.available_permits(), 0, "Semaphore should be exhausted");
         // p1, p2 dropped at end of scope -> permits returned
+    }
+
+    #[test]
+    fn test_toggle_change_selected_tracks_explicit_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = ProjectRegistry::load(temp_dir.path(), 2).unwrap();
+        let entry = registry
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let first = registry.toggle_change_selected(&entry.id, "change-a");
+        let second = registry.toggle_change_selected(&entry.id, "change-a");
+
+        assert!(!first, "first toggle should clear default selection");
+        assert!(second, "second toggle should restore explicit selection");
+        assert!(registry.is_change_selected(&entry.id, "change-a"));
+    }
+
+    #[test]
+    fn test_mark_change_error_clears_selection_until_explicit_remark() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = ProjectRegistry::load(temp_dir.path(), 2).unwrap();
+        let entry = registry
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        registry.mark_change_error(&entry.id, "change-a", "boom".to_string());
+
+        assert!(registry.is_change_error(&entry.id, "change-a"));
+        assert!(!registry.is_change_selected(&entry.id, "change-a"));
+
+        let remarked = registry.toggle_change_selected(&entry.id, "change-a");
+        assert!(remarked, "error changes should remark from false to true");
+
+        registry.clear_change_error(&entry.id, "change-a");
+        assert!(!registry.is_change_error(&entry.id, "change-a"));
+        assert!(registry.is_change_selected(&entry.id, "change-a"));
+    }
+
+    #[test]
+    fn test_toggle_all_changes_treats_error_changes_as_unselected_by_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = ProjectRegistry::load(temp_dir.path(), 2).unwrap();
+        let entry = registry
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        registry.mark_change_error(&entry.id, "change-a", "boom".to_string());
+
+        let new_selected = registry
+            .toggle_all_changes(&entry.id, &["change-a".to_string(), "change-b".to_string()]);
+
+        assert!(
+            new_selected,
+            "bulk toggle should mark all when any row is unselected"
+        );
+        assert!(registry.is_change_selected(&entry.id, "change-a"));
+        assert!(registry.is_change_selected(&entry.id, "change-b"));
+        assert!(
+            registry.is_change_error(&entry.id, "change-a"),
+            "bulk remark should not clear the tracked error state"
+        );
     }
 }

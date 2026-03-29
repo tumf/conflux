@@ -220,7 +220,7 @@ pub async fn list_projects(State(state): State<AppState>) -> Response {
 /// dashboard or client (including the TUI): projects (remote_url + branch) each
 /// with the list of OpenSpec changes discovered in that project's worktree.
 pub async fn projects_state(State(state): State<AppState>) -> Response {
-    let (entries, data_dir, all_selections) = {
+    let (entries, data_dir, all_selections, all_errors) = {
         let registry = state.registry.read().await;
         let entries = registry.list();
         let data_dir = registry.data_dir().to_path_buf();
@@ -235,13 +235,26 @@ pub async fn projects_state(State(state): State<AppState>) -> Response {
                     .map(|s| (e.id.clone(), s.clone()))
             })
             .collect();
-        (entries, data_dir, all_selections)
+        let all_errors: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        > = entries
+            .iter()
+            .filter_map(|e| {
+                registry
+                    .error_changes_for_project(&e.id)
+                    .map(|s| (e.id.clone(), s.clone()))
+            })
+            .collect();
+        (entries, data_dir, all_selections, all_errors)
     };
 
     let mut projects = Vec::new();
     for entry in &entries {
         let selections = all_selections.get(&entry.id);
-        projects.push(build_remote_project_snapshot_async(&data_dir, entry, selections).await);
+        let errors = all_errors.get(&entry.id);
+        projects
+            .push(build_remote_project_snapshot_async(&data_dir, entry, selections, errors).await);
     }
 
     let sync_available = state.resolve_command.is_some();
@@ -294,7 +307,7 @@ async fn handle_ws(
         tokio::select! {
             _ = interval.tick() => {
                 // Snapshot
-                let (entries, data_dir, all_selections) = {
+                let (entries, data_dir, all_selections, all_errors) = {
                     let reg = registry.read().await;
                     let entries = reg.list();
                     let data_dir = reg.data_dir().to_path_buf();
@@ -305,13 +318,21 @@ async fn handle_ws(
                                 .map(|s| (e.id.clone(), s.clone()))
                         })
                         .collect();
-                    (entries, data_dir, all_selections)
+                    let all_errors: std::collections::HashMap<String, std::collections::HashMap<String, String>> = entries
+                        .iter()
+                        .filter_map(|e| {
+                            reg.error_changes_for_project(&e.id)
+                                .map(|s| (e.id.clone(), s.clone()))
+                        })
+                        .collect();
+                    (entries, data_dir, all_selections, all_errors)
                 };
 
                 let mut snapshot = Vec::new();
                 for entry in &entries {
                     let selections = all_selections.get(&entry.id);
-                    snapshot.push(build_remote_project_snapshot_async(&data_dir, entry, selections).await);
+                    let errors = all_errors.get(&entry.id);
+                    snapshot.push(build_remote_project_snapshot_async(&data_dir, entry, selections, errors).await);
                 }
 
                 // Collect worktree information for each project
@@ -391,6 +412,7 @@ async fn build_remote_project_snapshot_async(
     data_dir: &std::path::Path,
     entry: &ProjectEntry,
     change_selections: Option<&std::collections::HashMap<String, bool>>,
+    error_changes: Option<&std::collections::HashMap<String, String>>,
 ) -> RemoteProject {
     let name = project_display_name(&entry.remote_url, &entry.branch);
     let repo = extract_repo_name(&entry.remote_url);
@@ -402,12 +424,21 @@ async fn build_remote_project_snapshot_async(
     let mut changes =
         list_remote_changes_in_worktree(&worktree_path, &entry.id, &entry.branch).await;
 
-    // Apply selected state from registry (defaults to true if not tracked)
+    // Apply selected/error state from registry.
     for change in &mut changes {
+        let is_error = error_changes
+            .and_then(|m| m.get(&change.id))
+            .map(|error| {
+                change.status = "error".to_string();
+                change.iteration_number = None;
+                !error.is_empty()
+            })
+            .unwrap_or(false);
+        let default_selected = !is_error;
         change.selected = change_selections
             .and_then(|m| m.get(&change.id))
             .copied()
-            .unwrap_or(true);
+            .unwrap_or(default_selected);
     }
 
     let status_str = match entry.status {
@@ -931,7 +962,7 @@ pub async fn add_project(
     {
         let orch_status = state.orchestration_status.read().await;
         if *orch_status == OrchestrationStatus::Running {
-            let changes = list_change_ids_in_worktree(&worktree_path).await;
+            let changes = list_selected_change_ids_in_worktree(&worktree_path, None).await;
             if !changes.is_empty() {
                 info!(
                     "Auto-enqueuing new project during Running state: project_id={} changes={:?}",
@@ -1570,6 +1601,9 @@ pub async fn toggle_change_selection(
         return error_response(StatusCode::NOT_FOUND, "Project not found");
     }
     let new_selected = registry.toggle_change_selected(&project_id, &change_id);
+    if new_selected {
+        registry.clear_change_error(&project_id, &change_id);
+    }
     info!(
         project_id = %project_id,
         change_id = %change_id,
@@ -1607,6 +1641,7 @@ pub async fn toggle_all_change_selection(
     let change_ids: Vec<String> = changes.iter().map(|c| c.id.clone()).collect();
 
     let new_selected = registry.toggle_all_changes(&project_id, &change_ids);
+
     info!(
         project_id = %project_id,
         selected = new_selected,
@@ -1629,10 +1664,8 @@ pub static CONTROL_CALLS: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<(String, 
 
 /// POST /api/v1/control/run - Start orchestration across all projects.
 ///
-/// For each project, collects changes with `selected: true` (currently all changes
-/// are implicitly selected since the change-selection feature is not yet implemented)
-/// and spawns a runner with those change IDs.
-///
+/// For each project, collects changes that are currently selected and spawns a runner
+/// with those change IDs. Error changes are excluded until they are explicitly re-marked.
 /// Projects with no changes are skipped.
 pub async fn global_control_run(State(state): State<AppState>) -> Response {
     // Record the call for test verification
@@ -1662,9 +1695,22 @@ pub async fn global_control_run(State(state): State<AppState>) -> Response {
         *status = OrchestrationStatus::Running;
     }
 
-    let (entries, data_dir) = {
+    let (entries, data_dir, all_selections) = {
         let registry = state.registry.read().await;
-        (registry.list(), registry.data_dir().to_path_buf())
+        let entries = registry.list();
+        let data_dir = registry.data_dir().to_path_buf();
+        let all_selections: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, bool>,
+        > = entries
+            .iter()
+            .filter_map(|entry| {
+                registry
+                    .change_selections_for_project(&entry.id)
+                    .map(|s| (entry.id.clone(), s.clone()))
+            })
+            .collect();
+        (entries, data_dir, all_selections)
     };
 
     let mut started_count = 0u32;
@@ -1676,8 +1722,10 @@ pub async fn global_control_run(State(state): State<AppState>) -> Response {
             .join(&entry.id)
             .join(&entry.branch);
 
-        // Collect all change IDs from the project worktree (all are implicitly selected for now)
-        let changes = list_change_ids_in_worktree(&worktree_path).await;
+        // Collect only the change IDs that are selected for the next run.
+        let project_selections = all_selections.get(&entry.id);
+        let changes =
+            list_selected_change_ids_in_worktree(&worktree_path, project_selections).await;
         if changes.is_empty() {
             skipped_count += 1;
             continue;
@@ -1797,39 +1845,26 @@ pub async fn global_control_status(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-/// List change IDs in a project worktree (all active changes are treated as selected).
-async fn list_change_ids_in_worktree(worktree_path: &std::path::Path) -> Vec<String> {
-    let changes_dir = worktree_path.join("openspec/changes");
-    if !changes_dir.exists() {
-        return Vec::new();
-    }
-
-    let entries = match std::fs::read_dir(&changes_dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut change_ids = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let dir_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        if dir_name == "archive" || dir_name.starts_with('.') {
-            continue;
-        }
-        // Only include changes with a proposal.md
-        if path.join("proposal.md").exists() {
-            change_ids.push(dir_name.to_string());
-        }
-    }
-
-    change_ids.sort();
-    change_ids
+/// List change IDs in a project worktree that should be included in the next run.
+/// Error changes are excluded unless they have been explicitly re-marked.
+async fn list_selected_change_ids_in_worktree(
+    worktree_path: &std::path::Path,
+    change_selections: Option<&std::collections::HashMap<String, bool>>,
+) -> Vec<String> {
+    let changes = list_remote_changes_in_worktree(worktree_path, "", "").await;
+    changes
+        .into_iter()
+        .filter(|change| {
+            let explicit_selection = change_selections.and_then(|m| m.get(&change.id)).copied();
+            let selected = explicit_selection.unwrap_or(true);
+            if change.status == "error" {
+                explicit_selection.unwrap_or(false)
+            } else {
+                selected
+            }
+        })
+        .map(|change| change.id)
+        .collect()
 }
 
 // ─────────────────────────── Deprecated per-project control (removed) ─────────
@@ -3965,12 +4000,21 @@ mod tests {
         CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
         CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
 
-        let _entry = state
+        let entry = state
             .registry
             .write()
             .await
             .add("https://github.com/foo/bar".to_string(), "main".to_string())
             .unwrap();
+
+        let worktree_path = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&entry.id)
+            .join(&entry.branch)
+            .join("openspec/changes/fix-a");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        std::fs::write(worktree_path.join("proposal.md"), "# proposal\n").unwrap();
 
         let router = build_router(state.clone());
 
@@ -3988,6 +4032,264 @@ mod tests {
         assert!(calls
             .iter()
             .any(|(id, action)| id == "_global_" && action == "run"));
+        assert!(calls
+            .iter()
+            .any(|(id, action)| id == &entry.id && action == "run"));
+    }
+
+    #[tokio::test]
+    async fn test_global_control_run_skips_unremarked_error_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+
+        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
+
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let worktree_path = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&entry.id)
+            .join(&entry.branch)
+            .join("openspec/changes/fix-a");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        std::fs::write(worktree_path.join("proposal.md"), "# proposal\n").unwrap();
+
+        {
+            let mut registry = state.registry.write().await;
+            registry.toggle_change_selected(&entry.id, "fix-a");
+        }
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/control/run")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["started"], 0);
+        assert_eq!(json["skipped"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_projects_state_preserves_selection_visibility_for_non_error_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let change_dir = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&entry.id)
+            .join(&entry.branch)
+            .join("openspec/changes/fix-a");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("proposal.md"), "# proposal\n").unwrap();
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
+
+        {
+            let mut registry = state.registry.write().await;
+            registry.toggle_change_selected(&entry.id, "fix-a");
+        }
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["projects"][0]["changes"][0]["selected"], false);
+    }
+
+    #[tokio::test]
+    async fn test_projects_state_reports_error_changes_as_unselected_until_remarked() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let change_dir = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&entry.id)
+            .join(&entry.branch)
+            .join("openspec/changes/fix-a");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("proposal.md"), "# proposal\n").unwrap();
+
+        {
+            let mut registry = state.registry.write().await;
+            registry.mark_change_error(&entry.id, "fix-a", "boom".to_string());
+        }
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["projects"][0]["changes"][0]["status"], "error");
+        assert_eq!(json["projects"][0]["changes"][0]["selected"], false);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/v1/projects/{}/changes/fix-a/toggle",
+                entry.id
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["selected"], true);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
+    }
+
+    #[tokio::test]
+    async fn test_toggle_all_change_selection_remarks_error_changes_for_next_run() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let change_dir = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&entry.id)
+            .join(&entry.branch)
+            .join("openspec/changes/fix-a");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("proposal.md"), "# proposal\n").unwrap();
+
+        {
+            let mut registry = state.registry.write().await;
+            registry.mark_change_error(&entry.id, "fix-a", "boom".to_string());
+        }
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/changes/toggle-all", entry.id))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["selected"], true);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
+        assert_eq!(json["projects"][0]["changes"][0]["status"], "error");
+
+        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/control/run")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["started"], 1);
+        assert_eq!(json["skipped"], 0);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
+        assert_eq!(json["projects"][0]["changes"][0]["status"], "error");
     }
 
     #[tokio::test]

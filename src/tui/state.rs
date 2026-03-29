@@ -1616,7 +1616,7 @@ impl AppState {
     fn handle_processing_error(&mut self, id: String, error: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
             change.queue_status = QueueStatus::Error(error.clone());
-            change.selected = true;
+            change.selected = false;
             // Record elapsed time on error
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
@@ -1976,6 +1976,7 @@ impl AppState {
     fn handle_apply_failed(&mut self, change_id: String, error: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.queue_status = QueueStatus::Error(error.clone());
+            change.selected = false;
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
             }
@@ -1989,6 +1990,7 @@ impl AppState {
     fn handle_archive_failed(&mut self, change_id: String, error: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.queue_status = QueueStatus::Error(error.clone());
+            change.selected = false;
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
             }
@@ -2123,6 +2125,7 @@ impl AppState {
     fn handle_change_skipped(&mut self, change_id: String, reason: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.queue_status = QueueStatus::Error(reason.clone());
+            change.selected = false;
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
             }
@@ -2787,7 +2790,21 @@ mod guards {
                 let log_msg = format!("Stop requested: {}", id);
                 ToggleActionResult::Command(TuiCommand::StopChange(id), Some(log_msg))
             }
-            // Completed, Archived, Merged, Blocked, Error - cannot change status
+            QueueStatus::Error(_) => {
+                change.selected = !change.selected;
+                if change.is_new {
+                    change.is_new = false;
+                    *new_change_count = new_change_count.saturating_sub(1);
+                }
+                let id = change.id.clone();
+                let log_msg = if change.selected {
+                    format!("Marked for retry: {}", id)
+                } else {
+                    format!("Retry mark cleared: {}", id)
+                };
+                ToggleActionResult::StateOnly(Some(log_msg))
+            }
+            // Completed, Archived, Merged, Blocked - cannot change status
             _ => ToggleActionResult::None,
         }
     }
@@ -2802,9 +2819,12 @@ mod guards {
         // For NotQueued, queue_status remains NotQueued until resume.
         if !matches!(
             change.queue_status,
-            QueueStatus::NotQueued | QueueStatus::MergeWait | QueueStatus::ResolveWait
+            QueueStatus::NotQueued
+                | QueueStatus::MergeWait
+                | QueueStatus::ResolveWait
+                | QueueStatus::Error(_)
         ) {
-            // Cannot modify processing/completed/error states.
+            // Cannot modify processing/completed states.
             return ToggleActionResult::None;
         }
 
@@ -3367,6 +3387,7 @@ mod tests {
         // Start in Running mode
         app.mode = AppMode::Running;
         app.current_change = Some("test-change".to_string());
+        app.changes[0].selected = true;
 
         // Receive ProcessingError
         app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
@@ -3374,9 +3395,10 @@ mod tests {
         // AppMode should remain Running (NOT transition to Error)
         assert_eq!(app.mode, AppMode::Running);
 
-        // Change should be marked as Error
+        // Change should be marked as Error and unselected until user re-marks it
         let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
         assert!(matches!(change.queue_status, QueueStatus::Error(_)));
+        assert!(!change.selected);
 
         // error_change_id should be set
         assert_eq!(app.error_change_id, Some("test-change".to_string()));
@@ -3392,6 +3414,7 @@ mod tests {
 
         // Start in Select mode
         app.mode = AppMode::Select;
+        app.changes[0].selected = true;
 
         // Receive ProcessingError
         app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
@@ -3399,9 +3422,58 @@ mod tests {
         // AppMode should remain Select (NOT transition to Error)
         assert_eq!(app.mode, AppMode::Select);
 
-        // Change should be marked as Error
+        // Change should be marked as Error and unselected until user re-marks it
         let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
         assert!(matches!(change.queue_status, QueueStatus::Error(_)));
+        assert!(!change.selected);
+    }
+
+    #[test]
+    fn test_running_mode_error_change_toggle_sets_retry_mark() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].queue_status = QueueStatus::Error("boom".to_string());
+        app.changes[0].selected = false;
+
+        let command = app.toggle_selection();
+
+        assert!(
+            command.is_none(),
+            "error retry mark should be local state only"
+        );
+        assert!(
+            app.changes[0].selected,
+            "Space should set retry mark on error change"
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("Marked for retry: test-change")));
+    }
+
+    #[test]
+    fn test_stopped_mode_error_change_toggle_sets_retry_mark() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Stopped;
+        app.changes[0].queue_status = QueueStatus::Error("boom".to_string());
+        app.changes[0].selected = false;
+
+        let command = app.toggle_selection();
+
+        assert!(
+            command.is_none(),
+            "stopped retry mark should be local state only"
+        );
+        assert!(
+            app.changes[0].selected,
+            "Space should set retry mark in stopped mode"
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("Marked for execution: test-change")));
     }
 
     #[test]
