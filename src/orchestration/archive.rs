@@ -775,6 +775,7 @@ mv "$base_dir/openspec/changes/$1" "$base_dir/openspec/changes/archive/$1"
             total_tasks: 1,
             last_modified: "".to_string(),
             dependencies: Vec::new(),
+            metadata: crate::openspec::ProposalMetadata::default(),
         };
 
         // Create AiCommandRunner for test

@@ -1,3 +1,14 @@
+---
+change_type: hybrid
+priority: high
+dependencies:
+  - add-demo-capability-baseline
+references:
+  - specs/demo-capability/spec.md
+  - src/demo.py
+  - tests/test_demo.py
+---
+
 # Change: Define and implement demo-capability range validation
 
 **Change Type**: hybrid

@@ -721,6 +721,7 @@ mod tests {
     use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
     use crate::command_queue::CommandQueueConfig;
     use crate::config::defaults::*;
+    use crate::openspec::ProposalMetadata;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -731,6 +732,7 @@ mod tests {
             total_tasks: 5,
             last_modified: "now".to_string(),
             dependencies: Vec::new(),
+            metadata: crate::openspec::ProposalMetadata::default(),
         }
     }
 
@@ -880,6 +882,7 @@ That's all."#;
                 total_tasks: 5,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
             Change {
                 id: "unselected-b".to_string(),
@@ -887,6 +890,7 @@ That's all."#;
                 total_tasks: 5,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
             Change {
                 id: "selected-c".to_string(),
@@ -894,6 +898,7 @@ That's all."#;
                 total_tasks: 5,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
         ];
 
@@ -919,6 +924,7 @@ That's all."#;
                 total_tasks: 5,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
             Change {
                 id: "change-2".to_string(),
@@ -926,6 +932,7 @@ That's all."#;
                 total_tasks: 5,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
         ];
 
@@ -946,6 +953,7 @@ That's all."#;
             total_tasks: 5,
             last_modified: "now".to_string(),
             dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
         }];
 
         let prompt = analyzer.build_parallelization_prompt(&changes, &[]);
@@ -1043,6 +1051,7 @@ That's all."#;
                 total_tasks: 5,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
             Change {
                 id: "queued-b".to_string(),
@@ -1050,6 +1059,7 @@ That's all."#;
                 total_tasks: 5,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
         ];
 
@@ -1124,6 +1134,7 @@ That's all."#;
             total_tasks: 5,
             last_modified: "now".to_string(),
             dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
         }];
 
         let in_flight_ids: Vec<String> = vec![];

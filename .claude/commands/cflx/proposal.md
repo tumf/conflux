@@ -11,6 +11,9 @@ The user has requested the following change proposal. Use the npx @fission-ai/op
 - Always consider the preceding conversation context to interpret the user's intent. If context is empty, summarize the conversation conclusions and create a proposal. If a change ID is not explicitly provided but can be inferred from context, use it without asking the user.
 
 **MUST**: The changes/* (tasks.md, design.md, proposal.md) must be written in Japanese.
+**MUST**: `proposal.md` should start with YAML frontmatter containing `change_type`, `priority`, optional `dependencies`, and optional `references`.
+**MUST**: `references` is the canonical field name for related files/specs/change IDs.
+**MUST**: If `dependencies` is present in frontmatter, it overrides any body `## Dependencies` section; if absent, body dependencies remain allowed for backward compatibility.
 **MUST**: Bugfixes with no intended spec changes still need at least one minimal `## MODIFIED Requirements` delta (one requirement + one `#### Scenario:`) so `npx @fission-ai/openspec@latest validate <id> --strict` passes.
 **MUST**: If a task is not executable by the AI (requires human action, external systems, or long-wait verification), either move it to a Future work section or omit it from tasks.md entirely.
 
@@ -36,7 +39,8 @@ The user has requested the following change proposal. Use the npx @fission-ai/op
 3. Map the change into concrete capabilities or requirements, breaking multi-scope efforts into distinct spec deltas with clear relationships and sequencing.
 4. Capture architectural reasoning in `design.md` when the solution spans multiple systems, introduces new patterns, or demands trade-off discussion before committing to specs.
 5. Draft spec deltas in `changes/<id>/specs/<capability>/spec.md` (one folder per capability) using `## ADDED|MODIFIED|REMOVED Requirements` with at least one `#### Scenario:` per requirement and cross-reference related capabilities when relevant.
-6. Draft `tasks.md` as an ordered list of small, verifiable work items that deliver user-visible progress, include validation (tests, tooling), and highlight dependencies or parallelizable work.
+6. Draft `proposal.md` with YAML frontmatter first, then human-readable sections; include `references` for relevant repo paths/specs/change IDs when they help implementation or review.
+7. Draft `tasks.md` as an ordered list of small, verifiable work items that deliver user-visible progress, include validation (tests, tooling), and highlight dependencies or parallelizable work.
 7. For any new capability, include explicit integration/entry-point tasks ("wire it into the execution path") and completion criteria (what code path proves it is used).
 8. Each task must state how completion is verified (e.g., where it is called, the command/output that proves it, or the file/line to inspect).
 9. Validate with `npx @fission-ai/openspec@latest validate <id> --strict` and resolve every issue before sharing the proposal.
