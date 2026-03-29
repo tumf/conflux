@@ -12,4 +12,4 @@
 
 ## Acceptance #1 Failure Follow-up
 
-- [ ] 受け入れレビュー前に変更をコミットまたは破棄し、git working tree を clean にする
+- [x] 受け入れレビュー前に変更をコミットまたは破棄し、git working tree を clean にする
