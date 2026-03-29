@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 import json
+import os
 import sys
 
 session_created = False
 pending_elicitation = {}
+opencode_config_path = os.environ.get("OPENCODE_CONFIG")
+output_path = os.environ.get("MOCK_ACP_OPENCODE_CONFIG_OUT")
+if opencode_config_path is not None and output_path:
+    with open(output_path, "w", encoding="utf-8") as fp:
+        fp.write(opencode_config_path)
 
 
 def send(message):
@@ -40,9 +46,10 @@ for raw in sys.stdin:
 
     if method == "session/new" and msg_id is not None:
         session_created = True
-        send(
-            {"jsonrpc": "2.0", "id": msg_id, "result": {"sessionId": "mock-session-1"}}
-        )
+        result = {"sessionId": "mock-session-1"}
+        if opencode_config_path is not None:
+            result["opencodeConfig"] = opencode_config_path
+        send({"jsonrpc": "2.0", "id": msg_id, "result": result})
         continue
 
     if method == "session/prompt" and msg_id is not None:

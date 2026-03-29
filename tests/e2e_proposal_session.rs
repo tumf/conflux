@@ -96,13 +96,16 @@ async fn create_project(router: axum::Router, remote_url: String) -> (axum::Rout
     (router, project_id)
 }
 
-fn make_state(temp_dir: &TempDir) -> AppState {
+fn make_state_with_transport_env(
+    temp_dir: &TempDir,
+    transport_env: std::collections::HashMap<String, String>,
+) -> AppState {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let proposal_config = ProposalSessionConfig {
         transport_command: "python3".to_string(),
         transport_args: vec![create_mock_acp_path(&repo_root).display().to_string()],
+        transport_env,
         session_inactivity_timeout_secs: 1,
-        ..Default::default()
     };
 
     let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
@@ -121,6 +124,10 @@ fn make_state(temp_dir: &TempDir) -> AppState {
         active_commands: create_shared_active_commands(),
         proposal_session_manager: create_proposal_session_manager(proposal_config),
     }
+}
+
+fn make_state(temp_dir: &TempDir) -> AppState {
+    make_state_with_transport_env(temp_dir, std::collections::HashMap::new())
 }
 
 #[tokio::test]
@@ -167,6 +174,48 @@ async fn proposal_session_create_and_list_use_frontend_contract_shape() {
     assert_eq!(first["id"], session_id);
     assert_eq!(first["status"], "active");
     assert!(first["updated_at"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn proposal_session_create_injects_default_opencode_config_env() {
+    let temp_dir = TempDir::new().unwrap();
+    let origin = create_local_git_repo(temp_dir.path());
+    let remote_url = format!("file://{}", origin.to_string_lossy());
+    let mut transport_env = std::collections::HashMap::new();
+    transport_env.insert(
+        "MOCK_ACP_OPENCODE_CONFIG_OUT".to_string(),
+        "mock-acp.out".to_string(),
+    );
+    let state = make_state_with_transport_env(&temp_dir, transport_env);
+    let router = build_router(state.clone());
+
+    let (router, project_id) = create_project(router, remote_url).await;
+
+    let create_req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/projects/{project_id}/proposal-sessions"))
+        .body(Body::empty())
+        .unwrap();
+    let create_resp = router.clone().oneshot(create_req).await.unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    let create_body = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&create_body).unwrap();
+    let session_id = created["id"].as_str().unwrap();
+
+    let worktree_path = proposal_worktree_path(temp_dir.path(), &project_id, session_id);
+    let default_opencode_config = temp_dir.path().join("opencode-proposal.jsonc");
+
+    assert!(default_opencode_config.exists());
+    let content = fs::read_to_string(&default_opencode_config).unwrap();
+    assert!(content.contains("\"mode\": \"spec\""));
+
+    let acp_config_value = fs::read_to_string(worktree_path.join("mock-acp.out")).unwrap();
+    assert_eq!(
+        acp_config_value.trim(),
+        default_opencode_config.to_string_lossy()
+    );
 }
 
 #[tokio::test]
