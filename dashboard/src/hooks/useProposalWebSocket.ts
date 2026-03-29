@@ -141,7 +141,7 @@ export function useProposalWebSocket(options: UseProposalWebSocketOptions) {
   };
 }
 
-function handleServerMessage(
+export function handleServerMessage(
   msg: ProposalWsServerMessage,
   callbacks: UseProposalWebSocketOptions,
 ) {

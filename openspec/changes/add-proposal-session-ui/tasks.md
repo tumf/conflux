@@ -23,3 +23,10 @@
 - File diff view for generated changes
 - Drag-and-drop file context into chat input
 - Session history/restore UI
+
+## Acceptance #2 Failure Follow-up
+
+- [x] Add repository-backed tests for `useProposalWebSocket` message parsing/dispatch so Task 3 verification is true
+- [x] Add UI tests for `ElicitationDialog` render + submit/decline/cancel behavior so Task 9 verification is true
+- [x] Add UI/integration tests for multi-session tab switching so Task 14 verification is true
+- [x] Remove the dead `onFinalizeStreaming` integration or wire it into the real streaming completion flow and cover it with tests

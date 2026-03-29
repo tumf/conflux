@@ -422,7 +422,6 @@ function App() {
               onClose={handleCloseProposalSession}
               onAppendMessage={store.appendChatMessage}
               onStreamingChunk={store.appendStreamingChunk}
-              onFinalizeStreaming={store.finalizeStreamingMessage}
               onToolCallStart={store.updateToolCall}
               onToolCallUpdate={store.updateToolCallStatus}
               onElicitation={store.setElicitation}

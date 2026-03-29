@@ -20,7 +20,6 @@ interface ProposalChatProps {
   onClose: () => void;
   onAppendMessage: (sessionId: string, message: ProposalChatMessage) => void;
   onStreamingChunk: (messageId: string, content: string) => void;
-  onFinalizeStreaming: (sessionId: string, messageId: string) => void;
   onToolCallStart: (sessionId: string, messageId: string, toolCall: import('../api/types').ToolCallInfo) => void;
   onToolCallUpdate: (sessionId: string, messageId: string, toolCallId: string, status: import('../api/types').ToolCallStatus) => void;
   onElicitation: (elicitation: ElicitationRequest | null) => void;
@@ -41,7 +40,6 @@ export function ProposalChat({
   onClose,
   onAppendMessage,
   onStreamingChunk,
-  onFinalizeStreaming,
   onToolCallStart,
   onToolCallUpdate,
   onElicitation,
