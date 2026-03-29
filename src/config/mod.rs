@@ -2028,4 +2028,38 @@ mod tests {
         assert_eq!(config.get_max_iterations(), 50);
         assert!(!config.get_parallel_mode());
     }
+
+    #[test]
+    fn test_load_server_config_and_resolve_command_includes_proposal_session_config() {
+        let jsonc = r#"{
+            "server": {
+                "bind": "127.0.0.1",
+                "port": 41234
+            },
+            "resolve_command": "echo resolve",
+            "proposal_session": {
+                "acp_command": "custom-acp",
+                "acp_args": ["agent", "serve"],
+                "acp_env": {
+                    "FOO": "bar"
+                },
+                "session_inactivity_timeout_secs": 42
+            }
+        }"#;
+
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        let server_config = config.server.clone().unwrap();
+        let resolve_command = config.resolve_command.clone();
+        let proposal_session = config.proposal_session.clone().unwrap();
+
+        assert_eq!(server_config.port, 41234);
+        assert_eq!(resolve_command.as_deref(), Some("echo resolve"));
+        assert_eq!(proposal_session.acp_command, "custom-acp");
+        assert_eq!(proposal_session.acp_args, vec!["agent", "serve"]);
+        assert_eq!(
+            proposal_session.acp_env.get("FOO").map(String::as_str),
+            Some("bar")
+        );
+        assert_eq!(proposal_session.session_inactivity_timeout_secs, 42);
+    }
 }

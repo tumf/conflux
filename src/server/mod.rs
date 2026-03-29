@@ -8,8 +8,10 @@
 //! - This module deliberately does NOT reference or execute `~/.wt/setup`.
 //!   The server is directory-independent and uses only its configured data_dir.
 
+pub mod acp_client;
 pub mod active_commands;
 pub mod api;
+pub mod proposal_session;
 pub mod registry;
 pub mod runner;
 pub mod terminal;
@@ -19,7 +21,7 @@ use std::net::SocketAddr;
 
 use tracing::info;
 
-use crate::config::ServerConfig;
+use crate::config::{ProposalSessionConfig, ServerConfig};
 use crate::error::Result;
 
 fn server_base_url(bind: &str, actual_port: u16) -> String {
@@ -31,7 +33,11 @@ fn server_base_url(bind: &str, actual_port: u16) -> String {
 /// # Arguments
 /// * `config` - Resolved server configuration (bind, port, auth, data_dir, max_concurrent_total).
 /// * `resolve_command` - Top-level resolve_command from global config (used for auto_resolve).
-pub async fn run_server(config: ServerConfig, resolve_command: Option<String>) -> Result<()> {
+pub async fn run_server(
+    config: ServerConfig,
+    resolve_command: Option<String>,
+    proposal_session_config: ProposalSessionConfig,
+) -> Result<()> {
     // Validate config (enforces auth for non-loopback binds, and rejects deprecated server.resolve_command).
     config.validate()?;
 
@@ -51,6 +57,9 @@ pub async fn run_server(config: ServerConfig, resolve_command: Option<String>) -
     // Create log broadcast channel for streaming execution logs to WebSocket clients.
     let (log_tx, _) = tokio::sync::broadcast::channel(crate::server::api::SERVER_LOG_BUFFER_SIZE);
 
+    let proposal_session_manager =
+        proposal_session::create_proposal_session_manager(proposal_session_config);
+
     let app_state = api::AppState {
         registry,
         runners,
@@ -63,10 +72,11 @@ pub async fn run_server(config: ServerConfig, resolve_command: Option<String>) -
         )),
         terminal_manager: terminal::create_terminal_manager(),
         active_commands: active_commands::create_shared_active_commands(),
+        proposal_session_manager,
     };
 
     // Build router.
-    let router = api::build_router(app_state);
+    let router = api::build_router(app_state.clone());
 
     // Bind and serve.
     let addr: SocketAddr = format!("{}:{}", config.bind, config.port)
@@ -103,7 +113,30 @@ pub async fn run_server(config: ServerConfig, resolve_command: Option<String>) -
 
     info!("Server daemon listening on {}", url);
 
-    axum::serve(listener, router).await.map_err(|e| {
+    // Start proposal session inactivity timeout scanner
+    let psm_for_scanner = app_state.proposal_session_manager.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let mut manager = psm_for_scanner.write().await;
+            manager.scan_timeouts().await;
+        }
+    });
+
+    // Run the server with graceful shutdown support
+    let psm_for_shutdown = app_state.proposal_session_manager.clone();
+    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+        info!("Shutdown signal received, cleaning up proposal sessions...");
+        let mut manager = psm_for_shutdown.write().await;
+        manager.cleanup_all(None).await;
+        info!("Proposal session cleanup complete");
+    });
+
+    server.await.map_err(|e| {
         crate::error::OrchestratorError::Io(std::io::Error::other(format!("Server error: {}", e)))
     })?;
 

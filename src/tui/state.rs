@@ -872,6 +872,9 @@ impl AppState {
             None
         } else {
             // Resolve is not running: start immediately
+            if matches!(self.mode, AppMode::Select | AppMode::Stopped) {
+                self.mode = AppMode::Running;
+            }
             self.changes[self.cursor_index].queue_status = QueueStatus::ResolveWait;
             Some(TuiCommand::ResolveMerge(change_id))
         }
@@ -3900,22 +3903,53 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_merge_starts_immediately_when_not_resolving() {
+    fn test_resolve_merge_select_transitions_to_running() {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
 
-        // Set up: change-a is in MergeWait, no resolve in progress
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.cursor_index = 0;
+        app.mode = AppMode::Select;
+        app.is_resolving = false;
+
+        let cmd = app.resolve_merge();
+
+        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
+        assert_eq!(app.mode, AppMode::Running);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+    }
+
+    #[test]
+    fn test_resolve_merge_stopped_transitions_to_running() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.cursor_index = 0;
+        app.mode = AppMode::Stopped;
+        app.is_resolving = false;
+
+        let cmd = app.resolve_merge();
+
+        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
+        assert_eq!(app.mode, AppMode::Running);
+        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+    }
+
+    #[test]
+    fn test_resolve_merge_running_stays_running() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
         app.changes[0].queue_status = QueueStatus::MergeWait;
         app.cursor_index = 0;
         app.mode = AppMode::Running;
         app.is_resolving = false;
 
-        // Call resolve_merge
         let cmd = app.resolve_merge();
 
-        // Should return a command to start resolve
         assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
-        // change-a should transition to ResolveWait
+        assert_eq!(app.mode, AppMode::Running);
         assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
     }
 
