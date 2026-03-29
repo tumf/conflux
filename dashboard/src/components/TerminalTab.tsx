@@ -9,6 +9,8 @@ interface TerminalTabProps {
   isActive: boolean;
 }
 
+const SHELL_CONTROL_KEYS = new Set(['a', 'e', 'k', 'u', 'l', 'r', 'd', 'w']);
+
 export function TerminalTab({ sessionId, isActive }: TerminalTabProps) {
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal | null>(null);
@@ -76,6 +78,24 @@ export function TerminalTab({ sessionId, isActive }: TerminalTabProps) {
     term.loadAddon(fitAddon);
 
     term.open(terminalRef.current);
+
+    term.attachCustomKeyEventHandler((event) => {
+      const isModifierKey = event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey;
+      const key = event.key.toLowerCase();
+
+      if (isModifierKey && SHELL_CONTROL_KEYS.has(key)) {
+        return false;
+      }
+
+      if (isModifierKey && key === 'c' && event.type === 'keydown') {
+        if (term.hasSelection()) {
+          return true;
+        }
+        return false;
+      }
+
+      return true;
+    });
     xtermRef.current = term;
     fitAddonRef.current = fitAddon;
 
