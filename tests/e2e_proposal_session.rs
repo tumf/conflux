@@ -98,10 +98,12 @@ async fn create_project(router: axum::Router, remote_url: String) -> (axum::Rout
 
 fn make_state(temp_dir: &TempDir) -> AppState {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut proposal_config = ProposalSessionConfig::default();
-    proposal_config.acp_command = "python3".to_string();
-    proposal_config.acp_args = vec![create_mock_acp_path(&repo_root).display().to_string()];
-    proposal_config.session_inactivity_timeout_secs = 1;
+    let proposal_config = ProposalSessionConfig {
+        acp_command: "python3".to_string(),
+        acp_args: vec![create_mock_acp_path(&repo_root).display().to_string()],
+        session_inactivity_timeout_secs: 1,
+        ..Default::default()
+    };
 
     let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
     let (log_tx, _) = broadcast::channel::<RemoteLogEntry>(SERVER_LOG_BUFFER_SIZE);
@@ -202,9 +204,7 @@ async fn proposal_session_ws_accepts_frontend_message_aliases() {
 
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({"type": "prompt", "content": "trigger-elicitation"})
-                .to_string()
-                .into(),
+            serde_json::json!({"type": "prompt", "content": "trigger-elicitation"}).to_string(),
         ))
         .await
         .unwrap();
@@ -222,8 +222,7 @@ async fn proposal_session_ws_accepts_frontend_message_aliases() {
                 "action": "accept",
                 "data": {"answer": "approved"}
             })
-            .to_string()
-            .into(),
+            .to_string(),
         ))
         .await
         .unwrap();
@@ -487,17 +486,13 @@ async fn proposal_session_multi_session_websockets_stay_independent() {
 
     socket_a
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({"type": "prompt", "content": "alpha"})
-                .to_string()
-                .into(),
+            serde_json::json!({"type": "prompt", "content": "alpha"}).to_string(),
         ))
         .await
         .unwrap();
     socket_b
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({"type": "prompt", "content": "beta"})
-                .to_string()
-                .into(),
+            serde_json::json!({"type": "prompt", "content": "beta"}).to_string(),
         ))
         .await
         .unwrap();
