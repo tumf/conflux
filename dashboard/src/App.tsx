@@ -193,6 +193,7 @@ function App() {
     store.setFileBrowseContext({ type: 'worktree', worktreeBranch: branch });
     setDesktopRightTab('files');
     setActiveTab('files');
+    setDesktopCenterTab('worktrees');
   }, [store]);
 
   const handleRefreshWorktrees = useCallback(async () => {
@@ -313,35 +314,53 @@ function App() {
             </div>
 
             <div className="flex flex-1 flex-col overflow-hidden">
-              {/* Right pane tab switcher: Logs / Files */}
-              <div className="flex border-b border-[#27272a]">
-                {(['logs', 'files'] as DesktopRightTab[]).map((tab) => (
-                  <button
-                    key={tab}
-                    onClick={() => setDesktopRightTab(tab)}
-                    className={`flex-1 py-2 text-xs font-medium transition-colors ${
-                      desktopRightTab === tab
-                        ? 'border-b-2 border-[#6366f1] text-[#fafafa]'
-                        : 'text-[#52525b] hover:text-[#a1a1aa]'
-                    }`}
-                  >
-                    {tab.charAt(0).toUpperCase() + tab.slice(1)}
-                  </button>
-                ))}
-              </div>
-              <div className="flex-1 overflow-y-auto">
-                {desktopRightTab === 'logs' ? (
-                  <LogsPanel
-                    logs={selectedProjectLogs}
-                    selectedProjectId={store.state.selectedProjectId}
-                  />
-                ) : (
-                  <FileViewPanel
-                    projectId={store.state.selectedProjectId}
-                    context={store.state.fileBrowseContext}
-                  />
-                )}
-              </div>
+              {/* Right pane tab switcher: Logs / Files (Logs hidden when worktree selected) */}
+              {store.state.fileBrowseContext?.type === 'worktree' ? (
+                <>
+                  <div className="flex border-b border-[#27272a]">
+                    <div className="flex-1 py-2 text-xs font-medium border-b-2 border-[#6366f1] text-[#fafafa] text-center">
+                      Files
+                    </div>
+                  </div>
+                  <div className="flex-1 overflow-y-auto">
+                    <FileViewPanel
+                      projectId={store.state.selectedProjectId}
+                      context={store.state.fileBrowseContext}
+                    />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="flex border-b border-[#27272a]">
+                    {(['logs', 'files'] as DesktopRightTab[]).map((tab) => (
+                      <button
+                        key={tab}
+                        onClick={() => setDesktopRightTab(tab)}
+                        className={`flex-1 py-2 text-xs font-medium transition-colors ${
+                          desktopRightTab === tab
+                            ? 'border-b-2 border-[#6366f1] text-[#fafafa]'
+                            : 'text-[#52525b] hover:text-[#a1a1aa]'
+                        }`}
+                      >
+                        {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="flex-1 overflow-y-auto">
+                    {desktopRightTab === 'logs' ? (
+                      <LogsPanel
+                        logs={selectedProjectLogs}
+                        selectedProjectId={store.state.selectedProjectId}
+                      />
+                    ) : (
+                      <FileViewPanel
+                        projectId={store.state.selectedProjectId}
+                        context={store.state.fileBrowseContext}
+                      />
+                    )}
+                  </div>
+                </>
+              )}
             </div>
           </div>
         </main>
@@ -349,7 +368,9 @@ function App() {
         {/* Mobile layout */}
         <div className="flex flex-1 flex-col md:hidden">
           <div className="flex border-b border-[#27272a]">
-            {(['projects', 'changes', 'worktrees', 'logs', 'files'] as TabName[]).map((tab) => (
+            {((['projects', 'changes', 'worktrees', 'logs', 'files'] as TabName[])
+              .filter((tab) => !(tab === 'logs' && store.state.fileBrowseContext?.type === 'worktree'))
+            ).map((tab) => (
               <button
                 key={tab}
                 onClick={() => setActiveTab(tab)}
