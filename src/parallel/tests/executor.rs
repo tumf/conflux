@@ -1672,7 +1672,7 @@ async fn test_attempt_merge_defers_when_change_not_archived() {
                 reason
             );
         }
-        Ok(MergeAttempt::Merged) => {
+        Ok(MergeAttempt::Merged { .. }) => {
             panic!("Merge should have been deferred when change directory exists");
         }
         Err(e) => {
@@ -1779,7 +1779,7 @@ async fn test_attempt_merge_succeeds_when_change_archived() {
         .await;
 
     match result {
-        Ok(MergeAttempt::Merged) => {
+        Ok(MergeAttempt::Merged { .. }) => {
             // Success - merge was allowed
         }
         Ok(MergeAttempt::Deferred(reason)) => {
@@ -2041,7 +2041,7 @@ async fn test_merge_deferred_when_worktree_dirty() {
                 reason
             );
         }
-        Ok(MergeAttempt::Merged) => {
+        Ok(MergeAttempt::Merged { .. }) => {
             panic!("Merge should have been deferred due to dirty worktree");
         }
         Err(e) => {
@@ -2123,7 +2123,7 @@ async fn test_merge_deferred_when_archive_entry_missing() {
                 reason
             );
         }
-        Ok(MergeAttempt::Merged) => {
+        Ok(MergeAttempt::Merged { .. }) => {
             panic!("Merge should have been deferred due to missing archive entry");
         }
         Err(e) => {
@@ -2231,7 +2231,7 @@ async fn test_merge_proceeds_when_archive_complete() {
         .await;
 
     match result {
-        Ok(MergeAttempt::Merged) => {
+        Ok(MergeAttempt::Merged { .. }) => {
             // Success - merge was allowed
         }
         Ok(MergeAttempt::Deferred(reason)) => {

@@ -66,8 +66,8 @@ pub fn is_dirty_reason_auto_resumable(reason: &str) -> bool {
 /// Result of a merge attempt
 #[derive(Debug)]
 pub enum MergeAttempt {
-    /// Merge succeeded
-    Merged,
+    /// Merge succeeded, includes the merge revision
+    Merged { revision: String },
     /// Merge deferred with reason (e.g., base dirty, archive not complete)
     Deferred(String),
 }
@@ -107,8 +107,8 @@ impl ParallelExecutor {
                 .attempt_merge(&revisions, &change_ids, &archive_paths)
                 .await
             {
-                Ok(MergeAttempt::Merged) => {
-                    // Run on_merged hook after merge completion
+                Ok(MergeAttempt::Merged { revision }) => {
+                    // Run on_merged hook before merged status transition (MergeCompleted event)
                     if let Some(ref hooks) = self.hooks {
                         // Fetch actual task counts from change data
                         let (completed_tasks, total_tasks) =
@@ -157,6 +157,16 @@ impl ParallelExecutor {
                             );
                         }
                     }
+
+                    // Send MergeCompleted after on_merged hook (triggers merged status transition)
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::MergeCompleted {
+                            change_id: workspace_result.change_id.clone(),
+                            revision: revision.clone(),
+                        },
+                    )
+                    .await;
 
                     // Merge succeeded, cleanup workspace
                     send_event(
@@ -292,8 +302,8 @@ impl ParallelExecutor {
             }
         }
 
-        self.merge_and_resolve(revisions, change_ids).await?;
-        Ok(MergeAttempt::Merged)
+        let revision = self.merge_and_resolve(revisions, change_ids).await?;
+        Ok(MergeAttempt::Merged { revision })
     }
 
     pub async fn resolve_merge_for_change(&mut self, change_id: &str) -> Result<()> {
@@ -319,8 +329,8 @@ impl ParallelExecutor {
             .attempt_merge(&revisions, &change_ids, &archive_paths)
             .await?
         {
-            MergeAttempt::Merged => {
-                // Run on_merged hook after merge completion
+            MergeAttempt::Merged { revision } => {
+                // Run on_merged hook before merged status transition (MergeCompleted event)
                 if let Some(ref hooks) = self.hooks {
                     // Fetch actual task counts from change data
                     let (completed_tasks, total_tasks) =
@@ -356,6 +366,16 @@ impl ParallelExecutor {
                         tracing::warn!("on_merged hook failed for {}: {}", change_id, e);
                     }
                 }
+
+                // Send MergeCompleted after on_merged hook (triggers merged status transition)
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::MergeCompleted {
+                        change_id: change_id.to_string(),
+                        revision: revision.clone(),
+                    },
+                )
+                .await;
 
                 send_event(
                     &self.event_tx,
@@ -437,7 +457,7 @@ impl ParallelExecutor {
         &self,
         revisions: &[String],
         change_ids: &[String],
-    ) -> Result<()> {
+    ) -> Result<String> {
         let change_ids_vec = change_ids.to_vec();
         let shared_stagger_state = self.shared_stagger_state.clone();
         let auto_resolve_count = self.auto_resolve_count.clone();
@@ -468,7 +488,7 @@ impl ParallelExecutor {
         revisions: &'a [String],
         change_ids: &'a [String],
         mut resolve_conflicts: F,
-    ) -> Result<()>
+    ) -> Result<String>
     where
         F: FnMut(Vec<String>, String) -> Fut,
         Fut: std::future::Future<Output = Result<()>> + Send + 'a,
@@ -518,18 +538,10 @@ impl ParallelExecutor {
                 .await?;
 
             let merge_revision = self.workspace_manager.get_current_revision().await?;
-            send_event(
-                &self.event_tx,
-                ParallelEvent::MergeCompleted {
-                    change_id: change_ids[0].clone(),
-                    revision: merge_revision.clone(),
-                },
-            )
-            .await;
 
-            // Note: on_merged hook is executed by the caller of attempt_merge()
-            // which has better context (workspace paths, etc.)
-            return Ok(());
+            // Note: MergeCompleted event is sent by the caller after running on_merged hook.
+            // This ensures on_merged executes before the merged status transition.
+            return Ok(merge_revision);
         }
 
         for attempt in 1..=max_attempts {
@@ -547,18 +559,10 @@ impl ParallelExecutor {
                     if attempt > 1 {
                         tracing::info!("Merge succeeded after {} attempts", attempt);
                     }
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::MergeCompleted {
-                            change_id: change_ids[0].clone(),
-                            revision: merge_revision.clone(),
-                        },
-                    )
-                    .await;
 
-                    // Note: on_merged hook is executed by the caller of attempt_merge()
-                    // which has better context (workspace paths, etc.)
-                    return Ok(());
+                    // Note: MergeCompleted event is sent by the caller after running on_merged hook.
+                    // This ensures on_merged executes before the merged status transition.
+                    return Ok(merge_revision);
                 }
                 Err(VcsError::Conflict { details, .. }) => {
                     let conflict_files =
@@ -645,7 +649,10 @@ impl ParallelExecutor {
             }
         }
 
-        Ok(())
+        // Fallback: should not normally reach here
+        Err(OrchestratorError::GitCommand(
+            "Merge failed: exhausted all attempts without success or error".to_string(),
+        ))
     }
 
     pub(super) async fn verify_merge_commits(
