@@ -11,6 +11,9 @@ import { DeleteDialog } from './components/DeleteDialog';
 import { DeleteWorktreeDialog } from './components/DeleteWorktreeDialog';
 import { AddProjectDialog } from './components/AddProjectDialog';
 import { CreateWorktreeDialog } from './components/CreateWorktreeDialog';
+import { ProposalChat } from './components/ProposalChat';
+import { ProposalSessionTabs } from './components/ProposalSessionTabs';
+import { CloseSessionDialog } from './components/CloseSessionDialog';
 import { useAppStore } from './store/useAppStore';
 import { useWebSocket } from './hooks/useWebSocket';
 import {
@@ -23,6 +26,10 @@ import {
   deleteWorktree as deleteWorktreeAPI,
   mergeWorktree as mergeWorktreeAPI,
   refreshWorktrees as refreshWorktreesAPI,
+  createProposalSession as createProposalSessionAPI,
+  listProposalSessions as listProposalSessionsAPI,
+  deleteProposalSession as deleteProposalSessionAPI,
+  mergeProposalSession as mergeProposalSessionAPI,
   APIError,
 } from './api/restClient';
 
@@ -40,6 +47,7 @@ function App() {
   const [isAddProjectOpen, setIsAddProjectOpen] = useState(false);
   const [isCreateWorktreeOpen, setIsCreateWorktreeOpen] = useState(false);
   const [deleteWorktreeTarget, setDeleteWorktreeTarget] = useState<string | null>(null);
+  const [closeSessionTarget, setCloseSessionTarget] = useState<string | null>(null);
 
   useWebSocket({
     onStateUpdate: (state) => store.setFullState(state),
@@ -196,6 +204,89 @@ function App() {
     setDesktopCenterTab('worktrees');
   }, [store]);
 
+  // ─── Proposal Session Handlers ────────────────────────────────────────────
+
+  const handleCreateProposalSession = useCallback(async () => {
+    const projectId = store.state.selectedProjectId;
+    if (!projectId) return;
+    setIsLoading(true);
+    try {
+      const session = await createProposalSessionAPI(projectId);
+      store.addProposalSession(projectId, session);
+      store.setActiveProposalSession(session.id);
+      toast.success('Proposal session created');
+    } catch (err) {
+      toast.error(`Failed to create session: ${err instanceof APIError ? err.message : String(err)}`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [store]);
+
+  const handleMergeProposalSession = useCallback(async () => {
+    const projectId = store.state.selectedProjectId;
+    const sessionId = store.state.activeProposalSessionId;
+    if (!projectId || !sessionId) return;
+    setIsLoading(true);
+    try {
+      await mergeProposalSessionAPI(projectId, sessionId);
+      store.removeProposalSession(projectId, sessionId);
+      toast.success('Session merged successfully');
+    } catch (err) {
+      toast.error(`Failed to merge: ${err instanceof APIError ? err.message : String(err)}`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [store]);
+
+  const handleCloseProposalSession = useCallback(() => {
+    const sessionId = store.state.activeProposalSessionId;
+    if (!sessionId) return;
+
+    // Find the session to check if dirty
+    const projectId = store.state.selectedProjectId;
+    if (!projectId) return;
+    const sessions = store.state.proposalSessionsByProjectId[projectId] || [];
+    const session = sessions.find((s) => s.id === sessionId);
+
+    if (session?.is_dirty) {
+      setCloseSessionTarget(sessionId);
+    } else {
+      handleForceCloseSession(sessionId);
+    }
+  }, [store]);
+
+  const handleForceCloseSession = useCallback(async (sessionId?: string) => {
+    const projectId = store.state.selectedProjectId;
+    const targetId = sessionId || closeSessionTarget;
+    if (!projectId || !targetId) return;
+    setIsLoading(true);
+    try {
+      await deleteProposalSessionAPI(projectId, targetId, true);
+      store.removeProposalSession(projectId, targetId);
+      setCloseSessionTarget(null);
+      toast.success('Session closed');
+    } catch (err) {
+      toast.error(`Failed to close session: ${err instanceof APIError ? err.message : String(err)}`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [store, closeSessionTarget]);
+
+  const handleBackFromProposal = useCallback(() => {
+    store.setActiveProposalSession(null);
+  }, [store]);
+
+  // Load proposal sessions when project is selected
+  const handleSelectProjectWithSessions = useCallback((projectId: string | null) => {
+    store.selectProject(projectId);
+    store.setActiveProposalSession(null);
+    if (projectId) {
+      listProposalSessionsAPI(projectId)
+        .then((sessions) => store.setProposalSessions(projectId, sessions))
+        .catch((err) => console.error('Failed to load proposal sessions:', err));
+    }
+  }, [store]);
+
   const handleRefreshWorktrees = useCallback(async () => {
     const projectId = store.state.selectedProjectId;
     if (!projectId) return;
@@ -223,10 +314,26 @@ function App() {
     ? store.state.worktreesByProjectId[store.state.selectedProjectId] || []
     : [];
 
+  // Derived state for proposal sessions
+  const currentProjectSessions = store.state.selectedProjectId
+    ? store.state.proposalSessionsByProjectId[store.state.selectedProjectId] || []
+    : [];
+  const activeProposalSession = currentProjectSessions.find(
+    (s) => s.id === store.state.activeProposalSessionId,
+  );
+  const activeSessionMessages = store.state.activeProposalSessionId
+    ? store.state.chatMessagesBySessionId[store.state.activeProposalSessionId] || []
+    : [];
+
+  // Get close target session for dialog
+  const closeTargetSession = closeSessionTarget
+    ? currentProjectSessions.find((s) => s.id === closeSessionTarget)
+    : null;
+
   const panelProps = {
     projects: store.state.projects,
     selectedProjectId: store.state.selectedProjectId,
-    onSelectProject: store.selectProject,
+    onSelectProject: handleSelectProjectWithSessions,
     onGitSync: handleGitSync,
     onDelete: handleDeleteClick,
     isLoading,
@@ -270,109 +377,162 @@ function App() {
         <main className="hidden flex-col md:flex md:flex-1 overflow-hidden">
           <div className="border-b border-[#27272a] px-4 py-2.5">
             {selectedProject ? (
-              <div className="flex items-center gap-1.5">
-                <span className="text-sm font-medium text-[#fafafa]">{selectedProject.repo}</span>
-                <span className="text-[#3f3f46]">/</span>
-                <span className="text-sm text-[#71717a]">{selectedProject.branch}</span>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-sm font-medium text-[#fafafa]">{selectedProject.repo}</span>
+                  <span className="text-[#3f3f46]">/</span>
+                  <span className="text-sm text-[#71717a]">{selectedProject.branch}</span>
+                </div>
+                {!activeProposalSession && (
+                  <button
+                    onClick={handleCreateProposalSession}
+                    disabled={isLoading}
+                    className="flex items-center gap-1.5 rounded-md bg-[#6366f1] px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-[#4f46e5] disabled:opacity-50"
+                  >
+                    <Plus className="size-3" />
+                    Add Proposal
+                  </button>
+                )}
               </div>
             ) : (
               <span className="text-sm text-[#52525b]">Select a project</span>
             )}
           </div>
 
-          <div className="flex flex-1 overflow-hidden">
-            <div className="flex w-72 shrink-0 flex-col border-r border-[#27272a]">
-              {/* Tab switcher for Changes/Worktrees */}
-              <div className="flex border-b border-[#27272a]">
-                {(['changes', 'worktrees'] as DesktopCenterTab[]).map((tab) => (
-                  <button
-                    key={tab}
-                    onClick={() => setDesktopCenterTab(tab)}
-                    className={`flex-1 py-2 text-xs font-medium transition-colors ${
-                      desktopCenterTab === tab
-                        ? 'border-b-2 border-[#6366f1] text-[#fafafa]'
-                        : 'text-[#52525b] hover:text-[#a1a1aa]'
-                    }`}
-                  >
-                    {tab.charAt(0).toUpperCase() + tab.slice(1)}
-                  </button>
-                ))}
-              </div>
-              <div className="flex-1 overflow-y-auto">
-                {desktopCenterTab === 'changes' ? (
-                  <ChangesPanel
-                    projects={store.state.projects}
-                    selectedProjectId={store.state.selectedProjectId}
-                    onClickChange={handleClickChange}
-                    selectedChangeId={store.state.fileBrowseContext?.type === 'change' ? store.state.fileBrowseContext.changeId : null}
-                  />
-                ) : (
-                  <WorktreesPanel
-                    worktrees={selectedProjectWorktrees}
-                    selectedProjectId={store.state.selectedProjectId}
-                    onMerge={handleMergeWorktree}
-                    onDelete={handleDeleteWorktreeClick}
-                    onCreate={() => setIsCreateWorktreeOpen(true)}
-                    onRefresh={handleRefreshWorktrees}
-                    onClickWorktree={handleClickWorktree}
-                    selectedWorktreeBranch={store.state.fileBrowseContext?.type === 'worktree' ? store.state.fileBrowseContext.worktreeBranch : null}
-                    isLoading={isLoading}
-                    activeCommands={selectedProjectActiveCommands}
-                  />
-                )}
-              </div>
-            </div>
+          {/* Proposal session tabs */}
+          {currentProjectSessions.length > 0 && (
+            <ProposalSessionTabs
+              sessions={currentProjectSessions}
+              activeSessionId={store.state.activeProposalSessionId}
+              onSelectSession={store.setActiveProposalSession}
+              onCreateSession={handleCreateProposalSession}
+              onCloseSession={(sid) => {
+                const s = currentProjectSessions.find((x) => x.id === sid);
+                if (s?.is_dirty) {
+                  setCloseSessionTarget(sid);
+                } else {
+                  handleForceCloseSession(sid);
+                }
+              }}
+            />
+          )}
 
-            <div className="flex flex-1 flex-col overflow-hidden">
-              {/* Right pane tab switcher: Logs / Files (Logs hidden when worktree selected) */}
-              {store.state.fileBrowseContext?.type === 'worktree' ? (
-                <>
-                  <div className="flex border-b border-[#27272a]">
-                    <div className="flex-1 py-2 text-xs font-medium border-b-2 border-[#6366f1] text-[#fafafa] text-center">
-                      Files
-                    </div>
-                  </div>
-                  <div className="flex flex-1 overflow-hidden">
-                    <FileViewPanel
-                      projectId={store.state.selectedProjectId}
-                      context={store.state.fileBrowseContext}
+          {/* Show ProposalChat when a session is active, otherwise show normal panels */}
+          {activeProposalSession && store.state.selectedProjectId ? (
+            <ProposalChat
+              projectId={store.state.selectedProjectId}
+              session={activeProposalSession}
+              messages={activeSessionMessages}
+              streamingContent={store.state.streamingContent}
+              activeElicitation={store.state.activeElicitation}
+              isAgentResponding={store.state.isAgentResponding}
+              onBack={handleBackFromProposal}
+              onMerge={handleMergeProposalSession}
+              onClose={handleCloseProposalSession}
+              onAppendMessage={store.appendChatMessage}
+              onStreamingChunk={store.appendStreamingChunk}
+              onToolCallStart={store.updateToolCall}
+              onToolCallUpdate={store.updateToolCallStatus}
+              onElicitation={store.setElicitation}
+              onSessionUpdate={store.updateProposalSession}
+              onClickChange={handleClickChange}
+              isLoading={isLoading}
+            />
+          ) : (
+            <div className="flex flex-1 overflow-hidden">
+              <div className="flex w-72 shrink-0 flex-col border-r border-[#27272a]">
+                {/* Tab switcher for Changes/Worktrees */}
+                <div className="flex border-b border-[#27272a]">
+                  {(['changes', 'worktrees'] as DesktopCenterTab[]).map((tab) => (
+                    <button
+                      key={tab}
+                      onClick={() => setDesktopCenterTab(tab)}
+                      className={`flex-1 py-2 text-xs font-medium transition-colors ${
+                        desktopCenterTab === tab
+                          ? 'border-b-2 border-[#6366f1] text-[#fafafa]'
+                          : 'text-[#52525b] hover:text-[#a1a1aa]'
+                      }`}
+                    >
+                      {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex-1 overflow-y-auto">
+                  {desktopCenterTab === 'changes' ? (
+                    <ChangesPanel
+                      projects={store.state.projects}
+                      selectedProjectId={store.state.selectedProjectId}
+                      onClickChange={handleClickChange}
+                      selectedChangeId={store.state.fileBrowseContext?.type === 'change' ? store.state.fileBrowseContext.changeId : null}
                     />
-                  </div>
-                </>
-              ) : (
-                <>
-                  <div className="flex border-b border-[#27272a]">
-                    {(['logs', 'files'] as DesktopRightTab[]).map((tab) => (
-                      <button
-                        key={tab}
-                        onClick={() => setDesktopRightTab(tab)}
-                        className={`flex-1 py-2 text-xs font-medium transition-colors ${
-                          desktopRightTab === tab
-                            ? 'border-b-2 border-[#6366f1] text-[#fafafa]'
-                            : 'text-[#52525b] hover:text-[#a1a1aa]'
-                        }`}
-                      >
-                        {tab.charAt(0).toUpperCase() + tab.slice(1)}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="flex flex-1 overflow-hidden">
-                    {desktopRightTab === 'logs' ? (
-                      <LogsPanel
-                        logs={selectedProjectLogs}
-                        selectedProjectId={store.state.selectedProjectId}
-                      />
-                    ) : (
+                  ) : (
+                    <WorktreesPanel
+                      worktrees={selectedProjectWorktrees}
+                      selectedProjectId={store.state.selectedProjectId}
+                      onMerge={handleMergeWorktree}
+                      onDelete={handleDeleteWorktreeClick}
+                      onCreate={() => setIsCreateWorktreeOpen(true)}
+                      onRefresh={handleRefreshWorktrees}
+                      onClickWorktree={handleClickWorktree}
+                      selectedWorktreeBranch={store.state.fileBrowseContext?.type === 'worktree' ? store.state.fileBrowseContext.worktreeBranch : null}
+                      isLoading={isLoading}
+                      activeCommands={selectedProjectActiveCommands}
+                    />
+                  )}
+                </div>
+              </div>
+
+              <div className="flex flex-1 flex-col overflow-hidden">
+                {/* Right pane tab switcher: Logs / Files (Logs hidden when worktree selected) */}
+                {store.state.fileBrowseContext?.type === 'worktree' ? (
+                  <>
+                    <div className="flex border-b border-[#27272a]">
+                      <div className="flex-1 py-2 text-xs font-medium border-b-2 border-[#6366f1] text-[#fafafa] text-center">
+                        Files
+                      </div>
+                    </div>
+                    <div className="flex flex-1 overflow-hidden">
                       <FileViewPanel
                         projectId={store.state.selectedProjectId}
                         context={store.state.fileBrowseContext}
                       />
-                    )}
-                  </div>
-                </>
-              )}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="flex border-b border-[#27272a]">
+                      {(['logs', 'files'] as DesktopRightTab[]).map((tab) => (
+                        <button
+                          key={tab}
+                          onClick={() => setDesktopRightTab(tab)}
+                          className={`flex-1 py-2 text-xs font-medium transition-colors ${
+                            desktopRightTab === tab
+                              ? 'border-b-2 border-[#6366f1] text-[#fafafa]'
+                              : 'text-[#52525b] hover:text-[#a1a1aa]'
+                          }`}
+                        >
+                          {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="flex flex-1 overflow-hidden">
+                      {desktopRightTab === 'logs' ? (
+                        <LogsPanel
+                          logs={selectedProjectLogs}
+                          selectedProjectId={store.state.selectedProjectId}
+                        />
+                      ) : (
+                        <FileViewPanel
+                          projectId={store.state.selectedProjectId}
+                          context={store.state.fileBrowseContext}
+                        />
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
             </div>
-          </div>
+          )}
         </main>
 
         {/* Mobile layout */}
@@ -478,6 +638,14 @@ function App() {
         isOpen={isCreateWorktreeOpen}
         onSubmit={handleCreateWorktree}
         onCancel={() => setIsCreateWorktreeOpen(false)}
+        isLoading={isLoading}
+      />
+
+      <CloseSessionDialog
+        isOpen={closeSessionTarget !== null}
+        uncommittedFiles={closeTargetSession?.uncommitted_files || []}
+        onForceClose={() => handleForceCloseSession()}
+        onCancel={() => setCloseSessionTarget(null)}
         isLoading={isLoading}
       />
 

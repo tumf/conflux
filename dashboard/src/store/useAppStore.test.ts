@@ -36,6 +36,12 @@ const createState = (overrides: Partial<AppState> = {}): AppState => ({
   syncAvailable: false,
   orchestrationStatus: 'idle',
   fileBrowseContext: null,
+  proposalSessionsByProjectId: {},
+  activeProposalSessionId: null,
+  chatMessagesBySessionId: {},
+  activeElicitation: null,
+  isAgentResponding: false,
+  streamingContent: {},
   activeCommands: [],
   ...overrides,
 });
@@ -66,41 +72,58 @@ describe('useAppStore - SET_FULL_STATE', () => {
     expect(state.connectionStatus).toBe('connected');
   });
 
+  it('should clear projects when empty FullState is set', () => {
+    const initialState = createState({
+      projects: [createProject('project-1')],
+      selectedProjectId: 'project-1',
+      connectionStatus: 'connected',
+    });
+
+    const action: AppAction = {
+      type: 'SET_FULL_STATE',
+      payload: {
+        projects: [],
+        changes: [],
+      },
+    };
+
+    const state = appReducer(initialState, action);
+
+    expect(state.projects).toHaveLength(0);
+  });
+
   it('should merge worktrees and orchestration metadata from full state', () => {
-    const state = appReducer(
-      createState(),
-      {
-        type: 'SET_FULL_STATE',
-        payload: {
-          projects: [createProject('project-1')],
-          changes: [],
-          worktrees: {
-            'project-1': [
-              {
-                path: '/tmp/project-1',
-                head: 'abc123',
-                branch: 'feature/test',
-                is_detached: false,
-                is_main: false,
-                merge_conflict: null,
-                has_commits_ahead: false,
-                is_merging: false,
-              },
-            ],
-          },
-          sync_available: true,
-          orchestration_status: 'running',
-          active_commands: [
+    const state = appReducer(createState(), {
+      type: 'SET_FULL_STATE',
+      payload: {
+        projects: [createProject('project-1')],
+        changes: [],
+        worktrees: {
+          'project-1': [
             {
-              project_id: 'project-1',
-              root: 'base',
-              operation: 'sync',
-              started_at: '2026-03-29T00:00:00.000Z',
+              path: '/tmp/project-1',
+              head: 'abc123',
+              branch: 'feature/test',
+              is_detached: false,
+              is_main: false,
+              merge_conflict: null,
+              has_commits_ahead: false,
+              is_merging: false,
             },
           ],
         },
+        sync_available: true,
+        orchestration_status: 'running',
+        active_commands: [
+          {
+            project_id: 'project-1',
+            root: 'base',
+            operation: 'sync',
+            started_at: '2026-03-29T00:00:00.000Z',
+          },
+        ],
       },
-    );
+    });
 
     expect(state.worktreesByProjectId['project-1']).toHaveLength(1);
     expect(state.syncAvailable).toBe(true);
@@ -111,29 +134,23 @@ describe('useAppStore - SET_FULL_STATE', () => {
 
 describe('useAppStore - APPEND_LOG', () => {
   it('should append log entry to project logs', () => {
-    const state = appReducer(
-      createState(),
-      {
-        type: 'APPEND_LOG',
-        payload: createLogEntry('project-1', 'Test log', '2026-03-29T00:00:00.000Z'),
-      },
-    );
+    const state = appReducer(createState(), {
+      type: 'APPEND_LOG',
+      payload: createLogEntry('project-1', 'Test log', '2026-03-29T00:00:00.000Z'),
+    });
 
     expect(state.logsByProjectId['project-1']).toHaveLength(1);
     expect(state.logsByProjectId['project-1'][0].message).toBe('Test log');
   });
 
   it('should ignore log entries without project ids', () => {
-    const state = appReducer(
-      createState(),
-      {
-        type: 'APPEND_LOG',
-        payload: {
-          ...createLogEntry('project-1', 'Ignored log', '2026-03-29T00:00:00.000Z'),
-          project_id: null,
-        },
+    const state = appReducer(createState(), {
+      type: 'APPEND_LOG',
+      payload: {
+        ...createLogEntry('project-1', 'Ignored log', '2026-03-29T00:00:00.000Z'),
+        project_id: null,
       },
-    );
+    });
 
     expect(state.logsByProjectId).toEqual({});
   });
@@ -156,20 +173,17 @@ describe('useAppStore - APPEND_LOG', () => {
     );
 
     expect(state.logsByProjectId['project-1']).toHaveLength(500);
-    expect(state.logsByProjectId['project-1'][499].message).toBe('Newest log');
     expect(state.logsByProjectId['project-1'][0].message).toBe('Log 1');
+    expect(state.logsByProjectId['project-1'][499].message).toBe('Newest log');
   });
 });
 
 describe('useAppStore - SELECT_PROJECT', () => {
   it('should select a project when a different project is chosen', () => {
-    const state = appReducer(
-      createState(),
-      {
-        type: 'SELECT_PROJECT',
-        payload: 'project-123',
-      },
-    );
+    const state = appReducer(createState(), {
+      type: 'SELECT_PROJECT',
+      payload: 'project-123',
+    });
 
     expect(state.selectedProjectId).toBe('project-123');
   });

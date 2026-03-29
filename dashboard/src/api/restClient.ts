@@ -2,7 +2,14 @@
  * REST API Client for Conflux Server
  */
 
-import { RemoteProject, WorktreeInfo, FileTreeEntry, FileContentResponse } from './types';
+import {
+  RemoteProject,
+  WorktreeInfo,
+  FileTreeEntry,
+  FileContentResponse,
+  ProposalSession,
+  ProposalSessionChange,
+} from './types';
 
 const API_BASE = '/api/v1';
 
@@ -263,4 +270,82 @@ export async function resizeTerminalSession(
 export function getTerminalWsUrl(sessionId: string): string {
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
   return `${protocol}://${window.location.host}/api/v1/terminal/sessions/${sessionId}/ws`;
+}
+
+// ─── Proposal Session API ────────────────────────────────────────────────────
+
+/**
+ * Create a new proposal session for a project
+ */
+export async function createProposalSession(
+  projectId: string,
+): Promise<ProposalSession> {
+  return fetchAPI(`/projects/${projectId}/proposal-sessions`, {
+    method: 'POST',
+  });
+}
+
+/**
+ * List all proposal sessions for a project
+ */
+export async function listProposalSessions(
+  projectId: string,
+): Promise<ProposalSession[]> {
+  return fetchAPI(`/projects/${projectId}/proposal-sessions`, {
+    method: 'GET',
+  });
+}
+
+/**
+ * Delete/close a proposal session
+ */
+export async function deleteProposalSession(
+  projectId: string,
+  sessionId: string,
+  force: boolean = false,
+): Promise<void> {
+  return fetchAPI(
+    `/projects/${projectId}/proposal-sessions/${sessionId}`,
+    {
+      method: 'DELETE',
+      body: JSON.stringify({ force }),
+    },
+  );
+}
+
+/**
+ * Merge a proposal session's worktree into the base branch
+ */
+export async function mergeProposalSession(
+  projectId: string,
+  sessionId: string,
+): Promise<void> {
+  return fetchAPI(
+    `/projects/${projectId}/proposal-sessions/${sessionId}/merge`,
+    { method: 'POST' },
+  );
+}
+
+/**
+ * List detected OpenSpec changes in a proposal session's worktree
+ */
+export async function listProposalSessionChanges(
+  projectId: string,
+  sessionId: string,
+): Promise<ProposalSessionChange[]> {
+  return fetchAPI(
+    `/projects/${projectId}/proposal-sessions/${sessionId}/changes`,
+    { method: 'GET' },
+  );
+}
+
+/**
+ * Get the WebSocket URL for a proposal session
+ */
+export function getProposalSessionWsUrl(
+  projectId: string,
+  sessionId: string,
+): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  return `${protocol}://${window.location.host}/api/v1/projects/${projectId}/proposal-sessions/${sessionId}/ws`;
 }
