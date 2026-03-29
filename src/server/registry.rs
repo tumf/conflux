@@ -530,4 +530,20 @@ mod tests {
         assert_eq!(sem.available_permits(), 0, "Semaphore should be exhausted");
         // p1, p2 dropped at end of scope -> permits returned
     }
+
+    #[test]
+    fn test_toggle_change_selected_tracks_explicit_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = ProjectRegistry::load(temp_dir.path(), 2).unwrap();
+        let entry = registry
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let first = registry.toggle_change_selected(&entry.id, "change-a");
+        let second = registry.toggle_change_selected(&entry.id, "change-a");
+
+        assert!(!first, "first toggle should clear default selection");
+        assert!(second, "second toggle should restore explicit selection");
+        assert!(registry.is_change_selected(&entry.id, "change-a"));
+    }
 }

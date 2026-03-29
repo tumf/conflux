@@ -596,16 +596,17 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
 
     let mut keys = vec!["↑↓/jk: move"];
     if let Some(item) = current_item {
-        // Show "Space: stop" for active changes, otherwise "Space: queue/unqueue"
-        // In parallel mode, don't show Space hints for uncommitted changes
+        // Show "Space: stop" for active changes, otherwise describe the mark action.
+        // In parallel mode, don't show Space hints for uncommitted changes.
         let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible;
         if item.queue_status.is_active() {
             keys.push("Space: stop");
         } else if !is_parallel_blocked {
-            keys.push(if item.selected {
-                "Space: unqueue"
-            } else {
-                "Space: queue"
+            keys.push(match (&item.queue_status, item.selected) {
+                (QueueStatus::Error(_), true) => "Space: clear retry",
+                (QueueStatus::Error(_), false) => "Space: retry mark",
+                (_, true) => "Space: unqueue",
+                (_, false) => "Space: queue",
             });
         }
         keys.push("e: edit");
@@ -953,16 +954,17 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
     let mut keys = vec!["↑↓/jk: move"];
     if let Some(item) = current_item {
-        // Show "Space: stop" for active changes, otherwise "Space: queue/unqueue"
-        // In parallel mode, don't show Space hints for uncommitted changes
+        // Show "Space: stop" for active changes, otherwise describe the mark action.
+        // In parallel mode, don't show Space hints for uncommitted changes.
         let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible;
         if item.queue_status.is_active() {
             keys.push("Space: stop");
         } else if !is_parallel_blocked {
-            keys.push(if item.selected {
-                "Space: unqueue"
-            } else {
-                "Space: queue"
+            keys.push(match (&item.queue_status, item.selected) {
+                (QueueStatus::Error(_), true) => "Space: clear retry",
+                (QueueStatus::Error(_), false) => "Space: retry mark",
+                (_, true) => "Space: unqueue",
+                (_, false) => "Space: queue",
             });
         }
         keys.push("e: edit");
@@ -1405,10 +1407,16 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
         ));
     } else if selected == 0 {
         // Changes exist but none selected
-        spans.push(Span::styled(
-            "Select changes with Space to process",
-            Style::default().fg(Color::Yellow),
-        ));
+        let has_error_changes = app
+            .changes
+            .iter()
+            .any(|change| matches!(change.queue_status, QueueStatus::Error(_)));
+        let message = if has_error_changes {
+            "Select changes with Space to process (error rows need retry mark)"
+        } else {
+            "Select changes with Space to process"
+        };
+        spans.push(Span::styled(message, Style::default().fg(Color::Yellow)));
     } else {
         // Changes selected and ready to process
         spans.push(Span::styled(
