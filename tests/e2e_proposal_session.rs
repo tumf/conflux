@@ -99,8 +99,8 @@ async fn create_project(router: axum::Router, remote_url: String) -> (axum::Rout
 fn make_state(temp_dir: &TempDir) -> AppState {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let proposal_config = ProposalSessionConfig {
-        acp_command: "python3".to_string(),
-        acp_args: vec![create_mock_acp_path(&repo_root).display().to_string()],
+        transport_command: "python3".to_string(),
+        transport_args: vec![create_mock_acp_path(&repo_root).display().to_string()],
         session_inactivity_timeout_secs: 1,
         ..Default::default()
     };

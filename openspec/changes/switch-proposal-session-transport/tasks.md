@@ -30,3 +30,6 @@
   - `ProposalSessionConfig` を ACP 命名から transport 非依存命名へ更新し、サーバ設定とテスト fixture を OpenCode 側に合わせる
 - owner: backend-maintainer
 - decision_due: 2026-03-31
+
+- owner: backend-maintainer
+- decision_due: 2026-03-31

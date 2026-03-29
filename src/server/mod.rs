@@ -10,6 +10,7 @@
 
 pub mod acp_client;
 pub mod active_commands;
+pub mod opencode_client;
 pub mod api;
 pub mod proposal_session;
 pub mod registry;

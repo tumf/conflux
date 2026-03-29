@@ -3212,8 +3212,8 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
 
     info!(session_id = %session_id, "Proposal session WebSocket connected");
 
-    // Get the ACP client and session ID from the manager
-    let (acp_client, acp_session_id) = {
+    // Get the OpenCode server handle and session ID from the manager
+    let (opencode_server, opencode_session_id) = {
         let manager = state.proposal_session_manager.read().await;
         match manager.get_session(&session_id) {
             Some(session) => {
@@ -3230,7 +3230,10 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                         .await;
                     return;
                 }
-                (session.acp_client.clone(), session.acp_session_id.clone())
+                (
+                    session.opencode_server.clone(),
+                    session.opencode_session_id.clone(),
+                )
             }
             None => {
                 let _ = ws_sender
@@ -3247,106 +3250,69 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
         }
     };
 
-    // Task to forward ACP notifications to WebSocket
-    let acp_client_for_notifs = acp_client.clone();
+    // Task to forward OpenCode SSE events to WebSocket
+    let opencode_server_for_notifs = opencode_server.clone();
     let session_id_for_notifs = session_id.clone();
     let state_for_notifs = state.clone();
+    let opencode_session_id_for_notifs = opencode_session_id.clone();
     let (ws_send_tx, mut ws_send_rx) = tokio::sync::mpsc::channel::<String>(256);
 
     let ws_send_tx_for_notifs = ws_send_tx.clone();
     let notif_task = tokio::spawn(async move {
-        loop {
-            match acp_client_for_notifs.recv_notification().await {
-                Some(crate::server::acp_client::AcpMessage::Notification(notif)) => {
-                    let msg = match notif.method.as_str() {
-                        "session/update" => {
-                            if let Some(params) = &notif.params {
-                                match serde_json::from_value::<
-                                    crate::server::acp_client::AcpUpdateParams,
-                                >(params.clone())
-                                {
-                                    Ok(update_params) => {
-                                        let mut mgr =
-                                            state_for_notifs.proposal_session_manager.write().await;
-                                        if let Some(s) = mgr.get_session_mut(&session_id_for_notifs)
-                                        {
-                                            s.touch();
-                                        }
-                                        drop(mgr);
+        let stream = match opencode_server_for_notifs.subscribe_events().await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = ws_send_tx_for_notifs
+                    .send(
+                        serde_json::to_string(&ProposalWsServerMessage::Error {
+                            message: format!("Failed to subscribe OpenCode events: {}", e),
+                        })
+                        .unwrap_or_default(),
+                    )
+                    .await;
+                return;
+            }
+        };
 
-                                        match acp_event_to_ws_message(update_params.update) {
-                                            Some(msg) => msg,
-                                            None => continue,
-                                        }
-                                    }
-                                    Err(e) => {
-                                        debug!(error = %e, "Failed to parse ACP event");
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                continue;
-                            }
-                        }
-                        "session/elicitation" => {
-                            if let Some(params) = &notif.params {
-                                let request_id = params
-                                    .get("requestId")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let mode = params
-                                    .get("mode")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("form")
-                                    .to_string();
-                                let message = params
-                                    .get("message")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let schema = params.get("schema").cloned();
+        futures_util::pin_mut!(stream);
 
-                                ProposalWsServerMessage::Elicitation {
-                                    request_id,
-                                    mode,
-                                    message,
-                                    schema,
-                                }
-                            } else {
-                                continue;
-                            }
-                        }
-                        _ => {
-                            debug!(method = %notif.method, "Unhandled ACP notification");
-                            continue;
-                        }
-                    };
-
-                    let json = match serde_json::to_string(&msg) {
-                        Ok(j) => j,
-                        Err(e) => {
-                            error!(error = %e, "Failed to serialize WebSocket message");
-                            continue;
-                        }
-                    };
-
-                    if ws_send_tx_for_notifs.send(json).await.is_err() {
-                        break;
-                    }
-                }
-                None => {
-                    // ACP process ended
+        while let Some(event_result) = stream.next().await {
+            let event = match event_result {
+                Ok(event) => event,
+                Err(e) => {
                     let _ = ws_send_tx_for_notifs
                         .send(
                             serde_json::to_string(&ProposalWsServerMessage::Error {
-                                message: "ACP process has exited".to_string(),
+                                message: format!("OpenCode event stream error: {}", e),
                             })
                             .unwrap_or_default(),
                         )
                         .await;
                     break;
                 }
+            };
+
+            let msg = match opencode_event_to_ws_message(event, &opencode_session_id_for_notifs) {
+                Some(msg) => msg,
+                None => continue,
+            };
+
+            let mut mgr = state_for_notifs.proposal_session_manager.write().await;
+            if let Some(s) = mgr.get_session_mut(&session_id_for_notifs) {
+                s.touch();
+            }
+            drop(mgr);
+
+            let json = match serde_json::to_string(&msg) {
+                Ok(j) => j,
+                Err(e) => {
+                    error!(error = %e, "Failed to serialize WebSocket message");
+                    continue;
+                }
+            };
+
+            if ws_send_tx_for_notifs.send(json).await.is_err() {
+                break;
             }
         }
     });
@@ -3377,8 +3343,11 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                                 }
                             }
 
-                            if let Err(e) = acp_client.send_prompt(&acp_session_id, &text).await {
-                                error!(error = %e, "Failed to send prompt to ACP");
+                            if let Err(e) = opencode_server
+                                .send_prompt_async(&opencode_session_id, &text, None, None)
+                                .await
+                            {
+                                error!(error = %e, "Failed to send prompt to OpenCode");
                                 let _ = ws_send_tx
                                     .send(
                                         serde_json::to_string(&ProposalWsServerMessage::Error {
@@ -3389,21 +3358,19 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                                     .await;
                             }
                         }
-                        Ok(ProposalWsClientMessage::ElicitationResponse {
-                            request_id,
-                            action,
-                            content,
-                        }) => {
-                            if let Err(e) = acp_client
-                                .respond_elicitation(&request_id, &action, content)
-                                .await
-                            {
-                                error!(error = %e, "Failed to respond to elicitation");
-                            }
+                        Ok(ProposalWsClientMessage::ElicitationResponse { .. }) => {
+                            let _ = ws_send_tx
+                                .send(
+                                    serde_json::to_string(&ProposalWsServerMessage::Error {
+                                        message: "Elicitation response is not supported on OpenCode transport yet".to_string(),
+                                    })
+                                    .unwrap_or_default(),
+                                )
+                                .await;
                         }
                         Ok(ProposalWsClientMessage::Cancel) => {
-                            if let Err(e) = acp_client.cancel(&acp_session_id).await {
-                                error!(error = %e, "Failed to cancel ACP session");
+                            if let Err(e) = opencode_server.abort_session(&opencode_session_id).await {
+                                error!(error = %e, "Failed to abort OpenCode session");
                             }
                         }
                         Err(e) => {
@@ -3429,52 +3396,69 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
     info!(session_id = %session_id, "Proposal session WebSocket disconnected");
 }
 
-/// Convert an ACP event to a WebSocket server message.
-fn acp_event_to_ws_message(
-    event: crate::server::acp_client::AcpEvent,
+/// Convert an OpenCode event to a WebSocket server message.
+fn opencode_event_to_ws_message(
+    event: crate::server::opencode_client::OpencodeEvent,
+    expected_session_id: &str,
 ) -> Option<ProposalWsServerMessage> {
-    use crate::server::acp_client::AcpEvent;
+    use crate::server::opencode_client::OpencodeEvent;
+
     match event {
-        AcpEvent::AgentMessageChunk { content } => {
-            let text = content.map(|c| c.text).unwrap_or_default();
-            Some(ProposalWsServerMessage::AgentMessageChunk { text })
+        OpencodeEvent::MessagePartUpdated(payload) => {
+            if let Some(session_id) = payload.session_id.as_deref() {
+                if session_id != expected_session_id {
+                    return None;
+                }
+            }
+
+            let part = payload.part.or_else(|| {
+                payload.delta.map(|delta| crate::server::opencode_client::MessagePart {
+                    id: None,
+                    part_type: delta.part_type.unwrap_or_default(),
+                    text: delta.text,
+                    tool_call_id: delta.tool_call_id,
+                    title: delta.title,
+                    kind: delta.kind,
+                    status: delta.status,
+                    content: delta.content,
+                })
+            })?;
+
+            match part.part_type.as_str() {
+                "text" => Some(ProposalWsServerMessage::AgentMessageChunk {
+                    text: part.text.unwrap_or_default(),
+                }),
+                "tool_call" => Some(ProposalWsServerMessage::ToolCall {
+                    tool_call_id: part.tool_call_id.unwrap_or_default(),
+                    title: part.title.unwrap_or_default(),
+                    kind: part.kind.unwrap_or_default(),
+                    status: part.status.unwrap_or_else(|| "pending".to_string()),
+                }),
+                "tool_call_update" => Some(ProposalWsServerMessage::ToolCallUpdate {
+                    tool_call_id: part.tool_call_id.unwrap_or_default(),
+                    status: part.status.unwrap_or_else(|| "running".to_string()),
+                    content: part.content.unwrap_or_default(),
+                }),
+                _ => None,
+            }
         }
-        AcpEvent::AgentThoughtChunk { .. } => None,
-        AcpEvent::ToolCall {
-            tool_call_id,
-            title,
-            kind,
-            status,
-        } => Some(ProposalWsServerMessage::ToolCall {
-            tool_call_id,
-            title,
-            kind,
-            status,
-        }),
-        AcpEvent::ToolCallUpdate {
-            tool_call_id,
-            status,
-            content,
-        } => Some(ProposalWsServerMessage::ToolCallUpdate {
-            tool_call_id,
-            status,
-            content,
-        }),
-        AcpEvent::Elicitation {
-            request_id,
-            mode,
-            message,
-            schema,
-        } => Some(ProposalWsServerMessage::Elicitation {
-            request_id,
-            mode,
-            message,
-            schema,
-        }),
-        AcpEvent::TurnComplete { stop_reason } => {
-            Some(ProposalWsServerMessage::TurnComplete { stop_reason })
+        OpencodeEvent::SessionStatus(payload) => {
+            if let Some(session_id) = payload.session_id.as_deref() {
+                if session_id != expected_session_id {
+                    return None;
+                }
+            }
+            if payload.status == "completed" || payload.status == "cancelled" {
+                Some(ProposalWsServerMessage::TurnComplete {
+                    stop_reason: payload
+                        .stop_reason
+                        .unwrap_or_else(|| "end_turn".to_string()),
+                })
+            } else {
+                None
+            }
         }
-        AcpEvent::Unknown => None,
+        OpencodeEvent::Unknown { .. } => None,
     }
 }
 
