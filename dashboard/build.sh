@@ -8,8 +8,8 @@ echo "Building Conflux Server Dashboard..."
 
 cd "$(dirname "$0")"
 
-# Install dependencies if needed
-if [ ! -d "node_modules" ]; then
+# Install dependencies if needed (or if package.json is newer than node_modules)
+if [ ! -d "node_modules" ] || [ "package.json" -nt "node_modules/.package-lock.json" ]; then
     echo "Installing dependencies..."
     npm install
 fi
