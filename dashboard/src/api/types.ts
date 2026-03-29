@@ -242,4 +242,3 @@ export interface ElicitationRequest {
   /** Required field names */
   required?: string[];
 }
-
