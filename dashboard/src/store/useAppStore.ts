@@ -10,6 +10,7 @@ import {
   WorktreeInfo,
   OrchestrationStatus,
   FileBrowseContext,
+  ActiveCommand,
 } from '../api/types';
 import { ConnectionStatus } from '../api/wsClient';
 
@@ -25,6 +26,8 @@ export interface AppState {
   orchestrationStatus: OrchestrationStatus;
   /** File browser context (change or worktree selection) */
   fileBrowseContext: FileBrowseContext | null;
+  /** Currently active commands across all worktree roots */
+  activeCommands: ActiveCommand[];
 }
 
 export type AppAction =
@@ -45,6 +48,7 @@ const initialState: AppState = {
   syncAvailable: false,
   orchestrationStatus: 'idle',
   fileBrowseContext: null,
+  activeCommands: [],
 };
 
 export function appReducer(state: AppState, action: AppAction): AppState {
@@ -55,6 +59,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         projects: action.payload.projects,
         syncAvailable: action.payload.sync_available ?? false,
         orchestrationStatus: action.payload.orchestration_status ?? 'idle',
+        activeCommands: action.payload.active_commands ?? [],
       };
       // Update worktrees if included in full_state
       if (action.payload.worktrees) {

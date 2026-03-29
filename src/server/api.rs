@@ -20,6 +20,9 @@ use tracing::{debug, error, info};
 
 use crate::execution::state::{detect_workspace_state, WorkspaceState};
 use crate::remote::types::{RemoteChange, RemoteLogEntry, RemoteProject, RemoteStateUpdate};
+use crate::server::active_commands::{
+    ActiveCommandGuard, RootKind, SharedActiveCommands, WorktreeRootKey,
+};
 use crate::server::proposal_session::{ProposalSessionError, SharedProposalSessionManager};
 use crate::server::registry::{
     server_worktree_branch, OrchestrationStatus, ProjectEntry, ProjectStatus, SharedRegistry,
@@ -53,6 +56,8 @@ pub struct AppState {
     pub orchestration_status: Arc<tokio::sync::RwLock<OrchestrationStatus>>,
     /// Terminal session manager for dashboard interactive shells
     pub terminal_manager: SharedTerminalManager,
+    /// Active command registry for worktree root-level singleton execution
+    pub active_commands: SharedActiveCommands,
     /// Proposal session manager for interactive proposal creation
     pub proposal_session_manager: SharedProposalSessionManager,
 }
@@ -84,6 +89,39 @@ pub async fn auth_middleware(
         }
     }
     next.run(req).await
+}
+
+// ─────────────────────────── Active command helpers ───────────────────────────
+
+/// Try to acquire an active command slot for the given root. On conflict, returns
+/// a `409 Conflict` response describing the busy root. On success, returns an
+/// `ActiveCommandGuard` that auto-releases the slot when dropped.
+async fn try_acquire_active_command(
+    active_commands: &SharedActiveCommands,
+    project_id: &str,
+    root_kind: RootKind,
+    operation: &str,
+) -> Result<ActiveCommandGuard, Response> {
+    let key = WorktreeRootKey {
+        project_id: project_id.to_string(),
+        root_kind,
+    };
+    let mut reg = active_commands.write().await;
+    match reg.try_acquire(key.clone(), operation) {
+        Ok(()) => Ok(ActiveCommandGuard::new(active_commands.clone(), key)),
+        Err(existing) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "root_busy",
+                "reason": format!(
+                    "Root is busy with operation '{}' (started {})",
+                    existing.operation, existing.started_at
+                ),
+                "active_command": existing,
+            })),
+        )
+            .into_response()),
+    }
 }
 
 // ─────────────────────────────── Request/Response types ───────────────────────
@@ -229,6 +267,7 @@ pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> 
     let log_rx = state.log_tx.subscribe();
     let sync_available = state.resolve_command.is_some();
     let orchestration_status = state.orchestration_status.clone();
+    let active_commands = state.active_commands.clone();
     ws.on_upgrade(move |socket| {
         handle_ws(
             socket,
@@ -236,6 +275,7 @@ pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> 
             log_rx,
             sync_available,
             orchestration_status,
+            active_commands,
         )
     })
 }
@@ -246,6 +286,7 @@ async fn handle_ws(
     mut log_rx: tokio::sync::broadcast::Receiver<RemoteLogEntry>,
     sync_available: bool,
     orchestration_status: Arc<tokio::sync::RwLock<OrchestrationStatus>>,
+    active_commands: SharedActiveCommands,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
 
@@ -297,7 +338,11 @@ async fn handle_ws(
                 };
 
                 let orch_status = orchestration_status.read().await.as_str().to_string();
-                if let Ok(payload) = serde_json::to_string(&RemoteStateUpdate::FullState { projects: snapshot, worktrees, sync_available, orchestration_status: orch_status }) {
+                let active_cmds = {
+                    let ac = active_commands.read().await;
+                    ac.snapshot()
+                };
+                if let Ok(payload) = serde_json::to_string(&RemoteStateUpdate::FullState { projects: snapshot, worktrees, sync_available, orchestration_status: orch_status, active_commands: active_cmds }) {
                     if socket.send(Message::Text(payload.into())).await.is_err() {
                         break;
                     }
@@ -956,6 +1001,8 @@ async fn run_resolve_command(
     resolve_command_template: &str,
     work_dir: &std::path::Path,
     prompt: &str,
+    log_tx: Option<&tokio::sync::broadcast::Sender<RemoteLogEntry>>,
+    project_id: Option<&str>,
 ) -> (bool, Option<i32>) {
     // Use the shared placeholder expansion from config::expand, which handles
     // both quoted ('{prompt}') and unquoted ({prompt}) template forms correctly,
@@ -967,19 +1014,110 @@ async fn run_resolve_command(
         command_str
     );
 
+    // Send start event to project log
+    if let (Some(tx), Some(pid)) = (log_tx, project_id) {
+        let _ = tx.send(RemoteLogEntry {
+            message: format!("resolve_command started: {}", command_str),
+            level: "info".to_string(),
+            change_id: None,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            project_id: Some(pid.to_string()),
+            operation: Some("resolve".to_string()),
+            iteration: None,
+        });
+    }
+
     let mut cmd = crate::shell_command::build_login_shell_command(&command_str);
     cmd.current_dir(work_dir);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
 
-    match cmd.status().await {
-        Ok(status) => (true, status.code()),
+    let child = match cmd.spawn() {
+        Ok(child) => child,
         Err(e) => {
             error!(
                 "Failed to run resolve_command '{}': {}",
                 resolve_command_template, e
             );
-            (true, Some(-1))
+            if let (Some(tx), Some(pid)) = (log_tx, project_id) {
+                let _ = tx.send(RemoteLogEntry {
+                    message: format!("resolve_command failed to start: {}", e),
+                    level: "error".to_string(),
+                    change_id: None,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    project_id: Some(pid.to_string()),
+                    operation: Some("resolve".to_string()),
+                    iteration: None,
+                });
+            }
+            return (true, Some(-1));
         }
+    };
+
+    // Stream stdout/stderr to project log
+    let output = match child.wait_with_output().await {
+        Ok(output) => output,
+        Err(e) => {
+            error!(
+                "Failed to wait for resolve_command '{}': {}",
+                resolve_command_template, e
+            );
+            return (true, Some(-1));
+        }
+    };
+
+    // Stream stdout lines
+    if let (Some(tx), Some(pid)) = (log_tx, project_id) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if !line.is_empty() {
+                let _ = tx.send(RemoteLogEntry {
+                    message: line.to_string(),
+                    level: "info".to_string(),
+                    change_id: None,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    project_id: Some(pid.to_string()),
+                    operation: Some("resolve".to_string()),
+                    iteration: None,
+                });
+            }
+        }
+
+        // Stream stderr lines
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines() {
+            if !line.is_empty() {
+                let _ = tx.send(RemoteLogEntry {
+                    message: line.to_string(),
+                    level: "warn".to_string(),
+                    change_id: None,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    project_id: Some(pid.to_string()),
+                    operation: Some("resolve".to_string()),
+                    iteration: None,
+                });
+            }
+        }
+
+        // Send completion event
+        let exit_code = output.status.code();
+        let level = if output.status.success() {
+            "success"
+        } else {
+            "error"
+        };
+        let _ = tx.send(RemoteLogEntry {
+            message: format!("resolve_command finished: exit_code={:?}", exit_code),
+            level: level.to_string(),
+            change_id: None,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            project_id: Some(pid.to_string()),
+            operation: Some("resolve".to_string()),
+            iteration: None,
+        });
     }
+
+    (true, output.status.code())
 }
 
 fn build_auto_resolve_prompt(
@@ -1056,6 +1194,19 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
             )
                 .into_response();
         }
+    };
+
+    // Acquire active command slot for base root (sync operates on the base worktree)
+    let _active_guard = match try_acquire_active_command(
+        &state.active_commands,
+        &project_id,
+        RootKind::Base,
+        "sync",
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(resp) => return resp,
     };
 
     let (remote_url, branch, lock, semaphore) = {
@@ -1308,8 +1459,14 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
         &remote_sha_for_push,
         &local_repo_path,
     );
-    let (resolve_command_ran, resolve_exit_code) =
-        run_resolve_command(&resolve_command, &local_repo_path, &resolve_prompt).await;
+    let (resolve_command_ran, resolve_exit_code) = run_resolve_command(
+        &resolve_command,
+        &local_repo_path,
+        &resolve_prompt,
+        Some(&state.log_tx),
+        Some(&project_id),
+    )
+    .await;
 
     if resolve_exit_code != Some(0) {
         error!(
@@ -1906,6 +2063,19 @@ pub async fn server_delete_worktree(
     State(state): State<AppState>,
     Path((project_id, branch)): Path<(String, String)>,
 ) -> Response {
+    // Acquire active command slot for this worktree root
+    let _active_guard = match try_acquire_active_command(
+        &state.active_commands,
+        &project_id,
+        RootKind::Worktree(branch.clone()),
+        "delete",
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(resp) => return resp,
+    };
+
     let (worktree_path, _entry) = match resolve_project_worktree_path(&state, &project_id).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -1978,6 +2148,31 @@ pub async fn server_merge_worktree(
     State(state): State<AppState>,
     Path((project_id, branch)): Path<(String, String)>,
 ) -> Response {
+    // Merge operates on the base worktree (merging branch into base), so guard the base root.
+    // Also guard the worktree root to prevent concurrent operations on the branch being merged.
+    let _active_guard_base = match try_acquire_active_command(
+        &state.active_commands,
+        &project_id,
+        RootKind::Base,
+        "merge",
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(resp) => return resp,
+    };
+    let _active_guard_wt = match try_acquire_active_command(
+        &state.active_commands,
+        &project_id,
+        RootKind::Worktree(branch.clone()),
+        "merge",
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(resp) => return resp,
+    };
+
     let (worktree_path, _entry) = match resolve_project_worktree_path(&state, &project_id).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -3306,6 +3501,7 @@ mod tests {
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
@@ -3750,6 +3946,7 @@ mod tests {
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
@@ -4605,6 +4802,7 @@ mod tests {
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
@@ -4759,6 +4957,7 @@ mod tests {
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
@@ -4853,7 +5052,8 @@ mod tests {
         // making PATH-dependent commands available even in non-login environments.
         let temp_dir = TempDir::new().unwrap();
         let (ran, exit_code) =
-            super::run_resolve_command("echo hello", temp_dir.path(), "test prompt").await;
+            super::run_resolve_command("echo hello", temp_dir.path(), "test prompt", None, None)
+                .await;
         assert!(ran, "resolve_command should have been attempted");
         assert_eq!(
             exit_code,
@@ -4867,7 +5067,8 @@ mod tests {
         // Verify that {prompt} placeholder is substituted in the command string.
         let temp_dir = TempDir::new().unwrap();
         let (ran, exit_code) =
-            super::run_resolve_command("echo {prompt}", temp_dir.path(), "test_marker").await;
+            super::run_resolve_command("echo {prompt}", temp_dir.path(), "test_marker", None, None)
+                .await;
         assert!(ran, "resolve_command should have been attempted");
         assert_eq!(
             exit_code,
@@ -4889,7 +5090,7 @@ mod tests {
             marker_path.to_str().unwrap()
         );
         let (ran, exit_code) =
-            super::run_resolve_command(&template, temp_dir.path(), "hello world").await;
+            super::run_resolve_command(&template, temp_dir.path(), "hello world", None, None).await;
         assert!(ran, "resolve_command should have been attempted");
         assert_eq!(
             exit_code,
@@ -4913,7 +5114,7 @@ mod tests {
             marker_path.to_str().unwrap()
         );
         let (ran, exit_code) =
-            super::run_resolve_command(&template, temp_dir.path(), "simple_word").await;
+            super::run_resolve_command(&template, temp_dir.path(), "simple_word", None, None).await;
         assert!(ran, "resolve_command should have been attempted");
         assert_eq!(
             exit_code,
@@ -4940,7 +5141,8 @@ mod tests {
         let multiline_prompt =
             "Conflux server auto_resolve\noperation=git_sync\nproject_id=abc123\nTask: reconcile local state";
         let (ran, exit_code) =
-            super::run_resolve_command(&template, temp_dir.path(), multiline_prompt).await;
+            super::run_resolve_command(&template, temp_dir.path(), multiline_prompt, None, None)
+                .await;
         assert!(ran, "resolve_command should have been attempted");
         assert_eq!(
             exit_code,
@@ -4965,7 +5167,8 @@ mod tests {
         );
         let multiline_prompt = "Line 1\nLine 2\nLine 3";
         let (ran, exit_code) =
-            super::run_resolve_command(&template, temp_dir.path(), multiline_prompt).await;
+            super::run_resolve_command(&template, temp_dir.path(), multiline_prompt, None, None)
+                .await;
         assert!(ran, "resolve_command should have been attempted");
         assert_eq!(
             exit_code,
@@ -5130,6 +5333,7 @@ mod tests {
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
@@ -5194,6 +5398,7 @@ mod tests {
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
@@ -5252,6 +5457,7 @@ mod tests {
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),

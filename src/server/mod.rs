@@ -9,6 +9,7 @@
 //!   The server is directory-independent and uses only its configured data_dir.
 
 pub mod acp_client;
+pub mod active_commands;
 pub mod api;
 pub mod proposal_session;
 pub mod registry;
@@ -70,6 +71,7 @@ pub async fn run_server(
             registry::OrchestrationStatus::default(),
         )),
         terminal_manager: terminal::create_terminal_manager(),
+        active_commands: active_commands::create_shared_active_commands(),
         proposal_session_manager,
     };
 
