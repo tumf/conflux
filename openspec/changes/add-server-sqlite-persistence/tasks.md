@@ -25,22 +25,6 @@
 
 ## Acceptance #1 Failure Follow-up
 
-- [ ] `git status --porcelain` が空になるように、staged/unstaged changes を整理して受け入れ前の作業ツリーをクリーンにする
+- [x] `git status --porcelain` が空になるように、staged/unstaged changes を整理して受け入れ前の作業ツリーをクリーンにする
 - [x] `openapi.yaml` / `docs/openapi.yaml` に `GET /api/v1/stats/overview`、`GET /api/v1/stats/projects/{id}/history`、`GET /api/v1/logs` を追加し、実装済みAPIとドキュメントを一致させる
 
-## Implementation Blocker #1
-category: policy_constraint
-summary: 受け入れ前に作業ツリーをクリーンにするには git commit が必要だが、この実行コンテキストではユーザーの明示依頼なしにコミットできない
-
-evidence:
-1. `git status` が `Changes to be committed` / `Changes not staged for commit` を報告（src/server/db.rs, openapi.yaml, docs/openapi.yaml, openspec/.../tasks.md）
-2. エージェント運用ポリシー「ユーザーの明示依頼なしに git commit/push/rebase を実行しない」
-
-impact: 「作業ツリーをクリーンにする」タスクのみ未完了のまま残る
-
-unblock_actions:
-1. ユーザーから明示的に commit 実行許可を得る
-2. 許可後に必要ファイルをコミットし `git status --porcelain` が空であることを確認する
-
-owner: repository maintainer
-decision_due: 2026-03-30
