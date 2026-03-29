@@ -10,6 +10,11 @@ import {
   WorktreeInfo,
   OrchestrationStatus,
   FileBrowseContext,
+  ProposalSession,
+  ProposalChatMessage,
+  ElicitationRequest,
+  ToolCallInfo,
+  ToolCallStatus,
   ActiveCommand,
 } from '../api/types';
 import { ConnectionStatus } from '../api/wsClient';
@@ -26,6 +31,18 @@ export interface AppState {
   orchestrationStatus: OrchestrationStatus;
   /** File browser context (change or worktree selection) */
   fileBrowseContext: FileBrowseContext | null;
+  /** Proposal sessions indexed by project ID */
+  proposalSessionsByProjectId: Record<string, ProposalSession[]>;
+  /** Currently active proposal session ID */
+  activeProposalSessionId: string | null;
+  /** Chat messages indexed by session ID */
+  chatMessagesBySessionId: Record<string, ProposalChatMessage[]>;
+  /** Active elicitation request (only one at a time) */
+  activeElicitation: ElicitationRequest | null;
+  /** Whether the agent is currently responding */
+  isAgentResponding: boolean;
+  /** Streaming message content being built (keyed by message_id) */
+  streamingContent: Record<string, string>;
   /** Currently active commands across all worktree roots */
   activeCommands: ActiveCommand[];
 }
@@ -37,7 +54,18 @@ export type AppAction =
   | { type: 'SELECT_PROJECT'; payload: string | null }
   | { type: 'CLEAR_LOGS'; payload: string }
   | { type: 'SET_WORKTREES'; payload: { projectId: string; worktrees: WorktreeInfo[] } }
-  | { type: 'SET_FILE_BROWSE_CONTEXT'; payload: FileBrowseContext | null };
+  | { type: 'SET_FILE_BROWSE_CONTEXT'; payload: FileBrowseContext | null }
+  | { type: 'SET_PROPOSAL_SESSIONS'; payload: { projectId: string; sessions: ProposalSession[] } }
+  | { type: 'ADD_PROPOSAL_SESSION'; payload: { projectId: string; session: ProposalSession } }
+  | { type: 'UPDATE_PROPOSAL_SESSION'; payload: ProposalSession }
+  | { type: 'REMOVE_PROPOSAL_SESSION'; payload: { projectId: string; sessionId: string } }
+  | { type: 'SET_ACTIVE_PROPOSAL_SESSION'; payload: string | null }
+  | { type: 'APPEND_CHAT_MESSAGE'; payload: { sessionId: string; message: ProposalChatMessage } }
+  | { type: 'APPEND_STREAMING_CHUNK'; payload: { messageId: string; content: string } }
+  | { type: 'UPDATE_TOOL_CALL'; payload: { sessionId: string; messageId: string; toolCall: ToolCallInfo } }
+  | { type: 'UPDATE_TOOL_CALL_STATUS'; payload: { sessionId: string; messageId: string; toolCallId: string; status: ToolCallStatus } }
+  | { type: 'SET_ELICITATION'; payload: ElicitationRequest | null }
+  | { type: 'SET_AGENT_RESPONDING'; payload: boolean };
 
 const initialState: AppState = {
   projects: [],
@@ -48,6 +76,12 @@ const initialState: AppState = {
   syncAvailable: false,
   orchestrationStatus: 'idle',
   fileBrowseContext: null,
+  proposalSessionsByProjectId: {},
+  activeProposalSessionId: null,
+  chatMessagesBySessionId: {},
+  activeElicitation: null,
+  isAgentResponding: false,
+  streamingContent: {},
   activeCommands: [],
 };
 
@@ -133,6 +167,141 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       };
     }
 
+    case 'SET_PROPOSAL_SESSIONS': {
+      return {
+        ...state,
+        proposalSessionsByProjectId: {
+          ...state.proposalSessionsByProjectId,
+          [action.payload.projectId]: action.payload.sessions,
+        },
+      };
+    }
+
+    case 'ADD_PROPOSAL_SESSION': {
+      const existing = state.proposalSessionsByProjectId[action.payload.projectId] || [];
+      return {
+        ...state,
+        proposalSessionsByProjectId: {
+          ...state.proposalSessionsByProjectId,
+          [action.payload.projectId]: [...existing, action.payload.session],
+        },
+      };
+    }
+
+    case 'UPDATE_PROPOSAL_SESSION': {
+      const session = action.payload;
+      const projectSessions = state.proposalSessionsByProjectId[session.project_id] || [];
+      return {
+        ...state,
+        proposalSessionsByProjectId: {
+          ...state.proposalSessionsByProjectId,
+          [session.project_id]: projectSessions.map((s) =>
+            s.id === session.id ? session : s,
+          ),
+        },
+      };
+    }
+
+    case 'REMOVE_PROPOSAL_SESSION': {
+      const { projectId, sessionId } = action.payload;
+      const sessions = state.proposalSessionsByProjectId[projectId] || [];
+      return {
+        ...state,
+        proposalSessionsByProjectId: {
+          ...state.proposalSessionsByProjectId,
+          [projectId]: sessions.filter((s) => s.id !== sessionId),
+        },
+        activeProposalSessionId:
+          state.activeProposalSessionId === sessionId ? null : state.activeProposalSessionId,
+      };
+    }
+
+    case 'SET_ACTIVE_PROPOSAL_SESSION': {
+      return {
+        ...state,
+        activeProposalSessionId: action.payload,
+        // Clear elicitation when switching sessions
+        activeElicitation: null,
+      };
+    }
+
+    case 'APPEND_CHAT_MESSAGE': {
+      const { sessionId, message } = action.payload;
+      const msgs = state.chatMessagesBySessionId[sessionId] || [];
+      return {
+        ...state,
+        chatMessagesBySessionId: {
+          ...state.chatMessagesBySessionId,
+          [sessionId]: [...msgs, message],
+        },
+        // User message starts agent responding; assistant_message finalizes it
+        isAgentResponding: message.role === 'user' ? true : false,
+      };
+    }
+
+    case 'APPEND_STREAMING_CHUNK': {
+      const { messageId, content } = action.payload;
+      const prev = state.streamingContent[messageId] || '';
+      return {
+        ...state,
+        streamingContent: {
+          ...state.streamingContent,
+          [messageId]: prev + content,
+        },
+        isAgentResponding: true,
+      };
+    }
+
+    case 'UPDATE_TOOL_CALL': {
+      const { sessionId, messageId, toolCall } = action.payload;
+      const msgs = state.chatMessagesBySessionId[sessionId] || [];
+      return {
+        ...state,
+        chatMessagesBySessionId: {
+          ...state.chatMessagesBySessionId,
+          [sessionId]: msgs.map((m) => {
+            if (m.id !== messageId) return m;
+            const existing = m.tool_calls || [];
+            return { ...m, tool_calls: [...existing, toolCall] };
+          }),
+        },
+      };
+    }
+
+    case 'UPDATE_TOOL_CALL_STATUS': {
+      const { sessionId, messageId, toolCallId, status } = action.payload;
+      const msgs = state.chatMessagesBySessionId[sessionId] || [];
+      return {
+        ...state,
+        chatMessagesBySessionId: {
+          ...state.chatMessagesBySessionId,
+          [sessionId]: msgs.map((m) => {
+            if (m.id !== messageId || !m.tool_calls) return m;
+            return {
+              ...m,
+              tool_calls: m.tool_calls.map((tc) =>
+                tc.id === toolCallId ? { ...tc, status } : tc,
+              ),
+            };
+          }),
+        },
+      };
+    }
+
+    case 'SET_ELICITATION': {
+      return {
+        ...state,
+        activeElicitation: action.payload,
+      };
+    }
+
+    case 'SET_AGENT_RESPONDING': {
+      return {
+        ...state,
+        isAgentResponding: action.payload,
+      };
+    }
+
     default:
       return state;
   }
@@ -169,6 +338,50 @@ export function useAppStore() {
     dispatch({ type: 'SET_FILE_BROWSE_CONTEXT', payload: ctx });
   }, []);
 
+  const setProposalSessions = useCallback((projectId: string, sessions: ProposalSession[]) => {
+    dispatch({ type: 'SET_PROPOSAL_SESSIONS', payload: { projectId, sessions } });
+  }, []);
+
+  const addProposalSession = useCallback((projectId: string, session: ProposalSession) => {
+    dispatch({ type: 'ADD_PROPOSAL_SESSION', payload: { projectId, session } });
+  }, []);
+
+  const updateProposalSession = useCallback((session: ProposalSession) => {
+    dispatch({ type: 'UPDATE_PROPOSAL_SESSION', payload: session });
+  }, []);
+
+  const removeProposalSession = useCallback((projectId: string, sessionId: string) => {
+    dispatch({ type: 'REMOVE_PROPOSAL_SESSION', payload: { projectId, sessionId } });
+  }, []);
+
+  const setActiveProposalSession = useCallback((sessionId: string | null) => {
+    dispatch({ type: 'SET_ACTIVE_PROPOSAL_SESSION', payload: sessionId });
+  }, []);
+
+  const appendChatMessage = useCallback((sessionId: string, message: ProposalChatMessage) => {
+    dispatch({ type: 'APPEND_CHAT_MESSAGE', payload: { sessionId, message } });
+  }, []);
+
+  const appendStreamingChunk = useCallback((messageId: string, content: string) => {
+    dispatch({ type: 'APPEND_STREAMING_CHUNK', payload: { messageId, content } });
+  }, []);
+
+  const updateToolCall = useCallback((sessionId: string, messageId: string, toolCall: ToolCallInfo) => {
+    dispatch({ type: 'UPDATE_TOOL_CALL', payload: { sessionId, messageId, toolCall } });
+  }, []);
+
+  const updateToolCallStatus = useCallback((sessionId: string, messageId: string, toolCallId: string, status: ToolCallStatus) => {
+    dispatch({ type: 'UPDATE_TOOL_CALL_STATUS', payload: { sessionId, messageId, toolCallId, status } });
+  }, []);
+
+  const setElicitation = useCallback((elicitation: ElicitationRequest | null) => {
+    dispatch({ type: 'SET_ELICITATION', payload: elicitation });
+  }, []);
+
+  const setAgentResponding = useCallback((responding: boolean) => {
+    dispatch({ type: 'SET_AGENT_RESPONDING', payload: responding });
+  }, []);
+
   return {
     state,
     setFullState,
@@ -178,5 +391,16 @@ export function useAppStore() {
     clearLogs,
     setWorktrees,
     setFileBrowseContext,
+    setProposalSessions,
+    addProposalSession,
+    updateProposalSession,
+    removeProposalSession,
+    setActiveProposalSession,
+    appendChatMessage,
+    appendStreamingChunk,
+    updateToolCall,
+    updateToolCallStatus,
+    setElicitation,
+    setAgentResponding,
   };
 }

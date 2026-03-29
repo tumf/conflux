@@ -7,16 +7,29 @@ import { appReducer, AppState, AppAction } from './useAppStore';
 
 // Use a reducer directly for testing (extract from hook)
 // Since appReducer is internal, we test it indirectly through dispatch behavior
+function makeInitialState(overrides: Partial<AppState> = {}): AppState {
+  return {
+    projects: [],
+    selectedProjectId: null,
+    logsByProjectId: {},
+    connectionStatus: 'disconnected',
+    worktreesByProjectId: {},
+    syncAvailable: false,
+    orchestrationStatus: 'idle',
+    fileBrowseContext: null,
+    proposalSessionsByProjectId: {},
+    activeProposalSessionId: null,
+    chatMessagesBySessionId: {},
+    activeElicitation: null,
+    isAgentResponding: false,
+    streamingContent: {},
+    ...overrides,
+  };
+}
+
 describe('useAppStore - SET_FULL_STATE', () => {
-  it('should set projects and changes from FullState', () => {
-    const initialState: AppState = {
-      projects: [],
-      selectedProjectId: null,
-      logsByProjectId: {},
-      connectionStatus: 'disconnected',
-      changes: [],
-      worktreesByProjectId: {},
-    };
+  it('should set projects from FullState', () => {
+    const initialState = makeInitialState();
 
     const fullState = {
       projects: [
@@ -53,12 +66,10 @@ describe('useAppStore - SET_FULL_STATE', () => {
 
     expect(state.projects).toHaveLength(1);
     expect(state.projects[0].id).toBe('test-project-1');
-    expect(state.changes).toHaveLength(1);
-    expect(state.changes[0].id).toBe('change-1');
   });
 
   it('should replace projects when SET_FULL_STATE is dispatched', () => {
-    const initialState: AppState = {
+    const initialState = makeInitialState({
       projects: [
         {
           id: 'old-project',
@@ -72,11 +83,8 @@ describe('useAppStore - SET_FULL_STATE', () => {
         },
       ],
       selectedProjectId: 'old-project',
-      logsByProjectId: {},
       connectionStatus: 'connected',
-      changes: [],
-      worktreesByProjectId: {},
-    };
+    });
 
     const newFullState = {
       projects: [
@@ -111,7 +119,7 @@ describe('useAppStore - SET_FULL_STATE', () => {
   });
 
   it('should clear projects when empty FullState is set', () => {
-    const initialState: AppState = {
+    const initialState = makeInitialState({
       projects: [
         {
           id: 'project-1',
@@ -125,11 +133,8 @@ describe('useAppStore - SET_FULL_STATE', () => {
         },
       ],
       selectedProjectId: 'project-1',
-      logsByProjectId: {},
       connectionStatus: 'connected',
-      changes: [],
-      worktreesByProjectId: {},
-    };
+    });
 
     const emptyFullState = {
       projects: [],
@@ -144,20 +149,12 @@ describe('useAppStore - SET_FULL_STATE', () => {
     const state = appReducer(initialState, action);
 
     expect(state.projects).toHaveLength(0);
-    expect(state.changes).toHaveLength(0);
   });
 });
 
 describe('useAppStore - APPEND_LOG', () => {
   it('should append log entry to project logs', () => {
-    const initialState: AppState = {
-      projects: [],
-      selectedProjectId: null,
-      logsByProjectId: {},
-      connectionStatus: 'disconnected',
-      changes: [],
-      worktreesByProjectId: {},
-    };
+    const initialState = makeInitialState();
 
     const logEntry = {
       message: 'Test log',
@@ -181,9 +178,7 @@ describe('useAppStore - APPEND_LOG', () => {
   });
 
   it('should trim logs to 500 entries per project', () => {
-    const initialState: AppState = {
-      projects: [],
-      selectedProjectId: null,
+    const initialState = makeInitialState({
       logsByProjectId: {
         'project-1': Array.from({ length: 500 }, (_, i) => ({
           message: `Log ${i}`,
@@ -195,10 +190,7 @@ describe('useAppStore - APPEND_LOG', () => {
           iteration: null,
         })),
       },
-      connectionStatus: 'disconnected',
-      changes: [],
-      worktreesByProjectId: {},
-    };
+    });
 
     const newLogEntry = {
       message: 'New log entry',
@@ -224,14 +216,7 @@ describe('useAppStore - APPEND_LOG', () => {
 
 describe('useAppStore - SET_CONNECTION_STATUS', () => {
   it('should update connection status', () => {
-    const initialState: AppState = {
-      projects: [],
-      selectedProjectId: null,
-      logsByProjectId: {},
-      connectionStatus: 'disconnected',
-      changes: [],
-      worktreesByProjectId: {},
-    };
+    const initialState = makeInitialState();
 
     const action: AppAction = {
       type: 'SET_CONNECTION_STATUS',
@@ -246,14 +231,7 @@ describe('useAppStore - SET_CONNECTION_STATUS', () => {
 
 describe('useAppStore - SELECT_PROJECT', () => {
   it('should select a project', () => {
-    const initialState: AppState = {
-      projects: [],
-      selectedProjectId: null,
-      logsByProjectId: {},
-      connectionStatus: 'disconnected',
-      changes: [],
-      worktreesByProjectId: {},
-    };
+    const initialState = makeInitialState();
 
     const action: AppAction = {
       type: 'SELECT_PROJECT',
@@ -266,14 +244,9 @@ describe('useAppStore - SELECT_PROJECT', () => {
   });
 
   it('should deselect by setting null', () => {
-    const initialState: AppState = {
-      projects: [],
+    const initialState = makeInitialState({
       selectedProjectId: 'project-123',
-      logsByProjectId: {},
-      connectionStatus: 'disconnected',
-      changes: [],
-      worktreesByProjectId: {},
-    };
+    });
 
     const action: AppAction = {
       type: 'SELECT_PROJECT',
