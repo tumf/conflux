@@ -630,6 +630,45 @@ pub async fn handle_tui_command(
                 .await
                 {
                     Ok(_) => {
+                        // Run on_merged hook before ResolveCompleted event (before merged status transition)
+                        let hooks_config = resolve_config.get_hooks();
+                        let hooks = crate::hooks::HookRunner::with_event_tx(
+                            hooks_config,
+                            resolve_repo_root.clone(),
+                            resolve_tx.clone(),
+                        );
+
+                        // Fetch actual task counts from change data
+                        let (completed_tasks, total_tasks) = match crate::openspec::list_changes_native()
+                        {
+                            Ok(changes) => changes
+                                .iter()
+                                .find(|c| c.id == id)
+                                .map(|c| (c.completed_tasks, c.total_tasks))
+                                .unwrap_or((0, 0)),
+                            Err(e) => {
+                                warn!("Failed to fetch task counts for on_merged hook: {}", e);
+                                (0, 0)
+                            }
+                        };
+
+                        let hook_context = crate::hooks::HookContext::new(
+                            0, // changes_processed not available in manual resolve
+                            0, // total_changes not available
+                            0, // remaining_changes not available
+                            false,
+                        )
+                        .with_change(&id, completed_tasks, total_tasks)
+                        .with_apply_count(0)
+                        .with_parallel_context("", None);
+
+                        if let Err(e) = hooks
+                            .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
+                            .await
+                        {
+                            warn!("on_merged hook failed for {}: {}", id, e);
+                        }
+
                         let worktree_change_ids =
                             match crate::vcs::git::list_worktree_change_ids(&resolve_repo_root)
                                 .await
