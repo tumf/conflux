@@ -236,7 +236,74 @@ pub async fn worktree_add<P: AsRef<Path>>(
             Ok(())
         }
         Err(retry_err) => {
-            // Retry failed, return error with both original classification and retry info
+            // Retry failed after prune. Check if the retry failure is due to the branch
+            // already existing (but not checked out elsewhere). If so, fall through to
+            // the safe existing-branch attach flow.
+            let retry_classification = match &retry_err {
+                VcsError::Command { stderr, .. } => {
+                    let stderr_str = stderr.as_deref().unwrap_or("");
+                    WorktreeAddFailure::classify(stderr_str)
+                }
+                _ => WorktreeAddFailure::Unknown,
+            };
+
+            if retry_classification == WorktreeAddFailure::BranchExists {
+                info!(
+                    "Stale-path retry failed with BranchExists, attempting safe existing-branch attach for '{}'",
+                    branch_name
+                );
+
+                // Check if branch is checked out in another worktree
+                let is_checked_out = match is_branch_checked_out(cwd_ref, branch_name).await {
+                    Ok(checked_out) => checked_out,
+                    Err(e) => {
+                        warn!("Failed to check if branch is checked out: {}", e);
+                        return Err(enhance_error_with_retry_info(
+                            err,
+                            retry_err,
+                            classification,
+                        ));
+                    }
+                };
+
+                if is_checked_out {
+                    debug!(
+                        "Branch {} is checked out in another worktree, cannot attach after stale-path retry",
+                        branch_name
+                    );
+                    return Err(enhance_error_with_retry_info(
+                        err,
+                        retry_err,
+                        classification,
+                    ));
+                }
+
+                // Branch exists but not checked out, try to attach it
+                info!(
+                    "Branch {} exists but not checked out after stale-path prune, attempting attach",
+                    branch_name
+                );
+
+                let attach_result =
+                    run_git(&["worktree", "add", worktree_path, branch_name], cwd_ref).await;
+
+                match attach_result {
+                    Ok(_) => {
+                        info!("Worktree add succeeded by attaching existing branch after stale-path prune");
+                        return Ok(());
+                    }
+                    Err(attach_err) => {
+                        warn!("Failed to attach existing branch after stale-path prune");
+                        return Err(enhance_error_with_retry_info(
+                            err,
+                            attach_err,
+                            classification,
+                        ));
+                    }
+                }
+            }
+
+            // Not a BranchExists retry failure, return combined error info
             warn!("Worktree add retry failed after prune");
             Err(enhance_error_with_retry_info(
                 err,
@@ -1116,5 +1183,227 @@ mod tests {
 
         // Cleanup
         let _ = worktree_remove(temp_dir.path(), worktree_path.to_str().unwrap()).await;
+    }
+
+    /// Test: stale-path retry falls through to existing-branch attach when the
+    /// branch exists but is NOT checked out in another worktree.
+    ///
+    /// Corresponds to spec scenario: "Stale path retry falls through to existing branch attach"
+    #[tokio::test]
+    async fn test_stale_path_retry_falls_through_to_existing_branch_attach() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let init = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init.is_err() {
+            return; // Skip if git not available
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create initial commit
+        std::fs::write(temp_dir.path().join("README.md"), "test").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        let worktree_path = temp_dir.path().join("worktrees").join("stale-wt");
+        std::fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
+
+        // Step 1: Create the branch manually (so it exists as a local branch)
+        let _ = Command::new("git")
+            .args(["branch", "stale-branch"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Step 2: Create a stale directory at the worktree path (exists but not registered)
+        std::fs::create_dir_all(&worktree_path).unwrap();
+
+        // Verify preconditions:
+        // - Directory exists
+        assert!(worktree_path.exists());
+        // - Not registered in worktree list
+        let worktrees = list_worktrees(temp_dir.path()).await.unwrap();
+        let is_registered = worktrees
+            .iter()
+            .any(|(path, _, _, _, _)| *path == worktree_path.to_string_lossy());
+        assert!(!is_registered, "Worktree path should NOT be registered");
+        // - Branch exists
+        let branch_check = Command::new("git")
+            .args(["show-ref", "--verify", "refs/heads/stale-branch"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(branch_check.status.success(), "Branch should exist");
+
+        // Step 3: Try to create worktree with -b for the existing branch at the stale path.
+        // The flow should be:
+        //   1. Initial `git worktree add <path> -b stale-branch HEAD` → fails (path exists)
+        //   2. Detect stale path → prune + remove directory
+        //   3. Retry `git worktree add <path> -b stale-branch HEAD` → fails (branch exists)
+        //   4. Fall through to safe attach → `git worktree add <path> stale-branch` → succeeds
+        let result = worktree_add(
+            temp_dir.path(),
+            worktree_path.to_str().unwrap(),
+            "stale-branch",
+            "HEAD",
+        )
+        .await;
+
+        if let Err(e) = &result {
+            eprintln!(
+                "Stale-path → existing-branch attach failed unexpectedly: {:?}",
+                e
+            );
+        }
+        assert!(
+            result.is_ok(),
+            "Expected stale-path retry to fall through to existing-branch attach"
+        );
+
+        // Verify the worktree is on the correct branch
+        assert!(worktree_path.exists());
+        let branch_output = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&worktree_path)
+            .output()
+            .await
+            .unwrap();
+        let current_branch = String::from_utf8_lossy(&branch_output.stdout);
+        assert_eq!(current_branch.trim(), "stale-branch");
+
+        // Cleanup
+        let _ = worktree_remove(temp_dir.path(), worktree_path.to_str().unwrap()).await;
+    }
+
+    /// Test: stale-path retry does NOT attach a branch that is already checked out
+    /// in another worktree.
+    ///
+    /// Corresponds to spec scenario: "Stale path retry does not attach a checked-out branch"
+    #[tokio::test]
+    async fn test_stale_path_retry_does_not_attach_checked_out_branch() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Initialize git repo
+        let init = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init.is_err() {
+            return; // Skip if git not available
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Create initial commit
+        std::fs::write(temp_dir.path().join("README.md"), "test").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        // Step 1: Create a worktree that checks out the branch (so it's "in use")
+        let worktree_existing = temp_dir.path().join("worktrees").join("existing-wt");
+        std::fs::create_dir_all(worktree_existing.parent().unwrap()).unwrap();
+        let create_result = worktree_add(
+            temp_dir.path(),
+            worktree_existing.to_str().unwrap(),
+            "shared-branch",
+            "HEAD",
+        )
+        .await;
+        assert!(
+            create_result.is_ok(),
+            "Should succeed creating the first worktree"
+        );
+
+        // Step 2: Create a stale directory at a second worktree path
+        let worktree_stale = temp_dir.path().join("worktrees").join("stale-wt-2");
+        std::fs::create_dir_all(&worktree_stale).unwrap();
+
+        // Verify preconditions:
+        // - Stale directory exists but is not registered
+        assert!(worktree_stale.exists());
+        let worktrees = list_worktrees(temp_dir.path()).await.unwrap();
+        let is_registered = worktrees
+            .iter()
+            .any(|(path, _, _, _, _)| *path == worktree_stale.to_string_lossy());
+        assert!(
+            !is_registered,
+            "Stale worktree path should NOT be registered"
+        );
+        // - Branch is checked out in existing worktree
+        let is_checked = is_branch_checked_out(temp_dir.path(), "shared-branch")
+            .await
+            .unwrap();
+        assert!(
+            is_checked,
+            "Branch should be checked out in the first worktree"
+        );
+
+        // Step 3: Try to create a worktree with -b for the checked-out branch at the stale path.
+        // Should fail: stale-path prune succeeds, but branch is checked out elsewhere.
+        let result = worktree_add(
+            temp_dir.path(),
+            worktree_stale.to_str().unwrap(),
+            "shared-branch",
+            "HEAD",
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Expected failure because branch is checked out in another worktree"
+        );
+
+        // Verify the error contains classification info
+        if let Err(VcsError::Command { message, .. }) = &result {
+            assert!(
+                message.contains("classified as") || message.contains("checked out"),
+                "Expected classified error, got: {}",
+                message
+            );
+        }
+
+        // Cleanup
+        let _ = worktree_remove(temp_dir.path(), worktree_existing.to_str().unwrap()).await;
     }
 }
