@@ -665,6 +665,7 @@ impl ParallelRunService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openspec::ProposalMetadata;
     use tempfile::TempDir;
     use tokio::process::Command;
 
@@ -675,6 +676,7 @@ mod tests {
             total_tasks: 5,
             last_modified: "1m ago".to_string(),
             dependencies: dependencies.into_iter().map(String::from).collect(),
+            metadata: ProposalMetadata::default(),
         }
     }
 

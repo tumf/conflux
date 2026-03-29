@@ -4,7 +4,7 @@
 //! local `Change` type used by the TUI, so the same display logic can render
 //! both local and remote data without modification.
 
-use crate::openspec::Change;
+use crate::openspec::{Change, ProposalMetadata};
 
 use super::types::{RemoteChange, RemoteProject};
 
@@ -19,6 +19,7 @@ pub fn remote_change_to_local(remote: &RemoteChange) -> Change {
         total_tasks: remote.total_tasks,
         last_modified: remote.last_modified.clone(),
         dependencies: Vec::new(), // Dependencies are not available from remote API
+        metadata: ProposalMetadata::default(),
     }
 }
 

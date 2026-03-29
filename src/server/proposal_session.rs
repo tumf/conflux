@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::config::ProposalSessionConfig;
+use crate::openspec::ProposalMetadata;
 use crate::server::acp_client::{AcpClient, AcpError};
 use crate::vcs::git::commands as git;
 
@@ -50,6 +51,7 @@ pub struct ProposalSessionInfo {
 pub struct DetectedChange {
     pub id: String,
     pub title: Option<String>,
+    pub metadata: ProposalMetadata,
 }
 
 /// Internal state of a proposal session.
@@ -409,12 +411,14 @@ impl ProposalSessionManager {
                 .unwrap_or("unknown")
                 .to_string();
 
-            // Try to extract title from proposal.md
+            // Try to extract title and metadata from proposal.md
             let title = extract_proposal_title(&proposal_path);
+            let metadata = crate::openspec::parse_proposal_metadata_from_file(&proposal_path);
 
             detected.push(DetectedChange {
                 id: change_id,
                 title,
+                metadata,
             });
         }
 
@@ -572,6 +576,26 @@ mod tests {
     }
 
     #[test]
+    fn test_detected_change_metadata_serializes() {
+        let change = DetectedChange {
+            id: "add-auth".to_string(),
+            title: Some("Add authentication".to_string()),
+            metadata: ProposalMetadata {
+                change_type: Some("implementation".to_string()),
+                priority: Some(crate::openspec::ProposalPriority::High),
+                dependencies: vec!["base-change".to_string()],
+                references: vec!["src/demo.py".to_string()],
+                warnings: vec![],
+            },
+        };
+
+        let json = serde_json::to_value(&change).unwrap();
+        assert_eq!(json["metadata"]["priority"], "high");
+        assert_eq!(json["metadata"]["dependencies"][0], "base-change");
+        assert_eq!(json["metadata"]["references"][0], "src/demo.py");
+    }
+
+    #[test]
     fn test_extract_proposal_title_missing_file() {
         let title = extract_proposal_title(Path::new("/nonexistent/proposal.md"));
         assert!(title.is_none());
@@ -598,6 +622,7 @@ mod tests {
         let change = DetectedChange {
             id: "add-auth".to_string(),
             title: Some("Add authentication".to_string()),
+            metadata: ProposalMetadata::default(),
         };
         let json = serde_json::to_value(&change).unwrap();
         assert_eq!(json["id"], "add-auth");

@@ -1765,6 +1765,7 @@ fn render_qr_popup(frame: &mut Frame, app: &AppState, area: Rect) {
 mod tests {
     use super::*;
     use crate::openspec::Change;
+    use crate::openspec::ProposalMetadata;
     use crate::tui::events::LogEntry;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -1778,6 +1779,7 @@ mod tests {
             total_tasks: 3,
             last_modified: "now".to_string(),
             dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
         }
     }
 
@@ -2842,6 +2844,7 @@ mod tests {
             total_tasks: 5,
             last_modified: "2024-01-01".to_string(),
             dependencies: vec![],
+            metadata: ProposalMetadata::default(),
         }];
         let mut app = AppState::new(changes);
         app.parallel_mode = true;
@@ -2902,6 +2905,7 @@ mod tests {
             total_tasks: 5,
             last_modified: "2024-01-01".to_string(),
             dependencies: vec![],
+            metadata: ProposalMetadata::default(),
         }];
         let mut app = AppState::new(changes);
         app.parallel_mode = true;

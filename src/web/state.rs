@@ -905,6 +905,7 @@ impl Default for WebState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openspec::ProposalMetadata;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -913,6 +914,7 @@ mod tests {
             total_tasks: total,
             last_modified: "1m ago".to_string(),
             dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
         }
     }
 
@@ -1238,6 +1240,7 @@ mod tests {
             total_tasks: 0,
             last_modified: "now".to_string(),
             dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
         }];
         web_state.update(&updated).await;
 
@@ -1294,6 +1297,7 @@ mod tests {
                     total_tasks: 0,
                     last_modified: "now".to_string(),
                     dependencies: Vec::new(),
+                    metadata: ProposalMetadata::default(),
                 }],
                 committed_change_ids: HashSet::new(),
                 uncommitted_file_change_ids: HashSet::new(),

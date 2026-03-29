@@ -91,6 +91,7 @@ impl ProgressDisplay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openspec::ProposalMetadata;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -99,6 +100,7 @@ mod tests {
             total_tasks: total,
             last_modified: "now".to_string(),
             dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
         }
     }
 

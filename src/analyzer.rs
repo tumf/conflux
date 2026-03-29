@@ -5,10 +5,10 @@
 
 use crate::ai_command_runner::OutputLine as AiOutputLine;
 use crate::error::{OrchestratorError, Result};
-use crate::openspec::Change;
+use crate::openspec::{Change, ProposalFrontmatterMetadata};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// A group of changes that can be executed in parallel
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +39,27 @@ pub struct AnalysisResult {
 pub struct ParallelizationAnalyzer {
     ai_runner: crate::ai_command_runner::AiCommandRunner,
     config: crate::config::OrchestratorConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnalyzePromptMetadata {
+    priority: Option<String>,
+    references: Vec<String>,
+    warnings: Vec<String>,
+}
+
+impl AnalyzePromptMetadata {
+    fn from_frontmatter(metadata: &ProposalFrontmatterMetadata) -> Self {
+        Self {
+            priority: metadata.priority.clone(),
+            references: metadata.references.clone(),
+            warnings: metadata
+                .warnings
+                .iter()
+                .map(|warning| warning.message.clone())
+                .collect(),
+        }
+    }
 }
 
 impl ParallelizationAnalyzer {
@@ -319,9 +340,9 @@ impl ParallelizationAnalyzer {
     fn build_parallelization_prompt(&self, changes: &[Change], in_flight_ids: &[String]) -> String {
         let change_list: String = changes
             .iter()
-            .map(|c| format!("- {} (openspec/changes/{}/proposal.md)", c.id, c.id))
+            .map(|change| self.format_change_prompt_entry(change))
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n\n");
 
         let executing_section = if in_flight_ids.is_empty() {
             String::new()
@@ -351,10 +372,11 @@ Read the proposal files at the specified paths to understand their dependencies:
 
 Your task:
 1. Read each change's proposal.md at the given path to understand what it does
-2. Identify dependencies between these changes
-3. Consider currently executing changes as potential dependencies (but DO NOT include them in the order)
-4. Determine the recommended execution order (considering dependencies and priorities)
-5. Return execution order and dependencies
+2. Use proposal frontmatter `dependencies` as the dependency source when present; only fall back to the body `## Dependencies` section when frontmatter dependencies are absent
+3. Treat proposal frontmatter `priority` as a soft ordering hint for `order` only
+4. Treat proposal frontmatter `references` as supplemental analysis context only
+5. Consider currently executing changes as potential dependencies (but DO NOT include them in the order)
+6. Return execution order and dependencies
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -371,15 +393,78 @@ Rules:
   - DO NOT include currently executing changes in the order (they are already running)
 - `dependencies`: Object mapping change IDs to arrays of their REQUIRED dependency IDs
   - STRICT CRITERIA: Only include a dependency if one change REQUIRES the artifacts, specs, or APIs from another change to function
-  - DO NOT include dependencies based on priority, preferred order, or efficiency alone
+  - DO NOT include dependencies based on priority, references, preferred order, or efficiency alone
   - Example of REQUIRED dependency: "change-b implements a feature using the API defined in change-a"
   - Example of NOT a dependency: "change-a should ideally be done before change-b for efficiency"
   - Dependencies CAN reference currently executing changes if a queued change requires their output
+- Proposal metadata warnings are informational only; continue analysis using known metadata
 - Every change ID in the input list must appear exactly once in `order`
 - Dependencies are hard constraints: a change CANNOT start until all its dependencies are merged to base
 - Order preferences without required dependencies should be reflected in `order` only, not in `dependencies`
 - Return valid JSON only, no markdown, no explanation"#
         )
+    }
+
+    fn format_change_prompt_entry(&self, change: &Change) -> String {
+        let proposal_path = format!("openspec/changes/{}/proposal.md", change.id);
+        let metadata = self.read_prompt_metadata(change);
+
+        let mut lines = vec![format!("- {} ({})", change.id, proposal_path)];
+        lines.push(format!(
+            "  dependency_source: {}",
+            if change.dependencies.is_empty() {
+                "none"
+            } else {
+                "proposal metadata or body fallback"
+            }
+        ));
+        lines.push(format!(
+            "  dependencies_for_analysis: {}",
+            if change.dependencies.is_empty() {
+                "[]".to_string()
+            } else {
+                format!("[{}]", change.dependencies.join(", "))
+            }
+        ));
+
+        if let Some(metadata) = metadata {
+            if let Some(priority) = metadata.priority {
+                lines.push(format!("  priority_hint: {}", priority));
+            }
+            if !metadata.references.is_empty() {
+                lines.push(format!(
+                    "  references: [{}]",
+                    metadata.references.join(", ")
+                ));
+            }
+            if !metadata.warnings.is_empty() {
+                lines.push(format!(
+                    "  metadata_warnings: [{}]",
+                    metadata.warnings.join(" | ")
+                ));
+            }
+        }
+
+        lines.join("\n")
+    }
+
+    fn read_prompt_metadata(&self, change: &Change) -> Option<AnalyzePromptMetadata> {
+        let proposal = crate::openspec::read_proposal(&change.id);
+        let metadata = proposal.metadata?;
+
+        for warning_message in metadata
+            .warnings
+            .iter()
+            .map(|warning| warning.message.as_str())
+        {
+            warn!(
+                change_id = %change.id,
+                warning = warning_message,
+                "Continuing analyze with proposal frontmatter warning"
+            );
+        }
+
+        Some(AnalyzePromptMetadata::from_frontmatter(&metadata))
     }
 
     /// Parse LLM response into AnalysisResult
@@ -721,6 +806,7 @@ mod tests {
     use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
     use crate::command_queue::CommandQueueConfig;
     use crate::config::defaults::*;
+    use crate::openspec::ProposalMetadata;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -731,6 +817,7 @@ mod tests {
             total_tasks: 5,
             last_modified: "now".to_string(),
             dependencies: Vec::new(),
+            metadata: crate::openspec::ProposalMetadata::default(),
         }
     }
 
@@ -870,6 +957,53 @@ That's all."#;
     }
 
     #[test]
+    fn test_build_prompt_includes_frontmatter_metadata_context() {
+        let analyzer = create_test_analyzer();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let change_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("change-a");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("proposal.md"),
+            "---\npriority: high\ndependencies:\n  - base-change\nreferences:\n  - src/analyzer.rs\nowner: tumf\n---\n# Change: Sample\n\n## Dependencies\n\n- legacy-dep\n",
+        )
+        .unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let metadata =
+            crate::openspec::parse_proposal_metadata_from_file(&change_dir.join("proposal.md"));
+        let changes = vec![Change {
+            id: "change-a".to_string(),
+            completed_tasks: 0,
+            total_tasks: 5,
+            last_modified: "now".to_string(),
+            dependencies: metadata.dependencies.clone(),
+            metadata,
+        }];
+
+        let prompt = analyzer.build_parallelization_prompt(&changes, &[]);
+
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert!(prompt.contains("priority_hint: high"));
+        assert!(prompt.contains("dependencies_for_analysis: [base-change]"));
+        assert!(prompt.contains("references: [src/analyzer.rs]"));
+        assert!(prompt.contains("metadata_warnings: [Unknown proposal frontmatter key: owner]"));
+        assert!(prompt.contains(
+            "Use proposal frontmatter `dependencies` as the dependency source when present"
+        ));
+        assert!(prompt.contains("Treat proposal frontmatter `priority` as a soft ordering hint"));
+        assert!(prompt.contains(
+            "Treat proposal frontmatter `references` as supplemental analysis context only"
+        ));
+    }
+
+    #[test]
     fn test_build_prompt_with_selected_markers() {
         let analyzer = create_test_analyzer();
 
@@ -880,6 +1014,7 @@ That's all."#;
                 total_tasks: 5,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
             Change {
                 id: "unselected-b".to_string(),
@@ -887,6 +1022,7 @@ That's all."#;
                 total_tasks: 5,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
             Change {
                 id: "selected-c".to_string(),
@@ -894,6 +1030,7 @@ That's all."#;
                 total_tasks: 5,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
         ];
 
@@ -919,6 +1056,7 @@ That's all."#;
                 total_tasks: 5,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
             Change {
                 id: "change-2".to_string(),
@@ -926,6 +1064,7 @@ That's all."#;
                 total_tasks: 5,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
         ];
 
@@ -946,6 +1085,7 @@ That's all."#;
             total_tasks: 5,
             last_modified: "now".to_string(),
             dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
         }];
 
         let prompt = analyzer.build_parallelization_prompt(&changes, &[]);
@@ -1043,6 +1183,7 @@ That's all."#;
                 total_tasks: 5,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
             Change {
                 id: "queued-b".to_string(),
@@ -1050,6 +1191,7 @@ That's all."#;
                 total_tasks: 5,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
         ];
 
@@ -1124,6 +1266,7 @@ That's all."#;
             total_tasks: 5,
             last_modified: "now".to_string(),
             dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
         }];
 
         let in_flight_ids: Vec<String> = vec![];
