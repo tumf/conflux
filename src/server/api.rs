@@ -1666,9 +1666,7 @@ pub static CONTROL_CALLS: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<(String, 
 ///
 /// For each project, collects changes that are currently selected and spawns a runner
 /// with those change IDs. Error changes are excluded until they are explicitly re-marked.
-///
 /// Projects with no changes are skipped.
-
 pub async fn global_control_run(State(state): State<AppState>) -> Response {
     // Record the call for test verification
     if let Some(calls) = CONTROL_CALLS.get() {
