@@ -14,5 +14,3 @@
 ## Future Work
 
 - Remove `src/server/acp_client.rs` after the frontend/state refactor is complete
-
-
