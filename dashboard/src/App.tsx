@@ -14,6 +14,7 @@ import { CreateWorktreeDialog } from './components/CreateWorktreeDialog';
 import { ProposalChat } from './components/ProposalChat';
 import { ProposalSessionTabs } from './components/ProposalSessionTabs';
 import { CloseSessionDialog } from './components/CloseSessionDialog';
+import { OverviewDashboard } from './components/OverviewDashboard';
 import { useAppStore } from './store/useAppStore';
 import { useWebSocket } from './hooks/useWebSocket';
 import {
@@ -395,29 +396,33 @@ function App() {
                 )}
               </div>
             ) : (
-              <span className="text-sm text-[#52525b]">Select a project</span>
+              <span className="text-sm text-[#52525b]">Orchestration overview</span>
             )}
           </div>
 
-          {/* Proposal session tabs */}
-          {currentProjectSessions.length > 0 && (
-            <ProposalSessionTabs
-              sessions={currentProjectSessions}
-              activeSessionId={store.state.activeProposalSessionId}
-              onSelectSession={store.setActiveProposalSession}
-              onCreateSession={handleCreateProposalSession}
-              onCloseSession={(sid) => {
-                const s = currentProjectSessions.find((x) => x.id === sid);
-                if (s?.is_dirty) {
-                  setCloseSessionTarget(sid);
-                } else {
-                  handleForceCloseSession(sid);
-                }
-              }}
-            />
+          {selectedProject && (
+            <>
+              {/* Proposal session tabs */}
+              {currentProjectSessions.length > 0 && (
+                <ProposalSessionTabs
+                  sessions={currentProjectSessions}
+                  activeSessionId={store.state.activeProposalSessionId}
+                  onSelectSession={store.setActiveProposalSession}
+                  onCreateSession={handleCreateProposalSession}
+                  onCloseSession={(sid) => {
+                    const s = currentProjectSessions.find((x) => x.id === sid);
+                    if (s?.is_dirty) {
+                      setCloseSessionTarget(sid);
+                    } else {
+                      handleForceCloseSession(sid);
+                    }
+                  }}
+                />
+              )}
+            </>
           )}
 
-          {/* Show ProposalChat when a session is active, otherwise show normal panels */}
+          {/* Show ProposalChat when a session is active, otherwise show overview/normal panels */}
           {activeProposalSession && store.state.selectedProjectId ? (
             <ProposalChat
               projectId={store.state.selectedProjectId}
@@ -433,11 +438,11 @@ function App() {
               onStreamingChunk={store.appendStreamingChunk}
               onToolCallStart={store.updateToolCall}
               onToolCallUpdate={store.updateToolCallStatus}
-                onElicitation={store.setElicitation}
-                onClickChange={handleClickChange}
-                isLoading={isLoading}
-              />
-          ) : (
+              onElicitation={store.setElicitation}
+              onClickChange={handleClickChange}
+              isLoading={isLoading}
+            />
+          ) : selectedProject ? (
             <div className="flex flex-1 overflow-hidden">
               <div className="flex w-72 shrink-0 flex-col border-r border-[#27272a]">
                 {/* Tab switcher for Changes/Worktrees */}
@@ -531,6 +536,8 @@ function App() {
                 )}
               </div>
             </div>
+          ) : (
+            <OverviewDashboard />
           )}
         </main>
 
@@ -555,56 +562,62 @@ function App() {
           </div>
 
           <div className="flex-1 overflow-hidden">
-            {activeTab === 'projects' && (
-              <div className="flex h-full flex-col">
-                <div className="flex items-center justify-between border-b border-[#27272a] px-3 py-2">
-                  <span className="text-xs font-medium text-[#52525b] uppercase tracking-wider">Projects</span>
-                  <button
-                    onClick={() => setIsAddProjectOpen(true)}
-                    className="rounded p-0.5 text-[#52525b] transition-colors hover:text-[#6366f1]"
-                    aria-label="Add project"
-                  >
-                    <Plus className="size-4" />
-                  </button>
-                </div>
-                <div className="flex-1 overflow-y-auto">
-                  <ProjectsPanel {...panelProps} />
-                </div>
-              </div>
-            )}
-            {activeTab === 'changes' && (
-              <ChangesPanel
-                projects={store.state.projects}
-                selectedProjectId={store.state.selectedProjectId}
-                onClickChange={handleClickChange}
-                selectedChangeId={store.state.fileBrowseContext?.type === 'change' ? store.state.fileBrowseContext.changeId : null}
-              />
-            )}
-            {activeTab === 'worktrees' && (
-              <WorktreesPanel
-                worktrees={selectedProjectWorktrees}
-                selectedProjectId={store.state.selectedProjectId}
-                onMerge={handleMergeWorktree}
-                onDelete={handleDeleteWorktreeClick}
-                onCreate={() => setIsCreateWorktreeOpen(true)}
-                onRefresh={handleRefreshWorktrees}
-                onClickWorktree={handleClickWorktree}
-                selectedWorktreeBranch={store.state.fileBrowseContext?.type === 'worktree' ? store.state.fileBrowseContext.worktreeBranch : null}
-                isLoading={isLoading}
-                activeCommands={selectedProjectActiveCommands}
-              />
-            )}
-            {activeTab === 'logs' && (
-              <LogsPanel
-                logs={selectedProjectLogs}
-                selectedProjectId={store.state.selectedProjectId}
-              />
-            )}
-            {activeTab === 'files' && (
-              <FileViewPanel
-                projectId={store.state.selectedProjectId}
-                context={store.state.fileBrowseContext}
-              />
+            {!selectedProject ? (
+              <OverviewDashboard />
+            ) : (
+              <>
+                {activeTab === 'projects' && (
+                  <div className="flex h-full flex-col">
+                    <div className="flex items-center justify-between border-b border-[#27272a] px-3 py-2">
+                      <span className="text-xs font-medium text-[#52525b] uppercase tracking-wider">Projects</span>
+                      <button
+                        onClick={() => setIsAddProjectOpen(true)}
+                        className="rounded p-0.5 text-[#52525b] transition-colors hover:text-[#6366f1]"
+                        aria-label="Add project"
+                      >
+                        <Plus className="size-4" />
+                      </button>
+                    </div>
+                    <div className="flex-1 overflow-y-auto">
+                      <ProjectsPanel {...panelProps} />
+                    </div>
+                  </div>
+                )}
+                {activeTab === 'changes' && (
+                  <ChangesPanel
+                    projects={store.state.projects}
+                    selectedProjectId={store.state.selectedProjectId}
+                    onClickChange={handleClickChange}
+                    selectedChangeId={store.state.fileBrowseContext?.type === 'change' ? store.state.fileBrowseContext.changeId : null}
+                  />
+                )}
+                {activeTab === 'worktrees' && (
+                  <WorktreesPanel
+                    worktrees={selectedProjectWorktrees}
+                    selectedProjectId={store.state.selectedProjectId}
+                    onMerge={handleMergeWorktree}
+                    onDelete={handleDeleteWorktreeClick}
+                    onCreate={() => setIsCreateWorktreeOpen(true)}
+                    onRefresh={handleRefreshWorktrees}
+                    onClickWorktree={handleClickWorktree}
+                    selectedWorktreeBranch={store.state.fileBrowseContext?.type === 'worktree' ? store.state.fileBrowseContext.worktreeBranch : null}
+                    isLoading={isLoading}
+                    activeCommands={selectedProjectActiveCommands}
+                  />
+                )}
+                {activeTab === 'logs' && (
+                  <LogsPanel
+                    logs={selectedProjectLogs}
+                    selectedProjectId={store.state.selectedProjectId}
+                  />
+                )}
+                {activeTab === 'files' && (
+                  <FileViewPanel
+                    projectId={store.state.selectedProjectId}
+                    context={store.state.fileBrowseContext}
+                  />
+                )}
+              </>
             )}
           </div>
         </div>
