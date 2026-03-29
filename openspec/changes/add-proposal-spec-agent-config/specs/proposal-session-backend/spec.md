@@ -2,23 +2,17 @@
 
 ### Requirement: proposal-session-config
 
-The system shall support a `proposal_session` configuration section with fields for ACP command, arguments, environment variables, OpenCode config file path, and session inactivity timeout.
+The system shall support a `proposal_session` configuration section with fields for ACP command, arguments, environment variables, and session inactivity timeout. The `transport_env` field allows arbitrary environment variable overrides for the ACP subprocess.
 
 #### Scenario: default-config-values
 
 **Given**: No `proposal_session` section in `.cflx.jsonc`
 **When**: The server starts
-**Then**: Default values are used: `acp_command = "opencode"`, `acp_args = ["acp"]`, `acp_env = {}`, `opencode_config_path = null`, `session_inactivity_timeout_secs = 1800`
+**Then**: Default values are used: `acp_command = "opencode"`, `acp_args = ["acp"]`, `acp_env = {}`, `session_inactivity_timeout_secs = 1800`
 
-#### Scenario: custom-opencode-config-path
+#### Scenario: default-spec-agent-config-auto-injected
 
-**Given**: `.cflx.jsonc` contains `"proposal_session": { "opencode_config_path": "/path/to/custom-opencode.jsonc" }`
-**When**: A proposal session is created
-**Then**: The ACP subprocess is started with `OPENCODE_CONFIG=/path/to/custom-opencode.jsonc` in its environment
-
-#### Scenario: default-spec-agent-config-auto-generated
-
-**Given**: No `opencode_config_path` is set and no `OPENCODE_CONFIG` is present in `transport_env`
+**Given**: No `OPENCODE_CONFIG` key is present in `transport_env`
 **When**: A proposal session is created
 **Then**: A default `opencode-proposal.jsonc` file containing `{ "mode": "spec" }` is auto-generated in the server data directory, and `OPENCODE_CONFIG` is set to that file path in the ACP subprocess environment
 

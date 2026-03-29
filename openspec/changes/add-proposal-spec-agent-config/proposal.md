@@ -6,11 +6,9 @@ references:
   - src/server/proposal_session.rs
   - src/server/acp_client.rs
   - src/config/types.rs
-  - src/config/defaults.rs
-  - openspec/specs/proposal-session-backend/spec.md
 ---
 
-# Change: Use spec agent for proposal chat via OPENCODE_CONFIG
+# Change: Use spec agent for proposal chat via default OPENCODE_CONFIG
 
 **Change Type**: implementation
 
@@ -18,41 +16,47 @@ references:
 
 Proposal chat currently starts ACP with the default OpenCode agent (typically `build`). The intended behavior is to use the **spec agent** — a specification-focused agent that guides users through requirement refinement without making code changes.
 
-OpenCode's ACP CLI has no `--agent` flag, but supports `OPENCODE_CONFIG` environment variable to load a custom config file. By providing a Conflux-managed config that sets the spec agent as primary, proposal chat sessions will use the correct agent without modifying the user's global/project OpenCode configuration.
+OpenCode supports `OPENCODE_CONFIG` environment variable to load a custom config file. The existing `transport_env` field in `ProposalSessionConfig` already allows arbitrary environment variables to be passed to the ACP subprocess. No new config field is needed.
 
 ## Proposed Solution
 
-1. Ship a bundled `opencode-proposal.jsonc` config file that defines the spec agent as the default for proposal sessions.
-2. On proposal session creation, automatically set `OPENCODE_CONFIG=<path-to-opencode-proposal.jsonc>` in the ACP subprocess environment via the existing `transport_env` mechanism.
-3. Make the config file path configurable (with a sensible default) so users can override the agent behavior if needed.
+1. Ship a bundled `opencode-proposal.jsonc` that sets `"mode": "spec"`.
+2. On proposal session creation, if `transport_env` does not already contain `OPENCODE_CONFIG`, auto-generate the default config file in the server data directory and inject `OPENCODE_CONFIG=<path>` into the ACP subprocess environment.
+3. If the user explicitly sets `OPENCODE_CONFIG` in `transport_env` via `.cflx.jsonc`, that value takes precedence — no auto-generation occurs.
 
-### Config file contents (minimal)
+### Default config file contents
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  // Use spec agent as primary for proposal sessions
   "mode": "spec"
 }
 ```
 
-### Configuration
+### User override via existing transport_env
 
-Add a new optional field `opencode_config_path` to `ProposalSessionConfig`:
-- Default: `<data_dir>/opencode-proposal.jsonc` (auto-generated on first use)
-- If set to an explicit path, use that path
-- The value is passed as `OPENCODE_CONFIG` env var to ACP subprocess
+```jsonc
+{
+  "proposal_session": {
+    "transport_env": {
+      "OPENCODE_CONFIG": "/path/to/my/custom-opencode.jsonc"
+    }
+  }
+}
+```
+
+No new config fields are introduced. The existing `transport_env` mechanism is sufficient.
 
 ## Acceptance Criteria
 
-- Proposal sessions start ACP with `OPENCODE_CONFIG` pointing to the spec agent config.
-- The spec agent handles proposal chat by default (verified via ACP initialize response or agent behavior).
-- Config file path is configurable via `proposal_session.opencode_config_path` in `.cflx.jsonc`.
-- A default `opencode-proposal.jsonc` is auto-generated if not present.
-- Existing `transport_env` overrides still work (explicit `OPENCODE_CONFIG` in `transport_env` takes precedence).
+- Proposal sessions start ACP with `OPENCODE_CONFIG` pointing to a spec agent config by default.
+- A default `opencode-proposal.jsonc` is auto-generated in the server data directory if not already present.
+- If `transport_env` already contains `OPENCODE_CONFIG`, no auto-generation or override occurs.
+- Existing `transport_env` behavior for other environment variables is unaffected.
 
 ## Out of Scope
 
 - Modifying OpenCode's ACP protocol to support `--agent` flag
-- Changing the spec agent's system prompt content (managed in OpenCode config)
+- Changing the spec agent's system prompt content
 - Dashboard UI changes
+- Adding new config fields to `ProposalSessionConfig`

@@ -1,10 +1,8 @@
 ## Implementation Tasks
 
-- [ ] Add `opencode_config_path: Option<String>` field to `ProposalSessionConfig` in `src/config/types.rs` with serde default of `None` (verification: `cargo build`)
-- [ ] In `src/server/proposal_session.rs::create_session`, inject `OPENCODE_CONFIG` into the ACP subprocess environment: if `opencode_config_path` is set use that path, otherwise auto-generate a default `opencode-proposal.jsonc` in the server data dir; skip injection if `transport_env` already contains `OPENCODE_CONFIG` (verification: `cargo test` passes, and a unit test confirms the env var is set)
-- [ ] Create the default `opencode-proposal.jsonc` content as a const or embedded resource with `{ "$schema": "https://opencode.ai/config.json", "mode": "spec" }` and write it to disk on first use (verification: `cargo test` unit test confirms file creation and correct content)
-- [ ] Add config test in `src/config/mod.rs` verifying `opencode_config_path` deserialization from `.cflx.jsonc` (verification: `cargo test config::`)
-- [ ] Update `tests/e2e_proposal_session.rs` to verify the ACP subprocess receives `OPENCODE_CONFIG` in its environment (verification: `cargo test --test e2e_proposal_session`)
+- [ ] In `src/server/proposal_session.rs::create_session`, after building the ACP config, check if `transport_env` contains `OPENCODE_CONFIG`; if not, auto-generate `opencode-proposal.jsonc` in the server data dir and insert `OPENCODE_CONFIG=<path>` into the env map before spawning ACP (verification: `cargo test` passes, unit test confirms the env var is set when not explicitly configured)
+- [ ] Implement the auto-generation helper: write `{ "$schema": "https://opencode.ai/config.json", "mode": "spec" }` to `<data_dir>/opencode-proposal.jsonc` if the file does not exist; return the path (verification: unit test confirms file creation and idempotency)
+- [ ] Update `tests/e2e_proposal_session.rs` to verify the ACP subprocess receives `OPENCODE_CONFIG` in its environment when `transport_env` does not override it (verification: `cargo test --test e2e_proposal_session`)
 - [ ] Run full verification (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`) and fix any regressions (verification: all three exit 0)
 
 ## Future Work
