@@ -14,3 +14,19 @@
 ## Future Work
 
 - Remove `src/server/acp_client.rs` after the frontend/state refactor is complete
+
+## Implementation Blocker #1
+- category: spec_contradiction
+- summary: 前提条件である `OpencodeServer` 実装がリポジトリに存在せず、本変更単体では OpenCode transport 置換タスクを開始できない
+- evidence:
+  - `openspec/changes/switch-proposal-session-transport/proposal.md:7` に「Once `OpencodeServer` exists」と前提が明記されている
+  - `openspec/changes/switch-proposal-session-transport/tasks.md:3-7` が `OpencodeServer::spawn/create_session/send_prompt_async/abort_session/list_messages` の既存実装を前提としている
+  - `src/server/mod.rs:11-17` に `opencode_client` モジュールが存在せず `acp_client` のみ公開されている
+  - `src/server/proposal_session.rs:18,66-67,171-185` が `AcpClient` と ACP session ID にハード依存している
+  - `src/server/api.rs:3216-3477` が `crate::server::acp_client::*` 型と `session/update` 通知に直接依存している
+- impact: `ProposalSession`/`api.rs` を OpenCode transport へ差し替える実装タスク（Implementation Tasks 1-8）を、仕様どおりの依存順で完了できない
+- unblock_actions:
+  - `add-opencode-server-client` 相当の `src/server/opencode_client.rs`（spawn/health/create_session/send_prompt_async/list_messages/abort_session/subscribe_events/kill）を先に実装・統合する
+  - `ProposalSessionConfig` を ACP 命名から transport 非依存命名へ更新し、サーバ設定とテスト fixture を OpenCode 側に合わせる
+- owner: backend-maintainer
+- decision_due: 2026-03-31
