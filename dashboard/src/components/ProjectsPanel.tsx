@@ -5,7 +5,7 @@ import { ProjectCard } from './ProjectCard';
 interface ProjectsPanelProps {
   projects: RemoteProject[];
   selectedProjectId: string | null;
-  onSelectProject: (projectId: string) => void;
+  onSelectProject: (projectId: string | null) => void;
   onGitSync: (projectId: string) => void;
   onDelete: (projectId: string) => void;
   isLoading: boolean;

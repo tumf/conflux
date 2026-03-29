@@ -9,20 +9,13 @@ interface LogsPanelProps {
 
 export function LogsPanel({ logs, selectedProjectId }: LogsPanelProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const regionLabel = selectedProjectId ? 'Project logs' : 'Orchestration logs';
 
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [logs]);
-
-  if (!selectedProjectId) {
-    return (
-      <div className="flex flex-1 items-center justify-center p-8">
-        <p className="text-sm text-[#52525b]">Select a project to view logs</p>
-      </div>
-    );
-  }
 
   if (logs.length === 0) {
     return (
@@ -37,16 +30,13 @@ export function LogsPanel({ logs, selectedProjectId }: LogsPanelProps) {
       ref={scrollRef}
       className="space-y-0.5 overflow-y-auto p-3"
       role="region"
-      aria-label="Project logs"
+      aria-label={regionLabel}
     >
       {logs.map((log, idx) => (
         <LogEntry
           key={`${log.timestamp}-${idx}`}
-          entry={{
-            timestamp: log.timestamp,
-            level: log.level,
-            message: log.message,
-          }}
+          entry={log}
+          showProjectLabel={!selectedProjectId}
         />
       ))}
     </div>

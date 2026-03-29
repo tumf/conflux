@@ -304,9 +304,12 @@ function App() {
   const selectedProject = store.state.projects.find(
     (p) => p.id === store.state.selectedProjectId,
   );
+  const allLogs = Object.values(store.state.logsByProjectId)
+    .flat()
+    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
   const selectedProjectLogs = store.state.selectedProjectId
     ? store.state.logsByProjectId[store.state.selectedProjectId] || []
-    : [];
+    : allLogs;
   const selectedProjectWorktrees = store.state.selectedProjectId
     ? store.state.worktreesByProjectId[store.state.selectedProjectId] || []
     : [];
