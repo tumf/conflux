@@ -32,3 +32,6 @@ TBD - created by archiving change pass-approved-changes-to-analyzer. Update Purp
 - **WHEN** Dynamic キューへの追加により依存分析が再実行される
 - **THEN** 分析プロンプトには実行中の変更一覧に A が含まれる
 - **AND** `dependencies` には B → A の必須依存が含まれる
+
+
+#
