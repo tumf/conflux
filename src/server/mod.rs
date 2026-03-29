@@ -8,10 +8,11 @@
 //! - This module deliberately does NOT reference or execute `~/.wt/setup`.
 //!   The server is directory-independent and uses only its configured data_dir.
 
+#[allow(dead_code)]
 pub mod acp_client;
 pub mod active_commands;
-pub mod opencode_client;
 pub mod api;
+pub mod opencode_client;
 pub mod proposal_session;
 pub mod registry;
 pub mod runner;

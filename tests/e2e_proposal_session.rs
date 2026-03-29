@@ -20,8 +20,8 @@ use conflux::server::registry::{create_shared_registry, OrchestrationStatus};
 use conflux::server::runner::create_shared_runners;
 use conflux::server::terminal::create_terminal_manager;
 
-fn create_mock_acp_path(repo_root: &Path) -> PathBuf {
-    repo_root.join("tests/fixtures/mock_acp_agent.py")
+fn create_mock_opencode_path(repo_root: &Path) -> PathBuf {
+    repo_root.join("tests/fixtures/mock_opencode_server.py")
 }
 
 fn proposal_worktree_path(base_dir: &Path, project_id: &str, session_id: &str) -> PathBuf {
@@ -100,7 +100,7 @@ fn make_state(temp_dir: &TempDir) -> AppState {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let proposal_config = ProposalSessionConfig {
         transport_command: "python3".to_string(),
-        transport_args: vec![create_mock_acp_path(&repo_root).display().to_string()],
+        transport_args: vec![create_mock_opencode_path(&repo_root).display().to_string()],
         session_inactivity_timeout_secs: 1,
         ..Default::default()
     };
@@ -204,25 +204,7 @@ async fn proposal_session_ws_accepts_frontend_message_aliases() {
 
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({"type": "prompt", "content": "trigger-elicitation"}).to_string(),
-        ))
-        .await
-        .unwrap();
-
-    let elicitation_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
-    let elicitation_json: Value = serde_json::from_str(&elicitation_message).unwrap();
-    assert_eq!(elicitation_json["type"], "elicitation");
-    let request_id = elicitation_json["request_id"].as_str().unwrap().to_string();
-
-    socket
-        .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({
-                "type": "elicitation_response",
-                "elicitation_id": request_id,
-                "action": "accept",
-                "data": {"answer": "approved"}
-            })
-            .to_string(),
+            serde_json::json!({"type": "prompt", "content": "alias-check"}).to_string(),
         ))
         .await
         .unwrap();
@@ -230,7 +212,7 @@ async fn proposal_session_ws_accepts_frontend_message_aliases() {
     let chunk_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let chunk_json: Value = serde_json::from_str(&chunk_message).unwrap();
     assert_eq!(chunk_json["type"], "agent_message_chunk");
-    assert_eq!(chunk_json["text"], "elicitation-accepted:approved");
+    assert_eq!(chunk_json["text"], "echo:alias-check");
 
     let turn_complete_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let turn_complete_json: Value = serde_json::from_str(&turn_complete_message).unwrap();

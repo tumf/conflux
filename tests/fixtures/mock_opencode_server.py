@@ -182,7 +182,13 @@ def main():
     port = int(args.port)
     httpd = ThreadingHTTPServer((args.hostname, port), Handler)
     actual_port = httpd.server_address[1]
-    print(f"listening on http://{args.hostname}:{actual_port}", flush=True)
+    import sys
+
+    print(
+        f"listening on http://{args.hostname}:{actual_port}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     try:
         httpd.serve_forever()

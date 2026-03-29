@@ -115,6 +115,7 @@ pub struct Session {
     pub title: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageWithParts {
     pub id: String,
@@ -188,9 +189,13 @@ pub struct MessagePartDelta {
 
 #[derive(Debug, Clone)]
 pub enum OpencodeEvent {
-    MessagePartUpdated(MessagePartUpdatedPayload),
+    MessagePartUpdated(Box<MessagePartUpdatedPayload>),
     SessionStatus(SessionStatusPayload),
-    Unknown { event_type: String, data: Value },
+    #[allow(dead_code)]
+    Unknown {
+        event_type: String,
+        data: Value,
+    },
 }
 
 pub struct OpencodeServer {
@@ -245,7 +250,12 @@ impl OpencodeServer {
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), stderr_lines.next_line()).await {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                stderr_lines.next_line(),
+            )
+            .await
+            {
                 Ok(Ok(Some(line))) => {
                     debug!(target: "opencode_stderr", "{}", line);
                     if let Some(url) = extract_listening_url(&line) {
@@ -261,7 +271,10 @@ impl OpencodeServer {
                     )));
                 }
                 Err(_) => {
-                    if let Some(status) = child.try_wait().map_err(|e| OpencodeError::Protocol(e.to_string()))? {
+                    if let Some(status) = child
+                        .try_wait()
+                        .map_err(|e| OpencodeError::Protocol(e.to_string()))?
+                    {
                         return Err(OpencodeError::Protocol(format!(
                             "OpenCode server exited before reporting listening URL: {}",
                             status
@@ -295,7 +308,9 @@ impl OpencodeServer {
             match self.health().await {
                 Ok(resp) if resp.healthy => return Ok(()),
                 Ok(_) => {}
-                Err(e) => debug!(error = %e, base_url = %self.base_url, "OpenCode health check not ready yet"),
+                Err(e) => {
+                    debug!(error = %e, base_url = %self.base_url, "OpenCode health check not ready yet")
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
@@ -348,7 +363,10 @@ impl OpencodeServer {
             "agent": agent,
         });
         self.client
-            .post(format!("{}/session/{}/prompt_async", self.base_url, session_id))
+            .post(format!(
+                "{}/session/{}/prompt_async",
+                self.base_url, session_id
+            ))
             .json(&body)
             .send()
             .await
@@ -358,6 +376,7 @@ impl OpencodeServer {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn list_messages(
         &self,
         session_id: &str,
@@ -438,7 +457,9 @@ impl OpencodeServer {
         if let Some(ref mut c) = *child {
             match c.kill().await {
                 Ok(()) => info!(base_url = %self.base_url, "OpenCode server killed"),
-                Err(e) => warn!(error = %e, base_url = %self.base_url, "Failed to kill OpenCode server"),
+                Err(e) => {
+                    warn!(error = %e, base_url = %self.base_url, "Failed to kill OpenCode server")
+                }
             }
         }
         *child = None;
@@ -464,27 +485,35 @@ fn parse_sse_frame(frame: &str) -> Result<OpencodeEvent, OpencodeError> {
         }
     }
 
-    let event_type = event_type.ok_or_else(|| OpencodeError::Protocol("SSE frame missing event type".to_string()))?;
+    let event_type = event_type
+        .ok_or_else(|| OpencodeError::Protocol("SSE frame missing event type".to_string()))?;
     let data = data_lines.join("\n");
     let json = if data.is_empty() {
         Value::Null
     } else {
-        serde_json::from_str::<Value>(&data)
-            .map_err(|e| OpencodeError::Protocol(format!("Failed to parse SSE JSON payload: {}", e)))?
+        serde_json::from_str::<Value>(&data).map_err(|e| {
+            OpencodeError::Protocol(format!("Failed to parse SSE JSON payload: {}", e))
+        })?
     };
 
     match event_type.as_str() {
-        "message.part.updated" => Ok(OpencodeEvent::MessagePartUpdated(
+        "message.part.updated" => Ok(OpencodeEvent::MessagePartUpdated(Box::new(
             serde_json::from_value::<MessagePartUpdatedPayload>(json).map_err(|e| {
-                OpencodeError::Protocol(format!("Failed to decode message.part.updated payload: {}", e))
+                OpencodeError::Protocol(format!(
+                    "Failed to decode message.part.updated payload: {}",
+                    e
+                ))
             })?,
-        )),
+        ))),
         "session.status" => Ok(OpencodeEvent::SessionStatus(
             serde_json::from_value::<SessionStatusPayload>(json).map_err(|e| {
                 OpencodeError::Protocol(format!("Failed to decode session.status payload: {}", e))
             })?,
         )),
-        _ => Ok(OpencodeEvent::Unknown { event_type, data: json }),
+        _ => Ok(OpencodeEvent::Unknown {
+            event_type,
+            data: json,
+        }),
     }
 }
 

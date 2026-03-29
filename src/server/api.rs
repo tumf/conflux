@@ -2991,9 +2991,12 @@ pub enum ProposalWsClientMessage {
         text: String,
     },
     ElicitationResponse {
+        #[allow(dead_code)]
         #[serde(alias = "elicitation_id")]
         request_id: String,
+        #[allow(dead_code)]
         action: String,
+        #[allow(dead_code)]
         #[serde(default, alias = "data")]
         content: Option<serde_json::Value>,
     },
@@ -3018,6 +3021,7 @@ pub enum ProposalWsServerMessage {
         status: String,
         content: Vec<serde_json::Value>,
     },
+    #[allow(dead_code)]
     Elicitation {
         request_id: String,
         mode: String,
@@ -3369,7 +3373,9 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                                 .await;
                         }
                         Ok(ProposalWsClientMessage::Cancel) => {
-                            if let Err(e) = opencode_server.abort_session(&opencode_session_id).await {
+                            if let Err(e) =
+                                opencode_server.abort_session(&opencode_session_id).await
+                            {
                                 error!(error = %e, "Failed to abort OpenCode session");
                             }
                         }
@@ -3405,6 +3411,7 @@ fn opencode_event_to_ws_message(
 
     match event {
         OpencodeEvent::MessagePartUpdated(payload) => {
+            let payload = *payload;
             if let Some(session_id) = payload.session_id.as_deref() {
                 if session_id != expected_session_id {
                     return None;
@@ -3412,16 +3419,18 @@ fn opencode_event_to_ws_message(
             }
 
             let part = payload.part.or_else(|| {
-                payload.delta.map(|delta| crate::server::opencode_client::MessagePart {
-                    id: None,
-                    part_type: delta.part_type.unwrap_or_default(),
-                    text: delta.text,
-                    tool_call_id: delta.tool_call_id,
-                    title: delta.title,
-                    kind: delta.kind,
-                    status: delta.status,
-                    content: delta.content,
-                })
+                payload
+                    .delta
+                    .map(|delta| crate::server::opencode_client::MessagePart {
+                        id: None,
+                        part_type: delta.part_type.unwrap_or_default(),
+                        text: delta.text,
+                        tool_call_id: delta.tool_call_id,
+                        title: delta.title,
+                        kind: delta.kind,
+                        status: delta.status,
+                        content: delta.content,
+                    })
             })?;
 
             match part.part_type.as_str() {
