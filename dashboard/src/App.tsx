@@ -429,14 +429,18 @@ function App() {
               onBack={handleBackFromProposal}
               onMerge={handleMergeProposalSession}
               onClose={handleCloseProposalSession}
+              onHydrateMessages={store.hydrateChatMessages}
               onAppendMessage={store.appendChatMessage}
+              onStartAssistantTurn={store.startAssistantTurn}
               onStreamingChunk={store.appendStreamingChunk}
+              onCompleteAssistantTurn={store.completeAssistantTurn}
+              onFailAssistantTurn={store.failAssistantTurn}
               onToolCallStart={store.updateToolCall}
               onToolCallUpdate={store.updateToolCallStatus}
-                onElicitation={store.setElicitation}
-                onClickChange={handleClickChange}
-                isLoading={isLoading}
-              />
+              onElicitation={store.setElicitation}
+              onClickChange={handleClickChange}
+              isLoading={isLoading}
+            />
           ) : (
             <div className="flex flex-1 overflow-hidden">
               <div className="flex w-72 shrink-0 flex-col border-r border-[#27272a]">

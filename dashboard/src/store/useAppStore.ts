@@ -19,6 +19,14 @@ import {
 } from '../api/types';
 import { ConnectionStatus } from '../api/wsClient';
 
+export interface ActiveAssistantTurn {
+  messageId: string;
+  turnId?: string;
+  content: string;
+  toolCalls: ToolCallInfo[];
+  startedAt: string;
+}
+
 export interface AppState {
   projects: RemoteProject[];
   selectedProjectId: string | null;
@@ -37,6 +45,8 @@ export interface AppState {
   activeProposalSessionId: string | null;
   /** Chat messages indexed by session ID */
   chatMessagesBySessionId: Record<string, ProposalChatMessage[]>;
+  /** Per-session assistant turn that is currently streaming */
+  activeTurnBySessionId: Record<string, ActiveAssistantTurn | undefined>;
   /** Active elicitation request (only one at a time) */
   activeElicitation: ElicitationRequest | null;
   /** Whether the agent is currently responding */
@@ -60,10 +70,14 @@ export type AppAction =
   | { type: 'UPDATE_PROPOSAL_SESSION'; payload: ProposalSession }
   | { type: 'REMOVE_PROPOSAL_SESSION'; payload: { projectId: string; sessionId: string } }
   | { type: 'SET_ACTIVE_PROPOSAL_SESSION'; payload: string | null }
+  | { type: 'HYDRATE_CHAT_MESSAGES'; payload: { sessionId: string; messages: ProposalChatMessage[] } }
   | { type: 'APPEND_CHAT_MESSAGE'; payload: { sessionId: string; message: ProposalChatMessage } }
-  | { type: 'APPEND_STREAMING_CHUNK'; payload: { messageId: string; content: string } }
-  | { type: 'UPDATE_TOOL_CALL'; payload: { sessionId: string; messageId: string; toolCall: ToolCallInfo } }
-  | { type: 'UPDATE_TOOL_CALL_STATUS'; payload: { sessionId: string; messageId: string; toolCallId: string; status: ToolCallStatus } }
+  | { type: 'START_ASSISTANT_TURN'; payload: { sessionId: string; messageId: string; turnId?: string } }
+  | { type: 'APPEND_STREAMING_CHUNK'; payload: { sessionId: string; messageId: string; content: string; turnId?: string } }
+  | { type: 'COMPLETE_ASSISTANT_TURN'; payload: { sessionId: string; stopReason?: string } }
+  | { type: 'FAIL_ASSISTANT_TURN'; payload: { sessionId: string; error: string } }
+  | { type: 'UPDATE_TOOL_CALL'; payload: { sessionId: string; messageId: string; turnId?: string; toolCall: ToolCallInfo } }
+  | { type: 'UPDATE_TOOL_CALL_STATUS'; payload: { sessionId: string; messageId: string; turnId?: string; toolCallId: string; status: ToolCallStatus } }
   | { type: 'SET_ELICITATION'; payload: ElicitationRequest | null }
   | { type: 'SET_AGENT_RESPONDING'; payload: boolean };
 
@@ -79,6 +93,7 @@ const initialState: AppState = {
   proposalSessionsByProjectId: {},
   activeProposalSessionId: null,
   chatMessagesBySessionId: {},
+  activeTurnBySessionId: {},
   activeElicitation: null,
   isAgentResponding: false,
   streamingContent: {},
@@ -231,13 +246,25 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       };
     }
 
+    case 'HYDRATE_CHAT_MESSAGES': {
+      const { sessionId, messages } = action.payload;
+      return {
+        ...state,
+        chatMessagesBySessionId: {
+          ...state.chatMessagesBySessionId,
+          [sessionId]: messages,
+        },
+      };
+    }
+
     case 'APPEND_CHAT_MESSAGE': {
       const { sessionId, message } = action.payload;
       const msgs = state.chatMessagesBySessionId[sessionId] || [];
       const existingIndex = msgs.findIndex((m) => m.id === message.id);
-      const nextMessages = existingIndex === -1
-        ? [...msgs, message]
-        : msgs.map((existing, index) => (index === existingIndex ? message : existing));
+      const nextMessages =
+        existingIndex === -1
+          ? [...msgs, message]
+          : msgs.map((existing, index) => (index === existingIndex ? message : existing));
       const nextStreamingContent = { ...state.streamingContent };
       if (message.role === 'assistant') {
         delete nextStreamingContent[message.id];
@@ -249,58 +276,177 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           [sessionId]: nextMessages,
         },
         streamingContent: nextStreamingContent,
-        isAgentResponding: message.role === 'user',
       };
     }
 
-    case 'APPEND_STREAMING_CHUNK': {
-      const { messageId, content } = action.payload;
-      const prev = state.streamingContent[messageId] || '';
+    case 'START_ASSISTANT_TURN': {
+      const { sessionId, messageId, turnId } = action.payload;
       return {
         ...state,
-        streamingContent: {
-          ...state.streamingContent,
-          [messageId]: prev + content,
+        activeTurnBySessionId: {
+          ...state.activeTurnBySessionId,
+          [sessionId]: {
+            messageId,
+            turnId,
+            content: '',
+            toolCalls: [],
+            startedAt: new Date().toISOString(),
+          },
         },
         isAgentResponding: true,
       };
     }
 
-    case 'UPDATE_TOOL_CALL': {
-      const { sessionId, messageId, toolCall } = action.payload;
+    case 'APPEND_STREAMING_CHUNK': {
+      const { sessionId, messageId, content, turnId } = action.payload;
+      const currentTurn = state.activeTurnBySessionId[sessionId];
+      const targetTurn =
+        currentTurn && currentTurn.messageId === messageId
+          ? currentTurn
+          : {
+              messageId,
+              turnId,
+              content: '',
+              toolCalls: [],
+              startedAt: new Date().toISOString(),
+            };
+      return {
+        ...state,
+        activeTurnBySessionId: {
+          ...state.activeTurnBySessionId,
+          [sessionId]: {
+            ...targetTurn,
+            turnId: targetTurn.turnId ?? turnId,
+            content: `${targetTurn.content}${content}`,
+          },
+        },
+        streamingContent: {
+          ...state.streamingContent,
+          [messageId]: `${state.streamingContent[messageId] || ''}${content}`,
+        },
+        isAgentResponding: true,
+      };
+    }
+
+    case 'COMPLETE_ASSISTANT_TURN': {
+      const { sessionId } = action.payload;
+      const activeTurn = state.activeTurnBySessionId[sessionId];
+      if (!activeTurn) {
+        return {
+          ...state,
+          isAgentResponding: false,
+        };
+      }
       const msgs = state.chatMessagesBySessionId[sessionId] || [];
-      const hasMessage = msgs.some((m) => m.id === messageId);
-      const nextMessages = hasMessage
-        ? msgs.map((m) => {
-            if (m.id !== messageId) return m;
-            const existing = m.tool_calls || [];
-            const existingIndex = existing.findIndex((tc) => tc.id === toolCall.id);
-            const nextToolCalls = existingIndex === -1
-              ? [...existing, toolCall]
-              : existing.map((tc, index) => (index === existingIndex ? toolCall : tc));
-            return { ...m, tool_calls: nextToolCalls };
-          })
-        : [
-            ...msgs,
-            {
-              id: messageId,
-              role: 'assistant' as const,
-              content: state.streamingContent[messageId] || '',
-              timestamp: new Date().toISOString(),
-              tool_calls: [toolCall],
-            },
-          ];
+      const assistantMessage: ProposalChatMessage = {
+        id: activeTurn.messageId,
+        role: 'assistant',
+        content: activeTurn.content,
+        timestamp: new Date().toISOString(),
+        turn_id: activeTurn.turnId,
+        tool_calls: activeTurn.toolCalls.length > 0 ? activeTurn.toolCalls : undefined,
+      };
+      const existingIndex = msgs.findIndex((m) => m.id === assistantMessage.id);
+      const nextMessages =
+        existingIndex === -1
+          ? [...msgs, assistantMessage]
+          : msgs.map((existing, index) => (index === existingIndex ? assistantMessage : existing));
+
+      const nextActiveTurns = { ...state.activeTurnBySessionId };
+      delete nextActiveTurns[sessionId];
+      const nextStreamingContent = { ...state.streamingContent };
+      delete nextStreamingContent[assistantMessage.id];
+
       return {
         ...state,
         chatMessagesBySessionId: {
           ...state.chatMessagesBySessionId,
           [sessionId]: nextMessages,
         },
+        activeTurnBySessionId: nextActiveTurns,
+        streamingContent: nextStreamingContent,
+        isAgentResponding: false,
+      };
+    }
+
+    case 'FAIL_ASSISTANT_TURN': {
+      const { sessionId } = action.payload;
+      const nextActiveTurns = { ...state.activeTurnBySessionId };
+      const failedTurn = nextActiveTurns[sessionId];
+      if (failedTurn) {
+        delete nextActiveTurns[sessionId];
+      }
+      const nextStreamingContent = { ...state.streamingContent };
+      if (failedTurn) {
+        delete nextStreamingContent[failedTurn.messageId];
+      }
+      return {
+        ...state,
+        activeTurnBySessionId: nextActiveTurns,
+        streamingContent: nextStreamingContent,
+        isAgentResponding: false,
+      };
+    }
+
+    case 'UPDATE_TOOL_CALL': {
+      const { sessionId, messageId, turnId, toolCall } = action.payload;
+      const activeTurn = state.activeTurnBySessionId[sessionId];
+      if (activeTurn && activeTurn.messageId === messageId && (!turnId || activeTurn.turnId === turnId)) {
+        const existingIndex = activeTurn.toolCalls.findIndex((tc) => tc.id === toolCall.id);
+        const nextToolCalls =
+          existingIndex === -1
+            ? [...activeTurn.toolCalls, toolCall]
+            : activeTurn.toolCalls.map((tc, index) => (index === existingIndex ? toolCall : tc));
+        return {
+          ...state,
+          activeTurnBySessionId: {
+            ...state.activeTurnBySessionId,
+            [sessionId]: {
+              ...activeTurn,
+              turnId: activeTurn.turnId ?? turnId,
+              toolCalls: nextToolCalls,
+            },
+          },
+        };
+      }
+
+      const msgs = state.chatMessagesBySessionId[sessionId] || [];
+      return {
+        ...state,
+        chatMessagesBySessionId: {
+          ...state.chatMessagesBySessionId,
+          [sessionId]: msgs.map((m) => {
+            if (m.id !== messageId) return m;
+            const existing = m.tool_calls || [];
+            const existingIndex = existing.findIndex((tc) => tc.id === toolCall.id);
+            const nextToolCalls =
+              existingIndex === -1
+                ? [...existing, toolCall]
+                : existing.map((tc, index) => (index === existingIndex ? toolCall : tc));
+            return { ...m, tool_calls: nextToolCalls };
+          }),
+        },
       };
     }
 
     case 'UPDATE_TOOL_CALL_STATUS': {
-      const { sessionId, messageId, toolCallId, status } = action.payload;
+      const { sessionId, messageId, turnId, toolCallId, status } = action.payload;
+      const activeTurn = state.activeTurnBySessionId[sessionId];
+      if (activeTurn && activeTurn.messageId === messageId && (!turnId || activeTurn.turnId === turnId)) {
+        return {
+          ...state,
+          activeTurnBySessionId: {
+            ...state.activeTurnBySessionId,
+            [sessionId]: {
+              ...activeTurn,
+              toolCalls: activeTurn.toolCalls.map((tc) =>
+                tc.id === toolCallId ? { ...tc, status } : tc,
+              ),
+            },
+          },
+        };
+      }
+
       const msgs = state.chatMessagesBySessionId[sessionId] || [];
       return {
         ...state,
@@ -389,20 +535,36 @@ export function useAppStore() {
     dispatch({ type: 'SET_ACTIVE_PROPOSAL_SESSION', payload: sessionId });
   }, []);
 
+  const hydrateChatMessages = useCallback((sessionId: string, messages: ProposalChatMessage[]) => {
+    dispatch({ type: 'HYDRATE_CHAT_MESSAGES', payload: { sessionId, messages } });
+  }, []);
+
   const appendChatMessage = useCallback((sessionId: string, message: ProposalChatMessage) => {
     dispatch({ type: 'APPEND_CHAT_MESSAGE', payload: { sessionId, message } });
   }, []);
 
-  const appendStreamingChunk = useCallback((messageId: string, content: string) => {
-    dispatch({ type: 'APPEND_STREAMING_CHUNK', payload: { messageId, content } });
+  const startAssistantTurn = useCallback((sessionId: string, messageId: string, turnId?: string) => {
+    dispatch({ type: 'START_ASSISTANT_TURN', payload: { sessionId, messageId, turnId } });
   }, []);
 
-  const updateToolCall = useCallback((sessionId: string, messageId: string, toolCall: ToolCallInfo) => {
-    dispatch({ type: 'UPDATE_TOOL_CALL', payload: { sessionId, messageId, toolCall } });
+  const appendStreamingChunk = useCallback((sessionId: string, messageId: string, content: string, turnId?: string) => {
+    dispatch({ type: 'APPEND_STREAMING_CHUNK', payload: { sessionId, messageId, content, turnId } });
   }, []);
 
-  const updateToolCallStatus = useCallback((sessionId: string, messageId: string, toolCallId: string, status: ToolCallStatus) => {
-    dispatch({ type: 'UPDATE_TOOL_CALL_STATUS', payload: { sessionId, messageId, toolCallId, status } });
+  const completeAssistantTurn = useCallback((sessionId: string, stopReason?: string) => {
+    dispatch({ type: 'COMPLETE_ASSISTANT_TURN', payload: { sessionId, stopReason } });
+  }, []);
+
+  const failAssistantTurn = useCallback((sessionId: string, error: string) => {
+    dispatch({ type: 'FAIL_ASSISTANT_TURN', payload: { sessionId, error } });
+  }, []);
+
+  const updateToolCall = useCallback((sessionId: string, messageId: string, toolCall: ToolCallInfo, turnId?: string) => {
+    dispatch({ type: 'UPDATE_TOOL_CALL', payload: { sessionId, messageId, turnId, toolCall } });
+  }, []);
+
+  const updateToolCallStatus = useCallback((sessionId: string, messageId: string, toolCallId: string, status: ToolCallStatus, turnId?: string) => {
+    dispatch({ type: 'UPDATE_TOOL_CALL_STATUS', payload: { sessionId, messageId, turnId, toolCallId, status } });
   }, []);
 
   const setElicitation = useCallback((elicitation: ElicitationRequest | null) => {
@@ -427,8 +589,12 @@ export function useAppStore() {
     updateProposalSession,
     removeProposalSession,
     setActiveProposalSession,
+    hydrateChatMessages,
     appendChatMessage,
+    startAssistantTurn,
     appendStreamingChunk,
+    completeAssistantTurn,
+    failAssistantTurn,
     updateToolCall,
     updateToolCallStatus,
     setElicitation,
