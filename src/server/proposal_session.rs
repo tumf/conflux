@@ -57,7 +57,30 @@ pub struct DetectedChange {
     pub metadata: ProposalMetadata,
 }
 
+/// Serialized proposal session chat message for dashboard history hydration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalSessionMessageRecord {
+    pub id: String,
+    pub role: String,
+    pub content: String,
+    pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hydrated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ProposalSessionToolCallRecord>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalSessionToolCallRecord {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+}
+
 /// Internal state of a proposal session.
+#[allow(dead_code)]
 pub struct ProposalSession {
     pub id: String,
     pub project_id: String,
@@ -68,6 +91,10 @@ pub struct ProposalSession {
     pub status: ProposalSessionStatus,
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
+    pub message_history: Vec<ProposalSessionMessageRecord>,
+    pub active_turn_id: Option<String>,
+    pub next_turn_seq: u64,
+    pub next_user_seq: u64,
 }
 
 impl ProposalSession {
@@ -190,6 +217,10 @@ impl ProposalSessionManager {
             status: ProposalSessionStatus::Active,
             created_at: now,
             last_activity: now,
+            message_history: Vec::new(),
+            active_turn_id: None,
+            next_turn_seq: 0,
+            next_user_seq: 0,
         };
 
         let info = session.to_info();
@@ -215,6 +246,180 @@ impl ProposalSessionManager {
     /// Get a mutable session by ID.
     pub fn get_session_mut(&mut self, session_id: &str) -> Option<&mut ProposalSession> {
         self.sessions.get_mut(session_id)
+    }
+
+    /// Return serialized chat messages for a proposal session.
+    #[allow(dead_code)]
+    pub fn list_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ProposalSessionMessageRecord>, ProposalSessionError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
+        Ok(session.message_history.clone())
+    }
+
+    /// Record an outgoing user prompt for history hydration.
+    #[allow(dead_code)]
+    pub fn record_user_prompt(
+        &mut self,
+        session_id: &str,
+        content: &str,
+    ) -> Result<(), ProposalSessionError> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
+        session.next_user_seq += 1;
+        let now = Utc::now().to_rfc3339();
+        session.message_history.push(ProposalSessionMessageRecord {
+            id: format!("{}-user-{}", session.id, session.next_user_seq),
+            role: "user".to_string(),
+            content: content.to_string(),
+            timestamp: now,
+            turn_id: None,
+            hydrated: Some(true),
+            tool_calls: None,
+        });
+        Ok(())
+    }
+
+    /// Append an assistant text chunk to the active turn in message history.
+    #[allow(dead_code)]
+    pub fn append_assistant_chunk(
+        &mut self,
+        session_id: &str,
+        chunk: &str,
+    ) -> Result<String, ProposalSessionError> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
+
+        let turn_id = if let Some(turn_id) = session.active_turn_id.clone() {
+            turn_id
+        } else {
+            session.next_turn_seq += 1;
+            let turn_id = format!("{}-turn-{}", session.id, session.next_turn_seq);
+            let now = Utc::now().to_rfc3339();
+            session.message_history.push(ProposalSessionMessageRecord {
+                id: format!("assistant-{}", turn_id),
+                role: "assistant".to_string(),
+                content: String::new(),
+                timestamp: now,
+                turn_id: Some(turn_id.clone()),
+                hydrated: Some(true),
+                tool_calls: None,
+            });
+            session.active_turn_id = Some(turn_id.clone());
+            turn_id
+        };
+
+        if let Some(message) = session
+            .message_history
+            .iter_mut()
+            .rev()
+            .find(|message| message.turn_id.as_deref() == Some(turn_id.as_str()))
+        {
+            message.content.push_str(chunk);
+        }
+
+        Ok(turn_id)
+    }
+
+    /// Record a tool call event into the currently active assistant turn.
+    #[allow(dead_code)]
+    pub fn record_tool_call(
+        &mut self,
+        session_id: &str,
+        tool_call_id: &str,
+        title: &str,
+        status: &str,
+    ) -> Result<(), ProposalSessionError> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
+
+        let turn_id = if let Some(turn_id) = session.active_turn_id.clone() {
+            turn_id
+        } else {
+            session.next_turn_seq += 1;
+            let turn_id = format!("{}-turn-{}", session.id, session.next_turn_seq);
+            let now = Utc::now().to_rfc3339();
+            session.message_history.push(ProposalSessionMessageRecord {
+                id: format!("assistant-{}", turn_id),
+                role: "assistant".to_string(),
+                content: String::new(),
+                timestamp: now,
+                turn_id: Some(turn_id.clone()),
+                hydrated: Some(true),
+                tool_calls: Some(Vec::new()),
+            });
+            session.active_turn_id = Some(turn_id.clone());
+            turn_id
+        };
+
+        if let Some(message) = session
+            .message_history
+            .iter_mut()
+            .rev()
+            .find(|message| message.turn_id.as_deref() == Some(turn_id.as_str()))
+        {
+            let tool_calls = message.tool_calls.get_or_insert_with(Vec::new);
+            if let Some(existing) = tool_calls.iter_mut().find(|call| call.id == tool_call_id) {
+                existing.status = status.to_string();
+                if !title.is_empty() {
+                    existing.title = title.to_string();
+                }
+            } else {
+                tool_calls.push(ProposalSessionToolCallRecord {
+                    id: tool_call_id.to_string(),
+                    title: title.to_string(),
+                    status: status.to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update a tool call status in message history.
+    #[allow(dead_code)]
+    pub fn update_tool_call_status(
+        &mut self,
+        session_id: &str,
+        tool_call_id: &str,
+        status: &str,
+    ) -> Result<(), ProposalSessionError> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
+
+        for message in session.message_history.iter_mut().rev() {
+            if let Some(tool_calls) = message.tool_calls.as_mut() {
+                if let Some(existing) = tool_calls.iter_mut().find(|call| call.id == tool_call_id) {
+                    existing.status = status.to_string();
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Mark the active assistant turn complete.
+    #[allow(dead_code)]
+    pub fn complete_active_turn(&mut self, session_id: &str) -> Result<(), ProposalSessionError> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
+        session.active_turn_id = None;
+        Ok(())
     }
 
     /// Check if a session's worktree has uncommitted changes.

@@ -84,8 +84,10 @@ pub struct ParallelExecutor {
     failed_tracker: FailedChangeTracker,
     /// Change-level dependencies (change_id -> dependency ids)
     change_dependencies: HashMap<String, Vec<String>>,
-    /// Changes waiting for merge resolution
-    merge_deferred_changes: HashSet<String>,
+    /// Changes waiting for auto-resumable resolve retry (ResolveWait)
+    resolve_wait_changes: HashSet<String>,
+    /// Changes waiting for manual user intervention before merge can continue (MergeWait)
+    merge_wait_changes: HashSet<String>,
     /// Changes that previously had unresolved dependencies (for worktree recreation tracking)
     #[allow(dead_code)]
     previously_blocked_changes: HashSet<String>,
