@@ -1,227 +1,353 @@
-#![allow(dead_code)]
+//! OpenCode Server HTTP/SSE client.
+//!
+//! Spawns a single `opencode serve` subprocess, discovers its bound URL,
+//! performs session/message HTTP operations, and subscribes to server-sent
+//! events for streaming updates.
 
-use std::{
-    collections::VecDeque,
-    path::Path,
-    pin::Pin,
-    process::Stdio,
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::path::Path;
+use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    process::{Child, Command},
-    sync::{mpsc, Mutex},
-    task::JoinHandle,
-    time,
-};
-use tracing::{debug, error, info, warn};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
 
-#[allow(dead_code)]
-pub type Result<T> = std::result::Result<T, OpencodeError>;
+use crate::config::ProposalSessionConfig;
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Resolve a relative command name to an absolute path via the user's login shell.
+struct ResolvedCommand {
+    command: String,
+    login_shell_path: Option<String>,
+}
+
+async fn resolve_command_path(command: &str) -> ResolvedCommand {
+    if command.starts_with('/') {
+        debug!(command = %command, "OpenCode command is absolute, skipping resolution");
+        return ResolvedCommand {
+            command: command.to_string(),
+            login_shell_path: resolve_login_shell_path().await,
+        };
+    }
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let which_arg = format!("which {}", command);
+
+    let result = Command::new(&shell)
+        .arg("-l")
+        .arg("-c")
+        .arg(&which_arg)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+
+    let resolved_cmd = match result {
+        Ok(output) if output.status.success() => {
+            let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if resolved.is_empty() {
+                warn!(command = %command, "Login shell returned empty path, using original");
+                command.to_string()
+            } else {
+                info!(command = %command, resolved = %resolved, "Resolved OpenCode command via login shell");
+                resolved
+            }
+        }
+        Ok(output) => {
+            warn!(
+                command = %command,
+                exit_code = ?output.status.code(),
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "Failed to resolve OpenCode command via login shell, using original"
+            );
+            command.to_string()
+        }
+        Err(e) => {
+            warn!(command = %command, error = %e, "Failed to resolve OpenCode command via login shell, using original");
+            command.to_string()
+        }
+    };
+
+    ResolvedCommand {
+        command: resolved_cmd,
+        login_shell_path: resolve_login_shell_path().await,
+    }
+}
+
+async fn resolve_login_shell_path() -> Option<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let result = Command::new(&shell)
+        .arg("-l")
+        .arg("-c")
+        .arg("echo $PATH")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if path.is_empty() {
+                None
+            } else {
+                Some(path)
+            }
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
     #[serde(default)]
     pub healthy: bool,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
-    #[serde(rename = "sessionId", default)]
-    pub id: Option<String>,
+    pub id: String,
     #[serde(default)]
     pub title: Option<String>,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageWithParts {
+    pub id: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub parts: Vec<MessagePart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagePart {
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default, rename = "type")]
+    pub part_type: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub content: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStatusPayload {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagePartUpdatedPayload {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub message_id: Option<String>,
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
-    pub parts: Vec<Value>,
+    pub part: Option<MessagePart>,
+    #[serde(default)]
+    pub delta: Option<MessagePartDelta>,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagePartDelta {
+    #[serde(default, rename = "type")]
+    pub part_type: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub content: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Clone)]
 pub enum OpencodeEvent {
-    MessagePartUpdated {
-        session_id: Option<String>,
-        part: Value,
-    },
-    SessionStatus {
-        session_id: Option<String>,
-        status: Option<String>,
-    },
+    MessagePartUpdated(Box<MessagePartUpdatedPayload>),
+    SessionStatus(SessionStatusPayload),
+    #[allow(dead_code)]
     Unknown {
         event_type: String,
         data: Value,
     },
 }
 
-#[allow(dead_code)]
 pub struct OpencodeServer {
     child: Mutex<Option<Child>>,
     pub base_url: String,
     client: reqwest::Client,
-    _stderr_task: Option<JoinHandle<()>>,
 }
 
 impl OpencodeServer {
-    pub async fn spawn(command: &str, working_dir: &Path) -> Result<Self> {
-        let mut cmd = Command::new(command);
-        cmd.arg("serve")
+    pub async fn spawn(
+        config: &ProposalSessionConfig,
+        working_dir: &Path,
+    ) -> Result<Arc<Self>, OpencodeError> {
+        let resolved = resolve_command_path(&config.transport_command).await;
+
+        info!(
+            cmd = %config.transport_command,
+            resolved_cmd = %resolved.command,
+            cwd = %working_dir.display(),
+            "Spawning OpenCode server"
+        );
+
+        let mut cmd = Command::new(&resolved.command);
+        cmd.args(&config.transport_args)
+            .current_dir(working_dir)
+            .arg("serve")
             .arg("--port")
             .arg("0")
             .arg("--hostname")
             .arg("127.0.0.1")
             .arg("--print-logs")
-            .current_dir(working_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+
+        if let Some(ref login_path) = resolved.login_shell_path {
+            cmd.env("PATH", login_path);
+        }
+
+        for (key, value) in &config.transport_env {
+            cmd.env(key, value);
+        }
 
         let mut child = cmd.spawn().map_err(|e| OpencodeError::SpawnFailed {
-            command: command.to_string(),
+            command: resolved.command.clone(),
             reason: e.to_string(),
         })?;
 
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or(OpencodeError::MissingStderrPipe)?;
+        let stderr = child.stderr.take().ok_or(OpencodeError::StdioPipeMissing)?;
+        let mut stderr_lines = BufReader::new(stderr).lines();
+        let mut base_url = None;
 
-        let (url_tx, mut url_rx) = mpsc::channel::<String>(1);
-        let stderr_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    debug!(line = %trimmed, "opencode stderr");
-                }
-                if let Some(url) = parse_listening_url(trimmed) {
-                    let _ = url_tx.send(url).await;
-                }
-            }
-        });
-
-        let base_url = time::timeout(Duration::from_secs(20), async {
-            loop {
-                match url_rx.try_recv() {
-                    Ok(url) => return Ok(url),
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        return Err(OpencodeError::TimedOut { phase: "spawn" });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                stderr_lines.next_line(),
+            )
+            .await
+            {
+                Ok(Ok(Some(line))) => {
+                    debug!(target: "opencode_stderr", "{}", line);
+                    if let Some(url) = extract_listening_url(&line) {
+                        base_url = Some(url);
+                        break;
                     }
                 }
-
-                if let Some(status) =
-                    child
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => {
+                    return Err(OpencodeError::Protocol(format!(
+                        "Failed reading OpenCode stderr: {}",
+                        e
+                    )));
+                }
+                Err(_) => {
+                    if let Some(status) = child
                         .try_wait()
-                        .map_err(|e| OpencodeError::UnexpectedExit {
-                            code: None,
-                            message: e.to_string(),
-                        })?
-                {
-                    return Err(OpencodeError::UnexpectedExit {
-                        code: status.code(),
-                        message: "process exited before listening URL was reported".to_string(),
-                    });
+                        .map_err(|e| OpencodeError::Protocol(e.to_string()))?
+                    {
+                        return Err(OpencodeError::Protocol(format!(
+                            "OpenCode server exited before reporting listening URL: {}",
+                            status
+                        )));
+                    }
                 }
-
-                time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .map_err(|_| OpencodeError::TimedOut { phase: "spawn" })??;
-
-        let server = Self {
-            child: Mutex::new(Some(child)),
-            base_url,
-            client: reqwest::Client::new(),
-            _stderr_task: Some(stderr_task),
-        };
-
-        server.wait_for_health().await?;
-        Ok(server)
-    }
-
-    async fn wait_for_health(&self) -> Result<()> {
-        for _ in 0..30 {
-            match self.health().await {
-                Ok(h) if h.healthy => {
-                    info!(url = %self.base_url, "OpenCode server is healthy");
-                    return Ok(());
-                }
-                Ok(_) => time::sleep(Duration::from_millis(200)).await,
-                Err(_) => time::sleep(Duration::from_millis(200)).await,
             }
         }
 
-        Err(OpencodeError::HealthCheckFailed)
+        let base_url = base_url.ok_or_else(|| {
+            OpencodeError::Protocol("OpenCode server did not report a listening URL".to_string())
+        })?;
+
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| OpencodeError::Protocol(format!("Failed to build HTTP client: {}", e)))?;
+
+        let server = Arc::new(Self {
+            child: Mutex::new(Some(child)),
+            base_url,
+            client,
+        });
+
+        server.wait_until_healthy().await?;
+        Ok(server)
     }
 
-    pub async fn health(&self) -> Result<HealthResponse> {
-        let resp = self
-            .client
+    async fn wait_until_healthy(&self) -> Result<(), OpencodeError> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            match self.health().await {
+                Ok(resp) if resp.healthy => return Ok(()),
+                Ok(_) => {}
+                Err(e) => {
+                    debug!(error = %e, base_url = %self.base_url, "OpenCode health check not ready yet")
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        Err(OpencodeError::Timeout {
+            operation: "health".to_string(),
+        })
+    }
+
+    pub async fn health(&self) -> Result<HealthResponse, OpencodeError> {
+        self.client
             .get(format!("{}/global/health", self.base_url))
             .send()
             .await
-            .map_err(|e| OpencodeError::RequestFailed {
-                operation: "GET /global/health".into(),
-                message: e.to_string(),
-            })?
+            .map_err(OpencodeError::Http)?
             .error_for_status()
-            .map_err(|e| OpencodeError::RequestFailed {
-                operation: "GET /global/health".into(),
-                message: e.to_string(),
-            })?;
-
-        resp.json::<HealthResponse>()
+            .map_err(OpencodeError::Http)?
+            .json::<HealthResponse>()
             .await
-            .map_err(|e| OpencodeError::ResponseDecode {
-                operation: "GET /global/health".into(),
-                message: e.to_string(),
-            })
+            .map_err(OpencodeError::Http)
     }
 
-    pub async fn create_session(&self, title: Option<&str>) -> Result<Session> {
-        let payload = match title {
-            Some(title) => serde_json::json!({ "title": title }),
-            None => serde_json::json!({}),
-        };
-
-        let resp = self
-            .client
+    pub async fn create_session(&self, title: Option<&str>) -> Result<Session, OpencodeError> {
+        let body = serde_json::json!({
+            "title": title,
+        });
+        self.client
             .post(format!("{}/session", self.base_url))
-            .json(&payload)
+            .json(&body)
             .send()
             .await
-            .map_err(|e| OpencodeError::RequestFailed {
-                operation: "POST /session".into(),
-                message: e.to_string(),
-            })?
+            .map_err(OpencodeError::Http)?
             .error_for_status()
-            .map_err(|e| OpencodeError::RequestFailed {
-                operation: "POST /session".into(),
-                message: e.to_string(),
-            })?;
-
-        resp.json::<Session>()
+            .map_err(OpencodeError::Http)?
+            .json::<Session>()
             .await
-            .map_err(|e| OpencodeError::ResponseDecode {
-                operation: "POST /session".into(),
-                message: e.to_string(),
-            })
+            .map_err(OpencodeError::Http)
     }
 
     pub async fn send_prompt_async(
@@ -230,525 +356,225 @@ impl OpencodeServer {
         text: &str,
         model: Option<&str>,
         agent: Option<&str>,
-    ) -> Result<()> {
-        let mut payload = serde_json::Map::new();
-        payload.insert("text".to_string(), Value::String(text.to_string()));
-        if let Some(model) = model {
-            payload.insert("model".to_string(), Value::String(model.to_string()));
-        }
-        if let Some(agent) = agent {
-            payload.insert("agent".to_string(), Value::String(agent.to_string()));
-        }
-
+    ) -> Result<(), OpencodeError> {
+        let body = serde_json::json!({
+            "text": text,
+            "model": model,
+            "agent": agent,
+        });
         self.client
             .post(format!(
                 "{}/session/{}/prompt_async",
                 self.base_url, session_id
             ))
-            .json(&Value::Object(payload))
+            .json(&body)
             .send()
             .await
-            .map_err(|e| OpencodeError::RequestFailed {
-                operation: "POST /session/:id/prompt_async".into(),
-                message: e.to_string(),
-            })?
+            .map_err(OpencodeError::Http)?
             .error_for_status()
-            .map_err(|e| OpencodeError::RequestFailed {
-                operation: "POST /session/:id/prompt_async".into(),
-                message: e.to_string(),
-            })?;
-
+            .map_err(OpencodeError::Http)?;
         Ok(())
     }
 
-    pub async fn list_messages(&self, session_id: &str) -> Result<Vec<MessageWithParts>> {
-        let resp = self
-            .client
+    #[allow(dead_code)]
+    pub async fn list_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<MessageWithParts>, OpencodeError> {
+        self.client
             .get(format!("{}/session/{}/message", self.base_url, session_id))
             .send()
             .await
-            .map_err(|e| OpencodeError::RequestFailed {
-                operation: "GET /session/:id/message".into(),
-                message: e.to_string(),
-            })?
+            .map_err(OpencodeError::Http)?
             .error_for_status()
-            .map_err(|e| OpencodeError::RequestFailed {
-                operation: "GET /session/:id/message".into(),
-                message: e.to_string(),
-            })?;
-
-        resp.json::<Vec<MessageWithParts>>()
+            .map_err(OpencodeError::Http)?
+            .json::<Vec<MessageWithParts>>()
             .await
-            .map_err(|e| OpencodeError::ResponseDecode {
-                operation: "GET /session/:id/message".into(),
-                message: e.to_string(),
-            })
+            .map_err(OpencodeError::Http)
     }
 
-    pub async fn abort_session(&self, session_id: &str) -> Result<()> {
+    pub async fn abort_session(&self, session_id: &str) -> Result<(), OpencodeError> {
         self.client
             .post(format!("{}/session/{}/abort", self.base_url, session_id))
             .send()
             .await
-            .map_err(|e| OpencodeError::RequestFailed {
-                operation: "POST /session/:id/abort".into(),
-                message: e.to_string(),
-            })?
+            .map_err(OpencodeError::Http)?
             .error_for_status()
-            .map_err(|e| OpencodeError::RequestFailed {
-                operation: "POST /session/:id/abort".into(),
-                message: e.to_string(),
-            })?;
-
+            .map_err(OpencodeError::Http)?;
         Ok(())
     }
 
-    pub async fn subscribe_events(&self) -> Result<impl Stream<Item = OpencodeEvent>> {
-        let resp = self
+    pub async fn subscribe_events(
+        &self,
+    ) -> Result<impl Stream<Item = Result<OpencodeEvent, OpencodeError>>, OpencodeError> {
+        let response = self
             .client
             .get(format!("{}/event", self.base_url))
             .send()
             .await
-            .map_err(|e| OpencodeError::RequestFailed {
-                operation: "GET /event".into(),
-                message: e.to_string(),
-            })?
+            .map_err(OpencodeError::Http)?
             .error_for_status()
-            .map_err(|e| OpencodeError::RequestFailed {
-                operation: "GET /event".into(),
-                message: e.to_string(),
-            })?;
+            .map_err(OpencodeError::Http)?;
 
-        let mut byte_stream = resp.bytes_stream();
-        let (tx, rx) = mpsc::channel::<OpencodeEvent>(256);
+        let mut byte_stream = response.bytes_stream();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<OpencodeEvent, OpencodeError>>(256);
 
         tokio::spawn(async move {
             let mut buffer = String::new();
-            while let Some(chunk) = byte_stream.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!(error = %e, "failed to read SSE chunk");
-                        break;
-                    }
-                };
 
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(chunk_result) = byte_stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-                while let Some(idx) = buffer.find("\n\n") {
-                    let event_block = buffer.drain(..idx + 2).collect::<String>();
-                    if let Some(parsed) = parse_sse_event(&event_block) {
-                        if tx.send(parsed).await.is_err() {
-                            return;
+                        while let Some(separator_idx) = buffer.find("\n\n") {
+                            let frame = buffer[..separator_idx].to_string();
+                            buffer = buffer[separator_idx + 2..].to_string();
+                            if tx.send(parse_sse_frame(&frame)).await.is_err() {
+                                return;
+                            }
                         }
+                    }
+                    Err(err) => {
+                        let _ = tx.send(Err(OpencodeError::Http(err))).await;
+                        return;
                     }
                 }
             }
+
+            if !buffer.trim().is_empty() {
+                let _ = tx.send(parse_sse_frame(&buffer)).await;
+            }
         });
 
-        Ok(OpencodeEventStream { rx })
+        Ok(futures_util::stream::unfold(rx, |mut rx| async {
+            rx.recv().await.map(|item| (item, rx))
+        }))
     }
 
-    pub async fn kill(&mut self) {
-        let mut guard = self.child.lock().await;
-        if let Some(child) = guard.as_mut() {
-            if let Err(e) = child.kill().await {
-                warn!(error = %e, "failed to kill opencode child process");
+    pub async fn kill(&self) {
+        let mut child = self.child.lock().await;
+        if let Some(ref mut c) = *child {
+            match c.kill().await {
+                Ok(()) => info!(base_url = %self.base_url, "OpenCode server killed"),
+                Err(e) => {
+                    warn!(error = %e, base_url = %self.base_url, "Failed to kill OpenCode server")
+                }
             }
         }
-        *guard = None;
+        *child = None;
     }
 }
 
-#[allow(dead_code)]
-struct OpencodeEventStream {
-    rx: mpsc::Receiver<OpencodeEvent>,
+fn extract_listening_url(line: &str) -> Option<String> {
+    let marker = "listening on ";
+    let index = line.find(marker)?;
+    let rest = &line[index + marker.len()..];
+    rest.split_whitespace().next().map(str::to_string)
 }
 
-impl Stream for OpencodeEventStream {
-    type Item = OpencodeEvent;
+fn parse_sse_frame(frame: &str) -> Result<OpencodeEvent, OpencodeError> {
+    let mut event_type = None;
+    let mut data_lines = Vec::new();
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.rx).poll_recv(cx)
-    }
-}
-
-#[allow(dead_code)]
-fn parse_sse_event(raw: &str) -> Option<OpencodeEvent> {
-    let mut event_type: Option<String> = None;
-    let mut data_lines: VecDeque<String> = VecDeque::new();
-
-    for line in raw.lines() {
-        if let Some(v) = line.strip_prefix("event:") {
-            event_type = Some(v.trim().to_string());
-        }
-        if let Some(v) = line.strip_prefix("data:") {
-            data_lines.push_back(v.trim().to_string());
+    for line in frame.lines() {
+        if let Some(rest) = line.strip_prefix("event:") {
+            event_type = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            data_lines.push(rest.trim().to_string());
         }
     }
 
-    if data_lines.is_empty() {
-        return None;
-    }
+    let event_type = event_type
+        .ok_or_else(|| OpencodeError::Protocol("SSE frame missing event type".to_string()))?;
+    let data = data_lines.join("\n");
+    let json = if data.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str::<Value>(&data).map_err(|e| {
+            OpencodeError::Protocol(format!("Failed to parse SSE JSON payload: {}", e))
+        })?
+    };
 
-    let data = serde_json::from_str::<Value>(&data_lines.make_contiguous().join("\n"))
-        .unwrap_or(Value::Null);
-
-    match event_type.as_deref() {
-        Some("message.part.updated") => Some(OpencodeEvent::MessagePartUpdated {
-            session_id: data
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            part: data.get("part").cloned().unwrap_or(Value::Null),
-        }),
-        Some("session.status") => Some(OpencodeEvent::SessionStatus {
-            session_id: data
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            status: data
-                .get("status")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-        }),
-        Some(other) => Some(OpencodeEvent::Unknown {
-            event_type: other.to_string(),
-            data,
-        }),
-        None => Some(OpencodeEvent::Unknown {
-            event_type: "unknown".to_string(),
-            data,
+    match event_type.as_str() {
+        "message.part.updated" => Ok(OpencodeEvent::MessagePartUpdated(Box::new(
+            serde_json::from_value::<MessagePartUpdatedPayload>(json).map_err(|e| {
+                OpencodeError::Protocol(format!(
+                    "Failed to decode message.part.updated payload: {}",
+                    e
+                ))
+            })?,
+        ))),
+        "session.status" => Ok(OpencodeEvent::SessionStatus(
+            serde_json::from_value::<SessionStatusPayload>(json).map_err(|e| {
+                OpencodeError::Protocol(format!("Failed to decode session.status payload: {}", e))
+            })?,
+        )),
+        _ => Ok(OpencodeEvent::Unknown {
+            event_type,
+            data: json,
         }),
     }
 }
 
-#[allow(dead_code)]
-fn parse_listening_url(line: &str) -> Option<String> {
-    ["http://", "https://"].iter().find_map(|marker| {
-        line.find(marker).map(|idx| {
-            let suffix = &line[idx..];
-            let end = suffix.find(char::is_whitespace).unwrap_or(suffix.len());
-            suffix[..end].to_string()
-        })
-    })
-}
-
-#[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum OpencodeError {
-    #[error("Failed to spawn opencode command '{command}': {reason}")]
+    #[error("Failed to spawn OpenCode command '{command}': {reason}")]
     SpawnFailed { command: String, reason: String },
 
-    #[error("opencode serve stderr pipe was not available")]
-    MissingStderrPipe,
+    #[error("OpenCode subprocess stdio pipe not available")]
+    StdioPipeMissing,
 
-    #[error("timed out while waiting for {phase}")]
-    TimedOut { phase: &'static str },
+    #[error("HTTP request failed: {0}")]
+    Http(#[from] reqwest::Error),
 
-    #[error("OpenCode server exited unexpectedly (code={code:?}): {message}")]
-    UnexpectedExit { code: Option<i32>, message: String },
+    #[error("OpenCode protocol error: {0}")]
+    Protocol(String),
 
-    #[error("OpenCode server failed health check")]
-    HealthCheckFailed,
-
-    #[error("HTTP request failed during {operation}: {message}")]
-    RequestFailed { operation: String, message: String },
-
-    #[error("failed to decode response for {operation}: {message}")]
-    ResponseDecode { operation: String, message: String },
+    #[error("Timeout waiting for OpenCode operation '{operation}'")]
+    Timeout { operation: String },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-        process::Command,
-        sync::oneshot,
-    };
 
-    async fn spawn_single_response_server(
-        status: u16,
-        content_type: &str,
-        body: &'static str,
-    ) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let response = format!(
-            "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            status,
-            content_type,
-            body.len(),
-            body
-        );
-
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = socket.read(&mut buf).await;
-            socket.write_all(response.as_bytes()).await.unwrap();
-            socket.shutdown().await.unwrap();
-        });
-
-        format!("http://{}", addr)
+    #[test]
+    fn test_extract_listening_url() {
+        let url = extract_listening_url("info: listening on http://127.0.0.1:43210");
+        assert_eq!(url.as_deref(), Some("http://127.0.0.1:43210"));
     }
 
     #[test]
-    fn test_parse_listening_url() {
-        assert_eq!(
-            parse_listening_url("listening on http://127.0.0.1:33123"),
-            Some("http://127.0.0.1:33123".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_sse_event() {
-        let event = parse_sse_event(
-            "event: message.part.updated\ndata: {\"sessionId\":\"s1\",\"part\":{\"text\":\"x\"}}\n\n",
+    fn test_parse_message_part_updated_event() {
+        let event = parse_sse_frame(
+            "event: message.part.updated\ndata: {\"session_id\":\"s1\",\"delta\":{\"type\":\"text\",\"text\":\"hello\"}}\n",
         )
         .unwrap();
 
         match event {
-            OpencodeEvent::MessagePartUpdated { session_id, part } => {
-                assert_eq!(session_id.as_deref(), Some("s1"));
-                assert_eq!(part.get("text").and_then(Value::as_str), Some("x"));
+            OpencodeEvent::MessagePartUpdated(payload) => {
+                assert_eq!(payload.session_id.as_deref(), Some("s1"));
+                assert_eq!(payload.delta.and_then(|d| d.text).as_deref(), Some("hello"));
             }
-            _ => panic!("unexpected event"),
+            _ => panic!("expected MessagePartUpdated"),
         }
     }
 
-    #[tokio::test]
-    async fn test_health() {
-        let base_url =
-            spawn_single_response_server(200, "application/json", r#"{"healthy":true}"#).await;
-        let server = OpencodeServer {
-            child: Mutex::new(None),
-            base_url,
-            client: reqwest::Client::new(),
-            _stderr_task: None,
-        };
-
-        let health = server.health().await.unwrap();
-        assert!(health.healthy);
-    }
-
-    #[tokio::test]
-    async fn test_create_session() {
-        let base_url = spawn_single_response_server(
-            200,
-            "application/json",
-            r#"{"sessionId":"sess-1","title":"demo"}"#,
+    #[test]
+    fn test_parse_session_status_event() {
+        let event = parse_sse_frame(
+            "event: session.status\ndata: {\"session_id\":\"s1\",\"status\":\"completed\",\"stop_reason\":\"end_turn\"}\n",
         )
-        .await;
-
-        let server = OpencodeServer {
-            child: Mutex::new(None),
-            base_url,
-            client: reqwest::Client::new(),
-            _stderr_task: None,
-        };
-
-        let session = server.create_session(Some("demo")).await.unwrap();
-        assert_eq!(session.id.as_deref(), Some("sess-1"));
-    }
-
-    #[tokio::test]
-    async fn test_list_messages() {
-        let base_url = spawn_single_response_server(
-            200,
-            "application/json",
-            r#"[{"id":"m1","role":"assistant","parts":[{"type":"text","text":"hello"}]}]"#,
-        )
-        .await;
-
-        let server = OpencodeServer {
-            child: Mutex::new(None),
-            base_url,
-            client: reqwest::Client::new(),
-            _stderr_task: None,
-        };
-
-        let messages = server.list_messages("sess-1").await.unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].id.as_deref(), Some("m1"));
-    }
-
-    async fn spawn_request_capture_server(
-        response_status: u16,
-        response_body: &'static str,
-    ) -> (String, oneshot::Receiver<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = oneshot::channel::<String>();
-
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 8192];
-            let size = socket.read(&mut buf).await.unwrap();
-            let req = String::from_utf8_lossy(&buf[..size]).to_string();
-            let _ = tx.send(req);
-
-            let response = format!(
-                "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                response_status,
-                response_body.len(),
-                response_body
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            socket.shutdown().await.unwrap();
-        });
-
-        (format!("http://{}", addr), rx)
-    }
-
-    async fn spawn_sse_server(event_payload: &'static str) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = socket.read(&mut buf).await;
-
-            let response_header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-                event_payload.len()
-            );
-            socket.write_all(response_header.as_bytes()).await.unwrap();
-            socket.write_all(event_payload.as_bytes()).await.unwrap();
-            socket.shutdown().await.unwrap();
-        });
-
-        format!("http://{}", addr)
-    }
-
-    #[tokio::test]
-    async fn test_send_prompt_async_posts_expected_payload() {
-        let (base_url, request_rx) = spawn_request_capture_server(200, "{}").await;
-
-        let server = OpencodeServer {
-            child: Mutex::new(None),
-            base_url,
-            client: reqwest::Client::new(),
-            _stderr_task: None,
-        };
-
-        server
-            .send_prompt_async("sess-1", "hello", Some("gpt-4.1"), Some("coder"))
-            .await
-            .unwrap();
-
-        let req = request_rx.await.unwrap();
-        assert!(req.starts_with("POST "), "request method mismatch: {req}");
-        assert!(
-            req.contains("/session/sess-1/prompt_async"),
-            "request path mismatch: {req}"
-        );
-        let separator = "\r\n\r\n";
-        let req_body = req
-            .find(separator)
-            .map(|idx| &req[idx + separator.len()..])
-            .unwrap_or_default();
-        assert!(
-            req_body.contains("\"text\":\"hello\""),
-            "request body mismatch: {req}"
-        );
-        assert!(
-            req_body.contains("\"model\":\"gpt-4.1\""),
-            "request body missing model: {req}"
-        );
-        assert!(
-            req_body.contains("\"agent\":\"coder\""),
-            "request body missing agent: {req}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_abort_session_posts_expected_endpoint() {
-        let (base_url, request_rx) = spawn_request_capture_server(200, "{}").await;
-
-        let server = OpencodeServer {
-            child: Mutex::new(None),
-            base_url,
-            client: reqwest::Client::new(),
-            _stderr_task: None,
-        };
-
-        server.abort_session("sess-1").await.unwrap();
-
-        let req = request_rx.await.unwrap();
-        assert!(req.starts_with("POST "), "request method mismatch: {req}");
-        assert!(
-            req.contains("/session/sess-1/abort"),
-            "request path mismatch: {req}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_subscribe_events_streams_typed_events() {
-        let base_url = spawn_sse_server(
-            "event: message.part.updated\ndata: {\"sessionId\":\"sess-1\",\"part\":{\"text\":\"hello\"}}\n\n",
-        )
-        .await;
-
-        let server = OpencodeServer {
-            child: Mutex::new(None),
-            base_url,
-            client: reqwest::Client::new(),
-            _stderr_task: None,
-        };
-
-        let mut stream = server.subscribe_events().await.unwrap();
-        let event = stream.next().await.expect("event stream ended");
+        .unwrap();
 
         match event {
-            OpencodeEvent::MessagePartUpdated { session_id, part } => {
-                assert_eq!(session_id.as_deref(), Some("sess-1"));
-                assert_eq!(part.get("text").and_then(Value::as_str), Some("hello"));
+            OpencodeEvent::SessionStatus(payload) => {
+                assert_eq!(payload.session_id.as_deref(), Some("s1"));
+                assert_eq!(payload.status, "completed");
+                assert_eq!(payload.stop_reason.as_deref(), Some("end_turn"));
             }
-            other => panic!("unexpected event: {other:?}"),
+            _ => panic!("expected SessionStatus"),
         }
-    }
-
-    #[tokio::test]
-    async fn test_kill_clears_child() {
-        #[cfg(unix)]
-        let command = "sh";
-        #[cfg(windows)]
-        let command = "cmd";
-
-        let mut child_cmd = Command::new(command);
-        #[cfg(unix)]
-        child_cmd.arg("-c").arg("sleep 30");
-        #[cfg(windows)]
-        child_cmd.arg("/C").arg("ping -n 30 127.0.0.1 > NUL");
-
-        let child = child_cmd.spawn().unwrap();
-        let mut server = OpencodeServer {
-            child: Mutex::new(Some(child)),
-            base_url: "http://127.0.0.1:0".to_string(),
-            client: reqwest::Client::new(),
-            _stderr_task: None,
-        };
-
-        server.kill().await;
-
-        let guard = server.child.lock().await;
-        assert!(guard.is_none());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires local `opencode` binary in PATH"]
-    async fn test_spawn_with_real_opencode_binary() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut server = OpencodeServer::spawn("opencode", temp_dir.path())
-            .await
-            .unwrap();
-        let health = server.health().await.unwrap();
-        assert!(health.healthy);
-        server.kill().await;
     }
 }

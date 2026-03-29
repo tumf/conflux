@@ -19,11 +19,11 @@ export type ProposalWsStatus = 'connecting' | 'connected' | 'disconnected' | 'er
 export interface UseProposalWebSocketOptions {
   projectId: string | null;
   sessionId: string | null;
-  onMessageChunk?: (content: string) => void;
-  onToolCall?: (toolCall: ToolCallInfo) => void;
-  onToolCallUpdate?: (toolCallId: string, status: ToolCallStatus) => void;
+  onMessageChunk?: (content: string, messageId?: string, turnId?: string) => void;
+  onToolCall?: (toolCall: ToolCallInfo, messageId?: string, turnId?: string) => void;
+  onToolCallUpdate?: (toolCallId: string, status: ToolCallStatus, messageId?: string, turnId?: string) => void;
   onElicitationRequest?: (elicitation: ElicitationRequest) => void;
-  onTurnComplete?: (stopReason: string) => void;
+  onTurnComplete?: (stopReason: string, messageId?: string, turnId?: string) => void;
   onError?: (message: string) => void;
 }
 
@@ -142,17 +142,21 @@ export function handleServerMessage(
 ) {
   switch (msg.type) {
     case 'agent_message_chunk':
-      callbacks.onMessageChunk?.(msg.text);
+      callbacks.onMessageChunk?.(msg.text, msg.message_id, msg.turn_id);
       break;
     case 'tool_call':
-      callbacks.onToolCall?.({
-        id: msg.tool_call_id,
-        title: msg.title,
-        status: msg.status,
-      });
+      callbacks.onToolCall?.(
+        {
+          id: msg.tool_call_id,
+          title: msg.title,
+          status: msg.status,
+        },
+        msg.message_id,
+        msg.turn_id,
+      );
       break;
     case 'tool_call_update':
-      callbacks.onToolCallUpdate?.(msg.tool_call_id, msg.status);
+      callbacks.onToolCallUpdate?.(msg.tool_call_id, msg.status, msg.message_id, msg.turn_id);
       break;
     case 'elicitation':
       callbacks.onElicitationRequest?.({
@@ -163,7 +167,7 @@ export function handleServerMessage(
       });
       break;
     case 'turn_complete':
-      callbacks.onTurnComplete?.(msg.stop_reason);
+      callbacks.onTurnComplete?.(msg.stop_reason, msg.message_id, msg.turn_id);
       break;
     case 'error':
       callbacks.onError?.(msg.message);

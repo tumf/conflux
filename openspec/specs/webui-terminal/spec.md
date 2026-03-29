@@ -1,7 +1,6 @@
-
 ### Requirement: terminal-keyboard-input
 
-WebUI の仮想ターミナル (`TerminalTab`) は、ターミナルにフォーカスがある状態でシェル操作キーバインドのブラウザデフォルト動作を抑制し、キー入力を PTY に正しく転送する。
+WebUI の仮想ターミナル (`TerminalTab`) は、ターミナルにフォーカスがある状態でシェル操作キーバインド (Ctrl+A, Ctrl+E, Ctrl+K 等) を xterm.js に処理させ、対応する制御コードを PTY に送信する。ブラウザのデフォルト動作（全選択等）は抑制する。さらに、制御入力の後に xterm.js の hidden helper textarea に stale text が残留しても、後続の printable input で以前の入力内容を再送しないようにしなければならない。
 
 #### Scenario: ctrl-a-moves-to-beginning-of-line
 
@@ -26,3 +25,9 @@ WebUI の仮想ターミナル (`TerminalTab`) は、ターミナルにフォー
 **Given**: WebUI ターミナルにフォーカスがある
 **When**: ユーザーが Ctrl+E, Ctrl+K, Ctrl+U, Ctrl+L, Ctrl+R, Ctrl+D, Ctrl+W のいずれかを押す
 **Then**: 対応する制御コードが PTY に送信され、ブラウザのデフォルト動作は発火しない
+
+#### Scenario: stale-helper-textarea-does-not-replay-previous-input
+
+**Given**: WebUI ターミナルで printable text を入力した直後に Ctrl+A などの制御入力を送信し、xterm.js の hidden helper textarea に直前の文字列が一時的に残留している
+**When**: ユーザーが次の printable key を入力する
+**Then**: 直前の文字列全体は再送・再表示されず、新しいキー入力だけが PTY に反映される

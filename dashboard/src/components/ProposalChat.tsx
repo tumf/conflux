@@ -1,7 +1,8 @@
-import React, { useCallback, useMemo } from 'react';
+import React, { useCallback, useEffect, useRef } from 'react';
 import { ArrowLeft } from 'lucide-react';
-import { ProposalSession, ProposalChatMessage, ElicitationRequest, ToolCallInfo, ToolCallStatus } from '../api/types';
+import { ElicitationRequest, ProposalChatMessage, ProposalSession, ToolCallInfo, ToolCallStatus } from '../api/types';
 import { useProposalWebSocket } from '../hooks/useProposalWebSocket';
+import { listProposalSessionMessages } from '../api/restClient';
 import { ChatMessageList } from './ChatMessageList';
 import { ChatInput } from './ChatInput';
 import { ElicitationDialog } from './ElicitationDialog';
@@ -18,10 +19,14 @@ interface ProposalChatProps {
   onBack: () => void;
   onMerge: () => void;
   onClose: () => void;
+  onHydrateMessages: (sessionId: string, messages: ProposalChatMessage[]) => void;
   onAppendMessage: (sessionId: string, message: ProposalChatMessage) => void;
-  onStreamingChunk: (messageId: string, content: string) => void;
-  onToolCallStart: (sessionId: string, messageId: string, toolCall: ToolCallInfo) => void;
-  onToolCallUpdate: (sessionId: string, messageId: string, toolCallId: string, status: ToolCallStatus) => void;
+  onStartAssistantTurn: (sessionId: string, messageId: string, turnId?: string) => void;
+  onStreamingChunk: (sessionId: string, messageId: string, content: string, turnId?: string) => void;
+  onCompleteAssistantTurn: (sessionId: string, stopReason?: string) => void;
+  onFailAssistantTurn: (sessionId: string, error: string) => void;
+  onToolCallStart: (sessionId: string, messageId: string, toolCall: ToolCallInfo, turnId?: string) => void;
+  onToolCallUpdate: (sessionId: string, messageId: string, toolCallId: string, status: ToolCallStatus, turnId?: string) => void;
   onElicitation: (elicitation: ElicitationRequest | null) => void;
   onClickChange?: (changeId: string) => void;
   isLoading?: boolean;
@@ -37,35 +42,79 @@ export function ProposalChat({
   onBack,
   onMerge,
   onClose,
+  onHydrateMessages,
   onAppendMessage,
+  onStartAssistantTurn,
   onStreamingChunk,
+  onCompleteAssistantTurn,
+  onFailAssistantTurn,
   onToolCallStart,
   onToolCallUpdate,
   onElicitation,
   onClickChange,
   isLoading = false,
 }: ProposalChatProps) {
-  const agentMessageId = `agent-${session.id}`;
-  const { sendPrompt, sendElicitationResponse, sendCancel, status } = useProposalWebSocket({
+  const pendingMessageIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    listProposalSessionMessages(projectId, session.id)
+      .then((response) => {
+        if (cancelled) return;
+        onHydrateMessages(
+          session.id,
+          response.messages.map((message) => ({
+            ...message,
+            hydrated: true,
+          })),
+        );
+      })
+      .catch((error) => {
+        console.error('Failed to hydrate proposal session history', {
+          sessionId: session.id,
+          projectId,
+          error,
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [onHydrateMessages, projectId, session.id]);
+
+  const { sendPrompt, sendElicitationResponse, status } = useProposalWebSocket({
     projectId,
     sessionId: session.id,
     onMessageChunk: useCallback(
-      (content: string) => {
-        onStreamingChunk(agentMessageId, content);
+      (content: string, messageId?: string, turnId?: string) => {
+        const resolvedMessageId = messageId ?? pendingMessageIdRef.current ?? `assistant-${session.id}-${Date.now()}`;
+        if (!pendingMessageIdRef.current) {
+          pendingMessageIdRef.current = resolvedMessageId;
+          onStartAssistantTurn(session.id, resolvedMessageId, turnId);
+        }
+        onStreamingChunk(session.id, resolvedMessageId, content, turnId);
       },
-      [agentMessageId, onStreamingChunk],
+      [onStartAssistantTurn, onStreamingChunk, session.id],
     ),
     onToolCall: useCallback(
-      (toolCall: ToolCallInfo) => {
-        onToolCallStart(session.id, agentMessageId, toolCall);
+      (toolCall: ToolCallInfo, messageId?: string, turnId?: string) => {
+        const resolvedMessageId = messageId ?? pendingMessageIdRef.current ?? `assistant-${session.id}-${Date.now()}`;
+        if (!pendingMessageIdRef.current) {
+          pendingMessageIdRef.current = resolvedMessageId;
+          onStartAssistantTurn(session.id, resolvedMessageId, turnId);
+        }
+        onToolCallStart(session.id, resolvedMessageId, toolCall, turnId);
       },
-      [agentMessageId, session.id, onToolCallStart],
+      [onStartAssistantTurn, onToolCallStart, session.id],
     ),
     onToolCallUpdate: useCallback(
-      (toolCallId: string, toolCallStatus: ToolCallStatus) => {
-        onToolCallUpdate(session.id, agentMessageId, toolCallId, toolCallStatus);
+      (toolCallId: string, toolCallStatus: ToolCallStatus, messageId?: string, turnId?: string) => {
+        const resolvedMessageId = messageId ?? pendingMessageIdRef.current;
+        if (!resolvedMessageId) return;
+        onToolCallUpdate(session.id, resolvedMessageId, toolCallId, toolCallStatus, turnId);
       },
-      [agentMessageId, session.id, onToolCallUpdate],
+      [onToolCallUpdate, session.id],
     ),
     onElicitationRequest: useCallback(
       (elicitation: ElicitationRequest) => {
@@ -74,25 +123,22 @@ export function ProposalChat({
       [onElicitation],
     ),
     onTurnComplete: useCallback(
-      () => {
-        const streamed = streamingContent[agentMessageId] ?? '';
-        const existingMessage = messages.find((message) => message.id === agentMessageId);
-        const assistantMessage: ProposalChatMessage = {
-          id: agentMessageId,
-          role: 'assistant',
-          content: streamed || existingMessage?.content || '',
-          timestamp: new Date().toISOString(),
-          tool_calls: existingMessage?.tool_calls,
-        };
-        onAppendMessage(session.id, assistantMessage);
+      (stopReason: string, messageId?: string, turnId?: string) => {
+        const resolvedMessageId = messageId ?? pendingMessageIdRef.current;
+        if (resolvedMessageId) {
+          onCompleteAssistantTurn(session.id, stopReason);
+        }
+        pendingMessageIdRef.current = null;
       },
-      [agentMessageId, messages, onAppendMessage, session.id, streamingContent],
+      [onCompleteAssistantTurn, session.id],
     ),
     onError: useCallback(
       (message: string) => {
-        console.error('Proposal WS error:', message);
+        console.error('Proposal WS error:', { message, sessionId: session.id });
+        onFailAssistantTurn(session.id, message);
+        pendingMessageIdRef.current = null;
       },
-      [],
+      [onFailAssistantTurn, session.id],
     ),
   });
 

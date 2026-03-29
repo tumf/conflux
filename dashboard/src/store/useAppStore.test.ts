@@ -39,6 +39,7 @@ const createState = (overrides: Partial<AppState> = {}): AppState => ({
   proposalSessionsByProjectId: {},
   activeProposalSessionId: null,
   chatMessagesBySessionId: {},
+  activeTurnBySessionId: {},
   activeElicitation: null,
   isAgentResponding: false,
   streamingContent: {},
@@ -218,6 +219,114 @@ describe('useAppStore - SELECT_PROJECT', () => {
 
     expect(state.selectedProjectId).toBeNull();
     expect(state.fileBrowseContext).toBeNull();
+  });
+});
+
+describe('useAppStore - proposal chat state transitions', () => {
+  it('keeps sequential assistant turns as distinct messages', () => {
+    const sessionId = 'session-1';
+
+    let state = appReducer(createState(), {
+      type: 'START_ASSISTANT_TURN',
+      payload: { sessionId, messageId: 'assistant-1', turnId: 'turn-1' },
+    });
+
+    state = appReducer(state, {
+      type: 'APPEND_STREAMING_CHUNK',
+      payload: { sessionId, messageId: 'assistant-1', content: 'Hello ', turnId: 'turn-1' },
+    });
+
+    state = appReducer(state, {
+      type: 'APPEND_STREAMING_CHUNK',
+      payload: { sessionId, messageId: 'assistant-1', content: 'world', turnId: 'turn-1' },
+    });
+
+    state = appReducer(state, {
+      type: 'UPDATE_TOOL_CALL',
+      payload: {
+        sessionId,
+        messageId: 'assistant-1',
+        turnId: 'turn-1',
+        toolCall: { id: 'tool-1', title: 'Lookup', status: 'pending' },
+      },
+    });
+
+    state = appReducer(state, {
+      type: 'COMPLETE_ASSISTANT_TURN',
+      payload: { sessionId, stopReason: 'completed' },
+    });
+
+    state = appReducer(state, {
+      type: 'START_ASSISTANT_TURN',
+      payload: { sessionId, messageId: 'assistant-2', turnId: 'turn-2' },
+    });
+
+    state = appReducer(state, {
+      type: 'APPEND_STREAMING_CHUNK',
+      payload: { sessionId, messageId: 'assistant-2', content: 'Second reply', turnId: 'turn-2' },
+    });
+
+    state = appReducer(state, {
+      type: 'COMPLETE_ASSISTANT_TURN',
+      payload: { sessionId, stopReason: 'completed' },
+    });
+
+    const messages = state.chatMessagesBySessionId[sessionId] || [];
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toMatchObject({ id: 'assistant-1', role: 'assistant', content: 'Hello world', turn_id: 'turn-1' });
+    expect(messages[0].tool_calls).toEqual([{ id: 'tool-1', title: 'Lookup', status: 'pending' }]);
+    expect(messages[1]).toMatchObject({ id: 'assistant-2', role: 'assistant', content: 'Second reply', turn_id: 'turn-2' });
+    expect(state.activeTurnBySessionId[sessionId]).toBeUndefined();
+    expect(state.isAgentResponding).toBe(false);
+  });
+
+  it('hydrates history for an existing session', () => {
+    const sessionId = 'session-1';
+    const hydratedMessages = [
+      {
+        id: 'user-1',
+        role: 'user' as const,
+        content: 'hello',
+        timestamp: '2026-03-29T00:00:00.000Z',
+      },
+      {
+        id: 'assistant-1',
+        role: 'assistant' as const,
+        content: 'hi there',
+        timestamp: '2026-03-29T00:00:01.000Z',
+        hydrated: true,
+      },
+    ];
+
+    const state = appReducer(createState(), {
+      type: 'HYDRATE_CHAT_MESSAGES',
+      payload: { sessionId, messages: hydratedMessages },
+    });
+
+    expect(state.chatMessagesBySessionId[sessionId]).toEqual(hydratedMessages);
+  });
+
+  it('clears active turn and re-enables input when turn fails', () => {
+    const sessionId = 'session-1';
+
+    let state = appReducer(createState(), {
+      type: 'START_ASSISTANT_TURN',
+      payload: { sessionId, messageId: 'assistant-1', turnId: 'turn-1' },
+    });
+
+    state = appReducer(state, {
+      type: 'APPEND_STREAMING_CHUNK',
+      payload: { sessionId, messageId: 'assistant-1', content: 'partial', turnId: 'turn-1' },
+    });
+
+    state = appReducer(state, {
+      type: 'FAIL_ASSISTANT_TURN',
+      payload: { sessionId, error: 'network' },
+    });
+
+    expect(state.activeTurnBySessionId[sessionId]).toBeUndefined();
+    expect(state.streamingContent['assistant-1']).toBeUndefined();
+    expect(state.isAgentResponding).toBe(false);
   });
 });
 

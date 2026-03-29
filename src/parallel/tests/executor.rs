@@ -269,8 +269,8 @@ fn test_skip_reason_for_merge_deferred_dependency() {
     let manager = TestWorkspaceManager::new(merge_calls);
     let mut change_dependencies = HashMap::new();
     change_dependencies.insert("change-b".to_string(), vec!["change-a".to_string()]);
-    let mut merge_deferred_changes = HashSet::new();
-    merge_deferred_changes.insert("change-a".to_string());
+    let mut resolve_wait_changes = HashSet::new();
+    resolve_wait_changes.insert("change-a".to_string());
 
     // Create test AI runner
     let shared_stagger_state = Arc::new(Mutex::new(None));
@@ -299,7 +299,8 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         no_resume: false,
         failed_tracker: FailedChangeTracker::new(),
         change_dependencies,
-        merge_deferred_changes,
+        resolve_wait_changes,
+        merge_wait_changes: HashSet::new(),
         previously_blocked_changes: HashSet::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
@@ -582,7 +583,8 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         no_resume: false,
         failed_tracker: FailedChangeTracker::new(),
         change_dependencies: HashMap::new(),
-        merge_deferred_changes: HashSet::new(),
+        resolve_wait_changes: HashSet::new(),
+        merge_wait_changes: HashSet::new(),
         previously_blocked_changes: HashSet::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
@@ -755,7 +757,8 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         no_resume: false,
         failed_tracker: FailedChangeTracker::new(),
         change_dependencies: HashMap::new(),
-        merge_deferred_changes: HashSet::new(),
+        resolve_wait_changes: HashSet::new(),
+        merge_wait_changes: HashSet::new(),
         previously_blocked_changes: HashSet::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
@@ -900,7 +903,8 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         no_resume: false,
         failed_tracker: FailedChangeTracker::new(),
         change_dependencies: HashMap::new(),
-        merge_deferred_changes: HashSet::new(),
+        resolve_wait_changes: HashSet::new(),
+        merge_wait_changes: HashSet::new(),
         previously_blocked_changes: HashSet::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
@@ -1074,7 +1078,8 @@ async fn test_merge_retries_when_merge_commit_missing() {
         no_resume: false,
         failed_tracker: FailedChangeTracker::new(),
         change_dependencies: HashMap::new(),
-        merge_deferred_changes: HashSet::new(),
+        resolve_wait_changes: HashSet::new(),
+        merge_wait_changes: HashSet::new(),
         previously_blocked_changes: HashSet::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
@@ -1262,7 +1267,8 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         no_resume: false,
         failed_tracker: FailedChangeTracker::new(),
         change_dependencies: HashMap::new(),
-        merge_deferred_changes: HashSet::new(),
+        resolve_wait_changes: HashSet::new(),
+        merge_wait_changes: HashSet::new(),
         previously_blocked_changes: HashSet::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
@@ -1456,7 +1462,8 @@ async fn test_merge_retries_after_pre_commit_changes() {
         no_resume: false,
         failed_tracker: FailedChangeTracker::new(),
         change_dependencies: HashMap::new(),
-        merge_deferred_changes: HashSet::new(),
+        resolve_wait_changes: HashSet::new(),
+        merge_wait_changes: HashSet::new(),
         previously_blocked_changes: HashSet::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
@@ -1677,6 +1684,62 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
         1,
         "slot recovery should move a queued follow-up change into flight"
     );
+
+    while join_set.join_next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn test_resolve_wait_does_not_block_queue_reanalysis_dispatch() {
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::parallel::WorkspaceResult;
+    use crate::vcs::VcsBackend;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().unwrap();
+    let workspace_base = TempDir::new().unwrap();
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let (tx, _rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    executor
+        .resolve_wait_changes
+        .insert("still-resolving".to_string());
+
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut queued = vec![make_test_change("queued-during-resolve-wait")];
+    let mut in_flight = HashSet::new();
+
+    let (should_break, iteration) = executor
+        .perform_reanalysis_and_dispatch(
+            &mut queued,
+            &mut in_flight,
+            1,
+            1,
+            ReanalysisReason::QueueNotification,
+            &ready_analysis_result,
+            semaphore,
+            &mut join_set,
+            &mut cleanup_guard,
+        )
+        .await
+        .unwrap();
+
+    assert!(!should_break);
+    assert_eq!(iteration, 2);
+    assert!(queued.is_empty());
+    assert_eq!(in_flight.len(), 1);
 
     while join_set.join_next().await.is_some() {}
 }
@@ -2036,32 +2099,24 @@ async fn test_attempt_merge_succeeds_when_change_archived() {
     }
 }
 
-/// Test that the has_merge_deferred helper correctly tracks MergeWait state.
-/// Per spec (update-tui-status-display): The system SHALL send AllCompleted
-/// even when MergeWait remains, but this helper tracks whether any changes
-/// are in MergeWait state for other logic purposes.
+/// Test that the has_resolve_wait helper correctly tracks ResolveWait state.
 #[test]
-fn test_merge_wait_suppresses_completion_events() {
+fn test_resolve_wait_helper_tracks_state() {
     let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let mut executor = ParallelExecutor::new(repo_root, config, None);
 
-    // Initially, no merge deferred - should allow completion
-    assert!(!executor.has_merge_deferred());
+    assert!(!executor.has_resolve_wait());
 
-    // Add a change to merge_deferred set
     executor
-        .merge_deferred_changes
+        .resolve_wait_changes
         .insert("test-change".to_string());
 
-    // Now has_merge_deferred should return true
-    assert!(executor.has_merge_deferred());
+    assert!(executor.has_resolve_wait());
 
-    // Clear the set
-    executor.merge_deferred_changes.clear();
+    executor.resolve_wait_changes.clear();
 
-    // Should return false again
-    assert!(!executor.has_merge_deferred());
+    assert!(!executor.has_resolve_wait());
 }
 
 /// Test that changes in MergeWait state are correctly filtered during loop iteration.
@@ -2069,22 +2124,17 @@ fn test_merge_wait_suppresses_completion_events() {
 /// "The loop continues processing runnable changes and MergeWait is not treated as a terminal completion reason."
 #[test]
 fn test_merge_wait_does_not_block_runnable_changes() {
-    // This is validated by the existing filtering logic in execute_with_reanalysis:
-    // - Changes with WorkspaceState::Archived are excluded from queued_changes
-    // - Changes with WorkspaceState::Created/Applying/Applied are included
-    // - The loop continues as long as queued_changes is not empty
-    //
-    // MergeWait is a WorkspaceStatus (in-memory), not a WorkspaceState (from git)
-    // Changes in MergeWait have WorkspaceState::Archived (archive commit exists)
-    // So they are correctly excluded from processing, allowing other changes to continue
-
     let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
-    let executor = ParallelExecutor::new(repo_root, config, None);
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
 
-    // Verify initial state
-    assert_eq!(executor.merge_deferred_changes.len(), 0);
-    assert!(!executor.has_merge_deferred());
+    // MergeWait は scheduler break 条件に含まれないため、
+    // ResolveWait が空なら completion 判定に影響しない。
+    executor
+        .merge_wait_changes
+        .insert("merge-wait-only".to_string());
+    assert!(executor.resolve_wait_changes.is_empty());
+    assert!(!executor.has_resolve_wait());
 }
 
 /// Test concurrent re-analysis: verify that re-analysis reason is properly tracked

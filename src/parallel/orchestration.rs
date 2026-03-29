@@ -161,9 +161,17 @@ impl ParallelExecutor {
             .await;
 
             // Step 2: Re-analysis if needed and debounce elapsed
-            if self.needs_reanalysis && queued.is_empty() && in_flight.is_empty() {
-                // All work completed
-                info!("All changes completed (queued and in-flight empty), stopping");
+            if self.needs_reanalysis
+                && queued.is_empty()
+                && in_flight.is_empty()
+                && self.resolve_wait_changes.is_empty()
+                && self.manual_resolve_active() == 0
+            {
+                // All work completed.
+                // Keep the scheduler alive while ResolveWait retries or manual resolve are active.
+                info!(
+                    "All changes completed (queued/in-flight/resolve_wait/manual_resolve empty), stopping"
+                );
                 break;
             }
 
@@ -190,8 +198,14 @@ impl ParallelExecutor {
             }
 
             // Step 3: Check if all work is done (before waiting on select)
-            if join_set.is_empty() && queued.is_empty() {
-                info!("All work completed (join_set and queued empty), exiting scheduler loop");
+            if join_set.is_empty()
+                && queued.is_empty()
+                && self.resolve_wait_changes.is_empty()
+                && self.manual_resolve_active() == 0
+            {
+                info!(
+                    "All work completed (join_set/queued/resolve_wait/manual_resolve empty), exiting scheduler loop"
+                );
                 break;
             }
 

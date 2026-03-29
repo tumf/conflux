@@ -9,6 +9,8 @@ import {
   FileContentResponse,
   ProposalSession,
   ProposalSessionChange,
+  StatsOverview,
+  ProposalSessionMessageHistoryResponse,
 } from './types';
 
 const API_BASE = '/api/v1';
@@ -75,6 +77,13 @@ export async function fetchProjectsState(): Promise<{
   projects: RemoteProject[];
 }> {
   return fetchAPI('/projects/state', { method: 'GET' });
+}
+
+/**
+ * Fetch orchestration overview statistics
+ */
+export async function fetchStatsOverview(): Promise<StatsOverview> {
+  return fetchAPI('/stats/overview', { method: 'GET' });
 }
 
 /**
@@ -348,6 +357,19 @@ export async function listProposalSessionChanges(
 ): Promise<ProposalSessionChange[]> {
   return fetchAPI(
     `/projects/${projectId}/proposal-sessions/${sessionId}/changes`,
+    { method: 'GET' },
+  );
+}
+
+/**
+ * Load proposal chat history for a session.
+ */
+export async function listProposalSessionMessages(
+  projectId: string,
+  sessionId: string,
+): Promise<ProposalSessionMessageHistoryResponse> {
+  return fetchAPI(
+    `/projects/${projectId}/proposal-sessions/${sessionId}/messages`,
     { method: 'GET' },
   );
 }

@@ -17,6 +17,8 @@ export function TerminalTab({ sessionId, isActive }: TerminalTabProps) {
   const fitAddonRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const initializedRef = useRef(false);
+  const helperTextAreaRef = useRef<HTMLTextAreaElement | null>(null);
+  const textEncoderRef = useRef(new TextEncoder());
 
   // Fit terminal to container
   const fitTerminal = useCallback(() => {
@@ -28,6 +30,26 @@ export function TerminalTab({ sessionId, isActive }: TerminalTabProps) {
       }
     }
   }, []);
+
+  const resolveHelperTextArea = useCallback(() => {
+    if (helperTextAreaRef.current?.isConnected) {
+      return helperTextAreaRef.current;
+    }
+
+    const container = terminalRef.current;
+    const helperTextArea = container?.querySelector('textarea.xterm-helper-textarea') as HTMLTextAreaElement | null;
+    helperTextAreaRef.current = helperTextArea;
+    return helperTextArea;
+  }, []);
+
+  const clearHelperTextArea = useCallback(() => {
+    requestAnimationFrame(() => {
+      const helperTextArea = resolveHelperTextArea();
+      if (helperTextArea) {
+        helperTextArea.value = '';
+      }
+    });
+  }, [resolveHelperTextArea]);
 
   // Send resize to server
   const sendResize = useCallback(
@@ -83,15 +105,12 @@ export function TerminalTab({ sessionId, isActive }: TerminalTabProps) {
       const isModifierKey = event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey;
       const key = event.key.toLowerCase();
 
-      if (isModifierKey && SHELL_CONTROL_KEYS.has(key)) {
-        return false;
+      if (isModifierKey && key === 'c' && event.type === 'keydown') {
+        return !term.hasSelection();
       }
 
-      if (isModifierKey && key === 'c' && event.type === 'keydown') {
-        if (term.hasSelection()) {
-          return true;
-        }
-        return false;
+      if (isModifierKey && SHELL_CONTROL_KEYS.has(key)) {
+        return true;
       }
 
       return true;
@@ -138,8 +157,9 @@ export function TerminalTab({ sessionId, isActive }: TerminalTabProps) {
     // Forward terminal input to WebSocket
     term.onData((data) => {
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(new TextEncoder().encode(data));
+        ws.send(textEncoderRef.current.encode(data));
       }
+      clearHelperTextArea();
     });
 
     // Handle terminal resize
@@ -149,6 +169,7 @@ export function TerminalTab({ sessionId, isActive }: TerminalTabProps) {
 
     // Cleanup
     return () => {
+      helperTextAreaRef.current = null;
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         ws.close();
       }

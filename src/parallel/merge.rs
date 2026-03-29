@@ -202,9 +202,18 @@ impl ParallelExecutor {
                     self.retry_deferred_merges().await;
                 }
                 Ok(MergeAttempt::Deferred(reason)) => {
-                    // Merge deferred, preserve workspace and transition to MergeWait
-                    self.merge_deferred_changes
-                        .insert(workspace_result.change_id.clone());
+                    // Merge deferred: classify by auto-resumable vs manual intervention.
+                    let auto_resumable = is_dirty_reason_auto_resumable(&reason);
+                    if auto_resumable {
+                        self.resolve_wait_changes
+                            .insert(workspace_result.change_id.clone());
+                        self.merge_wait_changes.remove(&workspace_result.change_id);
+                    } else {
+                        self.merge_wait_changes
+                            .insert(workspace_result.change_id.clone());
+                        self.resolve_wait_changes
+                            .remove(&workspace_result.change_id);
+                    }
 
                     // Update workspace status to MergeWait so it's no longer counted as active
                     self.workspace_manager.update_workspace_status(
@@ -220,9 +229,7 @@ impl ParallelExecutor {
                         ParallelEvent::MergeDeferred {
                             change_id: workspace_result.change_id.clone(),
                             reason,
-                            // All current deferral reasons (dirty base, archive incomplete)
-                            // are temporary and can be resolved automatically.
-                            auto_resumable: true,
+                            auto_resumable,
                         },
                     )
                     .await;
@@ -425,7 +432,7 @@ impl ParallelExecutor {
                 if auto_resumable {
                     // Auto-resumable: another merge/resolve is in progress.
                     // Track as deferred so retry_deferred_merges picks it up.
-                    self.merge_deferred_changes.insert(change_id.to_string());
+                    self.resolve_wait_changes.insert(change_id.to_string());
 
                     send_event(
                         &self.event_tx,
