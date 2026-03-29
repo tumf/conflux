@@ -1597,14 +1597,16 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
         *last_change = Some(std::time::Instant::now());
     }
 
-
     let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
         repo_dir.path().to_path_buf(),
     );
-    let mut queued = vec![make_test_change("follow-up-a"), make_test_change("follow-up-b")];
+    let mut queued = vec![
+        make_test_change("follow-up-a"),
+        make_test_change("follow-up-b"),
+    ];
     let mut in_flight = HashSet::new();
 
     let (should_break, iteration) = executor
@@ -1622,10 +1624,23 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
         .await
         .unwrap();
 
-    assert!(!should_break, "scheduler should keep running while resolve holds the slot");
-    assert_eq!(iteration, 2, "no dispatch should happen while available slots are zero");
-    assert_eq!(queued.len(), 2, "queued follow-up changes should remain queued");
-    assert!(in_flight.is_empty(), "nothing should dispatch before the slot is released");
+    assert!(
+        !should_break,
+        "scheduler should keep running while resolve holds the slot"
+    );
+    assert_eq!(
+        iteration, 2,
+        "no dispatch should happen while available slots are zero"
+    );
+    assert_eq!(
+        queued.len(),
+        2,
+        "queued follow-up changes should remain queued"
+    );
+    assert!(
+        in_flight.is_empty(),
+        "nothing should dispatch before the slot is released"
+    );
 
     manual_resolve_counter.store(0, Ordering::SeqCst);
 
@@ -1644,10 +1659,24 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
         .await
         .unwrap();
 
-    assert!(!should_break, "scheduler should continue after dispatching resumed queued work");
-    assert_eq!(iteration, 3, "dispatch should advance the scheduler iteration");
-    assert_eq!(queued.len(), 1, "one follow-up change should dispatch immediately after slot recovery");
-    assert_eq!(in_flight.len(), 1, "slot recovery should move a queued follow-up change into flight");
+    assert!(
+        !should_break,
+        "scheduler should continue after dispatching resumed queued work"
+    );
+    assert_eq!(
+        iteration, 3,
+        "dispatch should advance the scheduler iteration"
+    );
+    assert_eq!(
+        queued.len(),
+        1,
+        "one follow-up change should dispatch immediately after slot recovery"
+    );
+    assert_eq!(
+        in_flight.len(),
+        1,
+        "slot recovery should move a queued follow-up change into flight"
+    );
 
     while join_set.join_next().await.is_some() {}
 }
@@ -1677,7 +1706,6 @@ async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_wor
         *last_change = Some(std::time::Instant::now());
     }
 
-
     let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
@@ -1702,10 +1730,23 @@ async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_wor
         .await
         .unwrap();
 
-    assert!(!should_break, "resolve completion should resume the scheduler instead of terminating it");
-    assert_eq!(iteration, 3, "resolve completion should immediately trigger a dispatch iteration");
-    assert!(queued.is_empty(), "resolve completion should dispatch queued work without waiting for debounce");
-    assert_eq!(in_flight.len(), 1, "queued work should become in-flight after resolve completion");
+    assert!(
+        !should_break,
+        "resolve completion should resume the scheduler instead of terminating it"
+    );
+    assert_eq!(
+        iteration, 3,
+        "resolve completion should immediately trigger a dispatch iteration"
+    );
+    assert!(
+        queued.is_empty(),
+        "resolve completion should dispatch queued work without waiting for debounce"
+    );
+    assert_eq!(
+        in_flight.len(),
+        1,
+        "queued work should become in-flight after resolve completion"
+    );
 
     while join_set.join_next().await.is_some() {}
 }
