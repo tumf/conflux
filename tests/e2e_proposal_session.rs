@@ -106,7 +106,6 @@ fn make_state_with_transport_env(
         transport_args: vec![create_mock_acp_path(&repo_root).display().to_string()],
         transport_env,
         session_inactivity_timeout_secs: 1,
-        ..Default::default()
     };
 
     let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
