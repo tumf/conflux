@@ -220,7 +220,7 @@ pub async fn list_projects(State(state): State<AppState>) -> Response {
 /// dashboard or client (including the TUI): projects (remote_url + branch) each
 /// with the list of OpenSpec changes discovered in that project's worktree.
 pub async fn projects_state(State(state): State<AppState>) -> Response {
-    let (entries, data_dir, all_selections) = {
+    let (entries, data_dir, all_selections, all_errors) = {
         let registry = state.registry.read().await;
         let entries = registry.list();
         let data_dir = registry.data_dir().to_path_buf();
@@ -235,13 +235,26 @@ pub async fn projects_state(State(state): State<AppState>) -> Response {
                     .map(|s| (e.id.clone(), s.clone()))
             })
             .collect();
-        (entries, data_dir, all_selections)
+        let all_errors: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        > = entries
+            .iter()
+            .filter_map(|e| {
+                registry
+                    .error_changes_for_project(&e.id)
+                    .map(|s| (e.id.clone(), s.clone()))
+            })
+            .collect();
+        (entries, data_dir, all_selections, all_errors)
     };
 
     let mut projects = Vec::new();
     for entry in &entries {
         let selections = all_selections.get(&entry.id);
-        projects.push(build_remote_project_snapshot_async(&data_dir, entry, selections).await);
+        let errors = all_errors.get(&entry.id);
+        projects
+            .push(build_remote_project_snapshot_async(&data_dir, entry, selections, errors).await);
     }
 
     let sync_available = state.resolve_command.is_some();
@@ -294,7 +307,7 @@ async fn handle_ws(
         tokio::select! {
             _ = interval.tick() => {
                 // Snapshot
-                let (entries, data_dir, all_selections) = {
+                let (entries, data_dir, all_selections, all_errors) = {
                     let reg = registry.read().await;
                     let entries = reg.list();
                     let data_dir = reg.data_dir().to_path_buf();
@@ -305,13 +318,21 @@ async fn handle_ws(
                                 .map(|s| (e.id.clone(), s.clone()))
                         })
                         .collect();
-                    (entries, data_dir, all_selections)
+                    let all_errors: std::collections::HashMap<String, std::collections::HashMap<String, String>> = entries
+                        .iter()
+                        .filter_map(|e| {
+                            reg.error_changes_for_project(&e.id)
+                                .map(|s| (e.id.clone(), s.clone()))
+                        })
+                        .collect();
+                    (entries, data_dir, all_selections, all_errors)
                 };
 
                 let mut snapshot = Vec::new();
                 for entry in &entries {
                     let selections = all_selections.get(&entry.id);
-                    snapshot.push(build_remote_project_snapshot_async(&data_dir, entry, selections).await);
+                    let errors = all_errors.get(&entry.id);
+                    snapshot.push(build_remote_project_snapshot_async(&data_dir, entry, selections, errors).await);
                 }
 
                 // Collect worktree information for each project
@@ -391,6 +412,7 @@ async fn build_remote_project_snapshot_async(
     data_dir: &std::path::Path,
     entry: &ProjectEntry,
     change_selections: Option<&std::collections::HashMap<String, bool>>,
+    error_changes: Option<&std::collections::HashMap<String, String>>,
 ) -> RemoteProject {
     let name = project_display_name(&entry.remote_url, &entry.branch);
     let repo = extract_repo_name(&entry.remote_url);
@@ -402,12 +424,21 @@ async fn build_remote_project_snapshot_async(
     let mut changes =
         list_remote_changes_in_worktree(&worktree_path, &entry.id, &entry.branch).await;
 
-    // Apply selected state from registry (defaults to true if not tracked).
+    // Apply selected/error state from registry.
     for change in &mut changes {
+        let is_error = error_changes
+            .and_then(|m| m.get(&change.id))
+            .map(|error| {
+                change.status = "error".to_string();
+                change.iteration_number = None;
+                !error.is_empty()
+            })
+            .unwrap_or(false);
+        let default_selected = !is_error;
         change.selected = change_selections
             .and_then(|m| m.get(&change.id))
             .copied()
-            .unwrap_or(true);
+            .unwrap_or(default_selected);
     }
 
     let status_str = match entry.status {
@@ -1570,6 +1601,9 @@ pub async fn toggle_change_selection(
         return error_response(StatusCode::NOT_FOUND, "Project not found");
     }
     let new_selected = registry.toggle_change_selected(&project_id, &change_id);
+    if new_selected {
+        registry.clear_change_error(&project_id, &change_id);
+    }
     info!(
         project_id = %project_id,
         change_id = %change_id,
@@ -1607,6 +1641,14 @@ pub async fn toggle_all_change_selection(
     let change_ids: Vec<String> = changes.iter().map(|c| c.id.clone()).collect();
 
     let new_selected = registry.toggle_all_changes(&project_id, &change_ids);
+    if new_selected {
+        for change in &changes {
+            if change.status == "error" {
+                registry.clear_change_error(&project_id, &change.id);
+            }
+        }
+    }
+
     info!(
         project_id = %project_id,
         selected = new_selected,
@@ -4102,6 +4144,76 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["projects"][0]["changes"][0]["selected"], false);
+    }
+
+    #[tokio::test]
+    async fn test_projects_state_reports_error_changes_as_unselected_until_remarked() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let change_dir = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&entry.id)
+            .join(&entry.branch)
+            .join("openspec/changes/fix-a");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("proposal.md"), "# proposal\n").unwrap();
+
+        {
+            let mut registry = state.registry.write().await;
+            registry.mark_change_error(&entry.id, "fix-a", "boom".to_string());
+        }
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["projects"][0]["changes"][0]["status"], "error");
+        assert_eq!(json["projects"][0]["changes"][0]["selected"], false);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/v1/projects/{}/changes/fix-a/toggle",
+                entry.id
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["selected"], true);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
     }
 
     #[tokio::test]

@@ -5,3 +5,9 @@
 - [x] Task 3: API / Dashboard で Error change を toggle したとき、その `selected` 状態が WebSocket / state snapshot に反映され、次回 Run の対象に含まれるようにする（`src/server/registry.rs`, `src/server/api.rs`） (verification: API テストで Error change の toggle 後に `selected: true` が返り、Run 対象選定テストで含まれる)
 - [x] Task 4: TUI / API の双方で Error change の mark clear / re-mark semantics を回帰テストで固定する（TUI state tests, server API/registry tests） (verification: targeted `cargo test` names covering TUI and server selection behavior)
 - [x] Task 5: Error change の UI ヒント/表示を更新し、「再マークで再実行対象になる」ことが TUI 上で分かるようにする（`src/tui/render.rs`） (verification: render テストまたは snapshot テスト)
+
+## Acceptance #1 Failure Follow-up
+
+- [x] サーバー側で Error change を state snapshot / Run 対象判定に反映し、未再マークの Error change が除外され再マーク後のみ再実行対象になるよう実装する
+- [x] 上記の server API / registry 挙動を Error 状態つきのテストで固定し、誤って非 Error change の toggle テストだけで完了扱いしないようにする
+- [x] 作業ツリーをクリーンにしてから acceptance を再実行する
