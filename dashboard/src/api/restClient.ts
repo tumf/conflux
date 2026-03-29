@@ -10,6 +10,7 @@ import {
   ProposalSession,
   ProposalSessionChange,
   StatsOverview,
+  ProposalSessionMessageHistoryResponse,
 } from './types';
 
 const API_BASE = '/api/v1';
@@ -356,6 +357,19 @@ export async function listProposalSessionChanges(
 ): Promise<ProposalSessionChange[]> {
   return fetchAPI(
     `/projects/${projectId}/proposal-sessions/${sessionId}/changes`,
+    { method: 'GET' },
+  );
+}
+
+/**
+ * Load proposal chat history for a session.
+ */
+export async function listProposalSessionMessages(
+  projectId: string,
+  sessionId: string,
+): Promise<ProposalSessionMessageHistoryResponse> {
+  return fetchAPI(
+    `/projects/${projectId}/proposal-sessions/${sessionId}/messages`,
     { method: 'GET' },
   );
 }
