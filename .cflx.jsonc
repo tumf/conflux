@@ -12,6 +12,11 @@
   "hooks": {
     // Rebuild indexes after merge completion
     //"on_merged": "make bump-patch && make index"
-    "on_merged": "make bump-patch"
+    "on_merged": {
+      "command": "make bump-patch",
+      "timeout": 120,
+      "git_commit_no_verify": true
+    }
+
   }
 }
