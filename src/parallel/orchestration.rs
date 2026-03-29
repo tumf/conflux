@@ -204,9 +204,20 @@ impl ParallelExecutor {
                         Ok(workspace_result) => {
                             self.handle_workspace_completion(workspace_result, max_parallelism, &mut in_flight, &mut cleanup_guard).await;
 
-                            // Trigger re-analysis on next iteration
+                            // Trigger re-analysis on next iteration.
+                            // If a manual resolve is still active, keep the generic completion reason;
+                            // otherwise treat the slot release as resolve-aware capacity recovery.
                             self.needs_reanalysis = true;
-                            reanalysis_reason = ReanalysisReason::Completion;
+                            let manual_resolves_active = self
+                                .manual_resolve_count
+                                .as_ref()
+                                .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
+                                .unwrap_or(0);
+                            reanalysis_reason = if manual_resolves_active == 0 {
+                                ReanalysisReason::ResolveCompletion
+                            } else {
+                                ReanalysisReason::Completion
+                            };
                         }
                         Err(e) => {
                             error!("Task panicked: {:?}", e);

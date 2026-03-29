@@ -18,7 +18,13 @@ use tracing::info;
 /// multiple changes to be queued before triggering expensive re-analysis.
 pub async fn should_reanalyze_queue(
     last_queue_change_at: &Arc<Mutex<Option<std::time::Instant>>>,
+    bypass_debounce: bool,
 ) -> bool {
+    if bypass_debounce {
+        info!("Bypassing queue debounce because execution capacity recovered");
+        return true;
+    }
+
     let last_change = last_queue_change_at.lock().await;
     match *last_change {
         None => {
@@ -53,6 +59,10 @@ pub enum ReanalysisReason {
     Initial,
     /// Task completion (apply/archive/acceptance finished)
     Completion,
+    /// Manual resolve completed and released a scheduler slot.
+    ResolveCompletion,
+    /// Available slots transitioned from zero to positive while queued work exists.
+    SlotRecovery,
     /// Queue notification (dynamic queue has new items)
     QueueNotification,
 }
@@ -62,6 +72,8 @@ impl std::fmt::Display for ReanalysisReason {
         match self {
             ReanalysisReason::Initial => write!(f, "initial"),
             ReanalysisReason::Completion => write!(f, "completion"),
+            ReanalysisReason::ResolveCompletion => write!(f, "resolve_completion"),
+            ReanalysisReason::SlotRecovery => write!(f, "slot_recovery"),
             ReanalysisReason::QueueNotification => write!(f, "queue"),
         }
     }

@@ -97,6 +97,11 @@ pub struct ParallelExecutor {
     cancel_token: Option<CancellationToken>,
     /// Last queue change timestamp for debouncing re-analysis
     last_queue_change_at: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Last observed number of available execution slots.
+    ///
+    /// Used to bypass queue-edit debounce when capacity recovers from zero to positive,
+    /// so queued changes dispatch immediately after a running task or manual resolve frees a slot.
+    last_available_slots: Option<usize>,
     /// Dynamic queue for runtime change additions (TUI mode)
     dynamic_queue: Option<Arc<crate::tui::queue::DynamicQueue>>,
     /// Shared AI command runner for stagger coordination
