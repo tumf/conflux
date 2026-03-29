@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Folder, FolderOpen, File, ChevronRight, ChevronDown } from 'lucide-react';
 import { FileBrowseContext, FileTreeEntry, FileContentResponse } from '../api/types';
 import { fetchFileTree, fetchFileContent } from '../api/restClient';
+import { TerminalPanel } from './TerminalPanel';
 
 interface FileViewPanelProps {
   projectId: string | null;
@@ -111,6 +112,7 @@ export function FileViewPanel({ projectId, context }: FileViewPanelProps) {
   const [isLoadingTree, setIsLoadingTree] = useState(false);
   const [isLoadingContent, setIsLoadingContent] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [terminalExpanded, setTerminalExpanded] = useState(false);
 
   // Determine root parameter
   const rootParam = useMemo(() => {
@@ -264,52 +266,65 @@ export function FileViewPanel({ projectId, context }: FileViewPanelProps) {
         )}
       </div>
 
-      {/* File content (right) */}
+      {/* File content + terminal (right) */}
       <div className="flex flex-1 flex-col overflow-hidden">
-        {!selectedFilePath && (
-          <div className="flex flex-1 items-center justify-center p-8">
-            <p className="text-sm text-[#52525b]">Select a file to view its content</p>
-          </div>
-        )}
-
-        {selectedFilePath && isLoadingContent && (
-          <div className="flex flex-1 items-center justify-center p-8">
-            <p className="text-sm text-[#52525b]">Loading...</p>
-          </div>
-        )}
-
-        {selectedFilePath && !isLoadingContent && fileContent && (
-          <>
-            <div className="flex items-center justify-between border-b border-[#27272a] px-3 py-1.5">
-              <span className="truncate font-mono text-xs text-[#71717a]">{fileContent.path}</span>
-              <div className="flex items-center gap-2 text-xs text-[#52525b]">
-                {fileContent.truncated && (
-                  <span className="text-[#f59e0b]">truncated</span>
-                )}
-                <span>{formatFileSize(fileContent.size)}</span>
-              </div>
+        {/* File content area */}
+        <div className="flex flex-1 flex-col overflow-hidden">
+          {!selectedFilePath && (
+            <div className="flex flex-1 items-center justify-center p-8">
+              <p className="text-sm text-[#52525b]">Select a file to view its content</p>
             </div>
-            <div className="flex-1 overflow-auto">
-              {fileContent.binary ? (
-                <div className="flex flex-1 items-center justify-center p-8">
-                  <p className="text-sm text-[#52525b]">Binary file - cannot display</p>
+          )}
+
+          {selectedFilePath && isLoadingContent && (
+            <div className="flex flex-1 items-center justify-center p-8">
+              <p className="text-sm text-[#52525b]">Loading...</p>
+            </div>
+          )}
+
+          {selectedFilePath && !isLoadingContent && fileContent && (
+            <>
+              <div className="flex items-center justify-between border-b border-[#27272a] px-3 py-1.5">
+                <span className="truncate font-mono text-xs text-[#71717a]">{fileContent.path}</span>
+                <div className="flex items-center gap-2 text-xs text-[#52525b]">
+                  {fileContent.truncated && (
+                    <span className="text-[#f59e0b]">truncated</span>
+                  )}
+                  <span>{formatFileSize(fileContent.size)}</span>
                 </div>
-              ) : fileContent.content !== null ? (
-                <pre className="p-3 font-mono text-xs leading-relaxed text-[#d4d4d8]">
-                  <code>
-                    {fileContent.content.split('\n').map((line, idx) => (
-                      <div key={idx} className="flex">
-                        <span className="mr-3 inline-block w-8 shrink-0 select-none text-right text-[#3f3f46]">
-                          {idx + 1}
-                        </span>
-                        <span className="whitespace-pre-wrap break-all">{line}</span>
-                      </div>
-                    ))}
-                  </code>
-                </pre>
-              ) : null}
-            </div>
-          </>
+              </div>
+              <div className="flex-1 overflow-auto">
+                {fileContent.binary ? (
+                  <div className="flex flex-1 items-center justify-center p-8">
+                    <p className="text-sm text-[#52525b]">Binary file - cannot display</p>
+                  </div>
+                ) : fileContent.content !== null ? (
+                  <pre className="p-3 font-mono text-xs leading-relaxed text-[#d4d4d8]">
+                    <code>
+                      {fileContent.content.split('\n').map((line, idx) => (
+                        <div key={idx} className="flex">
+                          <span className="mr-3 inline-block w-8 shrink-0 select-none text-right text-[#3f3f46]">
+                            {idx + 1}
+                          </span>
+                          <span className="whitespace-pre-wrap break-all">{line}</span>
+                        </div>
+                      ))}
+                    </code>
+                  </pre>
+                ) : null}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Terminal panel (below file content) */}
+        {projectId && (
+          <TerminalPanel
+            projectId={projectId}
+            root={rootParam}
+            isExpanded={terminalExpanded}
+            onToggleExpand={() => setTerminalExpanded((prev) => !prev)}
+          />
         )}
       </div>
     </div>

@@ -11,6 +11,7 @@
 pub mod api;
 pub mod registry;
 pub mod runner;
+pub mod terminal;
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -59,6 +60,7 @@ pub async fn run_server(config: ServerConfig, resolve_command: Option<String>) -
         orchestration_status: std::sync::Arc::new(tokio::sync::RwLock::new(
             registry::OrchestrationStatus::default(),
         )),
+        terminal_manager: terminal::create_terminal_manager(),
     };
 
     // Build router.

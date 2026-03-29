@@ -197,3 +197,68 @@ export async function fetchFileContent(
     { method: 'GET' },
   );
 }
+
+// ─── Terminal Session API ────────────────────────────────────────────────────
+
+export interface TerminalSessionInfo {
+  id: string;
+  cwd: string;
+  rows: number;
+  cols: number;
+  created_at: string;
+}
+
+export interface CreateTerminalRequest {
+  project_id: string;
+  root: string;
+  rows?: number;
+  cols?: number;
+}
+
+/**
+ * Create a new terminal session
+ */
+export async function createTerminalSession(
+  request: CreateTerminalRequest,
+): Promise<TerminalSessionInfo> {
+  return fetchAPI('/terminal/sessions', {
+    method: 'POST',
+    body: JSON.stringify(request),
+  });
+}
+
+/**
+ * List all terminal sessions
+ */
+export async function listTerminalSessions(): Promise<TerminalSessionInfo[]> {
+  return fetchAPI('/terminal/sessions', { method: 'GET' });
+}
+
+/**
+ * Delete a terminal session
+ */
+export async function deleteTerminalSession(sessionId: string): Promise<void> {
+  return fetchAPI(`/terminal/sessions/${sessionId}`, { method: 'DELETE' });
+}
+
+/**
+ * Resize a terminal session
+ */
+export async function resizeTerminalSession(
+  sessionId: string,
+  rows: number,
+  cols: number,
+): Promise<void> {
+  return fetchAPI(`/terminal/sessions/${sessionId}/resize`, {
+    method: 'POST',
+    body: JSON.stringify({ rows, cols }),
+  });
+}
+
+/**
+ * Get the WebSocket URL for a terminal session
+ */
+export function getTerminalWsUrl(sessionId: string): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  return `${protocol}://${window.location.host}/api/v1/terminal/sessions/${sessionId}/ws`;
+}
