@@ -120,18 +120,17 @@ impl OpencodeServer {
                     Ok(url) => return Ok(url),
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        return Err(OpencodeError::TimedOut {
-                            phase: "spawn",
-                        });
+                        return Err(OpencodeError::TimedOut { phase: "spawn" });
                     }
                 }
 
-                if let Some(status) = child
-                    .try_wait()
-                    .map_err(|e| OpencodeError::UnexpectedExit {
-                        code: None,
-                        message: e.to_string(),
-                    })?
+                if let Some(status) =
+                    child
+                        .try_wait()
+                        .map_err(|e| OpencodeError::UnexpectedExit {
+                            code: None,
+                            message: e.to_string(),
+                        })?
                 {
                     return Err(OpencodeError::UnexpectedExit {
                         code: status.code(),
@@ -471,34 +470,11 @@ mod tests {
         sync::oneshot,
     };
 
-    #[cfg(unix)]
-    async fn spawn_binary_with_url_file() -> (String, std::process::Child, tempfile::TempDir) {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let script = temp_dir.path().join("opencode-mock-server.sh");
-        std::fs::write(
-            &script,
-            "#!/usr/bin/env sh\nprintf 'listening on http://127.0.0.1:0\\n'\nsleep 120\n",
-        )
-        .unwrap();
-
-        let mut perms = script.metadata().unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).unwrap();
-        }
-
-        let mut child = Command::new(&script)
-            .current_dir(temp_dir.path())
-            .spawn()
-            .unwrap();
-        let base_url = "http://127.0.0.1:0".to_string();
-
-        (base_url, child, temp_dir)
-    }
-
-    async fn spawn_single_response_server(status: u16, content_type: &str, body: &'static str) -> String {
+    async fn spawn_single_response_server(
+        status: u16,
+        content_type: &str,
+        body: &'static str,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let response = format!(
@@ -546,7 +522,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_health() {
-        let base_url = spawn_single_response_server(200, "application/json", r#"{"healthy":true}"#).await;
+        let base_url =
+            spawn_single_response_server(200, "application/json", r#"{"healthy":true}"#).await;
         let server = OpencodeServer {
             child: Mutex::new(None),
             base_url,
@@ -597,5 +574,181 @@ mod tests {
         let messages = server.list_messages("sess-1").await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id.as_deref(), Some("m1"));
+    }
+
+    async fn spawn_request_capture_server(
+        response_status: u16,
+        response_body: &'static str,
+    ) -> (String, oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel::<String>();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let size = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..size]).to_string();
+            let _ = tx.send(req);
+
+            let response = format!(
+                "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_status,
+                response_body.len(),
+                response_body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        (format!("http://{}", addr), rx)
+    }
+
+    async fn spawn_sse_server(event_payload: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+
+            let response_header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                event_payload.len()
+            );
+            socket.write_all(response_header.as_bytes()).await.unwrap();
+            socket.write_all(event_payload.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn test_send_prompt_async_posts_expected_payload() {
+        let (base_url, request_rx) = spawn_request_capture_server(200, "{}").await;
+
+        let server = OpencodeServer {
+            child: Mutex::new(None),
+            base_url,
+            client: reqwest::Client::new(),
+            _stderr_task: None,
+        };
+
+        server
+            .send_prompt_async("sess-1", "hello", Some("gpt-4.1"), Some("coder"))
+            .await
+            .unwrap();
+
+        let req = request_rx.await.unwrap();
+        assert!(req.starts_with("POST "), "request method mismatch: {req}");
+        assert!(
+            req.contains("/session/sess-1/prompt_async"),
+            "request path mismatch: {req}"
+        );
+        let separator = "\r\n\r\n";
+        let req_body = req
+            .find(separator)
+            .map(|idx| &req[idx + separator.len()..])
+            .unwrap_or_default();
+        assert!(
+            req_body.contains("\"text\":\"hello\""),
+            "request body mismatch: {req}"
+        );
+        assert!(
+            req_body.contains("\"model\":\"gpt-4.1\""),
+            "request body missing model: {req}"
+        );
+        assert!(
+            req_body.contains("\"agent\":\"coder\""),
+            "request body missing agent: {req}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_abort_session_posts_expected_endpoint() {
+        let (base_url, request_rx) = spawn_request_capture_server(200, "{}").await;
+
+        let server = OpencodeServer {
+            child: Mutex::new(None),
+            base_url,
+            client: reqwest::Client::new(),
+            _stderr_task: None,
+        };
+
+        server.abort_session("sess-1").await.unwrap();
+
+        let req = request_rx.await.unwrap();
+        assert!(req.starts_with("POST "), "request method mismatch: {req}");
+        assert!(
+            req.contains("/session/sess-1/abort"),
+            "request path mismatch: {req}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_events_streams_typed_events() {
+        let base_url = spawn_sse_server(
+            "event: message.part.updated\ndata: {\"sessionId\":\"sess-1\",\"part\":{\"text\":\"hello\"}}\n\n",
+        )
+        .await;
+
+        let server = OpencodeServer {
+            child: Mutex::new(None),
+            base_url,
+            client: reqwest::Client::new(),
+            _stderr_task: None,
+        };
+
+        let mut stream = server.subscribe_events().await.unwrap();
+        let event = stream.next().await.expect("event stream ended");
+
+        match event {
+            OpencodeEvent::MessagePartUpdated { session_id, part } => {
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(part.get("text").and_then(Value::as_str), Some("hello"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_kill_clears_child() {
+        #[cfg(unix)]
+        let command = "sh";
+        #[cfg(windows)]
+        let command = "cmd";
+
+        let mut child_cmd = Command::new(command);
+        #[cfg(unix)]
+        child_cmd.arg("-c").arg("sleep 30");
+        #[cfg(windows)]
+        child_cmd.arg("/C").arg("ping -n 30 127.0.0.1 > NUL");
+
+        let child = child_cmd.spawn().unwrap();
+        let mut server = OpencodeServer {
+            child: Mutex::new(Some(child)),
+            base_url: "http://127.0.0.1:0".to_string(),
+            client: reqwest::Client::new(),
+            _stderr_task: None,
+        };
+
+        server.kill().await;
+
+        let guard = server.child.lock().await;
+        assert!(guard.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local `opencode` binary in PATH"]
+    async fn test_spawn_with_real_opencode_binary() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut server = OpencodeServer::spawn("opencode", temp_dir.path())
+            .await
+            .unwrap();
+        let health = server.health().await.unwrap();
+        assert!(health.healthy);
+        server.kill().await;
     }
 }
