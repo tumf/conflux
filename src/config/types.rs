@@ -4,6 +4,8 @@
 //! merge/validation/accessor methods. File I/O is handled by the sibling `load`
 //! module.
 
+use std::collections::HashMap;
+
 use crate::error::{OrchestratorError, Result};
 use crate::hooks::HooksConfig;
 use crate::vcs::VcsBackend;
@@ -343,6 +345,58 @@ pub struct OrchestratorConfig {
     /// Default: true
     #[serde(default)]
     pub command_strict_process_cleanup: Option<bool>,
+
+    /// Proposal session configuration (ACP-based interactive proposal creation).
+    #[serde(default)]
+    pub proposal_session: Option<ProposalSessionConfig>,
+}
+
+// ── ProposalSessionConfig ──────────────────────────────────────────────────
+
+/// Configuration for proposal sessions (ACP-based interactive proposal creation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalSessionConfig {
+    /// ACP subprocess command (default: "opencode")
+    #[serde(default = "default_proposal_acp_command")]
+    pub acp_command: String,
+
+    /// Arguments passed to the ACP command (default: ["acp"])
+    #[serde(default = "default_proposal_acp_args")]
+    pub acp_args: Vec<String>,
+
+    /// Additional environment variables for the ACP subprocess
+    #[serde(default)]
+    pub acp_env: HashMap<String, String>,
+
+    /// Inactivity timeout in seconds before ACP process is killed (default: 1800)
+    #[serde(default = "default_proposal_session_inactivity_timeout_secs")]
+    pub session_inactivity_timeout_secs: u64,
+}
+
+fn default_proposal_acp_command() -> String {
+    defaults::DEFAULT_PROPOSAL_ACP_COMMAND.to_string()
+}
+
+fn default_proposal_acp_args() -> Vec<String> {
+    defaults::DEFAULT_PROPOSAL_ACP_ARGS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn default_proposal_session_inactivity_timeout_secs() -> u64 {
+    defaults::DEFAULT_PROPOSAL_SESSION_INACTIVITY_TIMEOUT_SECS
+}
+
+impl Default for ProposalSessionConfig {
+    fn default() -> Self {
+        Self {
+            acp_command: default_proposal_acp_command(),
+            acp_args: default_proposal_acp_args(),
+            acp_env: HashMap::new(),
+            session_inactivity_timeout_secs: default_proposal_session_inactivity_timeout_secs(),
+        }
+    }
 }
 
 // ── ServerAuthMode ─────────────────────────────────────────────────────────
@@ -726,6 +780,11 @@ impl OrchestratorConfig {
         // acceptance_prompt_mode
         if other.acceptance_prompt_mode.is_some() {
             self.acceptance_prompt_mode = other.acceptance_prompt_mode;
+        }
+
+        // Proposal session config
+        if other.proposal_session.is_some() {
+            self.proposal_session = other.proposal_session;
         }
     }
 
