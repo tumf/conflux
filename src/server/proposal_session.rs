@@ -5,6 +5,7 @@
 //! `opencode acp --cwd <worktree_path>` subprocess for conversational proposal generation.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -205,6 +206,21 @@ impl ProposalSessionManager {
             transport_args.push(worktree_path.display().to_string());
         }
         acp_config.transport_args = transport_args;
+
+        if let Some(default_config_path) =
+            inject_default_opencode_config_if_missing(&mut acp_config, repo_root)?
+        {
+            info!(
+                session_id = %session_id,
+                opencode_config = %default_config_path.display(),
+                "Injected default OPENCODE_CONFIG for proposal ACP session"
+            );
+        } else {
+            debug!(
+                session_id = %session_id,
+                "Using explicitly configured OPENCODE_CONFIG from proposal_session.transport_env"
+            );
+        }
 
         let acp_client = AcpClient::spawn(&acp_config, &worktree_path)
             .await
@@ -724,6 +740,68 @@ fn generate_session_id() -> String {
     format!("ps-{:016x}", id)
 }
 
+const OPENCODE_CONFIG_ENV_KEY: &str = "OPENCODE_CONFIG";
+const OPENCODE_PROPOSAL_CONFIG_FILENAME: &str = "opencode-proposal.jsonc";
+const OPENCODE_PROPOSAL_CONFIG_CONTENT: &str = r#"{
+  "$schema": "https://opencode.ai/config.json",
+  "mode": "spec"
+}
+"#;
+
+fn proposal_session_data_dir(repo_root: &Path) -> PathBuf {
+    repo_root
+        .ancestors()
+        .nth(3)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| repo_root.to_path_buf())
+}
+
+fn ensure_default_opencode_proposal_config(
+    data_dir: &Path,
+) -> Result<PathBuf, ProposalSessionError> {
+    let config_path = data_dir.join(OPENCODE_PROPOSAL_CONFIG_FILENAME);
+    if config_path.exists() {
+        return Ok(config_path);
+    }
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            ProposalSessionError::Git(format!(
+                "Failed to create OPENCODE_CONFIG parent directory '{}': {}",
+                parent.display(),
+                e
+            ))
+        })?;
+    }
+
+    fs::write(&config_path, OPENCODE_PROPOSAL_CONFIG_CONTENT).map_err(|e| {
+        ProposalSessionError::Git(format!(
+            "Failed to write default OPENCODE_CONFIG file '{}': {}",
+            config_path.display(),
+            e
+        ))
+    })?;
+
+    Ok(config_path)
+}
+
+fn inject_default_opencode_config_if_missing(
+    config: &mut ProposalSessionConfig,
+    repo_root: &Path,
+) -> Result<Option<PathBuf>, ProposalSessionError> {
+    if config.transport_env.contains_key(OPENCODE_CONFIG_ENV_KEY) {
+        return Ok(None);
+    }
+
+    let data_dir = proposal_session_data_dir(repo_root);
+    let default_config_path = ensure_default_opencode_proposal_config(&data_dir)?;
+    config.transport_env.insert(
+        OPENCODE_CONFIG_ENV_KEY.to_string(),
+        default_config_path.display().to_string(),
+    );
+    Ok(Some(default_config_path))
+}
+
 /// Extract the title from a proposal.md file (first `# ` heading).
 fn extract_proposal_title(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
@@ -819,6 +897,87 @@ mod tests {
     fn test_extract_proposal_title_missing_file() {
         let title = extract_proposal_title(Path::new("/nonexistent/proposal.md"));
         assert!(title.is_none());
+    }
+
+    #[test]
+    fn test_ensure_default_opencode_proposal_config_creates_file() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = ensure_default_opencode_proposal_config(temp_dir.path()).unwrap();
+
+        assert_eq!(
+            config_path,
+            temp_dir.path().join(OPENCODE_PROPOSAL_CONFIG_FILENAME)
+        );
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(content, OPENCODE_PROPOSAL_CONFIG_CONTENT);
+    }
+
+    #[test]
+    fn test_ensure_default_opencode_proposal_config_is_idempotent() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = ensure_default_opencode_proposal_config(temp_dir.path()).unwrap();
+        std::fs::write(&config_path, "custom-content\n").unwrap();
+
+        let second_path = ensure_default_opencode_proposal_config(temp_dir.path()).unwrap();
+
+        assert_eq!(second_path, config_path);
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(content, "custom-content\n");
+    }
+
+    #[test]
+    fn test_inject_default_opencode_config_if_missing_sets_env() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let repo_root = temp_dir
+            .path()
+            .join("worktrees")
+            .join("project")
+            .join("main");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let mut config = ProposalSessionConfig::default();
+
+        let injected = inject_default_opencode_config_if_missing(&mut config, &repo_root).unwrap();
+
+        let expected_path = temp_dir.path().join(OPENCODE_PROPOSAL_CONFIG_FILENAME);
+        assert_eq!(injected, Some(expected_path.clone()));
+        assert_eq!(
+            config
+                .transport_env
+                .get(OPENCODE_CONFIG_ENV_KEY)
+                .map(String::as_str),
+            Some(expected_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn test_inject_default_opencode_config_if_missing_respects_override() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let repo_root = temp_dir
+            .path()
+            .join("worktrees")
+            .join("project")
+            .join("main");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let mut config = ProposalSessionConfig::default();
+        config.transport_env.insert(
+            OPENCODE_CONFIG_ENV_KEY.to_string(),
+            "/custom/config.jsonc".to_string(),
+        );
+
+        let injected = inject_default_opencode_config_if_missing(&mut config, &repo_root).unwrap();
+
+        assert!(injected.is_none());
+        assert_eq!(
+            config
+                .transport_env
+                .get(OPENCODE_CONFIG_ENV_KEY)
+                .map(String::as_str),
+            Some("/custom/config.jsonc")
+        );
+        assert!(!temp_dir
+            .path()
+            .join(OPENCODE_PROPOSAL_CONFIG_FILENAME)
+            .exists());
     }
 
     #[test]
