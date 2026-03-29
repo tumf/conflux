@@ -16,13 +16,14 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::execution::state::{detect_workspace_state, WorkspaceState};
 use crate::remote::types::{RemoteChange, RemoteLogEntry, RemoteProject, RemoteStateUpdate};
 use crate::server::active_commands::{
     ActiveCommandGuard, RootKind, SharedActiveCommands, WorktreeRootKey,
 };
+use crate::server::db::ServerDb;
 use crate::server::proposal_session::{ProposalSessionError, SharedProposalSessionManager};
 use crate::server::registry::{
     server_worktree_branch, OrchestrationStatus, ProjectEntry, ProjectStatus, SharedRegistry,
@@ -43,6 +44,7 @@ pub const SERVER_LOG_BUFFER_SIZE: usize = 1000;
 pub struct AppState {
     pub registry: SharedRegistry,
     pub runners: SharedRunners,
+    pub db: Option<Arc<ServerDb>>,
     /// Optional bearer token for authentication (None = no auth required)
     pub auth_token: Option<String>,
     /// Maximum concurrent total (informational; actual semaphore is in registry)
@@ -190,6 +192,35 @@ struct ProjectsStateResponse {
     projects: Vec<RemoteProject>,
     /// Whether git/sync is available (resolve_command is configured)
     sync_available: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct StatsOverviewResponse {
+    success_count: i64,
+    failure_count: i64,
+    average_duration_ms: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    #[serde(default = "default_history_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    #[serde(default = "default_logs_limit")]
+    limit: usize,
+    before: Option<String>,
+    project_id: Option<String>,
+}
+
+fn default_history_limit() -> usize {
+    100
+}
+
+fn default_logs_limit() -> usize {
+    100
 }
 
 // ─────────────────────────────── /api/v1/version ──────────────────────────────
@@ -990,6 +1021,12 @@ pub async fn delete_project(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
 ) -> Response {
+    if let Some(db) = &state.db {
+        if let Err(e) = db.delete_change_states_for_project(&project_id) {
+            warn!(project_id = %project_id, error = %e, "Failed to clear persisted change states before deleting project");
+        }
+    }
+
     let mut registry = state.registry.write().await;
     match registry.remove(&project_id) {
         Ok(_) => {
@@ -1028,11 +1065,28 @@ fn build_resolve_command_argv(
         .collect())
 }
 
+fn emit_log_entry(state: &AppState, entry: RemoteLogEntry) {
+    if let Some(db) = &state.db {
+        if let Err(e) = db.insert_log(
+            entry.project_id.as_deref(),
+            &entry.level,
+            &entry.message,
+            entry.change_id.as_deref(),
+            entry.operation.as_deref(),
+            entry.iteration.map(i64::from),
+        ) {
+            error!(error = %e, "Failed to persist server log entry");
+        }
+    }
+
+    let _ = state.log_tx.send(entry);
+}
+
 async fn run_resolve_command(
     resolve_command_template: &str,
     work_dir: &std::path::Path,
     prompt: &str,
-    log_tx: Option<&tokio::sync::broadcast::Sender<RemoteLogEntry>>,
+    state: Option<&AppState>,
     project_id: Option<&str>,
 ) -> (bool, Option<i32>) {
     // Use the shared placeholder expansion from config::expand, which handles
@@ -1046,16 +1100,19 @@ async fn run_resolve_command(
     );
 
     // Send start event to project log
-    if let (Some(tx), Some(pid)) = (log_tx, project_id) {
-        let _ = tx.send(RemoteLogEntry {
-            message: format!("resolve_command started: {}", command_str),
-            level: "info".to_string(),
-            change_id: None,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            project_id: Some(pid.to_string()),
-            operation: Some("resolve".to_string()),
-            iteration: None,
-        });
+    if let (Some(state), Some(pid)) = (state, project_id) {
+        emit_log_entry(
+            state,
+            RemoteLogEntry {
+                message: format!("resolve_command started: {}", command_str),
+                level: "info".to_string(),
+                change_id: None,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                project_id: Some(pid.to_string()),
+                operation: Some("resolve".to_string()),
+                iteration: None,
+            },
+        );
     }
 
     let mut cmd = crate::shell_command::build_login_shell_command(&command_str);
@@ -1070,16 +1127,19 @@ async fn run_resolve_command(
                 "Failed to run resolve_command '{}': {}",
                 resolve_command_template, e
             );
-            if let (Some(tx), Some(pid)) = (log_tx, project_id) {
-                let _ = tx.send(RemoteLogEntry {
-                    message: format!("resolve_command failed to start: {}", e),
-                    level: "error".to_string(),
-                    change_id: None,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    project_id: Some(pid.to_string()),
-                    operation: Some("resolve".to_string()),
-                    iteration: None,
-                });
+            if let (Some(state), Some(pid)) = (state, project_id) {
+                emit_log_entry(
+                    state,
+                    RemoteLogEntry {
+                        message: format!("resolve_command failed to start: {}", e),
+                        level: "error".to_string(),
+                        change_id: None,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        project_id: Some(pid.to_string()),
+                        operation: Some("resolve".to_string()),
+                        iteration: None,
+                    },
+                );
             }
             return (true, Some(-1));
         }
@@ -1097,55 +1157,62 @@ async fn run_resolve_command(
         }
     };
 
-    // Stream stdout lines
-    if let (Some(tx), Some(pid)) = (log_tx, project_id) {
+    // Stream stdout/stderr lines and completion event to project log
+    if let (Some(state), Some(pid)) = (state, project_id) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             if !line.is_empty() {
-                let _ = tx.send(RemoteLogEntry {
-                    message: line.to_string(),
-                    level: "info".to_string(),
-                    change_id: None,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    project_id: Some(pid.to_string()),
-                    operation: Some("resolve".to_string()),
-                    iteration: None,
-                });
+                emit_log_entry(
+                    state,
+                    RemoteLogEntry {
+                        message: line.to_string(),
+                        level: "info".to_string(),
+                        change_id: None,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        project_id: Some(pid.to_string()),
+                        operation: Some("resolve".to_string()),
+                        iteration: None,
+                    },
+                );
             }
         }
 
-        // Stream stderr lines
         let stderr = String::from_utf8_lossy(&output.stderr);
         for line in stderr.lines() {
             if !line.is_empty() {
-                let _ = tx.send(RemoteLogEntry {
-                    message: line.to_string(),
-                    level: "warn".to_string(),
-                    change_id: None,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    project_id: Some(pid.to_string()),
-                    operation: Some("resolve".to_string()),
-                    iteration: None,
-                });
+                emit_log_entry(
+                    state,
+                    RemoteLogEntry {
+                        message: line.to_string(),
+                        level: "warn".to_string(),
+                        change_id: None,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        project_id: Some(pid.to_string()),
+                        operation: Some("resolve".to_string()),
+                        iteration: None,
+                    },
+                );
             }
         }
 
-        // Send completion event
         let exit_code = output.status.code();
         let level = if output.status.success() {
             "success"
         } else {
             "error"
         };
-        let _ = tx.send(RemoteLogEntry {
-            message: format!("resolve_command finished: exit_code={:?}", exit_code),
-            level: level.to_string(),
-            change_id: None,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            project_id: Some(pid.to_string()),
-            operation: Some("resolve".to_string()),
-            iteration: None,
-        });
+        emit_log_entry(
+            state,
+            RemoteLogEntry {
+                message: format!("resolve_command finished: exit_code={:?}", exit_code),
+                level: level.to_string(),
+                change_id: None,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                project_id: Some(pid.to_string()),
+                operation: Some("resolve".to_string()),
+                iteration: None,
+            },
+        );
     }
 
     (true, output.status.code())
@@ -1520,7 +1587,7 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
         &resolve_command,
         &local_repo_path,
         &resolve_prompt,
-        Some(&state.log_tx),
+        Some(&state),
         Some(&project_id),
     )
     .await;
@@ -1630,7 +1697,24 @@ pub async fn toggle_change_selection(
     if new_selected {
         registry.clear_change_error(&project_id, &change_id);
     }
+
+    if let Some(db) = &state.db {
+        let error_message = registry
+            .error_changes_for_project(&project_id)
+            .and_then(|m| m.get(&change_id))
+            .map(std::string::String::as_str);
+        if let Err(e) = db.upsert_change_state(&project_id, &change_id, new_selected, error_message)
+        {
+            error!(project_id = %project_id, change_id = %change_id, error = %e, "Failed to persist change toggle state");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to persist change state: {}", e),
+            );
+        }
+    }
+
     info!(
+
         project_id = %project_id,
         change_id = %change_id,
         selected = new_selected,
@@ -1668,7 +1752,26 @@ pub async fn toggle_all_change_selection(
 
     let new_selected = registry.toggle_all_changes(&project_id, &change_ids);
 
+    if let Some(db) = &state.db {
+        for change_id in &change_ids {
+            let selected = registry.is_change_selected(&project_id, change_id);
+            let error_message = registry
+                .error_changes_for_project(&project_id)
+                .and_then(|m| m.get(change_id))
+                .map(std::string::String::as_str);
+            if let Err(e) = db.upsert_change_state(&project_id, change_id, selected, error_message)
+            {
+                error!(project_id = %project_id, change_id = %change_id, error = %e, "Failed to persist toggle-all change state");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to persist change state: {}", e),
+                );
+            }
+        }
+    }
+
     info!(
+
         project_id = %project_id,
         selected = new_selected,
         count = change_ids.len(),
@@ -1768,6 +1871,7 @@ pub async fn global_control_run(State(state): State<AppState>) -> Response {
             if let Err(e) = crate::server::runner::start_project_run(
                 &state.runners,
                 state.registry.clone(),
+                state.db.clone(),
                 req,
                 state.log_tx.clone(),
             )
@@ -1871,6 +1975,87 @@ pub async fn global_control_status(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+/// GET /api/v1/stats/overview - 全プロジェクトの成功/失敗数と平均処理時間を返す
+async fn get_stats_overview(State(state): State<AppState>) -> Response {
+    let Some(db) = &state.db else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server database is not enabled",
+        );
+    };
+
+    match db.get_stats_overview() {
+        Ok(stats) => (
+            StatusCode::OK,
+            Json(StatsOverviewResponse {
+                success_count: stats.success_count,
+                failure_count: stats.failure_count,
+                average_duration_ms: stats.average_duration_ms,
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            error!(error = %e, "Failed to query stats overview");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to query stats overview: {}", e),
+            )
+        }
+    }
+}
+
+/// GET /api/v1/stats/projects/:id/history - プロジェクト履歴イベントを返す
+async fn get_project_history(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    let Some(db) = &state.db else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server database is not enabled",
+        );
+    };
+
+    if state.registry.read().await.get(&project_id).is_none() {
+        return error_response(StatusCode::NOT_FOUND, "Project not found");
+    }
+
+    let limit = query.limit.clamp(1, 1000);
+    match db.get_recent_events(&project_id, limit) {
+        Ok(events) => (StatusCode::OK, Json(events)).into_response(),
+        Err(e) => {
+            error!(project_id = %project_id, error = %e, "Failed to query project history");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to query project history: {}", e),
+            )
+        }
+    }
+}
+
+/// GET /api/v1/logs - 永続化ログの検索
+async fn get_logs(State(state): State<AppState>, Query(query): Query<LogsQuery>) -> Response {
+    let Some(db) = &state.db else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server database is not enabled",
+        );
+    };
+
+    let limit = query.limit.clamp(1, 1000);
+    match db.query_logs(limit, query.before.as_deref(), query.project_id.as_deref()) {
+        Ok(entries) => (StatusCode::OK, Json(entries)).into_response(),
+        Err(e) => {
+            error!(error = %e, "Failed to query persisted logs");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to query logs: {}", e),
+            )
+        }
+    }
+}
+
 /// List change IDs in a project worktree that should be included in the next run.
 /// Error changes are excluded unless they have been explicitly re-marked.
 async fn list_selected_change_ids_in_worktree(
@@ -1921,6 +2106,7 @@ async fn start_single_project_run(
     crate::server::runner::start_project_run(
         &state.runners,
         state.registry.clone(),
+        state.db.clone(),
         req,
         state.log_tx.clone(),
     )
@@ -3547,6 +3733,9 @@ pub fn build_router(app_state: AppState) -> Router {
     let authenticated_routes = Router::new()
         .route("/projects", get(list_projects).post(add_project))
         .route("/projects/state", get(projects_state))
+        .route("/stats/overview", get(get_stats_overview))
+        .route("/stats/projects/{id}/history", get(get_project_history))
+        .route("/logs", get(get_logs))
         .route("/projects/{id}", delete(delete_project))
         .route("/projects/{id}/git/pull", post(git_pull))
         .route("/projects/{id}/git/push", post(git_push))
@@ -3658,6 +3847,7 @@ mod tests {
         AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
+            db: None,
             auth_token: auth_token.map(|s| s.to_string()),
             max_concurrent_total: 4,
             resolve_command: None,
@@ -3676,6 +3866,12 @@ mod tests {
 
     fn make_router(temp_dir: &TempDir, auth_token: Option<&str>) -> Router {
         build_router(make_state(temp_dir, auth_token))
+    }
+
+    fn make_router_with_db(temp_dir: &TempDir, auth_token: Option<&str>) -> Router {
+        let mut state = make_state(temp_dir, auth_token);
+        state.db = Some(crate::server::db::ServerDb::new(temp_dir.path()).unwrap());
+        build_router(state)
     }
 
     // ── Auth tests ──
@@ -4103,6 +4299,7 @@ mod tests {
         AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
+            db: None,
             auth_token: auth_token.map(|s| s.to_string()),
             max_concurrent_total: max_concurrent,
             resolve_command: None,
@@ -5226,6 +5423,7 @@ mod tests {
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
+            db: None,
             auth_token: None,
             max_concurrent_total: 4,
             resolve_command: Some("echo resolve".to_string()),
@@ -5380,6 +5578,7 @@ mod tests {
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
+            db: None,
             auth_token: None,
             max_concurrent_total: 4,
             // This resolve_command now comes from top-level config (not server.resolve_command)
@@ -5757,6 +5956,7 @@ mod tests {
         let state_with_project = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
+            db: None,
             auth_token: None,
             max_concurrent_total: 4,
             resolve_command: None, // Not configured — must cause 422
@@ -5822,6 +6022,7 @@ mod tests {
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
+            db: None,
             auth_token: None,
             max_concurrent_total: 4,
             resolve_command: None, // Will trigger 422 (resolve_command not configured)
@@ -5881,6 +6082,7 @@ mod tests {
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
+            db: None,
             auth_token: None,
             max_concurrent_total: 4,
             resolve_command: Some("true".to_string()),
@@ -5965,6 +6167,7 @@ mod tests {
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
+            db: None,
             auth_token: None,
             max_concurrent_total: 4,
             resolve_command: Some("false".to_string()),
@@ -6047,6 +6250,7 @@ mod tests {
         let state = AppState {
             registry: registry.clone(),
             runners: crate::server::runner::create_shared_runners(),
+            db: None,
             auth_token: None,
             max_concurrent_total: 4,
             resolve_command: Some("true".to_string()),
@@ -6233,6 +6437,110 @@ mod tests {
             Some("synced"),
             "Status must be synced"
         );
+    }
+
+    /// Regression: when remote gets new commits after initial clone, git/sync
+    /// must run resolve_command on the next sync based on pre-pull SHA mismatch.
+    #[tokio::test]
+    async fn test_git_sync_runs_resolve_when_remote_ahead() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
+        let project_id = {
+            let mut reg = registry.write().await;
+            let entry = reg.add(remote_url.clone(), "main".to_string()).unwrap();
+            entry.id.clone()
+        };
+
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state = AppState {
+            registry,
+            runners: crate::server::runner::create_shared_runners(),
+            db: None,
+            auth_token: None,
+            max_concurrent_total: 4,
+            resolve_command: Some("true".to_string()),
+            log_tx,
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
+            terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                ),
+        };
+        let router = build_router(state);
+
+        // Initial sync to establish local bare clone.
+        let initial_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/projects/{}/git/sync", project_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial_resp.status(), StatusCode::OK);
+
+        // Push one new commit to remote.
+        let scratch = temp_dir.path().join("scratch-work-remote-ahead");
+        std::process::Command::new("git")
+            .args(["clone", origin.to_str().unwrap(), scratch.to_str().unwrap()])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+        std::fs::write(scratch.join("remote-change.txt"), "new remote commit").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "remote change"])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["push", "origin", "main"])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+
+        // Next sync must run resolve due to pre-pull mismatch.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/projects/{}/git/sync", project_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"].as_str(), Some("synced"));
     }
 
     // ── Worktree API routing tests ──
@@ -6889,6 +7197,145 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "File content endpoint should require authentication"
         );
+    }
+
+    #[tokio::test]
+    async fn test_stats_and_logs_endpoints_require_auth() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router_with_db(&temp_dir, Some("secret-token"));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/stats/overview")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/logs")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_stats_and_logs_endpoints_return_data() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let router = make_router_with_db(&temp_dir, None);
+
+        let add_body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+        let add_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(add_body.to_string()))
+            .unwrap();
+        let add_resp = router.clone().oneshot(add_req).await.unwrap();
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+
+        let body_bytes = axum::body::to_bytes(add_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let project_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let project_id = project_json["id"].as_str().unwrap();
+
+        let db = crate::server::db::ServerDb::new(temp_dir.path()).unwrap();
+        db.insert_change_event(
+            project_id,
+            "change-1",
+            None,
+            "apply",
+            1,
+            true,
+            1234,
+            Some(0),
+            None,
+            Some("ok"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_log(
+            Some(project_id),
+            "info",
+            "persisted-log",
+            Some("change-1"),
+            Some("apply"),
+            Some(1),
+        )
+        .unwrap();
+
+        let overview_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/stats/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(overview_resp.status(), StatusCode::OK);
+
+        let overview_body = axum::body::to_bytes(overview_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let overview_json: serde_json::Value = serde_json::from_slice(&overview_body).unwrap();
+        assert_eq!(overview_json["success_count"], 1);
+        assert_eq!(overview_json["failure_count"], 0);
+
+        let history_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/v1/stats/projects/{}/history?limit=10",
+                        project_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history_resp.status(), StatusCode::OK);
+
+        let history_body = axum::body::to_bytes(history_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let history_json: serde_json::Value = serde_json::from_slice(&history_body).unwrap();
+        assert!(!history_json.as_array().unwrap().is_empty());
+
+        let logs_resp = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/logs?project_id={}&limit=10", project_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logs_resp.status(), StatusCode::OK);
+
+        let logs_body = axum::body::to_bytes(logs_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let logs_json: serde_json::Value = serde_json::from_slice(&logs_body).unwrap();
+        assert!(!logs_json.as_array().unwrap().is_empty());
     }
 
     /// Verify the proposal-session WebSocket route is registered at the

@@ -12,6 +12,7 @@
 pub mod acp_client;
 pub mod active_commands;
 pub mod api;
+pub mod db;
 pub mod opencode_client;
 pub mod proposal_session;
 pub mod registry;
@@ -21,10 +22,11 @@ pub mod terminal;
 use std::io::Write;
 use std::net::SocketAddr;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{ProposalSessionConfig, ServerConfig};
 use crate::error::Result;
+use crate::server::db::ServerDb;
 
 fn server_base_url(bind: &str, actual_port: u16) -> String {
     crate::web::build_access_url(bind, actual_port)
@@ -46,6 +48,25 @@ pub async fn run_server(
     // Build the shared registry.
     let registry = registry::create_shared_registry(&config.data_dir, config.max_concurrent_total)?;
 
+    // Initialize persistent server database.
+    let db = ServerDb::new(&config.data_dir)?;
+    if let Err(e) = db.cleanup_old_logs(30) {
+        warn!(error = %e, "Failed to run startup log cleanup");
+    }
+
+    // Restore persisted change states into registry.
+    {
+        let mut reg = registry.write().await;
+        for row in db.load_change_states()? {
+            reg.set_change_state(
+                &row.project_id,
+                &row.change_id,
+                row.selected,
+                row.error_message,
+            );
+        }
+    }
+
     // In-memory runners map (per-project execution).
     let runners = runner::create_shared_runners();
 
@@ -65,6 +86,7 @@ pub async fn run_server(
     let app_state = api::AppState {
         registry,
         runners,
+        db: Some(db.clone()),
         auth_token,
         max_concurrent_total: config.max_concurrent_total,
         resolve_command,
@@ -123,6 +145,19 @@ pub async fn run_server(
             interval.tick().await;
             let mut manager = psm_for_scanner.write().await;
             manager.scan_timeouts().await;
+        }
+    });
+
+    // Start daily log cleanup task (keep 30 days).
+    let db_for_cleanup = db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+        loop {
+            interval.tick().await;
+            match db_for_cleanup.cleanup_old_logs(30) {
+                Ok(deleted) => info!(deleted, "Completed periodic log cleanup"),
+                Err(e) => warn!(error = %e, "Failed periodic log cleanup"),
+            }
         }
     });
 
