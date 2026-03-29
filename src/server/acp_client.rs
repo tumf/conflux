@@ -3,7 +3,7 @@
 //! Wraps a single ACP subprocess, providing typed methods for the initialize
 //! handshake, session lifecycle, and message relay.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -21,11 +21,19 @@ use tracing::{debug, error, info, warn};
 /// login-shell PATH (which includes directories like `~/.bun/bin`, `~/.cargo/bin`).
 ///
 /// Returns the absolute path on success, or the original command string as fallback.
-async fn resolve_command_path(command: &str) -> String {
-    // Absolute path — use directly.
+/// Resolved command info including the login shell PATH.
+struct ResolvedCommand {
+    command: String,
+    login_shell_path: Option<String>,
+}
+
+async fn resolve_command_path(command: &str) -> ResolvedCommand {
     if command.starts_with('/') {
         debug!(command = %command, "ACP command is absolute, skipping resolution");
-        return command.to_string();
+        return ResolvedCommand {
+            command: command.to_string(),
+            login_shell_path: resolve_login_shell_path().await,
+        };
     }
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -47,7 +55,7 @@ async fn resolve_command_path(command: &str) -> String {
         .output()
         .await;
 
-    match result {
+    let resolved_cmd = match result {
         Ok(output) if output.status.success() => {
             let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if resolved.is_empty() {
@@ -82,6 +90,36 @@ async fn resolve_command_path(command: &str) -> String {
             );
             command.to_string()
         }
+    };
+
+    ResolvedCommand {
+        command: resolved_cmd,
+        login_shell_path: resolve_login_shell_path().await,
+    }
+}
+
+async fn resolve_login_shell_path() -> Option<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let result = tokio::process::Command::new(&shell)
+        .arg("-l")
+        .arg("-c")
+        .arg("echo $PATH")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if path.is_empty() {
+                None
+            } else {
+                Some(path)
+            }
+        }
+        _ => None,
     }
 }
 
@@ -189,6 +227,8 @@ pub struct AcpClient {
     child: Mutex<Option<Child>>,
     /// Whether the ACP session has been initialized.
     initialized: Mutex<bool>,
+    /// Working directory for this ACP subprocess.
+    working_dir: PathBuf,
 }
 
 impl AcpClient {
@@ -198,30 +238,33 @@ impl AcpClient {
         working_dir: &Path,
     ) -> Result<Arc<Self>, AcpError> {
         // Resolve relative command names to absolute paths via login shell PATH.
-        let resolved_command = resolve_command_path(&config.acp_command).await;
+        let resolved = resolve_command_path(&config.acp_command).await;
 
         info!(
             cmd = %config.acp_command,
-            resolved_cmd = %resolved_command,
+            resolved_cmd = %resolved.command,
             args = ?config.acp_args,
             cwd = %working_dir.display(),
             "Spawning ACP subprocess"
         );
 
-        let mut cmd = Command::new(&resolved_command);
+        let mut cmd = Command::new(&resolved.command);
         cmd.args(&config.acp_args)
             .current_dir(working_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        // Set additional environment variables
+        if let Some(ref login_path) = resolved.login_shell_path {
+            cmd.env("PATH", login_path);
+        }
+
         for (key, value) in &config.acp_env {
             cmd.env(key, value);
         }
 
         let mut child = cmd.spawn().map_err(|e| AcpError::SpawnFailed {
-            command: resolved_command.clone(),
+            command: resolved.command.clone(),
             reason: e.to_string(),
         })?;
 
@@ -327,6 +370,7 @@ impl AcpClient {
             response_rx: Mutex::new(response_rx),
             child: Mutex::new(Some(child)),
             initialized: Mutex::new(false),
+            working_dir: working_dir.to_path_buf(),
         });
 
         Ok(client)
@@ -349,9 +393,6 @@ impl AcpClient {
 
         let result = self.send_request("initialize", Some(params)).await?;
 
-        // Send initialized notification
-        self.send_notification("initialized", None).await?;
-
         let mut init = self.initialized.lock().await;
         *init = true;
 
@@ -361,14 +402,22 @@ impl AcpClient {
 
     /// Create a new ACP session, returning the session ID.
     pub async fn create_session(&self) -> Result<String, AcpError> {
+        let cwd = self.working_dir.to_str().unwrap_or(".").to_string();
+
         let result = self
-            .send_request("session/create", Some(serde_json::json!({})))
+            .send_request(
+                "session/new",
+                Some(serde_json::json!({
+                    "cwd": cwd,
+                    "mcpServers": []
+                })),
+            )
             .await?;
 
         let session_id = result
-            .get("id")
+            .get("sessionId")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| AcpError::Protocol("session/create response missing 'id'".into()))?
+            .ok_or_else(|| AcpError::Protocol("session/new response missing 'sessionId'".into()))?
             .to_string();
 
         info!(acp_session_id = %session_id, "ACP session created");
@@ -562,27 +611,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_command_path_absolute_unchanged() {
-        // Absolute paths should be returned as-is without running `which`.
         let result = resolve_command_path("/usr/bin/echo").await;
-        assert_eq!(result, "/usr/bin/echo");
+        assert_eq!(result.command, "/usr/bin/echo");
     }
 
     #[tokio::test]
     async fn test_resolve_command_path_relative_resolves() {
-        // `cat` is universally available as a file (not a shell builtin).
         let result = resolve_command_path("cat").await;
         assert!(
-            result.starts_with('/'),
+            result.command.starts_with('/'),
             "Expected absolute path for 'cat', got: {}",
-            result
+            result.command
         );
     }
 
     #[tokio::test]
     async fn test_resolve_command_path_fallback() {
-        // A non-existent command should fall back to the original name.
         let result = resolve_command_path("nonexistent-binary-xyz-12345").await;
-        assert_eq!(result, "nonexistent-binary-xyz-12345");
+        assert_eq!(result.command, "nonexistent-binary-xyz-12345");
     }
 
     #[test]

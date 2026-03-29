@@ -30,20 +30,19 @@ for raw in sys.stdin:
                 "jsonrpc": "2.0",
                 "id": msg_id,
                 "result": {
-                    "protocolVersion": "2025-01-24",
-                    "serverInfo": {"name": "mock-acp", "version": "1.0.0"},
-                    "capabilities": {"elicitation": {"form": {}}},
+                    "protocolVersion": 1,
+                    "agentInfo": {"name": "mock-acp", "version": "1.0.0"},
+                    "agentCapabilities": {"elicitation": {"form": {}}},
                 },
             }
         )
         continue
 
-    if method == "initialized":
-        continue
-
-    if method == "session/create" and msg_id is not None:
+    if method == "session/new" and msg_id is not None:
         session_created = True
-        send({"jsonrpc": "2.0", "id": msg_id, "result": {"id": "mock-session-1"}})
+        send(
+            {"jsonrpc": "2.0", "id": msg_id, "result": {"sessionId": "mock-session-1"}}
+        )
         continue
 
     if method == "session/prompt":
