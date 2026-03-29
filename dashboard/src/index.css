@@ -41,3 +41,39 @@ body {
   display: flex;
   flex-direction: column;
 }
+
+/* --- ANSI color classes for log rendering (ansi-up useClasses mode) --- */
+
+/* Standard 8 colors – tuned for dark background readability */
+.ansi-black-fg   { color: #6b7280; }
+.ansi-red-fg     { color: #f87171; }
+.ansi-green-fg   { color: #4ade80; }
+.ansi-yellow-fg  { color: #facc15; }
+.ansi-blue-fg    { color: #60a5fa; }
+.ansi-magenta-fg { color: #c084fc; }
+.ansi-cyan-fg    { color: #22d3ee; }
+.ansi-white-fg   { color: #e4e4e7; }
+
+/* Bright / bold variants */
+.ansi-bright-black-fg   { color: #9ca3af; }
+.ansi-bright-red-fg     { color: #fca5a5; }
+.ansi-bright-green-fg   { color: #86efac; }
+.ansi-bright-yellow-fg  { color: #fde68a; }
+.ansi-bright-blue-fg    { color: #93c5fd; }
+.ansi-bright-magenta-fg { color: #d8b4fe; }
+.ansi-bright-cyan-fg    { color: #67e8f9; }
+.ansi-bright-white-fg   { color: #ffffff; }
+
+/* Background colors */
+.ansi-black-bg   { background-color: #1f2937; }
+.ansi-red-bg     { background-color: #991b1b; }
+.ansi-green-bg   { background-color: #166534; }
+.ansi-yellow-bg  { background-color: #854d0e; }
+.ansi-blue-bg    { background-color: #1e40af; }
+.ansi-magenta-bg { background-color: #7e22ce; }
+.ansi-cyan-bg    { background-color: #155e75; }
+.ansi-white-bg   { background-color: #d4d4d8; }
+
+/* Text decorations (custom – ansi-up does not emit these) */
+.ansi-bold      { font-weight: bold; }
+.ansi-underline { text-decoration: underline; }
