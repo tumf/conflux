@@ -1,16 +1,18 @@
 import React from 'react';
-import { RefreshCw, Trash2 } from 'lucide-react';
-import { RemoteProject } from '../api/types';
+import { RefreshCw, Loader2, Trash2 } from 'lucide-react';
+import { RemoteProject, ActiveCommand } from '../api/types';
 
 interface ProjectCardProps {
   project: RemoteProject;
   isSelected: boolean;
-  onSelect: (projectId: string) => void;
+  onSelect: (projectId: string | null) => void;
   onGitSync: (projectId: string) => void;
   onDelete: (projectId: string) => void;
   isLoading: boolean;
   /** Whether git/sync is available (resolve_command configured on server) */
   syncAvailable: boolean;
+  /** Active commands for this project */
+  activeCommands?: ActiveCommand[];
 }
 
 const statusConfig: Record<string, { dot: string; text: string; bg: string }> = {
@@ -27,13 +29,21 @@ export function ProjectCard({
   onDelete,
   isLoading,
   syncAvailable,
+  activeCommands = [],
 }: ProjectCardProps) {
   const [repo, branch] = [project.repo, project.branch];
   const cfg = statusConfig[project.status] ?? statusConfig.idle;
 
+  // Check if base root is busy (sync operates on base root)
+  const baseBusy = activeCommands.some(
+    (cmd) => cmd.project_id === project.id && cmd.root === 'base'
+  );
+  const syncDisabled = isLoading || !syncAvailable || baseBusy;
+  const nextSelection = isSelected ? null : project.id;
+
   return (
     <div
-      onClick={() => onSelect(project.id)}
+      onClick={() => onSelect(nextSelection)}
       className={`group cursor-pointer rounded-lg border p-3.5 transition-all ${
         isSelected
           ? 'border-[#6366f1] bg-[#1e1b4b]/30'
@@ -44,7 +54,7 @@ export function ProjectCard({
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
-          onSelect(project.id);
+          onSelect(nextSelection);
         }
       }}
     >
@@ -68,13 +78,23 @@ export function ProjectCard({
       <div className="flex gap-1.5">
         <button
           onClick={(e) => { e.stopPropagation(); onGitSync(project.id); }}
-          disabled={isLoading || !syncAvailable}
+          disabled={syncDisabled}
           className="flex flex-1 items-center justify-center gap-1 rounded-md bg-[#1e3a5f]/60 px-2 py-1.5 text-xs font-medium text-[#3b82f6] transition-colors hover:bg-[#1e3a5f]/80 disabled:cursor-not-allowed disabled:opacity-40"
           aria-label={`Sync ${repo}@${branch}`}
-          title={!syncAvailable ? 'resolve_command is not configured' : undefined}
+          title={
+            !syncAvailable
+              ? 'resolve_command is not configured'
+              : baseBusy
+                ? 'Sync is in progress'
+                : undefined
+          }
         >
-          <RefreshCw className="size-3" />
-          Sync
+          {baseBusy ? (
+            <Loader2 className="size-3 animate-spin" />
+          ) : (
+            <RefreshCw className="size-3" />
+          )}
+          {baseBusy ? 'Syncing…' : 'Sync'}
         </button>
 
         <button

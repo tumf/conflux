@@ -1,6 +1,6 @@
 import React from 'react';
-import { GitBranch, GitMerge, Trash2 } from 'lucide-react';
-import { WorktreeInfo } from '../api/types';
+import { GitBranch, GitMerge, Loader2, Trash2 } from 'lucide-react';
+import { WorktreeInfo, ActiveCommand } from '../api/types';
 
 interface WorktreeRowProps {
   worktree: WorktreeInfo;
@@ -9,17 +9,22 @@ interface WorktreeRowProps {
   onClickWorktree?: (branch: string) => void;
   isSelected?: boolean;
   isLoading?: boolean;
+  /** Active command for this worktree root, if any */
+  activeCommand?: ActiveCommand;
 }
 
-export function WorktreeRow({ worktree, onMerge, onDelete, onClickWorktree, isSelected, isLoading }: WorktreeRowProps) {
+export function WorktreeRow({ worktree, onMerge, onDelete, onClickWorktree, isSelected, isLoading, activeCommand }: WorktreeRowProps) {
+  const isBusy = !!activeCommand;
+
   const canMerge =
     !worktree.is_main &&
     !worktree.is_detached &&
     worktree.has_commits_ahead &&
     !worktree.merge_conflict &&
-    !worktree.is_merging;
+    !worktree.is_merging &&
+    !isBusy;
 
-  const canDelete = !worktree.is_main;
+  const canDelete = !worktree.is_main && !isBusy;
 
   const label = worktree.branch || worktree.head;
 
@@ -66,6 +71,12 @@ export function WorktreeRow({ worktree, onMerge, onDelete, onClickWorktree, isSe
               {worktree.merge_conflict.conflict_files.length} conflict{worktree.merge_conflict.conflict_files.length !== 1 ? 's' : ''}
             </span>
           )}
+          {isBusy && (
+            <span className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-[#f59e0b] bg-[#451a03]/50">
+              <Loader2 className="size-3 animate-spin" />
+              {activeCommand.operation}
+            </span>
+          )}
         </div>
       </div>
 
@@ -73,8 +84,8 @@ export function WorktreeRow({ worktree, onMerge, onDelete, onClickWorktree, isSe
         {canMerge && onMerge && (
           <button
             onClick={() => onMerge(worktree.branch)}
-            disabled={isLoading}
-            title="Merge branch"
+            disabled={isLoading || isBusy}
+            title={isBusy ? `Busy: ${activeCommand.operation}` : 'Merge branch'}
             className="rounded p-1.5 text-[#52525b] transition-colors hover:bg-[#27272a] hover:text-[#22c55e] disabled:opacity-50"
           >
             <GitMerge className="size-3.5" />
@@ -83,8 +94,8 @@ export function WorktreeRow({ worktree, onMerge, onDelete, onClickWorktree, isSe
         {canDelete && onDelete && (
           <button
             onClick={() => onDelete(worktree.branch)}
-            disabled={isLoading}
-            title="Delete worktree"
+            disabled={isLoading || isBusy}
+            title={isBusy ? `Busy: ${activeCommand.operation}` : 'Delete worktree'}
             className="rounded p-1.5 text-[#52525b] transition-colors hover:bg-[#27272a] hover:text-[#ef4444] disabled:opacity-50"
           >
             <Trash2 className="size-3.5" />

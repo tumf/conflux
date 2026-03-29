@@ -78,6 +78,14 @@ export interface WorktreeInfo {
   is_merging: boolean;
 }
 
+/** An active command occupying a worktree root */
+export interface ActiveCommand {
+  project_id: string;
+  root: string;
+  operation: string;
+  started_at: string;
+}
+
 export interface FullState {
   projects: RemoteProject[];
   /** Flattened changes extracted from projects for easy access */
@@ -87,6 +95,8 @@ export interface FullState {
   sync_available?: boolean;
   /** Global orchestration status */
   orchestration_status?: OrchestrationStatus;
+  /** Currently active commands across all worktree roots */
+  active_commands?: ActiveCommand[];
 }
 
 // ─── File Viewer Types ───────────────────────────────────────────────────────
@@ -114,3 +124,99 @@ export interface FileBrowseContext {
   changeId?: string;
   worktreeBranch?: string;
 }
+
+// ─── Proposal Session Types ──────────────────────────────────────────────────
+
+export type ProposalSessionStatus = 'active' | 'merging' | 'closed';
+
+export interface ProposalSession {
+  id: string;
+  project_id: string;
+  status: ProposalSessionStatus;
+  /** Worktree branch name backing this session */
+  worktree_branch: string;
+  /** Whether the worktree has uncommitted changes */
+  is_dirty: boolean;
+  /** List of uncommitted file paths (populated when dirty) */
+  uncommitted_files: string[];
+  /** ISO 8601 timestamp */
+  created_at: string;
+  /** ISO 8601 timestamp */
+  updated_at: string;
+}
+
+export interface ProposalSessionChange {
+  change_id: string;
+  title: string;
+}
+
+export type ProposalChatRole = 'user' | 'assistant';
+
+export type ToolCallStatus = 'pending' | 'in_progress' | 'completed' | 'failed';
+
+export interface ToolCallInfo {
+  id: string;
+  title: string;
+  status: ToolCallStatus;
+}
+
+export interface ProposalChatMessage {
+  id: string;
+  role: ProposalChatRole;
+  content: string;
+  /** ISO 8601 timestamp */
+  timestamp: string;
+  /** Tool calls associated with this message (agent only) */
+  tool_calls?: ToolCallInfo[];
+}
+
+/** JSON Schema property for elicitation forms */
+export interface ElicitationProperty {
+  type: 'string' | 'boolean' | 'number' | 'integer';
+  title?: string;
+  description?: string;
+  /** oneOf or enum values for select/radio */
+  oneOf?: Array<{ const: string; title: string }>;
+  enum?: string[];
+  default?: unknown;
+}
+
+export interface ElicitationRequest {
+  id: string;
+  /** Human-readable message describing what is needed */
+  message: string;
+  /** JSON Schema properties for form fields */
+  properties: Record<string, ElicitationProperty>;
+  /** Required field names */
+  required?: string[];
+}
+
+// ─── Proposal WebSocket Message Types ────────────────────────────────────────
+
+export type ProposalWsMessageType =
+  | 'prompt'
+  | 'elicitation_response'
+  | 'cancel'
+  | 'assistant_chunk'
+  | 'assistant_message'
+  | 'tool_call_start'
+  | 'tool_call_update'
+  | 'elicitation_request'
+  | 'session_update'
+  | 'error';
+
+/** Messages sent from client to server */
+export type ProposalWsClientMessage =
+  | { type: 'prompt'; content: string }
+  | { type: 'elicitation_response'; elicitation_id: string; action: 'accept' | 'decline' | 'cancel'; data?: Record<string, unknown> }
+  | { type: 'cancel' };
+
+/** Messages received from server */
+export type ProposalWsServerMessage =
+  | { type: 'assistant_chunk'; content: string; message_id: string }
+  | { type: 'assistant_message'; message: ProposalChatMessage }
+  | { type: 'tool_call_start'; tool_call: ToolCallInfo; message_id: string }
+  | { type: 'tool_call_update'; tool_call_id: string; status: ToolCallStatus; message_id: string }
+  | { type: 'elicitation_request'; elicitation: ElicitationRequest }
+  | { type: 'session_update'; session: ProposalSession }
+  | { type: 'error'; message: string };

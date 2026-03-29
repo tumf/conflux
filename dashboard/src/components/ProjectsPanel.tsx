@@ -1,16 +1,18 @@
 import React from 'react';
-import { RemoteProject } from '../api/types';
+import { RemoteProject, ActiveCommand } from '../api/types';
 import { ProjectCard } from './ProjectCard';
 
 interface ProjectsPanelProps {
   projects: RemoteProject[];
   selectedProjectId: string | null;
-  onSelectProject: (projectId: string) => void;
+  onSelectProject: (projectId: string | null) => void;
   onGitSync: (projectId: string) => void;
   onDelete: (projectId: string) => void;
   isLoading: boolean;
   /** Whether git/sync is available (resolve_command configured on server) */
   syncAvailable: boolean;
+  /** All active commands across projects */
+  activeCommands: ActiveCommand[];
 }
 
 export function ProjectsPanel({
@@ -21,6 +23,7 @@ export function ProjectsPanel({
   onDelete,
   isLoading,
   syncAvailable,
+  activeCommands,
 }: ProjectsPanelProps) {
   return (
     <div className="space-y-2 p-3">
@@ -39,6 +42,7 @@ export function ProjectsPanel({
             onDelete={onDelete}
             isLoading={isLoading}
             syncAvailable={syncAvailable}
+            activeCommands={activeCommands.filter((cmd) => cmd.project_id === project.id)}
           />
         ))
       )}
