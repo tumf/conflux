@@ -420,6 +420,95 @@ async fn proposal_session_merge_merges_branch_and_removes_worktree() {
 }
 
 #[tokio::test]
+async fn proposal_session_ws_cancel_and_reconnect_history_work() {
+    let temp_dir = TempDir::new().unwrap();
+    let origin = create_local_git_repo(temp_dir.path());
+    let remote_url = format!("file://{}", origin.to_string_lossy());
+    let state = make_state(&temp_dir);
+    let router = build_router(state.clone());
+
+    let (_router, project_id) = create_project(router.clone(), remote_url).await;
+
+    let create_req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/projects/{project_id}/proposal-sessions"))
+        .body(Body::empty())
+        .unwrap();
+    let create_resp = router.clone().oneshot(create_req).await.unwrap();
+    let create_body = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&create_body).unwrap();
+    let session_id = created["id"].as_str().unwrap().to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_router = router.clone();
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, serve_router).await.unwrap();
+    });
+
+    use futures_util::{SinkExt, StreamExt};
+
+    let ws_url = format!("ws://{addr}/api/v1/proposal-sessions/{session_id}/ws");
+    let (mut socket, _) = connect_async(ws_url.clone()).await.unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({"type": "prompt", "content": "history-check"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let chunk_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let chunk_json: Value = serde_json::from_str(&chunk_message).unwrap();
+    assert_eq!(chunk_json["type"], "agent_message_chunk");
+    assert_eq!(chunk_json["text"], "echo:history-check");
+
+    let turn_complete_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let turn_complete_json: Value = serde_json::from_str(&turn_complete_message).unwrap();
+    assert_eq!(turn_complete_json["type"], "turn_complete");
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({"type": "cancel"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let cancelled_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let cancelled_json: Value = serde_json::from_str(&cancelled_message).unwrap();
+    assert_eq!(cancelled_json["type"], "turn_complete");
+    assert_eq!(cancelled_json["stop_reason"], "cancelled");
+
+    drop(socket);
+
+    let (mut reconnect_socket, _) = connect_async(ws_url).await.unwrap();
+    let replay_message = reconnect_socket
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    let replay_json: Value = serde_json::from_str(&replay_message).unwrap();
+    assert_eq!(replay_json["type"], "agent_message_chunk");
+    assert_eq!(replay_json["text"], "echo:history-check");
+
+    let replay_turn_complete = reconnect_socket
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    let replay_turn_complete_json: Value = serde_json::from_str(&replay_turn_complete).unwrap();
+    assert_eq!(replay_turn_complete_json["type"], "turn_complete");
+
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn proposal_session_multi_session_websockets_stay_independent() {
     let temp_dir = TempDir::new().unwrap();
     let origin = create_local_git_repo(temp_dir.path());

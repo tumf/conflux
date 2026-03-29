@@ -15,6 +15,19 @@
 
 - Remove `src/server/acp_client.rs` after the frontend/state refactor is complete
 
+## Implementation Blocker #2
+- category: external_non_mockable
+- summary: ディスク空き容量不足 (`No space left on device`) により `cargo test --test e2e_proposal_session` の完走検証が不可
+- evidence:
+  - `cargo test --test e2e_proposal_session` 実行で `failed to build archive ... No space left on device (os error 28)`
+  - `df -h` で `/System/Volumes/Data` の `Avail 202Mi` / `Capacity 100%`
+- impact: `list_messages` を使った reconnect-history 変更に対する最終検証（e2e pass）を完了できないため、Implementation Tasks 7 を `[x]` に更新できない
+- unblock_actions:
+  - ホスト環境でディスク空き容量を確保し、`cargo fmt && cargo clippy -- -D warnings && cargo test --test e2e_proposal_session` を再実行する
+  - テスト再実行で `proposal_session_ws_cancel_and_reconnect_history_work` を含む e2e が pass したことを確認後、Implementation Tasks 7 を `[x]` へ更新する
+- owner: backend-maintainer
+- decision_due: 2026-03-31
+
 ## Implementation Blocker #1
 - category: spec_contradiction
 - summary: 前提条件である `OpencodeServer` 実装がリポジトリに存在せず、本変更単体では OpenCode transport 置換タスクを開始できない

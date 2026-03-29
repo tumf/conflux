@@ -3254,12 +3254,44 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
         }
     };
 
+    let (ws_send_tx, mut ws_send_rx) = tokio::sync::mpsc::channel::<String>(256);
+
+    // Replay existing session message history on reconnect before live SSE subscription.
+    match opencode_server.list_messages(&opencode_session_id).await {
+        Ok(messages) => {
+            for msg in messages {
+                for ws_msg in opencode_history_message_to_ws_messages(msg) {
+                    match serde_json::to_string(&ws_msg) {
+                        Ok(json) => {
+                            if ws_send_tx.send(json).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Failed to serialize history WebSocket message");
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            error!(error = %e, session_id = %session_id, "Failed to fetch OpenCode message history");
+            let _ = ws_send_tx
+                .send(
+                    serde_json::to_string(&ProposalWsServerMessage::Error {
+                        message: format!("Failed to load message history: {}", e),
+                    })
+                    .unwrap_or_default(),
+                )
+                .await;
+        }
+    }
+
     // Task to forward OpenCode SSE events to WebSocket
     let opencode_server_for_notifs = opencode_server.clone();
     let session_id_for_notifs = session_id.clone();
     let state_for_notifs = state.clone();
     let opencode_session_id_for_notifs = opencode_session_id.clone();
-    let (ws_send_tx, mut ws_send_rx) = tokio::sync::mpsc::channel::<String>(256);
 
     let ws_send_tx_for_notifs = ws_send_tx.clone();
     let notif_task = tokio::spawn(async move {
@@ -3400,6 +3432,43 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
     }
 
     info!(session_id = %session_id, "Proposal session WebSocket disconnected");
+}
+
+/// Convert an OpenCode stored message history item to WebSocket messages.
+fn opencode_history_message_to_ws_messages(
+    message: crate::server::opencode_client::MessageWithParts,
+) -> Vec<ProposalWsServerMessage> {
+    let mut ws_messages = Vec::new();
+
+    for part in message.parts {
+        match part.part_type.as_str() {
+            "text" => {
+                if let Some(text) = part.text {
+                    ws_messages.push(ProposalWsServerMessage::AgentMessageChunk { text });
+                }
+            }
+            "tool_call" => ws_messages.push(ProposalWsServerMessage::ToolCall {
+                tool_call_id: part.tool_call_id.unwrap_or_default(),
+                title: part.title.unwrap_or_default(),
+                kind: part.kind.unwrap_or_default(),
+                status: part.status.unwrap_or_else(|| "pending".to_string()),
+            }),
+            "tool_call_update" => ws_messages.push(ProposalWsServerMessage::ToolCallUpdate {
+                tool_call_id: part.tool_call_id.unwrap_or_default(),
+                status: part.status.unwrap_or_else(|| "running".to_string()),
+                content: part.content.unwrap_or_default(),
+            }),
+            _ => {}
+        }
+    }
+
+    if message.role == "assistant" {
+        ws_messages.push(ProposalWsServerMessage::TurnComplete {
+            stop_reason: "end_turn".to_string(),
+        });
+    }
+
+    ws_messages
 }
 
 /// Convert an OpenCode event to a WebSocket server message.
