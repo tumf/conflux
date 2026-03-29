@@ -16,7 +16,6 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use shlex;
 use tracing::{debug, error, info};
 
 use crate::execution::state::{detect_workspace_state, WorkspaceState};
@@ -955,10 +954,10 @@ async fn run_resolve_command(
     work_dir: &std::path::Path,
     prompt: &str,
 ) -> (bool, Option<i32>) {
-    // Substitute {prompt} placeholder in the template, then shell-escape the prompt
-    // value so the login shell receives it as a safe string.
-    let escaped_prompt = shlex::try_quote(prompt).unwrap_or_else(|_| prompt.into());
-    let command_str = resolve_command_template.replace("{prompt}", &escaped_prompt);
+    // Use the shared placeholder expansion from config::expand, which handles
+    // both quoted ('{prompt}') and unquoted ({prompt}) template forms correctly,
+    // avoiding double-quoting issues with multi-line prompts.
+    let command_str = crate::config::expand::expand_prompt(resolve_command_template, prompt);
 
     info!(
         "Running resolve_command via login shell: command='{}'",
@@ -4379,6 +4378,109 @@ mod tests {
             exit_code,
             Some(0),
             "echo with prompt substitution should succeed"
+        );
+    }
+
+    // ── resolve_command prompt escaping tests ──
+
+    #[tokio::test]
+    async fn test_run_resolve_command_quoted_template_does_not_double_quote() {
+        // Verify that a quoted template '{prompt}' works correctly and does not
+        // produce double-quoting that breaks the command.
+        let temp_dir = TempDir::new().unwrap();
+        let marker_path = temp_dir.path().join("quoted_marker.txt");
+        let template = format!(
+            "printf '%s' '{{prompt}}' > '{}'",
+            marker_path.to_str().unwrap()
+        );
+        let (ran, exit_code) =
+            super::run_resolve_command(&template, temp_dir.path(), "hello world").await;
+        assert!(ran, "resolve_command should have been attempted");
+        assert_eq!(
+            exit_code,
+            Some(0),
+            "printf with quoted prompt template should succeed, not exit 127"
+        );
+        let content = std::fs::read_to_string(&marker_path).unwrap_or_default();
+        assert_eq!(
+            content, "hello world",
+            "Quoted template should pass prompt value without double-quoting"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_resolve_command_unquoted_template_works() {
+        // Verify that an unquoted template {prompt} also works correctly.
+        let temp_dir = TempDir::new().unwrap();
+        let marker_path = temp_dir.path().join("unquoted_marker.txt");
+        let template = format!(
+            "printf '%s' {{prompt}} > '{}'",
+            marker_path.to_str().unwrap()
+        );
+        let (ran, exit_code) =
+            super::run_resolve_command(&template, temp_dir.path(), "simple_word").await;
+        assert!(ran, "resolve_command should have been attempted");
+        assert_eq!(
+            exit_code,
+            Some(0),
+            "printf with unquoted prompt template should succeed"
+        );
+        let content = std::fs::read_to_string(&marker_path).unwrap_or_default();
+        assert_eq!(
+            content, "simple_word",
+            "Unquoted template should pass prompt value correctly"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_resolve_command_multiline_prompt_does_not_break_shell() {
+        // Regression test: multi-line prompt must not cause exit code 127 or shell
+        // interpretation errors. This is the exact scenario from the proposal.
+        let temp_dir = TempDir::new().unwrap();
+        let marker_path = temp_dir.path().join("multiline_marker.txt");
+        let template = format!(
+            "printf '%s' '{{prompt}}' > '{}'",
+            marker_path.to_str().unwrap()
+        );
+        let multiline_prompt =
+            "Conflux server auto_resolve\noperation=git_sync\nproject_id=abc123\nTask: reconcile local state";
+        let (ran, exit_code) =
+            super::run_resolve_command(&template, temp_dir.path(), multiline_prompt).await;
+        assert!(ran, "resolve_command should have been attempted");
+        assert_eq!(
+            exit_code,
+            Some(0),
+            "Multi-line prompt with quoted template must not cause exit 127"
+        );
+        let content = std::fs::read_to_string(&marker_path).unwrap_or_default();
+        assert_eq!(
+            content, multiline_prompt,
+            "Multi-line prompt should be passed intact through the shell"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_resolve_command_multiline_prompt_unquoted_template() {
+        // Multi-line prompt with unquoted {prompt} template should also work.
+        let temp_dir = TempDir::new().unwrap();
+        let marker_path = temp_dir.path().join("multiline_unquoted.txt");
+        let template = format!(
+            "printf '%s' {{prompt}} > '{}'",
+            marker_path.to_str().unwrap()
+        );
+        let multiline_prompt = "Line 1\nLine 2\nLine 3";
+        let (ran, exit_code) =
+            super::run_resolve_command(&template, temp_dir.path(), multiline_prompt).await;
+        assert!(ran, "resolve_command should have been attempted");
+        assert_eq!(
+            exit_code,
+            Some(0),
+            "Multi-line prompt with unquoted template should succeed"
+        );
+        let content = std::fs::read_to_string(&marker_path).unwrap_or_default();
+        assert_eq!(
+            content, multiline_prompt,
+            "Multi-line prompt should be passed intact"
         );
     }
 
