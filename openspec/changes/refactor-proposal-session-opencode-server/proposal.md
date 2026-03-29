@@ -1,5 +1,11 @@
 # Change: Replace ACP stdio bridge with OpenCode Server HTTP/SSE integration
 
+> **SUPERSEDED** — Split into 4 smaller proposals for implementability:
+> 1. `add-opencode-server-client`
+> 2. `switch-proposal-session-transport`
+> 3. `fix-proposal-chat-state`
+> 4. `remove-acp-code`
+
 **Change Type**: implementation
 
 ## Why
