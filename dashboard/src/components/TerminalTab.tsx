@@ -105,15 +105,12 @@ export function TerminalTab({ sessionId, isActive }: TerminalTabProps) {
       const isModifierKey = event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey;
       const key = event.key.toLowerCase();
 
-      if (isModifierKey && SHELL_CONTROL_KEYS.has(key)) {
-        return false;
+      if (isModifierKey && key === 'c' && event.type === 'keydown') {
+        return !term.hasSelection();
       }
 
-      if (isModifierKey && key === 'c' && event.type === 'keydown') {
-        if (term.hasSelection()) {
-          return true;
-        }
-        return false;
+      if (isModifierKey && SHELL_CONTROL_KEYS.has(key)) {
+        return true;
       }
 
       return true;
