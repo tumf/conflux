@@ -1640,12 +1640,14 @@ pub async fn toggle_all_change_selection(
     let changes = list_remote_changes_in_worktree(&worktree_path, &entry.id, &entry.branch).await;
     let change_ids: Vec<String> = changes.iter().map(|c| c.id.clone()).collect();
 
+    let error_change_ids: Vec<String> = registry
+        .error_changes_for_project(&project_id)
+        .map(|errors| errors.keys().cloned().collect())
+        .unwrap_or_default();
     let new_selected = registry.toggle_all_changes(&project_id, &change_ids);
     if new_selected {
-        for change in &changes {
-            if change.status == "error" {
-                registry.clear_change_error(&project_id, &change.id);
-            }
+        for change_id in error_change_ids {
+            registry.clear_change_error(&project_id, &change_id);
         }
     }
 
@@ -4214,6 +4216,74 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
+    }
+
+    #[tokio::test]
+    async fn test_toggle_all_change_selection_remarks_error_changes_for_next_run() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let change_dir = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&entry.id)
+            .join(&entry.branch)
+            .join("openspec/changes/fix-a");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("proposal.md"), "# proposal\n").unwrap();
+
+        {
+            let mut registry = state.registry.write().await;
+            registry.mark_change_error(&entry.id, "fix-a", "boom".to_string());
+        }
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/changes/toggle-all", entry.id))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["selected"], true);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
+        assert_ne!(json["projects"][0]["changes"][0]["status"], "error");
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/control/run")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["started"], 1);
+        assert_eq!(json["skipped"], 0);
     }
 
     #[tokio::test]

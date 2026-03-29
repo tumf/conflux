@@ -11,3 +11,10 @@
 - [x] サーバー側で Error change を state snapshot / Run 対象判定に反映し、未再マークの Error change が除外され再マーク後のみ再実行対象になるよう実装する
 - [x] 上記の server API / registry 挙動を Error 状態つきのテストで固定し、誤って非 Error change の toggle テストだけで完了扱いしないようにする
 - [x] 作業ツリーをクリーンにしてから acceptance を再実行する
+
+## Acceptance #2 Failure Follow-up
+
+- [x] `toggle_all_change_selection()` で Error change の再マーク semantics を個別 toggle と揃え、bulk toggle が無条件に error 状態を clear しないよう修正する
+- [x] `toggle_all_changes()` の既定選択値を Error change では `false` に揃え、server selection semantics を一貫させる
+- [x] bulk toggle 経路の Error change 挙動を固定する server API / registry テストを追加する
+- [ ] 作業ツリーをクリーンにしてから acceptance を再実行する

@@ -303,28 +303,39 @@ impl ProjectRegistry {
         *entry
     }
 
-    /// Toggle all changes for a project. If any change is unselected, select all; otherwise
-    /// deselect all. `known_change_ids` is the current list of change IDs for the project so
-    /// that all are covered even if not yet tracked.
+    /// Toggle all changes for a project. If any eligible change is unselected, select all;
+    /// otherwise deselect all. `known_change_ids` is the current list of change IDs for the
+    /// project so that all are covered even if not yet tracked.
     ///
-    /// Returns the new selected value applied to all changes.
+    /// Error changes default to `false` until they are explicitly re-marked, so bulk toggle
+    /// follows the same semantics as individual toggle.
+    ///
+    /// Returns the new selected value applied to all tracked changes.
     pub fn toggle_all_changes(&mut self, project_id: &str, known_change_ids: &[String]) -> bool {
+        let default_selections: Vec<(String, bool)> = known_change_ids
+            .iter()
+            .map(|cid| (cid.clone(), !self.is_change_error(project_id, cid)))
+            .collect();
         let selections = self
             .change_selections
             .entry(project_id.to_string())
             .or_default();
 
-        // Ensure all known changes are tracked
-        for cid in known_change_ids {
-            selections.entry(cid.clone()).or_insert(true);
+        // Ensure all known changes are tracked with the same defaults as single-change toggles.
+        for (cid, default_selected) in default_selections {
+            selections.entry(cid).or_insert(default_selected);
         }
 
-        // If any change is false, select all; otherwise deselect all.
-        let any_unselected = selections.values().any(|&v| !v);
+        // If any tracked change is false, select all; otherwise deselect all.
+        let any_unselected = known_change_ids
+            .iter()
+            .any(|cid| !selections.get(cid).copied().unwrap_or(true));
         let new_value = any_unselected;
 
-        for val in selections.values_mut() {
-            *val = new_value;
+        for cid in known_change_ids {
+            if let Some(val) = selections.get_mut(cid) {
+                *val = new_value;
+            }
         }
 
         debug!(
@@ -614,5 +625,29 @@ mod tests {
         registry.clear_change_error(&entry.id, "change-a");
         assert!(!registry.is_change_error(&entry.id, "change-a"));
         assert!(registry.is_change_selected(&entry.id, "change-a"));
+    }
+
+    #[test]
+    fn test_toggle_all_changes_treats_error_changes_as_unselected_by_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut registry = ProjectRegistry::load(temp_dir.path(), 2).unwrap();
+        let entry = registry
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        registry.mark_change_error(&entry.id, "change-a", "boom".to_string());
+
+        let new_selected = registry.toggle_all_changes(
+            &entry.id,
+            &["change-a".to_string(), "change-b".to_string()],
+        );
+
+        assert!(new_selected, "bulk toggle should mark all when any row is unselected");
+        assert!(registry.is_change_selected(&entry.id, "change-a"));
+        assert!(registry.is_change_selected(&entry.id, "change-b"));
+        assert!(
+            registry.is_change_error(&entry.id, "change-a"),
+            "bulk remark should not clear the tracked error state"
+        );
     }
 }
