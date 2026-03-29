@@ -20,6 +20,10 @@ use tracing::{debug, error, info, warn};
 /// Default timeout for hook execution in seconds
 pub const DEFAULT_HOOK_TIMEOUT: u64 = 60;
 
+/// Environment variable that tells hook children whether downstream git commits should use
+/// `--no-verify`.
+pub const OPENSPEC_GIT_COMMIT_NO_VERIFY_ENV: &str = "OPENSPEC_GIT_COMMIT_NO_VERIFY";
+
 /// Maximum bytes of hook output to display before truncating
 pub const HOOK_OUTPUT_TRUNCATE_BYTES: usize = 1024;
 
@@ -101,6 +105,9 @@ pub struct HookConfig {
     /// Timeout in seconds (default: 60)
     #[serde(default = "default_timeout")]
     pub timeout: u64,
+    /// Whether downstream git commits should skip verification hooks (default: false)
+    #[serde(default)]
+    pub git_commit_no_verify: bool,
 }
 
 fn default_continue_on_failure() -> bool {
@@ -118,6 +125,7 @@ impl HookConfig {
             command,
             continue_on_failure: true,
             timeout: DEFAULT_HOOK_TIMEOUT,
+            git_commit_no_verify: false,
         }
     }
 }
@@ -571,7 +579,11 @@ impl HookRunner {
         };
 
         let command = context.expand_placeholders(&hook_config.command);
-        let env_vars = context.to_env_vars();
+        let mut env_vars = context.to_env_vars();
+        env_vars.insert(
+            OPENSPEC_GIT_COMMIT_NO_VERIFY_ENV.to_string(),
+            hook_config.git_commit_no_verify.to_string(),
+        );
         let timeout_duration = Duration::from_secs(hook_config.timeout);
 
         info!(
@@ -769,6 +781,7 @@ mod tests {
         assert_eq!(config.command, "echo test");
         assert!(config.continue_on_failure);
         assert_eq!(config.timeout, DEFAULT_HOOK_TIMEOUT);
+        assert!(!config.git_commit_no_verify);
     }
 
     #[test]
@@ -810,6 +823,7 @@ mod tests {
         assert_eq!(vars.get("OPENSPEC_TOTAL_TASKS"), Some(&"10".to_string()));
         assert_eq!(vars.get("OPENSPEC_APPLY_COUNT"), Some(&"2".to_string()));
         assert_eq!(vars.get("OPENSPEC_DRY_RUN"), Some(&"true".to_string()));
+        assert!(!vars.contains_key(OPENSPEC_GIT_COMMIT_NO_VERIFY_ENV));
     }
 
     #[test]
@@ -836,6 +850,23 @@ mod tests {
         assert_eq!(hook.command, "echo hello");
         assert!(!hook.continue_on_failure);
         assert_eq!(hook.timeout, 120);
+        assert!(!hook.git_commit_no_verify);
+    }
+
+    #[test]
+    fn test_hooks_config_deserialize_git_commit_no_verify() {
+        let json = r#"{
+            "on_merged": {
+                "command": "make bump-patch",
+                "git_commit_no_verify": true
+            }
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let hook = config.get(HookType::OnMerged).unwrap();
+        assert_eq!(hook.command, "make bump-patch");
+        assert!(hook.git_commit_no_verify);
+        assert!(hook.continue_on_failure);
+        assert_eq!(hook.timeout, DEFAULT_HOOK_TIMEOUT);
     }
 
     #[test]
@@ -951,6 +982,41 @@ mod tests {
         let context = HookContext::new(1, 5, 3, false).with_change("test-id", 2, 10);
 
         let result = runner.run_hook(HookType::OnStart, &context).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_hook_runner_exposes_git_commit_no_verify_true() {
+        let json = r#"{
+            "on_merged": {
+                "command": "test \"$OPENSPEC_GIT_COMMIT_NO_VERIFY\" = \"true\"",
+                "continue_on_failure": false,
+                "git_commit_no_verify": true
+            }
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config);
+
+        let result = runner
+            .run_hook(HookType::OnMerged, &HookContext::default())
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_hook_runner_exposes_git_commit_no_verify_false_by_default() {
+        let json = r#"{
+            "on_merged": {
+                "command": "test \"$OPENSPEC_GIT_COMMIT_NO_VERIFY\" = \"false\"",
+                "continue_on_failure": false
+            }
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config);
+
+        let result = runner
+            .run_hook(HookType::OnMerged, &HookContext::default())
+            .await;
         assert!(result.is_ok());
     }
 
