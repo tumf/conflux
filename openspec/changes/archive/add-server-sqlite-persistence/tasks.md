@@ -32,4 +32,3 @@
 
 - [x] `docs/openapi.yaml` の新エンドポイント削除方向の差分を解消し、ルート `openapi.yaml` と同一内容（`/api/v1/stats/overview`, `/api/v1/stats/projects/{id}/history`, `/api/v1/logs` と関連 schema を含む）へ復元する。
 - [x] 受け入れ実行直前に `git status --porcelain` が空になるよう、作業ツリーをクリーン化する（コミットまたは不要差分の整理）。
-

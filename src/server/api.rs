@@ -7233,7 +7233,7 @@ mod tests {
             .await
             .unwrap();
         let history_json: serde_json::Value = serde_json::from_slice(&history_body).unwrap();
-        assert!(history_json.as_array().unwrap().len() >= 1);
+        assert!(!history_json.as_array().unwrap().is_empty());
 
         let logs_resp = router
             .oneshot(
@@ -7251,7 +7251,7 @@ mod tests {
             .await
             .unwrap();
         let logs_json: serde_json::Value = serde_json::from_slice(&logs_body).unwrap();
-        assert!(logs_json.as_array().unwrap().len() >= 1);
+        assert!(!logs_json.as_array().unwrap().is_empty());
     }
 
     /// Verify the proposal-session WebSocket route is registered at the
