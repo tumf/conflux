@@ -5578,9 +5578,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_all_completed_keeps_running_when_resolving() {
-        // When AllCompleted arrives while a change is Resolving,
-        // AppMode must remain Running so the user can add changes via Space.
+    fn test_all_completed_transitions_to_select_even_when_resolving() {
+        // Scheduler側でResolveWaitを管理するため、TUI側のhandle_all_completedは
+        // Resolving changeがある場合でも即座にSelectに遷移する。
         let changes = vec![
             create_test_change("change-a", 3, 3),
             create_test_change("change-b", 2, 4),
@@ -5593,8 +5593,8 @@ mod tests {
 
         assert_eq!(
             app.mode,
-            AppMode::Running,
-            "Should stay Running while Resolving changes exist"
+            AppMode::Select,
+            "Should transition to Select because scheduler manages ResolveWait"
         );
     }
 
