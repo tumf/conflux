@@ -144,9 +144,15 @@ export function appReducer(state: AppState, action: AppAction): AppState {
     }
 
     case 'SELECT_PROJECT': {
+      const nextSelectedProjectId =
+        action.payload !== null && state.selectedProjectId === action.payload
+          ? null
+          : action.payload;
+
       return {
         ...state,
-        selectedProjectId: action.payload,
+        selectedProjectId: nextSelectedProjectId,
+        fileBrowseContext: nextSelectedProjectId === null ? null : state.fileBrowseContext,
       };
     }
 

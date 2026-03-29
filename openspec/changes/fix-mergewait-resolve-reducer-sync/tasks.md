@@ -1,6 +1,0 @@
-## Implementation Tasks
-
-- [ ] Task 1: Add reducer sync to immediate resolve path in `resolve_merge()` (file: `src/tui/state.rs`, around line 873-877; mirror the `ReducerCommand::ResolveMerge` call from lines 851-858; verification: `cargo test` passes, new unit test confirms reducer reflects `"resolve pending"` after `resolve_merge()` with `is_resolving == false`)
-- [ ] Task 2: Add unit test for immediate resolve reducer sync (file: `src/tui/state.rs` tests section; setup: change in `MergeWait`, `is_resolving = false`, shared state injected; call `resolve_merge()`; assert: reducer `display_status` == `"resolve pending"`; assert: returned command is `TuiCommand::ResolveMerge`; verification: `cargo test --lib -- resolve_merge`)
-- [ ] Task 3: Add regression test that `ChangesRefreshed` does not regress `ResolveWait` after immediate resolve (file: `src/tui/state.rs` tests section; setup: after Task 2's resolve_merge call, apply `ChangesRefreshed` to reducer, call `apply_display_statuses_from_reducer()`; assert: change remains `ResolveWait`, not `MergeWait`; verification: `cargo test --lib`)
-- [ ] Task 4: Run full test suite and lint checks (verification: `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` all pass)

@@ -876,6 +876,18 @@ impl AppState {
                 self.mode = AppMode::Running;
             }
             self.changes[self.cursor_index].queue_status = QueueStatus::ResolveWait;
+
+            // Sync resolve intent into the shared reducer so that
+            // apply_display_statuses_from_reducer() cannot regress the
+            // status back to "merge wait" on the next ChangesRefreshed.
+            if let Some(shared) = &self.shared_orchestrator_state {
+                if let Ok(mut guard) = shared.try_write() {
+                    guard.apply_command(crate::orchestration::state::ReducerCommand::ResolveMerge(
+                        change_id.clone(),
+                    ));
+                }
+            }
+
             Some(TuiCommand::ResolveMerge(change_id))
         }
     }
@@ -3952,6 +3964,114 @@ mod tests {
         assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
         assert_eq!(app.mode, AppMode::Running);
         assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+    }
+
+    /// Regression test: resolve_merge() in the immediate path (is_resolving == false) must
+    /// sync intent to the shared reducer so that display_status is "resolve pending".
+    #[test]
+    fn test_resolve_merge_immediate_syncs_reducer() {
+        use crate::orchestration::state::{OrchestratorState, WorkspaceObservation};
+        use std::sync::Arc;
+
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Set up shared orchestrator state.
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            0,
+        )));
+
+        // Pre-condition: change-a must be in MergeWait in the reducer
+        // (simulates workspace detected as Archived).
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_observation("change-a", WorkspaceObservation::WorkspaceArchived);
+        }
+
+        app.set_shared_state(shared.clone());
+
+        // change-a is in MergeWait, no resolve in progress
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.cursor_index = 0;
+        app.mode = AppMode::Running;
+        app.is_resolving = false;
+
+        // Trigger immediate resolve via M key
+        let cmd = app.resolve_merge();
+        assert!(
+            matches!(&cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"),
+            "immediate resolve must return TuiCommand::ResolveMerge"
+        );
+        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+
+        // Verify the shared reducer reflects "resolve pending" for change-a
+        let display_map = shared.blocking_read().all_display_statuses();
+        assert_eq!(
+            display_map.get("change-a"),
+            Some(&"resolve pending"),
+            "reducer must reflect 'resolve pending' after immediate resolve_merge()"
+        );
+    }
+
+    /// Regression test: after immediate resolve (is_resolving == false), a ChangesRefreshed
+    /// event with the change still in merge_wait_ids must NOT regress ResolveWait back to
+    /// MergeWait.
+    #[test]
+    fn test_resolve_wait_survives_changes_refreshed_after_immediate_resolve() {
+        use crate::orchestration::state::{OrchestratorState, WorkspaceObservation};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        // Set up shared orchestrator state.
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            0,
+        )));
+        // Pre-condition: change-a is in MergeWait in the reducer.
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_observation("change-a", WorkspaceObservation::WorkspaceArchived);
+        }
+        app.set_shared_state(shared.clone());
+
+        // change-a is in MergeWait, no resolve in progress; user presses M
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.cursor_index = 0;
+        app.mode = AppMode::Running;
+        app.is_resolving = false;
+
+        let cmd = app.resolve_merge();
+        assert!(cmd.is_some());
+        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+
+        // Simulate a ChangesRefreshed event where workspace still reports change-a
+        // as needing merge (which would normally set MergeWait in the reducer).
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ChangesRefreshed {
+                changes: vec![],
+                committed_change_ids: HashSet::new(),
+                uncommitted_file_change_ids: HashSet::new(),
+                worktree_change_ids: HashSet::new(),
+                worktree_paths: HashMap::new(),
+                worktree_not_ahead_ids: HashSet::new(),
+                merge_wait_ids: ["change-a".to_string()].into_iter().collect(),
+            });
+        }
+
+        // apply_display_statuses_from_reducer should preserve ResolveWait
+        let display_map = shared.blocking_read().all_display_statuses();
+        app.apply_display_statuses_from_reducer(&display_map);
+
+        assert_eq!(
+            app.changes[0].queue_status,
+            QueueStatus::ResolveWait,
+            "ResolveWait must survive ChangesRefreshed after immediate resolve"
+        );
     }
 
     #[test]
