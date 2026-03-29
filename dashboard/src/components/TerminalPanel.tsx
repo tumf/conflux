@@ -59,7 +59,7 @@ export function TerminalPanel({ projectId, root, isExpanded, onToggleExpand }: T
     } finally {
       setIsCreating(false);
     }
-  }, [cwd, isCreating]);
+  }, [projectId, root, isCreating]);
 
   const handleCloseTab = useCallback(
     async (sessionId: string) => {

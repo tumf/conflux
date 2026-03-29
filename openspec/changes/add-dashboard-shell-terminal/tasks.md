@@ -7,6 +7,10 @@
 - [x] Wire terminal cwd selection so worktree context uses the worktree path and change context uses the base repository path (verification: request payloads or server resolution tests assert the correct cwd for both contexts)
 - [x] Run dashboard lint/tests/build and Rust lint/tests for the terminal feature (verification: `npm run lint`, `npm run test`, `npm run build` in `dashboard/`, plus `cargo fmt --check`, `cargo clippy -- -D warnings`, and targeted `cargo test` succeed or documented failures are captured)
 
+## Acceptance #1 Failure Follow-up
+
+- [x] Fix `TerminalPanel.tsx:62` — `useCallback` dependency array references undefined variable `cwd`; should be `[projectId, root, isCreating]` so the callback updates when project context changes
+
 ## Future Work
 
 - Evaluate session persistence across browser reloads if users need long-lived shells
