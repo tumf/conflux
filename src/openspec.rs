@@ -1,9 +1,34 @@
+use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use serde_yaml::Value;
+use tracing::{debug, info, warn};
+
 use crate::error::{OrchestratorError, Result};
 use crate::task_parser;
 use crate::tui::log_deduplicator;
-use std::fs;
-use std::path::Path;
-use tracing::{debug, info};
+
+/// Represents allowed proposal priority values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalPriority {
+    High,
+    Medium,
+    Low,
+}
+
+/// Machine-readable metadata extracted from `proposal.md` frontmatter.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalMetadata {
+    pub change_type: Option<String>,
+    pub priority: Option<ProposalPriority>,
+    pub dependencies: Vec<String>,
+    pub references: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
 
 /// Represents a change from openspec list
 #[derive(Debug, Clone, PartialEq)]
@@ -15,6 +40,8 @@ pub struct Change {
     pub last_modified: String,
     /// Dependencies on other changes (parsed from proposal.md)
     pub dependencies: Vec<String>,
+    /// Optional proposal metadata from `proposal.md` frontmatter.
+    pub metadata: ProposalMetadata,
 }
 
 impl Change {
@@ -32,23 +59,123 @@ impl Change {
     }
 }
 
-/// Parse dependencies from a proposal.md file.
+#[derive(Debug, Deserialize)]
+struct RawProposalFrontmatter {
+    change_type: Option<String>,
+    priority: Option<ProposalPriority>,
+    dependencies: Option<Vec<String>>,
+    references: Option<Vec<String>>,
+}
+
+/// Parse proposal metadata from a `proposal.md` file.
 ///
-/// Looks for a `## Dependencies` section and extracts change IDs from bullet points.
+/// Supports optional YAML frontmatter. Dependencies in frontmatter take precedence,
+/// but the legacy `## Dependencies` section remains supported as a fallback.
+pub fn parse_proposal_metadata_from_file(path: &Path) -> ProposalMetadata {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) => {
+            debug!(proposal = %path.display(), error = %error, "Failed to read proposal metadata source");
+            return ProposalMetadata::default();
+        }
+    };
+
+    parse_proposal_metadata(&content, path)
+}
+
+fn parse_proposal_metadata(content: &str, path: &Path) -> ProposalMetadata {
+    let (frontmatter, body) = split_frontmatter(content);
+    let mut metadata = ProposalMetadata::default();
+
+    if let Some(frontmatter) = frontmatter {
+        match parse_frontmatter(frontmatter, path) {
+            Some(parsed) => metadata = parsed,
+            None => warn!(proposal = %path.display(), "Ignoring invalid proposal frontmatter"),
+        }
+    }
+
+    if metadata.dependencies.is_empty() {
+        metadata.dependencies = parse_body_dependencies(body, path);
+    }
+
+    metadata
+}
+
+fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
+    if !content.starts_with("---\n") {
+        return (None, content);
+    }
+
+    let remainder = &content[4..];
+    if let Some(end) = remainder.find("\n---\n") {
+        let frontmatter = &remainder[..end];
+        let body = &remainder[end + 5..];
+        return (Some(frontmatter), body);
+    }
+
+    (None, content)
+}
+
+fn parse_frontmatter(frontmatter: &str, path: &Path) -> Option<ProposalMetadata> {
+    let value: Value = match serde_yaml::from_str(frontmatter) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(proposal = %path.display(), error = %error, "Failed to parse proposal frontmatter YAML");
+            return None;
+        }
+    };
+
+    let mut warnings = Vec::new();
+    if let Value::Mapping(mapping) = &value {
+        let known_keys: HashSet<&str> = ["change_type", "priority", "dependencies", "references"]
+            .into_iter()
+            .collect();
+
+        for key in mapping.keys() {
+            if let Some(key) = key.as_str() {
+                if !known_keys.contains(key) {
+                    let warning = format!("Unknown proposal frontmatter key: {}", key);
+                    warn!(proposal = %path.display(), key = key, warning = %warning, "Unknown proposal frontmatter key detected");
+                    warnings.push(warning);
+                }
+            }
+        }
+    }
+
+    let raw: RawProposalFrontmatter = match serde_yaml::from_value(value) {
+        Ok(raw) => raw,
+        Err(error) => {
+            warn!(proposal = %path.display(), error = %error, "Failed to decode proposal frontmatter fields");
+            return None;
+        }
+    };
+
+    let mut dependencies = Vec::new();
+    if let Some(items) = raw.dependencies {
+        for item in items {
+            let dep_id = extract_dependency_id(item.trim());
+            if !dep_id.is_empty() {
+                dependencies.push(dep_id);
+            }
+        }
+    }
+
+    Some(ProposalMetadata {
+        change_type: raw.change_type,
+        priority: raw.priority,
+        dependencies,
+        references: raw.references.unwrap_or_default(),
+        warnings,
+    })
+}
+
+/// Parse dependencies from the legacy body `## Dependencies` section.
+///
 /// Supports formats like:
 /// - `- feature-base`
 /// - `- [feature-base](../feature-base/proposal.md)`
 /// - `- feature-base: description`
-fn parse_dependencies(change_id: &str) -> Vec<String> {
-    let proposal_path = Path::new("openspec/changes")
-        .join(change_id)
-        .join("proposal.md");
-
-    let content = match fs::read_to_string(&proposal_path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-
+fn parse_body_dependencies(content: &str, path: &Path) -> Vec<String> {
     let mut dependencies = Vec::new();
     let mut in_deps_section = false;
 
@@ -77,20 +204,28 @@ fn parse_dependencies(change_id: &str) -> Vec<String> {
 
             // Extract change ID from various formats
             let dep_id = extract_dependency_id(item);
-            if !dep_id.is_empty() && dep_id != change_id {
+            if !dep_id.is_empty() {
                 dependencies.push(dep_id);
             }
         }
     }
 
     if !dependencies.is_empty() {
-        info!(
-            "Parsed dependencies for '{}': [{}]",
-            change_id,
-            dependencies.join(", ")
-        );
+        info!(proposal = %path.display(), dependencies = ?dependencies, "Parsed proposal dependencies from body section");
     }
     dependencies
+}
+
+fn parse_dependencies(change_id: &str) -> ProposalMetadata {
+    let proposal_path = Path::new("openspec/changes")
+        .join(change_id)
+        .join("proposal.md");
+
+    let mut metadata = parse_proposal_metadata_from_file(&proposal_path);
+    metadata
+        .dependencies
+        .retain(|dependency| dependency != change_id);
+    metadata
 }
 
 /// Extract a dependency ID from a bullet point item.
@@ -182,8 +317,9 @@ pub fn list_changes_native() -> Result<Vec<Change>> {
             }
         };
 
-        // Parse dependencies from proposal.md
-        let dependencies = parse_dependencies(dir_name);
+        // Parse dependencies and metadata from proposal.md
+        let metadata = parse_dependencies(dir_name);
+        let dependencies = metadata.dependencies.clone();
 
         changes.push(Change {
             id: dir_name.to_string(),
@@ -191,6 +327,7 @@ pub fn list_changes_native() -> Result<Vec<Change>> {
             total_tasks,
             last_modified: String::new(), // Not used in native implementation
             dependencies,
+            metadata,
         });
     }
 
@@ -224,6 +361,7 @@ mod tests {
             total_tasks: 0,
             last_modified: "now".to_string(),
             dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
         };
         assert_eq!(change.progress_percent(), 0.0);
         assert!(!change.is_complete());
@@ -237,6 +375,7 @@ mod tests {
             total_tasks: 5,
             last_modified: "now".to_string(),
             dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
         };
         assert_eq!(change.progress_percent(), 100.0);
         assert!(change.is_complete());
@@ -352,6 +491,79 @@ mod tests {
         assert_eq!(result[0].id, "change-a");
         assert_eq!(result[0].completed_tasks, 1);
         assert_eq!(result[0].total_tasks, 2);
+    }
+
+    #[test]
+    fn test_parse_proposal_metadata_prefers_frontmatter_dependencies() {
+        let proposal = r#"---
+change_type: hybrid
+priority: high
+dependencies:
+  - frontmatter-change
+references:
+  - src/openspec.rs
+---
+
+# Change: Example
+
+## Dependencies
+- body-change
+"#;
+
+        let metadata = parse_proposal_metadata(proposal, Path::new("proposal.md"));
+
+        assert_eq!(metadata.priority, Some(ProposalPriority::High));
+        assert_eq!(
+            metadata.dependencies,
+            vec!["frontmatter-change".to_string()]
+        );
+        assert_eq!(metadata.references, vec!["src/openspec.rs".to_string()]);
+        assert!(metadata.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_parse_proposal_metadata_falls_back_to_body_dependencies() {
+        let proposal = r#"---
+change_type: implementation
+priority: medium
+references:
+  - tests/test_demo.py
+---
+
+# Change: Example
+
+## Dependencies
+- [body-change](../body-change/proposal.md)
+- another-change: note
+"#;
+
+        let metadata = parse_proposal_metadata(proposal, Path::new("proposal.md"));
+
+        assert_eq!(metadata.priority, Some(ProposalPriority::Medium));
+        assert_eq!(
+            metadata.dependencies,
+            vec!["body-change".to_string(), "another-change".to_string()]
+        );
+        assert_eq!(metadata.references, vec!["tests/test_demo.py".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_proposal_metadata_warns_on_unknown_frontmatter_keys() {
+        let proposal = r#"---
+change_type: spec-only
+priority: low
+owner: tumf
+references: []
+---
+
+# Change: Example
+"#;
+
+        let metadata = parse_proposal_metadata(proposal, Path::new("proposal.md"));
+
+        assert_eq!(metadata.priority, Some(ProposalPriority::Low));
+        assert_eq!(metadata.warnings.len(), 1);
+        assert!(metadata.warnings[0].contains("owner"));
     }
 
     #[test]

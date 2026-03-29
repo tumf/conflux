@@ -114,7 +114,18 @@ Every proposal MUST include a `Change Type` field in `proposal.md`. Use this dec
 - If the spec authoring and the implementation can be reviewed and deployed independently, split into two proposals.
 - Use `hybrid` only when spec and code must ship atomically to preserve correctness.
 
-Add the following line to `proposal.md` metadata (near the top, after the title):
+When drafting `proposal.md`, prefer YAML frontmatter at the top for machine-readable metadata:
+
+```yaml
+---
+change_type: spec-only   # or: implementation | hybrid
+priority: medium         # high | medium | low
+dependencies: []         # optional change-id list; overrides body `## Dependencies`
+references: []           # optional string list of related files/specs/changes
+---
+```
+
+Keep the human-readable line near the top as well for backward-compatible readability:
 
 ```markdown
 **Change Type**: spec-only   <!-- or: implementation | hybrid -->
@@ -153,6 +164,7 @@ When keeping a single proposal despite multiple scopes, explicitly record the ra
 Create `openspec/changes/<id>/proposal.md`:
 
 **Required sections**:
+- YAML frontmatter with `change_type`, `priority`, optional `dependencies`, optional `references`
 - Title (H1)
 - Problem/Context
 - Proposed Solution

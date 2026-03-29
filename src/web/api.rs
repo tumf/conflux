@@ -1274,7 +1274,7 @@ pub async fn execute_worktree_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openspec::Change;
+    use crate::openspec::{Change, ProposalMetadata};
     use crate::web::state::OrchestratorStateSnapshot;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
@@ -1284,6 +1284,7 @@ mod tests {
             total_tasks: total,
             last_modified: "1m ago".to_string(),
             dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
         }
     }
 
