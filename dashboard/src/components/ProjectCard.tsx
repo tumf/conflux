@@ -5,7 +5,7 @@ import { RemoteProject, ActiveCommand } from '../api/types';
 interface ProjectCardProps {
   project: RemoteProject;
   isSelected: boolean;
-  onSelect: (projectId: string) => void;
+  onSelect: (projectId: string | null) => void;
   onGitSync: (projectId: string) => void;
   onDelete: (projectId: string) => void;
   isLoading: boolean;
@@ -39,10 +39,11 @@ export function ProjectCard({
     (cmd) => cmd.project_id === project.id && cmd.root === 'base'
   );
   const syncDisabled = isLoading || !syncAvailable || baseBusy;
+  const nextSelection = isSelected ? null : project.id;
 
   return (
     <div
-      onClick={() => onSelect(project.id)}
+      onClick={() => onSelect(nextSelection)}
       className={`group cursor-pointer rounded-lg border p-3.5 transition-all ${
         isSelected
           ? 'border-[#6366f1] bg-[#1e1b4b]/30'
@@ -53,7 +54,7 @@ export function ProjectCard({
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
-          onSelect(project.id);
+          onSelect(nextSelection);
         }
       }}
     >
