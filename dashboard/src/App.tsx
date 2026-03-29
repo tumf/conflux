@@ -322,7 +322,7 @@ function App() {
                       Files
                     </div>
                   </div>
-                  <div className="flex-1 overflow-y-auto">
+                  <div className="flex flex-1 overflow-hidden">
                     <FileViewPanel
                       projectId={store.state.selectedProjectId}
                       context={store.state.fileBrowseContext}
@@ -346,7 +346,7 @@ function App() {
                       </button>
                     ))}
                   </div>
-                  <div className="flex-1 overflow-y-auto">
+                  <div className="flex flex-1 overflow-hidden">
                     {desktopRightTab === 'logs' ? (
                       <LogsPanel
                         logs={selectedProjectLogs}
