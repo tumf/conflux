@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::Serialize;
 use tracing::{debug, info};
 
@@ -43,6 +43,15 @@ pub struct LogEntryRow {
     pub created_at: String,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RunRow {
+    pub id: i64,
+    pub started_at: String,
+    pub stopped_at: Option<String>,
+    pub status: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChangeStateRow {
     pub project_id: String,
@@ -62,6 +71,7 @@ pub struct ServerDb {
     conn: Mutex<Connection>,
 }
 
+#[allow(dead_code)]
 impl ServerDb {
     pub fn new(data_dir: &Path) -> Result<Arc<Self>> {
         std::fs::create_dir_all(data_dir).map_err(|e| {
@@ -195,17 +205,19 @@ impl ServerDb {
         })
     }
 
-    pub fn get_recent_runs(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<(i64, String, Option<String>, String)>> {
+    pub fn get_recent_runs(&self, limit: usize) -> Result<Vec<RunRow>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, started_at, stopped_at, status FROM orchestration_runs ORDER BY id DESC LIMIT ?1",
             )?;
             let rows = stmt
                 .query_map(params![limit as i64], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    Ok(RunRow {
+                        id: row.get(0)?,
+                        started_at: row.get(1)?,
+                        stopped_at: row.get(2)?,
+                        status: row.get(3)?,
+                    })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
@@ -455,11 +467,133 @@ impl ServerDb {
     pub fn cleanup_old_logs(&self, days: u32) -> Result<usize> {
         self.with_conn(|conn| {
             let count = conn.execute(
-                "DELETE FROM log_entries WHERE created_at < datetime('now', '-' || ?1 || ' days')",
+                "DELETE FROM log_entries
+                 WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || ?1 || ' days')",
                 params![days],
             )?;
             debug!(days, deleted = count, "Cleaned up old log entries");
             Ok(count)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::ServerDb;
+
+    #[test]
+    fn test_server_db_init_and_run_crud() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ServerDb::new(temp_dir.path()).unwrap();
+
+        let run_id = db.insert_run(Some("manual")).unwrap();
+        assert!(run_id > 0);
+
+        db.update_run_status(run_id, "success").unwrap();
+        let runs = db.get_recent_runs(10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, run_id);
+        assert_eq!(runs[0].status, "success");
+    }
+
+    #[test]
+    fn test_change_events_stats_and_history_queries() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ServerDb::new(temp_dir.path()).unwrap();
+
+        db.insert_change_event(
+            "project-a",
+            "change-1",
+            None,
+            "apply",
+            1,
+            true,
+            1200,
+            Some(0),
+            None,
+            Some("ok"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_change_event(
+            "project-a",
+            "change-2",
+            None,
+            "archive",
+            1,
+            false,
+            700,
+            Some(1),
+            Some("failed"),
+            None,
+            Some("err"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let by_change = db
+            .get_events_by_project_change("project-a", "change-1")
+            .unwrap();
+        assert_eq!(by_change.len(), 1);
+        assert_eq!(by_change[0].operation, "apply");
+
+        let recent = db.get_recent_events("project-a", 10).unwrap();
+        assert_eq!(recent.len(), 2);
+
+        let stats = db.get_stats_overview().unwrap();
+        assert_eq!(stats.success_count, 1);
+        assert_eq!(stats.failure_count, 1);
+        assert!((stats.average_duration_ms - 950.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_logs_query_change_state_and_cleanup() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ServerDb::new(temp_dir.path()).unwrap();
+
+        db.insert_log(
+            Some("project-a"),
+            "info",
+            "hello",
+            Some("change-1"),
+            Some("apply"),
+            Some(1),
+        )
+        .unwrap();
+
+        let all_logs = db.query_logs(10, None, None).unwrap();
+        assert_eq!(all_logs.len(), 1);
+        let ts = all_logs[0].created_at.clone();
+
+        let logs_by_project = db.query_logs(10, None, Some("project-a")).unwrap();
+        assert_eq!(logs_by_project.len(), 1);
+
+        let logs_before = db.query_logs(10, Some(&ts), None).unwrap();
+        assert_eq!(logs_before.len(), 0);
+
+        db.upsert_change_state("project-a", "change-1", false, Some("boom"))
+            .unwrap();
+        let states = db.load_change_states().unwrap();
+        assert_eq!(states.len(), 1);
+        assert!(!states[0].selected);
+        assert_eq!(states[0].error_message.as_deref(), Some("boom"));
+
+        db.delete_change_states_for_project("project-a").unwrap();
+        let states = db.load_change_states().unwrap();
+        assert!(states.is_empty());
+
+        let deleted = db.cleanup_old_logs(0).unwrap();
+        assert_eq!(deleted, 1);
+        let remaining_logs = db.query_logs(10, None, None).unwrap();
+        assert!(remaining_logs.is_empty());
     }
 }

@@ -355,6 +355,37 @@ impl ProjectRegistry {
         self.change_selections.get(project_id)
     }
 
+    /// Set persisted change state values in memory.
+    pub fn set_change_state(
+        &mut self,
+        project_id: &str,
+        change_id: &str,
+        selected: bool,
+        error_message: Option<String>,
+    ) {
+        self.change_selections
+            .entry(project_id.to_string())
+            .or_default()
+            .insert(change_id.to_string(), selected);
+
+        match error_message {
+            Some(message) => {
+                self.error_changes
+                    .entry(project_id.to_string())
+                    .or_default()
+                    .insert(change_id.to_string(), message);
+            }
+            None => {
+                if let Some(project_errors) = self.error_changes.get_mut(project_id) {
+                    project_errors.remove(change_id);
+                    if project_errors.is_empty() {
+                        self.error_changes.remove(project_id);
+                    }
+                }
+            }
+        }
+    }
+
     /// Mark a change as errored and clear its selection.
     pub fn mark_change_error(&mut self, project_id: &str, change_id: &str, error: String) {
         self.error_changes

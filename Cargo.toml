@@ -97,6 +97,7 @@ utoipa-swagger-ui = { version = "8", features = ["axum"], optional = true }
 
 # Terminal session dependencies (optional, tied to web-monitoring)
 portable-pty = { version = "0.8", optional = true }
+rusqlite = { version = "0.34", features = ["bundled"], optional = true }
 
 # Process management dependencies (platform-specific)
 [target.'cfg(unix)'.dependencies]
