@@ -9,6 +9,7 @@ import {
   FileContentResponse,
   ProposalSession,
   ProposalSessionChange,
+  StatsOverview,
   ProposalSessionMessageHistoryResponse,
 } from './types';
 
@@ -76,6 +77,13 @@ export async function fetchProjectsState(): Promise<{
   projects: RemoteProject[];
 }> {
   return fetchAPI('/projects/state', { method: 'GET' });
+}
+
+/**
+ * Fetch orchestration overview statistics
+ */
+export async function fetchStatsOverview(): Promise<StatsOverview> {
+  return fetchAPI('/stats/overview', { method: 'GET' });
 }
 
 /**

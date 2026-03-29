@@ -99,6 +99,41 @@ export interface FullState {
   active_commands?: ActiveCommand[];
 }
 
+// ─── Overview Dashboard Types ─────────────────────────────────────────────────
+
+export interface StatsOverview {
+  summary: {
+    success_count: number;
+    failure_count: number;
+    in_progress_count: number;
+    /** Optional overall average duration in milliseconds */
+    average_duration_ms?: number | null;
+    /** Optional per-operation average duration in milliseconds */
+    average_duration_by_operation?: Record<string, number>;
+  };
+  recent_events: ChangeEventSummary[];
+  project_stats: ProjectStats[];
+}
+
+export interface ChangeEventSummary {
+  project_id: string;
+  project_name?: string;
+  change_id: string;
+  operation: string;
+  result: 'success' | 'failure' | 'in_progress' | string;
+  timestamp: string;
+}
+
+export interface ProjectStats {
+  project_id: string;
+  project_name?: string;
+  apply_success_rate: number;
+  average_duration_ms: number | null;
+  success_count: number;
+  failure_count: number;
+  in_progress_count: number;
+}
+
 // ─── File Viewer Types ───────────────────────────────────────────────────────
 
 /** A single entry in the file tree returned by the server */
