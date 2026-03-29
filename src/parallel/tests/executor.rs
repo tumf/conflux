@@ -2163,6 +2163,7 @@ async fn test_on_merged_hook_execution() {
             command: hook_command,
             continue_on_failure: true,
             timeout: 5,
+            git_commit_no_verify: false,
         })),
         ..Default::default()
     };
