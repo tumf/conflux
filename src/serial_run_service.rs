@@ -419,7 +419,7 @@ impl SerialRunService {
             |line| async move {
                 match &line {
                     OutputLine::Stdout(s) => output.on_stdout(s),
-                    OutputLine::Stderr(s) => output.on_stderr(s),
+                    OutputLine::Stderr(s) => output.on_agent_stderr(s),
                 }
             },
         )

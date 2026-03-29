@@ -903,11 +903,11 @@ pub async fn execute_acceptance_in_workspace(
             AiOutputLine::Stderr(s) => {
                 output_collector.add_stderr(&s);
 
-                // Forward to event channel
+                // Forward to event channel (agent stderr is info-level, not warn)
                 if let Some(ref tx) = event_tx {
                     let _ = tx
                         .send(ParallelEvent::Log(
-                            crate::events::LogEntry::warn(&s)
+                            crate::events::LogEntry::info(&s)
                                 .with_change_id(change_id)
                                 .with_operation("acceptance")
                                 .with_iteration(acceptance_iteration),

@@ -1614,6 +1614,13 @@ mod tests {
                 .push(("stderr".into(), line.to_string()));
         }
 
+        fn on_agent_stderr(&self, line: &str) {
+            self.messages
+                .lock()
+                .unwrap()
+                .push(("agent_stderr".into(), line.to_string()));
+        }
+
         fn on_info(&self, message: &str) {
             self.messages
                 .lock()
