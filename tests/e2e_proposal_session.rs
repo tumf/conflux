@@ -111,6 +111,7 @@ fn make_state(temp_dir: &TempDir) -> AppState {
     AppState {
         registry,
         runners: create_shared_runners(),
+        db: None,
         auth_token: None,
         max_concurrent_total: 4,
         resolve_command: None,
