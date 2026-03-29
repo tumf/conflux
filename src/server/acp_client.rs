@@ -335,7 +335,7 @@ impl AcpClient {
     /// Perform the ACP `initialize` handshake.
     pub async fn initialize(&self) -> Result<Value, AcpError> {
         let params = serde_json::json!({
-            "protocolVersion": "2025-01-24",
+            "protocolVersion": 1,
             "clientInfo": {
                 "name": "conflux-dashboard",
                 "version": env!("CARGO_PKG_VERSION")
