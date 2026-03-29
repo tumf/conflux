@@ -1247,7 +1247,7 @@ mod tests {
         let worktrees = list_worktrees(temp_dir.path()).await.unwrap();
         let is_registered = worktrees
             .iter()
-            .any(|(path, _, _, _, _)| PathBuf::from(path) == worktree_path);
+            .any(|(path, _, _, _, _)| *path == worktree_path.to_string_lossy());
         assert!(!is_registered, "Worktree path should NOT be registered");
         // - Branch exists
         let branch_check = Command::new("git")
@@ -1365,7 +1365,7 @@ mod tests {
         let worktrees = list_worktrees(temp_dir.path()).await.unwrap();
         let is_registered = worktrees
             .iter()
-            .any(|(path, _, _, _, _)| PathBuf::from(path) == worktree_stale);
+            .any(|(path, _, _, _, _)| *path == worktree_stale.to_string_lossy());
         assert!(
             !is_registered,
             "Stale worktree path should NOT be registered"
