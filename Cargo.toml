@@ -82,7 +82,7 @@ agent-skills-rs = "0.3.1"
 
 # Remote TUI client dependencies
 # Use rustls to avoid OpenSSL/native-tls issues in cross-compilation.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 
