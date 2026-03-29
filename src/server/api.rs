@@ -3261,11 +3261,11 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                     let msg = match notif.method.as_str() {
                         "session/update" => {
                             if let Some(params) = &notif.params {
-                                match serde_json::from_value::<crate::server::acp_client::AcpEvent>(
-                                    params.clone(),
-                                ) {
-                                    Ok(event) => {
-                                        // Update last_activity
+                                match serde_json::from_value::<
+                                    crate::server::acp_client::AcpUpdateParams,
+                                >(params.clone())
+                                {
+                                    Ok(update_params) => {
                                         let mut mgr =
                                             state_for_notifs.proposal_session_manager.write().await;
                                         if let Some(s) = mgr.get_session_mut(&session_id_for_notifs)
@@ -3274,7 +3274,10 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                                         }
                                         drop(mgr);
 
-                                        acp_event_to_ws_message(event)
+                                        match acp_event_to_ws_message(update_params.update) {
+                                            Some(msg) => msg,
+                                            None => continue,
+                                        }
                                     }
                                     Err(e) => {
                                         debug!(error = %e, "Failed to parse ACP event");
@@ -3427,44 +3430,51 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
 }
 
 /// Convert an ACP event to a WebSocket server message.
-fn acp_event_to_ws_message(event: crate::server::acp_client::AcpEvent) -> ProposalWsServerMessage {
+fn acp_event_to_ws_message(
+    event: crate::server::acp_client::AcpEvent,
+) -> Option<ProposalWsServerMessage> {
     use crate::server::acp_client::AcpEvent;
     match event {
-        AcpEvent::AgentMessageChunk { text } => ProposalWsServerMessage::AgentMessageChunk { text },
+        AcpEvent::AgentMessageChunk { content } => {
+            let text = content.map(|c| c.text).unwrap_or_default();
+            Some(ProposalWsServerMessage::AgentMessageChunk { text })
+        }
+        AcpEvent::AgentThoughtChunk { .. } => None,
         AcpEvent::ToolCall {
             tool_call_id,
             title,
             kind,
             status,
-        } => ProposalWsServerMessage::ToolCall {
+        } => Some(ProposalWsServerMessage::ToolCall {
             tool_call_id,
             title,
             kind,
             status,
-        },
+        }),
         AcpEvent::ToolCallUpdate {
             tool_call_id,
             status,
             content,
-        } => ProposalWsServerMessage::ToolCallUpdate {
+        } => Some(ProposalWsServerMessage::ToolCallUpdate {
             tool_call_id,
             status,
             content,
-        },
+        }),
         AcpEvent::Elicitation {
             request_id,
             mode,
             message,
             schema,
-        } => ProposalWsServerMessage::Elicitation {
+        } => Some(ProposalWsServerMessage::Elicitation {
             request_id,
             mode,
             message,
             schema,
-        },
+        }),
         AcpEvent::TurnComplete { stop_reason } => {
-            ProposalWsServerMessage::TurnComplete { stop_reason }
+            Some(ProposalWsServerMessage::TurnComplete { stop_reason })
         }
+        AcpEvent::Unknown => None,
     }
 }
 

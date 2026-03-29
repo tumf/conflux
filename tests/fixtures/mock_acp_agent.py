@@ -45,10 +45,17 @@ for raw in sys.stdin:
         )
         continue
 
-    if method == "session/prompt":
+    if method == "session/prompt" and msg_id is not None:
         params = msg.get("params") or {}
         session_id = params.get("sessionId", "mock-session-1")
-        content = ((params.get("message") or {}).get("content")) or ""
+        prompt_blocks = params.get("prompt") or []
+        content = ""
+        for block in prompt_blocks:
+            if block.get("type") == "text":
+                content = block.get("text", "")
+                break
+        if not content:
+            content = ((params.get("message") or {}).get("content")) or ""
 
         if not session_created:
             continue
@@ -82,8 +89,11 @@ for raw in sys.stdin:
                 "jsonrpc": "2.0",
                 "method": "session/update",
                 "params": {
-                    "type": "agent_message_chunk",
-                    "text": f"echo:{content}",
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": f"echo:{content}"},
+                    },
                 },
             }
         )
@@ -92,11 +102,15 @@ for raw in sys.stdin:
                 "jsonrpc": "2.0",
                 "method": "session/update",
                 "params": {
-                    "type": "turn_complete",
-                    "stop_reason": "completed",
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "turn_complete",
+                        "stopReason": "end_turn",
+                    },
                 },
             }
         )
+        send({"jsonrpc": "2.0", "id": msg_id, "result": {"stopReason": "end_turn"}})
         continue
 
     if msg_id is not None and isinstance(msg_id, str) and msg_id in pending_elicitation:
@@ -108,8 +122,14 @@ for raw in sys.stdin:
                 "jsonrpc": "2.0",
                 "method": "session/update",
                 "params": {
-                    "type": "agent_message_chunk",
-                    "text": f"elicitation-accepted:{answer}",
+                    "sessionId": pending_elicitation[msg_id],
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {
+                            "type": "text",
+                            "text": f"elicitation-accepted:{answer}",
+                        },
+                    },
                 },
             }
         )
@@ -118,8 +138,11 @@ for raw in sys.stdin:
                 "jsonrpc": "2.0",
                 "method": "session/update",
                 "params": {
-                    "type": "turn_complete",
-                    "stop_reason": "completed",
+                    "sessionId": pending_elicitation[msg_id],
+                    "update": {
+                        "sessionUpdate": "turn_complete",
+                        "stopReason": "end_turn",
+                    },
                 },
             }
         )
@@ -132,8 +155,11 @@ for raw in sys.stdin:
                 "jsonrpc": "2.0",
                 "method": "session/update",
                 "params": {
-                    "type": "turn_complete",
-                    "stop_reason": "cancelled",
+                    "sessionId": "mock-session-1",
+                    "update": {
+                        "sessionUpdate": "turn_complete",
+                        "stopReason": "cancelled",
+                    },
                 },
             }
         )
