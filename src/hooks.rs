@@ -9,6 +9,7 @@ use crate::events::{ExecutionEvent, LogEntry};
 use crate::orchestration::output::OutputHandler;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,6 +95,12 @@ impl std::fmt::Display for HookType {
     }
 }
 
+/// Default number of retries for a hook (0 means no retry)
+pub const DEFAULT_HOOK_MAX_RETRIES: u32 = 0;
+
+/// Default delay between hook retries in seconds
+pub const DEFAULT_HOOK_RETRY_DELAY_SECS: u64 = 3;
+
 /// Configuration for a single hook
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HookConfig {
@@ -108,6 +115,12 @@ pub struct HookConfig {
     /// Whether downstream git commits should skip verification hooks (default: false)
     #[serde(default)]
     pub git_commit_no_verify: bool,
+    /// Number of retries on non-zero exit before applying continue_on_failure logic (default: 0)
+    #[serde(default)]
+    pub max_retries: u32,
+    /// Delay in seconds between retries (default: 3)
+    #[serde(default = "default_retry_delay_secs")]
+    pub retry_delay_secs: u64,
 }
 
 fn default_continue_on_failure() -> bool {
@@ -118,6 +131,10 @@ fn default_timeout() -> u64 {
     DEFAULT_HOOK_TIMEOUT
 }
 
+fn default_retry_delay_secs() -> u64 {
+    DEFAULT_HOOK_RETRY_DELAY_SECS
+}
+
 impl HookConfig {
     /// Create a new HookConfig with just a command (using defaults)
     pub fn from_command(command: String) -> Self {
@@ -126,6 +143,8 @@ impl HookConfig {
             continue_on_failure: true,
             timeout: DEFAULT_HOOK_TIMEOUT,
             git_commit_no_verify: false,
+            max_retries: DEFAULT_HOOK_MAX_RETRIES,
+            retry_delay_secs: DEFAULT_HOOK_RETRY_DELAY_SECS,
         }
     }
 }
@@ -494,10 +513,15 @@ fn truncate_hook_output(s: &str, limit: usize) -> (&str, bool) {
     (&s[..boundary], true)
 }
 
+/// Default maximum wait time for .git/index.lock release (seconds)
+pub const DEFAULT_INDEX_LOCK_WAIT_SECS: u64 = 10;
+
 /// Hook runner that executes hooks based on configuration
 #[derive(Clone)]
 pub struct HookRunner {
     config: HooksConfig,
+    /// Repository root directory for hook execution (working directory for commands)
+    repo_root: PathBuf,
     /// Optional event sender for hook logs (TUI/parallel mode)
     event_tx: Option<mpsc::Sender<ExecutionEvent>>,
     /// Optional output handler for CLI-visible hook logs
@@ -508,6 +532,7 @@ impl std::fmt::Debug for HookRunner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HookRunner")
             .field("config", &self.config)
+            .field("repo_root", &self.repo_root)
             .field("event_tx", &self.event_tx.is_some())
             .field("output_handler", &self.output_handler.is_some())
             .finish()
@@ -516,9 +541,10 @@ impl std::fmt::Debug for HookRunner {
 
 impl HookRunner {
     /// Create a new HookRunner with the given configuration
-    pub fn new(config: HooksConfig) -> Self {
+    pub fn new(config: HooksConfig, repo_root: impl Into<PathBuf>) -> Self {
         Self {
             config,
+            repo_root: repo_root.into(),
             event_tx: None,
             output_handler: None,
         }
@@ -530,19 +556,26 @@ impl HookRunner {
     /// are surfaced in the user-visible log stream.
     pub fn with_output_handler(
         config: HooksConfig,
+        repo_root: impl Into<PathBuf>,
         output_handler: Arc<dyn OutputHandler>,
     ) -> Self {
         Self {
             config,
+            repo_root: repo_root.into(),
             event_tx: None,
             output_handler: Some(output_handler),
         }
     }
 
     /// Create a HookRunner with the given configuration and event sender
-    pub fn with_event_tx(config: HooksConfig, event_tx: mpsc::Sender<ExecutionEvent>) -> Self {
+    pub fn with_event_tx(
+        config: HooksConfig,
+        repo_root: impl Into<PathBuf>,
+        event_tx: mpsc::Sender<ExecutionEvent>,
+    ) -> Self {
         Self {
             config,
+            repo_root: repo_root.into(),
             event_tx: Some(event_tx),
             output_handler: None,
         }
@@ -553,9 +586,15 @@ impl HookRunner {
     pub fn empty() -> Self {
         Self {
             config: HooksConfig::default(),
+            repo_root: PathBuf::from("."),
             event_tx: None,
             output_handler: None,
         }
+    }
+
+    /// Get the repository root path
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
     }
 
     /// Check if a specific hook is configured

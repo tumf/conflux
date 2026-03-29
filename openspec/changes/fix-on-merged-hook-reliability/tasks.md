@@ -1,6 +1,6 @@
 ## Implementation Tasks
 
-- [ ] Add `max_retries: u32` (default 0) and `retry_delay_secs: u64` (default 3) to `HookConfig` in `src/hooks.rs` (verification: `cargo test test_hooks_config_deserialize` passes with new fields)
+- [x] Add `max_retries: u32` (default 0) and `retry_delay_secs: u64` (default 3) to `HookConfig` in `src/hooks.rs` (verification: `cargo test test_hooks_config_deserialize` passes with new fields)
 - [ ] Add `repo_root: PathBuf` field to `HookRunner` and update all constructors (`new`, `with_event_tx`, `with_output_handler`) to accept `repo_root` parameter (verification: `cargo build` succeeds)
 - [ ] Set `cmd.current_dir(&self.repo_root)` in `execute_hook()` (verification: unit test confirms cwd is repo_root)
 - [ ] Update all `HookRunner` instantiation sites to pass `repo_root`: `src/orchestrator.rs`, `src/parallel_run_service.rs`, `src/tui/orchestrator.rs`, `src/tui/command_handlers.rs` (verification: `cargo build` succeeds)
