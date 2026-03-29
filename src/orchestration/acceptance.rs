@@ -200,7 +200,7 @@ where
             }
             OutputLine::Stderr(s) => {
                 output_collector.add_stderr(&s);
-                output.on_stderr(&s);
+                output.on_agent_stderr(&s);
             }
         }
     }

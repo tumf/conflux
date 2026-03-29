@@ -228,7 +228,7 @@ where
             }
             Ok(OutputLine::Stderr(s)) => {
                 output_collector.add_stderr(&s);
-                output.on_stderr(&s);
+                output.on_agent_stderr(&s);
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                 // No data available, check if process is done

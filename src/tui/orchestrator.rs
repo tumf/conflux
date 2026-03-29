@@ -319,6 +319,16 @@ pub async fn run_orchestrator(
                             ))
                             .await;
                     }
+                    OutputMessage::AgentStderr(s) => {
+                        let _ = tx
+                            .send(OrchestratorEvent::Log(
+                                LogEntry::info(s)
+                                    .with_change_id(&change_id)
+                                    .with_operation(&operation)
+                                    .with_iteration(apply_count),
+                            ))
+                            .await;
+                    }
                     OutputMessage::Info(s) => {
                         let _ = tx
                             .send(OrchestratorEvent::Log(
