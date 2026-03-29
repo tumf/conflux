@@ -318,11 +318,11 @@ impl ParallelExecutor {
                 .attempt_merge(&revisions, &change_ids, &archive_paths)
                 .await
             {
-                Ok(super::merge::MergeAttempt::Merged) => {
+                Ok(super::merge::MergeAttempt::Merged { revision }) => {
                     info!("Deferred merge succeeded for '{}' on retry", change_id);
                     self.merge_deferred_changes.remove(&change_id);
 
-                    // Run on_merged hook.
+                    // Run on_merged hook before merged status transition (MergeCompleted event).
                     if let Some(ref hooks) = self.hooks {
                         let (completed_tasks, total_tasks) =
                             match crate::openspec::list_changes_native() {
@@ -351,6 +351,16 @@ impl ParallelExecutor {
                             );
                         }
                     }
+
+                    // Send MergeCompleted after on_merged hook (triggers merged status transition)
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::MergeCompleted {
+                            change_id: change_id.clone(),
+                            revision,
+                        },
+                    )
+                    .await;
 
                     // Clean up workspace.
                     send_event(

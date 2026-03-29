@@ -435,13 +435,8 @@ pub async fn handle_tui_command(
                 {
                     Ok(_) => {
                         debug!("Merge succeeded for branch: {}", merge_branch);
-                        let _ = merge_tx
-                            .send(OrchestratorEvent::BranchMergeCompleted {
-                                branch_name: merge_branch.clone(),
-                            })
-                            .await;
 
-                        // Run on_merged hook after manual branch merge
+                        // Run on_merged hook before BranchMergeCompleted event (before merged status transition)
                         // Try to extract change_id from branch name; if it fails, log a warning
                         if let Some(change_id) =
                             crate::vcs::GitWorkspaceManager::extract_change_id_from_worktree_name(
@@ -494,6 +489,13 @@ pub async fn handle_tui_command(
                                 merge_branch
                             );
                         }
+
+                        // Send BranchMergeCompleted after on_merged hook (triggers merged status transition)
+                        let _ = merge_tx
+                            .send(OrchestratorEvent::BranchMergeCompleted {
+                                branch_name: merge_branch.clone(),
+                            })
+                            .await;
 
                         // Refresh worktree list to update UI with conflict check
                         debug!("Refreshing worktree list after successful merge");
