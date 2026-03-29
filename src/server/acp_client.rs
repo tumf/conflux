@@ -273,18 +273,18 @@ impl AcpClient {
         working_dir: &Path,
     ) -> Result<Arc<Self>, AcpError> {
         // Resolve relative command names to absolute paths via login shell PATH.
-        let resolved = resolve_command_path(&config.acp_command).await;
+        let resolved = resolve_command_path(&config.transport_command).await;
 
         info!(
-            cmd = %config.acp_command,
+            cmd = %config.transport_command,
             resolved_cmd = %resolved.command,
-            args = ?config.acp_args,
+            args = ?config.transport_args,
             cwd = %working_dir.display(),
             "Spawning ACP subprocess"
         );
 
         let mut cmd = Command::new(&resolved.command);
-        cmd.args(&config.acp_args)
+        cmd.args(&config.transport_args)
             .current_dir(working_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -294,7 +294,7 @@ impl AcpClient {
             cmd.env("PATH", login_path);
         }
 
-        for (key, value) in &config.acp_env {
+        for (key, value) in &config.transport_env {
             cmd.env(key, value);
         }
 

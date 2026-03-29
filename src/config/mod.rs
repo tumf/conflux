@@ -2038,9 +2038,9 @@ mod tests {
             },
             "resolve_command": "echo resolve",
             "proposal_session": {
-                "acp_command": "custom-acp",
-                "acp_args": ["agent", "serve"],
-                "acp_env": {
+                "transport_command": "custom-opencode",
+                "transport_args": ["--foo", "bar"],
+                "transport_env": {
                     "FOO": "bar"
                 },
                 "session_inactivity_timeout_secs": 42
@@ -2054,10 +2054,13 @@ mod tests {
 
         assert_eq!(server_config.port, 41234);
         assert_eq!(resolve_command.as_deref(), Some("echo resolve"));
-        assert_eq!(proposal_session.acp_command, "custom-acp");
-        assert_eq!(proposal_session.acp_args, vec!["agent", "serve"]);
+        assert_eq!(proposal_session.transport_command, "custom-opencode");
+        assert_eq!(proposal_session.transport_args, vec!["--foo", "bar"]);
         assert_eq!(
-            proposal_session.acp_env.get("FOO").map(String::as_str),
+            proposal_session
+                .transport_env
+                .get("FOO")
+                .map(String::as_str),
             Some("bar")
         );
         assert_eq!(proposal_session.session_inactivity_timeout_secs, 42);

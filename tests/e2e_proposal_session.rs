@@ -20,8 +20,8 @@ use conflux::server::registry::{create_shared_registry, OrchestrationStatus};
 use conflux::server::runner::create_shared_runners;
 use conflux::server::terminal::create_terminal_manager;
 
-fn create_mock_acp_path(repo_root: &Path) -> PathBuf {
-    repo_root.join("tests/fixtures/mock_acp_agent.py")
+fn create_mock_opencode_path(repo_root: &Path) -> PathBuf {
+    repo_root.join("tests/fixtures/mock_opencode_server.py")
 }
 
 fn proposal_worktree_path(base_dir: &Path, project_id: &str, session_id: &str) -> PathBuf {
@@ -99,8 +99,8 @@ async fn create_project(router: axum::Router, remote_url: String) -> (axum::Rout
 fn make_state(temp_dir: &TempDir) -> AppState {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let proposal_config = ProposalSessionConfig {
-        acp_command: "python3".to_string(),
-        acp_args: vec![create_mock_acp_path(&repo_root).display().to_string()],
+        transport_command: "python3".to_string(),
+        transport_args: vec![create_mock_opencode_path(&repo_root).display().to_string()],
         session_inactivity_timeout_secs: 1,
         ..Default::default()
     };
@@ -204,25 +204,7 @@ async fn proposal_session_ws_accepts_frontend_message_aliases() {
 
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({"type": "prompt", "content": "trigger-elicitation"}).to_string(),
-        ))
-        .await
-        .unwrap();
-
-    let elicitation_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
-    let elicitation_json: Value = serde_json::from_str(&elicitation_message).unwrap();
-    assert_eq!(elicitation_json["type"], "elicitation");
-    let request_id = elicitation_json["request_id"].as_str().unwrap().to_string();
-
-    socket
-        .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({
-                "type": "elicitation_response",
-                "elicitation_id": request_id,
-                "action": "accept",
-                "data": {"answer": "approved"}
-            })
-            .to_string(),
+            serde_json::json!({"type": "prompt", "content": "alias-check"}).to_string(),
         ))
         .await
         .unwrap();
@@ -230,7 +212,7 @@ async fn proposal_session_ws_accepts_frontend_message_aliases() {
     let chunk_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let chunk_json: Value = serde_json::from_str(&chunk_message).unwrap();
     assert_eq!(chunk_json["type"], "agent_message_chunk");
-    assert_eq!(chunk_json["text"], "elicitation-accepted:approved");
+    assert_eq!(chunk_json["text"], "echo:alias-check");
 
     let turn_complete_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let turn_complete_json: Value = serde_json::from_str(&turn_complete_message).unwrap();
@@ -435,6 +417,95 @@ async fn proposal_session_merge_merges_branch_and_removes_worktree() {
             .exists(),
         "merged proposal change should exist in base worktree"
     );
+}
+
+#[tokio::test]
+async fn proposal_session_ws_cancel_and_reconnect_history_work() {
+    let temp_dir = TempDir::new().unwrap();
+    let origin = create_local_git_repo(temp_dir.path());
+    let remote_url = format!("file://{}", origin.to_string_lossy());
+    let state = make_state(&temp_dir);
+    let router = build_router(state.clone());
+
+    let (_router, project_id) = create_project(router.clone(), remote_url).await;
+
+    let create_req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/projects/{project_id}/proposal-sessions"))
+        .body(Body::empty())
+        .unwrap();
+    let create_resp = router.clone().oneshot(create_req).await.unwrap();
+    let create_body = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&create_body).unwrap();
+    let session_id = created["id"].as_str().unwrap().to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_router = router.clone();
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, serve_router).await.unwrap();
+    });
+
+    use futures_util::{SinkExt, StreamExt};
+
+    let ws_url = format!("ws://{addr}/api/v1/proposal-sessions/{session_id}/ws");
+    let (mut socket, _) = connect_async(ws_url.clone()).await.unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({"type": "prompt", "content": "history-check"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let chunk_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let chunk_json: Value = serde_json::from_str(&chunk_message).unwrap();
+    assert_eq!(chunk_json["type"], "agent_message_chunk");
+    assert_eq!(chunk_json["text"], "echo:history-check");
+
+    let turn_complete_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let turn_complete_json: Value = serde_json::from_str(&turn_complete_message).unwrap();
+    assert_eq!(turn_complete_json["type"], "turn_complete");
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({"type": "cancel"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let cancelled_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let cancelled_json: Value = serde_json::from_str(&cancelled_message).unwrap();
+    assert_eq!(cancelled_json["type"], "turn_complete");
+    assert_eq!(cancelled_json["stop_reason"], "cancelled");
+
+    drop(socket);
+
+    let (mut reconnect_socket, _) = connect_async(ws_url).await.unwrap();
+    let replay_message = reconnect_socket
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    let replay_json: Value = serde_json::from_str(&replay_message).unwrap();
+    assert_eq!(replay_json["type"], "agent_message_chunk");
+    assert_eq!(replay_json["text"], "echo:history-check");
+
+    let replay_turn_complete = reconnect_socket
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    let replay_turn_complete_json: Value = serde_json::from_str(&replay_turn_complete).unwrap();
+    assert_eq!(replay_turn_complete_json["type"], "turn_complete");
+
+    server_task.abort();
 }
 
 #[tokio::test]
