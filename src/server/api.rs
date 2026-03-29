@@ -20,6 +20,7 @@ use tracing::{debug, error, info};
 
 use crate::execution::state::{detect_workspace_state, WorkspaceState};
 use crate::remote::types::{RemoteChange, RemoteLogEntry, RemoteProject, RemoteStateUpdate};
+use crate::server::proposal_session::{ProposalSessionError, SharedProposalSessionManager};
 use crate::server::registry::{
     server_worktree_branch, OrchestrationStatus, ProjectEntry, ProjectStatus, SharedRegistry,
 };
@@ -52,6 +53,8 @@ pub struct AppState {
     pub orchestration_status: Arc<tokio::sync::RwLock<OrchestrationStatus>>,
     /// Terminal session manager for dashboard interactive shells
     pub terminal_manager: SharedTerminalManager,
+    /// Proposal session manager for interactive proposal creation
+    pub proposal_session_manager: SharedProposalSessionManager,
 }
 
 // ─────────────────────────────── Auth middleware ──────────────────────────────
@@ -2721,6 +2724,462 @@ async fn handle_terminal_ws(socket: WebSocket, manager: SharedTerminalManager, s
     info!(session_id = %session_id, "Terminal WebSocket disconnected");
 }
 
+// ─────────────────────────────── Proposal Session types ────────────────────────
+
+/// WebSocket message from client to server.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProposalWsClientMessage {
+    Prompt {
+        text: String,
+    },
+    ElicitationResponse {
+        request_id: String,
+        action: String,
+        #[serde(default)]
+        content: Option<serde_json::Value>,
+    },
+    Cancel,
+}
+
+/// WebSocket message from server to client.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProposalWsServerMessage {
+    AgentMessageChunk {
+        text: String,
+    },
+    ToolCall {
+        tool_call_id: String,
+        title: String,
+        kind: String,
+        status: String,
+    },
+    ToolCallUpdate {
+        tool_call_id: String,
+        status: String,
+        content: Vec<serde_json::Value>,
+    },
+    Elicitation {
+        request_id: String,
+        mode: String,
+        message: String,
+        schema: Option<serde_json::Value>,
+    },
+    TurnComplete {
+        stop_reason: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// Request body for closing a proposal session.
+#[derive(Debug, Deserialize)]
+pub struct CloseProposalSessionRequest {
+    #[serde(default)]
+    pub force: bool,
+}
+
+// ─────────────────────────────── Proposal Session handlers ─────────────────────
+
+/// POST /api/v1/projects/{id}/proposal-sessions
+async fn create_proposal_session(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Response {
+    let (worktree_path, _entry) = match resolve_project_worktree_path(&state, &project_id).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let mut manager = state.proposal_session_manager.write().await;
+    match manager.create_session(&project_id, &worktree_path).await {
+        Ok(info) => (StatusCode::CREATED, Json(serde_json::json!(info))).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)),
+    }
+}
+
+/// GET /api/v1/projects/{id}/proposal-sessions
+async fn list_proposal_sessions(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Response {
+    let manager = state.proposal_session_manager.read().await;
+    let sessions = manager.list_sessions(&project_id);
+    (StatusCode::OK, Json(serde_json::json!(sessions))).into_response()
+}
+
+/// DELETE /api/v1/projects/{id}/proposal-sessions/{session_id}
+async fn close_proposal_session(
+    State(state): State<AppState>,
+    Path((project_id, session_id)): Path<(String, String)>,
+    body: Option<Json<CloseProposalSessionRequest>>,
+) -> Response {
+    let force = body.map(|b| b.force).unwrap_or(false);
+
+    let (worktree_path, _entry) = match resolve_project_worktree_path(&state, &project_id).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let mut manager = state.proposal_session_manager.write().await;
+    match manager
+        .close_session(&session_id, force, &worktree_path)
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "closed"})),
+        )
+            .into_response(),
+        Err(ProposalSessionError::NotFound(id)) => {
+            error_response(StatusCode::NOT_FOUND, format!("Session not found: {}", id))
+        }
+        Err(ProposalSessionError::DirtyWorktree { files }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "dirty",
+                "message": "Worktree has uncommitted changes. Use force: true to close anyway.",
+                "uncommitted_files": files
+            })),
+        )
+            .into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)),
+    }
+}
+
+/// POST /api/v1/projects/{id}/proposal-sessions/{session_id}/merge
+async fn merge_proposal_session(
+    State(state): State<AppState>,
+    Path((project_id, session_id)): Path<(String, String)>,
+) -> Response {
+    let (worktree_path, entry) = match resolve_project_worktree_path(&state, &project_id).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let mut manager = state.proposal_session_manager.write().await;
+    match manager
+        .merge_session(&session_id, &worktree_path, &entry.branch)
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "merged"})),
+        )
+            .into_response(),
+        Err(ProposalSessionError::NotFound(id)) => {
+            error_response(StatusCode::NOT_FOUND, format!("Session not found: {}", id))
+        }
+        Err(ProposalSessionError::DirtyWorktree { files }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "dirty",
+                "message": "Worktree has uncommitted changes. Resolve them before merging.",
+                "uncommitted_files": files
+            })),
+        )
+            .into_response(),
+        Err(ProposalSessionError::MergeConflict(msg)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "conflict",
+                "message": msg
+            })),
+        )
+            .into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)),
+    }
+}
+
+/// GET /api/v1/projects/{id}/proposal-sessions/{session_id}/changes
+async fn list_proposal_session_changes(
+    State(state): State<AppState>,
+    Path((_project_id, session_id)): Path<(String, String)>,
+) -> Response {
+    let manager = state.proposal_session_manager.read().await;
+    match manager.detect_changes(&session_id).await {
+        Ok(changes) => (StatusCode::OK, Json(serde_json::json!(changes))).into_response(),
+        Err(ProposalSessionError::NotFound(id)) => {
+            error_response(StatusCode::NOT_FOUND, format!("Session not found: {}", id))
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)),
+    }
+}
+
+/// GET /api/v1/proposal-sessions/{session_id}/ws
+async fn proposal_session_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Response {
+    ws.on_upgrade(move |socket| proposal_session_ws(socket, state, session_id))
+}
+
+async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: String) {
+    use futures_util::{SinkExt, StreamExt};
+
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+
+    info!(session_id = %session_id, "Proposal session WebSocket connected");
+
+    // Get the ACP client and session ID from the manager
+    let (acp_client, acp_session_id) = {
+        let manager = state.proposal_session_manager.read().await;
+        match manager.get_session(&session_id) {
+            Some(session) => {
+                if session.status != crate::server::proposal_session::ProposalSessionStatus::Active
+                {
+                    let _ = ws_sender
+                        .send(Message::Text(
+                            serde_json::to_string(&ProposalWsServerMessage::Error {
+                                message: "Session is not active".to_string(),
+                            })
+                            .unwrap_or_default()
+                            .into(),
+                        ))
+                        .await;
+                    return;
+                }
+                (session.acp_client.clone(), session.acp_session_id.clone())
+            }
+            None => {
+                let _ = ws_sender
+                    .send(Message::Text(
+                        serde_json::to_string(&ProposalWsServerMessage::Error {
+                            message: "Session not found".to_string(),
+                        })
+                        .unwrap_or_default()
+                        .into(),
+                    ))
+                    .await;
+                return;
+            }
+        }
+    };
+
+    // Task to forward ACP notifications to WebSocket
+    let acp_client_for_notifs = acp_client.clone();
+    let session_id_for_notifs = session_id.clone();
+    let state_for_notifs = state.clone();
+    let (ws_send_tx, mut ws_send_rx) = tokio::sync::mpsc::channel::<String>(256);
+
+    let ws_send_tx_for_notifs = ws_send_tx.clone();
+    let notif_task = tokio::spawn(async move {
+        loop {
+            match acp_client_for_notifs.recv_notification().await {
+                Some(crate::server::acp_client::AcpMessage::Notification(notif)) => {
+                    let msg = match notif.method.as_str() {
+                        "session/update" => {
+                            if let Some(params) = &notif.params {
+                                match serde_json::from_value::<crate::server::acp_client::AcpEvent>(
+                                    params.clone(),
+                                ) {
+                                    Ok(event) => {
+                                        // Update last_activity
+                                        let mut mgr =
+                                            state_for_notifs.proposal_session_manager.write().await;
+                                        if let Some(s) = mgr.get_session_mut(&session_id_for_notifs)
+                                        {
+                                            s.touch();
+                                        }
+                                        drop(mgr);
+
+                                        acp_event_to_ws_message(event)
+                                    }
+                                    Err(e) => {
+                                        debug!(error = %e, "Failed to parse ACP event");
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                continue;
+                            }
+                        }
+                        "session/elicitation" => {
+                            if let Some(params) = &notif.params {
+                                let request_id = params
+                                    .get("requestId")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let mode = params
+                                    .get("mode")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("form")
+                                    .to_string();
+                                let message = params
+                                    .get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let schema = params.get("schema").cloned();
+
+                                ProposalWsServerMessage::Elicitation {
+                                    request_id,
+                                    mode,
+                                    message,
+                                    schema,
+                                }
+                            } else {
+                                continue;
+                            }
+                        }
+                        _ => {
+                            debug!(method = %notif.method, "Unhandled ACP notification");
+                            continue;
+                        }
+                    };
+
+                    let json = match serde_json::to_string(&msg) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            error!(error = %e, "Failed to serialize WebSocket message");
+                            continue;
+                        }
+                    };
+
+                    if ws_send_tx_for_notifs.send(json).await.is_err() {
+                        break;
+                    }
+                }
+                None => {
+                    // ACP process ended
+                    let _ = ws_send_tx_for_notifs
+                        .send(
+                            serde_json::to_string(&ProposalWsServerMessage::Error {
+                                message: "ACP process has exited".to_string(),
+                            })
+                            .unwrap_or_default(),
+                        )
+                        .await;
+                    break;
+                }
+            }
+        }
+    });
+
+    // Task to send queued messages to WebSocket
+    let send_task = tokio::spawn(async move {
+        while let Some(json) = ws_send_rx.recv().await {
+            if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Task to receive WebSocket messages from client and forward to ACP
+    let session_id_for_recv = session_id.clone();
+    let recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_receiver.next().await {
+            match msg {
+                Message::Text(text) => {
+                    let text_str: &str = &text;
+                    match serde_json::from_str::<ProposalWsClientMessage>(text_str) {
+                        Ok(ProposalWsClientMessage::Prompt { text }) => {
+                            // Update last_activity
+                            {
+                                let mut mgr = state.proposal_session_manager.write().await;
+                                if let Some(s) = mgr.get_session_mut(&session_id_for_recv) {
+                                    s.touch();
+                                }
+                            }
+
+                            if let Err(e) = acp_client.send_prompt(&acp_session_id, &text).await {
+                                error!(error = %e, "Failed to send prompt to ACP");
+                                let _ = ws_send_tx
+                                    .send(
+                                        serde_json::to_string(&ProposalWsServerMessage::Error {
+                                            message: format!("Failed to send prompt: {}", e),
+                                        })
+                                        .unwrap_or_default(),
+                                    )
+                                    .await;
+                            }
+                        }
+                        Ok(ProposalWsClientMessage::ElicitationResponse {
+                            request_id,
+                            action,
+                            content,
+                        }) => {
+                            if let Err(e) = acp_client
+                                .respond_elicitation(&request_id, &action, content)
+                                .await
+                            {
+                                error!(error = %e, "Failed to respond to elicitation");
+                            }
+                        }
+                        Ok(ProposalWsClientMessage::Cancel) => {
+                            if let Err(e) = acp_client.cancel(&acp_session_id).await {
+                                error!(error = %e, "Failed to cancel ACP session");
+                            }
+                        }
+                        Err(e) => {
+                            debug!(error = %e, text = %text_str, "Failed to parse client WebSocket message");
+                        }
+                    }
+                }
+                Message::Close(_) => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Wait for any task to complete
+    tokio::select! {
+        _ = notif_task => {},
+        _ = send_task => {},
+        _ = recv_task => {},
+    }
+
+    info!(session_id = %session_id, "Proposal session WebSocket disconnected");
+}
+
+/// Convert an ACP event to a WebSocket server message.
+fn acp_event_to_ws_message(event: crate::server::acp_client::AcpEvent) -> ProposalWsServerMessage {
+    use crate::server::acp_client::AcpEvent;
+    match event {
+        AcpEvent::AgentMessageChunk { text } => ProposalWsServerMessage::AgentMessageChunk { text },
+        AcpEvent::ToolCall {
+            tool_call_id,
+            title,
+            kind,
+            status,
+        } => ProposalWsServerMessage::ToolCall {
+            tool_call_id,
+            title,
+            kind,
+            status,
+        },
+        AcpEvent::ToolCallUpdate {
+            tool_call_id,
+            status,
+            content,
+        } => ProposalWsServerMessage::ToolCallUpdate {
+            tool_call_id,
+            status,
+            content,
+        },
+        AcpEvent::Elicitation {
+            request_id,
+            mode,
+            message,
+            schema,
+        } => ProposalWsServerMessage::Elicitation {
+            request_id,
+            mode,
+            message,
+            schema,
+        },
+        AcpEvent::TurnComplete { stop_reason } => {
+            ProposalWsServerMessage::TurnComplete { stop_reason }
+        }
+    }
+}
+
 // ─────────────────────────────── Router builder ────────────────────────────────
 
 /// Build the API v1 router with authentication middleware.
@@ -2767,6 +3226,22 @@ pub fn build_router(app_state: AppState) -> Router {
             "/terminal/sessions/{session_id}/resize",
             post(resize_terminal),
         )
+        .route(
+            "/projects/{id}/proposal-sessions",
+            get(list_proposal_sessions).post(create_proposal_session),
+        )
+        .route(
+            "/projects/{id}/proposal-sessions/{session_id}",
+            delete(close_proposal_session),
+        )
+        .route(
+            "/projects/{id}/proposal-sessions/{session_id}/merge",
+            post(merge_proposal_session),
+        )
+        .route(
+            "/projects/{id}/proposal-sessions/{session_id}/changes",
+            get(list_proposal_session_changes),
+        )
         .route("/control/run", post(global_control_run))
         .route("/control/stop", post(global_control_stop))
         .route("/control/status", get(global_control_status))
@@ -2781,6 +3256,10 @@ pub fn build_router(app_state: AppState) -> Router {
         .route(
             "/terminal/sessions/{session_id}/ws",
             get(terminal_ws_handler),
+        )
+        .route(
+            "/proposal-sessions/{session_id}/ws",
+            get(proposal_session_ws_handler),
         )
         .route("/version", get(get_version))
         .with_state(app_state);
@@ -2827,6 +3306,10 @@ mod tests {
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                ),
         }
     }
 
@@ -3267,6 +3750,10 @@ mod tests {
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                ),
         }
     }
 
@@ -4118,6 +4605,10 @@ mod tests {
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                ),
         };
 
         let branch = "main";
@@ -4268,6 +4759,10 @@ mod tests {
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                ),
         };
 
         let branch = "main";
@@ -4635,6 +5130,10 @@ mod tests {
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                ),
         };
         let router = build_router(state_with_project);
 
@@ -4695,6 +5194,10 @@ mod tests {
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                ),
         };
         let router = build_router(state);
 
@@ -4749,6 +5252,10 @@ mod tests {
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                ),
         };
         let router = build_router(state);
 
