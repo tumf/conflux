@@ -221,8 +221,12 @@ impl Orchestrator {
         config: OrchestratorConfig,
     ) -> Result<Self> {
         log_deduplicator::configure_logging(config.get_logging());
-        let hooks =
-            HookRunner::with_output_handler(config.get_hooks(), Arc::new(LogOutputHandler::new()));
+        let repo_root = std::env::current_dir()?;
+        let hooks = HookRunner::with_output_handler(
+            config.get_hooks(),
+            &repo_root,
+            Arc::new(LogOutputHandler::new()),
+        );
         let max_iterations = config.get_max_iterations();
         let agent = AgentRunner::new(config.clone());
         let stall_detector = StallDetector::new(config.get_stall_detection());

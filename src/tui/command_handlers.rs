@@ -450,8 +450,11 @@ pub async fn handle_tui_command(
                         {
                             // Create hook runner from config
                             let hooks_config = merge_config.get_hooks();
+                            let merge_repo_root = std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."));
                             let hooks = crate::hooks::HookRunner::with_event_tx(
                                 hooks_config,
+                                merge_repo_root,
                                 merge_tx.clone(),
                             );
 

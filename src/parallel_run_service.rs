@@ -157,9 +157,9 @@ impl ParallelRunService {
 
         // Create hooks before moving event_tx
         let hooks = if let Some(ref tx) = event_tx {
-            HookRunner::with_event_tx(self.config.get_hooks(), tx.clone())
+            HookRunner::with_event_tx(self.config.get_hooks(), &self.repo_root, tx.clone())
         } else {
-            HookRunner::new(self.config.get_hooks())
+            HookRunner::new(self.config.get_hooks(), &self.repo_root)
         };
 
         let mut executor = ParallelExecutor::with_backend_and_queue_and_stagger(
@@ -347,7 +347,8 @@ impl ParallelRunService {
         executor.set_no_resume(self.no_resume);
 
         // Set hooks from config
-        let hooks = HookRunner::with_event_tx(self.config.get_hooks(), event_tx.clone());
+        let hooks =
+            HookRunner::with_event_tx(self.config.get_hooks(), &self.repo_root, event_tx.clone());
         executor.set_hooks(hooks);
 
         // Set cancel token if provided
