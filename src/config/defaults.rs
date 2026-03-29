@@ -147,11 +147,11 @@ pub const DEFAULT_MERGE_STALL_CHECK_INTERVAL_SECONDS: u64 = 60;
 
 // ── Proposal session defaults ──────────────────────────────────────────────
 
-/// Default transport command for proposal sessions (OpenCode Server)
+/// Default transport command for proposal sessions (ACP subprocess)
 pub const DEFAULT_PROPOSAL_TRANSPORT_COMMAND: &str = "opencode";
 
-/// Default transport arguments for proposal sessions
-pub const DEFAULT_PROPOSAL_TRANSPORT_ARGS: &[&str] = &[];
+/// Default transport arguments for proposal sessions (ACP stdio mode)
+pub const DEFAULT_PROPOSAL_TRANSPORT_ARGS: &[&str] = &["acp"];
 
 /// Default inactivity timeout for proposal sessions (seconds)
 pub const DEFAULT_PROPOSAL_SESSION_INACTIVITY_TIMEOUT_SECS: u64 = 1800;

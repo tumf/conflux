@@ -13,7 +13,6 @@ pub mod acp_client;
 pub mod active_commands;
 pub mod api;
 pub mod db;
-pub mod opencode_client;
 pub mod proposal_session;
 pub mod registry;
 pub mod runner;

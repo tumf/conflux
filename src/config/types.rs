@@ -353,22 +353,22 @@ pub struct OrchestratorConfig {
 
 // ── ProposalSessionConfig ──────────────────────────────────────────────────
 
-/// Configuration for proposal sessions (OpenCode transport interactive proposal creation).
+/// Configuration for proposal sessions (ACP transport interactive proposal creation).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalSessionConfig {
-    /// OpenCode subprocess command (default: "opencode")
+    /// ACP subprocess command (default: "opencode")
     #[serde(default = "default_proposal_transport_command", alias = "acp_command")]
     pub transport_command: String,
 
-    /// Arguments passed to the OpenCode command before `serve --port 0 ...`
+    /// Arguments passed to the ACP command (default: ["acp"])
     #[serde(default = "default_proposal_transport_args", alias = "acp_args")]
     pub transport_args: Vec<String>,
 
-    /// Additional environment variables for the OpenCode subprocess
+    /// Additional environment variables for the ACP subprocess
     #[serde(default, alias = "acp_env")]
     pub transport_env: HashMap<String, String>,
 
-    /// Inactivity timeout in seconds before OpenCode process is killed (default: 1800)
+    /// Inactivity timeout in seconds before ACP process is killed (default: 1800)
     #[serde(default = "default_proposal_session_inactivity_timeout_secs")]
     pub session_inactivity_timeout_secs: u64,
 }
