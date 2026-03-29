@@ -3,7 +3,7 @@
 //! Provides PTY-backed interactive terminal sessions that can be attached
 //! to via WebSocket connections from the dashboard frontend.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +23,9 @@ const DEFAULT_COLS: u16 = 80;
 /// Maximum number of bytes to buffer for output broadcast.
 const OUTPUT_CHANNEL_CAPACITY: usize = 256;
 
+/// Maximum scrollback buffer size in bytes (64KB).
+const SCROLLBACK_BUFFER_CAPACITY: usize = 64 * 1024;
+
 /// Information about a terminal session visible to the API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalSessionInfo {
@@ -31,6 +34,12 @@ pub struct TerminalSessionInfo {
     pub rows: u16,
     pub cols: u16,
     pub created_at: String,
+    /// Project identifier associated with this session (empty if not set).
+    #[serde(default)]
+    pub project_id: String,
+    /// Root context (e.g. "base" or "worktree:feature-x") associated with this session.
+    #[serde(default)]
+    pub root: String,
 }
 
 /// Request to create a new terminal session.
@@ -42,6 +51,12 @@ pub struct CreateTerminalRequest {
     pub rows: Option<u16>,
     /// Optional initial cols (default: 80).
     pub cols: Option<u16>,
+    /// Project identifier to associate with this session.
+    #[serde(default)]
+    pub project_id: String,
+    /// Root context (e.g. "base" or "worktree:feature-x") to associate with this session.
+    #[serde(default)]
+    pub root: String,
 }
 
 /// Request from the dashboard to create a terminal session with project context.
@@ -71,6 +86,9 @@ enum PtyCommand {
     Shutdown,
 }
 
+/// Thread-safe scrollback buffer shared between PTY reader and WebSocket handlers.
+type SharedScrollback = Arc<std::sync::Mutex<VecDeque<u8>>>;
+
 /// Internal representation of a running terminal session.
 struct TerminalSession {
     info: TerminalSessionInfo,
@@ -80,6 +98,8 @@ struct TerminalSession {
     output_tx: broadcast::Sender<Vec<u8>>,
     /// Channel to send commands (resize) to the PTY management thread.
     pty_cmd_tx: mpsc::UnboundedSender<PtyCommand>,
+    /// Ring buffer storing recent PTY output for reconnection scrollback.
+    scrollback: SharedScrollback,
 }
 
 /// Thread-safe terminal session manager.
@@ -130,9 +150,15 @@ impl TerminalManager {
         let (pty_cmd_tx, pty_cmd_rx) = mpsc::unbounded_channel::<PtyCommand>();
         let (output_tx, _) = broadcast::channel(OUTPUT_CHANNEL_CAPACITY);
 
+        // Scrollback ring buffer for reconnection
+        let scrollback: SharedScrollback = Arc::new(std::sync::Mutex::new(
+            VecDeque::with_capacity(SCROLLBACK_BUFFER_CAPACITY),
+        ));
+
         // Spawn PTY in a blocking thread since portable-pty is synchronous.
         // The master PTY stays in this thread and is controlled via pty_cmd_rx.
         let output_tx_clone = output_tx.clone();
+        let scrollback_clone = scrollback.clone();
         let sid_clone = sid.clone();
 
         let (writer_tx, writer_rx) = tokio::sync::oneshot::channel();
@@ -193,7 +219,7 @@ impl TerminalManager {
             let tx = output_tx_clone;
             let reader_sid = sid_clone.clone();
             std::thread::spawn(move || {
-                read_pty_output(reader, tx, reader_sid);
+                read_pty_output(reader, tx, scrollback_clone, reader_sid);
             });
 
             // This thread now handles PTY commands (resize) since master stays here
@@ -238,6 +264,8 @@ impl TerminalManager {
             rows,
             cols,
             created_at: ts,
+            project_id: request.project_id,
+            root: request.root,
         };
 
         let session = TerminalSession {
@@ -245,6 +273,7 @@ impl TerminalManager {
             writer: Arc::new(Mutex::new(writer)),
             output_tx,
             pty_cmd_tx,
+            scrollback,
         };
 
         self.sessions.write().await.insert(session_id, session);
@@ -332,12 +361,28 @@ impl TerminalManager {
     pub async fn session_exists(&self, session_id: &str) -> bool {
         self.sessions.read().await.contains_key(session_id)
     }
+
+    /// Get the scrollback buffer contents for a session.
+    pub async fn get_scrollback(&self, session_id: &str) -> Result<Vec<u8>, String> {
+        let sessions = self.sessions.read().await;
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| format!("Session not found: {}", session_id))?;
+
+        let sb = session
+            .scrollback
+            .lock()
+            .map_err(|e| format!("Failed to lock scrollback buffer: {}", e))?;
+
+        Ok(sb.iter().copied().collect())
+    }
 }
 
-/// Read PTY output in a blocking thread and broadcast to subscribers.
+/// Read PTY output in a blocking thread, broadcast to subscribers, and write to scrollback buffer.
 fn read_pty_output(
     mut reader: Box<dyn Read + Send>,
     tx: broadcast::Sender<Vec<u8>>,
+    scrollback: SharedScrollback,
     session_id: String,
 ) {
     let mut buf = [0u8; 4096];
@@ -349,6 +394,17 @@ fn read_pty_output(
             }
             Ok(n) => {
                 let data = buf[..n].to_vec();
+
+                // Write to scrollback ring buffer
+                if let Ok(mut sb) = scrollback.lock() {
+                    for &byte in &data {
+                        if sb.len() >= SCROLLBACK_BUFFER_CAPACITY {
+                            sb.pop_front();
+                        }
+                        sb.push_back(byte);
+                    }
+                }
+
                 // Ignore send error - it just means no subscribers
                 let _ = tx.send(data);
             }
@@ -389,6 +445,8 @@ mod tests {
                 cwd: "/tmp".to_string(),
                 rows: Some(24),
                 cols: Some(80),
+                project_id: String::new(),
+                root: String::new(),
             })
             .await
             .unwrap();
@@ -417,6 +475,8 @@ mod tests {
                 cwd: "/nonexistent/path/that/does/not/exist".to_string(),
                 rows: None,
                 cols: None,
+                project_id: String::new(),
+                root: String::new(),
             })
             .await;
         assert!(result.is_err());
@@ -442,6 +502,8 @@ mod tests {
                 cwd: "/tmp".to_string(),
                 rows: None,
                 cols: None,
+                project_id: String::new(),
+                root: String::new(),
             })
             .await
             .unwrap();
@@ -450,5 +512,60 @@ mod tests {
 
         manager.delete_session(&info.id).await.unwrap();
         assert!(!manager.session_exists(&info.id).await);
+    }
+
+    #[tokio::test]
+    async fn test_session_preserves_project_id_and_root() {
+        let manager = create_terminal_manager();
+
+        let info = manager
+            .create_session(CreateTerminalRequest {
+                cwd: "/tmp".to_string(),
+                rows: Some(24),
+                cols: Some(80),
+                project_id: "proj1".to_string(),
+                root: "worktree:feature-x".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(info.project_id, "proj1");
+        assert_eq!(info.root, "worktree:feature-x");
+
+        // Verify via list_sessions
+        let sessions = manager.list_sessions().await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].project_id, "proj1");
+        assert_eq!(sessions[0].root, "worktree:feature-x");
+
+        // Cleanup
+        manager.delete_session(&info.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_scrollback_buffer_available() {
+        let manager = create_terminal_manager();
+
+        let info = manager
+            .create_session(CreateTerminalRequest {
+                cwd: "/tmp".to_string(),
+                rows: Some(24),
+                cols: Some(80),
+                project_id: String::new(),
+                root: String::new(),
+            })
+            .await
+            .unwrap();
+
+        // Scrollback should be initially empty
+        let scrollback = manager.get_scrollback(&info.id).await.unwrap();
+        assert!(scrollback.is_empty());
+
+        // Scrollback for nonexistent session should error
+        let result = manager.get_scrollback("nonexistent").await;
+        assert!(result.is_err());
+
+        // Cleanup
+        manager.delete_session(&info.id).await.unwrap();
     }
 }
