@@ -9,3 +9,7 @@
 ## Future Work
 
 - 必要であれば全体ログ表示時のプロジェクト識別ラベル改善を別提案で検討する
+
+## Acceptance #1 Failure Follow-up
+
+- [ ] 受け入れレビュー前に変更をコミットまたは破棄し、git working tree を clean にする
