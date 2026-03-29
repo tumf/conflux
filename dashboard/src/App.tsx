@@ -335,7 +335,13 @@ function App() {
     onDelete: handleDeleteClick,
     isLoading,
     syncAvailable: store.state.syncAvailable,
+    activeCommands: store.state.activeCommands,
   };
+
+  // Active commands for the currently selected project
+  const selectedProjectActiveCommands = store.state.activeCommands.filter(
+    (cmd) => cmd.project_id === store.state.selectedProjectId
+  );
 
   return (
     <div className="flex h-screen flex-col bg-[#09090b] text-[#fafafa]">
@@ -467,6 +473,7 @@ function App() {
                       onClickWorktree={handleClickWorktree}
                       selectedWorktreeBranch={store.state.fileBrowseContext?.type === 'worktree' ? store.state.fileBrowseContext.worktreeBranch : null}
                       isLoading={isLoading}
+                      activeCommands={selectedProjectActiveCommands}
                     />
                   )}
                 </div>
@@ -582,6 +589,7 @@ function App() {
                 onClickWorktree={handleClickWorktree}
                 selectedWorktreeBranch={store.state.fileBrowseContext?.type === 'worktree' ? store.state.fileBrowseContext.worktreeBranch : null}
                 isLoading={isLoading}
+                activeCommands={selectedProjectActiveCommands}
               />
             )}
             {activeTab === 'logs' && (

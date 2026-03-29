@@ -213,6 +213,8 @@ export interface TerminalSessionInfo {
   rows: number;
   cols: number;
   created_at: string;
+  project_id: string;
+  root: string;
 }
 
 export interface CreateTerminalRequest {

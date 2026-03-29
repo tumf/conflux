@@ -11,7 +11,7 @@ use crate::error::{OrchestratorError, Result};
 
 use super::defaults::PROJECT_CONFIG_FILE;
 use super::jsonc;
-use super::types::{OrchestratorConfig, ServerConfig};
+use super::types::{OrchestratorConfig, ProposalSessionConfig, ServerConfig};
 // Path helpers are defined in the parent (mod.rs) and accessed via super::
 use super::{get_platform_config_path, get_xdg_default_config_path, get_xdg_env_config_path};
 
@@ -43,14 +43,16 @@ impl OrchestratorConfig {
     /// Project config (`.cflx.jsonc`) is intentionally excluded — server mode is directory-independent.
     #[allow(dead_code)]
     pub fn load_server_config_from_global() -> ServerConfig {
-        let (server_config, _) = Self::load_server_config_and_resolve_command_from_global();
+        let (server_config, _, _) = Self::load_server_config_and_resolve_command_from_global();
         server_config
     }
 
-    /// Load server configuration and top-level `resolve_command` from global config files.
-    /// Used by `cflx server` to get both the `server` section and the top-level `resolve_command`.
+    /// Load server configuration, top-level `resolve_command`, and proposal session config
+    /// from global config files.
+    /// Used by `cflx server` to get server-specific settings plus top-level values that
+    /// are wired into the server runtime.
     ///
-    /// Returns `(ServerConfig, Option<resolve_command>)`.
+    /// Returns `(ServerConfig, Option<resolve_command>, ProposalSessionConfig)`.
     ///
     /// Priority (lowest to highest):
     /// 1. Platform default config
@@ -58,7 +60,8 @@ impl OrchestratorConfig {
     /// 3. XDG env config ($XDG_CONFIG_HOME/cflx/config.jsonc)
     ///
     /// Project config (`.cflx.jsonc`) is intentionally excluded — server mode is directory-independent.
-    pub fn load_server_config_and_resolve_command_from_global() -> (ServerConfig, Option<String>) {
+    pub fn load_server_config_and_resolve_command_from_global(
+    ) -> (ServerConfig, Option<String>, ProposalSessionConfig) {
         let mut merged = OrchestratorConfig::default();
 
         // 1. Platform default config
@@ -89,7 +92,12 @@ impl OrchestratorConfig {
         }
 
         let resolve_command = merged.resolve_command.clone();
-        (merged.server.unwrap_or_default(), resolve_command)
+        let proposal_session = merged.proposal_session.clone().unwrap_or_default();
+        (
+            merged.server.unwrap_or_default(),
+            resolve_command,
+            proposal_session,
+        )
     }
 
     /// Load configuration with merge-based priority:

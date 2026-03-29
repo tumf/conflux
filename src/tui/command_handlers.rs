@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::worktrees::load_worktrees_with_conflict_check;
 
@@ -243,6 +243,7 @@ pub async fn handle_tui_command(
             .await
             {
                 Ok(_) => {
+                    info!("Worktree deleted successfully: {}", path.display());
                     ctx.app.add_log(LogEntry::success(format!(
                         "Deleted worktree: {}",
                         path.display()
@@ -253,13 +254,17 @@ pub async fn handle_tui_command(
                         match crate::vcs::git::commands::branch_delete(ctx.repo_root, &branch).await
                         {
                             Ok(_) => {
+                                info!("Branch deleted after worktree removal: {}", branch);
                                 ctx.app.add_log(LogEntry::success(format!(
                                     "Deleted branch: {}",
                                     branch
                                 )));
                             }
                             Err(e) => {
-                                warn!("Failed to delete branch '{}': {} (continuing)", branch, e);
+                                warn!(
+                                    "Branch deletion failed for '{}' after worktree removal: {} (non-fatal)",
+                                    branch, e
+                                );
                                 ctx.app.add_log(LogEntry::warn(format!(
                                     "Failed to delete branch '{}': {}",
                                     branch, e

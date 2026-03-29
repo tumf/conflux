@@ -2,6 +2,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Describes an active command occupying a worktree root.
+/// Used in both server-side active command tracking and WebSocket `full_state`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActiveCommand {
+    /// Project ID this command belongs to.
+    pub project_id: String,
+    /// Which root is occupied (e.g. "base" or "worktree:<branch>").
+    pub root: String,
+    /// High-level operation name (e.g. "sync", "merge", "delete", "apply").
+    pub operation: String,
+    /// ISO 8601 timestamp when the command started.
+    pub started_at: String,
+}
+
 /// A change returned by the remote server
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RemoteChange {
@@ -167,6 +181,9 @@ pub enum RemoteStateUpdate {
         /// Global orchestration status: "idle", "running", or "stopped"
         #[serde(default = "default_orchestration_status")]
         orchestration_status: String,
+        /// Currently active commands across all worktree roots
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        active_commands: Vec<ActiveCommand>,
     },
     /// Incremental update for a single change
     ChangeUpdate { change: RemoteChange },
@@ -450,6 +467,7 @@ mod tests {
             worktrees: Some(worktrees_map),
             sync_available: true,
             orchestration_status: "idle".to_string(),
+            active_commands: vec![],
         };
 
         let json = serde_json::to_string(&update).unwrap();

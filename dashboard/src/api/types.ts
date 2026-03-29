@@ -78,6 +78,14 @@ export interface WorktreeInfo {
   is_merging: boolean;
 }
 
+/** An active command occupying a worktree root */
+export interface ActiveCommand {
+  project_id: string;
+  root: string;
+  operation: string;
+  started_at: string;
+}
+
 export interface FullState {
   projects: RemoteProject[];
   /** Flattened changes extracted from projects for easy access */
@@ -87,6 +95,8 @@ export interface FullState {
   sync_available?: boolean;
   /** Global orchestration status */
   orchestration_status?: OrchestrationStatus;
+  /** Currently active commands across all worktree roots */
+  active_commands?: ActiveCommand[];
 }
 
 // ─── File Viewer Types ───────────────────────────────────────────────────────

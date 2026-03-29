@@ -1,6 +1,6 @@
 import React from 'react';
 import { Plus, RefreshCw } from 'lucide-react';
-import { WorktreeInfo } from '../api/types';
+import { WorktreeInfo, ActiveCommand } from '../api/types';
 import { WorktreeRow } from './WorktreeRow';
 
 interface WorktreesPanelProps {
@@ -13,6 +13,8 @@ interface WorktreesPanelProps {
   onClickWorktree?: (branch: string) => void;
   selectedWorktreeBranch?: string | null;
   isLoading: boolean;
+  /** Active commands for the selected project */
+  activeCommands?: ActiveCommand[];
 }
 
 export function WorktreesPanel({
@@ -25,6 +27,7 @@ export function WorktreesPanel({
   onClickWorktree,
   selectedWorktreeBranch,
   isLoading,
+  activeCommands = [],
 }: WorktreesPanelProps) {
   if (!selectedProjectId) {
     return (
@@ -75,6 +78,11 @@ export function WorktreesPanel({
               onClickWorktree={onClickWorktree}
               isSelected={selectedWorktreeBranch === wt.branch}
               isLoading={isLoading}
+              activeCommand={activeCommands.find(
+                (cmd) =>
+                  (wt.is_main && cmd.root === 'base') ||
+                  cmd.root === `worktree:${wt.branch}`
+              )}
             />
           ))}
         </div>

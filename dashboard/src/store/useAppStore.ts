@@ -15,6 +15,7 @@ import {
   ElicitationRequest,
   ToolCallInfo,
   ToolCallStatus,
+  ActiveCommand,
 } from '../api/types';
 import { ConnectionStatus } from '../api/wsClient';
 
@@ -42,6 +43,8 @@ export interface AppState {
   isAgentResponding: boolean;
   /** Streaming message content being built (keyed by message_id) */
   streamingContent: Record<string, string>;
+  /** Currently active commands across all worktree roots */
+  activeCommands: ActiveCommand[];
 }
 
 export type AppAction =
@@ -79,6 +82,7 @@ const initialState: AppState = {
   activeElicitation: null,
   isAgentResponding: false,
   streamingContent: {},
+  activeCommands: [],
 };
 
 export function appReducer(state: AppState, action: AppAction): AppState {
@@ -89,6 +93,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         projects: action.payload.projects,
         syncAvailable: action.payload.sync_available ?? false,
         orchestrationStatus: action.payload.orchestration_status ?? 'idle',
+        activeCommands: action.payload.active_commands ?? [],
       };
       // Update worktrees if included in full_state
       if (action.payload.worktrees) {
