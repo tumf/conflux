@@ -1640,16 +1640,7 @@ pub async fn toggle_all_change_selection(
     let changes = list_remote_changes_in_worktree(&worktree_path, &entry.id, &entry.branch).await;
     let change_ids: Vec<String> = changes.iter().map(|c| c.id.clone()).collect();
 
-    let error_change_ids: Vec<String> = registry
-        .error_changes_for_project(&project_id)
-        .map(|errors| errors.keys().cloned().collect())
-        .unwrap_or_default();
     let new_selected = registry.toggle_all_changes(&project_id, &change_ids);
-    if new_selected {
-        for change_id in error_change_ids {
-            registry.clear_change_error(&project_id, &change_id);
-        }
-    }
 
     info!(
         project_id = %project_id,
@@ -4269,14 +4260,17 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
-        assert_ne!(json["projects"][0]["changes"][0]["status"], "error");
+        assert_eq!(json["projects"][0]["changes"][0]["status"], "error");
+
+        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
 
         let req = Request::builder()
             .method(Method::POST)
             .uri("/api/v1/control/run")
             .body(Body::empty())
             .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -4284,6 +4278,20 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["started"], 1);
         assert_eq!(json["skipped"], 0);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
+        assert_eq!(json["projects"][0]["changes"][0]["status"], "error");
     }
 
     #[tokio::test]

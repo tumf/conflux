@@ -637,12 +637,13 @@ mod tests {
 
         registry.mark_change_error(&entry.id, "change-a", "boom".to_string());
 
-        let new_selected = registry.toggle_all_changes(
-            &entry.id,
-            &["change-a".to_string(), "change-b".to_string()],
-        );
+        let new_selected = registry
+            .toggle_all_changes(&entry.id, &["change-a".to_string(), "change-b".to_string()]);
 
-        assert!(new_selected, "bulk toggle should mark all when any row is unselected");
+        assert!(
+            new_selected,
+            "bulk toggle should mark all when any row is unselected"
+        );
         assert!(registry.is_change_selected(&entry.id, "change-a"));
         assert!(registry.is_change_selected(&entry.id, "change-b"));
         assert!(

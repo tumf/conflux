@@ -14,7 +14,11 @@
 
 ## Acceptance #2 Failure Follow-up
 
-- [x] `toggle_all_change_selection()` で Error change の再マーク semantics を個別 toggle と揃え、bulk toggle が無条件に error 状態を clear しないよう修正する
 - [x] `toggle_all_changes()` の既定選択値を Error change では `false` に揃え、server selection semantics を一貫させる
 - [x] bulk toggle 経路の Error change 挙動を固定する server API / registry テストを追加する
-- [x] 作業ツリーをクリーンにしてから acceptance を再実行する
+
+## Acceptance #3 Failure Follow-up
+
+- [x] `toggle_all_change_selection()` で bulk toggle 時に `clear_change_error()` しないよう修正し、Error change の再マーク semantics を個別 toggle と揃える
+- [x] bulk toggle の server API テストを spec 通りに更新し、再マーク後も `status: "error"` が維持されつつ次回 Run 対象になることを固定する
+- [x] `tasks.md` の完了チェックを実装実態に合わせて真実に修正し、作業ツリーをクリーンにしてから acceptance を再実行する
