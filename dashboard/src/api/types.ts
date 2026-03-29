@@ -174,13 +174,14 @@ export type ProposalWsClientMessage =
 
 /** Messages received from server */
 export type ProposalWsServerMessage =
-  | { type: 'agent_message_chunk'; text: string }
+  | { type: 'agent_message_chunk'; text: string; message_id?: string }
   | {
       type: 'tool_call';
       tool_call_id: string;
       title: string;
       kind: string;
       status: ToolCallStatus;
+      message_id?: string;
     }
   | {
       type: 'tool_call_update';
@@ -218,8 +219,16 @@ export interface ProposalChatMessage {
   content: string;
   /** ISO 8601 timestamp */
   timestamp: string;
+  /** Server turn identifier used for chunk/tool-call correlation */
+  turn_id?: string;
+  /** Message restored from backend history endpoint */
+  hydrated?: boolean;
   /** Tool calls associated with this message (agent only) */
   tool_calls?: ToolCallInfo[];
+}
+
+export interface ProposalSessionMessageHistoryResponse {
+  messages: ProposalChatMessage[];
 }
 
 /** JSON Schema property for elicitation forms */
