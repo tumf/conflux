@@ -152,6 +152,9 @@ function App() {
     try {
       await deleteWorktreeAPI(projectId, deleteWorktreeTarget);
       toast.success('Worktree deleted');
+      if (store.state.fileBrowseContext?.type === 'worktree' && store.state.fileBrowseContext.worktreeBranch === deleteWorktreeTarget) {
+        store.setFileBrowseContext(null);
+      }
       setDeleteWorktreeTarget(null);
       // Refresh worktree list
       const updated = await refreshWorktreesAPI(projectId);

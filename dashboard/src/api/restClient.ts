@@ -122,9 +122,8 @@ export async function deleteWorktree(
   projectId: string,
   branchName: string,
 ): Promise<void> {
-  return fetchAPI(`/projects/${projectId}/worktrees/delete`, {
-    method: 'POST',
-    body: JSON.stringify({ branch_name: branchName }),
+  return fetchAPI(`/projects/${projectId}/worktrees/${encodeURIComponent(branchName)}`, {
+    method: 'DELETE',
   });
 }
 
