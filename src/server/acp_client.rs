@@ -176,15 +176,33 @@ pub enum AcpMessage {
 
 // ── ACP update event types ────────────────────────────────────────────────
 
+/// Wrapper for the `session/update` notification params.
+///
+/// ACP spec: `{ "sessionId": "...", "update": { "sessionUpdate": "...", ... } }`
+#[derive(Debug, Clone, Deserialize)]
+pub struct AcpUpdateParams {
+    #[serde(default, rename = "sessionId")]
+    #[allow(dead_code)]
+    pub session_id: Option<String>,
+    pub update: AcpEvent,
+}
+
 /// Events emitted by the ACP subprocess via `session/update` notifications.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 pub enum AcpEvent {
     AgentMessageChunk {
-        text: String,
+        #[serde(default)]
+        content: Option<AcpContent>,
+    },
+    AgentThoughtChunk {
+        #[serde(default)]
+        content: Option<AcpContent>,
     },
     ToolCall {
+        #[serde(default, rename = "toolCallId")]
         tool_call_id: String,
+        #[serde(default)]
         title: String,
         #[serde(default)]
         kind: String,
@@ -192,13 +210,17 @@ pub enum AcpEvent {
         status: String,
     },
     ToolCallUpdate {
+        #[serde(default, rename = "toolCallId")]
         tool_call_id: String,
+        #[serde(default)]
         status: String,
         #[serde(default)]
         content: Vec<Value>,
     },
     Elicitation {
+        #[serde(default, rename = "requestId")]
         request_id: String,
+        #[serde(default)]
         mode: String,
         #[serde(default)]
         message: String,
@@ -206,9 +228,20 @@ pub enum AcpEvent {
         schema: Option<Value>,
     },
     TurnComplete {
-        #[serde(default)]
+        #[serde(default, rename = "stopReason")]
         stop_reason: String,
     },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Content block in ACP messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpContent {
+    #[serde(default, rename = "type")]
+    pub content_type: String,
+    #[serde(default)]
+    pub text: String,
 }
 
 // ── AcpClient ─────────────────────────────────────────────────────────────
@@ -217,6 +250,8 @@ pub enum AcpEvent {
 pub struct AcpClient {
     /// Sender half for writing JSON-RPC messages to the subprocess stdin.
     stdin_tx: mpsc::Sender<String>,
+    /// Sender for synthetic notifications generated from request responses.
+    notification_tx: mpsc::Sender<AcpMessage>,
     /// Receiver half for incoming notifications from the subprocess stdout.
     notification_rx: Mutex<mpsc::Receiver<AcpMessage>>,
     /// Monotonically incrementing request ID counter.
@@ -302,6 +337,7 @@ impl AcpClient {
 
         // Spawn stdout reader task
         let response_tx_clone = response_tx.clone();
+        let notif_tx_clone = notif_tx.clone();
         tokio::spawn(async move {
             let reader = BufReader::new(child_stdout);
             let mut lines = reader.lines();
@@ -333,7 +369,7 @@ impl AcpClient {
                             match serde_json::from_value::<JsonRpcNotification>(val) {
                                 Ok(notif) => {
                                     let msg = AcpMessage::Notification(notif);
-                                    if notif_tx.send(msg).await.is_err() {
+                                    if notif_tx_clone.send(msg).await.is_err() {
                                         debug!("Notification channel closed");
                                         break;
                                     }
@@ -365,6 +401,7 @@ impl AcpClient {
 
         let client = Arc::new(Self {
             stdin_tx,
+            notification_tx: notif_tx.clone(),
             notification_rx: Mutex::new(notif_rx),
             next_id: AtomicU64::new(1),
             response_rx: Mutex::new(response_rx),
@@ -425,18 +462,55 @@ impl AcpClient {
     }
 
     /// Send a prompt to the ACP session.
-    pub async fn send_prompt(&self, session_id: &str, text: &str) -> Result<(), AcpError> {
-        self.send_notification(
-            "session/prompt",
-            Some(serde_json::json!({
-                "sessionId": session_id,
-                "message": {
-                    "role": "user",
-                    "content": text
+    ///
+    /// ACP spec: `session/prompt` is a request (has `id`). The response carries
+    /// the `stopReason` when the turn finishes.  We spawn the request in a
+    /// background task so the caller is not blocked – streaming updates arrive
+    /// via `session/update` notifications on the notification channel.
+    pub async fn send_prompt(
+        self: &Arc<Self>,
+        session_id: &str,
+        text: &str,
+    ) -> Result<(), AcpError> {
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "prompt": [
+                {
+                    "type": "text",
+                    "text": text
                 }
-            })),
-        )
-        .await
+            ]
+        });
+        let client = Arc::clone(self);
+        let method = "session/prompt".to_string();
+        let notif_tx = client.notification_tx.clone();
+        let sid = session_id.to_string();
+        tokio::spawn(async move {
+            match client.send_request(&method, Some(params)).await {
+                Ok(result) => {
+                    debug!("session/prompt completed");
+                    let stop_reason = result
+                        .get("stopReason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("end_turn")
+                        .to_string();
+                    let synthetic = AcpMessage::Notification(JsonRpcNotification {
+                        jsonrpc: "2.0".to_string(),
+                        method: "session/update".to_string(),
+                        params: Some(serde_json::json!({
+                            "sessionId": sid,
+                            "update": {
+                                "sessionUpdate": "turn_complete",
+                                "stopReason": stop_reason
+                            }
+                        })),
+                    });
+                    let _ = notif_tx.send(synthetic).await;
+                }
+                Err(e) => warn!(error = %e, "session/prompt request failed"),
+            }
+        });
+        Ok(())
     }
 
     /// Send a cancel signal to the ACP session.
@@ -489,7 +563,11 @@ impl AcpClient {
     /// Returns `None` when the subprocess has exited and all buffered messages are consumed.
     pub async fn recv_notification(&self) -> Option<AcpMessage> {
         let mut rx = self.notification_rx.lock().await;
-        rx.recv().await
+        let result = rx.recv().await;
+        if let Some(AcpMessage::Notification(ref notif)) = result {
+            debug!(method = %notif.method, "recv_notification received");
+        }
+        result
     }
 
     /// Kill the ACP subprocess.
@@ -678,17 +756,19 @@ mod tests {
 
     #[test]
     fn test_acp_event_deserialization() {
-        let json = r#"{"type": "agent_message_chunk", "text": "Hello"}"#;
+        let json = r#"{"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Hello"}}"#;
         let event: AcpEvent = serde_json::from_str(json).unwrap();
         match event {
-            AcpEvent::AgentMessageChunk { text } => assert_eq!(text, "Hello"),
+            AcpEvent::AgentMessageChunk { content } => {
+                assert_eq!(content.unwrap().text, "Hello");
+            }
             _ => panic!("Expected AgentMessageChunk"),
         }
     }
 
     #[test]
     fn test_acp_event_tool_call() {
-        let json = r#"{"type": "tool_call", "tool_call_id": "tc1", "title": "Read file", "kind": "read", "status": "pending"}"#;
+        let json = r#"{"sessionUpdate": "tool_call", "toolCallId": "tc1", "title": "Read file", "kind": "read", "status": "pending"}"#;
         let event: AcpEvent = serde_json::from_str(json).unwrap();
         match event {
             AcpEvent::ToolCall {
@@ -705,7 +785,7 @@ mod tests {
 
     #[test]
     fn test_acp_event_turn_complete() {
-        let json = r#"{"type": "turn_complete", "stop_reason": "end_turn"}"#;
+        let json = r#"{"sessionUpdate": "turn_complete", "stopReason": "end_turn"}"#;
         let event: AcpEvent = serde_json::from_str(json).unwrap();
         match event {
             AcpEvent::TurnComplete { stop_reason } => {
@@ -717,7 +797,7 @@ mod tests {
 
     #[test]
     fn test_acp_event_elicitation() {
-        let json = r#"{"type": "elicitation", "request_id": "req1", "mode": "form", "message": "Choose option", "schema": {"type": "object"}}"#;
+        let json = r#"{"sessionUpdate": "elicitation", "requestId": "req1", "mode": "form", "message": "Choose option", "schema": {"type": "object"}}"#;
         let event: AcpEvent = serde_json::from_str(json).unwrap();
         match event {
             AcpEvent::Elicitation {

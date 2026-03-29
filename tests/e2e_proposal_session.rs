@@ -235,7 +235,7 @@ async fn proposal_session_ws_accepts_frontend_message_aliases() {
     let turn_complete_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let turn_complete_json: Value = serde_json::from_str(&turn_complete_message).unwrap();
     assert_eq!(turn_complete_json["type"], "turn_complete");
-    assert_eq!(turn_complete_json["stop_reason"], "completed");
+    assert_eq!(turn_complete_json["stop_reason"], "end_turn");
 
     server_task.abort();
 }
