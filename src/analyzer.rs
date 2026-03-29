@@ -130,7 +130,8 @@ impl ParallelizationAnalyzer {
             .await?;
 
         // Parse and validate the output
-        let result = self.parse_and_validate_output(&full_output, &status, changes)?;
+        let result =
+            self.parse_and_validate_output(&full_output, &status, changes, in_flight_ids)?;
 
         info!("Analysis complete: {} changes in order", result.order.len());
         Ok(result)
@@ -185,18 +186,25 @@ impl ParallelizationAnalyzer {
     ///
     /// Extracts JSON from stream-json format if applicable, validates the schema,
     /// and checks the exit status. Returns the parsed AnalysisResult.
+    ///
+    /// The `in_flight_ids` parameter specifies changes that are currently executing.
+    /// These IDs are accepted as valid dependency targets during validation even
+    /// though they are not present in the `order` array.
     fn parse_and_validate_output(
         &self,
         full_output: &str,
         status: &std::process::ExitStatus,
         changes: &[Change],
+        in_flight_ids: &[String],
     ) -> Result<AnalysisResult> {
         // Extract result from stream-json format if applicable
         let response = self.extract_stream_json_result(full_output);
         debug!("LLM response: {}", response);
 
         // Parse JSON response with strict validation
-        let result = self.parse_response(&response, changes).map_err(|e| {
+        let result = self
+            .parse_response(&response, changes, in_flight_ids)
+            .map_err(|e| {
             let preview = response.chars().take(200).collect::<String>();
             let change_ids: Vec<&str> = changes.iter().map(|c| c.id.as_str()).collect();
             OrchestratorError::Parse(format!(
@@ -375,7 +383,15 @@ Rules:
     }
 
     /// Parse LLM response into AnalysisResult
-    fn parse_response(&self, response: &str, changes: &[Change]) -> Result<AnalysisResult> {
+    ///
+    /// The `in_flight_ids` parameter specifies currently executing change IDs that
+    /// are valid dependency targets but not expected in `order`.
+    fn parse_response(
+        &self,
+        response: &str,
+        changes: &[Change],
+        in_flight_ids: &[String],
+    ) -> Result<AnalysisResult> {
         // Try to extract JSON from response (may have surrounding text)
         let json_str = self.extract_json(response)?;
 
@@ -390,8 +406,8 @@ Rules:
         // Validate all change IDs exist
         self.validate_change_ids(&result, changes)?;
 
-        // Validate dependency graph (no circular dependencies)
-        self.validate_dependency_graph(&result)?;
+        // Validate dependency graph (no circular dependencies, in-flight refs allowed)
+        self.validate_dependency_graph(&result, in_flight_ids)?;
 
         Ok(result)
     }
@@ -519,7 +535,17 @@ Rules:
     }
 
     /// Validate dependency graph for circular dependencies
-    fn validate_dependency_graph(&self, result: &AnalysisResult) -> Result<()> {
+    ///
+    /// The `in_flight_ids` parameter specifies currently executing change IDs.
+    /// Dependencies referencing these IDs are considered valid even though
+    /// they are not present in the `order` array.
+    fn validate_dependency_graph(
+        &self,
+        result: &AnalysisResult,
+        in_flight_ids: &[String],
+    ) -> Result<()> {
+        let in_flight_set: HashSet<&str> = in_flight_ids.iter().map(|s| s.as_str()).collect();
+
         // Check for self-dependencies
         for (change_id, deps) in &result.dependencies {
             if deps.contains(change_id) {
@@ -529,9 +555,9 @@ Rules:
                 )));
             }
 
-            // Check all dependencies exist in order
+            // Check all dependencies exist in order or in-flight
             for dep_id in deps {
-                if !result.order.contains(dep_id) {
+                if !result.order.contains(dep_id) && !in_flight_set.contains(dep_id.as_str()) {
                     return Err(OrchestratorError::Parse(format!(
                         "Invalid dependency reference: change '{}' depends on non-existent change '{}'",
                         change_id, dep_id
@@ -806,7 +832,7 @@ That's all."#;
             groups: None,
         };
 
-        let validation = analyzer.validate_dependency_graph(&result);
+        let validation = analyzer.validate_dependency_graph(&result, &[]);
         assert!(validation.is_ok());
     }
 
@@ -822,7 +848,7 @@ That's all."#;
             groups: None,
         };
 
-        let validation = analyzer.validate_dependency_graph(&result);
+        let validation = analyzer.validate_dependency_graph(&result, &[]);
         assert!(validation.is_err());
     }
 
@@ -839,7 +865,7 @@ That's all."#;
             groups: None,
         };
 
-        let validation = analyzer.validate_dependency_graph(&result);
+        let validation = analyzer.validate_dependency_graph(&result, &[]);
         assert!(validation.is_err());
     }
 
@@ -964,7 +990,9 @@ That's all."#;
         };
 
         // Should pass validation (dependency graph is valid)
-        assert!(analyzer.validate_dependency_graph(&result_valid).is_ok());
+        assert!(analyzer
+            .validate_dependency_graph(&result_valid, &[])
+            .is_ok());
 
         // Invalid case: self-dependency (still caught)
         let mut deps_invalid = HashMap::new();
@@ -977,7 +1005,9 @@ That's all."#;
         };
 
         // Should fail validation (self-dependency)
-        assert!(analyzer.validate_dependency_graph(&result_invalid).is_err());
+        assert!(analyzer
+            .validate_dependency_graph(&result_invalid, &[])
+            .is_err());
     }
 
     #[test]
@@ -999,7 +1029,7 @@ That's all."#;
 
         // Should validate successfully - order is just a recommendation
         assert!(analyzer.validate_change_ids(&result, &changes).is_ok());
-        assert!(analyzer.validate_dependency_graph(&result).is_ok());
+        assert!(analyzer.validate_dependency_graph(&result, &[]).is_ok());
     }
 
     #[test]
@@ -1040,6 +1070,48 @@ That's all."#;
         assert!(prompt.contains("NOT selectable"));
         assert!(prompt.contains("DO NOT include currently executing changes in the order"));
         assert!(prompt.contains("Dependencies CAN reference currently executing changes"));
+    }
+
+    #[test]
+    fn test_validate_dependency_graph_with_inflight() {
+        let analyzer = create_test_analyzer();
+
+        // Dependency on an in-flight change (not in order) should be valid
+        let mut deps = HashMap::new();
+        deps.insert("b".to_string(), vec!["inflight-x".to_string()]);
+        let result = AnalysisResult {
+            order: vec!["a".to_string(), "b".to_string()],
+            dependencies: deps,
+            groups: None,
+        };
+
+        let in_flight_ids = vec!["inflight-x".to_string()];
+        let validation = analyzer.validate_dependency_graph(&result, &in_flight_ids);
+        assert!(
+            validation.is_ok(),
+            "Dependency on in-flight change should be valid"
+        );
+    }
+
+    #[test]
+    fn test_validate_dependency_graph_invalid_inflight_ref() {
+        let analyzer = create_test_analyzer();
+
+        // Dependency on an ID that is neither in order nor in-flight should fail
+        let mut deps = HashMap::new();
+        deps.insert("b".to_string(), vec!["nonexistent".to_string()]);
+        let result = AnalysisResult {
+            order: vec!["a".to_string(), "b".to_string()],
+            dependencies: deps,
+            groups: None,
+        };
+
+        let in_flight_ids = vec!["inflight-x".to_string()];
+        let validation = analyzer.validate_dependency_graph(&result, &in_flight_ids);
+        assert!(
+            validation.is_err(),
+            "Dependency on unknown ID should be rejected"
+        );
     }
 
     #[test]
