@@ -558,6 +558,7 @@ pub async fn handle_tui_command(
             let resolve_repo_root = ctx.repo_root.to_path_buf();
             let resolve_config = ctx.config.clone();
             let resolve_counter = manual_resolve_counter.clone();
+            let resolve_dynamic_queue = ctx.dynamic_queue.clone();
             tokio::spawn(async move {
                 // Increment counter when resolve starts (consumes a parallel execution slot)
                 resolve_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -565,9 +566,12 @@ pub async fn handle_tui_command(
                 // Note: ResolveStarted event is sent by resolve_deferred_merge -> resolve_merges_with_retry
                 // with the actual expanded command. We don't send it here to avoid duplicate events.
 
-                // Helper closure to decrement counter and send event
+                // Helper closure to decrement counter, wake the scheduler, and send event.
+                // Notifying before the event ensures the parallel loop observes freed capacity
+                // immediately instead of waiting for the debounce timer after queue edits.
                 let finish_resolve = |event: OrchestratorEvent| async {
                     resolve_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    resolve_dynamic_queue.notify_scheduler();
                     let _ = resolve_tx.send(event).await;
                 };
 

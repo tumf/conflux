@@ -145,6 +145,7 @@ impl ParallelExecutor {
             hooks: None,
             cancel_token: None,
             last_queue_change_at,
+            last_available_slots: None,
             dynamic_queue: None,
             ai_runner,
             shared_stagger_state,

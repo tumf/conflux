@@ -1535,6 +1535,10 @@ impl AppState {
                 iteration,
             } => self.handle_resolve_output(change_id, output, iteration),
 
+            OrchestratorEvent::AnalysisStarted { remaining_changes } => {
+                self.handle_analysis_started(remaining_changes)
+            }
+
             // Message events
             OrchestratorEvent::Log(entry) => self.handle_log(entry),
             OrchestratorEvent::Warning { title, message } => self.handle_warning(title, message),
@@ -1864,6 +1868,13 @@ impl AppState {
                 .with_operation("resolve")
                 .with_change_id(&change_id),
         );
+    }
+
+    fn handle_analysis_started(&mut self, remaining_changes: usize) {
+        self.add_log(LogEntry::info(format!(
+            "Re-analyzing queued changes for dispatch (remaining: {})",
+            remaining_changes
+        )));
     }
 
     fn handle_resolve_completed(

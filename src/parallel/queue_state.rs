@@ -31,8 +31,9 @@ impl ParallelExecutor {
     /// Note: This is now separated from slot availability check. Re-analysis can
     /// proceed even when available_slots == 0, and the next dispatch will happen
     /// when slots become available.
-    pub async fn should_reanalyze(&self) -> bool {
-        super::dynamic_queue::should_reanalyze_queue(&self.last_queue_change_at).await
+    pub async fn should_reanalyze(&self, bypass_debounce: bool) -> bool {
+        super::dynamic_queue::should_reanalyze_queue(&self.last_queue_change_at, bypass_debounce)
+            .await
     }
 
     pub(super) fn is_cancelled(&self) -> bool {
@@ -518,8 +519,21 @@ impl ParallelExecutor {
             > + Send
             + Sync,
     {
-        // Gate re-analysis by available execution slots
+        // Gate re-analysis by available execution slots.
+        // Track zero->positive transitions so queue-edit debounce can be bypassed when
+        // capacity is restored and queued work can run immediately.
         let available_slots = self.calculate_available_slots(max_parallelism, in_flight);
+        let previous_available_slots = self.last_available_slots.replace(available_slots);
+        let slot_recovered = matches!(previous_available_slots, Some(0)) && available_slots > 0;
+
+        if slot_recovered && matches!(reanalysis_reason, ReanalysisReason::QueueNotification) {
+            info!(
+                previous_available_slots = previous_available_slots.unwrap_or_default(),
+                available_slots,
+                queued = queued.len(),
+                "Execution capacity recovered; promoting queue re-analysis trigger"
+            );
+        }
 
         if available_slots == 0 {
             // No available slots, defer re-analysis until slots become available
@@ -533,12 +547,23 @@ impl ParallelExecutor {
             return Ok((false, iteration));
         }
 
+        let effective_reason =
+            if slot_recovered && matches!(reanalysis_reason, ReanalysisReason::QueueNotification) {
+                ReanalysisReason::SlotRecovery
+            } else {
+                reanalysis_reason
+            };
+        let bypass_debounce = matches!(
+            effective_reason,
+            ReanalysisReason::SlotRecovery | ReanalysisReason::ResolveCompletion
+        );
+
         // Check debounce (skip on first iteration)
         let should_analyze = if iteration == 1 {
             info!("First iteration, skipping debounce check");
             true
         } else {
-            self.should_reanalyze().await
+            self.should_reanalyze(bypass_debounce).await
         };
 
         if !should_analyze {
@@ -578,7 +603,7 @@ impl ParallelExecutor {
             iteration,
             queued.len(),
             in_flight.len(),
-            reanalysis_reason
+            effective_reason
         );
         send_event(
             &self.event_tx,

@@ -305,6 +305,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         hooks: None,
         cancel_token: None,
         last_queue_change_at: Arc::new(Mutex::new(None)),
+        last_available_slots: None,
         dynamic_queue: None,
         ai_runner,
         shared_stagger_state,
@@ -587,6 +588,7 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         hooks: None,
         cancel_token: None,
         last_queue_change_at: Arc::new(Mutex::new(None)),
+        last_available_slots: None,
         dynamic_queue: None,
         ai_runner,
         apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
@@ -759,6 +761,7 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         hooks: None,
         cancel_token: None,
         last_queue_change_at: Arc::new(Mutex::new(None)),
+        last_available_slots: None,
         dynamic_queue: None,
         ai_runner,
         apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
@@ -903,6 +906,7 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         hooks: None,
         cancel_token: None,
         last_queue_change_at: Arc::new(Mutex::new(None)),
+        last_available_slots: None,
         dynamic_queue: None,
         ai_runner,
         apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
@@ -1076,6 +1080,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         hooks: None,
         cancel_token: None,
         last_queue_change_at: Arc::new(Mutex::new(None)),
+        last_available_slots: None,
         dynamic_queue: None,
         ai_runner,
         apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
@@ -1263,6 +1268,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         hooks: None,
         cancel_token: None,
         last_queue_change_at: Arc::new(Mutex::new(None)),
+        last_available_slots: None,
         dynamic_queue: None,
         ai_runner,
         apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
@@ -1456,6 +1462,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         hooks: None,
         cancel_token: None,
         last_queue_change_at: Arc::new(Mutex::new(None)),
+        last_available_slots: None,
         dynamic_queue: None,
         ai_runner,
         apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
@@ -1512,6 +1519,31 @@ async fn test_dynamic_queue_injection() {
 }
 
 #[tokio::test]
+async fn test_should_reanalyze_bypasses_debounce_on_slot_recovery() {
+    use std::time::Instant;
+    use tokio::sync::mpsc;
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from("/tmp/test-repo");
+    let (tx, _rx) = mpsc::channel(10);
+    let executor = ParallelExecutor::new(repo_root, config, Some(tx));
+
+    {
+        let mut last_change = executor.last_queue_change_at.lock().await;
+        *last_change = Some(Instant::now());
+    }
+
+    assert!(
+        executor.should_reanalyze(true).await,
+        "slot recovery should bypass debounce"
+    );
+    assert!(
+        !executor.should_reanalyze(false).await,
+        "regular queue edits should still respect debounce"
+    );
+}
+
+#[tokio::test]
 async fn test_debounce_with_queue_changes() {
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
@@ -1522,7 +1554,7 @@ async fn test_debounce_with_queue_changes() {
     let executor = ParallelExecutor::new(repo_root, config, Some(tx));
 
     // First check: no queue changes, should reanalyze
-    assert!(executor.should_reanalyze().await);
+    assert!(executor.should_reanalyze(false).await);
 
     // Simulate a queue change
     {
@@ -1531,13 +1563,13 @@ async fn test_debounce_with_queue_changes() {
     }
 
     // Immediate check: should NOT reanalyze (debounce active)
-    assert!(!executor.should_reanalyze().await);
+    assert!(!executor.should_reanalyze(false).await);
 
     // Wait for debounce period to expire (10 seconds + margin)
     tokio::time::sleep(Duration::from_secs(11)).await;
 
     // After debounce: should reanalyze
-    assert!(executor.should_reanalyze().await);
+    assert!(executor.should_reanalyze(false).await);
 }
 
 #[tokio::test]
@@ -1886,13 +1918,13 @@ async fn test_concurrent_reanalysis_queue_dispatch() {
     }
 
     // Immediate check: should NOT reanalyze (debounce active)
-    assert!(!executor.should_reanalyze().await);
+    assert!(!executor.should_reanalyze(false).await);
 
     // Wait for debounce period to expire
     tokio::time::sleep(std::time::Duration::from_secs(11)).await;
 
     // After debounce: should reanalyze
-    assert!(executor.should_reanalyze().await);
+    assert!(executor.should_reanalyze(false).await);
 
     // Verify AnalysisStarted event would be emitted
     // (Full execution test would require mocking apply/archive commands)

@@ -2,6 +2,7 @@
 
 use crate::config::OrchestratorConfig;
 use crate::parallel::ParallelExecutor;
+use crate::tui::queue::DynamicQueue;
 use std::sync::{atomic::AtomicUsize, Arc};
 use tempfile::TempDir;
 
@@ -111,6 +112,18 @@ async fn test_multiple_manual_resolves_consume_multiple_slots() {
         0,
         "Manual resolve counter should be 0 after all complete"
     );
+}
+
+#[tokio::test]
+async fn test_manual_resolve_completion_notifies_scheduler() {
+    let queue = DynamicQueue::new();
+    let notified = queue.notified();
+
+    queue.notify_scheduler();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+        .await
+        .expect("scheduler notification should wake waiters");
 }
 
 #[test]

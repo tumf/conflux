@@ -114,6 +114,15 @@ impl DynamicQueue {
         self.notify.notified()
     }
 
+    /// Notify the scheduler without enqueuing a new change.
+    ///
+    /// This is used for slot-release events such as manual resolve completion,
+    /// where queued work should be reconsidered immediately even though the queue contents
+    /// themselves did not change.
+    pub fn notify_scheduler(&self) {
+        self.notify.notify_one();
+    }
+
     /// Mark a change ID as stopped (single-change stop)
     /// Returns true if the ID was newly marked for stopping
     pub async fn mark_stopped(&self, id: String) -> bool {
