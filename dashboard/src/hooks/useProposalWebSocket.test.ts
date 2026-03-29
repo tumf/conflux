@@ -12,15 +12,15 @@ function makeCallbacks(overrides: Partial<UseProposalWebSocketOptions> = {}): Us
 }
 
 describe('handleServerMessage', () => {
-  it('dispatches streaming chunks', () => {
+  it('dispatches streaming chunks with message/turn ids', () => {
     const onMessageChunk = vi.fn();
 
     handleServerMessage(
-      { type: 'agent_message_chunk', text: 'partial' },
+      { type: 'agent_message_chunk', text: 'partial', message_id: 'assistant-1', turn_id: 'turn-1' },
       makeCallbacks({ onMessageChunk }),
     );
 
-    expect(onMessageChunk).toHaveBeenCalledWith('partial');
+    expect(onMessageChunk).toHaveBeenCalledWith('partial', 'assistant-1', 'turn-1');
   });
 
   it('dispatches tool call events and updates', () => {
@@ -39,6 +39,8 @@ describe('handleServerMessage', () => {
         title: 'Run validation',
         kind: 'task',
         status: 'pending',
+        message_id: 'assistant-1',
+        turn_id: 'turn-1',
       },
       makeCallbacks({ onToolCall }),
     );
@@ -48,12 +50,14 @@ describe('handleServerMessage', () => {
         tool_call_id: 'tool-1',
         status: 'completed',
         content: [],
+        message_id: 'assistant-1',
+        turn_id: 'turn-1',
       },
       makeCallbacks({ onToolCallUpdate }),
     );
 
-    expect(onToolCall).toHaveBeenCalledWith(toolCall);
-    expect(onToolCallUpdate).toHaveBeenCalledWith('tool-1', 'completed');
+    expect(onToolCall).toHaveBeenCalledWith(toolCall, 'assistant-1', 'turn-1');
+    expect(onToolCallUpdate).toHaveBeenCalledWith('tool-1', 'completed', 'assistant-1', 'turn-1');
   });
 
   it('dispatches elicitation requests and turn completion', () => {
@@ -84,12 +88,12 @@ describe('handleServerMessage', () => {
       makeCallbacks({ onElicitationRequest }),
     );
     handleServerMessage(
-      { type: 'turn_complete', stop_reason: 'completed' },
+      { type: 'turn_complete', stop_reason: 'completed', message_id: 'assistant-1', turn_id: 'turn-1' },
       makeCallbacks({ onTurnComplete }),
     );
 
     expect(onElicitationRequest).toHaveBeenCalledWith(elicitation);
-    expect(onTurnComplete).toHaveBeenCalledWith('completed');
+    expect(onTurnComplete).toHaveBeenCalledWith('completed', 'assistant-1', 'turn-1');
   });
 
   it('dispatches errors', () => {

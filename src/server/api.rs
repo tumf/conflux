@@ -3052,17 +3052,29 @@ pub enum ProposalWsClientMessage {
 pub enum ProposalWsServerMessage {
     AgentMessageChunk {
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
     ToolCall {
         tool_call_id: String,
         title: String,
         kind: String,
         status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
     ToolCallUpdate {
         tool_call_id: String,
         status: String,
         content: Vec<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
     Elicitation {
         request_id: String,
@@ -3072,6 +3084,10 @@ pub enum ProposalWsServerMessage {
     },
     TurnComplete {
         stop_reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
     Error {
         message: String,
@@ -3242,6 +3258,25 @@ async fn list_proposal_session_changes(
     }
 }
 
+/// GET /api/v1/projects/{id}/proposal-sessions/{session_id}/messages
+async fn list_proposal_session_messages(
+    State(state): State<AppState>,
+    Path((_project_id, session_id)): Path<(String, String)>,
+) -> Response {
+    let manager = state.proposal_session_manager.read().await;
+    match manager.list_messages(&session_id) {
+        Ok(messages) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "messages": messages })),
+        )
+            .into_response(),
+        Err(ProposalSessionError::NotFound(id)) => {
+            error_response(StatusCode::NOT_FOUND, format!("Session not found: {}", id))
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)),
+    }
+}
+
 /// GET /api/v1/proposal-sessions/{session_id}/ws
 async fn proposal_session_ws_handler(
     ws: WebSocketUpgrade,
@@ -3318,9 +3353,12 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                                         {
                                             s.touch();
                                         }
-                                        drop(mgr);
 
-                                        match acp_event_to_ws_message(update_params.update) {
+                                        match acp_event_to_ws_message(
+                                            &mut mgr,
+                                            &session_id_for_notifs,
+                                            update_params.update,
+                                        ) {
                                             Some(msg) => msg,
                                             None => continue,
                                         }
@@ -3415,11 +3453,15 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                     let text_str: &str = &text;
                     match serde_json::from_str::<ProposalWsClientMessage>(text_str) {
                         Ok(ProposalWsClientMessage::Prompt { text }) => {
-                            // Update last_activity
+                            // Update last_activity and persist user message for history hydration.
                             {
                                 let mut mgr = state.proposal_session_manager.write().await;
                                 if let Some(s) = mgr.get_session_mut(&session_id_for_recv) {
                                     s.touch();
+                                }
+                                if let Err(e) = mgr.record_user_prompt(&session_id_for_recv, &text)
+                                {
+                                    debug!(error = %e, "Failed to record user prompt history");
                                 }
                             }
 
@@ -3477,13 +3519,21 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
 
 /// Convert an ACP event to a WebSocket server message.
 fn acp_event_to_ws_message(
+    manager: &mut crate::server::proposal_session::ProposalSessionManager,
+    session_id: &str,
     event: crate::server::acp_client::AcpEvent,
 ) -> Option<ProposalWsServerMessage> {
     use crate::server::acp_client::AcpEvent;
     match event {
         AcpEvent::AgentMessageChunk { content } => {
             let text = content.map(|c| c.text).unwrap_or_default();
-            Some(ProposalWsServerMessage::AgentMessageChunk { text })
+            let turn_id = manager.append_assistant_chunk(session_id, &text).ok();
+            let message_id = turn_id.as_ref().map(|id| format!("assistant-{}", id));
+            Some(ProposalWsServerMessage::AgentMessageChunk {
+                text,
+                message_id,
+                turn_id,
+            })
         }
         AcpEvent::AgentThoughtChunk { .. } => None,
         AcpEvent::ToolCall {
@@ -3491,21 +3541,43 @@ fn acp_event_to_ws_message(
             title,
             kind,
             status,
-        } => Some(ProposalWsServerMessage::ToolCall {
-            tool_call_id,
-            title,
-            kind,
-            status,
-        }),
+        } => {
+            if let Err(e) = manager.record_tool_call(session_id, &tool_call_id, &title, &status) {
+                debug!(error = %e, "Failed to persist tool call history");
+            }
+            let turn_id = manager
+                .get_session(session_id)
+                .and_then(|session| session.active_turn_id.clone());
+            let message_id = turn_id.as_ref().map(|id| format!("assistant-{}", id));
+            Some(ProposalWsServerMessage::ToolCall {
+                tool_call_id,
+                title,
+                kind,
+                status,
+                message_id,
+                turn_id,
+            })
+        }
         AcpEvent::ToolCallUpdate {
             tool_call_id,
             status,
             content,
-        } => Some(ProposalWsServerMessage::ToolCallUpdate {
-            tool_call_id,
-            status,
-            content,
-        }),
+        } => {
+            if let Err(e) = manager.update_tool_call_status(session_id, &tool_call_id, &status) {
+                debug!(error = %e, "Failed to persist tool call status history");
+            }
+            let turn_id = manager
+                .get_session(session_id)
+                .and_then(|session| session.active_turn_id.clone());
+            let message_id = turn_id.as_ref().map(|id| format!("assistant-{}", id));
+            Some(ProposalWsServerMessage::ToolCallUpdate {
+                tool_call_id,
+                status,
+                content,
+                message_id,
+                turn_id,
+            })
+        }
         AcpEvent::Elicitation {
             request_id,
             mode,
@@ -3518,7 +3590,18 @@ fn acp_event_to_ws_message(
             schema,
         }),
         AcpEvent::TurnComplete { stop_reason } => {
-            Some(ProposalWsServerMessage::TurnComplete { stop_reason })
+            let turn_id = manager
+                .get_session(session_id)
+                .and_then(|session| session.active_turn_id.clone());
+            let message_id = turn_id.as_ref().map(|id| format!("assistant-{}", id));
+            if let Err(e) = manager.complete_active_turn(session_id) {
+                debug!(error = %e, "Failed to complete active turn history");
+            }
+            Some(ProposalWsServerMessage::TurnComplete {
+                stop_reason,
+                message_id,
+                turn_id,
+            })
         }
         AcpEvent::Unknown => None,
     }
@@ -3585,6 +3668,10 @@ pub fn build_router(app_state: AppState) -> Router {
         .route(
             "/projects/{id}/proposal-sessions/{session_id}/changes",
             get(list_proposal_session_changes),
+        )
+        .route(
+            "/projects/{id}/proposal-sessions/{session_id}/messages",
+            get(list_proposal_session_messages),
         )
         .route("/control/run", post(global_control_run))
         .route("/control/stop", post(global_control_stop))
