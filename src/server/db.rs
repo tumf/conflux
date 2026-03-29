@@ -591,6 +591,11 @@ mod tests {
         let states = db.load_change_states().unwrap();
         assert!(states.is_empty());
 
+        // Sleep briefly so that the log entry's created_at timestamp is strictly
+        // less than SQLite's strftime('now'), which has millisecond resolution.
+        // Without this, cleanup_old_logs(0) may see created_at == now and the
+        // strict '<' comparison would not match.
+        std::thread::sleep(std::time::Duration::from_millis(20));
         let deleted = db.cleanup_old_logs(0).unwrap();
         assert_eq!(deleted, 1);
         let remaining_logs = db.query_logs(10, None, None).unwrap();
