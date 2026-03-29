@@ -28,3 +28,8 @@
 - [x] `git status --porcelain` が空になるように、staged/unstaged changes を整理して受け入れ前の作業ツリーをクリーンにする
 - [x] `openapi.yaml` / `docs/openapi.yaml` に `GET /api/v1/stats/overview`、`GET /api/v1/stats/projects/{id}/history`、`GET /api/v1/logs` を追加し、実装済みAPIとドキュメントを一致させる
 
+## Acceptance #2 Failure Follow-up
+
+- [x] `docs/openapi.yaml` の新エンドポイント削除方向の差分を解消し、ルート `openapi.yaml` と同一内容（`/api/v1/stats/overview`, `/api/v1/stats/projects/{id}/history`, `/api/v1/logs` と関連 schema を含む）へ復元する。
+- [ ] 受け入れ実行直前に `git status --porcelain` が空になるよう、作業ツリーをクリーン化する（コミットまたは不要差分の整理）。
+
