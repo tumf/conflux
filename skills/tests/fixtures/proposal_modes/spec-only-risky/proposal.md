@@ -1,3 +1,11 @@
+---
+change_type: spec-only
+priority: medium
+dependencies: []
+references:
+  - openspec/specs/demo-capability/spec.md
+---
+
 # Change: Modify existing demo-capability requirement
 
 **Change Type**: spec-only

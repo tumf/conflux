@@ -1,3 +1,12 @@
+---
+change_type: implementation
+priority: medium
+dependencies: []
+references:
+  - src/demo.py
+  - tests/test_demo.py
+---
+
 # Change: Implement demo-capability validation
 
 **Change Type**: implementation

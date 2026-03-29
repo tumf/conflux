@@ -720,6 +720,7 @@ impl<'a, O: OutputHandler> common_apply::ApplyEventHandler for SerialApplyEventH
 mod tests {
     use super::*;
     use crate::config::OrchestratorConfig;
+    use crate::openspec::ProposalMetadata;
     use tempfile::TempDir;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
@@ -729,6 +730,7 @@ mod tests {
             total_tasks: total,
             last_modified: "1m ago".to_string(),
             dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
         }
     }
 

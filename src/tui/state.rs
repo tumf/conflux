@@ -2843,6 +2843,7 @@ mod tests {
             total_tasks: total,
             last_modified: "now".to_string(),
             dependencies: Vec::new(),
+            metadata: crate::openspec::ProposalMetadata::default(),
         }
     }
 

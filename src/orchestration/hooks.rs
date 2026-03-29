@@ -129,6 +129,7 @@ mod tests {
             total_tasks: total,
             last_modified: "1m ago".to_string(),
             dependencies: Vec::new(),
+            metadata: crate::openspec::ProposalMetadata::default(),
         }
     }
 

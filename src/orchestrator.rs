@@ -1397,6 +1397,7 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openspec::ProposalMetadata;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -1405,6 +1406,7 @@ mod tests {
             total_tasks: total,
             last_modified: "1m ago".to_string(),
             dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
         }
     }
 
@@ -1528,6 +1530,7 @@ mod tests {
                 total_tasks: 3,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
             Change {
                 id: "change-b".to_string(),
@@ -1535,6 +1538,7 @@ mod tests {
                 total_tasks: 3,
                 last_modified: "now".to_string(),
                 dependencies: vec!["change-a".to_string()],
+                metadata: ProposalMetadata::default(),
             },
             Change {
                 id: "change-c".to_string(),
@@ -1542,6 +1546,7 @@ mod tests {
                 total_tasks: 3,
                 last_modified: "now".to_string(),
                 dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
             },
         ];
 
