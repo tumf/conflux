@@ -8,6 +8,7 @@
 //! - This module deliberately does NOT reference or execute `~/.wt/setup`.
 //!   The server is directory-independent and uses only its configured data_dir.
 
+pub mod active_commands;
 pub mod api;
 pub mod registry;
 pub mod runner;
@@ -61,6 +62,7 @@ pub async fn run_server(config: ServerConfig, resolve_command: Option<String>) -
             registry::OrchestrationStatus::default(),
         )),
         terminal_manager: terminal::create_terminal_manager(),
+        active_commands: active_commands::create_shared_active_commands(),
     };
 
     // Build router.
