@@ -43,8 +43,8 @@ impl ParallelExecutor {
     }
 
     #[cfg(test)]
-    pub(super) fn has_merge_deferred(&self) -> bool {
-        !self.merge_deferred_changes.is_empty()
+    pub(super) fn has_resolve_wait(&self) -> bool {
+        !self.resolve_wait_changes.is_empty()
     }
 
     #[allow(dead_code)]
@@ -93,16 +93,19 @@ impl ParallelExecutor {
     ///
     /// # Returns
     /// Number of available slots for new dispatches
+    pub(super) fn manual_resolve_active(&self) -> usize {
+        self.manual_resolve_count
+            .as_ref()
+            .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     pub(super) fn calculate_available_slots(
         &self,
         max_parallelism: usize,
         in_flight: &HashSet<String>,
     ) -> usize {
-        let manual_resolve_count = self
-            .manual_resolve_count
-            .as_ref()
-            .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(0);
+        let manual_resolve_count = self.manual_resolve_active();
         let auto_resolve_count = self
             .auto_resolve_count
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -265,20 +268,21 @@ impl ParallelExecutor {
         }
     }
 
-    /// Retry merge for all auto-resumable deferred changes.
+    /// Retry merge for all ResolveWait changes (auto-resumable deferred merges).
     ///
     /// Called after a merge or resolve succeeds, since the previously blocking
     /// condition (dirty base, another merge in progress) may now be resolved.
-    /// For each change in `merge_deferred_changes`:
+    /// For each change in `resolve_wait_changes`:
     /// - If merge now succeeds → send `MergeCompleted`, run hook, cleanup workspace.
-    /// - If still deferred    → send `MergeDeferred(auto_resumable=true)` again; keep in set.
-    /// - On error             → log and keep in set for the next retry opportunity.
+    /// - If still deferred and auto-resumable → keep in ResolveWait.
+    /// - If still deferred and manual action required → move to MergeWait.
+    /// - On error → log and keep in ResolveWait for the next retry opportunity.
     pub(super) async fn retry_deferred_merges(&mut self) {
-        if self.merge_deferred_changes.is_empty() {
+        if self.resolve_wait_changes.is_empty() {
             return;
         }
 
-        let deferred: Vec<String> = self.merge_deferred_changes.iter().cloned().collect();
+        let deferred: Vec<String> = self.resolve_wait_changes.iter().cloned().collect();
 
         for change_id in deferred {
             // Locate the preserved workspace for this change.
@@ -294,7 +298,7 @@ impl ParallelExecutor {
                         change_id
                     );
                     // Remove from deferred set; the workspace is gone, nothing to retry.
-                    self.merge_deferred_changes.remove(&change_id);
+                    self.resolve_wait_changes.remove(&change_id);
                     continue;
                 }
                 Err(e) => {
@@ -321,7 +325,7 @@ impl ParallelExecutor {
             {
                 Ok(super::merge::MergeAttempt::Merged { revision }) => {
                     info!("Deferred merge succeeded for '{}' on retry", change_id);
-                    self.merge_deferred_changes.remove(&change_id);
+                    self.resolve_wait_changes.remove(&change_id);
 
                     // Run on_merged hook before merged status transition (MergeCompleted event).
                     if let Some(ref hooks) = self.hooks {
@@ -391,18 +395,25 @@ impl ParallelExecutor {
                     }
                 }
                 Ok(super::merge::MergeAttempt::Deferred(reason)) => {
-                    // Still blocked; send another auto-resumable event so TUI stays in
-                    // ResolveWait rather than regressing to an unknown state.
+                    // Re-classify deferred reason: auto-resumable stays in ResolveWait,
+                    // manual-intervention reasons are downgraded to MergeWait.
+                    let auto_resumable = super::merge::is_dirty_reason_auto_resumable(&reason);
                     info!(
-                        "Deferred merge still blocked for '{}': {}",
-                        change_id, reason
+                        "Deferred merge still blocked for '{}': {} (auto_resumable={})",
+                        change_id, reason, auto_resumable
                     );
+                    if auto_resumable {
+                        self.merge_wait_changes.remove(&change_id);
+                    } else {
+                        self.resolve_wait_changes.remove(&change_id);
+                        self.merge_wait_changes.insert(change_id.clone());
+                    }
                     send_event(
                         &self.event_tx,
                         ParallelEvent::MergeDeferred {
                             change_id: change_id.clone(),
                             reason,
-                            auto_resumable: true,
+                            auto_resumable,
                         },
                     )
                     .await;

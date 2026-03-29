@@ -1653,20 +1653,6 @@ impl AppState {
             }
         }
 
-        // If any change is still Resolving, keep Running mode so the user can
-        // continue to add changes to the queue via Space key.
-        let has_resolving = self
-            .changes
-            .iter()
-            .any(|c| c.queue_status == QueueStatus::Resolving);
-        if has_resolving {
-            info!("AllCompleted received but resolve still in progress; staying in Running mode");
-            self.add_log(LogEntry::info(
-                "All changes processed, waiting for resolve to complete",
-            ));
-            return;
-        }
-
         self.mode = AppMode::Select;
         self.current_change = None;
         self.stop_mode = StopMode::None;
