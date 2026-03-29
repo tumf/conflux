@@ -1543,6 +1543,173 @@ async fn test_should_reanalyze_bypasses_debounce_on_slot_recovery() {
     );
 }
 
+fn make_test_change(id: &str) -> crate::openspec::Change {
+    crate::openspec::Change {
+        id: id.to_string(),
+        completed_tasks: 0,
+        total_tasks: 1,
+        last_modified: "now".to_string(),
+        dependencies: Vec::new(),
+        metadata: crate::openspec::ProposalMetadata::default(),
+    }
+}
+
+fn ready_analysis_result<'a>(
+    changes: &'a [crate::openspec::Change],
+    _in_flight: &'a [String],
+    _iteration: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
+{
+    let order = changes.iter().map(|change| change.id.clone()).collect();
+    Box::pin(async move {
+        crate::analyzer::AnalysisResult {
+            order,
+            dependencies: HashMap::new(),
+            groups: None,
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() {
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::parallel::WorkspaceResult;
+    use crate::vcs::VcsBackend;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().unwrap();
+    let workspace_base = TempDir::new().unwrap();
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let (tx, _rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let manual_resolve_counter = Arc::new(AtomicUsize::new(1));
+    executor.set_manual_resolve_counter(manual_resolve_counter.clone());
+
+    {
+        let mut last_change = executor.last_queue_change_at.lock().await;
+        *last_change = Some(std::time::Instant::now());
+    }
+
+
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut queued = vec![make_test_change("follow-up-a"), make_test_change("follow-up-b")];
+    let mut in_flight = HashSet::new();
+
+    let (should_break, iteration) = executor
+        .perform_reanalysis_and_dispatch(
+            &mut queued,
+            &mut in_flight,
+            1,
+            2,
+            ReanalysisReason::QueueNotification,
+            &ready_analysis_result,
+            semaphore.clone(),
+            &mut join_set,
+            &mut cleanup_guard,
+        )
+        .await
+        .unwrap();
+
+    assert!(!should_break, "scheduler should keep running while resolve holds the slot");
+    assert_eq!(iteration, 2, "no dispatch should happen while available slots are zero");
+    assert_eq!(queued.len(), 2, "queued follow-up changes should remain queued");
+    assert!(in_flight.is_empty(), "nothing should dispatch before the slot is released");
+
+    manual_resolve_counter.store(0, Ordering::SeqCst);
+
+    let (should_break, iteration) = executor
+        .perform_reanalysis_and_dispatch(
+            &mut queued,
+            &mut in_flight,
+            1,
+            iteration,
+            ReanalysisReason::QueueNotification,
+            &ready_analysis_result,
+            semaphore,
+            &mut join_set,
+            &mut cleanup_guard,
+        )
+        .await
+        .unwrap();
+
+    assert!(!should_break, "scheduler should continue after dispatching resumed queued work");
+    assert_eq!(iteration, 3, "dispatch should advance the scheduler iteration");
+    assert_eq!(queued.len(), 1, "one follow-up change should dispatch immediately after slot recovery");
+    assert_eq!(in_flight.len(), 1, "slot recovery should move a queued follow-up change into flight");
+
+    while join_set.join_next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_work() {
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::parallel::WorkspaceResult;
+    use crate::vcs::VcsBackend;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().unwrap();
+    let workspace_base = TempDir::new().unwrap();
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let (tx, _rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    {
+        let mut last_change = executor.last_queue_change_at.lock().await;
+        *last_change = Some(std::time::Instant::now());
+    }
+
+
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut queued = vec![make_test_change("follow-up-after-resolve")];
+    let mut in_flight = HashSet::new();
+
+    let (should_break, iteration) = executor
+        .perform_reanalysis_and_dispatch(
+            &mut queued,
+            &mut in_flight,
+            1,
+            2,
+            ReanalysisReason::ResolveCompletion,
+            &ready_analysis_result,
+            semaphore,
+            &mut join_set,
+            &mut cleanup_guard,
+        )
+        .await
+        .unwrap();
+
+    assert!(!should_break, "resolve completion should resume the scheduler instead of terminating it");
+    assert_eq!(iteration, 3, "resolve completion should immediately trigger a dispatch iteration");
+    assert!(queued.is_empty(), "resolve completion should dispatch queued work without waiting for debounce");
+    assert_eq!(in_flight.len(), 1, "queued work should become in-flight after resolve completion");
+
+    while join_set.join_next().await.is_some() {}
+}
+
 #[tokio::test]
 async fn test_debounce_with_queue_changes() {
     use std::time::{Duration, Instant};

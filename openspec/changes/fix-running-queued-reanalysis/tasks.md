@@ -9,3 +9,8 @@
 ## Future Work
 
 - If users still perceive ambiguity in waiting states, consider a separate proposal for richer UI wording such as explicit `waiting for slot` vs `waiting for debounce` indicators.
+
+## Acceptance #2 Failure Follow-up
+
+- [x] Add a regression test that reproduces the reported scenario end-to-end: one `MergeWait` resolve in progress, two more changes queued during `Running`, then verify re-analysis/dispatch resumes immediately when the slot becomes free.
+- [x] Add test coverage that manual resolve completion affects scheduler behavior, not just queue notification mechanics, by asserting queued follow-up changes move through analysis/dispatch after resolve completion.
