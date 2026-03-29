@@ -295,24 +295,26 @@ async fn run_cflx_in_worktree(
                     info!("cflx run exited successfully: project_id={}", project_id);
                     if let (Some(db), Some(change_ids)) = (db.as_ref(), changes.as_ref()) {
                         for change_id in change_ids {
-                            if let Err(e) = db.insert_change_event(
-                                project_id,
-                                change_id,
-                                None,
-                                "apply",
-                                1,
-                                true,
-                                duration_ms,
-                                s.code().map(i64::from),
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                            ) {
-                                warn!(project_id, change_id, error = %e, "Failed to persist apply success event");
+                            for operation in ["apply", "acceptance", "archive", "resolve"] {
+                                if let Err(e) = db.insert_change_event(
+                                    project_id,
+                                    change_id,
+                                    None,
+                                    operation,
+                                    1,
+                                    true,
+                                    duration_ms,
+                                    s.code().map(i64::from),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                ) {
+                                    warn!(project_id, change_id, operation, error = %e, "Failed to persist success event");
+                                }
                             }
                         }
                     }

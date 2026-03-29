@@ -1,84 +1,46 @@
 openapi: 3.1.0
 info:
   title: Conflux Web Monitoring API
-  version: 1.0.0
-  description: |
-    REST API and WebSocket interface for monitoring Conflux orchestrator state.
-    This API provides access to changes, orchestrator state, and real-time updates.
-
-servers:
-  - url: http://localhost:8080
-    description: Local development server
-
+  description: REST API for monitoring and controlling Conflux orchestration
+  contact:
+    name: Conflux
+    url: https://github.com/anomalyco/conflux
+  license:
+    name: MIT
+    identifier: MIT
+  version: 0.5.44
 paths:
-  /api/health:
-    get:
-      summary: Health check endpoint
-      description: Returns the health status and version of the orchestrator
-      operationId: getHealth
-      responses:
-        '200':
-          description: Successful health check
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HealthResponse'
-              example:
-                status: ok
-                version: v0.1.0 (12345)
-
-  /api/state:
-    get:
-      summary: Get full orchestrator state
-      description: |
-        Returns the complete orchestrator state including all changes, logs, worktrees, and app mode.
-        The response includes Cache-Control: no-store header to prevent caching.
-      operationId: getState
-      responses:
-        '200':
-          description: Successful state retrieval
-          headers:
-            Cache-Control:
-              description: Cache control directive
-              schema:
-                type: string
-                example: no-store
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/OrchestratorState'
-
   /api/changes:
     get:
+      tags:
+      - changes
       summary: List all changes
-      description: Returns a list of all changes with their current status and progress
-      operationId: listChanges
+      operationId: list_changes
       responses:
         '200':
-          description: Successful retrieval of changes list
+          description: List of all changes
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: '#/components/schemas/ChangeStatus'
-
   /api/changes/{id}:
     get:
+      tags:
+      - changes
       summary: Get a specific change by ID
-      description: Returns detailed information about a specific change
-      operationId: getChange
+      operationId: get_change
       parameters:
-        - name: id
-          in: path
-          required: true
-          description: The unique identifier of the change
-          schema:
-            type: string
-          example: add-web-api-openapi-docs
+      - name: id
+        in: path
+        description: Change ID
+        required: true
+        schema:
+          type: string
       responses:
         '200':
-          description: Successful retrieval of change
+          description: Change found
           content:
             application/json:
               schema:
@@ -89,578 +51,512 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error: "Change 'nonexistent-id' not found"
-
-  /api/changes/{id}/approve:
-    post:
-      summary: Approve a change
-      description: |
-        Marks a change as approved and broadcasts the update to WebSocket clients.
-        The approval status is persisted to disk.
-      operationId: approveChange
-      parameters:
-        - name: id
-          in: path
-          required: true
-          description: The unique identifier of the change to approve
-          schema:
-            type: string
-          example: add-web-api-openapi-docs
-      responses:
-        '200':
-          description: Change successfully approved
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ChangeStatus'
-        '404':
-          description: Change not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error: "Change 'nonexistent-id' not found"
-        '500':
-          description: Internal server error during approval
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error: "Failed to approve change: IO error"
-
-  /api/changes/{id}/unapprove:
-    post:
-      summary: Unapprove a change
-      description: |
-        Removes the approval status from a change and broadcasts the update to WebSocket clients.
-        The approval status is persisted to disk.
-      operationId: unapproveChange
-      parameters:
-        - name: id
-          in: path
-          required: true
-          description: The unique identifier of the change to unapprove
-          schema:
-            type: string
-          example: add-web-api-openapi-docs
-      responses:
-        '200':
-          description: Change successfully unapproved
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ChangeStatus'
-        '404':
-          description: Change not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error: "Change 'nonexistent-id' not found"
-        '500':
-          description: Internal server error during unapproval
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error: "Failed to unapprove change: IO error"
-
-  /api/control/start:
-    post:
-      summary: Start or resume processing
-      description: |
-        Initiates processing of selected changes or resumes from stopped state.
-        Returns 409 Conflict if already running or stopping.
-      operationId: controlStart
-      responses:
-        '200':
-          description: Processing started successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ControlResponse'
-              example:
-                success: true
-                message: "Processing started"
-        '409':
-          description: Cannot start (already running or stopping)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error: "Cannot start: already running"
-        '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error: "Failed to start processing: control channel not available"
-
-  /api/control/stop:
-    post:
-      summary: Stop processing (graceful shutdown)
-      description: |
-        Initiates graceful stop of processing. Current change will complete before stopping.
-        Returns 409 Conflict if not running.
-      operationId: controlStop
-      responses:
-        '200':
-          description: Stop initiated successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ControlResponse'
-              example:
-                success: true
-                message: "Stopping after current change completes..."
-        '409':
-          description: Cannot stop (not running)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error: "Cannot stop: not running (current mode: select)"
-        '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
   /api/control/cancel-stop:
     post:
+      tags:
+      - control
       summary: Cancel a pending stop request
-      description: |
-        Cancels a graceful stop request and continues processing.
-        Returns 409 Conflict if not in stopping mode.
-      operationId: controlCancelStop
+      description: |-
+        # Endpoint
+        POST /api/control/cancel-stop
+
+        # Returns
+        - 200 OK if stop is canceled
+        - 409 Conflict if not in stopping mode
+        - 500 Internal Server Error if control channel not available
+      operationId: control_cancel_stop
       responses:
         '200':
-          description: Stop canceled successfully
+          description: Stop canceled
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ControlResponse'
-              example:
-                success: true
-                message: "Stop canceled, continuing..."
         '409':
-          description: Cannot cancel stop (not stopping)
+          description: Not in stopping mode
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error: "Cannot cancel stop: not stopping (current mode: running)"
         '500':
-          description: Internal server error
+          description: Control channel error
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-
   /api/control/force-stop:
     post:
+      tags:
+      - control
       summary: Force stop immediately
-      description: |
-        Immediately terminates processing without waiting for current change to complete.
-        Returns 409 Conflict if not running or stopping.
-      operationId: controlForceStop
+      description: |-
+        # Endpoint
+        POST /api/control/force-stop
+
+        # Returns
+        - 200 OK if force stop is initiated
+        - 409 Conflict if not running or stopping
+        - 500 Internal Server Error if control channel not available
+      operationId: control_force_stop
       responses:
         '200':
-          description: Force stop initiated successfully
+          description: Force stop initiated
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ControlResponse'
-              example:
-                success: true
-                message: "Force stopping..."
         '409':
-          description: Cannot force stop (not running or stopping)
+          description: Not running or stopping
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error: "Cannot force stop: not running or stopping (current mode: select)"
         '500':
-          description: Internal server error
+          description: Control channel error
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-
   /api/control/retry:
     post:
+      tags:
+      - control
       summary: Retry error changes
-      description: |
-        Retries changes that failed with errors. Resets error changes to queued and starts processing.
-        Returns 409 Conflict if not in error mode.
-      operationId: controlRetry
+      description: |-
+        # Endpoint
+        POST /api/control/retry
+
+        # Returns
+        - 200 OK if retry is initiated
+        - 409 Conflict if not in error mode
+        - 500 Internal Server Error if control channel not available
+      operationId: control_retry
       responses:
         '200':
-          description: Retry initiated successfully
+          description: Retry initiated
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ControlResponse'
-              example:
-                success: true
-                message: "Retrying error changes..."
         '409':
-          description: Cannot retry (not in error mode)
+          description: Not in error mode
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-              example:
-                error: "Cannot retry: not in error mode (current mode: select)"
         '500':
-          description: Internal server error
+          description: Control channel error
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /api/control/start:
+    post:
+      tags:
+      - control
+      summary: Start or resume processing
+      description: |-
+        # Endpoint
+        POST /api/control/start
 
+        # Returns
+        - 200 OK if start/resume is successful
+        - 409 Conflict if already running or stopping
+        - 500 Internal Server Error if control channel not available
+      operationId: control_start
+      responses:
+        '200':
+          description: Processing started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+        '409':
+          description: Already running or stopping
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Control channel error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/control/stop:
+    post:
+      tags:
+      - control
+      summary: Stop processing (graceful shutdown)
+      description: |-
+        # Endpoint
+        POST /api/control/stop
+
+        # Returns
+        - 200 OK if stop is initiated
+        - 409 Conflict if not running
+        - 500 Internal Server Error if control channel not available
+      operationId: control_stop
+      responses:
+        '200':
+          description: Stop initiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+        '409':
+          description: Not running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Control channel error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/health:
+    get:
+      tags:
+      - health
+      summary: Health check endpoint
+      operationId: health
+      responses:
+        '200':
+          description: Health check successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /api/state:
+    get:
+      tags:
+      - state
+      summary: Get full orchestrator state
+      operationId: get_state
+      responses:
+        '200':
+          description: Current orchestrator state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrchestratorStateSnapshot'
   /ws:
     get:
-      summary: WebSocket endpoint for real-time updates
-      description: |
-        WebSocket connection for receiving real-time state updates.
-        The WebSocket sends InitialState on connection and StateUpdate messages on state changes.
-      operationId: websocketConnection
-      x-websocket: true
-      x-websocket-messages:
-        send:
-          - name: InitialState
-            description: Initial state sent immediately after WebSocket connection
-            schema:
-              $ref: '#/components/schemas/StateUpdate'
-          - name: StateUpdate
-            description: State update broadcast when changes occur
-            schema:
-              $ref: '#/components/schemas/StateUpdate'
+      tags:
+      - websocket
+      summary: WebSocket connection handler for real-time state updates
+      description: |-
+        This endpoint upgrades the HTTP connection to a WebSocket connection
+        and streams state updates to the client in real-time.
+
+        # Protocol
+        - Upon connection, the server sends an initial state message
+        - Subsequently, the server broadcasts state updates as they occur
+        - The client can send ping frames to keep the connection alive
+        - The server responds with pong frames automatically
+
+        # Message Format
+        All messages are JSON-encoded with the following structure:
+        ```json
+        {
+          "type": "initial_state" | "state_update",
+          "timestamp": "ISO 8601 timestamp",
+          "state": { ... }  // OrchestratorStateSnapshot
+        }
+        ```
+      operationId: ws_handler
       responses:
         '101':
-          description: WebSocket connection established
+          description: Switching Protocols - WebSocket connection established
         '400':
-          description: Invalid WebSocket upgrade request
-
+          description: Bad Request - Not a valid WebSocket upgrade request
 components:
   schemas:
-    HealthResponse:
-      type: object
-      description: Health check response containing service status and version
-      required:
-        - status
-        - version
-      properties:
-        status:
-          type: string
-          description: Health status of the service
-          enum:
-            - ok
-          example: ok
-        version:
-          type: string
-          description: Version string including build number
-          example: v0.1.0 (12345)
-
-    ErrorResponse:
-      type: object
-      description: Error response for API errors
-      required:
-        - error
-      properties:
-        error:
-          type: string
-          description: Human-readable error message
-          example: "Change 'my-change' not found"
-
-    ControlResponse:
-      type: object
-      description: Response for control operations (start/stop/retry)
-      required:
-        - success
-        - message
-      properties:
-        success:
-          type: boolean
-          description: Whether the operation was successful
-          example: true
-        message:
-          type: string
-          description: Human-readable status message
-          example: "Processing started"
-
     ChangeStatus:
       type: object
-      description: Status and progress information for a change
+      description: Change status for WebSocket updates
       required:
-        - id
-        - completed_tasks
-        - total_tasks
-        - progress_percent
-        - status
-        - is_approved
-        - dependencies
+      - id
+      - completed_tasks
+      - total_tasks
+      - progress_percent
+      - status
+      - dependencies
       properties:
-        id:
-          type: string
-          description: Unique identifier for the change
-          example: add-web-api-openapi-docs
         completed_tasks:
           type: integer
+          format: int32
           description: Number of completed tasks
           minimum: 0
-          example: 3
-        total_tasks:
-          type: integer
-          description: Total number of tasks
+        dependencies:
+          type: array
+          items:
+            type: string
+          description: Dependencies on other changes
+        id:
+          type: string
+          description: Change ID
+        iteration_number:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Current iteration number for apply/archive loops
           minimum: 0
-          example: 5
         progress_percent:
           type: number
           format: float
           description: Progress percentage (0-100)
-          minimum: 0
-          maximum: 100
-          example: 60.0
+        queue_status:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Queue status (for parallel/serial execution tracking)
+            Aligned with TUI QueueStatus display values: "not queued", "queued", "blocked", "processing",
+            "accepting", "archiving", "archived", "merged", "merge wait", "resolving", "resolve pending", "error"
         status:
           type: string
-          description: Current status of the change
-          enum:
-            - pending
-            - in_progress
-            - complete
-            - error
-            - archived
-          example: in_progress
-        is_approved:
+          description: 'Current status: "pending", "in_progress", "complete"'
+        total_tasks:
+          type: integer
+          format: int32
+          description: Total number of tasks
+          minimum: 0
+    ControlResponse:
+      type: object
+      description: Success response for control operations
+      required:
+      - success
+      - message
+      properties:
+        message:
+          type: string
+        success:
           type: boolean
-          description: Whether the change is approved
-          example: true
-        dependencies:
+    ErrorResponse:
+      type: object
+      description: Error response for API errors
+      required:
+      - error
+      properties:
+        error:
+          type: string
+    HealthResponse:
+      type: object
+      description: Health check response
+      required:
+      - status
+      - version
+      properties:
+        status:
+          type: string
+        version:
+          type: string
+    LogEntry:
+      type: object
+      description: Log entry for the TUI
+      required:
+      - timestamp
+      - created_at
+      - message
+      - level
+      properties:
+        change_id:
+          type:
+          - string
+          - 'null'
+          description: Optional change_id for parallel mode logs
+        created_at:
+          type: string
+          format: date-time
+          description: Creation time (actual timestamp for relative time calculation)
+        iteration:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Optional iteration number (for apply operations)
+          minimum: 0
+        level:
+          $ref: '#/components/schemas/LogLevel'
+          description: Log level
+        message:
+          type: string
+          description: Log message
+        operation:
+          type:
+          - string
+          - 'null'
+          description: Optional operation type (apply, archive, resolve)
+        timestamp:
+          type: string
+          description: Timestamp (formatted for display)
+        workspace_path:
+          type:
+          - string
+          - 'null'
+          description: Optional workspace path (for parallel mode logs with workspace context)
+    LogLevel:
+      type: string
+      description: Log level for TUI logs
+      enum:
+      - info
+      - success
+      - warn
+      - error
+    MergeConflictInfo:
+      type: object
+      description: Merge conflict information for a worktree
+      required:
+      - conflict_files
+      properties:
+        conflict_files:
           type: array
-          description: List of change IDs that this change depends on
           items:
             type: string
-          example:
-            - other-change-id
-        queue_status:
-          type: string
-          description: |
-            Queue status for parallel/serial execution tracking.
-            Aligned with TUI QueueStatus display values.
-          nullable: true
-          enum:
-            - not queued
-            - queued
-            - processing
-            - completed
-            - archiving
-            - archived
-            - merged
-            - merge wait
-            - resolving
-            - error
-          example: processing
-        iteration_number:
-          type: integer
-          description: Current iteration number for apply/archive loops
-          nullable: true
-          minimum: 1
-          example: 2
-
-    OrchestratorState:
+          description: List of files with merge conflicts
+    OrchestratorStateSnapshot:
       type: object
-      description: Complete orchestrator state including changes, logs, worktrees, and app mode
+      description: Full orchestrator state snapshot for REST API
       required:
-        - changes
-        - total_changes
-        - completed_changes
-        - in_progress_changes
-        - pending_changes
-        - last_updated
-        - logs
-        - worktrees
-        - app_mode
+      - changes
+      - total_changes
+      - completed_changes
+      - in_progress_changes
+      - pending_changes
+      - last_updated
+      - logs
+      - worktrees
+      - app_mode
+      - is_resolving
       properties:
+        app_mode:
+          type: string
+          description: Application mode (e.g., "select", "running", "stopped")
         changes:
           type: array
-          description: List of all changes with their status
           items:
             $ref: '#/components/schemas/ChangeStatus'
-        total_changes:
-          type: integer
-          description: Total number of changes
-          minimum: 0
-          example: 10
+          description: List of all changes
         completed_changes:
           type: integer
           description: Number of completed changes
           minimum: 0
-          example: 3
         in_progress_changes:
           type: integer
           description: Number of in-progress changes
           minimum: 0
-          example: 2
+        is_resolving:
+          type: boolean
+          description: Whether resolve is currently running
+        last_updated:
+          type: string
+          description: Timestamp of last update
+        logs:
+          type: array
+          items:
+            $ref: '#/components/schemas/LogEntry'
+          description: Log entries (TUI-equivalent)
         pending_changes:
           type: integer
           description: Number of pending changes
           minimum: 0
-          example: 5
-        last_updated:
-          type: string
-          format: date-time
-          description: ISO 8601 timestamp of last update
-          example: "2024-01-19T12:34:56.789Z"
-        logs:
-          type: array
-          description: Log entries (TUI-equivalent)
-          items:
-            $ref: '#/components/schemas/LogEntry'
+        total_changes:
+          type: integer
+          description: Total number of changes
+          minimum: 0
         worktrees:
           type: array
-          description: Worktree list (TUI-equivalent)
           items:
             $ref: '#/components/schemas/WorktreeInfo'
-        app_mode:
-          type: string
-          description: |
-            Application mode indicating current execution state.
-            - select: Initial state, ready to start processing
-            - running: Processing changes
-            - stopping: Graceful stop initiated, waiting for current change to complete
-            - stopped: Processing stopped, can be resumed
-            - error: Error occurred during processing
-          enum:
-            - select
-            - running
-            - stopping
-            - stopped
-            - error
-          example: select
-
+          description: Worktree list (TUI-equivalent)
     StateUpdate:
       type: object
       description: State update message sent to WebSocket clients
       required:
-        - type
-        - timestamp
-        - changes
+      - type
+      - timestamp
+      - changes
       properties:
+        app_mode:
+          type:
+          - string
+          - 'null'
+          description: Application mode (optional, sent with mode change events)
+        changes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChangeStatus'
+          description: List of changes with current status
+        logs:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/LogEntry'
+          description: Log entries (optional, sent with log events)
+        timestamp:
+          type: string
+          description: ISO 8601 timestamp
         type:
           type: string
           description: Type of update message
-          enum:
-            - state_update
-          example: state_update
-        timestamp:
-          type: string
-          format: date-time
-          description: ISO 8601 timestamp of the update
-          example: "2024-01-19T12:34:56.789Z"
-        changes:
-          type: array
-          description: List of changes with current status
-          items:
-            $ref: '#/components/schemas/ChangeStatus'
-        logs:
-          type: array
-          description: Log entries (optional, sent with log events)
-          nullable: true
-          items:
-            $ref: '#/components/schemas/LogEntry'
         worktrees:
-          type: array
-          description: Worktree list (optional, sent with worktree refresh events)
-          nullable: true
+          type:
+          - array
+          - 'null'
           items:
             $ref: '#/components/schemas/WorktreeInfo'
-        app_mode:
-          type: string
-          description: Application mode (optional, sent with mode change events)
-          nullable: true
-          enum:
-            - select
-            - running
-            - stopping
-            - stopped
-            - error
-          example: running
-
-    LogEntry:
-      type: object
-      description: Log entry for execution events
-      required:
-        - timestamp
-        - level
-        - message
-      properties:
-        timestamp:
-          type: string
-          format: date-time
-          description: ISO 8601 timestamp of the log entry
-          example: "2024-01-19T12:34:56.789Z"
-        level:
-          type: string
-          description: Log level
-          enum:
-            - debug
-            - info
-            - warn
-            - error
-          example: info
-        message:
-          type: string
-          description: Log message content
-          example: "Processing change: add-web-api-openapi-docs"
-        change_id:
-          type: string
-          description: Associated change ID (optional)
-          nullable: true
-          example: add-web-api-openapi-docs
-
+          description: Worktree list (optional, sent with worktree refresh events)
     WorktreeInfo:
       type: object
-      description: Git worktree information
+      description: Information about a git worktree
       required:
-        - path
-        - branch
-        - is_main
+      - path
+      - head
+      - branch
+      - is_detached
+      - is_main
+      - has_commits_ahead
+      - is_merging
       properties:
-        path:
-          type: string
-          description: Absolute path to the worktree
-          example: /Users/user/worktrees/my-change
         branch:
           type: string
-          description: Branch name associated with the worktree
-          nullable: true
-          example: ws-session-1234567890
+          description: Branch name (empty if detached)
+        has_commits_ahead:
+          type: boolean
+          description: Whether this worktree has commits ahead of the base branch
+        head:
+          type: string
+          description: Current HEAD commit (short hash or symbolic ref)
+        is_detached:
+          type: boolean
+          description: Whether HEAD is detached
         is_main:
           type: boolean
           description: Whether this is the main worktree
-          example: false
-        is_detached:
+        is_merging:
           type: boolean
-          description: Whether the worktree is in detached HEAD state
-          example: false
-        conflict_count:
-          type: integer
-          description: Number of merge conflicts (optional)
-          nullable: true
-          minimum: 0
-          example: 0
+          description: Whether a merge operation is in progress for this worktree
+        merge_conflict:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/MergeConflictInfo'
+            description: Merge conflict information (None if not checked or no conflicts)
+        path:
+          type: string
+          description: Path to the worktree
+tags:
+- name: health
+  description: Health check endpoints
+- name: state
+  description: State management endpoints
+- name: changes
+  description: Change management endpoints
+- name: control
+  description: Orchestrator control endpoints
+- name: websocket
+  description: WebSocket endpoints for real-time updates

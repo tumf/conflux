@@ -3778,9 +3778,6 @@ pub fn build_router(app_state: AppState) -> Router {
         .route("/control/run", post(global_control_run))
         .route("/control/stop", post(global_control_stop))
         .route("/control/status", get(global_control_status))
-        .route("/stats/overview", get(get_stats_overview))
-        .route("/stats/projects/{id}/history", get(get_project_history))
-        .route("/logs", get(get_logs))
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
             auth_middleware,
