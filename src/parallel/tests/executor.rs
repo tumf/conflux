@@ -2164,11 +2164,13 @@ async fn test_on_merged_hook_execution() {
             continue_on_failure: true,
             timeout: 5,
             git_commit_no_verify: false,
+            max_retries: 0,
+            retry_delay_secs: 3,
         })),
         ..Default::default()
     };
 
-    let hook_runner = HookRunner::new(hooks_config);
+    let hook_runner = HookRunner::new(hooks_config, ".");
 
     // Create a simple HookContext for testing
     let hook_context = crate::hooks::HookContext::new(1, 1, 0, false)

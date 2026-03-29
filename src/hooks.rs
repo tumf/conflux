@@ -9,6 +9,7 @@ use crate::events::{ExecutionEvent, LogEntry};
 use crate::orchestration::output::OutputHandler;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,6 +95,12 @@ impl std::fmt::Display for HookType {
     }
 }
 
+/// Default number of retries for a hook (0 means no retry)
+pub const DEFAULT_HOOK_MAX_RETRIES: u32 = 0;
+
+/// Default delay between hook retries in seconds
+pub const DEFAULT_HOOK_RETRY_DELAY_SECS: u64 = 3;
+
 /// Configuration for a single hook
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HookConfig {
@@ -108,6 +115,12 @@ pub struct HookConfig {
     /// Whether downstream git commits should skip verification hooks (default: false)
     #[serde(default)]
     pub git_commit_no_verify: bool,
+    /// Number of retries on non-zero exit before applying continue_on_failure logic (default: 0)
+    #[serde(default)]
+    pub max_retries: u32,
+    /// Delay in seconds between retries (default: 3)
+    #[serde(default = "default_retry_delay_secs")]
+    pub retry_delay_secs: u64,
 }
 
 fn default_continue_on_failure() -> bool {
@@ -118,6 +131,14 @@ fn default_timeout() -> u64 {
     DEFAULT_HOOK_TIMEOUT
 }
 
+fn default_retry_delay_secs() -> u64 {
+    DEFAULT_HOOK_RETRY_DELAY_SECS
+}
+
+fn default_index_lock_wait_secs() -> u64 {
+    DEFAULT_INDEX_LOCK_WAIT_SECS
+}
+
 impl HookConfig {
     /// Create a new HookConfig with just a command (using defaults)
     pub fn from_command(command: String) -> Self {
@@ -126,6 +147,8 @@ impl HookConfig {
             continue_on_failure: true,
             timeout: DEFAULT_HOOK_TIMEOUT,
             git_commit_no_verify: false,
+            max_retries: DEFAULT_HOOK_MAX_RETRIES,
+            retry_delay_secs: DEFAULT_HOOK_RETRY_DELAY_SECS,
         }
     }
 }
@@ -197,6 +220,10 @@ impl HookConfigValue {
 /// Configuration for all hooks
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HooksConfig {
+    /// Maximum seconds to wait for .git/index.lock release before on_merged hook (default: 10)
+    #[serde(default = "default_index_lock_wait_secs")]
+    pub index_lock_wait_secs: u64,
+
     // === Run lifecycle ===
     #[serde(default)]
     pub on_start: Option<HookConfigValue>,
@@ -494,10 +521,15 @@ fn truncate_hook_output(s: &str, limit: usize) -> (&str, bool) {
     (&s[..boundary], true)
 }
 
+/// Default maximum wait time for .git/index.lock release (seconds)
+pub const DEFAULT_INDEX_LOCK_WAIT_SECS: u64 = 10;
+
 /// Hook runner that executes hooks based on configuration
 #[derive(Clone)]
 pub struct HookRunner {
     config: HooksConfig,
+    /// Repository root directory for hook execution (working directory for commands)
+    repo_root: PathBuf,
     /// Optional event sender for hook logs (TUI/parallel mode)
     event_tx: Option<mpsc::Sender<ExecutionEvent>>,
     /// Optional output handler for CLI-visible hook logs
@@ -508,6 +540,7 @@ impl std::fmt::Debug for HookRunner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HookRunner")
             .field("config", &self.config)
+            .field("repo_root", &self.repo_root)
             .field("event_tx", &self.event_tx.is_some())
             .field("output_handler", &self.output_handler.is_some())
             .finish()
@@ -516,9 +549,10 @@ impl std::fmt::Debug for HookRunner {
 
 impl HookRunner {
     /// Create a new HookRunner with the given configuration
-    pub fn new(config: HooksConfig) -> Self {
+    pub fn new(config: HooksConfig, repo_root: impl Into<PathBuf>) -> Self {
         Self {
             config,
+            repo_root: repo_root.into(),
             event_tx: None,
             output_handler: None,
         }
@@ -530,19 +564,26 @@ impl HookRunner {
     /// are surfaced in the user-visible log stream.
     pub fn with_output_handler(
         config: HooksConfig,
+        repo_root: impl Into<PathBuf>,
         output_handler: Arc<dyn OutputHandler>,
     ) -> Self {
         Self {
             config,
+            repo_root: repo_root.into(),
             event_tx: None,
             output_handler: Some(output_handler),
         }
     }
 
     /// Create a HookRunner with the given configuration and event sender
-    pub fn with_event_tx(config: HooksConfig, event_tx: mpsc::Sender<ExecutionEvent>) -> Self {
+    pub fn with_event_tx(
+        config: HooksConfig,
+        repo_root: impl Into<PathBuf>,
+        event_tx: mpsc::Sender<ExecutionEvent>,
+    ) -> Self {
         Self {
             config,
+            repo_root: repo_root.into(),
             event_tx: Some(event_tx),
             output_handler: None,
         }
@@ -553,6 +594,7 @@ impl HookRunner {
     pub fn empty() -> Self {
         Self {
             config: HooksConfig::default(),
+            repo_root: PathBuf::from("."),
             event_tx: None,
             output_handler: None,
         }
@@ -564,6 +606,83 @@ impl HookRunner {
         self.config.get(hook_type).is_some()
     }
 
+    /// Wait for `.git/index.lock` to be released, polling every 500ms.
+    ///
+    /// Returns `true` if the lock was released within the timeout, `false` if timed out.
+    async fn wait_for_index_lock_release(&self, max_wait_secs: u64) -> bool {
+        let lock_path = self.repo_root.join(".git/index.lock");
+        if !lock_path.exists() {
+            return true;
+        }
+
+        info!(
+            "Waiting for .git/index.lock release (max {}s)...",
+            max_wait_secs
+        );
+        let poll_interval = Duration::from_millis(500);
+        let max_wait = Duration::from_secs(max_wait_secs);
+        let start = tokio::time::Instant::now();
+
+        loop {
+            tokio::time::sleep(poll_interval).await;
+            if !lock_path.exists() {
+                info!(
+                    ".git/index.lock released after {:.1}s",
+                    start.elapsed().as_secs_f64()
+                );
+                return true;
+            }
+            if start.elapsed() >= max_wait {
+                warn!(
+                    ".git/index.lock still present after {}s, proceeding anyway",
+                    max_wait_secs
+                );
+                return false;
+            }
+        }
+    }
+
+    /// Emit captured output (stdout/stderr) to configured log sinks.
+    async fn emit_hook_output(&self, hook_type: HookType, stdout: &str, stderr: &str) {
+        if !stdout.is_empty() {
+            let (display, was_truncated) = truncate_hook_output(stdout, HOOK_OUTPUT_TRUNCATE_BYTES);
+            let mut msg = format!("{} hook stdout: {}", hook_type, display);
+            if was_truncated {
+                msg.push_str(&format!(
+                    "\n[... {} bytes truncated]",
+                    stdout.len() - HOOK_OUTPUT_TRUNCATE_BYTES
+                ));
+            }
+            if let Some(ref tx) = self.event_tx {
+                let _ = tx
+                    .send(ExecutionEvent::Log(LogEntry::info(msg.clone())))
+                    .await;
+            }
+            if let Some(ref handler) = self.output_handler {
+                handler.on_stdout(&msg);
+            }
+        }
+
+        if !stderr.is_empty() {
+            let (display, was_truncated) = truncate_hook_output(stderr, HOOK_OUTPUT_TRUNCATE_BYTES);
+            let mut msg = format!("{} hook stderr: {}", hook_type, display);
+            if was_truncated {
+                msg.push_str(&format!(
+                    "\n[... {} bytes truncated]",
+                    stderr.len() - HOOK_OUTPUT_TRUNCATE_BYTES
+                ));
+            }
+            if let Some(ref tx) = self.event_tx {
+                let _ = tx
+                    .send(ExecutionEvent::Log(LogEntry::warn(msg.clone())))
+                    .await;
+            }
+            if let Some(ref handler) = self.output_handler {
+                handler.on_stderr(&msg);
+            }
+        }
+    }
+
     /// Run a hook if configured
     ///
     /// Returns Ok(()) if:
@@ -572,6 +691,9 @@ impl HookRunner {
     /// - Hook failed but continue_on_failure is true
     ///
     /// Returns Err if hook failed and continue_on_failure is false
+    ///
+    /// For `on_merged` hooks, waits for `.git/index.lock` release before execution.
+    /// If `max_retries > 0`, retries on non-zero exit with `retry_delay_secs` delay.
     pub async fn run_hook(&self, hook_type: HookType, context: &HookContext) -> Result<()> {
         let Some(hook_config) = self.config.get(hook_type) else {
             debug!("No hook configured for {}", hook_type);
@@ -603,83 +725,95 @@ impl HookRunner {
             handler.on_info(&cmd_msg);
         }
 
-        match self
-            .execute_hook(hook_type, &command, &env_vars, timeout_duration)
-            .await
-        {
-            Ok((success, stdout, stderr)) => {
-                // Emit captured stdout – always, regardless of exit status
-                if !stdout.is_empty() {
-                    let (display, was_truncated) =
-                        truncate_hook_output(&stdout, HOOK_OUTPUT_TRUNCATE_BYTES);
-                    let mut msg = format!("{} hook stdout: {}", hook_type, display);
-                    if was_truncated {
-                        msg.push_str(&format!(
-                            "\n[... {} bytes truncated]",
-                            stdout.len() - HOOK_OUTPUT_TRUNCATE_BYTES
-                        ));
-                    }
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx
-                            .send(ExecutionEvent::Log(LogEntry::info(msg.clone())))
-                            .await;
-                    }
-                    if let Some(ref handler) = self.output_handler {
-                        handler.on_stdout(&msg);
-                    }
-                }
+        // For on_merged hooks, wait for .git/index.lock to be released first
+        if hook_type == HookType::OnMerged {
+            self.wait_for_index_lock_release(self.config.index_lock_wait_secs)
+                .await;
+        }
 
-                // Emit captured stderr – always, regardless of exit status
-                if !stderr.is_empty() {
-                    let (display, was_truncated) =
-                        truncate_hook_output(&stderr, HOOK_OUTPUT_TRUNCATE_BYTES);
-                    let mut msg = format!("{} hook stderr: {}", hook_type, display);
-                    if was_truncated {
-                        msg.push_str(&format!(
-                            "\n[... {} bytes truncated]",
-                            stderr.len() - HOOK_OUTPUT_TRUNCATE_BYTES
-                        ));
-                    }
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx
-                            .send(ExecutionEvent::Log(LogEntry::warn(msg.clone())))
-                            .await;
-                    }
-                    if let Some(ref handler) = self.output_handler {
-                        handler.on_stderr(&msg);
-                    }
-                }
+        // Execute with retry loop
+        let max_attempts = 1 + hook_config.max_retries;
+        let mut last_result: Result<()> = Ok(());
 
-                if success {
-                    info!("{} hook completed successfully", hook_type);
-                    Ok(())
-                } else if hook_config.continue_on_failure {
-                    warn!(
-                        "{} hook failed (non-zero exit), continuing due to continue_on_failure=true",
-                        hook_type
-                    );
-                    Ok(())
-                } else {
-                    error!("{} hook failed (non-zero exit)", hook_type);
-                    Err(OrchestratorError::HookFailed {
-                        hook_type: hook_type.to_string(),
-                        message: "Hook command returned non-zero exit code".to_string(),
-                    })
+        for attempt in 1..=max_attempts {
+            match self
+                .execute_hook(hook_type, &command, &env_vars, timeout_duration)
+                .await
+            {
+                Ok((success, stdout, stderr)) => {
+                    self.emit_hook_output(hook_type, &stdout, &stderr).await;
+
+                    if success {
+                        info!("{} hook completed successfully", hook_type);
+                        return Ok(());
+                    }
+
+                    // Non-zero exit: check if we should retry
+                    if attempt < max_attempts {
+                        warn!(
+                            "{} hook failed (attempt {}/{}), retrying in {}s...",
+                            hook_type, attempt, max_attempts, hook_config.retry_delay_secs
+                        );
+                        tokio::time::sleep(Duration::from_secs(hook_config.retry_delay_secs)).await;
+                        last_result = Err(OrchestratorError::HookFailed {
+                            hook_type: hook_type.to_string(),
+                            message: "Hook command returned non-zero exit code".to_string(),
+                        });
+                        continue;
+                    }
+
+                    // All attempts exhausted: apply continue_on_failure logic
+                    if hook_config.continue_on_failure {
+                        warn!(
+                            "{} hook failed after {} attempt(s), continuing due to continue_on_failure=true",
+                            hook_type, max_attempts
+                        );
+                        return Ok(());
+                    } else {
+                        error!(
+                            "{} hook failed after {} attempt(s)",
+                            hook_type, max_attempts
+                        );
+                        return Err(OrchestratorError::HookFailed {
+                            hook_type: hook_type.to_string(),
+                            message: format!(
+                                "Hook command returned non-zero exit code after {} attempt(s)",
+                                max_attempts
+                            ),
+                        });
+                    }
                 }
-            }
-            Err(e) => {
-                if hook_config.continue_on_failure {
-                    warn!(
-                        "{} hook failed: {} (continuing due to continue_on_failure=true)",
-                        hook_type, e
-                    );
-                    Ok(())
-                } else {
-                    error!("{} hook failed: {}", hook_type, e);
-                    Err(e)
+                Err(e) => {
+                    // Execution error (spawn failure, timeout, etc.): check retry
+                    if attempt < max_attempts {
+                        warn!(
+                            "{} hook error (attempt {}/{}): {}, retrying in {}s...",
+                            hook_type, attempt, max_attempts, e, hook_config.retry_delay_secs
+                        );
+                        tokio::time::sleep(Duration::from_secs(hook_config.retry_delay_secs)).await;
+                        last_result = Err(e);
+                        continue;
+                    }
+
+                    // All attempts exhausted
+                    if hook_config.continue_on_failure {
+                        warn!(
+                            "{} hook failed after {} attempt(s): {} (continuing due to continue_on_failure=true)",
+                            hook_type, max_attempts, e
+                        );
+                        return Ok(());
+                    } else {
+                        error!(
+                            "{} hook failed after {} attempt(s): {}",
+                            hook_type, max_attempts, e
+                        );
+                        return Err(e);
+                    }
                 }
             }
         }
+
+        last_result
     }
 
     /// Execute a hook command with the given environment variables and timeout.
@@ -697,9 +831,15 @@ impl HookRunner {
         // is available, even when cflx is started from launchd/systemd/cron.
         let mut cmd = crate::shell_command::build_login_shell_command(command);
 
+        // Set working directory to repo root so hooks always run from a consistent location
+        cmd.current_dir(&self.repo_root);
+
         debug!(
             module = module_path!(),
-            "Executing {} hook command via login shell: {}", hook_type, command
+            "Executing {} hook command via login shell in {:?}: {}",
+            hook_type,
+            self.repo_root,
+            command
         );
         for (key, value) in env_vars {
             cmd.env(key, value);
@@ -905,7 +1045,7 @@ mod tests {
     fn test_hook_runner_has_hook() {
         let json = r#"{"on_start": "echo hello"}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
+        let runner = HookRunner::new(config, ".");
 
         assert!(runner.has_hook(HookType::OnStart));
         assert!(!runner.has_hook(HookType::PreApply));
@@ -925,7 +1065,7 @@ mod tests {
     async fn test_hook_runner_run_hook_success() {
         let json = r#"{"on_start": "echo hello"}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
+        let runner = HookRunner::new(config, ".");
         let context = HookContext::default();
 
         let result = runner.run_hook(HookType::OnStart, &context).await;
@@ -936,7 +1076,7 @@ mod tests {
     async fn test_hook_runner_run_hook_failure_with_continue() {
         let json = r#"{"on_start": {"command": "exit 1", "continue_on_failure": true}}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
+        let runner = HookRunner::new(config, ".");
         let context = HookContext::default();
 
         // Should succeed because continue_on_failure is true
@@ -948,7 +1088,7 @@ mod tests {
     async fn test_hook_runner_run_hook_failure_without_continue() {
         let json = r#"{"on_start": {"command": "exit 1", "continue_on_failure": false}}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
+        let runner = HookRunner::new(config, ".");
         let context = HookContext::default();
 
         // Should fail because continue_on_failure is false
@@ -961,7 +1101,7 @@ mod tests {
         let json =
             r#"{"on_start": {"command": "sleep 10", "timeout": 1, "continue_on_failure": false}}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
+        let runner = HookRunner::new(config, ".");
         let context = HookContext::default();
 
         // Should fail due to timeout
@@ -978,7 +1118,7 @@ mod tests {
     async fn test_hook_runner_with_env_vars() {
         let json = r#"{"on_start": "echo $OPENSPEC_CHANGE_ID"}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
+        let runner = HookRunner::new(config, ".");
         let context = HookContext::new(1, 5, 3, false).with_change("test-id", 2, 10);
 
         let result = runner.run_hook(HookType::OnStart, &context).await;
@@ -995,7 +1135,7 @@ mod tests {
             }
         }"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
+        let runner = HookRunner::new(config, ".");
 
         let result = runner
             .run_hook(HookType::OnMerged, &HookContext::default())
@@ -1012,7 +1152,7 @@ mod tests {
             }
         }"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
+        let runner = HookRunner::new(config, ".");
 
         let result = runner
             .run_hook(HookType::OnMerged, &HookContext::default())
@@ -1034,7 +1174,7 @@ mod tests {
     async fn test_on_queue_add_hook_execution() {
         let json = r#"{"on_queue_add": "echo added"}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
+        let runner = HookRunner::new(config, ".");
         let context = HookContext::new(0, 5, 5, false).with_change("test-change", 0, 3);
 
         let result = runner.run_hook(HookType::OnQueueAdd, &context).await;
@@ -1055,7 +1195,7 @@ mod tests {
     async fn test_on_queue_remove_hook_execution() {
         let json = r#"{"on_queue_remove": "echo removed"}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
+        let runner = HookRunner::new(config, ".");
         let context = HookContext::new(0, 5, 5, false).with_change("test-change", 0, 3);
 
         let result = runner.run_hook(HookType::OnQueueRemove, &context).await;
@@ -1076,7 +1216,7 @@ mod tests {
     async fn test_on_change_start_hook_receives_change_id() {
         let json = r#"{"on_change_start": "echo test"}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
+        let runner = HookRunner::new(config, ".");
         let context = HookContext::new(0, 3, 3, false).with_change("add-feature", 0, 5);
 
         let result = runner.run_hook(HookType::OnChangeStart, &context).await;
@@ -1112,7 +1252,7 @@ mod tests {
     async fn test_on_change_end_hook_execution() {
         let json = r#"{"on_change_end": "echo finished"}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
+        let runner = HookRunner::new(config, ".");
         // After first change is archived: changes_processed=1, remaining=2
         let context = HookContext::new(1, 3, 2, false).with_change("change-a", 5, 5);
 
@@ -1161,7 +1301,7 @@ mod tests {
             "on_change_end": "echo end"
         }"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config.clone());
+        let runner = HookRunner::new(config.clone(), ".");
 
         // TUI mode context
         let tui_context = HookContext::new(0, 3, 3, false).with_change("change-a", 0, 5);
@@ -1284,7 +1424,7 @@ mod tests {
             "on_queue_remove": "echo queue_remove"
         }"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
+        let runner = HookRunner::new(config, ".");
 
         // All hook types should be configured
         assert!(runner.has_hook(HookType::OnStart));
@@ -1386,7 +1526,7 @@ mod tests {
         let config: HooksConfig = serde_json::from_str(json).unwrap();
 
         let (tx, mut rx) = mpsc::channel(10);
-        let runner = HookRunner::with_event_tx(config, tx);
+        let runner = HookRunner::with_event_tx(config, ".", tx);
         let context = HookContext::default();
 
         let result = runner.run_hook(HookType::OnStart, &context).await;
@@ -1425,7 +1565,7 @@ mod tests {
     async fn test_hook_without_event_tx_still_works() {
         let json = r#"{"on_start": "echo test"}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(config);
+        let runner = HookRunner::new(config, ".");
         let context = HookContext::default();
 
         // Should work without event_tx (no logs sent)
@@ -1516,7 +1656,7 @@ mod tests {
         let json = r#"{"on_start": "echo 'hello stdout'"}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
         let handler = RecordingOutputHandler::new();
-        let runner = HookRunner::with_output_handler(config, Arc::new(handler.clone()));
+        let runner = HookRunner::with_output_handler(config, ".", Arc::new(handler.clone()));
 
         let result = runner
             .run_hook(HookType::OnStart, &HookContext::default())
@@ -1546,7 +1686,7 @@ mod tests {
         let json = r#"{"on_start": "echo 'hello stderr' >&2"}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
         let handler = RecordingOutputHandler::new();
-        let runner = HookRunner::with_output_handler(config, Arc::new(handler.clone()));
+        let runner = HookRunner::with_output_handler(config, ".", Arc::new(handler.clone()));
 
         let result = runner
             .run_hook(HookType::OnStart, &HookContext::default())
@@ -1569,7 +1709,7 @@ mod tests {
         let json = r#"{"on_start": {"command": "echo 'output before fail'; exit 1", "continue_on_failure": true}}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
         let handler = RecordingOutputHandler::new();
-        let runner = HookRunner::with_output_handler(config, Arc::new(handler.clone()));
+        let runner = HookRunner::with_output_handler(config, ".", Arc::new(handler.clone()));
 
         // continue_on_failure=true so run_hook returns Ok
         let result = runner
@@ -1591,7 +1731,7 @@ mod tests {
         let json = r#"{"on_finish": "echo 'run finished'"}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
         let handler = RecordingOutputHandler::new();
-        let runner = HookRunner::with_output_handler(config, Arc::new(handler.clone()));
+        let runner = HookRunner::with_output_handler(config, ".", Arc::new(handler.clone()));
 
         // Build a context with no change_id (as on_start/on_finish use)
         let ctx = HookContext::new(3, 3, 0, false).with_status("completed");
@@ -1619,7 +1759,7 @@ mod tests {
         let json = format!(r#"{{"on_start": "printf '{}'" }}"#, big_output);
         let config: HooksConfig = serde_json::from_str(&json).unwrap();
         let handler = RecordingOutputHandler::new();
-        let runner = HookRunner::with_output_handler(config, Arc::new(handler.clone()));
+        let runner = HookRunner::with_output_handler(config, ".", Arc::new(handler.clone()));
 
         let result = runner
             .run_hook(HookType::OnStart, &HookContext::default())
@@ -1669,5 +1809,241 @@ mod tests {
         assert!(truncated);
         // Should be at most 1024 bytes and a valid char boundary
         assert!(result.len() <= 1024);
+    }
+
+    // === Tests for max_retries and retry_delay_secs (fix-on-merged-hook-reliability) ===
+
+    #[test]
+    fn test_hook_config_deserialize_with_max_retries() {
+        let json = r#"{
+            "on_merged": {
+                "command": "make bump-patch",
+                "max_retries": 3,
+                "retry_delay_secs": 5
+            }
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let hook = config.get(HookType::OnMerged).unwrap();
+        assert_eq!(hook.command, "make bump-patch");
+        assert_eq!(hook.max_retries, 3);
+        assert_eq!(hook.retry_delay_secs, 5);
+        // Other fields should have defaults
+        assert!(hook.continue_on_failure);
+        assert_eq!(hook.timeout, DEFAULT_HOOK_TIMEOUT);
+        assert!(!hook.git_commit_no_verify);
+    }
+
+    #[test]
+    fn test_hook_config_default_retry_values() {
+        let json = r#"{
+            "on_merged": {
+                "command": "make bump-patch"
+            }
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let hook = config.get(HookType::OnMerged).unwrap();
+        assert_eq!(hook.max_retries, DEFAULT_HOOK_MAX_RETRIES);
+        assert_eq!(hook.retry_delay_secs, DEFAULT_HOOK_RETRY_DELAY_SECS);
+    }
+
+    #[test]
+    fn test_hook_config_simple_string_has_default_retry_values() {
+        let json = r#"{"on_start": "echo hello"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let hook = config.get(HookType::OnStart).unwrap();
+        assert_eq!(hook.max_retries, DEFAULT_HOOK_MAX_RETRIES);
+        assert_eq!(hook.retry_delay_secs, DEFAULT_HOOK_RETRY_DELAY_SECS);
+    }
+
+    #[test]
+    fn test_hooks_config_backward_compat_no_new_fields() {
+        // Existing configs without max_retries/retry_delay_secs/index_lock_wait_secs parse fine
+        let json = r#"{
+            "on_start": "echo start",
+            "on_merged": {
+                "command": "make bump-patch",
+                "continue_on_failure": false,
+                "timeout": 120,
+                "git_commit_no_verify": true
+            }
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+
+        let on_start = config.get(HookType::OnStart).unwrap();
+        assert_eq!(on_start.command, "echo start");
+        assert_eq!(on_start.max_retries, 0);
+        assert_eq!(on_start.retry_delay_secs, 3);
+
+        let on_merged = config.get(HookType::OnMerged).unwrap();
+        assert_eq!(on_merged.command, "make bump-patch");
+        assert!(!on_merged.continue_on_failure);
+        assert_eq!(on_merged.timeout, 120);
+        assert!(on_merged.git_commit_no_verify);
+        assert_eq!(on_merged.max_retries, 0);
+        assert_eq!(on_merged.retry_delay_secs, 3);
+
+        // index_lock_wait_secs defaults
+        assert_eq!(config.index_lock_wait_secs, DEFAULT_INDEX_LOCK_WAIT_SECS);
+    }
+
+    #[test]
+    fn test_hooks_config_index_lock_wait_secs() {
+        let json = r#"{"index_lock_wait_secs": 30}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.index_lock_wait_secs, 30);
+    }
+
+    #[test]
+    fn test_hooks_config_index_lock_wait_secs_default() {
+        let json = r#"{}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.index_lock_wait_secs, DEFAULT_INDEX_LOCK_WAIT_SECS);
+    }
+
+    #[tokio::test]
+    async fn test_hook_retry_success_after_failure() {
+        // Hook fails on first attempt, succeeds on second
+        // We use a shell script that creates a marker file on first run,
+        // and succeeds when the marker exists
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let marker = tmp_dir.path().join("attempt_marker");
+        let marker_str = marker.to_str().unwrap();
+        let cmd = format!(
+            "if [ -f '{}' ]; then echo ok; else touch '{}' && exit 1; fi",
+            marker_str, marker_str
+        );
+        let json = serde_json::json!({
+            "on_merged": {
+                "command": cmd,
+                "max_retries": 1,
+                "retry_delay_secs": 0,
+                "continue_on_failure": false
+            }
+        });
+        let config: HooksConfig = serde_json::from_str(&json.to_string()).unwrap();
+        let runner = HookRunner::new(config, tmp_dir.path());
+        let context = HookContext::default();
+
+        let result = runner.run_hook(HookType::OnMerged, &context).await;
+        assert!(result.is_ok(), "Expected retry to succeed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_hook_retry_all_fail_continue_on_failure() {
+        // Hook always fails, but continue_on_failure=true
+        let json = r#"{
+            "on_start": {
+                "command": "exit 1",
+                "max_retries": 2,
+                "retry_delay_secs": 0,
+                "continue_on_failure": true
+            }
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config, ".");
+        let context = HookContext::default();
+
+        let result = runner.run_hook(HookType::OnStart, &context).await;
+        assert!(result.is_ok(), "Expected Ok with continue_on_failure=true");
+    }
+
+    #[tokio::test]
+    async fn test_hook_retry_all_fail_no_continue() {
+        // Hook always fails, continue_on_failure=false
+        let json = r#"{
+            "on_start": {
+                "command": "exit 1",
+                "max_retries": 1,
+                "retry_delay_secs": 0,
+                "continue_on_failure": false
+            }
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config, ".");
+        let context = HookContext::default();
+
+        let result = runner.run_hook(HookType::OnStart, &context).await;
+        assert!(result.is_err(), "Expected error with all retries exhausted");
+    }
+
+    #[tokio::test]
+    async fn test_hook_no_retry_by_default() {
+        // Default max_retries=0 means no retry, immediately apply continue_on_failure
+        let json = r#"{
+            "on_start": {
+                "command": "exit 1",
+                "continue_on_failure": false
+            }
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config, ".");
+        let context = HookContext::default();
+
+        let result = runner.run_hook(HookType::OnStart, &context).await;
+        assert!(
+            result.is_err(),
+            "Expected immediate failure with max_retries=0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hook_runner_cwd_is_repo_root() {
+        // Verify that hook commands execute in the repo_root directory
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let json = r#"{"on_start": {"command": "pwd", "continue_on_failure": false}}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(config, tmp_dir.path());
+        let context = HookContext::default();
+
+        let result = runner.run_hook(HookType::OnStart, &context).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_index_lock_wait_no_lock_file() {
+        // When no .git/index.lock exists, wait returns immediately
+        let tmp_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp_dir.path().join(".git")).unwrap();
+        let runner = HookRunner::new(HooksConfig::default(), tmp_dir.path());
+
+        let released = runner.wait_for_index_lock_release(1).await;
+        assert!(released, "Expected immediate return when no lock file");
+    }
+
+    #[tokio::test]
+    async fn test_index_lock_wait_lock_released() {
+        // Lock file is released within wait period
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let git_dir = tmp_dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let lock_file = git_dir.join("index.lock");
+        std::fs::write(&lock_file, "lock").unwrap();
+
+        let runner = HookRunner::new(HooksConfig::default(), tmp_dir.path());
+
+        // Remove lock after a short delay
+        let lock_clone = lock_file.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = std::fs::remove_file(lock_clone);
+        });
+
+        let released = runner.wait_for_index_lock_release(5).await;
+        assert!(released, "Expected lock to be released");
+    }
+
+    #[tokio::test]
+    async fn test_index_lock_wait_timeout() {
+        // Lock file persists beyond timeout
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let git_dir = tmp_dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let lock_file = git_dir.join("index.lock");
+        std::fs::write(&lock_file, "lock").unwrap();
+
+        let runner = HookRunner::new(HooksConfig::default(), tmp_dir.path());
+
+        let released = runner.wait_for_index_lock_release(1).await;
+        assert!(!released, "Expected timeout when lock persists");
     }
 }
