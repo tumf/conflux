@@ -42,7 +42,7 @@ pub const SERVER_LOG_BUFFER_SIZE: usize = 1000;
 #[derive(Clone)]
 pub struct AppState {
     pub registry: SharedRegistry,
-    pub(crate) runners: SharedRunners,
+    pub runners: SharedRunners,
     /// Optional bearer token for authentication (None = no auth required)
     pub auth_token: Option<String>,
     /// Maximum concurrent total (informational; actual semaphore is in registry)
@@ -2961,12 +2961,14 @@ async fn handle_terminal_ws(socket: WebSocket, manager: SharedTerminalManager, s
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProposalWsClientMessage {
     Prompt {
+        #[serde(alias = "content")]
         text: String,
     },
     ElicitationResponse {
+        #[serde(alias = "elicitation_id")]
         request_id: String,
         action: String,
-        #[serde(default)]
+        #[serde(default, alias = "data")]
         content: Option<serde_json::Value>,
     },
     Cancel,
@@ -3025,7 +3027,20 @@ async fn create_proposal_session(
 
     let mut manager = state.proposal_session_manager.write().await;
     match manager.create_session(&project_id, &worktree_path).await {
-        Ok(info) => (StatusCode::CREATED, Json(serde_json::json!(info))).into_response(),
+        Ok(info) => {
+            let dirty_state = manager.check_dirty(&info.id).await.ok();
+            let response = serde_json::json!({
+                "id": info.id,
+                "project_id": info.project_id,
+                "status": info.status,
+                "worktree_branch": info.worktree_branch,
+                "is_dirty": dirty_state.as_ref().map(|(is_dirty, _)| *is_dirty).unwrap_or(false),
+                "uncommitted_files": dirty_state.map(|(_, files)| files).unwrap_or_default(),
+                "created_at": info.created_at,
+                "updated_at": info.updated_at,
+            });
+            (StatusCode::CREATED, Json(response)).into_response()
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)),
     }
 }
@@ -3037,7 +3052,24 @@ async fn list_proposal_sessions(
 ) -> Response {
     let manager = state.proposal_session_manager.read().await;
     let sessions = manager.list_sessions(&project_id);
-    (StatusCode::OK, Json(serde_json::json!(sessions))).into_response()
+    let responses = futures_util::future::join_all(sessions.into_iter().map(|info| {
+        let manager = state.proposal_session_manager.clone();
+        async move {
+            let dirty_state = manager.read().await.check_dirty(&info.id).await.ok();
+            serde_json::json!({
+                "id": info.id,
+                "project_id": info.project_id,
+                "status": info.status,
+                "worktree_branch": info.worktree_branch,
+                "is_dirty": dirty_state.as_ref().map(|(is_dirty, _)| *is_dirty).unwrap_or(false),
+                "uncommitted_files": dirty_state.map(|(_, files)| files).unwrap_or_default(),
+                "created_at": info.created_at,
+                "updated_at": info.updated_at,
+            })
+        }
+    }))
+    .await;
+    (StatusCode::OK, Json(serde_json::json!(responses))).into_response()
 }
 
 /// DELETE /api/v1/projects/{id}/proposal-sessions/{session_id}
@@ -6470,6 +6502,57 @@ mod tests {
             resp.status(),
             StatusCode::UNAUTHORIZED,
             "File content endpoint should require authentication"
+        );
+    }
+
+    /// Verify the proposal-session WebSocket route is registered at the
+    /// path the dashboard frontend connects to:
+    /// `/api/v1/proposal-sessions/{session_id}/ws`
+    ///
+    /// A plain GET (without WebSocket upgrade headers) should return 400
+    /// or similar — NOT 404 — proving the route exists.
+    #[tokio::test]
+    async fn test_proposal_session_ws_route_exists() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        // Send a plain GET (no WS upgrade) — the route handler will reject
+        // with a non-404 status, proving the route is registered.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/proposal-sessions/test-session-id/ws")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // Axum's WebSocketUpgrade extractor returns 400 when upgrade
+        // headers are absent — anything other than 404 means the route
+        // exists.
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "Proposal session WS route must be registered at /api/v1/proposal-sessions/{{session_id}}/ws"
+        );
+    }
+
+    /// Verify there is NO route at the old project-scoped path the
+    /// dashboard previously used.  This guards against regressions.
+    #[tokio::test]
+    async fn test_proposal_session_ws_old_route_does_not_exist() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/some-project/proposal-sessions/test-session-id/ws")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "Old project-scoped WS route should NOT exist"
         );
     }
 }

@@ -31,16 +31,16 @@ pub struct ProjectRunRequest {
 }
 
 #[derive(Debug)]
-pub(crate) struct RunnerEntry {
+pub struct RunnerEntry {
     cancel: CancellationToken,
     // Presence indicates a task is (or was) running.
     #[allow(dead_code)]
     handle: tokio::task::JoinHandle<()>,
 }
 
-pub(crate) type SharedRunners = Arc<RwLock<HashMap<String, RunnerEntry>>>;
+pub type SharedRunners = Arc<RwLock<HashMap<String, RunnerEntry>>>;
 
-pub(crate) fn create_shared_runners() -> SharedRunners {
+pub fn create_shared_runners() -> SharedRunners {
     Arc::new(RwLock::new(HashMap::new()))
 }
 

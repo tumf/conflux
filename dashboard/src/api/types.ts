@@ -127,7 +127,7 @@ export interface FileBrowseContext {
 
 // ─── Proposal Session Types ──────────────────────────────────────────────────
 
-export type ProposalSessionStatus = 'active' | 'merging' | 'closed';
+export type ProposalSessionStatus = 'active' | 'merging' | 'timed_out' | 'closed';
 
 export interface ProposalSession {
   id: string;
@@ -146,9 +146,61 @@ export interface ProposalSession {
 }
 
 export interface ProposalSessionChange {
-  change_id: string;
-  title: string;
+  id: string;
+  title: string | null;
 }
+
+export type ProposalWsMessageType =
+  | 'prompt'
+  | 'elicitation_response'
+  | 'cancel'
+  | 'agent_message_chunk'
+  | 'tool_call'
+  | 'tool_call_update'
+  | 'elicitation'
+  | 'turn_complete'
+  | 'error';
+
+/** Messages sent from client to server */
+export type ProposalWsClientMessage =
+  | { type: 'prompt'; content: string }
+  | {
+      type: 'elicitation_response';
+      elicitation_id: string;
+      action: 'accept' | 'decline' | 'cancel';
+      data?: Record<string, unknown>;
+    }
+  | { type: 'cancel' };
+
+/** Messages received from server */
+export type ProposalWsServerMessage =
+  | { type: 'agent_message_chunk'; text: string }
+  | {
+      type: 'tool_call';
+      tool_call_id: string;
+      title: string;
+      kind: string;
+      status: ToolCallStatus;
+    }
+  | {
+      type: 'tool_call_update';
+      tool_call_id: string;
+      status: ToolCallStatus;
+      content: unknown[];
+    }
+  | {
+      type: 'elicitation';
+      request_id: string;
+      mode: string;
+      message: string;
+      schema?: {
+        type?: string;
+        properties?: Record<string, ElicitationProperty>;
+        required?: string[];
+      } | null;
+    }
+  | { type: 'turn_complete'; stop_reason: string }
+  | { type: 'error'; message: string };
 
 export type ProposalChatRole = 'user' | 'assistant';
 
@@ -191,32 +243,3 @@ export interface ElicitationRequest {
   required?: string[];
 }
 
-// ─── Proposal WebSocket Message Types ────────────────────────────────────────
-
-export type ProposalWsMessageType =
-  | 'prompt'
-  | 'elicitation_response'
-  | 'cancel'
-  | 'assistant_chunk'
-  | 'assistant_message'
-  | 'tool_call_start'
-  | 'tool_call_update'
-  | 'elicitation_request'
-  | 'session_update'
-  | 'error';
-
-/** Messages sent from client to server */
-export type ProposalWsClientMessage =
-  | { type: 'prompt'; content: string }
-  | { type: 'elicitation_response'; elicitation_id: string; action: 'accept' | 'decline' | 'cancel'; data?: Record<string, unknown> }
-  | { type: 'cancel' };
-
-/** Messages received from server */
-export type ProposalWsServerMessage =
-  | { type: 'assistant_chunk'; content: string; message_id: string }
-  | { type: 'assistant_message'; message: ProposalChatMessage }
-  | { type: 'tool_call_start'; tool_call: ToolCallInfo; message_id: string }
-  | { type: 'tool_call_update'; tool_call_id: string; status: ToolCallStatus; message_id: string }
-  | { type: 'elicitation_request'; elicitation: ElicitationRequest }
-  | { type: 'session_update'; session: ProposalSession }
-  | { type: 'error'; message: string };

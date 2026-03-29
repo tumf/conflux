@@ -234,14 +234,22 @@ export function appReducer(state: AppState, action: AppAction): AppState {
     case 'APPEND_CHAT_MESSAGE': {
       const { sessionId, message } = action.payload;
       const msgs = state.chatMessagesBySessionId[sessionId] || [];
+      const existingIndex = msgs.findIndex((m) => m.id === message.id);
+      const nextMessages = existingIndex === -1
+        ? [...msgs, message]
+        : msgs.map((existing, index) => (index === existingIndex ? message : existing));
+      const nextStreamingContent = { ...state.streamingContent };
+      if (message.role === 'assistant') {
+        delete nextStreamingContent[message.id];
+      }
       return {
         ...state,
         chatMessagesBySessionId: {
           ...state.chatMessagesBySessionId,
-          [sessionId]: [...msgs, message],
+          [sessionId]: nextMessages,
         },
-        // User message starts agent responding; assistant_message finalizes it
-        isAgentResponding: message.role === 'user' ? true : false,
+        streamingContent: nextStreamingContent,
+        isAgentResponding: message.role === 'user',
       };
     }
 
@@ -261,15 +269,32 @@ export function appReducer(state: AppState, action: AppAction): AppState {
     case 'UPDATE_TOOL_CALL': {
       const { sessionId, messageId, toolCall } = action.payload;
       const msgs = state.chatMessagesBySessionId[sessionId] || [];
+      const hasMessage = msgs.some((m) => m.id === messageId);
+      const nextMessages = hasMessage
+        ? msgs.map((m) => {
+            if (m.id !== messageId) return m;
+            const existing = m.tool_calls || [];
+            const existingIndex = existing.findIndex((tc) => tc.id === toolCall.id);
+            const nextToolCalls = existingIndex === -1
+              ? [...existing, toolCall]
+              : existing.map((tc, index) => (index === existingIndex ? toolCall : tc));
+            return { ...m, tool_calls: nextToolCalls };
+          })
+        : [
+            ...msgs,
+            {
+              id: messageId,
+              role: 'assistant' as const,
+              content: state.streamingContent[messageId] || '',
+              timestamp: new Date().toISOString(),
+              tool_calls: [toolCall],
+            },
+          ];
       return {
         ...state,
         chatMessagesBySessionId: {
           ...state.chatMessagesBySessionId,
-          [sessionId]: msgs.map((m) => {
-            if (m.id !== messageId) return m;
-            const existing = m.tool_calls || [];
-            return { ...m, tool_calls: [...existing, toolCall] };
-          }),
+          [sessionId]: nextMessages,
         },
       };
     }

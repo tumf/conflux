@@ -38,7 +38,20 @@ async function fetchAPI<T>(
 
   if (!response.ok) {
     const text = await response.text();
-    throw new APIError(response.status, text || response.statusText);
+    let message = text || response.statusText;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed.message) {
+        message = parsed.message;
+      } else if (parsed.error) {
+        message = parsed.error;
+      } else if (parsed.reason) {
+        message = parsed.reason;
+      }
+    } catch {
+      // Keep raw text when the server did not return JSON.
+    }
+    throw new APIError(response.status, message);
   }
 
   if (response.status === 204) {
@@ -343,9 +356,9 @@ export async function listProposalSessionChanges(
  * Get the WebSocket URL for a proposal session
  */
 export function getProposalSessionWsUrl(
-  projectId: string,
+  _projectId: string,
   sessionId: string,
 ): string {
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${protocol}://${window.location.host}/api/v1/projects/${projectId}/proposal-sessions/${sessionId}/ws`;
+  return `${protocol}://${window.location.host}/api/v1/proposal-sessions/${sessionId}/ws`;
 }
