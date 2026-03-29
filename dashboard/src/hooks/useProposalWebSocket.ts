@@ -7,8 +7,6 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { getProposalSessionWsUrl } from '../api/restClient';
 import {
-  ProposalChatMessage,
-  ProposalSession,
   ProposalWsClientMessage,
   ProposalWsServerMessage,
   ElicitationRequest,
@@ -21,12 +19,11 @@ export type ProposalWsStatus = 'connecting' | 'connected' | 'disconnected' | 'er
 export interface UseProposalWebSocketOptions {
   projectId: string | null;
   sessionId: string | null;
-  onMessage?: (message: ProposalChatMessage) => void;
-  onMessageChunk?: (messageId: string, content: string) => void;
-  onToolCallStart?: (messageId: string, toolCall: ToolCallInfo) => void;
-  onToolCallUpdate?: (messageId: string, toolCallId: string, status: ToolCallStatus) => void;
+  onMessageChunk?: (content: string) => void;
+  onToolCall?: (toolCall: ToolCallInfo) => void;
+  onToolCallUpdate?: (toolCallId: string, status: ToolCallStatus) => void;
   onElicitationRequest?: (elicitation: ElicitationRequest) => void;
-  onSessionUpdate?: (session: ProposalSession) => void;
+  onTurnComplete?: (stopReason: string) => void;
   onError?: (message: string) => void;
 }
 
@@ -34,12 +31,10 @@ export function useProposalWebSocket(options: UseProposalWebSocketOptions) {
   const {
     projectId,
     sessionId,
-    onMessage,
-    onMessageChunk,
-    onToolCallStart,
+    onToolCall,
     onToolCallUpdate,
     onElicitationRequest,
-    onSessionUpdate,
+    onTurnComplete,
     onError,
   } = options;
 
@@ -146,23 +141,29 @@ export function handleServerMessage(
   callbacks: UseProposalWebSocketOptions,
 ) {
   switch (msg.type) {
-    case 'assistant_message':
-      callbacks.onMessage?.(msg.message);
+    case 'agent_message_chunk':
+      callbacks.onMessageChunk?.(msg.text);
       break;
-    case 'assistant_chunk':
-      callbacks.onMessageChunk?.(msg.message_id, msg.content);
-      break;
-    case 'tool_call_start':
-      callbacks.onToolCallStart?.(msg.message_id, msg.tool_call);
+    case 'tool_call':
+      callbacks.onToolCall?.({
+        id: msg.tool_call_id,
+        title: msg.title,
+        status: msg.status,
+      });
       break;
     case 'tool_call_update':
-      callbacks.onToolCallUpdate?.(msg.message_id, msg.tool_call_id, msg.status);
+      callbacks.onToolCallUpdate?.(msg.tool_call_id, msg.status);
       break;
-    case 'elicitation_request':
-      callbacks.onElicitationRequest?.(msg.elicitation);
+    case 'elicitation':
+      callbacks.onElicitationRequest?.({
+        id: msg.request_id,
+        message: msg.message,
+        properties: msg.schema?.properties ?? {},
+        required: msg.schema?.required,
+      });
       break;
-    case 'session_update':
-      callbacks.onSessionUpdate?.(msg.session);
+    case 'turn_complete':
+      callbacks.onTurnComplete?.(msg.stop_reason);
       break;
     case 'error':
       callbacks.onError?.(msg.message);

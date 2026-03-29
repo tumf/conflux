@@ -48,6 +48,12 @@ pub struct ActiveCommandRegistry {
     commands: HashMap<WorktreeRootKey, ActiveCommand>,
 }
 
+impl Default for ActiveCommandRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ActiveCommandRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {

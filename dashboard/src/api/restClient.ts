@@ -38,7 +38,20 @@ async function fetchAPI<T>(
 
   if (!response.ok) {
     const text = await response.text();
-    throw new APIError(response.status, text || response.statusText);
+    let message = text || response.statusText;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed.message) {
+        message = parsed.message;
+      } else if (parsed.error) {
+        message = parsed.error;
+      } else if (parsed.reason) {
+        message = parsed.reason;
+      }
+    } catch {
+      // Keep raw text when the server did not return JSON.
+    }
+    throw new APIError(response.status, message);
   }
 
   if (response.status === 204) {

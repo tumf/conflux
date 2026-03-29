@@ -433,11 +433,10 @@ function App() {
               onStreamingChunk={store.appendStreamingChunk}
               onToolCallStart={store.updateToolCall}
               onToolCallUpdate={store.updateToolCallStatus}
-              onElicitation={store.setElicitation}
-              onSessionUpdate={store.updateProposalSession}
-              onClickChange={handleClickChange}
-              isLoading={isLoading}
-            />
+                onElicitation={store.setElicitation}
+                onClickChange={handleClickChange}
+                isLoading={isLoading}
+              />
           ) : (
             <div className="flex flex-1 overflow-hidden">
               <div className="flex w-72 shrink-0 flex-col border-r border-[#27272a]">

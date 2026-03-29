@@ -42,7 +42,10 @@ pub struct ProposalSessionInfo {
     pub worktree_path: String,
     pub worktree_branch: String,
     pub status: ProposalSessionStatus,
+    pub is_dirty: bool,
+    pub uncommitted_files: Vec<String>,
     pub created_at: String,
+    pub updated_at: String,
     pub last_activity: String,
 }
 
@@ -76,7 +79,10 @@ impl ProposalSession {
             worktree_path: self.worktree_path.display().to_string(),
             worktree_branch: self.worktree_branch.clone(),
             status: self.status.clone(),
+            is_dirty: false,
+            uncommitted_files: Vec::new(),
             created_at: self.created_at.to_rfc3339(),
+            updated_at: self.last_activity.to_rfc3339(),
             last_activity: self.last_activity.to_rfc3339(),
         }
     }
@@ -609,7 +615,10 @@ mod tests {
             worktree_path: "/tmp/proposal-abc123".to_string(),
             worktree_branch: "proposal/ps-abc123".to_string(),
             status: ProposalSessionStatus::Active,
+            is_dirty: false,
+            uncommitted_files: Vec::new(),
             created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
             last_activity: "2025-01-01T00:00:00Z".to_string(),
         };
         let json = serde_json::to_value(&info).unwrap();

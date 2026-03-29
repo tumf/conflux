@@ -1,6 +1,6 @@
 import React, { useCallback, useMemo } from 'react';
 import { ArrowLeft } from 'lucide-react';
-import { ProposalSession, ProposalChatMessage, ElicitationRequest } from '../api/types';
+import { ProposalSession, ProposalChatMessage, ElicitationRequest, ToolCallInfo, ToolCallStatus } from '../api/types';
 import { useProposalWebSocket } from '../hooks/useProposalWebSocket';
 import { ChatMessageList } from './ChatMessageList';
 import { ChatInput } from './ChatInput';
@@ -20,10 +20,9 @@ interface ProposalChatProps {
   onClose: () => void;
   onAppendMessage: (sessionId: string, message: ProposalChatMessage) => void;
   onStreamingChunk: (messageId: string, content: string) => void;
-  onToolCallStart: (sessionId: string, messageId: string, toolCall: import('../api/types').ToolCallInfo) => void;
-  onToolCallUpdate: (sessionId: string, messageId: string, toolCallId: string, status: import('../api/types').ToolCallStatus) => void;
+  onToolCallStart: (sessionId: string, messageId: string, toolCall: ToolCallInfo) => void;
+  onToolCallUpdate: (sessionId: string, messageId: string, toolCallId: string, status: ToolCallStatus) => void;
   onElicitation: (elicitation: ElicitationRequest | null) => void;
-  onSessionUpdate: (session: ProposalSession) => void;
   onClickChange?: (changeId: string) => void;
   isLoading?: boolean;
 }
@@ -43,36 +42,30 @@ export function ProposalChat({
   onToolCallStart,
   onToolCallUpdate,
   onElicitation,
-  onSessionUpdate,
   onClickChange,
   isLoading = false,
 }: ProposalChatProps) {
+  const agentMessageId = `agent-${session.id}`;
   const { sendPrompt, sendElicitationResponse, sendCancel, status } = useProposalWebSocket({
     projectId,
     sessionId: session.id,
-    onMessage: useCallback(
-      (msg: ProposalChatMessage) => {
-        onAppendMessage(session.id, msg);
-      },
-      [session.id, onAppendMessage],
-    ),
     onMessageChunk: useCallback(
-      (messageId: string, content: string) => {
-        onStreamingChunk(messageId, content);
+      (content: string) => {
+        onStreamingChunk(agentMessageId, content);
       },
-      [onStreamingChunk],
+      [agentMessageId, onStreamingChunk],
     ),
-    onToolCallStart: useCallback(
-      (messageId: string, toolCall: import('../api/types').ToolCallInfo) => {
-        onToolCallStart(session.id, messageId, toolCall);
+    onToolCall: useCallback(
+      (toolCall: ToolCallInfo) => {
+        onToolCallStart(session.id, agentMessageId, toolCall);
       },
-      [session.id, onToolCallStart],
+      [agentMessageId, session.id, onToolCallStart],
     ),
     onToolCallUpdate: useCallback(
-      (messageId: string, toolCallId: string, toolCallStatus: import('../api/types').ToolCallStatus) => {
-        onToolCallUpdate(session.id, messageId, toolCallId, toolCallStatus);
+      (toolCallId: string, toolCallStatus: ToolCallStatus) => {
+        onToolCallUpdate(session.id, agentMessageId, toolCallId, toolCallStatus);
       },
-      [session.id, onToolCallUpdate],
+      [agentMessageId, session.id, onToolCallUpdate],
     ),
     onElicitationRequest: useCallback(
       (elicitation: ElicitationRequest) => {
@@ -80,11 +73,20 @@ export function ProposalChat({
       },
       [onElicitation],
     ),
-    onSessionUpdate: useCallback(
-      (updatedSession: ProposalSession) => {
-        onSessionUpdate(updatedSession);
+    onTurnComplete: useCallback(
+      () => {
+        const streamed = streamingContent[agentMessageId] ?? '';
+        const existingMessage = messages.find((message) => message.id === agentMessageId);
+        const assistantMessage: ProposalChatMessage = {
+          id: agentMessageId,
+          role: 'assistant',
+          content: streamed || existingMessage?.content || '',
+          timestamp: new Date().toISOString(),
+          tool_calls: existingMessage?.tool_calls,
+        };
+        onAppendMessage(session.id, assistantMessage);
       },
-      [onSessionUpdate],
+      [agentMessageId, messages, onAppendMessage, session.id, streamingContent],
     ),
     onError: useCallback(
       (message: string) => {
