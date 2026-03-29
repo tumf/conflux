@@ -1,8 +1,8 @@
 //! Proposal session manager for the dashboard.
 //!
-//! Manages interactive proposal creation sessions backed by OpenCode Server
+//! Manages interactive proposal creation sessions backed by ACP stdio
 //! subprocesses. Each session creates an independent worktree and one
-//! `opencode serve` subprocess for conversational proposal generation.
+//! `opencode acp --cwd <worktree_path>` subprocess for conversational proposal generation.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::ProposalSessionConfig;
 use crate::openspec::ProposalMetadata;
-use crate::server::opencode_client::{OpencodeError, OpencodeServer};
+use crate::server::acp_client::{AcpClient, AcpError};
 use crate::vcs::git::commands as git;
 
 // ── Types ─────────────────────────────────────────────────────────────────
@@ -24,11 +24,11 @@ use crate::vcs::git::commands as git;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProposalSessionStatus {
-    /// Session is active with a running OpenCode server process.
+    /// Session is active with a running ACP subprocess.
     Active,
     /// Session is in the process of merging.
     Merging,
-    /// OpenCode server process has been stopped (e.g., by inactivity timeout).
+    /// ACP subprocess has been stopped (e.g., by inactivity timeout).
     TimedOut,
     /// Session has been closed.
     Closed,
@@ -86,8 +86,8 @@ pub struct ProposalSession {
     pub project_id: String,
     pub worktree_path: PathBuf,
     pub worktree_branch: String,
-    pub opencode_server: Arc<OpencodeServer>,
-    pub opencode_session_id: String,
+    pub acp_client: Arc<AcpClient>,
+    pub acp_session_id: String,
     pub status: ProposalSessionStatus,
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
@@ -151,8 +151,8 @@ impl ProposalSessionManager {
     ///
     /// This will:
     /// 1. Create a new worktree on branch `proposal/<session_id>`
-    /// 2. Spawn an OpenCode server subprocess in the worktree directory
-    /// 3. Create an OpenCode session via HTTP API
+    /// 2. Spawn an ACP subprocess in the worktree directory
+    /// 3. Create an ACP session via JSON-RPC
     pub async fn create_session(
         &mut self,
         project_id: &str,
@@ -194,17 +194,31 @@ impl ProposalSessionManager {
             "Worktree created for proposal session"
         );
 
-        // Spawn OpenCode server subprocess
-        let opencode_server = OpencodeServer::spawn(&self.config, &worktree_path)
-            .await
-            .map_err(ProposalSessionError::Opencode)?;
+        // Spawn ACP subprocess with explicit --cwd for the proposal worktree.
+        let mut acp_config = self.config.clone();
+        let mut transport_args = acp_config.transport_args.clone();
+        if transport_args.is_empty() {
+            transport_args.push("acp".to_string());
+        }
+        if !transport_args.iter().any(|arg| arg == "--cwd") {
+            transport_args.push("--cwd".to_string());
+            transport_args.push(worktree_path.display().to_string());
+        }
+        acp_config.transport_args = transport_args;
 
-        // Create OpenCode session
-        let opencode_session_id = opencode_server
-            .create_session(None)
+        let acp_client = AcpClient::spawn(&acp_config, &worktree_path)
             .await
-            .map_err(ProposalSessionError::Opencode)?
-            .id;
+            .map_err(ProposalSessionError::Acp)?;
+
+        acp_client
+            .initialize()
+            .await
+            .map_err(ProposalSessionError::Acp)?;
+
+        let acp_session_id = acp_client
+            .create_session()
+            .await
+            .map_err(ProposalSessionError::Acp)?;
 
         let now = Utc::now();
         let session = ProposalSession {
@@ -212,8 +226,8 @@ impl ProposalSessionManager {
             project_id: project_id.to_string(),
             worktree_path: worktree_path.clone(),
             worktree_branch: branch_name.clone(),
-            opencode_server,
-            opencode_session_id,
+            acp_client,
+            acp_session_id,
             status: ProposalSessionStatus::Active,
             created_at: now,
             last_activity: now,
@@ -481,7 +495,7 @@ impl ProposalSessionManager {
         );
 
         // Kill ACP process
-        session.opencode_server.kill().await;
+        session.acp_client.kill().await;
 
         // Remove worktree
         let wt_path_str = session.worktree_path.to_string_lossy().to_string();
@@ -546,7 +560,7 @@ impl ProposalSessionManager {
             .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
 
         // Kill ACP process
-        session.opencode_server.kill().await;
+        session.acp_client.kill().await;
 
         // Remove worktree
         let wt_path_str = session.worktree_path.to_string_lossy().to_string();
@@ -655,9 +669,9 @@ impl ProposalSessionManager {
             if let Some(session) = self.sessions.get_mut(&id) {
                 info!(
                     session_id = %id,
-                    "Proposal session timed out, stopping OpenCode server"
+                    "Proposal session timed out, stopping ACP subprocess"
                 );
-                session.opencode_server.kill().await;
+                session.acp_client.kill().await;
                 session.status = ProposalSessionStatus::TimedOut;
             }
         }
@@ -670,7 +684,7 @@ impl ProposalSessionManager {
         for id in session_ids {
             if let Some(session) = self.sessions.remove(&id) {
                 info!(session_id = %id, "Cleaning up proposal session");
-                session.opencode_server.kill().await;
+                session.acp_client.kill().await;
 
                 if let Some(root) = repo_root {
                     // Only remove clean worktrees
@@ -735,8 +749,8 @@ pub enum ProposalSessionError {
     #[error("Git operation failed: {0}")]
     Git(String),
 
-    #[error("OpenCode transport error: {0}")]
-    Opencode(#[from] OpencodeError),
+    #[error("ACP transport error: {0}")]
+    Acp(#[from] AcpError),
 
     #[error("Worktree has uncommitted changes")]
     DirtyWorktree { files: Vec<String> },

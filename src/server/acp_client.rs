@@ -174,6 +174,30 @@ pub enum AcpMessage {
     Notification(JsonRpcNotification),
 }
 
+impl AcpMessage {
+    /// Try to parse this notification as ACP session/update params.
+    pub fn as_update(&self) -> Option<AcpUpdateParams> {
+        match self {
+            AcpMessage::Notification(notif) if notif.method == "session/update" => notif
+                .params
+                .clone()
+                .and_then(|params| serde_json::from_value::<AcpUpdateParams>(params).ok()),
+            _ => None,
+        }
+    }
+
+    /// Try to parse this notification as ACP session/elicitation params.
+    pub fn as_elicitation(&self) -> Option<AcpElicitationParams> {
+        match self {
+            AcpMessage::Notification(notif) if notif.method == "session/elicitation" => notif
+                .params
+                .clone()
+                .and_then(|params| serde_json::from_value::<AcpElicitationParams>(params).ok()),
+            _ => None,
+        }
+    }
+}
+
 // ── ACP update event types ────────────────────────────────────────────────
 
 /// Wrapper for the `session/update` notification params.
@@ -185,6 +209,21 @@ pub struct AcpUpdateParams {
     #[allow(dead_code)]
     pub session_id: Option<String>,
     pub update: AcpEvent,
+}
+
+/// Wrapper for the `session/elicitation` notification params.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AcpElicitationParams {
+    #[serde(default, rename = "sessionId")]
+    pub session_id: Option<String>,
+    #[serde(default, rename = "requestId")]
+    pub request_id: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub schema: Option<Value>,
 }
 
 /// Events emitted by the ACP subprocess via `session/update` notifications.
@@ -483,29 +522,10 @@ impl AcpClient {
         });
         let client = Arc::clone(self);
         let method = "session/prompt".to_string();
-        let notif_tx = client.notification_tx.clone();
-        let sid = session_id.to_string();
         tokio::spawn(async move {
             match client.send_request(&method, Some(params)).await {
-                Ok(result) => {
+                Ok(_) => {
                     debug!("session/prompt completed");
-                    let stop_reason = result
-                        .get("stopReason")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("end_turn")
-                        .to_string();
-                    let synthetic = AcpMessage::Notification(JsonRpcNotification {
-                        jsonrpc: "2.0".to_string(),
-                        method: "session/update".to_string(),
-                        params: Some(serde_json::json!({
-                            "sessionId": sid,
-                            "update": {
-                                "sessionUpdate": "turn_complete",
-                                "stopReason": stop_reason
-                            }
-                        })),
-                    });
-                    let _ = notif_tx.send(synthetic).await;
                 }
                 Err(e) => warn!(error = %e, "session/prompt request failed"),
             }
