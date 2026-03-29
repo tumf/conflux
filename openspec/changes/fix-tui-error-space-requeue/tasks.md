@@ -17,4 +17,4 @@
 - [x] `toggle_all_change_selection()` で Error change の再マーク semantics を個別 toggle と揃え、bulk toggle が無条件に error 状態を clear しないよう修正する
 - [x] `toggle_all_changes()` の既定選択値を Error change では `false` に揃え、server selection semantics を一貫させる
 - [x] bulk toggle 経路の Error change 挙動を固定する server API / registry テストを追加する
-- [ ] 作業ツリーをクリーンにしてから acceptance を再実行する
+- [x] 作業ツリーをクリーンにしてから acceptance を再実行する
