@@ -2525,6 +2525,8 @@ async fn create_terminal(
         cwd,
         rows: request.rows,
         cols: request.cols,
+        project_id: request.project_id.clone(),
+        root: request.root.clone(),
     };
 
     match state.terminal_manager.create_session(create_request).await {
@@ -2605,6 +2607,28 @@ async fn handle_terminal_ws(socket: WebSocket, manager: SharedTerminalManager, s
     info!(session_id = %session_id, "Terminal WebSocket connected");
 
     let (mut ws_tx, mut ws_rx) = socket.split();
+
+    // Send scrollback buffer contents before subscribing to live output.
+    // This ensures the client receives recent output history on reconnection.
+    match manager.get_scrollback(&session_id).await {
+        Ok(scrollback) if !scrollback.is_empty() => {
+            debug!(session_id = %session_id, bytes = scrollback.len(), "Sending scrollback buffer");
+            if ws_tx
+                .send(Message::Binary(scrollback.into()))
+                .await
+                .is_err()
+            {
+                debug!(session_id = %session_id, "WebSocket closed while sending scrollback");
+                return;
+            }
+        }
+        Ok(_) => {
+            debug!(session_id = %session_id, "No scrollback data to send");
+        }
+        Err(e) => {
+            debug!(session_id = %session_id, error = %e, "Failed to get scrollback, continuing without it");
+        }
+    }
 
     // Subscribe to terminal output
     let mut output_rx = match manager.subscribe_output(&session_id).await {
