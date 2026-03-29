@@ -250,6 +250,8 @@ pub struct AcpContent {
 pub struct AcpClient {
     /// Sender half for writing JSON-RPC messages to the subprocess stdin.
     stdin_tx: mpsc::Sender<String>,
+    /// Sender for synthetic notifications generated from request responses.
+    notification_tx: mpsc::Sender<AcpMessage>,
     /// Receiver half for incoming notifications from the subprocess stdout.
     notification_rx: Mutex<mpsc::Receiver<AcpMessage>>,
     /// Monotonically incrementing request ID counter.
@@ -335,6 +337,7 @@ impl AcpClient {
 
         // Spawn stdout reader task
         let response_tx_clone = response_tx.clone();
+        let notif_tx_clone = notif_tx.clone();
         tokio::spawn(async move {
             let reader = BufReader::new(child_stdout);
             let mut lines = reader.lines();
@@ -366,7 +369,7 @@ impl AcpClient {
                             match serde_json::from_value::<JsonRpcNotification>(val) {
                                 Ok(notif) => {
                                     let msg = AcpMessage::Notification(notif);
-                                    if notif_tx.send(msg).await.is_err() {
+                                    if notif_tx_clone.send(msg).await.is_err() {
                                         debug!("Notification channel closed");
                                         break;
                                     }
@@ -398,6 +401,7 @@ impl AcpClient {
 
         let client = Arc::new(Self {
             stdin_tx,
+            notification_tx: notif_tx.clone(),
             notification_rx: Mutex::new(notif_rx),
             next_id: AtomicU64::new(1),
             response_rx: Mutex::new(response_rx),
@@ -479,9 +483,30 @@ impl AcpClient {
         });
         let client = Arc::clone(self);
         let method = "session/prompt".to_string();
+        let notif_tx = client.notification_tx.clone();
+        let sid = session_id.to_string();
         tokio::spawn(async move {
             match client.send_request(&method, Some(params)).await {
-                Ok(_) => debug!("session/prompt completed"),
+                Ok(result) => {
+                    debug!("session/prompt completed");
+                    let stop_reason = result
+                        .get("stopReason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("end_turn")
+                        .to_string();
+                    let synthetic = AcpMessage::Notification(JsonRpcNotification {
+                        jsonrpc: "2.0".to_string(),
+                        method: "session/update".to_string(),
+                        params: Some(serde_json::json!({
+                            "sessionId": sid,
+                            "update": {
+                                "sessionUpdate": "turn_complete",
+                                "stopReason": stop_reason
+                            }
+                        })),
+                    });
+                    let _ = notif_tx.send(synthetic).await;
+                }
                 Err(e) => warn!(error = %e, "session/prompt request failed"),
             }
         });
