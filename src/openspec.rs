@@ -1,6 +1,8 @@
 use crate::error::{OrchestratorError, Result};
 use crate::task_parser;
 use crate::tui::log_deduplicator;
+use serde::Deserialize;
+use serde_yaml::Value as YamlValue;
 use std::fs;
 use std::path::Path;
 use tracing::{debug, info};
@@ -32,23 +34,168 @@ impl Change {
     }
 }
 
-/// Parse dependencies from a proposal.md file.
-///
-/// Looks for a `## Dependencies` section and extracts change IDs from bullet points.
-/// Supports formats like:
-/// - `- feature-base`
-/// - `- [feature-base](../feature-base/proposal.md)`
-/// - `- feature-base: description`
-fn parse_dependencies(change_id: &str) -> Vec<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalFrontmatterWarning {
+    pub key: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalFrontmatterMetadata {
+    pub priority: Option<String>,
+    pub dependencies: Option<Vec<String>>,
+    pub references: Vec<String>,
+    pub warnings: Vec<ProposalFrontmatterWarning>,
+}
+
+impl ProposalFrontmatterMetadata {
+    fn is_empty(&self) -> bool {
+        self.priority.is_none()
+            && self.dependencies.is_none()
+            && self.references.is_empty()
+            && self.warnings.is_empty()
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawProposalFrontmatter {
+    priority: Option<String>,
+    dependencies: Option<Vec<String>>,
+    references: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalReadResult {
+    pub metadata: Option<ProposalFrontmatterMetadata>,
+    pub body_dependencies: Vec<String>,
+}
+
+impl ProposalReadResult {
+    pub fn dependencies_for_analysis(&self) -> Vec<String> {
+        self.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.dependencies.clone())
+            .unwrap_or_else(|| self.body_dependencies.clone())
+    }
+}
+
+/// Parse dependencies and frontmatter metadata from a proposal.md file.
+pub fn read_proposal(change_id: &str) -> ProposalReadResult {
     let proposal_path = Path::new("openspec/changes")
         .join(change_id)
         .join("proposal.md");
 
     let content = match fs::read_to_string(&proposal_path) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            return ProposalReadResult {
+                metadata: None,
+                body_dependencies: Vec::new(),
+            }
+        }
     };
 
+    let (metadata, body) = parse_frontmatter_metadata(change_id, &content);
+    let body_dependencies = parse_body_dependencies(change_id, &body);
+
+    ProposalReadResult {
+        metadata,
+        body_dependencies,
+    }
+}
+
+/// Parse dependencies from a proposal.md file, preferring frontmatter metadata when present.
+fn parse_dependencies(change_id: &str) -> Vec<String> {
+    let proposal = read_proposal(change_id);
+    let dependencies = proposal.dependencies_for_analysis();
+
+    if !dependencies.is_empty() {
+        info!(
+            "Parsed dependencies for '{}': [{}]",
+            change_id,
+            dependencies.join(", ")
+        );
+    }
+
+    dependencies
+}
+
+fn parse_frontmatter_metadata(
+    change_id: &str,
+    content: &str,
+) -> (Option<ProposalFrontmatterMetadata>, String) {
+    let Some((frontmatter, body)) = split_frontmatter(content) else {
+        return (None, content.to_string());
+    };
+
+    let body = body.to_string();
+    let raw_value = match serde_yaml::from_str::<YamlValue>(frontmatter) {
+        Ok(value) => value,
+        Err(error) => {
+            info!(
+                "Ignoring invalid proposal frontmatter for '{}': {}",
+                change_id, error
+            );
+            return (None, body);
+        }
+    };
+
+    let Some(mapping) = raw_value.as_mapping() else {
+        info!(
+            "Ignoring non-mapping proposal frontmatter for '{}'",
+            change_id
+        );
+        return (None, body);
+    };
+
+    let raw = match serde_yaml::from_value::<RawProposalFrontmatter>(raw_value.clone()) {
+        Ok(raw) => raw,
+        Err(error) => {
+            info!(
+                "Ignoring unparsable proposal frontmatter for '{}': {}",
+                change_id, error
+            );
+            return (None, body);
+        }
+    };
+
+    let known_keys = ["priority", "dependencies", "references"];
+    let mut warnings = Vec::new();
+    for key in mapping.keys().filter_map(YamlValue::as_str) {
+        if !known_keys.contains(&key) {
+            warnings.push(ProposalFrontmatterWarning {
+                key: key.to_string(),
+                message: format!("Unknown proposal frontmatter key: {}", key),
+            });
+        }
+    }
+
+    let metadata = ProposalFrontmatterMetadata {
+        priority: raw.priority,
+        dependencies: raw.dependencies,
+        references: raw.references.unwrap_or_default(),
+        warnings,
+    };
+
+    let metadata = (!metadata.is_empty()).then_some(metadata);
+    (metadata, body)
+}
+
+fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+    let stripped = content.strip_prefix("---\n")?;
+    let delimiter_index = stripped.find("\n---\n")?;
+    let frontmatter = &stripped[..delimiter_index];
+    let body_start = delimiter_index + "\n---\n".len();
+    let body = &stripped[body_start..];
+    Some((frontmatter, body))
+}
+
+/// Looks for a `## Dependencies` section and extracts change IDs from bullet points.
+/// Supports formats like:
+/// - `- feature-base`
+/// - `- [feature-base](../feature-base/proposal.md)`
+/// - `- feature-base: description`
+fn parse_body_dependencies(change_id: &str, content: &str) -> Vec<String> {
     let mut dependencies = Vec::new();
     let mut in_deps_section = false;
 
@@ -83,13 +230,6 @@ fn parse_dependencies(change_id: &str) -> Vec<String> {
         }
     }
 
-    if !dependencies.is_empty() {
-        info!(
-            "Parsed dependencies for '{}': [{}]",
-            change_id,
-            dependencies.join(", ")
-        );
-    }
     dependencies
 }
 
@@ -317,6 +457,124 @@ mod tests {
         for change in &changes {
             assert!(!change.id.is_empty(), "change ID should not be empty");
         }
+    }
+
+    #[test]
+    fn test_read_proposal_prefers_frontmatter_dependencies() {
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let change_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("change-a");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\ndependencies:\n  - frontmatter-dep\npriority: high\nreferences:\n  - src/analyzer.rs\n---\n# Change: Sample\n\n## Dependencies\n\n- body-dep\n",
+        )
+        .unwrap();
+
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(temp_dir.path()).unwrap();
+
+        let proposal = read_proposal("change-a");
+
+        env::set_current_dir(original_dir).unwrap();
+
+        let metadata = proposal
+            .metadata
+            .as_ref()
+            .expect("metadata should be present");
+        assert_eq!(metadata.priority.as_deref(), Some("high"));
+        assert_eq!(
+            metadata.dependencies,
+            Some(vec!["frontmatter-dep".to_string()])
+        );
+        assert_eq!(metadata.references, vec!["src/analyzer.rs".to_string()]);
+        assert!(metadata.warnings.is_empty());
+        assert_eq!(proposal.body_dependencies, vec!["body-dep".to_string()]);
+        assert_eq!(
+            proposal.dependencies_for_analysis(),
+            vec!["frontmatter-dep".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_read_proposal_falls_back_to_body_dependencies_without_frontmatter_field() {
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let change_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("change-a");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\npriority: low\n---\n# Change: Sample\n\n## Dependencies\n\n- body-dep\n",
+        )
+        .unwrap();
+
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(temp_dir.path()).unwrap();
+
+        let proposal = read_proposal("change-a");
+
+        env::set_current_dir(original_dir).unwrap();
+
+        let metadata = proposal
+            .metadata
+            .as_ref()
+            .expect("metadata should be present");
+        assert_eq!(metadata.priority.as_deref(), Some("low"));
+        assert_eq!(metadata.dependencies, None);
+        assert_eq!(
+            proposal.dependencies_for_analysis(),
+            vec!["body-dep".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_read_proposal_warns_on_unknown_frontmatter_keys() {
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let change_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("change-a");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\ndependencies:\n  - frontmatter-dep\nowner: tumf\n---\n# Change: Sample\n",
+        )
+        .unwrap();
+
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(temp_dir.path()).unwrap();
+
+        let proposal = read_proposal("change-a");
+
+        env::set_current_dir(original_dir).unwrap();
+
+        let metadata = proposal
+            .metadata
+            .as_ref()
+            .expect("metadata should be present");
+        assert_eq!(
+            metadata.dependencies,
+            Some(vec!["frontmatter-dep".to_string()])
+        );
+        assert_eq!(metadata.warnings.len(), 1);
+        assert_eq!(metadata.warnings[0].key, "owner");
+        assert!(metadata.warnings[0]
+            .message
+            .contains("Unknown proposal frontmatter key: owner"));
+        assert_eq!(
+            proposal.dependencies_for_analysis(),
+            vec!["frontmatter-dep".to_string()]
+        );
     }
 
     #[test]
