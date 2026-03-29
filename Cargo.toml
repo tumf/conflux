@@ -51,7 +51,7 @@ required-features = ["web-monitoring"]
 
 [features]
 default = ["web-monitoring"]
-web-monitoring = ["axum", "tower", "tower-http", "qrcode", "local-ip-address", "utoipa", "utoipa-swagger-ui"]
+web-monitoring = ["axum", "tower", "tower-http", "qrcode", "local-ip-address", "utoipa", "utoipa-swagger-ui", "portable-pty"]
 
 [dependencies]
 tokio = { version = "1", features = ["full", "process"] }
@@ -94,6 +94,9 @@ qrcode = { version = "0.14", optional = true }
 local-ip-address = { version = "0.6", optional = true }
 utoipa = { version = "5", features = ["axum_extras", "chrono"], optional = true }
 utoipa-swagger-ui = { version = "8", features = ["axum"], optional = true }
+
+# Terminal session dependencies (optional, tied to web-monitoring)
+portable-pty = { version = "0.8", optional = true }
 
 # Process management dependencies (platform-specific)
 [target.'cfg(unix)'.dependencies]
