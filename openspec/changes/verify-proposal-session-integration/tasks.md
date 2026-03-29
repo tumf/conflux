@@ -15,3 +15,8 @@
 
 - CI pipeline integration for proposal session E2E tests
 - Performance benchmarking with concurrent sessions
+
+## Acceptance #2 Failure Follow-up
+
+- [x] Fix the dashboard proposal-session WebSocket URL so it targets the backend route actually exposed at `/api/v1/proposal-sessions/{session_id}/ws`, or add the missing backend route under `/api/v1/projects/{project_id}/proposal-sessions/{session_id}/ws`
+- [x] Add an integration test that verifies the dashboard WebSocket URL matches a live backend proposal-session WebSocket route

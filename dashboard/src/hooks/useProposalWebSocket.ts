@@ -1,6 +1,6 @@
 /**
  * WebSocket hook for proposal session real-time communication.
- * Connects to /api/v1/projects/{projectId}/proposal-sessions/{sessionId}/ws
+ * Connects to /api/v1/proposal-sessions/{sessionId}/ws
  * and handles all proposal-specific message types.
  */
 

@@ -356,9 +356,9 @@ export async function listProposalSessionChanges(
  * Get the WebSocket URL for a proposal session
  */
 export function getProposalSessionWsUrl(
-  projectId: string,
+  _projectId: string,
   sessionId: string,
 ): string {
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${protocol}://${window.location.host}/api/v1/projects/${projectId}/proposal-sessions/${sessionId}/ws`;
+  return `${protocol}://${window.location.host}/api/v1/proposal-sessions/${sessionId}/ws`;
 }
