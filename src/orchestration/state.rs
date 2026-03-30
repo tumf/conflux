@@ -56,8 +56,9 @@
 //!        let is_pending = guard.is_pending(change_id);
 //!    }
 //!    ```
-
 use std::collections::{HashMap, HashSet};
+
+use crate::error_history::{CircuitBreakerConfig, ErrorHistory};
 
 // ============================================================================
 // Execution mode – determines terminal states for the state machine
@@ -301,8 +302,17 @@ pub struct OrchestratorState {
     /// Apply counts per change (how many times each change has been applied).
     apply_counts: HashMap<String, u32>,
 
+    /// Changes marked as stalled (failed due to no progress or blockers).
+    stalled_change_ids: HashSet<String>,
+
+    /// Changes skipped because one of their dependencies stalled.
+    skipped_change_ids: HashSet<String>,
+
     /// Task progress per change (completed_tasks, total_tasks).
     task_progress: HashMap<String, (u32, u32)>,
+
+    /// Error history per change for repeated failure detection.
+    error_histories: HashMap<String, ErrorHistory>,
 
     /// Number of changes processed (archived).
     changes_processed: usize,
@@ -358,7 +368,10 @@ impl OrchestratorState {
             pending_changes: pending_set,
             archived_changes: HashSet::new(),
             apply_counts: HashMap::new(),
+            stalled_change_ids: HashSet::new(),
+            skipped_change_ids: HashSet::new(),
             task_progress: HashMap::new(),
+            error_histories: HashMap::new(),
             changes_processed: 0,
             total_changes: total,
             max_iterations,
@@ -383,6 +396,37 @@ impl OrchestratorState {
     /// Get the set of archived changes.
     pub fn archived_changes(&self) -> &HashSet<String> {
         &self.archived_changes
+    }
+
+    /// Get stalled change IDs.
+    pub fn stalled_change_ids(&self) -> &HashSet<String> {
+        &self.stalled_change_ids
+    }
+
+    /// Get skipped change IDs.
+    pub fn skipped_change_ids(&self) -> &HashSet<String> {
+        &self.skipped_change_ids
+    }
+
+    /// Mark a change as stalled.
+    pub fn mark_stalled(&mut self, change_id: String) {
+        self.stalled_change_ids.insert(change_id);
+    }
+
+    /// Mark a change as skipped.
+    ///
+    /// Returns true when the value was newly inserted.
+    pub fn mark_skipped(&mut self, change_id: String) -> bool {
+        self.skipped_change_ids.insert(change_id)
+    }
+
+    /// Clear transient counters for a stalled change.
+    pub fn clear_stalled_change(&mut self, change_id: &str) {
+        self.skipped_change_ids.remove(change_id);
+        self.apply_counts.remove(change_id);
+        if self.current_change_id.as_deref() == Some(change_id) {
+            self.current_change_id = None;
+        }
     }
 
     /// Get the number of changes processed.
@@ -579,6 +623,53 @@ impl OrchestratorState {
         if self.current_change_id.as_deref() == Some(change_id) {
             self.current_change_id = None;
         }
+    }
+
+    /// Remove a change from pending and decrement total_changes.
+    ///
+    /// Returns true when the change was pending and removed.
+    pub fn drop_pending_change(&mut self, change_id: &str) -> bool {
+        let removed = self.pending_changes.remove(change_id);
+        if removed {
+            self.total_changes = self.total_changes.saturating_sub(1);
+        }
+        if self.current_change_id.as_deref() == Some(change_id) {
+            self.current_change_id = None;
+        }
+        removed
+    }
+
+    /// Clear all pending changes.
+    pub fn clear_pending_changes(&mut self) {
+        self.pending_changes.clear();
+    }
+
+    /// Record an error and return whether circuit breaker should trip.
+    pub fn record_error_and_check_circuit_breaker(
+        &mut self,
+        change_id: &str,
+        error: &str,
+        config: CircuitBreakerConfig,
+    ) -> bool {
+        let history = self
+            .error_histories
+            .entry(change_id.to_string())
+            .or_insert_with(|| ErrorHistory::new(config.clone()));
+
+        history.record_error(error);
+        history.detect_same_error()
+    }
+
+    /// Return the most recent normalized error for a change.
+    pub fn last_error(&self, change_id: &str) -> Option<&str> {
+        self.error_histories
+            .get(change_id)
+            .and_then(ErrorHistory::last_error)
+    }
+
+    /// Clear error history for a change.
+    pub fn clear_error_history(&mut self, change_id: &str) {
+        self.error_histories.remove(change_id);
     }
 
     // -----------------------------------------------------------------------
@@ -1104,6 +1195,26 @@ mod tests {
         assert!(!state.is_pending("change-a"));
         assert!(!state.is_archived("change-a")); // Not archived, just removed
         assert!(state.current_change_id().is_none());
+    }
+
+    #[test]
+    fn test_error_history_management_and_circuit_breaker() {
+        let mut state = OrchestratorState::new(vec!["change-a".to_string()], 0);
+        let config = CircuitBreakerConfig {
+            enabled: true,
+            threshold: 2,
+        };
+
+        assert!(!state.record_error_and_check_circuit_breaker(
+            "change-a",
+            "same error",
+            config.clone()
+        ));
+        assert!(state.record_error_and_check_circuit_breaker("change-a", "same error", config));
+        assert!(state.last_error("change-a").is_some());
+
+        state.clear_error_history("change-a");
+        assert!(state.last_error("change-a").is_none());
     }
 
     // -----------------------------------------------------------------------

@@ -4,7 +4,7 @@ use crate::command_queue::CommandQueueConfig;
 use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
-use crate::error_history::{CircuitBreakerConfig, ErrorHistory};
+use crate::error_history::CircuitBreakerConfig;
 use crate::events::ExecutionEvent;
 use crate::execution::apply::{check_task_progress, create_progress_commit};
 use crate::hooks::{HookContext, HookRunner, HookType};
@@ -19,7 +19,7 @@ use crate::task_parser::TaskProgress;
 use crate::tui::log_deduplicator;
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{GitWorkspaceManager, VcsBackend, WorkspaceManager};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -48,26 +48,10 @@ pub struct Orchestrator {
     initial_change_ids: Option<HashSet<String>>,
     /// Hook runner for executing hooks at various stages
     hooks: HookRunner,
-    /// Current change ID being processed (for on_change_start/on_change_end detection)
-    current_change_id: Option<String>,
-    /// Completed change IDs (after archive, on_change_end called)
-    completed_change_ids: HashSet<String>,
-    /// Apply counts per change (how many times each change has been applied)
-    apply_counts: HashMap<String, u32>,
     /// Stall detector for empty WIP commit tracking
     stall_detector: StallDetector,
-    /// Changes marked as stalled (failed due to no progress)
-    stalled_change_ids: HashSet<String>,
-    /// Changes skipped due to stalled dependencies
-    skipped_change_ids: HashSet<String>,
-    /// Error history per change (for circuit breaker pattern)
-    error_histories: HashMap<String, ErrorHistory>,
-    /// Number of changes processed (archived)
-    changes_processed: usize,
     /// Maximum iterations limit (0 = no limit)
     max_iterations: u32,
-    /// Current iteration number (for max_iterations check)
-    iteration: u32,
     /// Enable parallel execution mode
     parallel: bool,
     /// Maximum concurrent workspaces for parallel execution
@@ -168,16 +152,8 @@ impl Orchestrator {
             target_changes,
             initial_change_ids: None,
             hooks,
-            current_change_id: None,
-            completed_change_ids: HashSet::new(),
-            apply_counts: HashMap::new(),
             stall_detector,
-            stalled_change_ids: HashSet::new(),
-            skipped_change_ids: HashSet::new(),
-            error_histories: HashMap::new(),
-            changes_processed: 0,
             max_iterations,
-            iteration: 0,
             parallel,
             max_concurrent,
             dry_run,
@@ -274,16 +250,8 @@ impl Orchestrator {
             target_changes,
             initial_change_ids: None,
             hooks,
-            current_change_id: None,
-            completed_change_ids: HashSet::new(),
-            apply_counts: HashMap::new(),
             stall_detector,
-            stalled_change_ids: HashSet::new(),
-            skipped_change_ids: HashSet::new(),
-            error_histories: HashMap::new(),
-            changes_processed: 0,
             max_iterations,
-            iteration: 0,
             parallel: false,
             max_concurrent: None,
             dry_run: false,
@@ -369,24 +337,28 @@ impl Orchestrator {
 
     /// Check max iterations limit and increment counter
     /// Returns LoopControl indicating whether to continue or break
-    fn check_max_iterations(&mut self) -> LoopControl {
-        self.iteration += 1;
+    async fn check_max_iterations(&mut self) -> LoopControl {
+        let mut state = self.shared_state.write().await;
+        state.increment_iteration();
+        let iteration = state.iteration();
+        let max_iterations = state.max_iterations();
+        drop(state);
 
-        if self.max_iterations > 0 {
+        if max_iterations > 0 {
             // Log warning when approaching limit (80%)
-            let warning_threshold = (self.max_iterations as f32 * 0.8) as u32;
-            if self.iteration == warning_threshold {
+            let warning_threshold = (max_iterations as f32 * 0.8) as u32;
+            if iteration == warning_threshold {
                 warn!(
                     "Approaching max iterations: {}/{}",
-                    self.iteration, self.max_iterations
+                    iteration, max_iterations
                 );
             }
 
             // Stop if max iterations reached
-            if self.iteration > self.max_iterations {
+            if iteration > max_iterations {
                 info!(
                     "Max iterations ({}) reached, stopping orchestration",
-                    self.max_iterations
+                    max_iterations
                 );
                 if let Some(progress) = &mut self.progress {
                     progress.complete_all();
@@ -423,7 +395,7 @@ impl Orchestrator {
         }
 
         // Check max iterations
-        self.check_max_iterations()
+        self.check_max_iterations().await
     }
 
     /// Update shared state with an execution event
@@ -436,14 +408,8 @@ impl Orchestrator {
 
     /// Handle Archived result
     async fn handle_archived(&mut self, next: &Change) {
-        self.changes_processed += 1;
-
         self.update_shared_state(ExecutionEvent::ChangeArchived(next.id.clone()))
             .await;
-
-        self.completed_change_ids.insert(next.id.clone());
-        self.current_change_id = None;
-        self.apply_counts.remove(&next.id);
         self.stall_detector.clear_change(&next.id);
 
         if let Some(progress) = &mut self.progress {
@@ -452,9 +418,9 @@ impl Orchestrator {
     }
 
     /// Handle Stalled result
-    fn handle_stalled(&mut self, next: &Change, error: &str) -> LoopControl {
+    async fn handle_stalled(&mut self, next: &Change, error: &str) -> LoopControl {
         warn!("Change stalled: {} - {}", next.id, error);
-        self.mark_change_stalled(&next.id, error);
+        self.mark_change_stalled(&next.id, error).await;
         LoopControl::Continue
     }
 
@@ -501,7 +467,7 @@ impl Orchestrator {
             snapshot.empty_commit,
         ) {
             warn!("{}", stall_reason);
-            self.mark_change_stalled(&next.id, &stall_reason);
+            self.mark_change_stalled(&next.id, &stall_reason).await;
             return LoopControl::Continue;
         }
 
@@ -531,13 +497,16 @@ impl Orchestrator {
         }
 
         // CLI-specific: Check circuit breaker
-        if self.record_error_and_check_circuit_breaker(&next.id, error) {
+        if self
+            .record_error_and_check_circuit_breaker(&next.id, error)
+            .await
+        {
             let message = format!(
                 "Circuit breaker opened for '{}' due to repeated errors",
                 next.id
             );
             warn!("{}", message);
-            self.mark_change_stalled(&next.id, &message);
+            self.mark_change_stalled(&next.id, &message).await;
             serial_service.mark_stalled(&next.id, &message);
             return Ok(());
         }
@@ -594,7 +563,7 @@ impl Orchestrator {
                 );
                 // Mark change as stalled to prevent re-selection and archive
                 let reason = "Implementation blocker detected - requires manual intervention";
-                self.mark_change_stalled(&next.id, reason);
+                self.mark_change_stalled(&next.id, reason).await;
                 serial_service.mark_stalled(&next.id, reason);
             }
             ChangeProcessResult::AcceptanceFailed { .. } => {
@@ -684,7 +653,7 @@ impl Orchestrator {
                 self.handle_archived(next).await;
                 Ok(LoopControl::Continue)
             }
-            ChangeProcessResult::Stalled { error } => Ok(self.handle_stalled(next, &error)),
+            ChangeProcessResult::Stalled { error } => Ok(self.handle_stalled(next, &error).await),
             ChangeProcessResult::Failed { error } => {
                 self.handle_failed(next, &error).await?;
                 Ok(LoopControl::Continue)
@@ -811,7 +780,10 @@ impl Orchestrator {
                 };
 
             // Check if this is a new change (for state tracking)
-            let is_new_change = self.current_change_id.as_ref() != Some(&next.id);
+            let is_new_change = {
+                let state = self.shared_state.read().await;
+                state.current_change_id() != Some(&next.id)
+            };
             if is_new_change {
                 // Update shared state: processing started
                 self.shared_state
@@ -820,7 +792,6 @@ impl Orchestrator {
                     .apply_execution_event(&ExecutionEvent::ProcessingStarted(next.id.clone()));
 
                 // Note: OnChangeStart hook is called by process_change() internally
-                self.current_change_id = Some(next.id.clone());
             }
 
             // Process the change through SerialRunService
@@ -859,8 +830,9 @@ impl Orchestrator {
         }
 
         // Run on_finish hook
-        let finish_context = HookContext::new(self.changes_processed, total_changes, 0, false)
-            .with_status(finish_status);
+        let processed = self.shared_state.read().await.changes_processed();
+        let finish_context =
+            HookContext::new(processed, total_changes, 0, false).with_status(finish_status);
         self.hooks
             .run_hook(HookType::OnFinish, &finish_context)
             .await?;
@@ -1000,20 +972,21 @@ impl Orchestrator {
     }
 
     /// Filter out stalled changes and those blocked by stalled dependencies.
-    fn filter_stalled_changes(&mut self, changes: &[Change]) -> Vec<Change> {
+    async fn filter_stalled_changes(&mut self, changes: &[Change]) -> Vec<Change> {
         let mut eligible = Vec::new();
+        let mut state = self.shared_state.write().await;
 
         for change in changes {
-            if self.stalled_change_ids.contains(&change.id) {
+            if state.stalled_change_ids().contains(&change.id) {
                 continue;
             }
 
             if let Some(failed_dep) = change
                 .dependencies
                 .iter()
-                .find(|dep| self.stalled_change_ids.contains(*dep))
+                .find(|dep| state.stalled_change_ids().contains(*dep))
             {
-                if self.skipped_change_ids.insert(change.id.clone()) {
+                if state.mark_skipped(change.id.clone()) {
                     warn!(
                         "Skipping '{}' because dependency '{}' stalled",
                         change.id, failed_dep
@@ -1055,7 +1028,7 @@ impl Orchestrator {
             return Ok(None);
         }
 
-        let eligible_changes = self.filter_stalled_changes(&snapshot_changes);
+        let eligible_changes = self.filter_stalled_changes(&snapshot_changes).await;
         let remaining_changes = eligible_changes.len();
 
         if eligible_changes.is_empty() {
@@ -1081,11 +1054,13 @@ impl Orchestrator {
         Ok(Some((next.clone(), remaining_changes)))
     }
 
-    fn mark_change_stalled(&mut self, change_id: &str, reason: &str) {
-        self.stalled_change_ids.insert(change_id.to_string());
-        self.apply_counts.remove(change_id);
-        self.error_histories.remove(change_id);
-        self.current_change_id = None;
+    async fn mark_change_stalled(&mut self, change_id: &str, reason: &str) {
+        {
+            let mut state = self.shared_state.write().await;
+            state.mark_stalled(change_id.to_string());
+            state.clear_stalled_change(change_id);
+            state.clear_error_history(change_id);
+        }
         self.stall_detector.clear_change(change_id);
 
         if let Some(progress) = &mut self.progress {
@@ -1095,26 +1070,28 @@ impl Orchestrator {
 
     /// Record an error and check if circuit breaker should trip
     /// Returns true if the change should be skipped due to repeated errors
-    fn record_error_and_check_circuit_breaker(&mut self, change_id: &str, error: &str) -> bool {
+    async fn record_error_and_check_circuit_breaker(
+        &mut self,
+        change_id: &str,
+        error: &str,
+    ) -> bool {
         let cb_config = self.config.get_error_circuit_breaker();
         let circuit_breaker_config = CircuitBreakerConfig {
             enabled: cb_config.enabled,
             threshold: cb_config.threshold,
         };
 
-        let history = self
-            .error_histories
-            .entry(change_id.to_string())
-            .or_insert_with(|| ErrorHistory::new(circuit_breaker_config.clone()));
-
-        history.record_error(error);
-
-        if history.detect_same_error() {
+        let mut state = self.shared_state.write().await;
+        if state.record_error_and_check_circuit_breaker(
+            change_id,
+            error,
+            circuit_breaker_config.clone(),
+        ) {
             error!(
                 "Circuit breaker triggered for '{}': same error occurred {} times consecutively",
                 change_id, circuit_breaker_config.threshold
             );
-            if let Some(last_err) = history.last_error() {
+            if let Some(last_err) = state.last_error(change_id) {
                 error!("Last error pattern: {}", last_err);
             }
             true
@@ -1523,13 +1500,15 @@ mod tests {
         assert_eq!(filtered[0].completed_tasks, 4); // Progress should be updated
     }
 
-    #[test]
-    fn test_filter_stalled_changes_skips_dependencies() {
+    #[tokio::test]
+    async fn test_filter_stalled_changes_skips_dependencies() {
         let config = OrchestratorConfig::default();
         let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
         orchestrator
-            .stalled_change_ids
-            .insert("change-a".to_string());
+            .shared_state
+            .write()
+            .await
+            .mark_stalled("change-a".to_string());
 
         let changes = vec![
             Change {
@@ -1558,25 +1537,25 @@ mod tests {
             },
         ];
 
-        let eligible = orchestrator.filter_stalled_changes(&changes);
+        let eligible = orchestrator.filter_stalled_changes(&changes).await;
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].id, "change-c");
     }
 
     // Note: build_analysis_prompt tests moved to src/orchestration/selection.rs
 
-    #[test]
-    fn test_orchestrator_creation() {
+    #[tokio::test]
+    async fn test_orchestrator_creation() {
         let config = OrchestratorConfig::default();
         let orchestrator = Orchestrator::with_config(None, config).unwrap();
 
         assert!(orchestrator.target_changes.is_none());
         assert!(orchestrator.initial_change_ids.is_none());
-        assert!(orchestrator.current_change_id.is_none());
-        assert!(orchestrator.completed_change_ids.is_empty());
-        assert!(orchestrator.apply_counts.is_empty());
-        assert_eq!(orchestrator.changes_processed, 0);
-        assert_eq!(orchestrator.iteration, 0);
+
+        let state = orchestrator.shared_state.read().await;
+        assert!(state.current_change_id().is_none());
+        assert_eq!(state.changes_processed(), 0);
+        assert_eq!(state.iteration(), 0);
     }
 
     #[test]
@@ -1615,6 +1594,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_serial_shared_state_apply_count_and_iteration_increment() {
+        let config = OrchestratorConfig::default();
+        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
+
+        {
+            let mut state = orchestrator.shared_state.write().await;
+            *state = crate::orchestration::state::OrchestratorState::new(
+                vec!["change-a".to_string()],
+                3,
+            );
+        }
+
+        // check_max_iterations increments iteration in shared state
+        match orchestrator.check_max_iterations().await {
+            super::LoopControl::Continue => {}
+            _ => panic!("iteration check should continue"),
+        }
+
+        {
+            let state = orchestrator.shared_state.read().await;
+            assert_eq!(state.iteration(), 1);
+            assert_eq!(state.apply_count("change-a"), 0);
+        }
+
+        // ApplyCompleted increments per-change apply count in shared state
+        orchestrator
+            .shared_state
+            .write()
+            .await
+            .apply_execution_event(&crate::events::ExecutionEvent::ApplyCompleted {
+                change_id: "change-a".to_string(),
+                revision: "serial".to_string(),
+            });
+
+        let state = orchestrator.shared_state.read().await;
+        assert_eq!(state.apply_count("change-a"), 1);
+    }
+
+    #[tokio::test]
     async fn test_acceptance_blocked_prevents_reapply_and_archive() {
         use crate::serial_run_service::ChangeProcessResult;
         use tempfile::TempDir;
@@ -1636,7 +1654,12 @@ mod tests {
             .unwrap();
 
         // Verify the change is marked as stalled in orchestrator
-        assert!(orchestrator.stalled_change_ids.contains(&blocked_change.id));
+        assert!(orchestrator
+            .shared_state
+            .read()
+            .await
+            .stalled_change_ids()
+            .contains(&blocked_change.id));
 
         // Verify the change is marked as stalled in serial service
         assert!(serial_service.is_stalled(&blocked_change.id));
@@ -1648,7 +1671,7 @@ mod tests {
         ];
 
         // Filter should exclude the blocked change
-        let eligible = orchestrator.filter_stalled_changes(&changes);
+        let eligible = orchestrator.filter_stalled_changes(&changes).await;
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].id, "other-change");
     }

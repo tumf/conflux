@@ -22,28 +22,6 @@ use tokio_util::sync::CancellationToken;
 use super::events::{LogEntry, OrchestratorEvent};
 use super::queue::DynamicQueue;
 
-fn apply_pending_removals(
-    pending_changes: &mut HashSet<String>,
-    processed_change_ids: &mut Vec<String>,
-    apply_counts: &mut HashMap<String, u32>,
-    removed_ids: Vec<String>,
-) -> Vec<String> {
-    if removed_ids.is_empty() {
-        return Vec::new();
-    }
-
-    let mut removed_pending = Vec::new();
-    for id in removed_ids {
-        if pending_changes.remove(&id) {
-            processed_change_ids.retain(|existing| existing != &id);
-            apply_counts.remove(&id);
-            removed_pending.push(id);
-        }
-    }
-
-    removed_pending
-}
-
 fn post_archive_dispatch_event(
     state: &crate::orchestration::state::OrchestratorState,
     change_id: &str,
@@ -118,15 +96,13 @@ pub async fn run_orchestrator(
     let repo_root = std::env::current_dir()?;
     let mut serial_service = SerialRunService::new(repo_root, config);
 
-    let mut total_changes = change_ids.len();
-    let mut changes_processed: usize = 0;
-    // Note: current_change_id is now tracked by SerialRunService
-    let mut apply_counts: HashMap<String, u32> = HashMap::new();
-    let mut archived_changes: HashSet<String> = HashSet::new();
-    let mut pending_changes: HashSet<String> = change_ids.iter().cloned().collect();
-    let mut processed_change_ids: Vec<String> = change_ids.clone();
+    {
+        let mut state = shared_state.write().await;
+        *state = crate::orchestration::state::OrchestratorState::new(change_ids, max_iterations);
+    }
 
     // Run on_start hook
+    let total_changes = shared_state.read().await.total_changes();
     let start_context = HookContext::new(0, total_changes, total_changes, false);
     if let Err(e) = hooks.run_hook(HookType::OnStart, &start_context).await {
         let _ = tx
@@ -190,27 +166,36 @@ pub async fn run_orchestrator(
         // Check dynamic queue for new changes before checking if we're done
         while let Some(dynamic_id) = dynamic_queue.pop().await {
             // Skip if already archived or in pending
-            if !archived_changes.contains(&dynamic_id) && !pending_changes.contains(&dynamic_id) {
+            let should_add = {
+                let state = shared_state.read().await;
+                !state.is_archived(&dynamic_id) && !state.is_pending(&dynamic_id)
+            };
+            if should_add {
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::info(format!(
                         "Processing dynamically added: {}",
                         dynamic_id
                     ))))
                     .await;
-                pending_changes.insert(dynamic_id.clone());
-                processed_change_ids.push(dynamic_id);
-                total_changes += 1;
+                shared_state
+                    .write()
+                    .await
+                    .add_dynamic_change(dynamic_id.clone());
             }
         }
 
-        let removed_pending = apply_pending_removals(
-            &mut pending_changes,
-            &mut processed_change_ids,
-            &mut apply_counts,
-            dynamic_queue.drain_removed().await,
-        );
-        if !removed_pending.is_empty() {
-            total_changes = total_changes.saturating_sub(removed_pending.len());
+        let removed_ids = dynamic_queue.drain_removed().await;
+        if !removed_ids.is_empty() {
+            let mut removed_pending = Vec::new();
+            {
+                let mut state = shared_state.write().await;
+                for id in removed_ids {
+                    if state.drop_pending_change(&id) {
+                        removed_pending.push(id);
+                    }
+                }
+            }
+
             for id in removed_pending {
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::info(format!(
@@ -222,7 +207,7 @@ pub async fn run_orchestrator(
         }
 
         // Check if all pending changes are done
-        if pending_changes.is_empty() {
+        if shared_state.read().await.is_complete() {
             break;
         }
 
@@ -245,11 +230,14 @@ pub async fn run_orchestrator(
         let changes = openspec::list_changes_native()?;
 
         // Filter to changes in pending set (include completed changes so they can be archived)
-        let eligible_changes: Vec<_> = changes
-            .iter()
-            .filter(|c| pending_changes.contains(&c.id))
-            .cloned()
-            .collect();
+        let eligible_changes: Vec<_> = {
+            let state = shared_state.read().await;
+            changes
+                .iter()
+                .filter(|c| state.is_pending(&c.id))
+                .cloned()
+                .collect()
+        };
 
         // Use serial service for change selection
         let next_change = serial_service.select_next_change(&eligible_changes);
@@ -266,8 +254,7 @@ pub async fn run_orchestrator(
         // Check if this change has been stopped (single-change stop)
         if dynamic_queue.is_stopped(&change_id).await {
             dynamic_queue.clear_stopped(&change_id).await;
-            pending_changes.remove(&change_id);
-            total_changes = total_changes.saturating_sub(1);
+            shared_state.write().await.drop_pending_change(&change_id);
             let change_stopped_event = OrchestratorEvent::ChangeStopped {
                 change_id: change_id.clone(),
             };
@@ -298,10 +285,10 @@ pub async fn run_orchestrator(
             ws.apply_execution_event(&processing_started_event).await;
         }
 
-        let remaining_changes = pending_changes.len();
+        let remaining_changes = shared_state.read().await.remaining_changes();
 
         // Get current apply count for this change (before processing)
-        let apply_count_before = *apply_counts.get(&change_id).unwrap_or(&0);
+        let apply_count_before = shared_state.read().await.apply_count(&change_id);
 
         // Create output handler that forwards to TUI events
         // Use Arc<RwLock<String>> to track current operation (apply/acceptance/archive/resolve)
@@ -449,6 +436,7 @@ pub async fn run_orchestrator(
         let is_single_change_stopped =
             move || dynamic_queue_clone2.try_is_stopped(&change_id_for_single_stop);
 
+        let total_changes = shared_state.read().await.total_changes();
         let result = serial_service
             .process_change(
                 &change,
@@ -486,7 +474,7 @@ pub async fn run_orchestrator(
                         "Processing cancelled".to_string(),
                     )))
                     .await;
-                pending_changes.clear();
+                shared_state.write().await.clear_pending_changes();
                 break;
             }
             Ok(ChangeProcessResult::ChangeStopped) => {
@@ -508,7 +496,7 @@ pub async fn run_orchestrator(
                     ))))
                     .await;
                 // Remove this change from pending but continue processing others
-                pending_changes.retain(|id| id != &change_id);
+                shared_state.write().await.remove_from_pending(&change_id);
                 continue;
             }
             Ok(ChangeProcessResult::AcceptancePassed) => {
@@ -568,9 +556,6 @@ pub async fn run_orchestrator(
                 if let Some(ws) = &web_state {
                     ws.apply_execution_event(&processing_completed_event).await;
                 }
-
-                // Update local state tracking
-                apply_counts.insert(change_id.clone(), apply_count);
             }
             Ok(ChangeProcessResult::ApplySuccessIncomplete) => {
                 // Send ApplyCompleted event
@@ -587,9 +572,6 @@ pub async fn run_orchestrator(
                 if let Some(ws) = &web_state {
                     ws.apply_execution_event(&apply_completed_event).await;
                 }
-
-                // Update local state tracking
-                apply_counts.insert(change_id.clone(), apply_count);
             }
             Ok(ChangeProcessResult::AcceptanceContinue) => {
                 // Send ApplyCompleted event
@@ -623,9 +605,6 @@ pub async fn run_orchestrator(
                 if let Some(ws) = &web_state {
                     ws.apply_execution_event(&acceptance_completed_event).await;
                 }
-
-                // Update local state tracking
-                apply_counts.insert(change_id.clone(), apply_count);
             }
             Ok(ChangeProcessResult::AcceptanceContinueExceeded) => {
                 // Send ApplyCompleted event
@@ -656,9 +635,6 @@ pub async fn run_orchestrator(
                 if let Some(ws) = &web_state {
                     ws.apply_execution_event(&acceptance_completed_event).await;
                 }
-
-                // Update local state tracking
-                apply_counts.insert(change_id.clone(), apply_count);
             }
             Ok(ChangeProcessResult::AcceptanceBlocked) => {
                 // Send ApplyCompleted event
@@ -700,10 +676,7 @@ pub async fn run_orchestrator(
                 // Mark as stalled in SerialRunService and remove from pending to prevent re-selection and archive
                 let reason = "Implementation blocker detected - requires manual intervention";
                 serial_service.mark_stalled(&change_id, reason);
-                pending_changes.remove(&change_id);
-
-                // Update local state tracking
-                apply_counts.insert(change_id.clone(), apply_count);
+                shared_state.write().await.remove_from_pending(&change_id);
             }
             Ok(ChangeProcessResult::AcceptanceFailed { .. }) => {
                 // Send ApplyCompleted event
@@ -737,9 +710,6 @@ pub async fn run_orchestrator(
                 if let Some(ws) = &web_state {
                     ws.apply_execution_event(&acceptance_completed_event).await;
                 }
-
-                // Update local state tracking
-                apply_counts.insert(change_id.clone(), apply_count);
             }
             Ok(ChangeProcessResult::AcceptanceCommandFailed { error }) => {
                 // Send ApplyCompleted event
@@ -780,9 +750,6 @@ pub async fn run_orchestrator(
                         error
                     ))))
                     .await;
-
-                // Update local state tracking
-                apply_counts.insert(change_id.clone(), apply_count);
             }
             Ok(ChangeProcessResult::ApplyFailed { error }) => {
                 let processing_error_event = OrchestratorEvent::ProcessingError {
@@ -798,9 +765,6 @@ pub async fn run_orchestrator(
                 if let Some(ws) = &web_state {
                     ws.apply_execution_event(&processing_error_event).await;
                 }
-
-                // Update local state tracking
-                apply_counts.insert(change_id.clone(), apply_count);
             }
             Ok(ChangeProcessResult::Archived) => {
                 // Change was complete and successfully archived
@@ -835,12 +799,6 @@ pub async fn run_orchestrator(
                         ws.apply_execution_event(&dispatch_event).await;
                     }
                 }
-
-                // Update local state tracking
-                archived_changes.insert(change_id.clone());
-                pending_changes.remove(&change_id);
-                changes_processed += 1;
-                apply_counts.remove(&change_id);
             }
             Ok(ChangeProcessResult::Stalled { error }) => {
                 let processing_error_event = OrchestratorEvent::ProcessingError {
@@ -858,7 +816,7 @@ pub async fn run_orchestrator(
                 }
 
                 // Remove stalled change from pending
-                pending_changes.remove(&change_id);
+                shared_state.write().await.remove_from_pending(&change_id);
             }
             Ok(ChangeProcessResult::Failed { error }) => {
                 let processing_error_event = OrchestratorEvent::ProcessingError {
@@ -881,8 +839,7 @@ pub async fn run_orchestrator(
                 if error_str.contains("Cancelled") && dynamic_queue.try_is_stopped(&change_id) {
                     // Clear the stop flag and send ChangeStopped event
                     dynamic_queue.clear_stopped(&change_id).await;
-                    pending_changes.remove(&change_id);
-                    total_changes = total_changes.saturating_sub(1);
+                    shared_state.write().await.drop_pending_change(&change_id);
                     let change_stopped_event2 = OrchestratorEvent::ChangeStopped {
                         change_id: change_id.clone(),
                     };
@@ -921,7 +878,9 @@ pub async fn run_orchestrator(
     }
 
     // Run on_finish hook after all changes processed or stopped
-    let complete_context = HookContext::new(changes_processed, total_changes, 0, false);
+    let state = shared_state.read().await;
+    let complete_context =
+        HookContext::new(state.changes_processed(), state.total_changes(), 0, false);
     if let Err(e) = hooks.run_hook(HookType::OnFinish, &complete_context).await {
         let _ = tx
             .send(OrchestratorEvent::Log(LogEntry::warn(format!(
@@ -959,7 +918,6 @@ pub async fn run_orchestrator_parallel(
     use crate::openspec::list_changes_native;
     use crate::parallel::ParallelEvent;
     use crate::parallel_run_service::ParallelRunService;
-    use std::collections::HashSet;
 
     let _ = tx
         .send(OrchestratorEvent::Log(LogEntry::info(format!(
@@ -1296,6 +1254,27 @@ mod tests {
         // If archive exists, the archive is considered successful
         let archive_ok = archive_path.exists();
         assert!(archive_ok);
+    }
+
+    #[tokio::test]
+    async fn test_tui_shared_state_pending_changes_decrease_when_cleared() {
+        use crate::orchestration::state::OrchestratorState;
+
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            3,
+        )));
+
+        {
+            let state = shared_state.read().await;
+            assert_eq!(state.pending_changes().len(), 2);
+        }
+
+        shared_state.write().await.clear_pending_changes();
+
+        let state = shared_state.read().await;
+        assert_eq!(state.pending_changes().len(), 0);
+        assert!(state.pending_changes().is_empty());
     }
 
     #[test]
