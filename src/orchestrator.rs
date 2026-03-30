@@ -1195,7 +1195,7 @@ impl Orchestrator {
             let (tx, mut rx) = mpsc::unbounded_channel();
             let handle = tokio::spawn(async move {
                 while let Some(event) = rx.recv().await {
-                    web_state.apply_execution_event(&event).await;
+                    crate::web::WebState::apply_execution_event(&web_state, &event).await;
                     if matches!(
                         event,
                         crate::events::ExecutionEvent::AllCompleted
