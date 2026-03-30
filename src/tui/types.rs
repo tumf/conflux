@@ -50,35 +50,6 @@ pub enum AppMode {
     QrPopup,
 }
 
-/// Queue status for a change
-#[derive(Debug, Clone, PartialEq)]
-pub enum QueueStatus {
-    /// Not in the execution queue
-    NotQueued,
-    /// Waiting in the execution queue
-    Queued,
-    /// Blocked by unresolved dependencies
-    Blocked,
-    /// Currently being applied
-    Applying,
-    /// Running acceptance tests
-    Accepting,
-    /// Currently being archived
-    Archiving,
-    /// Archived after completion
-    Archived,
-    /// Merged to main branch (parallel mode only)
-    Merged,
-    /// Waiting for merge resolution
-    MergeWait,
-    /// Currently resolving a merge
-    Resolving,
-    /// Waiting for resolve execution after archive completion
-    ResolveWait,
-    /// Error occurred during processing
-    Error(String),
-}
-
 /// Information about a git worktree
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "web-monitoring", derive(ToSchema))]

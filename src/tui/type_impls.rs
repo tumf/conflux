@@ -6,63 +6,7 @@
 
 #[cfg(test)]
 use super::types::MergeConflictInfo;
-use super::types::{QueueStatus, WorktreeInfo};
-use ratatui::style::Color;
-
-impl QueueStatus {
-    /// Get display string for the queue status
-    pub fn display(&self) -> &str {
-        match self {
-            QueueStatus::NotQueued => "not queued",
-            QueueStatus::Queued => "queued",
-            QueueStatus::Blocked => "blocked",
-            QueueStatus::Applying => "applying",
-            QueueStatus::Accepting => "accepting",
-            QueueStatus::Archiving => "archiving",
-            QueueStatus::Archived => "archived",
-            QueueStatus::Merged => "merged",
-            QueueStatus::MergeWait => "merge wait",
-            QueueStatus::Resolving => "resolving",
-            QueueStatus::ResolveWait => "resolve pending",
-            QueueStatus::Error(_) => "error",
-        }
-    }
-
-    /// Get the color for the queue status
-    pub fn color(&self) -> Color {
-        match self {
-            QueueStatus::NotQueued => Color::DarkGray,
-            QueueStatus::Queued => Color::Yellow,
-            QueueStatus::Blocked => Color::Gray,
-            QueueStatus::Applying => Color::Cyan,
-            QueueStatus::Accepting => Color::LightGreen,
-            QueueStatus::Archiving => Color::Magenta,
-            QueueStatus::Archived => Color::Blue,
-            QueueStatus::Merged => Color::LightBlue,
-            QueueStatus::MergeWait => Color::LightMagenta,
-            QueueStatus::Resolving => Color::LightCyan,
-            QueueStatus::ResolveWait => Color::Magenta,
-            QueueStatus::Error(_) => Color::Red,
-        }
-    }
-
-    /// Check if the queue status represents an active processing state
-    ///
-    /// Active states are those where work is currently being performed (in-flight).
-    /// This is used for counting "Running N" in the TUI header.
-    ///
-    /// Active (in-flight): Applying, Accepting, Archiving, Resolving
-    /// Inactive: NotQueued, Queued, Blocked, MergeWait, Archived, Merged, Error
-    pub fn is_active(&self) -> bool {
-        matches!(
-            self,
-            QueueStatus::Applying
-                | QueueStatus::Accepting
-                | QueueStatus::Archiving
-                | QueueStatus::Resolving
-        )
-    }
-}
+use super::types::WorktreeInfo;
 
 impl WorktreeInfo {
     /// Get display label for the worktree (basename of path)
@@ -118,67 +62,6 @@ impl WorktreeInfo {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-
-    #[test]
-    fn test_queue_status_display() {
-        assert_eq!(QueueStatus::NotQueued.display(), "not queued");
-        assert_eq!(QueueStatus::Queued.display(), "queued");
-        assert_eq!(QueueStatus::Blocked.display(), "blocked");
-        assert_eq!(QueueStatus::Applying.display(), "applying");
-        assert_eq!(QueueStatus::Accepting.display(), "accepting");
-        assert_eq!(QueueStatus::Archiving.display(), "archiving");
-        assert_eq!(QueueStatus::Archived.display(), "archived");
-        assert_eq!(QueueStatus::Merged.display(), "merged");
-        assert_eq!(QueueStatus::MergeWait.display(), "merge wait");
-        assert_eq!(QueueStatus::Resolving.display(), "resolving");
-        assert_eq!(QueueStatus::ResolveWait.display(), "resolve pending");
-        assert_eq!(QueueStatus::Error("err".to_string()).display(), "error");
-    }
-
-    #[test]
-    fn test_queue_status_color() {
-        assert_eq!(QueueStatus::NotQueued.color(), Color::DarkGray);
-        assert_eq!(QueueStatus::Queued.color(), Color::Yellow);
-        assert_eq!(QueueStatus::Blocked.color(), Color::Gray);
-        assert_eq!(QueueStatus::Applying.color(), Color::Cyan);
-        assert_eq!(QueueStatus::Accepting.color(), Color::LightGreen);
-        assert_eq!(QueueStatus::Archiving.color(), Color::Magenta);
-        assert_eq!(QueueStatus::Archived.color(), Color::Blue);
-        assert_eq!(QueueStatus::Merged.color(), Color::LightBlue);
-        assert_eq!(QueueStatus::MergeWait.color(), Color::LightMagenta);
-        assert_eq!(QueueStatus::Resolving.color(), Color::LightCyan);
-        assert_eq!(QueueStatus::ResolveWait.color(), Color::Magenta);
-        assert_eq!(QueueStatus::Error("err".to_string()).color(), Color::Red);
-    }
-
-    #[test]
-    fn test_queue_status_merged_display() {
-        assert_eq!(QueueStatus::Merged.display(), "merged");
-    }
-
-    #[test]
-    fn test_queue_status_merged_color() {
-        assert_eq!(QueueStatus::Merged.color(), Color::LightBlue);
-    }
-
-    #[test]
-    fn test_queue_status_is_active() {
-        // In-flight states (actively processing)
-        assert!(QueueStatus::Applying.is_active());
-        assert!(QueueStatus::Accepting.is_active());
-        assert!(QueueStatus::Archiving.is_active());
-        assert!(QueueStatus::Resolving.is_active());
-
-        // Not in-flight (queued but not started, or completed/waiting states)
-        assert!(!QueueStatus::NotQueued.is_active());
-        assert!(!QueueStatus::Queued.is_active());
-        assert!(!QueueStatus::Blocked.is_active());
-        assert!(!QueueStatus::MergeWait.is_active());
-        assert!(!QueueStatus::ResolveWait.is_active());
-        assert!(!QueueStatus::Archived.is_active());
-        assert!(!QueueStatus::Merged.is_active());
-        assert!(!QueueStatus::Error("err".to_string()).is_active());
-    }
 
     #[test]
     fn test_worktree_info_display_label() {
@@ -269,37 +152,5 @@ mod tests {
             is_merging: false,
         };
         assert_eq!(wt.conflict_file_count(), 2);
-    }
-
-    #[test]
-    fn test_queue_status_blocked_display() {
-        assert_eq!(QueueStatus::Blocked.display(), "blocked");
-    }
-
-    #[test]
-    fn test_queue_status_blocked_color() {
-        assert_eq!(QueueStatus::Blocked.color(), Color::Gray);
-    }
-
-    #[test]
-    fn test_queue_status_blocked_is_not_active() {
-        assert!(!QueueStatus::Blocked.is_active());
-    }
-
-    #[test]
-    fn test_queue_status_blocked_transition() {
-        // Test transition from NotQueued to Blocked
-        let status = QueueStatus::Blocked;
-        assert_eq!(status, QueueStatus::Blocked);
-
-        // Test transition from Blocked to Queued (when dependencies resolve)
-        let status = QueueStatus::Queued;
-        assert_eq!(status, QueueStatus::Queued);
-        // Queued is not considered active (only in-flight states are active)
-        assert!(!status.is_active());
-
-        // When processing starts, it becomes active
-        let status = QueueStatus::Applying;
-        assert!(status.is_active());
     }
 }
