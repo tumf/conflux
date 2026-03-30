@@ -390,6 +390,25 @@ This allows you to use different AI tools (Claude Code, OpenCode, Codex, etc.) w
 | `acceptance_prompt` | Prompt injected into acceptance_command's `{prompt}` | (empty) |
 | `archive_prompt` | Prompt injected into archive_command's `{prompt}` | (empty) |
 
+### Proposal Session OPENCODE_CONFIG Customization
+
+Proposal sessions do **not** auto-generate or inject `OPENCODE_CONFIG`.
+If `proposal_session.transport_env.OPENCODE_CONFIG` is not set, opencode uses its built-in default config.
+
+To override the config, set `OPENCODE_CONFIG` explicitly:
+
+```jsonc
+{
+  "proposal_session": {
+    "transport_env": {
+      "OPENCODE_CONFIG": "/absolute/path/to/opencode.json"
+    }
+  }
+}
+```
+
+`OPENCODE_CONFIG` is optional and only needed when you want a custom opencode configuration file.
+
 **Quick start:**
 
 ```bash
