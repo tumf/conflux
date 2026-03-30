@@ -400,10 +400,8 @@ impl Orchestrator {
 
     /// Update shared state with an execution event
     async fn update_shared_state(&self, event: ExecutionEvent) {
-        self.shared_state
-            .write()
-            .await
-            .apply_execution_event(&event);
+        let mut state = self.shared_state.write().await;
+        crate::orchestration::state::OrchestratorState::apply_execution_event(&mut state, &event);
     }
 
     /// Handle Archived result
@@ -786,10 +784,8 @@ impl Orchestrator {
             };
             if is_new_change {
                 // Update shared state: processing started
-                self.shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&ExecutionEvent::ProcessingStarted(next.id.clone()));
+                self.update_shared_state(ExecutionEvent::ProcessingStarted(next.id.clone()))
+                    .await;
 
                 // Note: OnChangeStart hook is called by process_change() internally
             }
@@ -1199,7 +1195,7 @@ impl Orchestrator {
             let (tx, mut rx) = mpsc::unbounded_channel();
             let handle = tokio::spawn(async move {
                 while let Some(event) = rx.recv().await {
-                    web_state.apply_execution_event(&event).await;
+                    crate::web::WebState::apply_execution_event(&web_state, &event).await;
                     if matches!(
                         event,
                         crate::events::ExecutionEvent::AllCompleted
@@ -1619,14 +1615,16 @@ mod tests {
         }
 
         // ApplyCompleted increments per-change apply count in shared state
-        orchestrator
-            .shared_state
-            .write()
-            .await
-            .apply_execution_event(&crate::events::ExecutionEvent::ApplyCompleted {
-                change_id: "change-a".to_string(),
-                revision: "serial".to_string(),
-            });
+        {
+            let mut state = orchestrator.shared_state.write().await;
+            crate::orchestration::state::OrchestratorState::apply_execution_event(
+                &mut state,
+                &crate::events::ExecutionEvent::ApplyCompleted {
+                    change_id: "change-a".to_string(),
+                    revision: "serial".to_string(),
+                },
+            );
+        }
 
         let state = orchestrator.shared_state.read().await;
         assert_eq!(state.apply_count("change-a"), 1);
