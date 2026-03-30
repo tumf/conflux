@@ -5,7 +5,7 @@ use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::error_history::CircuitBreakerConfig;
-use crate::events::ExecutionEvent;
+use crate::events::{cli_event_sinks, dispatch_event, ExecutionEvent};
 use crate::execution::apply::{check_task_progress, create_progress_commit};
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
@@ -400,8 +400,8 @@ impl Orchestrator {
 
     /// Update shared state with an execution event
     async fn update_shared_state(&self, event: ExecutionEvent) {
-        let mut state = self.shared_state.write().await;
-        crate::orchestration::state::OrchestratorState::apply_execution_event(&mut state, &event);
+        let sinks: Vec<std::sync::Arc<dyn crate::events::EventSink>> = cli_event_sinks();
+        dispatch_event(self.shared_state.as_ref(), &sinks, event).await;
     }
 
     /// Handle Archived result
@@ -1615,16 +1615,12 @@ mod tests {
         }
 
         // ApplyCompleted increments per-change apply count in shared state
-        {
-            let mut state = orchestrator.shared_state.write().await;
-            crate::orchestration::state::OrchestratorState::apply_execution_event(
-                &mut state,
-                &crate::events::ExecutionEvent::ApplyCompleted {
-                    change_id: "change-a".to_string(),
-                    revision: "serial".to_string(),
-                },
-            );
-        }
+        orchestrator
+            .update_shared_state(crate::events::ExecutionEvent::ApplyCompleted {
+                change_id: "change-a".to_string(),
+                revision: "serial".to_string(),
+            })
+            .await;
 
         let state = orchestrator.shared_state.read().await;
         assert_eq!(state.apply_count("change-a"), 1);

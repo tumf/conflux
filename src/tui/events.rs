@@ -11,6 +11,35 @@ pub type OrchestratorEvent = ExecutionEvent;
 
 use std::path::PathBuf;
 
+/// Event sink implementation for TUI event channel.
+pub struct TuiEventSink {
+    tx: mpsc::Sender<OrchestratorEvent>,
+}
+
+impl TuiEventSink {
+    pub fn new(tx: mpsc::Sender<OrchestratorEvent>) -> Self {
+        Self { tx }
+    }
+}
+
+#[async_trait]
+impl EventSink for TuiEventSink {
+    async fn on_event(&self, event: &ExecutionEvent) {
+        if let Err(err) = self.tx.send(event.clone()).await {
+            warn!(error = %err, "failed to send TUI event through sink");
+        }
+    }
+
+    async fn on_state_changed(&self, _state: &OrchestratorState) {}
+}
+
+use async_trait::async_trait;
+use tokio::sync::mpsc;
+use tracing::warn;
+
+use crate::events::EventSink;
+use crate::orchestration::state::OrchestratorState;
+
 /// Commands sent from TUI to orchestrator
 #[derive(Debug, Clone)]
 pub enum TuiCommand {

@@ -11,6 +11,7 @@ use crate::error::Result;
 use crate::openspec::Change;
 // Note: acceptance_test_streaming and related types are no longer imported here
 // as they are handled by SerialRunService internally.
+use crate::events::EventSink;
 use crate::orchestration::output::{ChannelOutputHandler, ContextualOutputHandler, OutputMessage};
 use crate::serial_run_service::SerialRunService;
 use std::collections::{HashMap, HashSet};
@@ -19,7 +20,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use super::events::{LogEntry, OrchestratorEvent};
+use super::events::{LogEntry, OrchestratorEvent, TuiEventSink};
 use super::queue::DynamicQueue;
 
 fn post_archive_dispatch_event(
@@ -112,6 +113,12 @@ pub async fn run_orchestrator(
     // Create serial run service for shared state and helpers
     let repo_root = std::env::current_dir()?;
     let mut serial_service = SerialRunService::new(repo_root, config);
+
+    let mut sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(TuiEventSink::new(tx.clone()))];
+    #[cfg(feature = "web-monitoring")]
+    if let Some(ws) = &web_state {
+        sinks.push(Arc::new(crate::web::state::WebEventSink::new(ws.clone())));
+    }
 
     {
         let mut state = shared_state.write().await;
