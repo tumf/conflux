@@ -65,6 +65,8 @@ describe('ProposalChat timeout handling', () => {
         onMerge={vi.fn()}
         onClose={vi.fn()}
         onAppendMessage={vi.fn()}
+        onUpsertServerUserMessage={vi.fn()}
+        onUpdateMessageSendStatus={vi.fn()}
         onStartAssistantTurn={vi.fn()}
         onStreamingChunk={vi.fn()}
         onCompleteAssistantTurn={vi.fn()}
@@ -75,8 +77,47 @@ describe('ProposalChat timeout handling', () => {
       />,
     );
 
-    expect(screen.getByPlaceholderText('Connecting...')).toBeTruthy();
+    expect(screen.getByPlaceholderText('Disconnected. Message will be queued and sent on reconnect.')).toBeTruthy();
     expect(screen.getByTitle('Disconnected')).toBeTruthy();
+  });
+
+  it('opens and closes changes drawer with button, backdrop, and Escape key', () => {
+    render(
+      <ProposalChat
+        projectId="project-1"
+        session={session}
+        messages={[]}
+        streamingContent={{}}
+        activeElicitation={null}
+        isAgentResponding={false}
+        onBack={vi.fn()}
+        onMerge={vi.fn()}
+        onClose={vi.fn()}
+        onAppendMessage={vi.fn()}
+        onStartAssistantTurn={vi.fn()}
+        onStreamingChunk={vi.fn()}
+        onCompleteAssistantTurn={vi.fn()}
+        onFailAssistantTurn={vi.fn()}
+        onToolCallStart={vi.fn()}
+        onToolCallUpdate={vi.fn()}
+        onElicitation={vi.fn()}
+      />,
+    );
+
+    const dialog = screen.getByRole('dialog', { hidden: true });
+    expect(dialog.className).toContain('pointer-events-none');
+
+    fireEvent.click(screen.getByLabelText('Open changes drawer'));
+    expect(dialog.className).toContain('pointer-events-auto');
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(dialog.className).toContain('pointer-events-none');
+
+    fireEvent.click(screen.getByLabelText('Open changes drawer'));
+    expect(dialog.className).toContain('pointer-events-auto');
+
+    fireEvent.click(dialog);
+    expect(dialog.className).toContain('pointer-events-none');
   });
 
   it('shows enter-to-send hint when connected', () => {
@@ -94,6 +135,8 @@ describe('ProposalChat timeout handling', () => {
         onMerge={vi.fn()}
         onClose={vi.fn()}
         onAppendMessage={vi.fn()}
+        onUpsertServerUserMessage={vi.fn()}
+        onUpdateMessageSendStatus={vi.fn()}
         onStartAssistantTurn={vi.fn()}
         onStreamingChunk={vi.fn()}
         onCompleteAssistantTurn={vi.fn()}
@@ -120,6 +163,8 @@ describe('ProposalChat timeout handling', () => {
         onMerge={vi.fn()}
         onClose={vi.fn()}
         onAppendMessage={vi.fn()}
+        onUpsertServerUserMessage={vi.fn()}
+        onUpdateMessageSendStatus={vi.fn()}
         onStartAssistantTurn={vi.fn()}
         onStreamingChunk={vi.fn()}
         onCompleteAssistantTurn={vi.fn()}
@@ -132,6 +177,8 @@ describe('ProposalChat timeout handling', () => {
 
     fireEvent.click(screen.getByText('Summarize the current proposal and open risks'));
 
-    expect(sendPromptMock).toHaveBeenCalledWith('Summarize the current proposal and open risks');
+    expect(sendPromptMock).toHaveBeenCalledTimes(1);
+    expect(sendPromptMock.mock.calls[0][0]).toBe('Summarize the current proposal and open risks');
+    expect(typeof sendPromptMock.mock.calls[0][1]).toBe('string');
   });
 });

@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Bot, Copy, User } from 'lucide-react';
+import { AlertCircle, Bot, Clock3, Copy, RotateCcw, User } from 'lucide-react';
 
 import { ProposalChatMessage } from '../api/types';
 import { ToolCallIndicator } from './ToolCallIndicator';
@@ -10,6 +10,7 @@ interface ChatMessageListProps {
   streamingContent: Record<string, string>;
   isAgentResponding?: boolean;
   onExamplePromptSelect?: (prompt: string) => void;
+  onRetryMessage?: (messageId: string) => void;
 }
 
 const AUTO_SCROLL_THRESHOLD_PX = 100;
@@ -86,7 +87,7 @@ function renderInlineMarkdown(text: string): React.ReactNode {
     const codeMatch = remaining.match(/^`([^`]+)`/);
     if (codeMatch) {
       parts.push(
-        <code key={key++} className="rounded bg-[#27272a] px-1 py-0.5 font-mono text-[0.85em] text-[#a5b4fc]">
+        <code key={key++} className="rounded bg-border px-1 py-0.5 font-mono text-[0.85em] text-accent">
           {codeMatch[1]}
         </code>,
       );
@@ -304,6 +305,7 @@ export function ChatMessageList({
   streamingContent,
   isAgentResponding = false,
   onExamplePromptSelect,
+  onRetryMessage,
 }: ChatMessageListProps) {
   const scrollerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -354,17 +356,17 @@ export function ChatMessageList({
         {messages.length === 0 && streamingIds.length === 0 && (
           <div className="flex flex-1 items-center justify-center py-16">
             <div className="flex max-w-md flex-col items-center gap-3 text-center">
-              <div className="flex size-10 items-center justify-center rounded-full bg-[#1e1b4b]">
-                <Bot className="size-5 text-[#a5b4fc]" />
+              <div className="flex size-10 items-center justify-center rounded-full bg-accent/20">
+                <Bot className="size-5 text-accent" />
               </div>
-              <p className="text-sm font-medium text-[#d4d4d8]">Start a conversation with the agent</p>
-              <p className="text-xs text-[#71717a]">Try one of these prompts to get started:</p>
+              <p className="text-sm font-medium text-text">Start a conversation with the agent</p>
+              <p className="text-xs text-text-subtle">Try one of these prompts to get started:</p>
               <div className="flex flex-wrap items-center justify-center gap-2">
                 {EXAMPLE_PROMPTS.map((prompt) => (
                   <button
                     key={prompt}
                     type="button"
-                    className="rounded-full border border-[#27272a] bg-[#111113] px-3 py-1 text-xs text-[#a1a1aa] transition-colors hover:border-[#3f3f46] hover:text-[#d4d4d8]"
+                    className="rounded-full border border-border bg-surface px-3 py-1 text-xs text-text-muted transition-colors hover:border-border-hover hover:text-text"
                     onClick={() => onExamplePromptSelect?.(prompt)}
                   >
                     {prompt}
@@ -376,7 +378,7 @@ export function ChatMessageList({
         )}
 
         {messages.map((msg) => (
-          <MessageBubble key={msg.id} message={msg} />
+          <MessageBubble key={msg.id} message={msg} onRetryMessage={onRetryMessage} />
         ))}
 
         {streamingIds
@@ -416,21 +418,35 @@ export function ChatMessageList({
   );
 }
 
-function MessageBubble({ message }: { message: ProposalChatMessage }) {
+function MessageBubble({
+  message,
+  onRetryMessage,
+}: {
+  message: ProposalChatMessage;
+  onRetryMessage?: (messageId: string) => void;
+}) {
   const isUser = message.role === 'user';
+  const isPending = isUser && message.sendStatus === 'pending';
+  const isFailed = isUser && message.sendStatus === 'failed';
 
   return (
     <div className={`group flex items-start gap-3 ${isUser ? 'flex-row-reverse' : ''}`}>
       <div
         className={`flex size-7 shrink-0 items-center justify-center rounded-full ${
-          isUser ? 'bg-[#27272a]' : 'bg-[#1e1b4b]'
+          isUser ? 'bg-border' : 'bg-accent/20'
         }`}
       >
-        {isUser ? <User className="size-4 text-[#a1a1aa]" /> : <Bot className="size-4 text-[#a5b4fc]" />}
+        {isUser ? <User className="size-4 text-text-muted" /> : <Bot className="size-4 text-accent" />}
       </div>
       <div
-        className={`relative min-w-0 max-w-[80%] space-y-2 rounded-lg px-3 py-2 text-sm ${
-          isUser ? 'bg-[#1e1b4b]/60 text-[#e0e7ff]' : 'bg-[#18181b] text-[#d4d4d8]'
+        className={`relative min-w-0 max-w-[80%] space-y-2 rounded-lg border px-3 py-2 text-sm ${
+          isUser
+            ? isFailed
+              ? 'border-[#dc2626] bg-[#450a0a]/40 text-[#fecaca]'
+              : isPending
+                ? 'border-[#3f3f46] bg-[#18181b] text-[#d4d4d8]'
+                : 'border-transparent bg-[#1e1b4b]/60 text-[#e0e7ff]'
+            : 'border-transparent bg-[#18181b] text-[#d4d4d8]'
         }`}
       >
         {!isUser && (
@@ -447,6 +463,30 @@ function MessageBubble({ message }: { message: ProposalChatMessage }) {
         )}
 
         <div>{renderMarkdownSimple(message.content)}</div>
+
+        {isPending && (
+          <div className="inline-flex items-center gap-1 text-[11px] text-[#a1a1aa]" data-testid="message-pending-indicator">
+            <Clock3 className="size-3" />
+            <span>Queued (will send on reconnect)</span>
+          </div>
+        )}
+
+        {isFailed && (
+          <div className="flex items-center gap-2" data-testid="message-failed-indicator">
+            <span className="inline-flex items-center gap-1 text-[11px] text-[#fca5a5]">
+              <AlertCircle className="size-3" />
+              Failed to send
+            </span>
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 rounded border border-[#dc2626] px-2 py-0.5 text-[11px] text-[#fecaca] transition-colors hover:bg-[#7f1d1d]/60"
+              onClick={() => onRetryMessage?.(message.id)}
+            >
+              <RotateCcw className="size-3" />
+              Retry
+            </button>
+          </div>
+        )}
 
         <p className="text-[11px] text-[#71717a] opacity-0 transition group-hover:opacity-100" title={message.timestamp}>
           {formatRelativeTime(message.timestamp)}

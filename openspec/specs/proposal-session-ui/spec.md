@@ -166,6 +166,44 @@ The Dashboard SHALL model active-turn state explicitly and SHALL enable or disab
 **When**: The WebSocket connection closes unexpectedly
 **Then**: The active turn is treated as failed, `isAgentResponding` is set to false, and the input is re-enabled (though still disabled due to disconnected state, it will become usable upon reconnection)
 
+### Requirement: proposal-session-ui-semantic-tokens
+
+The Dashboard chat components SHALL use semantic color tokens defined in the CSS `@theme` block rather than hardcoded hex color values. This ensures consistency and enables future theming.
+
+#### Scenario: no-hardcoded-hex-in-chat-components
+
+**Given**: The chat-related component source files (ProposalChat, ChatMessageList, ChatInput, ToolCallIndicator, ProposalChangesList, ElicitationDialog)
+**When**: The source code is inspected
+**Then**: No hardcoded hex color values (e.g., `#27272a`, `#6366f1`) are used in Tailwind class names; all colors reference semantic tokens
+
+### Requirement: proposal-session-ui-mobile-changes-drawer
+
+The Dashboard SHALL provide access to the proposal session Changes list on mobile viewports (below the `md` breakpoint) via a slide-in drawer accessible from the chat header.
+
+#### Scenario: open-changes-drawer-on-mobile
+
+**Given**: A proposal session chat view on a viewport narrower than 768px
+**When**: The user taps the Changes toggle button in the chat header
+**Then**: A drawer slides in from the right showing the ProposalChangesList with a backdrop overlay
+
+#### Scenario: close-drawer-on-backdrop-tap
+
+**Given**: The Changes drawer is open on mobile
+**When**: The user taps the backdrop area outside the drawer
+**Then**: The drawer closes
+
+#### Scenario: close-drawer-on-escape
+
+**Given**: The Changes drawer is open on mobile
+**When**: The user presses the Escape key
+**Then**: The drawer closes
+
+#### Scenario: drawer-hidden-on-desktop
+
+**Given**: A proposal session chat view on a viewport 768px or wider
+**When**: The chat view is displayed
+**Then**: The Changes toggle button is not visible and the sidebar renders inline as before
+
 ### Requirement: proposal-session-ui-smart-scroll
 
 The Dashboard chat message list SHALL auto-scroll to the bottom only when the user is already near the bottom of the scroll area (within 100px). When the user has scrolled up and new content arrives, a "New messages" indicator button SHALL appear. Clicking the indicator SHALL scroll to the bottom.
@@ -223,3 +261,33 @@ The Dashboard SHALL display an informative empty state when a proposal session h
 **Given**: A newly created proposal session with no messages
 **When**: The chat view is displayed
 **Then**: A Bot icon, descriptive text ("Start a conversation..."), and at least 2 clickable example prompts are shown
+
+## Requirements
+
+### Requirement: proposal-session-ui-send-retry
+
+The Dashboard SHALL queue user messages sent while the WebSocket is disconnected and automatically send them upon reconnection. Failed sends SHALL be visually indicated with a retry mechanism.
+
+#### Scenario: queue-message-while-disconnected
+
+**Given**: A proposal session with a disconnected WebSocket
+**When**: The user submits a message
+**Then**: The message appears in the chat list with a "pending" visual indicator and is queued for sending
+
+#### Scenario: auto-send-on-reconnection
+
+**Given**: One or more pending messages are queued
+**When**: The WebSocket reconnects
+**Then**: The queued messages are sent automatically in chronological order and their status transitions to "sent"
+
+#### Scenario: show-failed-with-retry
+
+**Given**: A pending message that failed to send after reconnection
+**When**: The send attempt results in an error
+**Then**: The message displays a "failed" visual state with a "Retry" button
+
+#### Scenario: retry-sends-message
+
+**Given**: A failed message with a visible "Retry" button
+**When**: The user clicks "Retry"
+**Then**: The message status transitions to "pending" and a new send attempt is made

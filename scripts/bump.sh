@@ -47,11 +47,32 @@ if [[ -z "$CURRENT_BRANCH" ]]; then
 fi
 
 if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
-	ARGS=("$LEVEL" --no-confirm --no-publish)
+	VERSION_ARGS=("$LEVEL" --no-confirm)
 	if ! $DRY_RUN; then
-		ARGS+=(--execute)
+		VERSION_ARGS+=(--execute)
 	fi
-	exec cargo release "${ARGS[@]}"
+
+	cargo release version "${VERSION_ARGS[@]}"
+
+	REPLACE_ARGS=(--no-confirm)
+	if ! $DRY_RUN; then
+		REPLACE_ARGS+=(--execute)
+	fi
+	cargo release replace "${REPLACE_ARGS[@]}"
+
+	NEW_VERSION=$(grep -E '^version\s*=' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+	cargo generate-lockfile
+
+	if $DRY_RUN; then
+		echo "[dry-run] Would commit, tag v${NEW_VERSION}, and push"
+		exit 0
+	fi
+
+	git add -A
+	git commit --no-verify -m "chore(release): release v${NEW_VERSION}"
+	git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}"
+	git push origin "$CURRENT_BRANCH" --follow-tags
+	exit 0
 fi
 
 if [[ ! -f Cargo.toml ]]; then

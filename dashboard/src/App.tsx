@@ -435,6 +435,8 @@ function App() {
               onMerge={handleMergeProposalSession}
               onClose={handleCloseProposalSession}
               onAppendMessage={store.appendChatMessage}
+              onUpsertServerUserMessage={store.upsertServerUserMessage}
+              onUpdateMessageSendStatus={store.updateChatMessageSendStatus}
               onStartAssistantTurn={store.startAssistantTurn}
               onStreamingChunk={store.appendStreamingChunk}
               onCompleteAssistantTurn={store.completeAssistantTurn}
