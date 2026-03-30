@@ -177,7 +177,7 @@ async fn proposal_session_create_and_list_use_frontend_contract_shape() {
 }
 
 #[tokio::test]
-async fn proposal_session_create_injects_default_opencode_config_env() {
+async fn proposal_session_create_does_not_inject_default_opencode_config_env() {
     let temp_dir = TempDir::new().unwrap();
     let origin = create_local_git_repo(temp_dir.path());
     let remote_url = format!("file://{}", origin.to_string_lossy());
@@ -207,15 +207,8 @@ async fn proposal_session_create_injects_default_opencode_config_env() {
     let worktree_path = proposal_worktree_path(temp_dir.path(), &project_id, session_id);
     let default_opencode_config = temp_dir.path().join("opencode-proposal.jsonc");
 
-    assert!(default_opencode_config.exists());
-    let content = fs::read_to_string(&default_opencode_config).unwrap();
-    assert!(content.contains("\"mode\": \"spec\""));
-
-    let acp_config_value = fs::read_to_string(worktree_path.join("mock-acp.out")).unwrap();
-    assert_eq!(
-        acp_config_value.trim(),
-        default_opencode_config.to_string_lossy()
-    );
+    assert!(!default_opencode_config.exists());
+    assert!(!worktree_path.join("mock-acp.out").exists());
 }
 
 #[tokio::test]
