@@ -189,6 +189,7 @@ export type ProposalWsMessageType =
   | 'prompt'
   | 'elicitation_response'
   | 'cancel'
+  | 'user_message'
   | 'agent_message_chunk'
   | 'tool_call'
   | 'tool_call_update'
@@ -209,6 +210,7 @@ export type ProposalWsClientMessage =
 
 /** Messages received from server */
 export type ProposalWsServerMessage =
+  | { type: 'user_message'; id: string; content: string; timestamp: string }
   | { type: 'agent_message_chunk'; text: string; message_id?: string; turn_id?: string }
   | {
       type: 'tool_call';

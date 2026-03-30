@@ -12,6 +12,21 @@ function makeCallbacks(overrides: Partial<UseProposalWebSocketOptions> = {}): Us
 }
 
 describe('handleServerMessage', () => {
+  it('dispatches user messages', () => {
+    const onUserMessage = vi.fn();
+
+    handleServerMessage(
+      { type: 'user_message', id: 'user-1', content: 'hello', timestamp: '2026-03-30T00:00:00Z' },
+      makeCallbacks({ onUserMessage }),
+    );
+
+    expect(onUserMessage).toHaveBeenCalledWith({
+      id: 'user-1',
+      content: 'hello',
+      timestamp: '2026-03-30T00:00:00Z',
+    });
+  });
+
   it('dispatches streaming chunks with message/turn ids', () => {
     const onMessageChunk = vi.fn();
 

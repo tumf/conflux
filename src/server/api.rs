@@ -24,7 +24,9 @@ use crate::server::active_commands::{
     ActiveCommandGuard, RootKind, SharedActiveCommands, WorktreeRootKey,
 };
 use crate::server::db::ServerDb;
-use crate::server::proposal_session::{ProposalSessionError, SharedProposalSessionManager};
+use crate::server::proposal_session::{
+    ProposalSessionError, ProposalSessionMessageRecord, SharedProposalSessionManager,
+};
 use crate::server::registry::{
     server_worktree_branch, OrchestrationStatus, ProjectEntry, ProjectStatus, SharedRegistry,
 };
@@ -3248,6 +3250,11 @@ pub enum ProposalWsClientMessage {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProposalWsServerMessage {
+    UserMessage {
+        id: String,
+        content: String,
+        timestamp: String,
+    },
     AgentMessageChunk {
         text: String,
     },
@@ -3450,6 +3457,56 @@ async fn proposal_session_ws_handler(
     ws.on_upgrade(move |socket| proposal_session_ws(socket, state, session_id))
 }
 
+fn build_replay_ws_messages(messages: Vec<ProposalSessionMessageRecord>) -> Vec<String> {
+    let mut replay_messages = Vec::new();
+
+    for msg in messages {
+        if msg.role == "user" {
+            replay_messages.push(
+                serde_json::to_string(&ProposalWsServerMessage::UserMessage {
+                    id: msg.id,
+                    content: msg.content,
+                    timestamp: msg.timestamp,
+                })
+                .unwrap_or_default(),
+            );
+            continue;
+        }
+
+        if msg.role == "assistant" {
+            if !msg.content.is_empty() {
+                replay_messages.push(
+                    serde_json::to_string(&ProposalWsServerMessage::AgentMessageChunk {
+                        text: msg.content.clone(),
+                    })
+                    .unwrap_or_default(),
+                );
+            }
+            if let Some(tool_calls) = msg.tool_calls {
+                for tool_call in tool_calls {
+                    replay_messages.push(
+                        serde_json::to_string(&ProposalWsServerMessage::ToolCall {
+                            tool_call_id: tool_call.id,
+                            title: tool_call.title,
+                            kind: "tool".to_string(),
+                            status: tool_call.status,
+                        })
+                        .unwrap_or_default(),
+                    );
+                }
+            }
+            replay_messages.push(
+                serde_json::to_string(&ProposalWsServerMessage::TurnComplete {
+                    stop_reason: "end_turn".to_string(),
+                })
+                .unwrap_or_default(),
+            );
+        }
+    }
+
+    replay_messages
+}
+
 async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: String) {
     use futures_util::{SinkExt, StreamExt};
 
@@ -3501,44 +3558,8 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
         .list_messages(&session_id)
     {
         Ok(messages) => {
-            for msg in messages {
-                if msg.role == "assistant" {
-                    if !msg.content.is_empty() {
-                        let _ = ws_send_tx
-                            .send(
-                                serde_json::to_string(
-                                    &ProposalWsServerMessage::AgentMessageChunk {
-                                        text: msg.content.clone(),
-                                    },
-                                )
-                                .unwrap_or_default(),
-                            )
-                            .await;
-                    }
-                    if let Some(tool_calls) = msg.tool_calls {
-                        for tool_call in tool_calls {
-                            let _ = ws_send_tx
-                                .send(
-                                    serde_json::to_string(&ProposalWsServerMessage::ToolCall {
-                                        tool_call_id: tool_call.id,
-                                        title: tool_call.title,
-                                        kind: "tool".to_string(),
-                                        status: tool_call.status,
-                                    })
-                                    .unwrap_or_default(),
-                                )
-                                .await;
-                        }
-                    }
-                    let _ = ws_send_tx
-                        .send(
-                            serde_json::to_string(&ProposalWsServerMessage::TurnComplete {
-                                stop_reason: "end_turn".to_string(),
-                            })
-                            .unwrap_or_default(),
-                        )
-                        .await;
-                }
+            for replay_message in build_replay_ws_messages(messages) {
+                let _ = ws_send_tx.send(replay_message).await;
             }
         }
         Err(e) => {
@@ -3707,7 +3728,22 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                                 if let Some(s) = mgr.get_session_mut(&session_id_for_recv) {
                                     s.touch();
                                 }
-                                let _ = mgr.record_user_prompt(&session_id_for_recv, &text);
+                                if let Ok(user_message) =
+                                    mgr.record_user_prompt(&session_id_for_recv, &text)
+                                {
+                                    let _ = ws_send_tx_for_recv
+                                        .send(
+                                            serde_json::to_string(
+                                                &ProposalWsServerMessage::UserMessage {
+                                                    id: user_message.id,
+                                                    content: user_message.content,
+                                                    timestamp: user_message.timestamp,
+                                                },
+                                            )
+                                            .unwrap_or_default(),
+                                        )
+                                        .await;
+                                }
                             }
 
                             if let Err(e) = acp_client_for_recv

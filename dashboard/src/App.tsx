@@ -434,7 +434,6 @@ function App() {
               onBack={handleBackFromProposal}
               onMerge={handleMergeProposalSession}
               onClose={handleCloseProposalSession}
-              onHydrateMessages={store.hydrateChatMessages}
               onAppendMessage={store.appendChatMessage}
               onStartAssistantTurn={store.startAssistantTurn}
               onStreamingChunk={store.appendStreamingChunk}
