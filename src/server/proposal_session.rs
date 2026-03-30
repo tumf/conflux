@@ -69,6 +69,8 @@ pub struct ProposalSessionMessageRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hydrated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_thought: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ProposalSessionToolCallRecord>>,
 }
 
@@ -295,6 +297,7 @@ impl ProposalSessionManager {
             timestamp: now,
             turn_id: None,
             hydrated: Some(true),
+            is_thought: None,
             tool_calls: None,
         };
         session.message_history.push(message.clone());
@@ -307,6 +310,25 @@ impl ProposalSessionManager {
         &mut self,
         session_id: &str,
         chunk: &str,
+    ) -> Result<String, ProposalSessionError> {
+        self.append_assistant_chunk_with_kind(session_id, chunk, false)
+    }
+
+    /// Append an assistant thought chunk to the active turn in message history.
+    #[allow(dead_code)]
+    pub fn append_assistant_thought_chunk(
+        &mut self,
+        session_id: &str,
+        chunk: &str,
+    ) -> Result<String, ProposalSessionError> {
+        self.append_assistant_chunk_with_kind(session_id, chunk, true)
+    }
+
+    fn append_assistant_chunk_with_kind(
+        &mut self,
+        session_id: &str,
+        chunk: &str,
+        is_thought: bool,
     ) -> Result<String, ProposalSessionError> {
         let session = self
             .sessions
@@ -326,6 +348,7 @@ impl ProposalSessionManager {
                 timestamp: now,
                 turn_id: Some(turn_id.clone()),
                 hydrated: Some(true),
+                is_thought: if is_thought { Some(true) } else { None },
                 tool_calls: None,
             });
             session.active_turn_id = Some(turn_id.clone());
@@ -339,6 +362,9 @@ impl ProposalSessionManager {
             .find(|message| message.turn_id.as_deref() == Some(turn_id.as_str()))
         {
             message.content.push_str(chunk);
+            if is_thought {
+                message.is_thought = Some(true);
+            }
         }
 
         Ok(turn_id)
@@ -371,6 +397,7 @@ impl ProposalSessionManager {
                 timestamp: now,
                 turn_id: Some(turn_id.clone()),
                 hydrated: Some(true),
+                is_thought: None,
                 tool_calls: Some(Vec::new()),
             });
             session.active_turn_id = Some(turn_id.clone());
@@ -866,5 +893,45 @@ mod tests {
         let manager = ProposalSessionManager::new(config);
         let sessions = manager.list_sessions("proj1");
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn test_append_assistant_thought_chunk_sets_is_thought() {
+        let config = ProposalSessionConfig::default();
+        let mut manager = ProposalSessionManager::new(config);
+
+        let session_id = "ps-test".to_string();
+        manager.sessions.insert(
+            session_id.clone(),
+            ProposalSession {
+                id: session_id.clone(),
+                project_id: "proj1".to_string(),
+                worktree_path: PathBuf::from("/tmp/proposal-ps-test"),
+                worktree_branch: "proposal/ps-test".to_string(),
+                acp_client: Arc::new(AcpClient::new_for_test()),
+                acp_session_id: "acp-session-1".to_string(),
+                status: ProposalSessionStatus::Active,
+                created_at: Utc::now(),
+                last_activity: Utc::now(),
+                message_history: Vec::new(),
+                active_turn_id: None,
+                next_turn_seq: 0,
+                next_user_seq: 0,
+            },
+        );
+
+        let turn_id = manager
+            .append_assistant_thought_chunk(&session_id, "thinking")
+            .expect("append thought chunk should succeed");
+        assert_eq!(turn_id, "ps-test-turn-1");
+
+        let messages = manager
+            .list_messages(&session_id)
+            .expect("list_messages should succeed");
+        assert_eq!(messages.len(), 1);
+        let message = &messages[0];
+        assert_eq!(message.role, "assistant");
+        assert_eq!(message.content, "thinking");
+        assert_eq!(message.is_thought, Some(true));
     }
 }

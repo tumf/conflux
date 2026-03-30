@@ -98,7 +98,7 @@ for raw in sys.stdin:
                 "params": {
                     "sessionId": session_id,
                     "update": {
-                        "sessionUpdate": "agent_message_chunk",
+                        "sessionUpdate": "agent_thought_chunk",
                         "content": {"type": "text", "text": f"echo:{content}"},
                     },
                 },
@@ -131,7 +131,7 @@ for raw in sys.stdin:
                 "params": {
                     "sessionId": pending_elicitation[msg_id],
                     "update": {
-                        "sessionUpdate": "agent_message_chunk",
+                        "sessionUpdate": "agent_thought_chunk",
                         "content": {
                             "type": "text",
                             "text": f"elicitation-accepted:{answer}",
