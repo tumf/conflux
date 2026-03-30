@@ -72,6 +72,14 @@ export type AppAction =
   | { type: 'SET_ACTIVE_PROPOSAL_SESSION'; payload: string | null }
   | { type: 'HYDRATE_CHAT_MESSAGES'; payload: { sessionId: string; messages: ProposalChatMessage[] } }
   | { type: 'APPEND_CHAT_MESSAGE'; payload: { sessionId: string; message: ProposalChatMessage } }
+  | {
+      type: 'UPSERT_SERVER_USER_MESSAGE';
+      payload: { sessionId: string; message: { id: string; content: string; timestamp: string } };
+    }
+  | {
+      type: 'UPDATE_CHAT_MESSAGE_SEND_STATUS';
+      payload: { sessionId: string; messageId: string; sendStatus: 'sent' | 'pending' | 'failed' };
+    }
   | { type: 'START_ASSISTANT_TURN'; payload: { sessionId: string; messageId: string; turnId?: string } }
   | { type: 'APPEND_STREAMING_CHUNK'; payload: { sessionId: string; messageId: string; content: string; turnId?: string } }
   | { type: 'COMPLETE_ASSISTANT_TURN'; payload: { sessionId: string; stopReason?: string } }
@@ -276,6 +284,42 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           [sessionId]: nextMessages,
         },
         streamingContent: nextStreamingContent,
+      };
+    }
+
+    case 'UPSERT_SERVER_USER_MESSAGE': {
+      const { sessionId, message } = action.payload;
+      const msgs = state.chatMessagesBySessionId[sessionId] || [];
+      const existingIndex = msgs.findIndex((m) => m.id === message.id);
+      const normalizedMessage: ProposalChatMessage = {
+        ...message,
+        role: 'user',
+        sendStatus: 'sent',
+        hydrated: true,
+      };
+      const nextMessages =
+        existingIndex === -1
+          ? [...msgs, normalizedMessage]
+          : msgs.map((existing, index) => (index === existingIndex ? { ...existing, ...normalizedMessage } : existing));
+
+      return {
+        ...state,
+        chatMessagesBySessionId: {
+          ...state.chatMessagesBySessionId,
+          [sessionId]: nextMessages,
+        },
+      };
+    }
+
+    case 'UPDATE_CHAT_MESSAGE_SEND_STATUS': {
+      const { sessionId, messageId, sendStatus } = action.payload;
+      const msgs = state.chatMessagesBySessionId[sessionId] || [];
+      return {
+        ...state,
+        chatMessagesBySessionId: {
+          ...state.chatMessagesBySessionId,
+          [sessionId]: msgs.map((m) => (m.id === messageId ? { ...m, sendStatus } : m)),
+        },
       };
     }
 
@@ -543,6 +587,20 @@ export function useAppStore() {
     dispatch({ type: 'APPEND_CHAT_MESSAGE', payload: { sessionId, message } });
   }, []);
 
+  const upsertServerUserMessage = useCallback(
+    (sessionId: string, message: { id: string; content: string; timestamp: string }) => {
+      dispatch({ type: 'UPSERT_SERVER_USER_MESSAGE', payload: { sessionId, message } });
+    },
+    [],
+  );
+
+  const updateChatMessageSendStatus = useCallback(
+    (sessionId: string, messageId: string, sendStatus: 'sent' | 'pending' | 'failed') => {
+      dispatch({ type: 'UPDATE_CHAT_MESSAGE_SEND_STATUS', payload: { sessionId, messageId, sendStatus } });
+    },
+    [],
+  );
+
   const startAssistantTurn = useCallback((sessionId: string, messageId: string, turnId?: string) => {
     dispatch({ type: 'START_ASSISTANT_TURN', payload: { sessionId, messageId, turnId } });
   }, []);
@@ -591,6 +649,8 @@ export function useAppStore() {
     setActiveProposalSession,
     hydrateChatMessages,
     appendChatMessage,
+    upsertServerUserMessage,
+    updateChatMessageSendStatus,
     startAssistantTurn,
     appendStreamingChunk,
     completeAssistantTurn,

@@ -65,6 +65,8 @@ describe('ProposalChat timeout handling', () => {
         onMerge={vi.fn()}
         onClose={vi.fn()}
         onAppendMessage={vi.fn()}
+        onUpsertServerUserMessage={vi.fn()}
+        onUpdateMessageSendStatus={vi.fn()}
         onStartAssistantTurn={vi.fn()}
         onStreamingChunk={vi.fn()}
         onCompleteAssistantTurn={vi.fn()}
@@ -75,7 +77,7 @@ describe('ProposalChat timeout handling', () => {
       />,
     );
 
-    expect(screen.getByPlaceholderText('Connecting...')).toBeTruthy();
+    expect(screen.getByPlaceholderText('Disconnected. Message will be queued and sent on reconnect.')).toBeTruthy();
     expect(screen.getByTitle('Disconnected')).toBeTruthy();
   });
 
@@ -133,6 +135,8 @@ describe('ProposalChat timeout handling', () => {
         onMerge={vi.fn()}
         onClose={vi.fn()}
         onAppendMessage={vi.fn()}
+        onUpsertServerUserMessage={vi.fn()}
+        onUpdateMessageSendStatus={vi.fn()}
         onStartAssistantTurn={vi.fn()}
         onStreamingChunk={vi.fn()}
         onCompleteAssistantTurn={vi.fn()}
@@ -159,6 +163,8 @@ describe('ProposalChat timeout handling', () => {
         onMerge={vi.fn()}
         onClose={vi.fn()}
         onAppendMessage={vi.fn()}
+        onUpsertServerUserMessage={vi.fn()}
+        onUpdateMessageSendStatus={vi.fn()}
         onStartAssistantTurn={vi.fn()}
         onStreamingChunk={vi.fn()}
         onCompleteAssistantTurn={vi.fn()}
@@ -171,6 +177,8 @@ describe('ProposalChat timeout handling', () => {
 
     fireEvent.click(screen.getByText('Summarize the current proposal and open risks'));
 
-    expect(sendPromptMock).toHaveBeenCalledWith('Summarize the current proposal and open risks');
+    expect(sendPromptMock).toHaveBeenCalledTimes(1);
+    expect(sendPromptMock.mock.calls[0][0]).toBe('Summarize the current proposal and open risks');
+    expect(typeof sendPromptMock.mock.calls[0][1]).toBe('string');
   });
 });

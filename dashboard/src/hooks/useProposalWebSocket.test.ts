@@ -1,7 +1,45 @@
-import { describe, expect, it, vi } from 'vitest';
+// @vitest-environment jsdom
+
+import React from 'react';
+import { act, renderHook } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ElicitationRequest, ToolCallInfo } from '../api/types';
-import { handleServerMessage, UseProposalWebSocketOptions } from './useProposalWebSocket';
+import { handleServerMessage, UseProposalWebSocketOptions, useProposalWebSocket } from './useProposalWebSocket';
+
+vi.mock('../api/restClient', () => ({
+  getProposalSessionWsUrl: vi.fn(() => 'ws://localhost/ws'),
+}));
+
+class MockWebSocket {
+  static instances: MockWebSocket[] = [];
+  static OPEN = 1;
+  static CONNECTING = 0;
+
+  readyState = MockWebSocket.CONNECTING;
+  sentMessages: string[] = [];
+  onopen: ((event: Event) => void) | null = null;
+  onmessage: ((event: MessageEvent) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+  onclose: ((event: CloseEvent) => void) | null = null;
+
+  constructor(public readonly url: string) {
+    MockWebSocket.instances.push(this);
+  }
+
+  send(payload: string): void {
+    this.sentMessages.push(payload);
+  }
+
+  close(): void {
+    this.readyState = 3;
+  }
+
+  emitOpen(): void {
+    this.readyState = MockWebSocket.OPEN;
+    this.onopen?.(new Event('open'));
+  }
+}
 
 function makeCallbacks(overrides: Partial<UseProposalWebSocketOptions> = {}): UseProposalWebSocketOptions {
   return {
@@ -10,6 +48,15 @@ function makeCallbacks(overrides: Partial<UseProposalWebSocketOptions> = {}): Us
     ...overrides,
   };
 }
+
+beforeEach(() => {
+  MockWebSocket.instances = [];
+  vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe('handleServerMessage', () => {
   it('dispatches user messages', () => {
@@ -120,5 +167,76 @@ describe('handleServerMessage', () => {
     );
 
     expect(onError).toHaveBeenCalledWith('boom');
+  });
+});
+
+describe('useProposalWebSocket prompt queueing', () => {
+  it('queues prompt while disconnected and flushes in order after reconnect', () => {
+    const onPromptQueued = vi.fn();
+    const onPromptSendStarted = vi.fn();
+
+    const { result } = renderHook(() =>
+      useProposalWebSocket({
+        projectId: 'project-1',
+        sessionId: 'session-1',
+        onPromptQueued,
+        onPromptSendStarted,
+      }),
+    );
+
+    const ws = MockWebSocket.instances[0];
+    expect(ws).toBeDefined();
+
+    act(() => {
+      const queued = result.current.sendPrompt('first prompt', 'client-1');
+      expect(queued.queued).toBe(true);
+      expect(queued.clientMessageId).toBe('client-1');
+    });
+
+    expect(onPromptQueued).toHaveBeenCalledWith('client-1');
+    expect(ws.sentMessages).toHaveLength(0);
+
+    act(() => {
+      const queued = result.current.sendPrompt('second prompt', 'client-2');
+      expect(queued.queued).toBe(true);
+    });
+
+    act(() => {
+      ws.emitOpen();
+    });
+
+    expect(onPromptSendStarted).toHaveBeenNthCalledWith(1, 'client-1');
+    expect(onPromptSendStarted).toHaveBeenNthCalledWith(2, 'client-2');
+    expect(ws.sentMessages).toEqual([
+      JSON.stringify({ type: 'prompt', content: 'first prompt' }),
+      JSON.stringify({ type: 'prompt', content: 'second prompt' }),
+    ]);
+  });
+
+  it('marks send failure when websocket send throws', () => {
+    const onPromptSendFailed = vi.fn();
+
+    const { result } = renderHook(() =>
+      useProposalWebSocket({
+        projectId: 'project-1',
+        sessionId: 'session-1',
+        onPromptSendFailed,
+      }),
+    );
+
+    const ws = MockWebSocket.instances[0];
+    expect(ws).toBeDefined();
+
+    ws.send = () => {
+      throw new Error('send failed');
+    };
+
+    act(() => {
+      ws.emitOpen();
+      const sendResult = result.current.sendPrompt('prompt', 'client-fail');
+      expect(sendResult.queued).toBe(false);
+    });
+
+    expect(onPromptSendFailed).toHaveBeenCalledWith('client-fail', 'send failed');
   });
 });

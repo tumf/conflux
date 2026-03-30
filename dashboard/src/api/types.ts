@@ -253,12 +253,16 @@ export interface ToolCallInfo {
   status: ToolCallStatus;
 }
 
+export type ProposalChatSendStatus = 'sent' | 'pending' | 'failed';
+
 export interface ProposalChatMessage {
   id: string;
   role: ProposalChatRole;
   content: string;
   /** ISO 8601 timestamp */
   timestamp: string;
+  /** User message delivery state for websocket retry UX */
+  sendStatus?: ProposalChatSendStatus;
   /** Server turn identifier used for chunk/tool-call correlation */
   turn_id?: string;
   /** Message restored from backend history endpoint */

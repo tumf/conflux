@@ -132,6 +132,34 @@ describe('ChatMessageList', () => {
     expect(writeText).toHaveBeenCalledWith(code);
   });
 
+  it('shows pending and failed indicators with retry action', () => {
+    const onRetryMessage = vi.fn();
+    const messages: ProposalChatMessage[] = [
+      {
+        id: 'pending-1',
+        role: 'user',
+        content: 'queued message',
+        timestamp: '2026-03-30T00:08:00Z',
+        sendStatus: 'pending',
+      },
+      {
+        id: 'failed-1',
+        role: 'user',
+        content: 'failed message',
+        timestamp: '2026-03-30T00:09:00Z',
+        sendStatus: 'failed',
+      },
+    ];
+
+    render(<ChatMessageList messages={messages} streamingContent={{}} onRetryMessage={onRetryMessage} />);
+
+    expect(screen.getByTestId('message-pending-indicator')).toBeTruthy();
+    expect(screen.getByTestId('message-failed-indicator')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: /Retry/i }));
+    expect(onRetryMessage).toHaveBeenCalledWith('failed-1');
+  });
+
   it('copies assistant message and shows relative timestamp text', () => {
     const content = 'assistant message';
     const messages: ProposalChatMessage[] = [

@@ -21,12 +21,25 @@ export interface UseProposalWebSocketOptions {
   sessionId: string | null;
   hasActiveTurn?: () => boolean;
   onUserMessage?: (message: { id: string; content: string; timestamp: string }) => void;
+  onPromptQueued?: (clientMessageId: string) => void;
+  onPromptSendStarted?: (clientMessageId: string) => void;
+  onPromptSendFailed?: (clientMessageId: string, error: string) => void;
   onMessageChunk?: (content: string, messageId?: string, turnId?: string) => void;
   onToolCall?: (toolCall: ToolCallInfo, messageId?: string, turnId?: string) => void;
   onToolCallUpdate?: (toolCallId: string, status: ToolCallStatus, messageId?: string, turnId?: string) => void;
   onElicitationRequest?: (elicitation: ElicitationRequest) => void;
   onTurnComplete?: (stopReason: string, messageId?: string, turnId?: string) => void;
   onError?: (message: string) => void;
+}
+
+interface PendingPrompt {
+  clientMessageId: string;
+  content: string;
+}
+
+interface SendPromptResult {
+  clientMessageId: string;
+  queued: boolean;
 }
 
 export function useProposalWebSocket(options: UseProposalWebSocketOptions) {
@@ -42,10 +55,44 @@ export function useProposalWebSocket(options: UseProposalWebSocketOptions) {
 
   const [status, setStatus] = useState<ProposalWsStatus>('disconnected');
   const wsRef = useRef<WebSocket | null>(null);
+  const pendingPromptsRef = useRef<PendingPrompt[]>([]);
   const callbacksRef = useRef(options);
   callbacksRef.current = options;
 
   // Connect/disconnect based on projectId + sessionId
+  const sendPromptMessage = useCallback((pendingPrompt: PendingPrompt): void => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      callbacksRef.current.onPromptSendFailed?.(
+        pendingPrompt.clientMessageId,
+        'WebSocket not connected while sending queued prompt',
+      );
+      return;
+    }
+
+    callbacksRef.current.onPromptSendStarted?.(pendingPrompt.clientMessageId);
+
+    try {
+      ws.send(JSON.stringify({ type: 'prompt', content: pendingPrompt.content } satisfies ProposalWsClientMessage));
+    } catch (error) {
+      const normalizedError = error instanceof Error ? error.message : 'Unknown prompt send error';
+      callbacksRef.current.onPromptSendFailed?.(pendingPrompt.clientMessageId, normalizedError);
+    }
+  }, []);
+
+  const flushPendingPrompts = useCallback((): void => {
+    if (pendingPromptsRef.current.length === 0) {
+      return;
+    }
+
+    const queue = [...pendingPromptsRef.current];
+    pendingPromptsRef.current = [];
+
+    queue.forEach((pendingPrompt) => {
+      sendPromptMessage(pendingPrompt);
+    });
+  }, [sendPromptMessage]);
+
   useEffect(() => {
     if (!projectId || !sessionId) {
       setStatus('disconnected');
@@ -60,6 +107,7 @@ export function useProposalWebSocket(options: UseProposalWebSocketOptions) {
 
     ws.onopen = () => {
       setStatus('connected');
+      flushPendingPrompts();
     };
 
     ws.onmessage = (event) => {
@@ -93,24 +141,35 @@ export function useProposalWebSocket(options: UseProposalWebSocketOptions) {
         ws.close();
       }
       wsRef.current = null;
+      pendingPromptsRef.current = [];
       setStatus('disconnected');
     };
-  }, [projectId, sessionId]);
+  }, [flushPendingPrompts, projectId, sessionId]);
 
   const sendMessage = useCallback((msg: ProposalWsClientMessage) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       console.warn('Proposal WebSocket not connected, cannot send message');
-      return;
+      return false;
     }
+
     ws.send(JSON.stringify(msg));
+    return true;
   }, []);
 
   const sendPrompt = useCallback(
-    (content: string) => {
-      sendMessage({ type: 'prompt', content });
+    (content: string, clientMessageId: string): SendPromptResult => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        pendingPromptsRef.current.push({ clientMessageId, content });
+        callbacksRef.current.onPromptQueued?.(clientMessageId);
+        return { clientMessageId, queued: true };
+      }
+
+      sendPromptMessage({ clientMessageId, content });
+      return { clientMessageId, queued: false };
     },
-    [sendMessage],
+    [sendPromptMessage],
   );
 
   const sendElicitationResponse = useCallback(
