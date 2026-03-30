@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::config::defaults::get_server_log_path;
 use crate::error::{OrchestratorError, Result};
 
 #[cfg(target_os = "macos")]
@@ -52,7 +53,7 @@ mod platform {
             .join(format!("{SERVICE_LABEL}.plist")))
     }
 
-    fn generate_plist(exe: &Path) -> String {
+    fn generate_plist(exe: &Path, log_path: &Path) -> String {
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -71,14 +72,15 @@ mod platform {
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/cflx-server.log</string>
+    <string>{log_path}</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/cflx-server.log</string>
+    <string>{log_path}</string>
 </dict>
 </plist>
 "#,
             label = SERVICE_LABEL,
-            exe = exe.display()
+            exe = exe.display(),
+            log_path = log_path.display()
         )
     }
 
@@ -86,10 +88,14 @@ mod platform {
         validate_server_config()?;
         let exe = cflx_executable()?;
         let path = plist_path()?;
+        let log_path = get_server_log_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, generate_plist(&exe))?;
+        if let Some(log_parent) = log_path.parent() {
+            std::fs::create_dir_all(log_parent)?;
+        }
+        std::fs::write(&path, generate_plist(&exe, &log_path))?;
         println!("Service plist written: {}", path.display());
         let status = Command::new("launchctl")
             .args(["load", "-w"])
