@@ -301,6 +301,12 @@ pub struct OrchestratorState {
     /// Apply counts per change (how many times each change has been applied).
     apply_counts: HashMap<String, u32>,
 
+    /// Changes marked as stalled (failed due to no progress or blockers).
+    stalled_change_ids: HashSet<String>,
+
+    /// Changes skipped because one of their dependencies stalled.
+    skipped_change_ids: HashSet<String>,
+
     /// Task progress per change (completed_tasks, total_tasks).
     task_progress: HashMap<String, (u32, u32)>,
 
@@ -358,6 +364,8 @@ impl OrchestratorState {
             pending_changes: pending_set,
             archived_changes: HashSet::new(),
             apply_counts: HashMap::new(),
+            stalled_change_ids: HashSet::new(),
+            skipped_change_ids: HashSet::new(),
             task_progress: HashMap::new(),
             changes_processed: 0,
             total_changes: total,
@@ -383,6 +391,37 @@ impl OrchestratorState {
     /// Get the set of archived changes.
     pub fn archived_changes(&self) -> &HashSet<String> {
         &self.archived_changes
+    }
+
+    /// Get stalled change IDs.
+    pub fn stalled_change_ids(&self) -> &HashSet<String> {
+        &self.stalled_change_ids
+    }
+
+    /// Get skipped change IDs.
+    pub fn skipped_change_ids(&self) -> &HashSet<String> {
+        &self.skipped_change_ids
+    }
+
+    /// Mark a change as stalled.
+    pub fn mark_stalled(&mut self, change_id: String) {
+        self.stalled_change_ids.insert(change_id);
+    }
+
+    /// Mark a change as skipped.
+    ///
+    /// Returns true when the value was newly inserted.
+    pub fn mark_skipped(&mut self, change_id: String) -> bool {
+        self.skipped_change_ids.insert(change_id)
+    }
+
+    /// Clear transient counters for a stalled change.
+    pub fn clear_stalled_change(&mut self, change_id: &str) {
+        self.skipped_change_ids.remove(change_id);
+        self.apply_counts.remove(change_id);
+        if self.current_change_id.as_deref() == Some(change_id) {
+            self.current_change_id = None;
+        }
     }
 
     /// Get the number of changes processed.
@@ -579,6 +618,25 @@ impl OrchestratorState {
         if self.current_change_id.as_deref() == Some(change_id) {
             self.current_change_id = None;
         }
+    }
+
+    /// Remove a change from pending and decrement total_changes.
+    ///
+    /// Returns true when the change was pending and removed.
+    pub fn drop_pending_change(&mut self, change_id: &str) -> bool {
+        let removed = self.pending_changes.remove(change_id);
+        if removed {
+            self.total_changes = self.total_changes.saturating_sub(1);
+        }
+        if self.current_change_id.as_deref() == Some(change_id) {
+            self.current_change_id = None;
+        }
+        removed
+    }
+
+    /// Clear all pending changes.
+    pub fn clear_pending_changes(&mut self) {
+        self.pending_changes.clear();
     }
 
     // -----------------------------------------------------------------------

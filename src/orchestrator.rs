@@ -48,26 +48,12 @@ pub struct Orchestrator {
     initial_change_ids: Option<HashSet<String>>,
     /// Hook runner for executing hooks at various stages
     hooks: HookRunner,
-    /// Current change ID being processed (for on_change_start/on_change_end detection)
-    current_change_id: Option<String>,
-    /// Completed change IDs (after archive, on_change_end called)
-    completed_change_ids: HashSet<String>,
-    /// Apply counts per change (how many times each change has been applied)
-    apply_counts: HashMap<String, u32>,
     /// Stall detector for empty WIP commit tracking
     stall_detector: StallDetector,
-    /// Changes marked as stalled (failed due to no progress)
-    stalled_change_ids: HashSet<String>,
-    /// Changes skipped due to stalled dependencies
-    skipped_change_ids: HashSet<String>,
     /// Error history per change (for circuit breaker pattern)
     error_histories: HashMap<String, ErrorHistory>,
-    /// Number of changes processed (archived)
-    changes_processed: usize,
     /// Maximum iterations limit (0 = no limit)
     max_iterations: u32,
-    /// Current iteration number (for max_iterations check)
-    iteration: u32,
     /// Enable parallel execution mode
     parallel: bool,
     /// Maximum concurrent workspaces for parallel execution
@@ -168,16 +154,9 @@ impl Orchestrator {
             target_changes,
             initial_change_ids: None,
             hooks,
-            current_change_id: None,
-            completed_change_ids: HashSet::new(),
-            apply_counts: HashMap::new(),
             stall_detector,
-            stalled_change_ids: HashSet::new(),
-            skipped_change_ids: HashSet::new(),
             error_histories: HashMap::new(),
-            changes_processed: 0,
             max_iterations,
-            iteration: 0,
             parallel,
             max_concurrent,
             dry_run,
@@ -274,16 +253,9 @@ impl Orchestrator {
             target_changes,
             initial_change_ids: None,
             hooks,
-            current_change_id: None,
-            completed_change_ids: HashSet::new(),
-            apply_counts: HashMap::new(),
             stall_detector,
-            stalled_change_ids: HashSet::new(),
-            skipped_change_ids: HashSet::new(),
             error_histories: HashMap::new(),
-            changes_processed: 0,
             max_iterations,
-            iteration: 0,
             parallel: false,
             max_concurrent: None,
             dry_run: false,
@@ -369,24 +341,25 @@ impl Orchestrator {
 
     /// Check max iterations limit and increment counter
     /// Returns LoopControl indicating whether to continue or break
-    fn check_max_iterations(&mut self) -> LoopControl {
-        self.iteration += 1;
+    async fn check_max_iterations(&mut self) -> LoopControl {
+        let mut state = self.shared_state.write().await;
+        state.increment_iteration();
+        let iteration = state.iteration();
+        let max_iterations = state.max_iterations();
+        drop(state);
 
-        if self.max_iterations > 0 {
+        if max_iterations > 0 {
             // Log warning when approaching limit (80%)
-            let warning_threshold = (self.max_iterations as f32 * 0.8) as u32;
-            if self.iteration == warning_threshold {
-                warn!(
-                    "Approaching max iterations: {}/{}",
-                    self.iteration, self.max_iterations
-                );
+            let warning_threshold = (max_iterations as f32 * 0.8) as u32;
+            if iteration == warning_threshold {
+                warn!("Approaching max iterations: {}/{}", iteration, max_iterations);
             }
 
             // Stop if max iterations reached
-            if self.iteration > self.max_iterations {
+            if iteration > max_iterations {
                 info!(
                     "Max iterations ({}) reached, stopping orchestration",
-                    self.max_iterations
+                    max_iterations
                 );
                 if let Some(progress) = &mut self.progress {
                     progress.complete_all();
@@ -423,7 +396,7 @@ impl Orchestrator {
         }
 
         // Check max iterations
-        self.check_max_iterations()
+        self.check_max_iterations().await
     }
 
     /// Update shared state with an execution event
@@ -436,14 +409,8 @@ impl Orchestrator {
 
     /// Handle Archived result
     async fn handle_archived(&mut self, next: &Change) {
-        self.changes_processed += 1;
-
         self.update_shared_state(ExecutionEvent::ChangeArchived(next.id.clone()))
             .await;
-
-        self.completed_change_ids.insert(next.id.clone());
-        self.current_change_id = None;
-        self.apply_counts.remove(&next.id);
         self.stall_detector.clear_change(&next.id);
 
         if let Some(progress) = &mut self.progress {
@@ -452,9 +419,9 @@ impl Orchestrator {
     }
 
     /// Handle Stalled result
-    fn handle_stalled(&mut self, next: &Change, error: &str) -> LoopControl {
+    async fn handle_stalled(&mut self, next: &Change, error: &str) -> LoopControl {
         warn!("Change stalled: {} - {}", next.id, error);
-        self.mark_change_stalled(&next.id, error);
+        self.mark_change_stalled(&next.id, error).await;
         LoopControl::Continue
     }
 
@@ -500,9 +467,10 @@ impl Orchestrator {
             &snapshot.progress,
             snapshot.empty_commit,
         ) {
-            warn!("{}", stall_reason);
-            self.mark_change_stalled(&next.id, &stall_reason);
-            return LoopControl::Continue;
+                warn!("{}", stall_reason);
+                self.mark_change_stalled(&next.id, &stall_reason).await;
+                return LoopControl::Continue;
+
         }
 
         if let Some(progress) = &mut self.progress {
@@ -537,7 +505,7 @@ impl Orchestrator {
                 next.id
             );
             warn!("{}", message);
-            self.mark_change_stalled(&next.id, &message);
+            self.mark_change_stalled(&next.id, &message).await;
             serial_service.mark_stalled(&next.id, &message);
             return Ok(());
         }
@@ -594,7 +562,7 @@ impl Orchestrator {
                 );
                 // Mark change as stalled to prevent re-selection and archive
                 let reason = "Implementation blocker detected - requires manual intervention";
-                self.mark_change_stalled(&next.id, reason);
+                self.mark_change_stalled(&next.id, reason).await;
                 serial_service.mark_stalled(&next.id, reason);
             }
             ChangeProcessResult::AcceptanceFailed { .. } => {
@@ -684,7 +652,7 @@ impl Orchestrator {
                 self.handle_archived(next).await;
                 Ok(LoopControl::Continue)
             }
-            ChangeProcessResult::Stalled { error } => Ok(self.handle_stalled(next, &error)),
+            ChangeProcessResult::Stalled { error } => Ok(self.handle_stalled(next, &error).await),
             ChangeProcessResult::Failed { error } => {
                 self.handle_failed(next, &error).await?;
                 Ok(LoopControl::Continue)
@@ -811,7 +779,10 @@ impl Orchestrator {
                 };
 
             // Check if this is a new change (for state tracking)
-            let is_new_change = self.current_change_id.as_ref() != Some(&next.id);
+            let is_new_change = {
+                let state = self.shared_state.read().await;
+                state.current_change_id() != Some(&next.id)
+            };
             if is_new_change {
                 // Update shared state: processing started
                 self.shared_state
@@ -820,7 +791,6 @@ impl Orchestrator {
                     .apply_execution_event(&ExecutionEvent::ProcessingStarted(next.id.clone()));
 
                 // Note: OnChangeStart hook is called by process_change() internally
-                self.current_change_id = Some(next.id.clone());
             }
 
             // Process the change through SerialRunService
@@ -859,7 +829,8 @@ impl Orchestrator {
         }
 
         // Run on_finish hook
-        let finish_context = HookContext::new(self.changes_processed, total_changes, 0, false)
+        let processed = self.shared_state.read().await.changes_processed();
+        let finish_context = HookContext::new(processed, total_changes, 0, false)
             .with_status(finish_status);
         self.hooks
             .run_hook(HookType::OnFinish, &finish_context)
@@ -1000,20 +971,21 @@ impl Orchestrator {
     }
 
     /// Filter out stalled changes and those blocked by stalled dependencies.
-    fn filter_stalled_changes(&mut self, changes: &[Change]) -> Vec<Change> {
+    async fn filter_stalled_changes(&mut self, changes: &[Change]) -> Vec<Change> {
         let mut eligible = Vec::new();
+        let mut state = self.shared_state.write().await;
 
         for change in changes {
-            if self.stalled_change_ids.contains(&change.id) {
+            if state.stalled_change_ids().contains(&change.id) {
                 continue;
             }
 
             if let Some(failed_dep) = change
                 .dependencies
                 .iter()
-                .find(|dep| self.stalled_change_ids.contains(*dep))
+                .find(|dep| state.stalled_change_ids().contains(*dep))
             {
-                if self.skipped_change_ids.insert(change.id.clone()) {
+                if state.mark_skipped(change.id.clone()) {
                     warn!(
                         "Skipping '{}' because dependency '{}' stalled",
                         change.id, failed_dep
@@ -1055,7 +1027,7 @@ impl Orchestrator {
             return Ok(None);
         }
 
-        let eligible_changes = self.filter_stalled_changes(&snapshot_changes);
+        let eligible_changes = self.filter_stalled_changes(&snapshot_changes).await;
         let remaining_changes = eligible_changes.len();
 
         if eligible_changes.is_empty() {
@@ -1081,11 +1053,13 @@ impl Orchestrator {
         Ok(Some((next.clone(), remaining_changes)))
     }
 
-    fn mark_change_stalled(&mut self, change_id: &str, reason: &str) {
-        self.stalled_change_ids.insert(change_id.to_string());
-        self.apply_counts.remove(change_id);
+    async fn mark_change_stalled(&mut self, change_id: &str, reason: &str) {
+        {
+            let mut state = self.shared_state.write().await;
+            state.mark_stalled(change_id.to_string());
+            state.clear_stalled_change(change_id);
+        }
         self.error_histories.remove(change_id);
-        self.current_change_id = None;
         self.stall_detector.clear_change(change_id);
 
         if let Some(progress) = &mut self.progress {
@@ -1523,13 +1497,15 @@ mod tests {
         assert_eq!(filtered[0].completed_tasks, 4); // Progress should be updated
     }
 
-    #[test]
-    fn test_filter_stalled_changes_skips_dependencies() {
+    #[tokio::test]
+    async fn test_filter_stalled_changes_skips_dependencies() {
         let config = OrchestratorConfig::default();
         let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
         orchestrator
-            .stalled_change_ids
-            .insert("change-a".to_string());
+            .shared_state
+            .write()
+            .await
+            .mark_stalled("change-a".to_string());
 
         let changes = vec![
             Change {
@@ -1558,25 +1534,25 @@ mod tests {
             },
         ];
 
-        let eligible = orchestrator.filter_stalled_changes(&changes);
+        let eligible = orchestrator.filter_stalled_changes(&changes).await;
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].id, "change-c");
     }
 
     // Note: build_analysis_prompt tests moved to src/orchestration/selection.rs
 
-    #[test]
-    fn test_orchestrator_creation() {
+    #[tokio::test]
+    async fn test_orchestrator_creation() {
         let config = OrchestratorConfig::default();
         let orchestrator = Orchestrator::with_config(None, config).unwrap();
 
         assert!(orchestrator.target_changes.is_none());
         assert!(orchestrator.initial_change_ids.is_none());
-        assert!(orchestrator.current_change_id.is_none());
-        assert!(orchestrator.completed_change_ids.is_empty());
-        assert!(orchestrator.apply_counts.is_empty());
-        assert_eq!(orchestrator.changes_processed, 0);
-        assert_eq!(orchestrator.iteration, 0);
+
+        let state = orchestrator.shared_state.read().await;
+        assert!(state.current_change_id().is_none());
+        assert_eq!(state.changes_processed(), 0);
+        assert_eq!(state.iteration(), 0);
     }
 
     #[test]
@@ -1636,7 +1612,12 @@ mod tests {
             .unwrap();
 
         // Verify the change is marked as stalled in orchestrator
-        assert!(orchestrator.stalled_change_ids.contains(&blocked_change.id));
+        assert!(orchestrator
+            .shared_state
+            .read()
+            .await
+            .stalled_change_ids()
+            .contains(&blocked_change.id));
 
         // Verify the change is marked as stalled in serial service
         assert!(serial_service.is_stalled(&blocked_change.id));
@@ -1648,7 +1629,7 @@ mod tests {
         ];
 
         // Filter should exclude the blocked change
-        let eligible = orchestrator.filter_stalled_changes(&changes);
+        let eligible = orchestrator.filter_stalled_changes(&changes).await;
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].id, "other-change");
     }
