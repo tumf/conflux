@@ -210,6 +210,25 @@ fn status_from_progress(completed: u32, total: u32) -> &'static str {
     }
 }
 
+fn apply_reducer_derived_queue_statuses(
+    state: &mut OrchestratorStateSnapshot,
+    shared: &crate::orchestration::state::OrchestratorState,
+) {
+    for change in &mut state.changes {
+        let display = shared.display_status(&change.id);
+        change.queue_status = if display == "not queued" {
+            None
+        } else {
+            Some(display.to_string())
+        };
+
+        let apply_count = shared.apply_count(&change.id);
+        if apply_count > 0 {
+            change.iteration_number = Some(apply_count);
+        }
+    }
+}
+
 fn refresh_summary(state: &mut OrchestratorStateSnapshot) {
     state.total_changes = state.changes.len();
     state.completed_changes = state
@@ -386,7 +405,20 @@ impl WebState {
 
     /// Update the state with new changes and explicit app_mode (for Run mode)
     pub async fn update_with_mode(&self, changes: &[Change], app_mode: &str) {
-        let mut new_state = OrchestratorStateSnapshot::from_changes(changes);
+        // Query shared state if available for enriched metadata
+        let shared_state_opt = self.shared_orchestrator_state.read().await;
+        let shared_state_data = if let Some(ref shared_arc) = *shared_state_opt {
+            shared_arc.try_read().ok()
+        } else {
+            None
+        };
+
+        let mut new_state = OrchestratorStateSnapshot::from_changes_with_shared_state(
+            changes,
+            shared_state_data.as_deref(),
+        );
+        drop(shared_state_data); // Drop guard before awaiting
+        drop(shared_state_opt); // Drop read lock
 
         // Override app_mode from orchestrator execution state
         new_state.app_mode = app_mode.to_string();
@@ -459,7 +491,6 @@ impl WebState {
                 ExecutionEvent::ProcessingStarted(change_id) => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
                         change.status = "in_progress".to_string();
-                        change.queue_status = Some("applying".to_string());
                         change.progress_percent =
                             progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
@@ -473,7 +504,6 @@ impl WebState {
                             change.completed_tasks = change.total_tasks;
                         }
                         change.status = "complete".to_string();
-                        change.queue_status = Some("archiving".to_string());
                         change.progress_percent =
                             progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
@@ -482,7 +512,6 @@ impl WebState {
                 ExecutionEvent::ProcessingError { id, error: _ } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *id) {
                         change.status = "error".to_string();
-                        change.queue_status = Some("error".to_string());
                         updated = true;
                     }
                     state.app_mode = "error".to_string();
@@ -506,13 +535,15 @@ impl WebState {
                 // Acceptance events
                 ExecutionEvent::AcceptanceStarted { change_id, .. } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.queue_status = Some("accepting".to_string());
+                        change.progress_percent =
+                            progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
                     }
                 }
                 ExecutionEvent::AcceptanceCompleted { change_id } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.queue_status = Some("archiving".to_string());
+                        change.progress_percent =
+                            progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
                     }
                 }
@@ -523,26 +554,26 @@ impl WebState {
                     command: _,
                 } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.queue_status = Some("archiving".to_string());
+                        change.progress_percent =
+                            progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
                     }
                 }
                 ExecutionEvent::ChangeArchived(change_id) => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.status = "archived".to_string();
-                        change.queue_status = Some("archived".to_string());
+                        change.progress_percent =
+                            progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
                     }
+
                 }
-                ExecutionEvent::ArchiveOutput {
-                    change_id,
-                    iteration,
-                    ..
-                } => {
+                ExecutionEvent::ArchiveOutput { change_id, .. } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.iteration_number = Some(*iteration);
+                        change.progress_percent =
+                            progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
                     }
+
                 }
 
                 // Progress events
@@ -569,7 +600,7 @@ impl WebState {
                 // Merge events
                 ExecutionEvent::MergeCompleted { change_id, .. } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.queue_status = Some("merged".to_string());
+                        change.status = "complete".to_string();
                         updated = true;
                     }
                 }
@@ -579,14 +610,16 @@ impl WebState {
                 } => {
                     state.is_resolving = true;
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.queue_status = Some("resolving".to_string());
+                        change.progress_percent =
+                            progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
                     }
                 }
                 ExecutionEvent::ResolveCompleted { change_id, .. } => {
                     state.is_resolving = false;
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.queue_status = Some("archiving".to_string());
+                        change.progress_percent =
+                            progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
                     }
                 }
@@ -596,7 +629,7 @@ impl WebState {
                 } => {
                     state.is_resolving = false;
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.queue_status = Some("error".to_string());
+                        change.status = "error".to_string();
                         updated = true;
                     }
                 }
@@ -608,13 +641,11 @@ impl WebState {
                     // Read is_resolving before mutable borrow
                     let is_resolving = state.is_resolving;
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        // If resolve is running, or the deferral is auto-resumable,
-                        // transition to resolve pending; otherwise maintain merge wait.
-                        change.queue_status = if is_resolving || *auto_resumable {
-                            Some("resolve pending".to_string())
-                        } else {
-                            Some("merge wait".to_string())
-                        };
+                        // Keep non-status metadata updates only.
+                        // queue_status is derived from reducer state.
+                        if is_resolving || *auto_resumable {
+                            change.status = "in_progress".to_string();
+                        }
                         updated = true;
                     }
                 }
@@ -644,11 +675,11 @@ impl WebState {
                     let mut new_change_statuses: Vec<ChangeStatus> =
                         changes.iter().map(ChangeStatus::from).collect();
 
-                    // Preserve queue_status, iteration_number, and progress from existing state where applicable
+                    // Preserve iteration_number and progress from existing state where applicable.
+                    // queue_status is derived from reducer state.
                     for new_change in &mut new_change_statuses {
                         if let Some(existing) = state.changes.iter().find(|c| c.id == new_change.id)
                         {
-                            new_change.queue_status = existing.queue_status.clone();
                             new_change.iteration_number = existing.iteration_number;
 
                             // Preserve existing progress if retrieval failed (new data is 0/0)
@@ -681,13 +712,14 @@ impl WebState {
                     dependency_ids: _,
                 } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.queue_status = Some("blocked".to_string());
+                        change.status = "pending".to_string();
                         updated = true;
                     }
                 }
                 ExecutionEvent::DependencyResolved { change_id } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        change.queue_status = Some("queued".to_string());
+                        change.progress_percent =
+                            progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
                     }
                 }
@@ -715,6 +747,13 @@ impl WebState {
             }
 
             if updated {
+                if let Ok(shared_state_opt) = self.shared_orchestrator_state.try_read() {
+                    if let Some(shared_arc) = shared_state_opt.as_ref() {
+                        if let Ok(shared) = shared_arc.try_read() {
+                            apply_reducer_derived_queue_statuses(&mut state, &shared);
+                        }
+                    }
+                }
                 refresh_summary(&mut state);
             }
 
@@ -1017,7 +1056,7 @@ mod tests {
 
         let state = web_state.get_state().await;
         assert_eq!(state.changes[0].status, "in_progress");
-        assert_eq!(state.changes[0].queue_status, Some("applying".to_string()));
+        assert_eq!(state.changes[0].queue_status, None);
     }
 
     #[tokio::test]
@@ -1033,7 +1072,7 @@ mod tests {
             .await;
 
         let state = web_state.get_state().await;
-        assert_eq!(state.changes[0].queue_status, Some("accepting".to_string()));
+        assert_eq!(state.changes[0].queue_status, None);
     }
 
     #[tokio::test]
@@ -1048,7 +1087,7 @@ mod tests {
             .await;
 
         let state = web_state.get_state().await;
-        assert_eq!(state.changes[0].queue_status, Some("archiving".to_string()));
+        assert_eq!(state.changes[0].queue_status, None);
     }
 
     #[tokio::test]
@@ -1374,11 +1413,7 @@ mod tests {
             state.changes[0].total_tasks, 10,
             "total_tasks should be preserved during archiving"
         );
-        assert_eq!(
-            state.changes[0].queue_status,
-            Some("archiving".to_string()),
-            "queue_status should be set to archiving"
-        );
+        assert_eq!(state.changes[0].queue_status, None);
     }
 
     #[tokio::test]
@@ -1486,11 +1521,7 @@ mod tests {
             state.changes[0].total_tasks, 10,
             "total_tasks should be preserved on ChangesRefreshed with 0/0 during archiving"
         );
-        assert_eq!(
-            state.changes[0].queue_status,
-            Some("archiving".to_string()),
-            "queue_status should be preserved"
-        );
+        assert_eq!(state.changes[0].queue_status, None);
     }
 
     #[tokio::test]
@@ -1530,11 +1561,7 @@ mod tests {
             state.changes[0].total_tasks, 10,
             "total_tasks should be preserved on ChangesRefreshed with 0/0 during resolving"
         );
-        assert_eq!(
-            state.changes[0].queue_status,
-            Some("resolving".to_string()),
-            "queue_status should be preserved"
-        );
+        assert_eq!(state.changes[0].queue_status, None);
     }
 
     // === Tests for update-merge-deferred-resolve-pending ===
@@ -1567,11 +1594,7 @@ mod tests {
 
         // Verify queue_status is "resolve pending"
         let state = web_state.get_state().await;
-        assert_eq!(
-            state.changes[0].queue_status,
-            Some("resolve pending".to_string()),
-            "queue_status should be 'resolve pending' when resolve is running"
-        );
+        assert_eq!(state.changes[0].queue_status, None);
     }
 
     #[tokio::test]
@@ -1590,11 +1613,7 @@ mod tests {
 
         // Verify queue_status is "merge wait"
         let state = web_state.get_state().await;
-        assert_eq!(
-            state.changes[0].queue_status,
-            Some("merge wait".to_string()),
-            "queue_status should be 'merge wait' when resolve is not running and not auto-resumable"
-        );
+        assert_eq!(state.changes[0].queue_status, None);
         assert!(!state.is_resolving, "is_resolving should be false");
     }
 
@@ -1614,7 +1633,7 @@ mod tests {
         // Verify is_resolving is true
         let state = web_state.get_state().await;
         assert!(state.is_resolving, "is_resolving should be true");
-        assert_eq!(state.changes[0].queue_status, Some("resolving".to_string()));
+        assert_eq!(state.changes[0].queue_status, None);
     }
 
     #[tokio::test]
@@ -1641,7 +1660,7 @@ mod tests {
         // Verify is_resolving is false
         let state = web_state.get_state().await;
         assert!(!state.is_resolving, "is_resolving should be false");
-        assert_eq!(state.changes[0].queue_status, Some("archiving".to_string()));
+        assert_eq!(state.changes[0].queue_status, None);
     }
 
     #[tokio::test]
@@ -1668,7 +1687,7 @@ mod tests {
         // Verify is_resolving is false
         let state = web_state.get_state().await;
         assert!(!state.is_resolving, "is_resolving should be false");
-        assert_eq!(state.changes[0].queue_status, Some("error".to_string()));
+        assert_eq!(state.changes[0].queue_status, None);
     }
 
     /// Auto-resumable MergeDeferred when resolve is NOT running must show "resolve pending"
@@ -1690,11 +1709,7 @@ mod tests {
             .await;
 
         let state = web_state.get_state().await;
-        assert_eq!(
-            state.changes[0].queue_status,
-            Some("resolve pending".to_string()),
-            "auto-resumable MergeDeferred must show 'resolve pending' even when resolve is not running"
-        );
+        assert_eq!(state.changes[0].queue_status, None);
     }
 
     /// Phase 6.3: verify that from_changes_with_shared_state derives queue_status from the reducer
