@@ -45,7 +45,9 @@ class OpenSpecManager:
         self.archive_dir = self.changes_dir / "archive"
         self.specs_dir = self.root_dir / "openspec" / "specs"
 
-    def list_changes(self, show_specs: bool = False) -> List[Dict]:
+    def list_changes(
+        self, show_specs: bool = False, include_archived: bool = False
+    ) -> List[Dict]:
         """List all changes or specs."""
         if show_specs:
             return self._list_specs()
@@ -60,8 +62,7 @@ class OpenSpecManager:
                 if change_info:
                     changes.append(change_info)
 
-        # Also check archive
-        if self.archive_dir.exists():
+        if include_archived and self.archive_dir.exists():
             for item in self.archive_dir.iterdir():
                 if item.is_dir():
                     change_info = self._get_change_info(item, archived=True)
@@ -372,7 +373,9 @@ class OpenSpecManager:
         if not skip_specs:
             sim_errors = self._simulate_spec_promotion(change_dir)
             if sim_errors:
-                return False, "Spec promotion simulation failed:\n" + "\n".join(sim_errors)
+                return False, "Spec promotion simulation failed:\n" + "\n".join(
+                    sim_errors
+                )
 
         # Create archive directory if needed
         self.archive_dir.mkdir(parents=True, exist_ok=True)
@@ -443,7 +446,9 @@ class OpenSpecManager:
 
             if canonical_spec.exists():
                 canonical_content = canonical_spec.read_text(encoding="utf-8")
-                merged_content, _ = _shared_merge_spec_delta(canonical_content, delta_content)
+                merged_content, _ = _shared_merge_spec_delta(
+                    canonical_content, delta_content
+                )
                 canonical_spec.write_text(merged_content, encoding="utf-8")
             else:
                 canonical_spec.write_text(
@@ -530,6 +535,9 @@ def main():
     list_parser.add_argument(
         "--specs", action="store_true", help="List specs instead of changes"
     )
+    list_parser.add_argument(
+        "--archived", action="store_true", help="Include archived changes"
+    )
 
     # show command
     show_parser = subparsers.add_parser("show", help="Show change details")
@@ -566,7 +574,9 @@ def main():
 
     try:
         if args.command == "list":
-            changes = manager.list_changes(show_specs=args.specs)
+            changes = manager.list_changes(
+                show_specs=args.specs, include_archived=args.archived
+            )
             print_changes(changes, show_specs=args.specs)
 
         elif args.command == "show":

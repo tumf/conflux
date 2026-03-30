@@ -1,20 +1,23 @@
 // @vitest-environment jsdom
 
 import React from 'react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 
 import { ProposalChat } from '../ProposalChat';
 import { ProposalSession } from '../../api/types';
 
+const sendPromptMock = vi.fn();
+const sendElicitationResponseMock = vi.fn();
+let wsStatus: 'connected' | 'disconnected' = 'disconnected';
+
 vi.mock('../../hooks/useProposalWebSocket', () => ({
   useProposalWebSocket: () => ({
-    status: 'disconnected',
-    sendPrompt: vi.fn(),
-    sendElicitationResponse: vi.fn(),
+    status: wsStatus,
+    sendPrompt: sendPromptMock,
+    sendElicitationResponse: sendElicitationResponseMock,
   }),
 }));
-
 
 vi.mock('../ProposalChangesList', () => ({
   ProposalChangesList: () => <div>changes</div>,
@@ -26,11 +29,16 @@ vi.mock('../ProposalActions', () => ({
 
 afterEach(() => {
   cleanup();
+  sendPromptMock.mockReset();
+  sendElicitationResponseMock.mockReset();
+  wsStatus = 'disconnected';
 });
 
-if (!Element.prototype.scrollIntoView) {
-  Element.prototype.scrollIntoView = vi.fn();
-}
+beforeEach(() => {
+  if (!Element.prototype.scrollIntoView) {
+    Element.prototype.scrollIntoView = vi.fn();
+  }
+});
 
 const session: ProposalSession = {
   id: 'session-1',
@@ -71,5 +79,98 @@ describe('ProposalChat timeout handling', () => {
     expect(screen.getByTitle('Disconnected')).toBeTruthy();
   });
 
+  it('opens and closes changes drawer with button, backdrop, and Escape key', () => {
+    render(
+      <ProposalChat
+        projectId="project-1"
+        session={session}
+        messages={[]}
+        streamingContent={{}}
+        activeElicitation={null}
+        isAgentResponding={false}
+        onBack={vi.fn()}
+        onMerge={vi.fn()}
+        onClose={vi.fn()}
+        onAppendMessage={vi.fn()}
+        onStartAssistantTurn={vi.fn()}
+        onStreamingChunk={vi.fn()}
+        onCompleteAssistantTurn={vi.fn()}
+        onFailAssistantTurn={vi.fn()}
+        onToolCallStart={vi.fn()}
+        onToolCallUpdate={vi.fn()}
+        onElicitation={vi.fn()}
+      />,
+    );
 
+    const dialog = screen.getByRole('dialog', { hidden: true });
+    expect(dialog.className).toContain('pointer-events-none');
+
+    fireEvent.click(screen.getByLabelText('Open changes drawer'));
+    expect(dialog.className).toContain('pointer-events-auto');
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(dialog.className).toContain('pointer-events-none');
+
+    fireEvent.click(screen.getByLabelText('Open changes drawer'));
+    expect(dialog.className).toContain('pointer-events-auto');
+
+    fireEvent.click(dialog);
+    expect(dialog.className).toContain('pointer-events-none');
+  });
+
+  it('shows enter-to-send hint when connected', () => {
+    wsStatus = 'connected';
+
+    render(
+      <ProposalChat
+        projectId="project-1"
+        session={session}
+        messages={[]}
+        streamingContent={{}}
+        activeElicitation={null}
+        isAgentResponding={false}
+        onBack={vi.fn()}
+        onMerge={vi.fn()}
+        onClose={vi.fn()}
+        onAppendMessage={vi.fn()}
+        onStartAssistantTurn={vi.fn()}
+        onStreamingChunk={vi.fn()}
+        onCompleteAssistantTurn={vi.fn()}
+        onFailAssistantTurn={vi.fn()}
+        onToolCallStart={vi.fn()}
+        onToolCallUpdate={vi.fn()}
+        onElicitation={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByPlaceholderText('Type a message... (Enter to send, Shift+Enter for newline)')).toBeTruthy();
+  });
+
+  it('sends example prompt when empty-state chip is clicked', () => {
+    render(
+      <ProposalChat
+        projectId="project-1"
+        session={session}
+        messages={[]}
+        streamingContent={{}}
+        activeElicitation={null}
+        isAgentResponding={false}
+        onBack={vi.fn()}
+        onMerge={vi.fn()}
+        onClose={vi.fn()}
+        onAppendMessage={vi.fn()}
+        onStartAssistantTurn={vi.fn()}
+        onStreamingChunk={vi.fn()}
+        onCompleteAssistantTurn={vi.fn()}
+        onFailAssistantTurn={vi.fn()}
+        onToolCallStart={vi.fn()}
+        onToolCallUpdate={vi.fn()}
+        onElicitation={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByText('Summarize the current proposal and open risks'));
+
+    expect(sendPromptMock).toHaveBeenCalledWith('Summarize the current proposal and open risks');
+  });
 });
