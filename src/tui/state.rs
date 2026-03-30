@@ -872,6 +872,9 @@ impl AppState {
             None
         } else {
             // Resolve is not running: start immediately
+            // Set resolving flag synchronously so consecutive M presses in the same
+            // event loop tick are routed to the queueing path.
+            self.is_resolving = true;
             if matches!(self.mode, AppMode::Select | AppMode::Stopped) {
                 self.mode = AppMode::Running;
             }
@@ -4140,6 +4143,44 @@ mod tests {
             app.changes[0].queue_status,
             QueueStatus::ResolveWait,
             "ResolveWait must survive ChangesRefreshed after immediate resolve"
+        );
+    }
+
+    #[test]
+    fn test_resolve_merge_consecutive_m_key_presses_queue_second_change() {
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        // Both changes are merge-wait candidates.
+        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[1].queue_status = QueueStatus::MergeWait;
+        app.mode = AppMode::Running;
+        app.is_resolving = false;
+
+        // 1st M press on change-a: should start immediate resolve and set is_resolving.
+        app.cursor_index = 0;
+        let first_cmd = app.resolve_merge();
+        assert!(matches!(first_cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
+        assert!(
+            app.is_resolving,
+            "first resolve_merge() must set is_resolving=true immediately"
+        );
+        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+
+        // 2nd M press on change-b: must take queue path and not start immediately.
+        app.cursor_index = 1;
+        let second_cmd = app.resolve_merge();
+        assert!(
+            second_cmd.is_none(),
+            "second resolve_merge() must queue while resolve is in progress"
+        );
+        assert_eq!(app.changes[1].queue_status, QueueStatus::ResolveWait);
+        assert!(
+            app.resolve_queue_set.contains("change-b"),
+            "second change must be queued for resolve"
         );
     }
 
