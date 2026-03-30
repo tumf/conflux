@@ -1264,6 +1264,27 @@ mod tests {
         assert!(archive_ok);
     }
 
+    #[tokio::test]
+    async fn test_tui_shared_state_pending_changes_decrease_when_cleared() {
+        use crate::orchestration::state::OrchestratorState;
+
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            3,
+        )));
+
+        {
+            let state = shared_state.read().await;
+            assert_eq!(state.pending_changes().len(), 2);
+        }
+
+        shared_state.write().await.clear_pending_changes();
+
+        let state = shared_state.read().await;
+        assert_eq!(state.pending_changes().len(), 0);
+        assert!(state.pending_changes().is_empty());
+    }
+
     #[test]
     fn test_tui_archived_during_resolve() {
         use crate::events::ExecutionEvent;

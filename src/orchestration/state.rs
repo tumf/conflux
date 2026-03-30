@@ -56,8 +56,9 @@
 //!        let is_pending = guard.is_pending(change_id);
 //!    }
 //!    ```
-
 use std::collections::{HashMap, HashSet};
+
+use crate::error_history::{CircuitBreakerConfig, ErrorHistory};
 
 // ============================================================================
 // Execution mode – determines terminal states for the state machine
@@ -310,6 +311,9 @@ pub struct OrchestratorState {
     /// Task progress per change (completed_tasks, total_tasks).
     task_progress: HashMap<String, (u32, u32)>,
 
+    /// Error history per change for repeated failure detection.
+    error_histories: HashMap<String, ErrorHistory>,
+
     /// Number of changes processed (archived).
     changes_processed: usize,
 
@@ -367,6 +371,7 @@ impl OrchestratorState {
             stalled_change_ids: HashSet::new(),
             skipped_change_ids: HashSet::new(),
             task_progress: HashMap::new(),
+            error_histories: HashMap::new(),
             changes_processed: 0,
             total_changes: total,
             max_iterations,
@@ -637,6 +642,34 @@ impl OrchestratorState {
     /// Clear all pending changes.
     pub fn clear_pending_changes(&mut self) {
         self.pending_changes.clear();
+    }
+
+    /// Record an error and return whether circuit breaker should trip.
+    pub fn record_error_and_check_circuit_breaker(
+        &mut self,
+        change_id: &str,
+        error: &str,
+        config: CircuitBreakerConfig,
+    ) -> bool {
+        let history = self
+            .error_histories
+            .entry(change_id.to_string())
+            .or_insert_with(|| ErrorHistory::new(config.clone()));
+
+        history.record_error(error);
+        history.detect_same_error()
+    }
+
+    /// Return the most recent normalized error for a change.
+    pub fn last_error(&self, change_id: &str) -> Option<&str> {
+        self.error_histories
+            .get(change_id)
+            .and_then(ErrorHistory::last_error)
+    }
+
+    /// Clear error history for a change.
+    pub fn clear_error_history(&mut self, change_id: &str) {
+        self.error_histories.remove(change_id);
     }
 
     // -----------------------------------------------------------------------
@@ -1162,6 +1195,26 @@ mod tests {
         assert!(!state.is_pending("change-a"));
         assert!(!state.is_archived("change-a")); // Not archived, just removed
         assert!(state.current_change_id().is_none());
+    }
+
+    #[test]
+    fn test_error_history_management_and_circuit_breaker() {
+        let mut state = OrchestratorState::new(vec!["change-a".to_string()], 0);
+        let config = CircuitBreakerConfig {
+            enabled: true,
+            threshold: 2,
+        };
+
+        assert!(!state.record_error_and_check_circuit_breaker(
+            "change-a",
+            "same error",
+            config.clone()
+        ));
+        assert!(state.record_error_and_check_circuit_breaker("change-a", "same error", config));
+        assert!(state.last_error("change-a").is_some());
+
+        state.clear_error_history("change-a");
+        assert!(state.last_error("change-a").is_none());
     }
 
     // -----------------------------------------------------------------------

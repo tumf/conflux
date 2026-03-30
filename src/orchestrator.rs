@@ -4,7 +4,7 @@ use crate::command_queue::CommandQueueConfig;
 use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
-use crate::error_history::{CircuitBreakerConfig, ErrorHistory};
+use crate::error_history::CircuitBreakerConfig;
 use crate::events::ExecutionEvent;
 use crate::execution::apply::{check_task_progress, create_progress_commit};
 use crate::hooks::{HookContext, HookRunner, HookType};
@@ -19,7 +19,7 @@ use crate::task_parser::TaskProgress;
 use crate::tui::log_deduplicator;
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{GitWorkspaceManager, VcsBackend, WorkspaceManager};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -50,8 +50,6 @@ pub struct Orchestrator {
     hooks: HookRunner,
     /// Stall detector for empty WIP commit tracking
     stall_detector: StallDetector,
-    /// Error history per change (for circuit breaker pattern)
-    error_histories: HashMap<String, ErrorHistory>,
     /// Maximum iterations limit (0 = no limit)
     max_iterations: u32,
     /// Enable parallel execution mode
@@ -155,7 +153,6 @@ impl Orchestrator {
             initial_change_ids: None,
             hooks,
             stall_detector,
-            error_histories: HashMap::new(),
             max_iterations,
             parallel,
             max_concurrent,
@@ -254,7 +251,6 @@ impl Orchestrator {
             initial_change_ids: None,
             hooks,
             stall_detector,
-            error_histories: HashMap::new(),
             max_iterations,
             parallel: false,
             max_concurrent: None,
@@ -499,7 +495,10 @@ impl Orchestrator {
         }
 
         // CLI-specific: Check circuit breaker
-        if self.record_error_and_check_circuit_breaker(&next.id, error) {
+        if self
+            .record_error_and_check_circuit_breaker(&next.id, error)
+            .await
+        {
             let message = format!(
                 "Circuit breaker opened for '{}' due to repeated errors",
                 next.id
@@ -1058,8 +1057,8 @@ impl Orchestrator {
             let mut state = self.shared_state.write().await;
             state.mark_stalled(change_id.to_string());
             state.clear_stalled_change(change_id);
+            state.clear_error_history(change_id);
         }
-        self.error_histories.remove(change_id);
         self.stall_detector.clear_change(change_id);
 
         if let Some(progress) = &mut self.progress {
@@ -1069,26 +1068,20 @@ impl Orchestrator {
 
     /// Record an error and check if circuit breaker should trip
     /// Returns true if the change should be skipped due to repeated errors
-    fn record_error_and_check_circuit_breaker(&mut self, change_id: &str, error: &str) -> bool {
+    async fn record_error_and_check_circuit_breaker(&mut self, change_id: &str, error: &str) -> bool {
         let cb_config = self.config.get_error_circuit_breaker();
         let circuit_breaker_config = CircuitBreakerConfig {
             enabled: cb_config.enabled,
             threshold: cb_config.threshold,
         };
 
-        let history = self
-            .error_histories
-            .entry(change_id.to_string())
-            .or_insert_with(|| ErrorHistory::new(circuit_breaker_config.clone()));
-
-        history.record_error(error);
-
-        if history.detect_same_error() {
+        let mut state = self.shared_state.write().await;
+        if state.record_error_and_check_circuit_breaker(change_id, error, circuit_breaker_config.clone()) {
             error!(
                 "Circuit breaker triggered for '{}': same error occurred {} times consecutively",
                 change_id, circuit_breaker_config.threshold
             );
-            if let Some(last_err) = history.last_error() {
+            if let Some(last_err) = state.last_error(change_id) {
                 error!("Last error pattern: {}", last_err);
             }
             true
@@ -1588,6 +1581,45 @@ mod tests {
                 "change-c".to_string()
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn test_serial_shared_state_apply_count_and_iteration_increment() {
+        let config = OrchestratorConfig::default();
+        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
+
+        {
+            let mut state = orchestrator.shared_state.write().await;
+            *state = crate::orchestration::state::OrchestratorState::new(
+                vec!["change-a".to_string()],
+                3,
+            );
+        }
+
+        // check_max_iterations increments iteration in shared state
+        match orchestrator.check_max_iterations().await {
+            super::LoopControl::Continue => {}
+            _ => panic!("iteration check should continue"),
+        }
+
+        {
+            let state = orchestrator.shared_state.read().await;
+            assert_eq!(state.iteration(), 1);
+            assert_eq!(state.apply_count("change-a"), 0);
+        }
+
+        // ApplyCompleted increments per-change apply count in shared state
+        orchestrator
+            .shared_state
+            .write()
+            .await
+            .apply_execution_event(&crate::events::ExecutionEvent::ApplyCompleted {
+                change_id: "change-a".to_string(),
+                revision: "serial".to_string(),
+            });
+
+        let state = orchestrator.shared_state.read().await;
+        assert_eq!(state.apply_count("change-a"), 1);
     }
 
     #[tokio::test]
