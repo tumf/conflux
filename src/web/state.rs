@@ -565,7 +565,6 @@ impl WebState {
                             progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
                     }
-
                 }
                 ExecutionEvent::ArchiveOutput { change_id, .. } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
@@ -573,7 +572,6 @@ impl WebState {
                             progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
                     }
-
                 }
 
                 // Progress events
