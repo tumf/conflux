@@ -578,6 +578,16 @@ pub async fn handle_tui_command(
                     let _ = resolve_tx.send(event).await;
                 };
 
+                if resolve_counter.load(std::sync::atomic::Ordering::SeqCst) > 1 {
+                    finish_resolve(OrchestratorEvent::MergeDeferred {
+                        change_id: id.clone(),
+                        reason: "Resolve in progress for another change".to_string(),
+                        auto_resumable: true,
+                    })
+                    .await;
+                    return;
+                }
+
                 match crate::parallel::base_dirty_reason(&resolve_repo_root).await {
                     Ok(Some(reason)) => {
                         let auto_resumable =

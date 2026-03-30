@@ -60,7 +60,9 @@ pub async fn base_dirty_reason(repo_root: &Path) -> Result<Option<String>> {
 /// Manual-intervention reasons:
 /// - Working tree has uncommitted changes — user must repair the workspace
 pub fn is_dirty_reason_auto_resumable(reason: &str) -> bool {
-    reason.contains("Merge in progress") || reason.contains("MERGE_HEAD")
+    reason.contains("Merge in progress")
+        || reason.contains("MERGE_HEAD")
+        || reason.contains("Resolve in progress")
 }
 
 /// Result of a merge attempt
@@ -271,6 +273,21 @@ impl ParallelExecutor {
         use crate::execution::archive::is_archive_commit_complete;
 
         let _merge_guard = super::global_merge_lock().lock().await;
+
+        let auto_resolve_count = self
+            .auto_resolve_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let manual_resolve_count = self
+            .manual_resolve_count
+            .as_ref()
+            .map(|counter| counter.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0);
+        if auto_resolve_count.saturating_add(manual_resolve_count) > 0 {
+            return Ok(MergeAttempt::Deferred(
+                "Resolve in progress for another change".to_string(),
+            ));
+        }
+
         if let Some(reason) = base_dirty_reason(&self.repo_root).await? {
             return Ok(MergeAttempt::Deferred(reason));
         }
@@ -712,6 +729,13 @@ mod tests {
     #[test]
     fn test_is_dirty_reason_auto_resumable_merge_head_present() {
         assert!(is_dirty_reason_auto_resumable("MERGE_HEAD exists"));
+    }
+
+    #[test]
+    fn test_is_dirty_reason_auto_resumable_resolve_in_progress() {
+        assert!(is_dirty_reason_auto_resumable(
+            "Resolve in progress for another change"
+        ));
     }
 
     #[test]
