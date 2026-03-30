@@ -1,7 +1,7 @@
 ## Implementation Tasks
 
-- [ ] 1. `src/orchestration/state.rs` の `ChangeRuntimeState` に `display_color() -> ratatui::style::Color` メソッドを追加する。`display_status()` の返す文字列に対し `src/tui/type_impls.rs` L32-45 と同一の Color マッピングを実装する（verification: `cargo test --lib orchestration::state` でメソッドの単体テスト通過）
-- [ ] 2. `src/orchestration/state.rs` の `ChangeRuntimeState` に `error_message() -> Option<&str>` メソッドを追加する。`TerminalState::Error(msg)` のとき `Some(msg.as_str())` を返す（verification: テスト追加・通過）
+- [x] 1. `src/orchestration/state.rs` の `ChangeRuntimeState` に `display_color() -> ratatui::style::Color` メソッドを追加する。`display_status()` の返す文字列に対し `src/tui/type_impls.rs` L32-45 と同一の Color マッピングを実装する（verification: `cargo test --lib orchestration::state` でメソッドの単体テスト通過）
+- [x] 2. `src/orchestration/state.rs` の `ChangeRuntimeState` に `error_message() -> Option<&str>` メソッドを追加する。`TerminalState::Error(msg)` のとき `Some(msg.as_str())` を返す（verification: テスト追加・通過）
 - [ ] 3. `src/tui/state.rs` の `ChangeState` struct (L123付近) に `display_status_cache: String`（初期値 `"not queued".to_string()`）と `display_color_cache: Color`（初期値 `Color::DarkGray`）と `error_message_cache: Option<String>`（初期値 `None`）を追加する（verification: `cargo test` 通過）
 - [ ] 4. `src/tui/state.rs` の `apply_display_statuses_from_reducer()` (L970付近) で cache フィールドを同時更新するよう修正する（verification: `cargo test` 通過）
 - [ ] 5. `src/tui/render.rs` 内の `QueueStatus` 参照（59箇所）を `display_status_cache` / `display_color_cache` の文字列比較に置き換える。`get_checkbox_display()` のシグネチャを `(display_status: &str, is_selected: bool)` に変更する（verification: `rg "QueueStatus" src/tui/render.rs` が test 以外ゼロ、`cargo test` 通過）

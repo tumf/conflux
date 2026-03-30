@@ -234,6 +234,34 @@ impl ChangeRuntimeState {
             QueueIntent::NotQueued => "not queued",
         }
     }
+
+    /// Derive the display color used by TUI status rendering.
+    pub fn display_color(&self) -> ratatui::style::Color {
+        match self.display_status() {
+            "not queued" => ratatui::style::Color::DarkGray,
+            "queued" => ratatui::style::Color::Yellow,
+            "blocked" => ratatui::style::Color::Gray,
+            "applying" => ratatui::style::Color::Cyan,
+            "accepting" => ratatui::style::Color::LightGreen,
+            "archiving" => ratatui::style::Color::Magenta,
+            "archived" => ratatui::style::Color::Blue,
+            "merged" => ratatui::style::Color::LightBlue,
+            "merge wait" => ratatui::style::Color::LightMagenta,
+            "resolving" => ratatui::style::Color::LightCyan,
+            "resolve pending" => ratatui::style::Color::Magenta,
+            "error" => ratatui::style::Color::Red,
+            "stopped" => ratatui::style::Color::DarkGray,
+            _ => ratatui::style::Color::DarkGray,
+        }
+    }
+
+    /// Returns the terminal error message when in error state.
+    pub fn error_message(&self) -> Option<&str> {
+        match &self.terminal {
+            TerminalState::Error(message) => Some(message.as_str()),
+            _ => None,
+        }
+    }
 }
 
 // ============================================================================
@@ -1298,6 +1326,65 @@ mod tests {
         let rt = state.runtime_entry("c");
         rt.terminal = TerminalState::Archived;
         assert_eq!(state.display_status("c"), "archived");
+    }
+
+    #[test]
+    fn test_display_color_derivation() {
+        let mut rt = ChangeRuntimeState::default();
+        assert_eq!(rt.display_color(), ratatui::style::Color::DarkGray);
+
+        rt.queue_intent = QueueIntent::Queued;
+        assert_eq!(rt.display_color(), ratatui::style::Color::Yellow);
+
+        rt.wait_state = WaitState::DependencyBlocked;
+        assert_eq!(rt.display_color(), ratatui::style::Color::Gray);
+
+        rt.activity = ActivityState::Applying;
+        assert_eq!(rt.display_color(), ratatui::style::Color::Cyan);
+
+        rt.activity = ActivityState::Accepting;
+        assert_eq!(rt.display_color(), ratatui::style::Color::LightGreen);
+
+        rt.activity = ActivityState::Archiving;
+        assert_eq!(rt.display_color(), ratatui::style::Color::Magenta);
+
+        rt.activity = ActivityState::Resolving;
+        assert_eq!(rt.display_color(), ratatui::style::Color::LightCyan);
+
+        rt.activity = ActivityState::Idle;
+        rt.wait_state = WaitState::MergeWait;
+        assert_eq!(rt.display_color(), ratatui::style::Color::LightMagenta);
+
+        rt.wait_state = WaitState::ResolveWait;
+        assert_eq!(rt.display_color(), ratatui::style::Color::Magenta);
+
+        rt.wait_state = WaitState::None;
+        rt.terminal = TerminalState::Archived;
+        assert_eq!(rt.display_color(), ratatui::style::Color::Blue);
+
+        rt.terminal = TerminalState::Merged;
+        assert_eq!(rt.display_color(), ratatui::style::Color::LightBlue);
+
+        rt.terminal = TerminalState::Stopped;
+        assert_eq!(rt.display_color(), ratatui::style::Color::DarkGray);
+
+        rt.terminal = TerminalState::Error("boom".to_string());
+        assert_eq!(rt.display_color(), ratatui::style::Color::Red);
+    }
+
+    #[test]
+    fn test_error_message_derivation() {
+        let rt = ChangeRuntimeState {
+            terminal: TerminalState::Error("fatal".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(rt.error_message(), Some("fatal"));
+
+        let rt2 = ChangeRuntimeState {
+            terminal: TerminalState::Merged,
+            ..Default::default()
+        };
+        assert_eq!(rt2.error_message(), None);
     }
 
     // -----------------------------------------------------------------------
