@@ -9,7 +9,7 @@
 - [x] Add `onThoughtChunk` callback to `UseProposalWebSocketOptions` and handle `agent_thought_chunk` in `handleServerMessage` in `dashboard/src/hooks/useProposalWebSocket.ts` (verification: `npm test` in dashboard)
 - [x] Add test case for `agent_thought_chunk` dispatch in `dashboard/src/hooks/useProposalWebSocket.test.ts` (verification: `npm test` passes)
 - [x] Wire `onThoughtChunk` in `ProposalChat.tsx` as a no-op or pass-through (verification: `npm run build` in dashboard, no type errors)
-- [ ] Run `cargo fmt --check && cargo clippy -- -D warnings` and `cd dashboard && npm run build` to confirm no regressions (verification: all pass)
+- [x] Run `cargo fmt --check && cargo clippy -- -D warnings` and `cd dashboard && npm run build` to confirm no regressions (verification: all pass)
 
 ## Future Work
 
