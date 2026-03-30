@@ -151,7 +151,7 @@ export function OverviewDashboard() {
             <h3 className="text-sm font-medium text-[#fafafa]">Recent Activity</h3>
           </header>
           <div className="min-h-0 flex-1 overflow-y-auto">
-            {!overview || overview.recent_events.length === 0 ? (
+            {!overview || !overview.recent_events || overview.recent_events.length === 0 ? (
               <div className="flex h-full items-center justify-center p-4 text-sm text-[#52525b]">
                 {isLoading ? 'Loading events...' : 'No recent events'}
               </div>
@@ -191,7 +191,7 @@ export function OverviewDashboard() {
             <h3 className="text-sm font-medium text-[#fafafa]">Project Stats</h3>
           </header>
           <div className="min-h-0 flex-1 overflow-y-auto p-3">
-            {!overview || overview.project_stats.length === 0 ? (
+            {!overview || !overview.project_stats || overview.project_stats.length === 0 ? (
               <div className="flex h-full items-center justify-center text-sm text-[#52525b]">
                 {isLoading ? 'Loading project stats...' : 'No project stats'}
               </div>

@@ -61,10 +61,38 @@ pub struct ChangeStateRow {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct StatsOverview {
+pub struct StatsOverviewSummary {
     pub success_count: i64,
     pub failure_count: i64,
-    pub average_duration_ms: f64,
+    pub in_progress_count: i64,
+    pub average_duration_ms: Option<f64>,
+    pub average_duration_by_operation: Option<std::collections::HashMap<String, f64>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentEventSummary {
+    pub project_id: String,
+    pub change_id: String,
+    pub operation: String,
+    pub result: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectStatsSummary {
+    pub project_id: String,
+    pub apply_success_rate: f64,
+    pub average_duration_ms: Option<f64>,
+    pub success_count: i64,
+    pub failure_count: i64,
+    pub in_progress_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatsOverview {
+    pub summary: StatsOverviewSummary,
+    pub recent_events: Vec<RecentEventSummary>,
+    pub project_stats: Vec<ProjectStatsSummary>,
 }
 
 pub struct ServerDb {
@@ -349,17 +377,93 @@ impl ServerDb {
                 "SELECT
                     SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success_count,
                     SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as failure_count,
-                    COALESCE(AVG(duration_ms), 0) as average_duration_ms
+                    AVG(duration_ms) as average_duration_ms
                  FROM change_events",
             )?;
-            let row = stmt.query_row([], |row| {
-                Ok(StatsOverview {
-                    success_count: row.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                    failure_count: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                    average_duration_ms: row.get::<_, f64>(2)?,
-                })
-            })?;
-            Ok(row)
+            let (success_count, failure_count, avg_dur): (i64, i64, Option<f64>) =
+                stmt.query_row([], |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                        row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                        row.get::<_, Option<f64>>(2)?,
+                    ))
+                })?;
+
+            let mut op_stmt = conn.prepare(
+                "SELECT operation, AVG(duration_ms) FROM change_events GROUP BY operation",
+            )?;
+            let avg_by_op: std::collections::HashMap<String, f64> = op_stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let summary = StatsOverviewSummary {
+                success_count,
+                failure_count,
+                in_progress_count: 0,
+                average_duration_ms: avg_dur,
+                average_duration_by_operation: if avg_by_op.is_empty() {
+                    None
+                } else {
+                    Some(avg_by_op)
+                },
+            };
+
+            let mut events_stmt = conn.prepare(
+                "SELECT project_id, change_id, operation, success, created_at
+                 FROM change_events ORDER BY id DESC LIMIT 50",
+            )?;
+            let recent_events: Vec<RecentEventSummary> = events_stmt
+                .query_map([], |row| {
+                    let success: bool = row.get::<_, i64>(3)? == 1;
+                    Ok(RecentEventSummary {
+                        project_id: row.get(0)?,
+                        change_id: row.get(1)?,
+                        operation: row.get(2)?,
+                        result: if success {
+                            "success".to_string()
+                        } else {
+                            "failure".to_string()
+                        },
+                        timestamp: row.get(4)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let mut proj_stmt = conn.prepare(
+                "SELECT
+                    project_id,
+                    CASE WHEN COUNT(*) > 0
+                        THEN CAST(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS REAL) / COUNT(*)
+                        ELSE 0.0
+                    END as apply_success_rate,
+                    AVG(duration_ms) as average_duration_ms,
+                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success_count,
+                    SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as failure_count
+                 FROM change_events GROUP BY project_id",
+            )?;
+            let project_stats: Vec<ProjectStatsSummary> = proj_stmt
+                .query_map([], |row| {
+                    Ok(ProjectStatsSummary {
+                        project_id: row.get(0)?,
+                        apply_success_rate: row.get(1)?,
+                        average_duration_ms: row.get(2)?,
+                        success_count: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        failure_count: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                        in_progress_count: 0,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(StatsOverview {
+                summary,
+                recent_events,
+                project_stats,
+            })
         })
     }
 
@@ -550,9 +654,11 @@ mod tests {
         assert_eq!(recent.len(), 2);
 
         let stats = db.get_stats_overview().unwrap();
-        assert_eq!(stats.success_count, 1);
-        assert_eq!(stats.failure_count, 1);
-        assert!((stats.average_duration_ms - 950.0).abs() < f64::EPSILON);
+        assert_eq!(stats.summary.success_count, 1);
+        assert_eq!(stats.summary.failure_count, 1);
+        assert!((stats.summary.average_duration_ms.unwrap() - 950.0).abs() < f64::EPSILON);
+        assert_eq!(stats.recent_events.len(), 2);
+        assert_eq!(stats.project_stats.len(), 1);
     }
 
     #[test]

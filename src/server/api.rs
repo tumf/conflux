@@ -196,9 +196,37 @@ struct ProjectsStateResponse {
 
 #[derive(Debug, Serialize)]
 struct StatsOverviewResponse {
+    summary: StatsOverviewSummaryResponse,
+    recent_events: Vec<StatsRecentEventResponse>,
+    project_stats: Vec<StatsProjectResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct StatsOverviewSummaryResponse {
     success_count: i64,
     failure_count: i64,
-    average_duration_ms: f64,
+    in_progress_count: i64,
+    average_duration_ms: Option<f64>,
+    average_duration_by_operation: Option<std::collections::HashMap<String, f64>>,
+}
+
+#[derive(Debug, Serialize)]
+struct StatsRecentEventResponse {
+    project_id: String,
+    change_id: String,
+    operation: String,
+    result: String,
+    timestamp: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StatsProjectResponse {
+    project_id: String,
+    apply_success_rate: f64,
+    average_duration_ms: Option<f64>,
+    success_count: i64,
+    failure_count: i64,
+    in_progress_count: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1988,9 +2016,36 @@ async fn get_stats_overview(State(state): State<AppState>) -> Response {
         Ok(stats) => (
             StatusCode::OK,
             Json(StatsOverviewResponse {
-                success_count: stats.success_count,
-                failure_count: stats.failure_count,
-                average_duration_ms: stats.average_duration_ms,
+                summary: StatsOverviewSummaryResponse {
+                    success_count: stats.summary.success_count,
+                    failure_count: stats.summary.failure_count,
+                    in_progress_count: stats.summary.in_progress_count,
+                    average_duration_ms: stats.summary.average_duration_ms,
+                    average_duration_by_operation: stats.summary.average_duration_by_operation,
+                },
+                recent_events: stats
+                    .recent_events
+                    .into_iter()
+                    .map(|e| StatsRecentEventResponse {
+                        project_id: e.project_id,
+                        change_id: e.change_id,
+                        operation: e.operation,
+                        result: e.result,
+                        timestamp: e.timestamp,
+                    })
+                    .collect(),
+                project_stats: stats
+                    .project_stats
+                    .into_iter()
+                    .map(|p| StatsProjectResponse {
+                        project_id: p.project_id,
+                        apply_success_rate: p.apply_success_rate,
+                        average_duration_ms: p.average_duration_ms,
+                        success_count: p.success_count,
+                        failure_count: p.failure_count,
+                        in_progress_count: p.in_progress_count,
+                    })
+                    .collect(),
             }),
         )
             .into_response(),
@@ -7277,8 +7332,10 @@ mod tests {
             .await
             .unwrap();
         let overview_json: serde_json::Value = serde_json::from_slice(&overview_body).unwrap();
-        assert_eq!(overview_json["success_count"], 1);
-        assert_eq!(overview_json["failure_count"], 0);
+        assert_eq!(overview_json["summary"]["success_count"], 1);
+        assert_eq!(overview_json["summary"]["failure_count"], 0);
+        assert!(overview_json["recent_events"].is_array());
+        assert!(overview_json["project_stats"].is_array());
 
         let history_resp = router
             .clone()
