@@ -23,7 +23,7 @@ function renderMarkdownSimple(content: string): React.ReactNode {
     if (line.startsWith('```')) {
       if (inCodeBlock) {
         elements.push(
-          <pre key={`code-${codeKey++}`} className="my-2 overflow-x-auto rounded bg-[#18181b] p-2 font-mono text-xs text-[#d4d4d8]">
+          <pre key={`code-${codeKey++}`} className="my-2 overflow-x-auto rounded bg-surface-2 p-2 font-mono text-xs text-text">
             <code>{codeLines.join('\n')}</code>
           </pre>,
         );
@@ -48,7 +48,7 @@ function renderMarkdownSimple(content: string): React.ReactNode {
   // Unclosed code block
   if (inCodeBlock && codeLines.length > 0) {
     elements.push(
-      <pre key={`code-${codeKey}`} className="my-2 overflow-x-auto rounded bg-[#18181b] p-2 font-mono text-xs text-[#d4d4d8]">
+      <pre key={`code-${codeKey}`} className="my-2 overflow-x-auto rounded bg-surface-2 p-2 font-mono text-xs text-text">
         <code>{codeLines.join('\n')}</code>
       </pre>,
     );
@@ -68,7 +68,7 @@ function renderInlineMarkdown(text: string): React.ReactNode {
     const codeMatch = remaining.match(/^`([^`]+)`/);
     if (codeMatch) {
       parts.push(
-        <code key={key++} className="rounded bg-[#27272a] px-1 py-0.5 font-mono text-[0.85em] text-[#a5b4fc]">
+        <code key={key++} className="rounded bg-border px-1 py-0.5 font-mono text-[0.85em] text-accent">
           {codeMatch[1]}
         </code>,
       );
@@ -118,7 +118,7 @@ export function ChatMessageList({ messages, streamingContent }: ChatMessageListP
     <div className="flex-1 overflow-y-auto p-4 space-y-4">
       {messages.length === 0 && streamingIds.length === 0 && (
         <div className="flex flex-1 items-center justify-center py-16">
-          <p className="text-sm text-[#52525b]">Start a conversation with the agent</p>
+          <p className="text-sm text-text-subtle">Start a conversation with the agent</p>
         </div>
       )}
 
@@ -131,12 +131,12 @@ export function ChatMessageList({ messages, streamingContent }: ChatMessageListP
         .filter((id) => !messages.some((m) => m.id === id))
         .map((id) => (
           <div key={`stream-${id}`} className="flex items-start gap-3">
-            <div className="flex size-7 shrink-0 items-center justify-center rounded-full bg-[#1e1b4b]">
-              <Bot className="size-4 text-[#a5b4fc]" />
+            <div className="flex size-7 shrink-0 items-center justify-center rounded-full bg-accent/20">
+              <Bot className="size-4 text-accent" />
             </div>
-            <div className="min-w-0 flex-1 rounded-lg bg-[#18181b] px-3 py-2 text-sm text-[#d4d4d8]">
+            <div className="min-w-0 flex-1 rounded-lg bg-surface-2 px-3 py-2 text-sm text-text">
               {renderMarkdownSimple(streamingContent[id])}
-              <span className="inline-block h-4 w-1 animate-pulse bg-[#6366f1] align-middle" />
+              <span className="inline-block h-4 w-1 animate-pulse bg-accent align-middle" />
             </div>
           </div>
         ))}
@@ -153,20 +153,20 @@ function MessageBubble({ message }: { message: ProposalChatMessage }) {
     <div className={`flex items-start gap-3 ${isUser ? 'flex-row-reverse' : ''}`}>
       <div
         className={`flex size-7 shrink-0 items-center justify-center rounded-full ${
-          isUser ? 'bg-[#27272a]' : 'bg-[#1e1b4b]'
+          isUser ? 'bg-border' : 'bg-accent/20'
         }`}
       >
         {isUser ? (
-          <User className="size-4 text-[#a1a1aa]" />
+          <User className="size-4 text-text-muted" />
         ) : (
-          <Bot className="size-4 text-[#a5b4fc]" />
+          <Bot className="size-4 text-accent" />
         )}
       </div>
       <div
         className={`min-w-0 max-w-[80%] space-y-2 rounded-lg px-3 py-2 text-sm ${
           isUser
-            ? 'bg-[#1e1b4b]/60 text-[#e0e7ff]'
-            : 'bg-[#18181b] text-[#d4d4d8]'
+            ? 'bg-accent/20 text-text'
+            : 'bg-surface-2 text-text'
         }`}
       >
         <div>{renderMarkdownSimple(message.content)}</div>
