@@ -2,7 +2,7 @@
 
 import React from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 
 import { ProposalChat } from '../ProposalChat';
 import { ProposalSession } from '../../api/types';
@@ -71,5 +71,42 @@ describe('ProposalChat timeout handling', () => {
     expect(screen.getByTitle('Disconnected')).toBeTruthy();
   });
 
+  it('opens and closes changes drawer with button, backdrop, and Escape key', () => {
+    render(
+      <ProposalChat
+        projectId="project-1"
+        session={session}
+        messages={[]}
+        streamingContent={{}}
+        activeElicitation={null}
+        isAgentResponding={false}
+        onBack={vi.fn()}
+        onMerge={vi.fn()}
+        onClose={vi.fn()}
+        onAppendMessage={vi.fn()}
+        onStartAssistantTurn={vi.fn()}
+        onStreamingChunk={vi.fn()}
+        onCompleteAssistantTurn={vi.fn()}
+        onFailAssistantTurn={vi.fn()}
+        onToolCallStart={vi.fn()}
+        onToolCallUpdate={vi.fn()}
+        onElicitation={vi.fn()}
+      />,
+    );
 
+    const dialog = screen.getByRole('dialog', { hidden: true });
+    expect(dialog.className).toContain('pointer-events-none');
+
+    fireEvent.click(screen.getByLabelText('Open changes drawer'));
+    expect(dialog.className).toContain('pointer-events-auto');
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(dialog.className).toContain('pointer-events-none');
+
+    fireEvent.click(screen.getByLabelText('Open changes drawer'));
+    expect(dialog.className).toContain('pointer-events-auto');
+
+    fireEvent.click(dialog);
+    expect(dialog.className).toContain('pointer-events-none');
+  });
 });
