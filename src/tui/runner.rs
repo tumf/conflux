@@ -761,6 +761,7 @@ async fn run_tui_loop(
                     | crate::events::ExecutionEvent::ResolveStarted { .. }
                     | crate::events::ExecutionEvent::ResolveCompleted { .. }
                     | crate::events::ExecutionEvent::ResolveFailed { .. }
+                    | crate::events::ExecutionEvent::MergeDeferred { .. }
             );
             if apply_to_reducer {
                 let display_map = {
