@@ -2246,6 +2246,88 @@ async fn test_on_merged_hook_execution() {
 
 /// Test that attempt_merge defers when worktree is dirty
 #[tokio::test]
+async fn test_attempt_merge_deferred_when_resolve_active() {
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    // Create temporary repository
+    let temp_dir = TempDir::new().unwrap();
+    let repo_root = temp_dir.path();
+
+    // Initialize git repo
+    Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Create initial commit
+    fs::write(repo_root.join("README.md"), "initial").unwrap();
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "Initial"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    let config = create_test_config();
+    let (tx, _rx) = mpsc::channel(10);
+    let mut executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
+
+    // Simulate an already running manual resolve for another change.
+    let manual_resolve_counter = Arc::new(AtomicUsize::new(1));
+    executor.set_manual_resolve_counter(manual_resolve_counter.clone());
+
+    let revisions = vec!["test-workspace".to_string()];
+    let change_ids = vec!["test-change".to_string()];
+    let archive_paths = vec![repo_root.to_path_buf()];
+
+    let result = executor
+        .attempt_merge(&revisions, &change_ids, &archive_paths)
+        .await;
+
+    match result {
+        Ok(MergeAttempt::Deferred(reason)) => {
+            assert!(
+                reason.contains("Resolve in progress"),
+                "Expected deferred reason to mention resolve in progress, got: {}",
+                reason
+            );
+        }
+        Ok(MergeAttempt::Merged { .. }) => {
+            panic!("Merge should have been deferred while resolve is active");
+        }
+        Err(e) => {
+            panic!("Unexpected error: {}", e);
+        }
+    }
+
+    manual_resolve_counter.store(0, Ordering::SeqCst);
+}
+
+#[tokio::test]
 async fn test_merge_deferred_when_worktree_dirty() {
     use std::fs;
     use tempfile::TempDir;
