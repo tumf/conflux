@@ -44,6 +44,23 @@ fn apply_pending_removals(
     removed_pending
 }
 
+fn post_archive_dispatch_event(
+    state: &crate::orchestration::state::OrchestratorState,
+    change_id: &str,
+) -> Option<OrchestratorEvent> {
+    let reason = if state.is_resolving_active() {
+        "Resolve already active; auto-queue archived change"
+    } else {
+        "No active resolve; trigger immediate resolve attempt"
+    };
+
+    Some(OrchestratorEvent::MergeDeferred {
+        change_id: change_id.to_string(),
+        reason: reason.to_string(),
+        auto_resumable: true,
+    })
+}
+
 /// Run the orchestrator for selected changes
 /// Uses streaming output to send log entries in real-time
 /// Supports cancellation via CancellationToken for graceful shutdown
@@ -797,13 +814,26 @@ pub async fn run_orchestrator(
                 // Send ChangeArchived event
                 let change_archived_event = OrchestratorEvent::ChangeArchived(change_id.clone());
                 let _ = tx.send(change_archived_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&change_archived_event);
+                let post_archive_event = {
+                    let mut state = shared_state.write().await;
+                    state.apply_execution_event(&change_archived_event);
+                    post_archive_dispatch_event(&state, &change_id)
+                };
                 #[cfg(feature = "web-monitoring")]
                 if let Some(ws) = &web_state {
                     ws.apply_execution_event(&change_archived_event).await;
+                }
+
+                if let Some(dispatch_event) = post_archive_event {
+                    let _ = tx.send(dispatch_event.clone()).await;
+                    shared_state
+                        .write()
+                        .await
+                        .apply_execution_event(&dispatch_event);
+                    #[cfg(feature = "web-monitoring")]
+                    if let Some(ws) = &web_state {
+                        ws.apply_execution_event(&dispatch_event).await;
+                    }
                 }
 
                 // Update local state tracking
@@ -1266,6 +1296,77 @@ mod tests {
         // If archive exists, the archive is considered successful
         let archive_ok = archive_path.exists();
         assert!(archive_ok);
+    }
+
+    #[test]
+    fn test_tui_archived_during_resolve() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState, WaitState};
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            3,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&ExecutionEvent::ResolveStarted {
+            change_id: "change-a".to_string(),
+            command: "resolve change-a".to_string(),
+        });
+
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("change-b".to_string()));
+
+        let deferred = super::post_archive_dispatch_event(&state, "change-b");
+        assert!(matches!(
+            deferred,
+            Some(ExecutionEvent::MergeDeferred {
+                ref change_id,
+                auto_resumable: true,
+                ..
+            }) if change_id == "change-b"
+        ));
+
+        if let Some(event) = deferred {
+            state.apply_execution_event(&event);
+        }
+
+        let runtime = state
+            .change_runtime("change-b")
+            .expect("change-b runtime should exist");
+        assert_eq!(runtime.wait_state, WaitState::ResolveWait);
+    }
+
+    #[test]
+    fn test_tui_archived_no_active_resolve() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["change-a".to_string()], 3, ExecutionMode::Parallel);
+
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("change-a".to_string()));
+
+        let deferred = super::post_archive_dispatch_event(&state, "change-a");
+        assert!(matches!(
+            deferred,
+            Some(ExecutionEvent::MergeDeferred {
+                ref change_id,
+                auto_resumable: true,
+                ..
+            }) if change_id == "change-a"
+        ));
+
+        if let Some(event) = deferred {
+            state.apply_execution_event(&event);
+        }
+
+        let runtime = state
+            .change_runtime("change-a")
+            .expect("change-a runtime should exist");
+        assert_eq!(
+            runtime.wait_state,
+            crate::orchestration::state::WaitState::ResolveWait
+        );
     }
 
     /// Test that AcceptanceBlocked prevents re-selection and archive in TUI serial mode.

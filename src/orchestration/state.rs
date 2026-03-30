@@ -549,6 +549,13 @@ impl OrchestratorState {
             .unwrap_or(false)
     }
 
+    /// Return true when any change is currently in resolving activity.
+    pub fn is_resolving_active(&self) -> bool {
+        self.change_runtime
+            .values()
+            .any(|rt| matches!(rt.activity, ActivityState::Resolving) && !rt.is_terminal())
+    }
+
     /// Return a snapshot of display status strings for all known changes.
     /// Used by the TUI to sync `ChangeState.queue_status` from the reducer.
     pub fn all_display_statuses(&self) -> HashMap<String, &'static str> {
