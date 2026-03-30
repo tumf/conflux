@@ -395,9 +395,8 @@ impl ParallelExecutor {
                     }
                 }
                 Ok(super::merge::MergeAttempt::Deferred(reason)) => {
-                    // Re-classify deferred reason: auto-resumable stays in ResolveWait,
-                    // manual-intervention reasons are downgraded to MergeWait.
-                    let auto_resumable = super::merge::is_dirty_reason_auto_resumable(&reason);
+                    // Re-classify deferred reason: only resolve-in-progress is auto-resumable.
+                    let auto_resumable = reason.contains("Resolve in progress");
                     info!(
                         "Deferred merge still blocked for '{}': {} (auto_resumable={})",
                         change_id, reason, auto_resumable

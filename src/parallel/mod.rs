@@ -28,7 +28,7 @@ mod workspace;
 // Re-export unified event type as ParallelEvent for backward compatibility.
 pub use crate::events::ExecutionEvent as ParallelEvent;
 
-pub use merge::{base_dirty_reason, is_dirty_reason_auto_resumable, resolve_deferred_merge};
+pub use merge::{base_dirty_reason, resolve_deferred_merge};
 pub use types::{FailedChangeTracker, WorkspaceResult};
 
 // Re-exports used in tests via `use super::super::*`.
