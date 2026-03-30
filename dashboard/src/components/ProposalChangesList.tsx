@@ -37,7 +37,7 @@ export function ProposalChangesList({ projectId, sessionId, onClickChange }: Pro
   if (isLoading && changes.length === 0) {
     return (
       <div className="flex items-center justify-center p-4">
-        <Loader2 className="size-4 animate-spin text-[#52525b]" />
+        <Loader2 className="size-4 animate-spin text-text-subtle" />
       </div>
     );
   }
@@ -45,7 +45,7 @@ export function ProposalChangesList({ projectId, sessionId, onClickChange }: Pro
   if (error) {
     return (
       <div className="p-3">
-        <p className="text-xs text-[#ef4444]">{error}</p>
+        <p className="text-xs text-error">{error}</p>
       </div>
     );
   }
@@ -53,7 +53,7 @@ export function ProposalChangesList({ projectId, sessionId, onClickChange }: Pro
   if (changes.length === 0) {
     return (
       <div className="flex items-center justify-center p-4">
-        <p className="text-xs text-[#52525b]">No changes detected yet</p>
+        <p className="text-xs text-text-subtle">No changes detected yet</p>
       </div>
     );
   }
@@ -61,19 +61,19 @@ export function ProposalChangesList({ projectId, sessionId, onClickChange }: Pro
   return (
     <div className="space-y-1 p-2">
       <div className="px-1 py-1.5">
-        <span className="text-xs font-medium text-[#52525b] uppercase tracking-wider">Changes</span>
+        <span className="text-xs font-medium text-text-subtle uppercase tracking-wider">Changes</span>
       </div>
       {changes.map((change) => (
         <button
           key={change.change_id}
           onClick={() => onClickChange?.(change.change_id)}
-          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-[#a1a1aa] transition-colors hover:bg-[#27272a]/50"
+          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-text-muted transition-colors hover:bg-border/50"
         >
-          <FileText className="size-3.5 shrink-0 text-[#6366f1]" />
+          <FileText className="size-3.5 shrink-0 text-accent" />
           <div className="min-w-0">
             <div className="truncate font-mono">{change.change_id}</div>
             {change.title && (
-              <div className="truncate text-[#52525b]">{change.title}</div>
+              <div className="truncate text-text-subtle">{change.title}</div>
             )}
           </div>
         </button>

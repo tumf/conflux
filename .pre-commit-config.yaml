@@ -23,10 +23,3 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
-      - id: openapi-generate
-        name: openapi-generate
-        entry: bash -c 'make openapi && git add docs/openapi.yaml'
-        language: system
-        pass_filenames: false
-        always_run: true
-        stages: [pre-commit]

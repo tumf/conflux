@@ -1,5 +1,5 @@
-import React, { useCallback, useRef } from 'react';
-import { ArrowLeft } from 'lucide-react';
+import React, { useCallback, useState, useRef } from 'react';
+import { ArrowLeft, PanelRight } from 'lucide-react';
 import {
   ElicitationRequest,
   ProposalChatMessage,
@@ -13,6 +13,7 @@ import { ChatInput } from './ChatInput';
 import { ElicitationDialog } from './ElicitationDialog';
 import { ProposalChangesList } from './ProposalChangesList';
 import { ProposalActions } from './ProposalActions';
+import { ChangesDrawer } from './ChangesDrawer';
 
 interface ProposalChatProps {
   projectId: string;
@@ -68,6 +69,7 @@ export function ProposalChat({
   onClickChange,
   isLoading = false,
 }: ProposalChatProps) {
+  const [isChangesDrawerOpen, setIsChangesDrawerOpen] = useState(false);
   const pendingMessageIdRef = useRef<string | null>(null);
 
   const { sendPrompt, sendElicitationResponse, status } = useProposalWebSocket({
@@ -224,34 +226,46 @@ export function ProposalChat({
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between border-b border-[#27272a] px-3 py-2">
+      <div className="flex items-center justify-between border-b border-border px-3 py-2">
         <div className="flex items-center gap-2">
           <button
             onClick={onBack}
-            className="rounded p-1 text-[#52525b] transition-colors hover:text-[#a1a1aa]"
+            className="rounded p-1 text-text-subtle transition-colors hover:text-text-muted"
             aria-label="Back to project"
           >
             <ArrowLeft className="size-4" />
           </button>
           <div className="flex items-center gap-1.5">
-            <span className="text-sm font-medium text-[#fafafa]">Proposal Session</span>
-            <span className="rounded bg-[#27272a] px-1.5 py-0.5 font-mono text-xs text-[#71717a]">
+            <span className="text-sm font-medium text-text">Proposal Session</span>
+            <span className="rounded bg-border px-1.5 py-0.5 font-mono text-xs text-text-muted">
               {session.worktree_branch}
             </span>
             <span
               className={`size-2 rounded-full ${
-                wsConnected ? 'bg-[#22c55e]' : 'bg-[#52525b]'
+                wsConnected ? 'bg-success' : 'bg-text-subtle'
               }`}
               title={wsConnected ? 'Connected' : 'Disconnected'}
             />
           </div>
         </div>
-        <ProposalActions
-          session={session}
-          onMerge={onMerge}
-          onClose={onClose}
-          isLoading={isLoading}
-        />
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            className="rounded p-1 text-[#52525b] transition-colors hover:text-[#a1a1aa] md:hidden"
+            aria-label="Open changes drawer"
+            onClick={() => {
+              setIsChangesDrawerOpen(true);
+            }}
+          >
+            <PanelRight className="size-4" />
+          </button>
+          <ProposalActions
+            session={session}
+            onMerge={onMerge}
+            onClose={onClose}
+            isLoading={isLoading}
+          />
+        </div>
       </div>
 
       {/* Main content: chat + sidebar */}
@@ -281,7 +295,7 @@ export function ProposalChat({
         </div>
 
         {/* Changes sidebar */}
-        <div className="hidden w-56 shrink-0 flex-col border-l border-[#27272a] md:flex">
+        <div className="hidden w-56 shrink-0 flex-col border-l border-border md:flex">
           <ProposalChangesList
             projectId={projectId}
             sessionId={session.id}
@@ -289,6 +303,23 @@ export function ProposalChat({
           />
         </div>
       </div>
+
+      <ChangesDrawer
+        isOpen={isChangesDrawerOpen}
+        onClose={() => {
+          setIsChangesDrawerOpen(false);
+        }}
+        title="Changes"
+      >
+        <ProposalChangesList
+          projectId={projectId}
+          sessionId={session.id}
+          onClickChange={(changeId) => {
+            onClickChange?.(changeId);
+            setIsChangesDrawerOpen(false);
+          }}
+        />
+      </ChangesDrawer>
 
       {/* Elicitation dialog */}
       {activeElicitation && (

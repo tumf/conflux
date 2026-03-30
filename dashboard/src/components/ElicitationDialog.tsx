@@ -1,6 +1,19 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { X } from 'lucide-react';
 import { ElicitationRequest, ElicitationProperty } from '../api/types';
+
+const FOCUSABLE_SELECTOR = [
+  'button:not([disabled])',
+  'input:not([disabled])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  'a[href]',
+  '[tabindex]:not([tabindex="-1"])',
+].join(', ');
+
+function getFocusableElements(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR));
+}
 
 interface ElicitationDialogProps {
   elicitation: ElicitationRequest;
@@ -26,6 +39,10 @@ export function ElicitationDialog({ elicitation, onSubmit, onDecline, onCancel }
     return initial;
   });
 
+  const dialogId = useMemo(() => `elicitation-dialog-${elicitation.id}`, [elicitation.id]);
+  const titleId = `${dialogId}-title`;
+  const dialogRef = useRef<HTMLDivElement>(null);
+
   const handleChange = useCallback((key: string, value: unknown) => {
     setFormData((prev) => ({ ...prev, [key]: value }));
   }, []);
@@ -38,15 +55,91 @@ export function ElicitationDialog({ elicitation, onSubmit, onDecline, onCancel }
     [formData, onSubmit],
   );
 
+  const handleBackdropClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (e.target === e.currentTarget) {
+        onCancel();
+      }
+    },
+    [onCancel],
+  );
+
+  const handleDialogKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onCancel();
+        return;
+      }
+
+      if (e.key !== 'Tab') {
+        return;
+      }
+
+      const container = dialogRef.current;
+      if (!container) {
+        return;
+      }
+
+      const focusableElements = getFocusableElements(container);
+      if (focusableElements.length === 0) {
+        e.preventDefault();
+        container.focus();
+        return;
+      }
+
+      const first = focusableElements[0];
+      const last = focusableElements[focusableElements.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+
+      if (e.shiftKey) {
+        if (active === first || !container.contains(active)) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (active === last || !container.contains(active)) {
+        e.preventDefault();
+        first.focus();
+      }
+    },
+    [onCancel],
+  );
+
+  useEffect(() => {
+    const container = dialogRef.current;
+    if (!container) {
+      return;
+    }
+
+    const focusableElements = getFocusableElements(container);
+    if (focusableElements.length > 0) {
+      focusableElements[0].focus();
+    } else {
+      container.focus();
+    }
+  }, []);
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-      <div className="w-full max-w-md rounded-lg border border-[#27272a] bg-[#09090b] shadow-xl">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+      onClick={handleBackdropClick}
+    >
+      <div
+        ref={dialogRef}
+        className="w-full max-w-md rounded-lg border border-border bg-bg shadow-xl"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        id={dialogId}
+        tabIndex={-1}
+        onKeyDown={handleDialogKeyDown}
+      >
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-[#27272a] px-4 py-3">
-          <h3 className="text-sm font-medium text-[#fafafa]">Agent Request</h3>
+        <div className="flex items-center justify-between border-b border-border px-4 py-3">
+          <h3 id={titleId} className="text-sm font-medium text-text">Agent Request</h3>
           <button
             onClick={onCancel}
-            className="rounded p-1 text-[#52525b] transition-colors hover:text-[#a1a1aa]"
+            className="rounded p-1 text-text-subtle transition-colors hover:text-text-muted"
             aria-label="Close"
           >
             <X className="size-4" />
@@ -55,8 +148,8 @@ export function ElicitationDialog({ elicitation, onSubmit, onDecline, onCancel }
 
         {/* Message */}
         {elicitation.message && (
-          <div className="border-b border-[#27272a] px-4 py-3">
-            <p className="text-sm text-[#a1a1aa]">{elicitation.message}</p>
+          <div className="border-b border-border px-4 py-3">
+            <p className="text-sm text-text-muted">{elicitation.message}</p>
           </div>
         )}
 
@@ -78,20 +171,20 @@ export function ElicitationDialog({ elicitation, onSubmit, onDecline, onCancel }
             <button
               type="button"
               onClick={onDecline}
-              className="rounded-md border border-[#27272a] px-3 py-1.5 text-sm text-[#a1a1aa] transition-colors hover:border-[#3f3f46] hover:text-[#fafafa]"
+              className="rounded-md border border-border px-3 py-1.5 text-sm text-text-muted transition-colors hover:border-border-hover hover:text-text"
             >
               Decline
             </button>
             <button
               type="button"
               onClick={onCancel}
-              className="rounded-md border border-[#27272a] px-3 py-1.5 text-sm text-[#a1a1aa] transition-colors hover:border-[#3f3f46] hover:text-[#fafafa]"
+              className="rounded-md border border-border px-3 py-1.5 text-sm text-text-muted transition-colors hover:border-border-hover hover:text-text"
             >
               Cancel
             </button>
             <button
               type="submit"
-              className="rounded-md bg-[#6366f1] px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-[#4f46e5]"
+              className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-accent-hover"
             >
               Submit
             </button>
@@ -123,9 +216,9 @@ function FormField({ name, property, value, onChange, required }: FormFieldProps
           id={id}
           checked={Boolean(value)}
           onChange={(e) => onChange(e.target.checked)}
-          className="size-4 rounded border-[#27272a] bg-[#111113] text-[#6366f1] focus:ring-[#6366f1]"
+          className="size-4 rounded border-border bg-surface text-accent focus:ring-accent"
         />
-        <label htmlFor={id} className="text-sm text-[#d4d4d8]">
+        <label htmlFor={id} className="text-sm text-text">
           {label}
         </label>
       </div>
@@ -140,19 +233,19 @@ function FormField({ name, property, value, onChange, required }: FormFieldProps
 
     return (
       <div className="space-y-1.5">
-        <label htmlFor={id} className="block text-sm text-[#d4d4d8]">
+        <label htmlFor={id} className="block text-sm text-text">
           {label}
-          {required && <span className="ml-1 text-[#ef4444]">*</span>}
+          {required && <span className="ml-1 text-error">*</span>}
         </label>
         {property.description && (
-          <p className="text-xs text-[#52525b]">{property.description}</p>
+          <p className="text-xs text-text-subtle">{property.description}</p>
         )}
         <select
           id={id}
           value={String(value || '')}
           onChange={(e) => onChange(e.target.value)}
           required={required}
-          className="w-full rounded-md border border-[#27272a] bg-[#111113] px-3 py-2 text-sm text-[#fafafa] focus:border-[#6366f1] focus:outline-none"
+          className="w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-text focus:border-accent focus:outline-none"
         >
           <option value="">Select...</option>
           {options.map((opt) => (
@@ -169,12 +262,12 @@ function FormField({ name, property, value, onChange, required }: FormFieldProps
   if (property.type === 'number' || property.type === 'integer') {
     return (
       <div className="space-y-1.5">
-        <label htmlFor={id} className="block text-sm text-[#d4d4d8]">
+        <label htmlFor={id} className="block text-sm text-text">
           {label}
-          {required && <span className="ml-1 text-[#ef4444]">*</span>}
+          {required && <span className="ml-1 text-error">*</span>}
         </label>
         {property.description && (
-          <p className="text-xs text-[#52525b]">{property.description}</p>
+          <p className="text-xs text-text-subtle">{property.description}</p>
         )}
         <input
           type="number"
@@ -188,7 +281,7 @@ function FormField({ name, property, value, onChange, required }: FormFieldProps
           }}
           step={property.type === 'integer' ? 1 : 'any'}
           required={required}
-          className="w-full rounded-md border border-[#27272a] bg-[#111113] px-3 py-2 text-sm text-[#fafafa] focus:border-[#6366f1] focus:outline-none"
+          className="w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-text focus:border-accent focus:outline-none"
         />
       </div>
     );
@@ -197,12 +290,12 @@ function FormField({ name, property, value, onChange, required }: FormFieldProps
   // Default: string → text input
   return (
     <div className="space-y-1.5">
-      <label htmlFor={id} className="block text-sm text-[#d4d4d8]">
+      <label htmlFor={id} className="block text-sm text-text">
         {label}
-        {required && <span className="ml-1 text-[#ef4444]">*</span>}
+        {required && <span className="ml-1 text-error">*</span>}
       </label>
       {property.description && (
-        <p className="text-xs text-[#52525b]">{property.description}</p>
+        <p className="text-xs text-text-subtle">{property.description}</p>
       )}
       <input
         type="text"
@@ -210,7 +303,7 @@ function FormField({ name, property, value, onChange, required }: FormFieldProps
         value={String(value || '')}
         onChange={(e) => onChange(e.target.value)}
         required={required}
-        className="w-full rounded-md border border-[#27272a] bg-[#111113] px-3 py-2 text-sm text-[#fafafa] focus:border-[#6366f1] focus:outline-none"
+        className="w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-text focus:border-accent focus:outline-none"
       />
     </div>
   );

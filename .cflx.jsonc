@@ -15,7 +15,9 @@
     "on_merged": {
       "command": "make bump-patch",
       "timeout": 120,
-      "git_commit_no_verify": true
+      "continue_on_failure": false,
+      "max_retries": 2,
+      "retry_delay_secs": 5
     }
 
   }
