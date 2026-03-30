@@ -15,6 +15,11 @@
 
 - UI display for thought chunks (toggle, collapse, debug view)
 
+## Acceptance #3 Failure Follow-up
+
+- [x] `tests/fixtures/mock_acp_agent.py` の101行目と134行目の `"sessionUpdate": "agent_message_chunk"` を `"agent_thought_chunk"` に変更し、E2Eテスト3件を通す
+- [x] `cargo test --test e2e_proposal_session` で全テスト通過を確認
+
 ## Implementation Blocker #1
 - category: other
 - summary: ローカルディスク容量不足で Rust 側の最終回帰検証（clippy/e2e）が完了できない
