@@ -21,14 +21,14 @@
 - [x] `cargo test --test e2e_proposal_session` で全テスト通過を確認
 
 ## Implementation Blocker #1
-- category: other
-- summary: ローカルディスク容量不足で Rust 側の最終回帰検証（clippy/e2e）が完了できない
-- evidence:
-  - `cargo test e2e_proposal_session -- --nocapture` 実行時に `No space left on device (os error 28)` で失敗
-  - `df -h .` 結果で `/System/Volumes/Data` の空きが `1.4Gi`、使用率 `100%`
-- impact: `cargo clippy -- -D warnings` と e2e を含む最終 Rust 回帰確認が未完了
-- unblock_actions:
-  - 開発環境のディスク空き容量を増やして `cargo clippy -- -D warnings` を再実行
-  - 同条件で `cargo test e2e_proposal_session -- --nocapture` を再実行し WebSocket 挙動を再確認
-- owner: development
-- decision_due: 2026-03-31
+category: other
+summary: ローカルディスク容量不足で Rust 側の最終回帰検証（clippy/e2e）が完了できない
+evidence:
+  • `cargo test e2e_proposal_session -- --nocapture` 実行時に `No space left on device (os error 28)` で失敗
+  • `df -h .` 結果で `/System/Volumes/Data` の空きが `1.4Gi`、使用率 `100%`
+impact: `cargo clippy -- -D warnings` と e2e を含む最終 Rust 回帰確認が未完了
+unblock_actions:
+  • 開発環境のディスク空き容量を増やして `cargo clippy -- -D warnings` を再実行
+  • 同条件で `cargo test e2e_proposal_session -- --nocapture` を再実行し WebSocket 挙動を再確認
+owner: development
+decision_due: 2026-03-31
