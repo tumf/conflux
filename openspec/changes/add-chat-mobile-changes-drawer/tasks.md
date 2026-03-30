@@ -8,6 +8,10 @@
 - [x] 6. Add Escape key handler to close the drawer (verification: press Escape closes drawer)
 - [x] 7. Add test for drawer open/close behavior (verification: `npm run test` passes in dashboard/)
 
+## Acceptance #1 Failure Follow-up
+
+- [x] Restore `docs/openapi.yaml` to its committed state (`git checkout docs/openapi.yaml`) — the file was emptied outside this change's scope
+
 ## Future Work
 
 - Swipe-to-dismiss gesture for mobile
