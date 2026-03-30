@@ -20,10 +20,10 @@ export function ChatInput({ onSend, disabled = false, placeholder = 'Type a mess
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-        e.preventDefault();
-        handleSubmit();
-      }
+      if (e.key !== 'Enter') return;
+      if (e.shiftKey) return;
+      e.preventDefault();
+      handleSubmit();
     },
     [handleSubmit],
   );
