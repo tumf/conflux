@@ -13,7 +13,7 @@ use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
 
 use super::state::{AppState, ChangeState};
-use super::types::{AppMode, QueueStatus};
+use super::types::AppMode;
 use super::utils::{get_version_string, truncate_to_display_width_with_suffix};
 
 /// Parsed parts of a remote change ID.
@@ -126,8 +126,8 @@ fn build_change_rows(changes: &[ChangeState]) -> (Vec<ChangeRow>, Vec<usize>) {
 /// Returns (checkbox_text, checkbox_color) based on the change's status.
 /// Archived changes are always shown as gray "[x]" to indicate they are
 /// no longer actionable.
-fn get_checkbox_display(queue_status: &QueueStatus, is_selected: bool) -> (&'static str, Color) {
-    if matches!(queue_status, QueueStatus::Archived | QueueStatus::Merged) {
+fn get_checkbox_display(display_status: &str, is_selected: bool) -> (&'static str, Color) {
+    if matches!(display_status, "archived" | "merged") {
         ("[x]", Color::DarkGray) // Archived - grayed out
     } else if is_selected {
         ("[x]", Color::Green) // Selected/In queue
@@ -303,7 +303,12 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
     let active_count = app
         .changes
         .iter()
-        .filter(|c| c.queue_status.is_active())
+        .filter(|c| {
+            matches!(
+                c.display_status_cache.as_str(),
+                "applying" | "accepting" | "archiving" | "resolving"
+            )
+        })
         .count();
 
     // Per spec (update-tui-header-loop-state):
@@ -415,16 +420,14 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 // [x] - selected (will become Queued when F5 is pressed)
                 // [x] (gray) - archived (processing complete, no longer actionable)
                 // Note: 'selected' field indicates selection for next run
-                let is_archived = matches!(
-                    change.queue_status,
-                    QueueStatus::Archived | QueueStatus::Merged
-                );
+                let is_archived =
+                    matches!(change.display_status_cache.as_str(), "archived" | "merged");
                 let show_uncommitted_badge = app.parallel_mode
                     && !change.is_parallel_eligible
                     && !is_archived
                     && matches!(
-                        change.queue_status,
-                        QueueStatus::NotQueued | QueueStatus::Queued
+                        change.display_status_cache.as_str(),
+                        "not queued" | "queued"
                     );
                 let is_parallel_blocked = show_uncommitted_badge;
                 // Determine if this is the focused/cursor row before computing colors.
@@ -439,7 +442,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 let (checkbox, checkbox_color) = if is_parallel_blocked {
                     ("[ ]", blocked_fg)
                 } else {
-                    get_checkbox_display(&change.queue_status, change.selected)
+                    get_checkbox_display(&change.display_status_cache, change.selected)
                 };
 
                 let cursor = if i == app.cursor_index { "►" } else { " " };
@@ -599,12 +602,15 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
         // Show "Space: stop" for active changes, otherwise describe the mark action.
         // In parallel mode, don't show Space hints for uncommitted changes.
         let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible;
-        if item.queue_status.is_active() {
+        if matches!(
+            item.display_status_cache.as_str(),
+            "applying" | "accepting" | "archiving" | "resolving"
+        ) {
             keys.push("Space: stop");
         } else if !is_parallel_blocked {
-            keys.push(match (&item.queue_status, item.selected) {
-                (QueueStatus::Error(_), true) => "Space: clear retry",
-                (QueueStatus::Error(_), false) => "Space: retry mark",
+            keys.push(match (item.display_status_cache.as_str(), item.selected) {
+                ("error", true) => "Space: clear retry",
+                ("error", false) => "Space: retry mark",
                 (_, true) => "Space: unqueue",
                 (_, false) => "Space: queue",
             });
@@ -613,7 +619,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
         // Show M key hint based on resolve state (only in Select, Running, Stopped modes)
         // - When resolve is NOT running and current item is MergeWait: "M: resolve"
         // - When resolve IS running and current item is MergeWait: "M: queue resolve"
-        if matches!(item.queue_status, QueueStatus::MergeWait)
+        if item.display_status_cache == "merge wait"
             && matches!(
                 app.mode,
                 AppMode::Select | AppMode::Running | AppMode::Stopped
@@ -702,17 +708,15 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 // [x] (gray) - archived (processing complete, no longer actionable)
                 // Note: Display is driven by 'selected' field, which serves dual purpose:
                 //   - Running: shows queue membership (selected=true means Queued/Processing)
-                //   - Stopped: shows execution mark (selected=true, queue_status=NotQueued)
-                let is_archived = matches!(
-                    change.queue_status,
-                    QueueStatus::Archived | QueueStatus::Merged
-                );
+                //   - Stopped: shows execution mark (selected=true, display_status_cache=NotQueued)
+                let is_archived =
+                    matches!(change.display_status_cache.as_str(), "archived" | "merged");
                 let show_uncommitted_badge = app.parallel_mode
                     && !change.is_parallel_eligible
                     && !is_archived
                     && matches!(
-                        change.queue_status,
-                        QueueStatus::NotQueued | QueueStatus::Queued
+                        change.display_status_cache.as_str(),
+                        "not queued" | "queued"
                     );
                 let is_parallel_blocked = show_uncommitted_badge;
                 // Determine if this is the focused/cursor row before computing colors.
@@ -727,7 +731,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 let (checkbox, checkbox_color) = if is_parallel_blocked {
                     ("[ ]", blocked_fg)
                 } else {
-                    get_checkbox_display(&change.queue_status, change.selected)
+                    get_checkbox_display(&change.display_status_cache, change.selected)
                 };
 
                 let cursor = if i == app.cursor_index { "►" } else { " " };
@@ -770,28 +774,23 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
                 // Build status text (without spinner for in-flight states)
                 // For in-flight states, spinner will be prepended separately with elapsed time
-                let (spinner_prefix, status_text) = match &change.queue_status {
-                    QueueStatus::Applying => {
+                let (spinner_prefix, status_text) = match change.display_status_cache.as_str() {
+                    "applying" | "archiving" | "resolving" | "accepting" => {
                         let status = if let Some(iter) = change.iteration_number {
-                            format!("[{}:{}]", change.queue_status.display(), iter)
+                            format!("[{}:{}]", change.display_status_cache.as_str(), iter)
                         } else {
-                            format!("[{}]", change.queue_status.display())
+                            format!("[{}]", change.display_status_cache.as_str())
                         };
                         (format!("{} ", spinner_char), status)
                     }
-                    QueueStatus::Archiving | QueueStatus::Resolving | QueueStatus::Accepting => {
-                        let status = if let Some(iter) = change.iteration_number {
-                            format!("[{}:{}]", change.queue_status.display(), iter)
-                        } else {
-                            format!("[{}]", change.queue_status.display())
-                        };
-                        (format!("{} ", spinner_char), status)
-                    }
-                    QueueStatus::Archived | QueueStatus::Merged | QueueStatus::Error(_) => (
+                    "archived" | "merged" | "error" => (
                         String::new(),
-                        format!("[{}]", change.queue_status.display()),
+                        format!("[{}]", change.display_status_cache.as_str()),
                     ),
-                    status => (String::new(), format!("[{}]", status.display())),
+                    _ => (
+                        String::new(),
+                        format!("[{}]", change.display_status_cache.as_str()),
+                    ),
                 };
 
                 // Pre-calculate widths before moving values into Spans
@@ -846,18 +845,18 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                     ));
                     spans.push(Span::styled(
                         status_text,
-                        Style::default().fg(change.queue_status.color()),
+                        Style::default().fg(change.display_color_cache),
                     ));
                 } else {
                     spans.push(Span::styled(
                         format!(" {:>18}", status_text),
-                        Style::default().fg(change.queue_status.color()),
+                        Style::default().fg(change.display_color_cache),
                     ));
                 }
 
                 // For Applying status, show progress as "completed/total(percent%)"
                 // For other statuses, show just "completed/total"
-                let tasks_text = if matches!(change.queue_status, QueueStatus::Applying) {
+                let tasks_text = if change.display_status_cache == "applying" {
                     format!(
                         "  {}/{}({:.0}%)",
                         change.completed_tasks,
@@ -957,12 +956,15 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
         // Show "Space: stop" for active changes, otherwise describe the mark action.
         // In parallel mode, don't show Space hints for uncommitted changes.
         let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible;
-        if item.queue_status.is_active() {
+        if matches!(
+            item.display_status_cache.as_str(),
+            "applying" | "accepting" | "archiving" | "resolving"
+        ) {
             keys.push("Space: stop");
         } else if !is_parallel_blocked {
-            keys.push(match (&item.queue_status, item.selected) {
-                (QueueStatus::Error(_), true) => "Space: clear retry",
-                (QueueStatus::Error(_), false) => "Space: retry mark",
+            keys.push(match (item.display_status_cache.as_str(), item.selected) {
+                ("error", true) => "Space: clear retry",
+                ("error", false) => "Space: retry mark",
                 (_, true) => "Space: unqueue",
                 (_, false) => "Space: queue",
             });
@@ -971,7 +973,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
         // Show M key hint based on resolve state (only in Select, Running, Stopped modes)
         // - When resolve is NOT running and current item is MergeWait: "M: resolve"
         // - When resolve IS running and current item is MergeWait: "M: queue resolve"
-        if matches!(item.queue_status, QueueStatus::MergeWait)
+        if item.display_status_cache == "merge wait"
             && matches!(
                 app.mode,
                 AppMode::Select | AppMode::Running | AppMode::Stopped
@@ -1410,7 +1412,7 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
         let has_error_changes = app
             .changes
             .iter()
-            .any(|change| matches!(change.queue_status, QueueStatus::Error(_)));
+            .any(|change| change.display_status_cache == "error");
         let message = if has_error_changes {
             "Select changes with Space to process (error rows need retry mark)"
         } else {
@@ -1815,29 +1817,29 @@ mod tests {
     fn test_get_checkbox_display_archived_always_gray() {
         // Archived status should always result in gray checkbox,
         // regardless of is_selected value
-        let (text, color) = get_checkbox_display(&QueueStatus::Archived, true);
+        let (text, color) = get_checkbox_display("archived", true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::DarkGray);
 
-        let (text, color) = get_checkbox_display(&QueueStatus::Archived, false);
+        let (text, color) = get_checkbox_display("archived", false);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::DarkGray);
     }
 
     #[test]
     fn test_get_checkbox_display_not_selected() {
-        let (text, color) = get_checkbox_display(&QueueStatus::NotQueued, false);
+        let (text, color) = get_checkbox_display("not queued", false);
         assert_eq!(text, "[ ]");
         assert_eq!(color, Color::Gray);
     }
 
     #[test]
     fn test_get_checkbox_display_selected() {
-        let (text, color) = get_checkbox_display(&QueueStatus::NotQueued, true);
+        let (text, color) = get_checkbox_display("not queued", true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
 
-        let (text, color) = get_checkbox_display(&QueueStatus::Queued, true);
+        let (text, color) = get_checkbox_display("queued", true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
     }
@@ -1845,7 +1847,7 @@ mod tests {
     #[test]
     fn test_get_checkbox_display_marked_not_queued() {
         // When selected but not queued, show [@] marker
-        let (text, color) = get_checkbox_display(&QueueStatus::NotQueued, true);
+        let (text, color) = get_checkbox_display("not queued", true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
     }
@@ -1853,12 +1855,12 @@ mod tests {
     #[test]
     fn test_get_checkbox_display_processing_states() {
         // Applying state should show green when selected
-        let (text, color) = get_checkbox_display(&QueueStatus::Applying, true);
+        let (text, color) = get_checkbox_display("applying", true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
 
         // Archiving state should show green when selected
-        let (text, color) = get_checkbox_display(&QueueStatus::Archiving, true);
+        let (text, color) = get_checkbox_display("archiving", true);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
     }
@@ -1884,7 +1886,7 @@ mod tests {
     #[test]
     fn test_render_resolving_status_shows_label() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "resolving".to_string();
         app.add_log(LogEntry::info("log"));
 
         let buffer = render_buffer(&mut app, 100, 24);
@@ -1895,7 +1897,7 @@ mod tests {
     #[test]
     fn test_render_merge_wait_status_shows_label() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
         app.add_log(LogEntry::info("log"));
 
         let buffer = render_buffer(&mut app, 100, 24);
@@ -1906,7 +1908,7 @@ mod tests {
     #[test]
     fn test_render_merge_wait_shows_resolve_key_hint() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
         app.is_resolving = false; // Not currently resolving
 
         let buffer = render_buffer(&mut app, 100, 24);
@@ -1920,7 +1922,7 @@ mod tests {
     #[test]
     fn test_render_merge_wait_hides_resolve_key_hint_when_resolving() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
         app.is_resolving = true; // Currently resolving
 
         let buffer = render_buffer(&mut app, 100, 24);
@@ -1950,7 +1952,7 @@ mod tests {
         // Verify that render shows M: resolve in Select mode with MergeWait
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Select;
-        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
         app.is_resolving = false;
         app.cursor_index = 0;
 
@@ -1968,7 +1970,7 @@ mod tests {
         // Verify that render does NOT show M: resolve in Error mode
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Error; // Error mode
-        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
         app.is_resolving = false;
         app.cursor_index = 0;
         app.add_log(LogEntry::info("log")); // Add log to show render_running_mode
@@ -1987,7 +1989,7 @@ mod tests {
         // Verify that render shows M: resolve in Running mode for MergeWait
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
         app.is_resolving = false;
         app.cursor_index = 0;
         app.add_log(LogEntry::info("log")); // Add log to trigger render_running_mode
@@ -2004,24 +2006,53 @@ mod tests {
     #[test]
     fn test_render_consistency_with_resolve_availability() {
         // Test that M key hint is shown correctly based on resolve state
-        // - When resolve is NOT running and queue_status is MergeWait: "M: resolve"
-        // - When resolve IS running and queue_status is MergeWait: "M: queue resolve"
+        // - When resolve is NOT running and display_status_cache is MergeWait: "M: resolve"
+        // - When resolve IS running and display_status_cache is MergeWait: "M: queue resolve"
         let test_cases = vec![
-            // (mode, queue_status, is_resolving, should_show_resolve, should_show_queue_resolve)
-            (AppMode::Select, QueueStatus::MergeWait, false, true, false),
-            (AppMode::Select, QueueStatus::MergeWait, true, false, true),
-            (AppMode::Running, QueueStatus::MergeWait, false, true, false),
-            (AppMode::Running, QueueStatus::MergeWait, true, false, true),
-            (AppMode::Error, QueueStatus::MergeWait, false, false, false),
-            (AppMode::Select, QueueStatus::Queued, false, false, false),
+            // (mode, display_status_cache, is_resolving, should_show_resolve, should_show_queue_resolve)
+            (
+                AppMode::Select,
+                "merge wait".to_string(),
+                false,
+                true,
+                false,
+            ),
+            (AppMode::Select, "merge wait".to_string(), true, false, true),
+            (
+                AppMode::Running,
+                "merge wait".to_string(),
+                false,
+                true,
+                false,
+            ),
+            (
+                AppMode::Running,
+                "merge wait".to_string(),
+                true,
+                false,
+                true,
+            ),
+            (
+                AppMode::Error,
+                "merge wait".to_string(),
+                false,
+                false,
+                false,
+            ),
+            (AppMode::Select, "queued".to_string(), false, false, false),
         ];
 
-        for (mode, queue_status, is_resolving, should_show_resolve, should_show_queue_resolve) in
-            test_cases
+        for (
+            mode,
+            display_status_cache,
+            is_resolving,
+            should_show_resolve,
+            should_show_queue_resolve,
+        ) in test_cases
         {
             let mut app = create_test_app(vec![create_test_change("change-a")]);
             app.mode = mode.clone();
-            app.changes[0].queue_status = queue_status.clone();
+            app.changes[0].display_status_cache = display_status_cache.clone();
             app.is_resolving = is_resolving;
             app.cursor_index = 0;
             if mode != AppMode::Select {
@@ -2035,13 +2066,13 @@ mod tests {
 
             assert_eq!(
                 shows_resolve, should_show_resolve,
-                "Render 'M: resolve' hint mismatch for mode={:?}, queue_status={:?}, is_resolving={}",
-                mode, queue_status, is_resolving
+                "Render 'M: resolve' hint mismatch for mode={:?}, display_status_cache={:?}, is_resolving={}",
+                mode, display_status_cache, is_resolving
             );
             assert_eq!(
                 shows_queue_resolve, should_show_queue_resolve,
-                "Render 'M: queue resolve' hint mismatch for mode={:?}, queue_status={:?}, is_resolving={}",
-                mode, queue_status, is_resolving
+                "Render 'M: queue resolve' hint mismatch for mode={:?}, display_status_cache={:?}, is_resolving={}",
+                mode, display_status_cache, is_resolving
             );
         }
     }
@@ -2065,7 +2096,7 @@ mod tests {
     fn test_render_parallel_archived_row_does_not_show_uncommited_badge() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.parallel_mode = true;
-        app.changes[0].queue_status = QueueStatus::Archived;
+        app.changes[0].display_status_cache = "archived".to_string();
         app.changes[0].is_parallel_eligible = false;
 
         let buffer = render_buffer(&mut app, 80, 24);
@@ -2079,7 +2110,7 @@ mod tests {
     fn test_render_parallel_uncommitted_queueable_row_shows_uncommited_badge() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.parallel_mode = true;
-        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].display_status_cache = "not queued".to_string();
         app.changes[0].is_parallel_eligible = false;
 
         let buffer = render_buffer(&mut app, 80, 24);
@@ -2100,7 +2131,7 @@ mod tests {
         // DarkGray highlight background.
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.parallel_mode = true;
-        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].display_status_cache = "not queued".to_string();
         app.changes[0].is_parallel_eligible = false;
         app.cursor_index = 0; // cursor on the blocked row
 
@@ -2121,7 +2152,7 @@ mod tests {
             create_test_change("change-b"),
         ]);
         app.parallel_mode = true;
-        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].display_status_cache = "not queued".to_string();
         app.changes[0].is_parallel_eligible = false;
         app.cursor_index = 1; // cursor on change-b, not on the blocked row
 
@@ -2140,7 +2171,7 @@ mod tests {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Running;
         app.parallel_mode = true;
-        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].display_status_cache = "not queued".to_string();
         app.changes[0].is_parallel_eligible = false;
         app.cursor_index = 0;
 
@@ -2161,7 +2192,7 @@ mod tests {
         ]);
         app.mode = AppMode::Running;
         app.parallel_mode = true;
-        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].display_status_cache = "not queued".to_string();
         app.changes[0].is_parallel_eligible = false;
         app.cursor_index = 1;
 
@@ -2392,10 +2423,10 @@ mod tests {
         // - change-b: Applying (should be counted)
         // - change-c: Archiving (should be counted)
         // - change-d: NotQueued (should NOT be counted)
-        app.changes[0].queue_status = QueueStatus::Queued;
-        app.changes[1].queue_status = QueueStatus::Applying;
-        app.changes[2].queue_status = QueueStatus::Archiving;
-        app.changes[3].queue_status = QueueStatus::NotQueued;
+        app.changes[0].display_status_cache = "queued".to_string();
+        app.changes[1].display_status_cache = "applying".to_string();
+        app.changes[2].display_status_cache = "archiving".to_string();
+        app.changes[3].display_status_cache = "not queued".to_string();
 
         // Add a log to trigger running mode display
         app.add_log(LogEntry::info("test"));
@@ -2430,8 +2461,8 @@ mod tests {
         app.mode = AppMode::Running;
 
         // Set one change to Resolving, one to Queued
-        app.changes[0].queue_status = QueueStatus::Resolving;
-        app.changes[1].queue_status = QueueStatus::Queued;
+        app.changes[0].display_status_cache = "resolving".to_string();
+        app.changes[1].display_status_cache = "queued".to_string();
 
         // Add a log to trigger running mode display
         app.add_log(LogEntry::info("test"));
@@ -2455,8 +2486,8 @@ mod tests {
         ]);
 
         app.mode = AppMode::Select;
-        app.changes[0].queue_status = QueueStatus::Resolving;
-        app.changes[1].queue_status = QueueStatus::Queued;
+        app.changes[0].display_status_cache = "resolving".to_string();
+        app.changes[1].display_status_cache = "queued".to_string();
 
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
@@ -2478,7 +2509,7 @@ mod tests {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
 
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Queued;
+        app.changes[0].display_status_cache = "queued".to_string();
 
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
@@ -2853,7 +2884,7 @@ mod tests {
         // Mark the change as uncommitted (not parallel eligible)
         app.changes[0].is_parallel_eligible = false;
         app.changes[0].selected = false;
-        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].display_status_cache = "not queued".to_string();
 
         // Render the frame
         terminal
@@ -2914,7 +2945,7 @@ mod tests {
         // Mark the change as committed (parallel eligible) - this is the default
         app.changes[0].is_parallel_eligible = true;
         app.changes[0].selected = false;
-        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].display_status_cache = "not queued".to_string();
 
         // Render the frame
         terminal
@@ -2969,7 +3000,7 @@ mod tests {
     fn test_toggle_all_hint_shown_in_running_mode_with_non_active_target() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].display_status_cache = "not queued".to_string();
 
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
@@ -2983,7 +3014,7 @@ mod tests {
     fn test_toggle_all_hint_not_shown_in_running_mode_without_non_active_targets() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "resolving".to_string();
 
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
@@ -3079,7 +3110,9 @@ mod tests {
             id: id.to_string(),
             completed_tasks: 0,
             total_tasks: 3,
-            queue_status: crate::tui::types::QueueStatus::NotQueued,
+            display_status_cache: "not queued".to_string(),
+            display_color_cache: Color::DarkGray,
+            error_message_cache: None,
             selected: false,
             is_new: false,
             is_parallel_eligible: true,

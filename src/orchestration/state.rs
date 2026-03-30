@@ -236,6 +236,7 @@ impl ChangeRuntimeState {
     }
 
     /// Derive the display color used by TUI status rendering.
+    #[allow(dead_code)]
     pub fn display_color(&self) -> ratatui::style::Color {
         match self.display_status() {
             "not queued" => ratatui::style::Color::DarkGray,
@@ -256,6 +257,7 @@ impl ChangeRuntimeState {
     }
 
     /// Returns the terminal error message when in error state.
+    #[allow(dead_code)]
     pub fn error_message(&self) -> Option<&str> {
         match &self.terminal {
             TerminalState::Error(message) => Some(message.as_str()),
