@@ -7332,10 +7332,40 @@ mod tests {
             .await
             .unwrap();
         let overview_json: serde_json::Value = serde_json::from_slice(&overview_body).unwrap();
+
+        // summary contract assertions
         assert_eq!(overview_json["summary"]["success_count"], 1);
         assert_eq!(overview_json["summary"]["failure_count"], 0);
-        assert!(overview_json["recent_events"].is_array());
-        assert!(overview_json["project_stats"].is_array());
+        assert_eq!(overview_json["summary"]["in_progress_count"], 0);
+        assert_eq!(overview_json["summary"]["average_duration_ms"], 1234.0);
+
+        // recent_events contract assertions
+        let recent_events = overview_json["recent_events"]
+            .as_array()
+            .expect("recent_events must be an array");
+        assert!(!recent_events.is_empty(), "recent_events must not be empty");
+        let first_event = &recent_events[0];
+        assert_eq!(first_event["project_id"], project_id);
+        assert_eq!(first_event["change_id"], "change-1");
+        assert_eq!(first_event["operation"], "apply");
+        assert_eq!(first_event["result"], "success");
+        assert!(
+            first_event["timestamp"].as_str().is_some(),
+            "recent_events[0].timestamp must be a string"
+        );
+
+        // project_stats contract assertions
+        let project_stats = overview_json["project_stats"]
+            .as_array()
+            .expect("project_stats must be an array");
+        assert!(!project_stats.is_empty(), "project_stats must not be empty");
+        let first_project_stats = &project_stats[0];
+        assert_eq!(first_project_stats["project_id"], project_id);
+        assert_eq!(first_project_stats["success_count"], 1);
+        assert_eq!(first_project_stats["failure_count"], 0);
+        assert_eq!(first_project_stats["in_progress_count"], 0);
+        assert_eq!(first_project_stats["average_duration_ms"], 1234.0);
+        assert_eq!(first_project_stats["apply_success_rate"], 1.0);
 
         let history_resp = router
             .clone()
