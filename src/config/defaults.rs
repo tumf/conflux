@@ -302,6 +302,36 @@ pub fn default_workspace_base_dir(repo_root: Option<&std::path::Path>) -> PathBu
     path
 }
 
+/// Returns server service log path using XDG_STATE_HOME-compliant defaults.
+///
+/// - Uses `${XDG_STATE_HOME}/cflx/server.log` when XDG_STATE_HOME is set and non-empty
+/// - Falls back to `~/.local/state/cflx/server.log` when home directory is available
+/// - Falls back to `{temp_dir}/cflx-server.log` when home directory is unavailable
+pub fn get_server_log_path() -> PathBuf {
+    let xdg_state_home = std::env::var("XDG_STATE_HOME").ok();
+    get_server_log_path_from(xdg_state_home.as_deref(), dirs::home_dir())
+}
+
+fn get_server_log_path_from(xdg_state_home: Option<&str>, home_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(xdg_state_home) = xdg_state_home {
+        if !xdg_state_home.is_empty() {
+            return PathBuf::from(xdg_state_home)
+                .join("cflx")
+                .join("server.log");
+        }
+    }
+
+    if let Some(home) = home_dir {
+        return home
+            .join(".local")
+            .join("state")
+            .join("cflx")
+            .join("server.log");
+    }
+
+    std::env::temp_dir().join("cflx-server.log")
+}
+
 /// Generates log file path using XDG_STATE_HOME with project_slug and date.
 /// Format: `{XDG_STATE_HOME}/cflx/logs/<project_slug>/<YYYY-MM-DD>.log`
 ///
@@ -419,6 +449,14 @@ pub fn cleanup_old_logs(
 mod tests {
     use super::*;
 
+    fn set_env_var<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
+        unsafe { std::env::set_var(key, value) }
+    }
+
+    fn remove_env_var<K: AsRef<std::ffi::OsStr>>(key: K) {
+        unsafe { std::env::remove_var(key) }
+    }
+
     #[test]
     fn test_default_workspace_base_dir_returns_path() {
         // Test that the function returns a valid PathBuf without repo_root
@@ -487,7 +525,7 @@ mod tests {
 
             // Set XDG_DATA_HOME
             let test_path = "/tmp/test-xdg-data";
-            env::set_var("XDG_DATA_HOME", test_path);
+            set_env_var("XDG_DATA_HOME", test_path);
 
             let repo_root = PathBuf::from("/tmp/test-repo");
             let result = default_workspace_base_dir(Some(&repo_root));
@@ -507,8 +545,8 @@ mod tests {
 
             // Restore original value
             match original {
-                Some(val) => env::set_var("XDG_DATA_HOME", val),
-                None => env::remove_var("XDG_DATA_HOME"),
+                Some(val) => set_env_var("XDG_DATA_HOME", val),
+                None => remove_env_var("XDG_DATA_HOME"),
             }
         }
     }
@@ -617,6 +655,51 @@ mod tests {
     }
 
     #[test]
+    fn test_get_server_log_path_with_xdg_state_home() {
+        let result = get_server_log_path_from(
+            Some("/custom/state"),
+            Some(PathBuf::from("/home/test-user")),
+        );
+
+        assert_eq!(result, PathBuf::from("/custom/state/cflx/server.log"));
+    }
+
+    #[test]
+    fn test_get_server_log_path_without_xdg_state_home() {
+        use std::env;
+
+        let original = env::var("XDG_STATE_HOME").ok();
+        remove_env_var("XDG_STATE_HOME");
+
+        let home = PathBuf::from("/home/test-user");
+        let result = get_server_log_path_from(None, Some(home.clone()));
+
+        assert_eq!(result, home.join(".local/state/cflx/server.log"));
+
+        match original {
+            Some(val) => set_env_var("XDG_STATE_HOME", val),
+            None => remove_env_var("XDG_STATE_HOME"),
+        }
+    }
+
+    #[test]
+    fn test_get_server_log_path_without_home_directory() {
+        use std::env;
+
+        let original = env::var("XDG_STATE_HOME").ok();
+        remove_env_var("XDG_STATE_HOME");
+
+        let result = get_server_log_path_from(None, None);
+
+        assert_eq!(result, std::env::temp_dir().join("cflx-server.log"));
+
+        match original {
+            Some(val) => set_env_var("XDG_STATE_HOME", val),
+            None => remove_env_var("XDG_STATE_HOME"),
+        }
+    }
+
+    #[test]
     fn test_cleanup_old_logs_with_nonexistent_directory() {
         // Should return Ok(0) for non-existent directory
         let repo_root = PathBuf::from("/tmp/nonexistent-repo-for-test");
@@ -639,7 +722,7 @@ mod tests {
 
         // Save original XDG_STATE_HOME and set to temp
         let original_state_home = env::var("XDG_STATE_HOME").ok();
-        env::set_var("XDG_STATE_HOME", &temp_state_home);
+        set_env_var("XDG_STATE_HOME", &temp_state_home);
 
         // Create repo root and get project slug
         let repo_root = PathBuf::from("/tmp/test-retention-repo");
@@ -708,8 +791,8 @@ mod tests {
 
         // Restore original XDG_STATE_HOME
         match original_state_home {
-            Some(val) => env::set_var("XDG_STATE_HOME", val),
-            None => env::remove_var("XDG_STATE_HOME"),
+            Some(val) => set_env_var("XDG_STATE_HOME", val),
+            None => remove_env_var("XDG_STATE_HOME"),
         }
     }
 }
