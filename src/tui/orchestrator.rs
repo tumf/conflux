@@ -39,6 +39,23 @@ fn post_archive_dispatch_event(
     })
 }
 
+async fn dispatch_event(
+    tx: &mpsc::Sender<OrchestratorEvent>,
+    shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    #[cfg(feature = "web-monitoring")] web_state: Option<&Arc<crate::web::WebState>>,
+    event: OrchestratorEvent,
+) {
+    let _ = tx.send(event.clone()).await;
+    {
+        let mut state = shared_state.write().await;
+        crate::orchestration::state::OrchestratorState::apply_execution_event(&mut state, &event);
+    }
+    #[cfg(feature = "web-monitoring")]
+    if let Some(ws) = web_state {
+        crate::web::WebState::apply_execution_event(ws, &event).await;
+    }
+}
+
 /// Run the orchestrator for selected changes
 /// Uses streaming output to send log entries in real-time
 /// Supports cancellation via CancellationToken for graceful shutdown
@@ -258,11 +275,14 @@ pub async fn run_orchestrator(
             let change_stopped_event = OrchestratorEvent::ChangeStopped {
                 change_id: change_id.clone(),
             };
-            let _ = tx.send(change_stopped_event.clone()).await;
-            shared_state
-                .write()
-                .await
-                .apply_execution_event(&change_stopped_event);
+            dispatch_event(
+                &tx,
+                &shared_state,
+                #[cfg(feature = "web-monitoring")]
+                web_state.as_ref(),
+                change_stopped_event,
+            )
+            .await;
             let _ = tx
                 .send(OrchestratorEvent::Log(LogEntry::info(format!(
                     "Change stopped: {}",
@@ -274,16 +294,14 @@ pub async fn run_orchestrator(
 
         // Notify processing started
         let processing_started_event = OrchestratorEvent::ProcessingStarted(change_id.clone());
-        let _ = tx.send(processing_started_event.clone()).await;
-        // Update shared orchestration state
-        shared_state
-            .write()
-            .await
-            .apply_execution_event(&processing_started_event);
-        #[cfg(feature = "web-monitoring")]
-        if let Some(ws) = &web_state {
-            ws.apply_execution_event(&processing_started_event).await;
-        }
+        dispatch_event(
+            &tx,
+            &shared_state,
+            #[cfg(feature = "web-monitoring")]
+            web_state.as_ref(),
+            processing_started_event,
+        )
+        .await;
 
         let remaining_changes = shared_state.read().await.remaining_changes();
 
@@ -404,15 +422,14 @@ pub async fn run_orchestrator(
             change_id: change_id.to_string(),
             command: apply_expanded_command,
         };
-        let _ = tx.send(apply_started_event.clone()).await;
-        shared_state
-            .write()
-            .await
-            .apply_execution_event(&apply_started_event);
-        #[cfg(feature = "web-monitoring")]
-        if let Some(ws) = &web_state {
-            ws.apply_execution_event(&apply_started_event).await;
-        }
+        dispatch_event(
+            &tx,
+            &shared_state,
+            #[cfg(feature = "web-monitoring")]
+            web_state.as_ref(),
+            apply_started_event,
+        )
+        .await;
 
         // Process the change using SerialRunService
         use crate::serial_run_service::ChangeProcessResult;
@@ -461,11 +478,14 @@ pub async fn run_orchestrator(
             output: String::new(),
             iteration: Some(apply_count),
         };
-        let _ = tx.send(apply_output_event.clone()).await;
-        #[cfg(feature = "web-monitoring")]
-        if let Some(ws) = &web_state {
-            ws.apply_execution_event(&apply_output_event).await;
-        }
+        dispatch_event(
+            &tx,
+            &shared_state,
+            #[cfg(feature = "web-monitoring")]
+            web_state.as_ref(),
+            apply_output_event,
+        )
+        .await;
 
         match result {
             Ok(ChangeProcessResult::Cancelled) => {
@@ -484,11 +504,15 @@ pub async fn run_orchestrator(
                 let change_stopped_event = OrchestratorEvent::ChangeStopped {
                     change_id: change_id.clone(),
                 };
-                let _ = tx.send(change_stopped_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&change_stopped_event);
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    change_stopped_event,
+                )
+                .await;
+
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::info(format!(
                         "Change {} stopped, continuing with other queued changes",
@@ -505,57 +529,53 @@ pub async fn run_orchestrator(
                     change_id: change_id.clone(),
                     revision: String::new(),
                 };
-                let _ = tx.send(apply_completed_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&apply_completed_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&apply_completed_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    apply_completed_event,
+                )
+                .await;
 
                 // Send AcceptanceStarted event
                 let acceptance_started_event = OrchestratorEvent::AcceptanceStarted {
                     change_id: change_id.clone(),
                     command: format!("opencode acceptance {}", change_id),
                 };
-                let _ = tx.send(acceptance_started_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&acceptance_started_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&acceptance_started_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    acceptance_started_event,
+                )
+                .await;
 
                 // Send AcceptanceCompleted event
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
                     change_id: change_id.clone(),
                 };
-                let _ = tx.send(acceptance_completed_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&acceptance_completed_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&acceptance_completed_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    acceptance_completed_event,
+                )
+                .await;
 
                 // Send ProcessingCompleted event
                 let processing_completed_event =
                     OrchestratorEvent::ProcessingCompleted(change_id.clone());
-                let _ = tx.send(processing_completed_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&processing_completed_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&processing_completed_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    processing_completed_event,
+                )
+                .await;
             }
             Ok(ChangeProcessResult::ApplySuccessIncomplete) => {
                 // Send ApplyCompleted event
@@ -563,15 +583,14 @@ pub async fn run_orchestrator(
                     change_id: change_id.clone(),
                     revision: String::new(),
                 };
-                let _ = tx.send(apply_completed_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&apply_completed_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&apply_completed_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    apply_completed_event,
+                )
+                .await;
             }
             Ok(ChangeProcessResult::AcceptanceContinue) => {
                 // Send ApplyCompleted event
@@ -579,15 +598,14 @@ pub async fn run_orchestrator(
                     change_id: change_id.clone(),
                     revision: String::new(),
                 };
-                let _ = tx.send(apply_completed_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&apply_completed_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&apply_completed_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    apply_completed_event,
+                )
+                .await;
 
                 // Note: AcceptanceStarted event is sent from acceptance_test_streaming
                 // with the actual command string (including diff context and last output)
@@ -596,15 +614,14 @@ pub async fn run_orchestrator(
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
                     change_id: change_id.clone(),
                 };
-                let _ = tx.send(acceptance_completed_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&acceptance_completed_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&acceptance_completed_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    acceptance_completed_event,
+                )
+                .await;
             }
             Ok(ChangeProcessResult::AcceptanceContinueExceeded) => {
                 // Send ApplyCompleted event
@@ -612,29 +629,27 @@ pub async fn run_orchestrator(
                     change_id: change_id.clone(),
                     revision: String::new(),
                 };
-                let _ = tx.send(apply_completed_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&apply_completed_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&apply_completed_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    apply_completed_event,
+                )
+                .await;
 
                 // Send AcceptanceCompleted event
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
                     change_id: change_id.clone(),
                 };
-                let _ = tx.send(acceptance_completed_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&acceptance_completed_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&acceptance_completed_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    acceptance_completed_event,
+                )
+                .await;
             }
             Ok(ChangeProcessResult::AcceptanceBlocked) => {
                 // Send ApplyCompleted event
@@ -642,29 +657,27 @@ pub async fn run_orchestrator(
                     change_id: change_id.clone(),
                     revision: String::new(),
                 };
-                let _ = tx.send(apply_completed_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&apply_completed_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&apply_completed_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    apply_completed_event,
+                )
+                .await;
 
                 // Send AcceptanceCompleted event
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
                     change_id: change_id.clone(),
                 };
-                let _ = tx.send(acceptance_completed_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&acceptance_completed_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&acceptance_completed_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    acceptance_completed_event,
+                )
+                .await;
 
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::warn(
@@ -684,15 +697,14 @@ pub async fn run_orchestrator(
                     change_id: change_id.clone(),
                     revision: String::new(),
                 };
-                let _ = tx.send(apply_completed_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&apply_completed_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&apply_completed_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    apply_completed_event,
+                )
+                .await;
 
                 // Note: AcceptanceStarted event is sent from acceptance_test_streaming
                 // with the actual command string (including diff context and last output)
@@ -701,15 +713,14 @@ pub async fn run_orchestrator(
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
                     change_id: change_id.clone(),
                 };
-                let _ = tx.send(acceptance_completed_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&acceptance_completed_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&acceptance_completed_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    acceptance_completed_event,
+                )
+                .await;
             }
             Ok(ChangeProcessResult::AcceptanceCommandFailed { error }) => {
                 // Send ApplyCompleted event
@@ -717,15 +728,14 @@ pub async fn run_orchestrator(
                     change_id: change_id.clone(),
                     revision: String::new(),
                 };
-                let _ = tx.send(apply_completed_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&apply_completed_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&apply_completed_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    apply_completed_event,
+                )
+                .await;
 
                 // Note: AcceptanceStarted event is sent from acceptance_test_streaming
                 // with the actual command string (including diff context and last output)
@@ -734,15 +744,14 @@ pub async fn run_orchestrator(
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
                     change_id: change_id.clone(),
                 };
-                let _ = tx.send(acceptance_completed_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&acceptance_completed_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&acceptance_completed_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    acceptance_completed_event,
+                )
+                .await;
 
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::error(format!(
@@ -756,15 +765,14 @@ pub async fn run_orchestrator(
                     id: change_id.clone(),
                     error: error.clone(),
                 };
-                let _ = tx.send(processing_error_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&processing_error_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&processing_error_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    processing_error_event,
+                )
+                .await;
             }
             Ok(ChangeProcessResult::Archived) => {
                 // Change was complete and successfully archived
@@ -777,27 +785,27 @@ pub async fn run_orchestrator(
 
                 // Send ChangeArchived event
                 let change_archived_event = OrchestratorEvent::ChangeArchived(change_id.clone());
-                let _ = tx.send(change_archived_event.clone()).await;
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    change_archived_event,
+                )
+                .await;
                 let post_archive_event = {
-                    let mut state = shared_state.write().await;
-                    state.apply_execution_event(&change_archived_event);
+                    let state = shared_state.read().await;
                     post_archive_dispatch_event(&state, &change_id)
                 };
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&change_archived_event).await;
-                }
-
-                if let Some(dispatch_event) = post_archive_event {
-                    let _ = tx.send(dispatch_event.clone()).await;
-                    shared_state
-                        .write()
-                        .await
-                        .apply_execution_event(&dispatch_event);
-                    #[cfg(feature = "web-monitoring")]
-                    if let Some(ws) = &web_state {
-                        ws.apply_execution_event(&dispatch_event).await;
-                    }
+                if let Some(post_event) = post_archive_event {
+                    dispatch_event(
+                        &tx,
+                        &shared_state,
+                        #[cfg(feature = "web-monitoring")]
+                        web_state.as_ref(),
+                        post_event,
+                    )
+                    .await;
                 }
             }
             Ok(ChangeProcessResult::Stalled { error }) => {
@@ -805,15 +813,14 @@ pub async fn run_orchestrator(
                     id: change_id.clone(),
                     error: error.clone(),
                 };
-                let _ = tx.send(processing_error_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&processing_error_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&processing_error_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    processing_error_event,
+                )
+                .await;
 
                 // Remove stalled change from pending
                 shared_state.write().await.remove_from_pending(&change_id);
@@ -823,15 +830,14 @@ pub async fn run_orchestrator(
                     id: change_id.clone(),
                     error: error.clone(),
                 };
-                let _ = tx.send(processing_error_event.clone()).await;
-                shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&processing_error_event);
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ws) = &web_state {
-                    ws.apply_execution_event(&processing_error_event).await;
-                }
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    processing_error_event,
+                )
+                .await;
             }
             Err(e) => {
                 // Check if this was a single-change stop (error message contains "Cancelled")
@@ -843,11 +849,14 @@ pub async fn run_orchestrator(
                     let change_stopped_event2 = OrchestratorEvent::ChangeStopped {
                         change_id: change_id.clone(),
                     };
-                    let _ = tx.send(change_stopped_event2.clone()).await;
-                    shared_state
-                        .write()
-                        .await
-                        .apply_execution_event(&change_stopped_event2);
+                    dispatch_event(
+                        &tx,
+                        &shared_state,
+                        #[cfg(feature = "web-monitoring")]
+                        web_state.as_ref(),
+                        change_stopped_event2,
+                    )
+                    .await;
                     let _ = tx
                         .send(OrchestratorEvent::Log(LogEntry::info(format!(
                             "Change stopped during execution: {}",
@@ -862,15 +871,14 @@ pub async fn run_orchestrator(
                         id: change_id.clone(),
                         error: error_msg,
                     };
-                    let _ = tx.send(processing_error_event.clone()).await;
-                    shared_state
-                        .write()
-                        .await
-                        .apply_execution_event(&processing_error_event);
-                    #[cfg(feature = "web-monitoring")]
-                    if let Some(ws) = &web_state {
-                        ws.apply_execution_event(&processing_error_event).await;
-                    }
+                    dispatch_event(
+                        &tx,
+                        &shared_state,
+                        #[cfg(feature = "web-monitoring")]
+                        web_state.as_ref(),
+                        processing_error_event,
+                    )
+                    .await;
                     break;
                 }
             }
@@ -1014,7 +1022,7 @@ pub async fn run_orchestrator_parallel(
         let (tx, mut rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                web_state.apply_execution_event(&event).await;
+                crate::web::WebState::apply_execution_event(&web_state, &event).await;
                 if matches!(
                     event,
                     crate::events::ExecutionEvent::AllCompleted
@@ -1070,10 +1078,13 @@ pub async fn run_orchestrator_parallel(
                             // This prevents TUI updates from being blocked when acceptance tests run for a long time
                             let _ = forward_tx.send(parallel_event.clone()).await;
                             // Apply to shared orchestration state
-                            forward_shared_state
-                                .write()
-                                .await
-                                .apply_execution_event(&parallel_event);
+                            {
+                                let mut state = forward_shared_state.write().await;
+                                crate::orchestration::state::OrchestratorState::apply_execution_event(
+                                    &mut state,
+                                    &parallel_event,
+                                );
+                            }
                             // Forward to WebState
                             #[cfg(feature = "web-monitoring")]
                             if let Some(tx) = &forward_web_tx {
@@ -1288,12 +1299,17 @@ mod tests {
             ExecutionMode::Parallel,
         );
 
-        state.apply_execution_event(&ExecutionEvent::ResolveStarted {
-            change_id: "change-a".to_string(),
-            command: "resolve change-a".to_string(),
-        });
-
-        state.apply_execution_event(&ExecutionEvent::ChangeArchived("change-b".to_string()));
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::ResolveStarted {
+                change_id: "change-b".to_string(),
+                command: "resolve change-b".to_string(),
+            },
+        );
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::ChangeArchived("change-b".to_string()),
+        );
 
         let deferred = super::post_archive_dispatch_event(&state, "change-b");
         assert!(matches!(
@@ -1306,7 +1322,9 @@ mod tests {
         ));
 
         if let Some(event) = deferred {
-            state.apply_execution_event(&event);
+            crate::orchestration::state::OrchestratorState::apply_execution_event(
+                &mut state, &event,
+            );
         }
 
         let runtime = state
@@ -1323,7 +1341,10 @@ mod tests {
         let mut state =
             OrchestratorState::with_mode(vec!["change-a".to_string()], 3, ExecutionMode::Parallel);
 
-        state.apply_execution_event(&ExecutionEvent::ChangeArchived("change-a".to_string()));
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::ChangeArchived("change-a".to_string()),
+        );
 
         let deferred = super::post_archive_dispatch_event(&state, "change-a");
         assert!(matches!(
@@ -1336,7 +1357,9 @@ mod tests {
         ));
 
         if let Some(event) = deferred {
-            state.apply_execution_event(&event);
+            crate::orchestration::state::OrchestratorState::apply_execution_event(
+                &mut state, &event,
+            );
         }
 
         let runtime = state
