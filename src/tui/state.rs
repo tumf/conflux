@@ -17,8 +17,9 @@
 use crate::openspec::Change;
 use crate::task_parser;
 use crate::tui::events::{LogEntry, LogLevel, OrchestratorEvent, TuiCommand};
-use crate::tui::types::{AppMode, QueueStatus, StopMode, ViewMode, WorktreeAction, WorktreeInfo};
+use crate::tui::types::{AppMode, StopMode, ViewMode, WorktreeAction, WorktreeInfo};
 use crate::vcs::GitWorkspaceManager;
+use ratatui::style::Color;
 use ratatui::widgets::ListState;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -27,21 +28,21 @@ use tracing::{debug, error, info, warn};
 
 fn apply_remote_status(change: &mut ChangeState, status: &str) {
     // Avoid regressing active/terminal states based on laggy remote snapshots.
-    let current = change.queue_status.clone();
+    let current = change.display_status_cache.as_str();
 
     let next = match status {
-        "applying" => Some(QueueStatus::Applying),
-        "archiving" => Some(QueueStatus::Archiving),
-        "accepting" => Some(QueueStatus::Accepting),
-        "resolving" => Some(QueueStatus::Resolving),
-        "archived" => Some(QueueStatus::Archived),
-        "merged" => Some(QueueStatus::Merged),
-        "merge_wait" => Some(QueueStatus::MergeWait),
-        "resolve_wait" => Some(QueueStatus::ResolveWait),
-        "blocked" => Some(QueueStatus::Blocked),
-        "queued" => Some(QueueStatus::Queued),
-        "idle" => Some(QueueStatus::NotQueued),
-        "error" => Some(QueueStatus::Error("remote".to_string())),
+        "applying" => Some("applying"),
+        "archiving" => Some("archiving"),
+        "accepting" => Some("accepting"),
+        "resolving" => Some("resolving"),
+        "archived" => Some("archived"),
+        "merged" => Some("merged"),
+        "merge_wait" => Some("merge wait"),
+        "resolve_wait" => Some("resolve pending"),
+        "blocked" => Some("blocked"),
+        "queued" => Some("queued"),
+        "idle" => Some("not queued"),
+        "error" => Some("error"),
         _ => None,
     };
 
@@ -52,50 +53,43 @@ fn apply_remote_status(change: &mut ChangeState, status: &str) {
     // Don't downgrade active states to queued/idle.
     if matches!(
         current,
-        QueueStatus::Applying
-            | QueueStatus::Archiving
-            | QueueStatus::Accepting
-            | QueueStatus::Resolving
-    ) && matches!(next, QueueStatus::Queued | QueueStatus::NotQueued)
+        "applying" | "archiving" | "accepting" | "resolving"
+    ) && matches!(next, "queued" | "not queued")
     {
         return;
     }
 
     // Only set queued/idle if we're not already in a terminal state.
-    if matches!(next, QueueStatus::Queued | QueueStatus::NotQueued)
-        && matches!(
-            current,
-            QueueStatus::Archived | QueueStatus::Merged | QueueStatus::Error(_)
-        )
+    if matches!(next, "queued" | "not queued") && matches!(current, "archived" | "merged" | "error")
     {
         return;
     }
 
     // Transition bookkeeping for elapsed time.
-    if matches!(next, QueueStatus::Applying) && change.started_at.is_none() {
+    if matches!(next, "applying") && change.started_at.is_none() {
         change.started_at = Some(Instant::now());
         change.elapsed_time = None;
     }
 
-    if !matches!(
-        next,
-        QueueStatus::Applying
-            | QueueStatus::Archiving
-            | QueueStatus::Accepting
-            | QueueStatus::Resolving
-    ) && matches!(
-        current,
-        QueueStatus::Applying
-            | QueueStatus::Archiving
-            | QueueStatus::Accepting
-            | QueueStatus::Resolving
-    ) {
+    if !matches!(next, "applying" | "archiving" | "accepting" | "resolving")
+        && matches!(
+            current,
+            "applying" | "archiving" | "accepting" | "resolving"
+        )
+    {
         if let Some(started) = change.started_at {
             change.elapsed_time = Some(started.elapsed());
         }
     }
 
-    change.queue_status = next;
+    if next == "error" {
+        if change.error_message_cache.is_none() {
+            change.error_message_cache = Some("remote".to_string());
+        }
+        change.set_display_status_cache("error");
+    } else {
+        change.set_display_status_cache(next);
+    }
 }
 
 // ============================================================================
@@ -127,8 +121,12 @@ pub struct ChangeState {
     pub completed_tasks: u32,
     /// Total number of tasks
     pub total_tasks: u32,
-    /// Queue status
-    pub queue_status: QueueStatus,
+    /// Display status cache (from reducer/TUI events)
+    pub display_status_cache: String,
+    /// Display color cache for status
+    pub display_color_cache: Color,
+    /// Error message cache for error status
+    pub error_message_cache: Option<String>,
     /// Whether this change is selected
     pub selected: bool,
     /// Whether this is a newly detected change
@@ -245,7 +243,9 @@ impl ChangeState {
             total_tasks: change.total_tasks,
             selected: false, // Always start unselected
             is_new: false,
-            queue_status: QueueStatus::NotQueued,
+            display_status_cache: "not queued".to_string(),
+            display_color_cache: Color::DarkGray,
+            error_message_cache: None,
             is_parallel_eligible: true,
             has_worktree: false,
             started_at: None,
@@ -260,6 +260,40 @@ impl ChangeState {
             return 0.0;
         }
         (self.completed_tasks as f32 / self.total_tasks as f32) * 100.0
+    }
+
+    pub fn set_display_status_cache(&mut self, status: &str) {
+        self.display_status_cache = status.to_string();
+        self.display_color_cache = match status {
+            "not queued" => Color::DarkGray,
+            "queued" => Color::Yellow,
+            "blocked" => Color::Gray,
+            "applying" => Color::Cyan,
+            "accepting" => Color::LightGreen,
+            "archiving" => Color::Magenta,
+            "merge wait" => Color::LightMagenta,
+            "resolve pending" => Color::Magenta,
+            "resolving" => Color::LightCyan,
+            "archived" => Color::Blue,
+            "merged" => Color::LightBlue,
+            "error" => Color::Red,
+            _ => Color::DarkGray,
+        };
+        if status != "error" {
+            self.error_message_cache = None;
+        }
+    }
+
+    pub fn set_error_message_cache(&mut self, message: String) {
+        self.error_message_cache = Some(message);
+        self.set_display_status_cache("error");
+    }
+
+    pub fn is_active_display_status(&self) -> bool {
+        matches!(
+            self.display_status_cache.as_str(),
+            "applying" | "accepting" | "archiving" | "resolving"
+        )
     }
 
     /// Update iteration number with monotonic increase guard
@@ -475,20 +509,15 @@ impl AppState {
             if let Some(change) = self.changes.iter().find(|c| c.id == change_id) {
                 // Block deletion if change is in active processing states
                 let is_active = matches!(
-                    change.queue_status,
-                    QueueStatus::Queued
-                        | QueueStatus::Applying
-                        | QueueStatus::Archiving
-                        | QueueStatus::Resolving
-                        | QueueStatus::Accepting
-                        | QueueStatus::MergeWait
+                    change.display_status_cache.as_str(),
+                    "queued" | "applying" | "archiving" | "resolving" | "accepting" | "merge wait"
                 );
 
                 if is_active {
                     self.warning_message = Some(format!(
                         "Cannot delete worktree: change '{}' is {}",
                         change_id,
-                        change.queue_status.display()
+                        change.display_status_cache.as_str()
                     ));
                     return None;
                 }
@@ -646,7 +675,7 @@ impl AppState {
         if let guards::ToggleGuardResult::Blocked(msg) = guards::validate_change_toggleable(
             change.is_parallel_eligible,
             self.parallel_mode,
-            &change.queue_status,
+            &change.display_status_cache,
             &change.id,
         ) {
             self.warning_message = Some(msg);
@@ -714,14 +743,14 @@ impl AppState {
     }
 
     fn can_bulk_toggle_change(&self, change: &ChangeState) -> bool {
-        if matches!(self.mode, AppMode::Running) && change.queue_status.is_active() {
+        if matches!(self.mode, AppMode::Running) && change.is_active_display_status() {
             return false;
         }
 
         guards::validate_change_toggleable(
             change.is_parallel_eligible,
             self.parallel_mode,
-            &change.queue_status,
+            &change.display_status_cache,
             &change.id,
         )
         .is_allowed()
@@ -782,13 +811,13 @@ impl AppState {
                 // (same semantics as single-row Space toggle).
                 // MergeWait/ResolveWait only toggle the execution mark.
                 if is_running {
-                    match &self.changes[i].queue_status {
-                        QueueStatus::NotQueued if target_state => {
+                    match self.changes[i].display_status_cache.as_str() {
+                        "not queued" if target_state => {
                             let id = self.changes[i].id.clone();
                             self.add_log(LogEntry::info(format!("Added to queue: {}", id)));
                             commands.push(TuiCommand::AddToQueue(id));
                         }
-                        QueueStatus::Queued if !target_state => {
+                        "queued" if !target_state => {
                             let id = self.changes[i].id.clone();
                             self.add_log(LogEntry::info(format!("Removed from queue: {}", id)));
                             commands.push(TuiCommand::RemoveFromQueue(id));
@@ -834,7 +863,7 @@ impl AppState {
         // Check current change status and get change_id
         let change_id = {
             let change = &self.changes[self.cursor_index];
-            if !matches!(change.queue_status, QueueStatus::MergeWait) {
+            if !matches!(change.display_status_cache.as_str(), "merge wait") {
                 return None;
             }
             change.id.clone()
@@ -843,7 +872,7 @@ impl AppState {
         if self.is_resolving {
             // Resolve is running: add to queue and transition to ResolveWait
             if self.add_to_resolve_queue(&change_id) {
-                self.changes[self.cursor_index].queue_status = QueueStatus::ResolveWait;
+                self.changes[self.cursor_index].set_display_status_cache("resolve pending");
 
                 // Sync resolve intent into the shared reducer so that
                 // apply_display_statuses_from_reducer() cannot regress the
@@ -878,7 +907,7 @@ impl AppState {
             if matches!(self.mode, AppMode::Select | AppMode::Stopped) {
                 self.mode = AppMode::Running;
             }
-            self.changes[self.cursor_index].queue_status = QueueStatus::ResolveWait;
+            self.changes[self.cursor_index].set_display_status_cache("resolve pending");
 
             // Sync resolve intent into the shared reducer so that
             // apply_display_statuses_from_reducer() cannot regress the
@@ -947,8 +976,8 @@ impl AppState {
                 if change.selected {
                     change.selected = false;
                 }
-                if matches!(change.queue_status, QueueStatus::Queued) {
-                    change.queue_status = QueueStatus::NotQueued;
+                if matches!(change.display_status_cache.as_str(), "queued") {
+                    change.set_display_status_cache("not queued");
                 }
             }
         }
@@ -962,7 +991,7 @@ impl AppState {
         }
     }
 
-    /// Sync `ChangeState.queue_status` from the reducer's display status snapshot.
+    /// Sync displayed status caches from the reducer's display status snapshot.
     ///
     /// This is Phase 6.1: TUI derives displayed change status from the shared
     /// orchestration reducer state instead of maintaining an independent lifecycle copy.
@@ -973,28 +1002,22 @@ impl AppState {
     ) {
         for change in &mut self.changes {
             if let Some(&status_str) = display_map.get(&change.id) {
-                let new_status = match status_str {
-                    "not queued" => QueueStatus::NotQueued,
-                    "queued" => QueueStatus::Queued,
-                    "blocked" => QueueStatus::Blocked,
-                    "applying" => QueueStatus::Applying,
-                    "accepting" => QueueStatus::Accepting,
-                    "archiving" => QueueStatus::Archiving,
-                    "merge wait" => QueueStatus::MergeWait,
-                    "resolve pending" => QueueStatus::ResolveWait,
-                    "resolving" => QueueStatus::Resolving,
-                    "archived" => QueueStatus::Archived,
-                    "merged" => QueueStatus::Merged,
-                    "stopped" => QueueStatus::NotQueued, // Stopped changes appear as not-queued in TUI
-                    "error" => {
-                        if matches!(change.queue_status, QueueStatus::Error(_)) {
-                            continue; // Preserve existing error message
-                        }
-                        QueueStatus::Error("reducer".to_string())
-                    }
-                    _ => continue,
+                let normalized = match status_str {
+                    "stopped" => "not queued",
+                    other => other,
                 };
-                change.queue_status = new_status;
+
+                if normalized == "error" {
+                    if change.display_status_cache == "error" {
+                        continue;
+                    }
+                    if change.error_message_cache.is_none() {
+                        change.error_message_cache = Some("reducer".to_string());
+                    }
+                    change.set_display_status_cache("error");
+                } else {
+                    change.set_display_status_cache(normalized);
+                }
             }
         }
     }
@@ -1039,8 +1062,8 @@ impl AppState {
             for change in &mut self.changes {
                 if !change.is_parallel_eligible && change.selected {
                     change.selected = false;
-                    if matches!(change.queue_status, QueueStatus::Queued) {
-                        change.queue_status = QueueStatus::NotQueued;
+                    if matches!(change.display_status_cache.as_str(), "queued") {
+                        change.set_display_status_cache("not queued");
                     }
                     removed.push(change.id.clone());
                 }
@@ -1084,7 +1107,7 @@ impl AppState {
         let selected: Vec<String> = self
             .changes
             .iter()
-            .filter(|c| c.selected && matches!(c.queue_status, QueueStatus::NotQueued))
+            .filter(|c| c.selected && matches!(c.display_status_cache.as_str(), "not queued"))
             .map(|c| c.id.clone())
             .collect();
 
@@ -1095,7 +1118,7 @@ impl AppState {
                 .filter(|c| {
                     c.selected
                         && !c.is_parallel_eligible
-                        && matches!(c.queue_status, QueueStatus::NotQueued)
+                        && matches!(c.display_status_cache.as_str(), "not queued")
                 })
                 .map(|c| c.id.clone())
                 .collect();
@@ -1115,8 +1138,8 @@ impl AppState {
 
         // Mark selected NotQueued changes as Queued
         for change in &mut self.changes {
-            if change.selected && matches!(change.queue_status, QueueStatus::NotQueued) {
-                change.queue_status = QueueStatus::Queued;
+            if change.selected && matches!(change.display_status_cache.as_str(), "not queued") {
+                change.set_display_status_cache("queued");
             }
         }
 
@@ -1156,11 +1179,11 @@ impl AppState {
             return None;
         }
 
-        // Find execution-marked changes (selected=true, queue_status=NotQueued)
+        // Find execution-marked changes (selected=true, display_status_cache=NotQueued)
         let marked_ids: Vec<String> = self
             .changes
             .iter()
-            .filter(|c| c.selected && matches!(c.queue_status, QueueStatus::NotQueued))
+            .filter(|c| c.selected && matches!(c.display_status_cache.as_str(), "not queued"))
             .map(|c| c.id.clone())
             .collect();
 
@@ -1172,7 +1195,7 @@ impl AppState {
         // Convert execution-marked changes to Queued
         for change in &mut self.changes {
             if marked_ids.contains(&change.id) {
-                change.queue_status = QueueStatus::Queued;
+                change.set_display_status_cache("queued");
             }
         }
 
@@ -1216,7 +1239,7 @@ impl AppState {
         let error_ids: Vec<String> = self
             .changes
             .iter()
-            .filter(|c| matches!(c.queue_status, QueueStatus::Error(_)))
+            .filter(|c| c.display_status_cache == "error")
             .map(|c| c.id.clone())
             .collect();
 
@@ -1226,8 +1249,8 @@ impl AppState {
 
         // Reset error changes to queued
         for change in &mut self.changes {
-            if matches!(change.queue_status, QueueStatus::Error(_)) {
-                change.queue_status = QueueStatus::Queued;
+            if change.display_status_cache == "error" {
+                change.set_display_status_cache("queued");
                 change.selected = true;
             }
         }
@@ -1569,13 +1592,13 @@ impl AppState {
 
                     // Status update (remote mode)
                     if let Some(status) = status.as_deref() {
-                        let before = change.queue_status.clone();
+                        let before = change.display_status_cache.clone();
                         apply_remote_status(change, status);
-                        if before != change.queue_status {
+                        if before != change.display_status_cache {
                             status_log = Some(format!(
                                 "Remote status: {} -> {}",
                                 id,
-                                change.queue_status.display()
+                                change.display_status_cache.as_str()
                             ));
                         }
                     }
@@ -1601,7 +1624,7 @@ impl AppState {
     fn handle_processing_started(&mut self, id: String) {
         self.current_change = Some(id.clone());
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-            change.queue_status = QueueStatus::Applying;
+            change.set_display_status_cache("applying");
             change.started_at = Some(Instant::now());
             change.elapsed_time = None;
         }
@@ -1610,7 +1633,7 @@ impl AppState {
 
     fn handle_processing_completed(&mut self, id: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-            change.queue_status = QueueStatus::Archiving;
+            change.set_display_status_cache("archiving");
             // Reload final progress from tasks.md to preserve it
             if let Ok(progress) = task_parser::parse_change(&id) {
                 change.completed_tasks = progress.completed;
@@ -1622,7 +1645,7 @@ impl AppState {
 
     fn handle_processing_error(&mut self, id: String, error: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-            change.queue_status = QueueStatus::Error(error.clone());
+            change.set_error_message_cache(error.clone());
             change.selected = false;
             // Record elapsed time on error
             if let Some(started) = change.started_at {
@@ -1648,11 +1671,8 @@ impl AppState {
         // Safety net: reset any changes still in Queued or Blocked state (e.g. rejected
         // before start or blocked by dependency failures that were not cleared earlier).
         for change in &mut self.changes {
-            if matches!(
-                change.queue_status,
-                QueueStatus::Queued | QueueStatus::Blocked
-            ) {
-                change.queue_status = QueueStatus::NotQueued;
+            if matches!(change.display_status_cache.as_str(), "queued" | "blocked") {
+                change.set_display_status_cache("not queued");
             }
         }
 
@@ -1680,14 +1700,14 @@ impl AppState {
 
         let has_active = self.changes.iter().any(|c| {
             matches!(
-                c.queue_status,
-                QueueStatus::Queued
-                    | QueueStatus::Blocked
-                    | QueueStatus::Applying
-                    | QueueStatus::Accepting
-                    | QueueStatus::Archiving
-                    | QueueStatus::Resolving
-                    | QueueStatus::ResolveWait
+                c.display_status_cache.as_str(),
+                "queued"
+                    | "blocked"
+                    | "applying"
+                    | "accepting"
+                    | "archiving"
+                    | "resolving"
+                    | "resolve pending"
             )
         });
 
@@ -1714,20 +1734,15 @@ impl AppState {
         // This implements the policy: queued only during active execution
         for change in &mut self.changes {
             if matches!(
-                change.queue_status,
-                QueueStatus::Applying
-                    | QueueStatus::Accepting
-                    | QueueStatus::Archiving
-                    | QueueStatus::Resolving
-                    | QueueStatus::Queued
-                    | QueueStatus::Blocked
+                change.display_status_cache.as_str(),
+                "applying" | "accepting" | "archiving" | "resolving" | "queued" | "blocked"
             ) {
                 // Record elapsed time before resetting status (for in-flight changes)
                 if let Some(started) = change.started_at {
                     change.elapsed_time = Some(started.elapsed());
                 }
                 // Reset to NotQueued but preserve execution mark (selected field)
-                change.queue_status = QueueStatus::NotQueued;
+                change.set_display_status_cache("not queued");
                 // Keep change.selected as-is to preserve execution mark
             }
         }
@@ -1744,7 +1759,7 @@ impl AppState {
                 change.completed_tasks = completed;
                 change.total_tasks = total;
             }
-            // Never modify queue_status here.
+            // Never modify display_status_cache here.
             // In Stopped mode, task completion does not trigger auto-queue.
         }
     }
@@ -1755,7 +1770,7 @@ impl AppState {
             if change.started_at.is_none() {
                 change.started_at = Some(Instant::now());
             }
-            change.queue_status = QueueStatus::Applying;
+            change.set_display_status_cache("applying");
             change.elapsed_time = None;
             // Reset iteration_number when starting a new stage
             change.iteration_number = None;
@@ -1777,7 +1792,7 @@ impl AppState {
             if change.started_at.is_none() {
                 change.started_at = Some(Instant::now());
             }
-            change.queue_status = QueueStatus::Archiving;
+            change.set_display_status_cache("archiving");
             // Reset iteration_number when starting a new stage
             change.iteration_number = None;
             // Reload final progress from tasks.md to preserve it before archiving
@@ -1811,7 +1826,7 @@ impl AppState {
 
     fn handle_change_archived(&mut self, id: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-            change.queue_status = QueueStatus::Archived;
+            change.set_display_status_cache("archived");
             // Record final elapsed time
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
@@ -1842,7 +1857,7 @@ impl AppState {
             if change.started_at.is_none() {
                 change.started_at = Some(Instant::now());
             }
-            change.queue_status = QueueStatus::Resolving;
+            change.set_display_status_cache("resolving");
             change.elapsed_time = None;
             // Reset iteration_number when starting a new stage
             change.iteration_number = None;
@@ -1873,7 +1888,7 @@ impl AppState {
     ) -> Option<TuiCommand> {
         self.is_resolving = false;
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            change.queue_status = QueueStatus::Merged;
+            change.set_display_status_cache("merged");
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
             }
@@ -1910,7 +1925,7 @@ impl AppState {
             )));
             // Transition from ResolveWait to about-to-start
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == next_change_id) {
-                change.queue_status = QueueStatus::ResolveWait;
+                change.set_display_status_cache("resolve pending");
             }
             Some(TuiCommand::ResolveMerge(next_change_id))
         } else {
@@ -1922,7 +1937,7 @@ impl AppState {
 
     fn handle_merge_completed(&mut self, change_id: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            change.queue_status = QueueStatus::Merged;
+            change.set_display_status_cache("merged");
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
             }
@@ -1975,7 +1990,7 @@ impl AppState {
     // Completion and error event handlers
     fn handle_apply_failed(&mut self, change_id: String, error: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            change.queue_status = QueueStatus::Error(error.clone());
+            change.set_error_message_cache(error.clone());
             change.selected = false;
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
@@ -1989,7 +2004,7 @@ impl AppState {
 
     fn handle_archive_failed(&mut self, change_id: String, error: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            change.queue_status = QueueStatus::Error(error.clone());
+            change.set_error_message_cache(error.clone());
             change.selected = false;
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
@@ -2004,7 +2019,7 @@ impl AppState {
     fn handle_resolve_failed(&mut self, change_id: String, error: String) {
         self.is_resolving = false;
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            if change.queue_status == QueueStatus::Merged {
+            if change.display_status_cache == "merged" {
                 // Already successfully merged; ignore spurious ResolveFailed to prevent regression.
                 self.add_log(LogEntry::info(format!(
                     "Ignoring ResolveFailed for '{}': already Merged",
@@ -2012,7 +2027,7 @@ impl AppState {
                 )));
                 return;
             }
-            change.queue_status = QueueStatus::MergeWait;
+            change.set_display_status_cache("merge wait");
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
             }
@@ -2039,7 +2054,7 @@ impl AppState {
             let is_current_resolving = self
                 .changes
                 .iter()
-                .any(|c| c.id == change_id && c.queue_status == QueueStatus::Resolving);
+                .any(|c| c.id == change_id && c.display_status_cache == "resolving");
 
             if is_current_resolving {
                 // Don't queue the currently resolving change - keep it Resolving
@@ -2050,7 +2065,7 @@ impl AppState {
             } else {
                 // Different change: transition to ResolveWait and add to resolve queue
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-                    change.queue_status = QueueStatus::ResolveWait;
+                    change.set_display_status_cache("resolve pending");
                 }
                 if self.add_to_resolve_queue(&change_id) {
                     self.add_log(LogEntry::warn(format!(
@@ -2070,7 +2085,7 @@ impl AppState {
             // another merge in progress).  Transition to ResolveWait, add to resolve queue,
             // and return ResolveMerge to start resolve immediately.
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-                change.queue_status = QueueStatus::ResolveWait;
+                change.set_display_status_cache("resolve pending");
             }
             self.add_to_resolve_queue(&change_id);
             self.add_log(LogEntry::warn(format!(
@@ -2081,7 +2096,7 @@ impl AppState {
         } else {
             // Resolve is not running and manual intervention is required: MergeWait.
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-                change.queue_status = QueueStatus::MergeWait;
+                change.set_display_status_cache("merge wait");
             }
             self.add_log(LogEntry::warn(format!(
                 "Merge deferred for {}: {}",
@@ -2096,7 +2111,7 @@ impl AppState {
             if change.started_at.is_none() {
                 change.started_at = Some(Instant::now());
             }
-            change.queue_status = QueueStatus::Accepting;
+            change.set_display_status_cache("accepting");
             // Reset iteration_number when starting a new stage
             change.iteration_number = None;
         }
@@ -2114,7 +2129,7 @@ impl AppState {
 
     fn handle_acceptance_completed(&mut self, change_id: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            change.queue_status = QueueStatus::Archiving;
+            change.set_display_status_cache("archiving");
         }
         self.add_log(LogEntry::info(format!(
             "Acceptance completed: {}",
@@ -2124,7 +2139,7 @@ impl AppState {
 
     fn handle_change_skipped(&mut self, change_id: String, reason: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            change.queue_status = QueueStatus::Error(reason.clone());
+            change.set_error_message_cache(reason.clone());
             change.selected = false;
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
@@ -2151,7 +2166,7 @@ impl AppState {
     fn handle_change_stopped(&mut self, change_id: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             // Transition to NotQueued and clear execution mark
-            change.queue_status = QueueStatus::NotQueued;
+            change.set_display_status_cache("not queued");
             change.selected = false;
             // Record elapsed time
             if let Some(started) = change.started_at {
@@ -2171,7 +2186,7 @@ impl AppState {
 
     fn handle_dependency_blocked(&mut self, change_id: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            change.queue_status = QueueStatus::Blocked;
+            change.set_display_status_cache("blocked");
         }
         self.add_log(LogEntry::info(format!(
             "Change '{}' blocked by dependencies",
@@ -2182,8 +2197,8 @@ impl AppState {
     fn handle_dependency_resolved(&mut self, change_id: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             // Only update if currently blocked, otherwise preserve the current state
-            if change.queue_status == QueueStatus::Blocked {
-                change.queue_status = QueueStatus::Queued;
+            if change.display_status_cache == "blocked" {
+                change.set_display_status_cache("queued");
             }
         }
         self.add_log(LogEntry::info(format!(
@@ -2228,7 +2243,7 @@ impl AppState {
         // Update iteration number in change state with monotonic guard
         // Only update if the change is currently in Applying stage
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            if matches!(change.queue_status, QueueStatus::Applying) {
+            if matches!(change.display_status_cache.as_str(), "applying") {
                 change.update_iteration_monotonic(iteration);
             }
         }
@@ -2245,7 +2260,7 @@ impl AppState {
         // Update iteration number in change state with monotonic guard
         // Only update if the change is currently in Archiving stage
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            if matches!(change.queue_status, QueueStatus::Archiving) {
+            if matches!(change.display_status_cache.as_str(), "archiving") {
                 change.update_iteration_monotonic(Some(iteration));
             }
         }
@@ -2267,7 +2282,7 @@ impl AppState {
         // Update iteration number in change state with monotonic guard
         // Only update if the change is currently in Accepting stage
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            if matches!(change.queue_status, QueueStatus::Accepting) {
+            if matches!(change.display_status_cache.as_str(), "accepting") {
                 change.update_iteration_monotonic(iteration);
             }
         }
@@ -2292,7 +2307,7 @@ impl AppState {
         // Update iteration number in change state with monotonic guard
         // Only update if the change is currently in Resolving stage
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            if matches!(change.queue_status, QueueStatus::Resolving) {
+            if matches!(change.display_status_cache.as_str(), "resolving") {
                 change.update_iteration_monotonic(iteration);
             }
         }
@@ -2330,9 +2345,10 @@ impl AppState {
     fn handle_parallel_start_rejected(&mut self, change_ids: Vec<String>, reason: String) {
         let mut reset_ids = Vec::new();
         for change in &mut self.changes {
-            if change_ids.contains(&change.id) && matches!(change.queue_status, QueueStatus::Queued)
+            if change_ids.contains(&change.id)
+                && matches!(change.display_status_cache.as_str(), "queued")
             {
-                change.queue_status = QueueStatus::NotQueued;
+                change.set_display_status_cache("not queued");
                 reset_ids.push(change.id.clone());
             }
         }
@@ -2377,7 +2393,7 @@ impl AppState {
     /// enriches change metadata from shared orchestration state when available (apply counts,
     /// pending/archived tracking).
     ///
-    /// IMPORTANT: This method does NOT modify queue_status. In Stopped mode, task completion
+    /// IMPORTANT: This method does NOT modify display_status_cache. In Stopped mode, task completion
     /// does not trigger auto-queue. Changes are only queued through explicit user action (Space key).
     ///
     /// Note: Task progress is synchronized with shared orchestration state.
@@ -2411,9 +2427,9 @@ impl AppState {
         // Update existing changes
         for fetched in &fetched_changes {
             if let Some(existing) = self.changes.iter_mut().find(|c| c.id == fetched.id) {
-                let was_archived = existing.queue_status == QueueStatus::Archived;
-                let is_merge_wait = existing.queue_status == QueueStatus::MergeWait;
-                let is_resolve_wait = existing.queue_status == QueueStatus::ResolveWait;
+                let was_archived = existing.display_status_cache == "archived";
+                let is_merge_wait = existing.display_status_cache == "merge wait";
+                let is_resolve_wait = existing.display_status_cache == "resolve pending";
 
                 // Get task progress from shared state (with fallback to fetched data)
                 let (completed, total) = if let Some(shared_state) = &self.shared_orchestrator_state
@@ -2435,7 +2451,7 @@ impl AppState {
                 if was_archived {
                     // If change still exists after archiving, it means archive failed
                     // Revert to NotQueued status
-                    existing.queue_status = QueueStatus::NotQueued;
+                    existing.set_display_status_cache("not queued");
                     // Update progress for unarchived changes
                     if total > 0 {
                         existing.completed_tasks = completed;
@@ -2474,11 +2490,8 @@ impl AppState {
                         let worktree_path =
                             self.worktree_paths.get(&fetched.id).map(|p| p.as_path());
 
-                        match existing.queue_status {
-                            QueueStatus::Archiving
-                            | QueueStatus::Resolving
-                            | QueueStatus::Archived
-                            | QueueStatus::Merged => {
+                        match existing.display_status_cache.as_str() {
+                            "archiving" | "resolving" | "archived" | "merged" => {
                                 // Use comprehensive fallback: worktree active -> worktree archive -> base active -> base archive
                                 if let Ok(progress) = task_parser::parse_progress_with_fallback(
                                     &fetched.id,
@@ -2551,14 +2564,14 @@ impl AppState {
             current_ids.contains(&c.id)
                 || c.started_at.is_some()
                 || matches!(
-                    c.queue_status,
-                    QueueStatus::Archiving
-                        | QueueStatus::Archived
-                        | QueueStatus::Merged
-                        | QueueStatus::MergeWait
-                        | QueueStatus::Resolving
-                        | QueueStatus::ResolveWait
-                        | QueueStatus::Error(_)
+                    c.display_status_cache.as_str(),
+                    "archiving"
+                        | "archived"
+                        | "merged"
+                        | "merge wait"
+                        | "resolving"
+                        | "resolve pending"
+                        | "error"
                 )
         });
 
@@ -2571,14 +2584,14 @@ impl AppState {
 }
 // Note: auto_clear_merge_wait() and apply_merge_wait_status() have been removed in Phase 5.3.
 // Their logic is now handled by the shared reducer's apply_observation() path.
-// The TUI syncs queue_status via apply_display_statuses_from_reducer() in the runner.
+// The TUI syncs display_status_cache via apply_display_statuses_from_reducer() in the runner.
 
 // ============================================================================
 // Guard Logic
 // ============================================================================
 
 mod guards {
-    use super::{ChangeState, QueueStatus, TuiCommand, ViewMode, WorktreeInfo};
+    use super::{ChangeState, TuiCommand, ViewMode, WorktreeInfo};
 
     /// Result type for merge validation
     pub enum MergeGuardResult {
@@ -2692,7 +2705,7 @@ mod guards {
     pub fn validate_change_toggleable(
         is_parallel_eligible: bool,
         parallel_mode: bool,
-        queue_status: &QueueStatus,
+        display_status_cache: &str,
         change_id: &str,
     ) -> ToggleGuardResult {
         // Active (in-flight) changes can be stopped via Space key in Running mode
@@ -2700,7 +2713,13 @@ mod guards {
         // No need to block here
 
         // Cannot select uncommitted changes in parallel mode (only applies to non-active states)
-        if parallel_mode && !is_parallel_eligible && !queue_status.is_active() {
+        if parallel_mode
+            && !is_parallel_eligible
+            && !matches!(
+                display_status_cache,
+                "applying" | "accepting" | "archiving" | "resolving"
+            )
+        {
             return ToggleGuardResult::Blocked(format!(
                 "Cannot queue uncommitted change '{}' in parallel mode. Commit it first.",
                 change_id
@@ -2708,7 +2727,7 @@ mod guards {
         }
 
         // MergeWait and ResolveWait can toggle execution mark (selected)
-        // but cannot change queue_status or modify DynamicQueue
+        // but cannot change display_status_cache or modify DynamicQueue
         // This is handled by the mode-specific handlers
         ToggleGuardResult::Allowed
     }
@@ -2742,9 +2761,9 @@ mod guards {
         change: &mut ChangeState,
         new_change_count: &mut usize,
     ) -> ToggleActionResult {
-        match &change.queue_status {
-            QueueStatus::NotQueued => {
-                // Emit AddToQueue command; do NOT directly assign queue_status here.
+        match change.display_status_cache.as_str() {
+            "not queued" => {
+                // Emit AddToQueue command; do NOT directly assign display_status_cache here.
                 // The shared reducer state will be updated via apply_command in command_handlers,
                 // and the TUI will derive the display status from the shared state.
                 change.selected = true;
@@ -2757,15 +2776,15 @@ mod guards {
                 let log_msg = format!("Added to queue: {}", id);
                 ToggleActionResult::Command(TuiCommand::AddToQueue(id), Some(log_msg))
             }
-            QueueStatus::Queued => {
-                // Emit RemoveFromQueue command; do NOT directly assign queue_status here.
+            "queued" => {
+                // Emit RemoveFromQueue command; do NOT directly assign display_status_cache here.
                 change.selected = false;
                 let id = change.id.clone();
                 let log_msg = format!("Removed from queue: {}", id);
                 ToggleActionResult::Command(TuiCommand::RemoveFromQueue(id), Some(log_msg))
             }
-            QueueStatus::MergeWait | QueueStatus::ResolveWait => {
-                // Only toggle execution mark (selected), do not modify queue_status or DynamicQueue
+            "merge wait" | "resolve pending" => {
+                // Only toggle execution mark (selected), do not modify display_status_cache or DynamicQueue
                 change.selected = !change.selected;
                 // Clear NEW flag when user interacts with the change
                 if change.is_new {
@@ -2780,17 +2799,14 @@ mod guards {
                 };
                 ToggleActionResult::StateOnly(Some(log_msg))
             }
-            QueueStatus::Applying
-            | QueueStatus::Accepting
-            | QueueStatus::Archiving
-            | QueueStatus::Resolving => {
+            "applying" | "accepting" | "archiving" | "resolving" => {
                 // Active (in-flight) changes: issue stop request
                 // State transition happens when ChangeStopped event is received
                 let id = change.id.clone();
                 let log_msg = format!("Stop requested: {}", id);
                 ToggleActionResult::Command(TuiCommand::StopChange(id), Some(log_msg))
             }
-            QueueStatus::Error(_) => {
+            "error" => {
                 change.selected = !change.selected;
                 if change.is_new {
                     change.is_new = false;
@@ -2814,15 +2830,12 @@ mod guards {
         change: &mut ChangeState,
         new_change_count: &mut usize,
     ) -> ToggleActionResult {
-        // In Stopped mode, only toggle execution mark (selected), not queue_status.
-        // For wait states (MergeWait/ResolveWait), queue_status MUST remain unchanged.
-        // For NotQueued, queue_status remains NotQueued until resume.
+        // In Stopped mode, only toggle execution mark (selected), not display_status_cache.
+        // For wait states (MergeWait/ResolveWait), display_status_cache MUST remain unchanged.
+        // For NotQueued, display_status_cache remains NotQueued until resume.
         if !matches!(
-            change.queue_status,
-            QueueStatus::NotQueued
-                | QueueStatus::MergeWait
-                | QueueStatus::ResolveWait
-                | QueueStatus::Error(_)
+            change.display_status_cache.as_str(),
+            "not queued" | "merge wait" | "resolve pending" | "error"
         ) {
             // Cannot modify processing/completed states.
             return ToggleActionResult::None;
@@ -2873,7 +2886,9 @@ mod tests {
             id: "test".to_string(),
             completed_tasks: 3,
             total_tasks: 6,
-            queue_status: QueueStatus::NotQueued,
+            display_status_cache: "not queued".to_string(),
+            display_color_cache: Color::DarkGray,
+            error_message_cache: None,
             selected: false,
             is_new: false,
             is_parallel_eligible: true,
@@ -3081,10 +3096,10 @@ mod tests {
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
         app.is_resolving = true;
-        app.changes[0].queue_status = QueueStatus::Resolving;
-        app.changes[1].queue_status = QueueStatus::NotQueued;
-        app.changes[2].queue_status = QueueStatus::MergeWait;
-        app.changes[3].queue_status = QueueStatus::ResolveWait;
+        app.changes[0].display_status_cache = "resolving".to_string();
+        app.changes[1].display_status_cache = "not queued".to_string();
+        app.changes[2].display_status_cache = "merge wait".to_string();
+        app.changes[3].display_status_cache = "resolve pending".to_string();
 
         app.toggle_all_marks();
         assert!(!app.changes[0].selected, "active row must stay unchanged");
@@ -3092,9 +3107,9 @@ mod tests {
         assert!(app.changes[2].selected);
         assert!(app.changes[3].selected);
 
-        // Wait states must keep queue_status unchanged.
-        assert_eq!(app.changes[2].queue_status, QueueStatus::MergeWait);
-        assert_eq!(app.changes[3].queue_status, QueueStatus::ResolveWait);
+        // Wait states must keep display_status_cache unchanged.
+        assert_eq!(app.changes[2].display_status_cache, "merge wait");
+        assert_eq!(app.changes[3].display_status_cache, "resolve pending");
 
         // Second toggle unmarks only non-active rows.
         app.toggle_all_marks();
@@ -3116,9 +3131,9 @@ mod tests {
 
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::NotQueued;
-        app.changes[1].queue_status = QueueStatus::NotQueued;
-        app.changes[2].queue_status = QueueStatus::NotQueued;
+        app.changes[0].display_status_cache = "not queued".to_string();
+        app.changes[1].display_status_cache = "not queued".to_string();
+        app.changes[2].display_status_cache = "not queued".to_string();
 
         let commands = app.toggle_all_marks();
 
@@ -3142,9 +3157,9 @@ mod tests {
 
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Queued;
+        app.changes[0].display_status_cache = "queued".to_string();
         app.changes[0].selected = true;
-        app.changes[1].queue_status = QueueStatus::Queued;
+        app.changes[1].display_status_cache = "queued".to_string();
         app.changes[1].selected = true;
 
         let commands = app.toggle_all_marks();
@@ -3171,9 +3186,9 @@ mod tests {
 
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::NotQueued;
-        app.changes[1].queue_status = QueueStatus::MergeWait;
-        app.changes[2].queue_status = QueueStatus::ResolveWait;
+        app.changes[0].display_status_cache = "not queued".to_string();
+        app.changes[1].display_status_cache = "merge wait".to_string();
+        app.changes[2].display_status_cache = "resolve pending".to_string();
 
         let commands = app.toggle_all_marks();
 
@@ -3182,9 +3197,9 @@ mod tests {
         assert!(app.changes[1].selected);
         assert!(app.changes[2].selected);
 
-        // Wait state queue_status must remain unchanged
-        assert_eq!(app.changes[1].queue_status, QueueStatus::MergeWait);
-        assert_eq!(app.changes[2].queue_status, QueueStatus::ResolveWait);
+        // Wait state display_status_cache must remain unchanged
+        assert_eq!(app.changes[1].display_status_cache, "merge wait");
+        assert_eq!(app.changes[2].display_status_cache, "resolve pending");
 
         // Only the NotQueued row should emit AddToQueue
         assert_eq!(commands.len(), 1);
@@ -3202,8 +3217,8 @@ mod tests {
 
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Applying;
-        app.changes[1].queue_status = QueueStatus::NotQueued;
+        app.changes[0].display_status_cache = "applying".to_string();
+        app.changes[1].display_status_cache = "not queued".to_string();
 
         let commands = app.toggle_all_marks();
 
@@ -3230,9 +3245,9 @@ mod tests {
 
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Queued;
+        app.changes[0].display_status_cache = "queued".to_string();
         app.changes[0].selected = true; // already marked
-        app.changes[1].queue_status = QueueStatus::NotQueued;
+        app.changes[1].display_status_cache = "not queued".to_string();
         app.changes[1].selected = false; // not yet marked
 
         let commands = app.toggle_all_marks();
@@ -3288,11 +3303,11 @@ mod tests {
 
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Applying;
-        app.changes[1].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "applying".to_string();
+        app.changes[1].display_status_cache = "resolving".to_string();
         assert!(!app.has_bulk_toggle_targets());
 
-        app.changes[1].queue_status = QueueStatus::ResolveWait;
+        app.changes[1].display_status_cache = "resolve pending".to_string();
         assert!(app.has_bulk_toggle_targets());
     }
 
@@ -3330,7 +3345,7 @@ mod tests {
         let changes = vec![create_test_change("a", 0, 1)];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Error;
-        app.changes[0].queue_status = QueueStatus::Error("boom".to_string());
+        app.changes[0].set_error_message_cache("boom".to_string());
         app.is_resolving = true;
 
         let command = app.retry_error_changes();
@@ -3397,7 +3412,7 @@ mod tests {
 
         // Change should be marked as Error and unselected until user re-marks it
         let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
-        assert!(matches!(change.queue_status, QueueStatus::Error(_)));
+        assert_eq!(change.display_status_cache, "error");
         assert!(!change.selected);
 
         // error_change_id should be set
@@ -3424,7 +3439,7 @@ mod tests {
 
         // Change should be marked as Error and unselected until user re-marks it
         let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
-        assert!(matches!(change.queue_status, QueueStatus::Error(_)));
+        assert_eq!(change.display_status_cache, "error");
         assert!(!change.selected);
     }
 
@@ -3433,7 +3448,7 @@ mod tests {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Error("boom".to_string());
+        app.changes[0].set_error_message_cache("boom".to_string());
         app.changes[0].selected = false;
 
         let command = app.toggle_selection();
@@ -3457,7 +3472,7 @@ mod tests {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Stopped;
-        app.changes[0].queue_status = QueueStatus::Error("boom".to_string());
+        app.changes[0].set_error_message_cache("boom".to_string());
         app.changes[0].selected = false;
 
         let command = app.toggle_selection();
@@ -3485,7 +3500,7 @@ mod tests {
 
         assert_eq!(app.current_change, Some("test-change".to_string()));
         let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
-        assert_eq!(change.queue_status, QueueStatus::Applying);
+        assert_eq!(change.display_status_cache, "applying");
         assert!(change.started_at.is_some());
     }
 
@@ -3497,7 +3512,7 @@ mod tests {
         app.handle_processing_completed("test-change".to_string());
 
         let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
-        assert_eq!(change.queue_status, QueueStatus::Archiving);
+        assert_eq!(change.display_status_cache, "archiving");
     }
 
     #[test]
@@ -3537,18 +3552,18 @@ mod tests {
     }
 
     #[test]
-    fn test_stopped_resets_queue_status() {
+    fn test_stopped_resets_display_status_cache() {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
         // Set to Queued
-        app.changes[0].queue_status = QueueStatus::Queued;
+        app.changes[0].display_status_cache = "queued".to_string();
         app.changes[0].selected = true;
 
         app.handle_stopped();
 
         assert_eq!(app.mode, AppMode::Stopped);
-        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+        assert_eq!(app.changes[0].display_status_cache, "not queued");
         // selected should be preserved
         assert!(app.changes[0].selected);
     }
@@ -3561,7 +3576,9 @@ mod tests {
             id: "test".to_string(),
             completed_tasks: 0,
             total_tasks: 1,
-            queue_status: QueueStatus::Applying,
+            display_status_cache: "applying".to_string(),
+            display_color_cache: Color::Cyan,
+            error_message_cache: None,
             selected: false,
             is_new: false,
             is_parallel_eligible: true,
@@ -3586,7 +3603,9 @@ mod tests {
             id: "test".to_string(),
             completed_tasks: 0,
             total_tasks: 1,
-            queue_status: QueueStatus::Applying,
+            display_status_cache: "applying".to_string(),
+            display_color_cache: Color::Cyan,
+            error_message_cache: None,
             selected: false,
             is_new: false,
             is_parallel_eligible: true,
@@ -3615,7 +3634,9 @@ mod tests {
             id: "test".to_string(),
             completed_tasks: 0,
             total_tasks: 1,
-            queue_status: QueueStatus::Applying,
+            display_status_cache: "applying".to_string(),
+            display_color_cache: Color::Cyan,
+            error_message_cache: None,
             selected: false,
             is_new: false,
             is_parallel_eligible: true,
@@ -3643,7 +3664,7 @@ mod tests {
 
         // Iteration should be reset to None
         assert_eq!(app.changes[0].iteration_number, None);
-        assert_eq!(app.changes[0].queue_status, QueueStatus::Applying);
+        assert_eq!(app.changes[0].display_status_cache, "applying");
     }
 
     #[test]
@@ -3659,7 +3680,7 @@ mod tests {
 
         // Iteration should be reset to None
         assert_eq!(app.changes[0].iteration_number, None);
-        assert_eq!(app.changes[0].queue_status, QueueStatus::Archiving);
+        assert_eq!(app.changes[0].display_status_cache, "archiving");
     }
 
     #[test]
@@ -3675,7 +3696,7 @@ mod tests {
 
         // Iteration should be reset to None
         assert_eq!(app.changes[0].iteration_number, None);
-        assert_eq!(app.changes[0].queue_status, QueueStatus::Resolving);
+        assert_eq!(app.changes[0].display_status_cache, "resolving");
     }
 
     #[test]
@@ -3691,7 +3712,7 @@ mod tests {
 
         // Iteration should be reset to None
         assert_eq!(app.changes[0].iteration_number, None);
-        assert_eq!(app.changes[0].queue_status, QueueStatus::Accepting);
+        assert_eq!(app.changes[0].display_status_cache, "accepting");
     }
 
     #[test]
@@ -3807,12 +3828,12 @@ mod tests {
         let mut app = AppState::new(changes);
 
         // Set change-a to Resolving
-        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "resolving".to_string();
         app.is_resolving = true;
 
         // Queue change-b for resolve
         app.add_to_resolve_queue("change-b");
-        app.changes[1].queue_status = QueueStatus::ResolveWait;
+        app.changes[1].display_status_cache = "resolve pending".to_string();
 
         // Simulate resolve completion for change-a
         let cmd = app.handle_resolve_completed("change-a".to_string(), None);
@@ -3831,7 +3852,7 @@ mod tests {
         let mut app = AppState::new(changes);
 
         // Set change-a to Resolving
-        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "resolving".to_string();
         app.is_resolving = true;
 
         // Simulate resolve completion with empty queue
@@ -3852,11 +3873,11 @@ mod tests {
         let mut app = AppState::new(changes);
 
         // Set up: change-a is currently resolving
-        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "resolving".to_string();
         app.is_resolving = true;
 
         // Set up: change-b is in MergeWait
-        app.changes[1].queue_status = QueueStatus::MergeWait;
+        app.changes[1].display_status_cache = "merge wait".to_string();
         app.cursor_index = 1;
         app.mode = AppMode::Running;
 
@@ -3866,7 +3887,7 @@ mod tests {
         // Should NOT return a command (queued instead)
         assert!(cmd.is_none());
         // change-b should transition to ResolveWait
-        assert_eq!(app.changes[1].queue_status, QueueStatus::ResolveWait);
+        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
         // change-b should be in the queue
         assert!(app.has_queued_resolves());
     }
@@ -3900,18 +3921,18 @@ mod tests {
         app.set_shared_state(shared.clone());
 
         // change-a is currently resolving
-        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "resolving".to_string();
         app.is_resolving = true;
 
         // change-b is in MergeWait
-        app.changes[1].queue_status = QueueStatus::MergeWait;
+        app.changes[1].display_status_cache = "merge wait".to_string();
         app.cursor_index = 1;
         app.mode = AppMode::Running;
 
         // Queue change-b for resolve via M key
         let cmd = app.resolve_merge();
         assert!(cmd.is_none());
-        assert_eq!(app.changes[1].queue_status, QueueStatus::ResolveWait);
+        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
 
         // Verify the shared reducer reflects "resolve pending" for change-b
         let display_map = shared.blocking_read().all_display_statuses();
@@ -3949,17 +3970,17 @@ mod tests {
         app.set_shared_state(shared.clone());
 
         // change-a is currently resolving
-        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "resolving".to_string();
         app.is_resolving = true;
 
         // change-b is in MergeWait; user presses M to queue resolve
-        app.changes[1].queue_status = QueueStatus::MergeWait;
+        app.changes[1].display_status_cache = "merge wait".to_string();
         app.cursor_index = 1;
         app.mode = AppMode::Running;
 
         let cmd = app.resolve_merge();
         assert!(cmd.is_none());
-        assert_eq!(app.changes[1].queue_status, QueueStatus::ResolveWait);
+        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
 
         // Simulate a ChangesRefreshed event where workspace still reports change-b
         // as Archived (which would normally set MergeWait in the reducer).
@@ -3981,8 +4002,7 @@ mod tests {
         app.apply_display_statuses_from_reducer(&display_map);
 
         assert_eq!(
-            app.changes[1].queue_status,
-            QueueStatus::ResolveWait,
+            app.changes[1].display_status_cache, "resolve pending",
             "ResolveWait must survive ChangesRefreshed + apply_display_statuses_from_reducer"
         );
     }
@@ -3992,7 +4012,7 @@ mod tests {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
 
-        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
         app.mode = AppMode::Select;
         app.is_resolving = false;
@@ -4001,7 +4021,7 @@ mod tests {
 
         assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
         assert_eq!(app.mode, AppMode::Running);
-        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
     }
 
     #[test]
@@ -4009,7 +4029,7 @@ mod tests {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
 
-        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
         app.mode = AppMode::Stopped;
         app.is_resolving = false;
@@ -4018,7 +4038,7 @@ mod tests {
 
         assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
         assert_eq!(app.mode, AppMode::Running);
-        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
     }
 
     #[test]
@@ -4026,7 +4046,7 @@ mod tests {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
 
-        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
         app.mode = AppMode::Running;
         app.is_resolving = false;
@@ -4035,7 +4055,7 @@ mod tests {
 
         assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
         assert_eq!(app.mode, AppMode::Running);
-        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
     }
 
     /// Regression test: resolve_merge() in the immediate path (is_resolving == false) must
@@ -4064,7 +4084,7 @@ mod tests {
         app.set_shared_state(shared.clone());
 
         // change-a is in MergeWait, no resolve in progress
-        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
         app.mode = AppMode::Running;
         app.is_resolving = false;
@@ -4075,7 +4095,7 @@ mod tests {
             matches!(&cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"),
             "immediate resolve must return TuiCommand::ResolveMerge"
         );
-        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
 
         // Verify the shared reducer reflects "resolve pending" for change-a
         let display_map = shared.blocking_read().all_display_statuses();
@@ -4111,14 +4131,14 @@ mod tests {
         app.set_shared_state(shared.clone());
 
         // change-a is in MergeWait, no resolve in progress; user presses M
-        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
         app.mode = AppMode::Running;
         app.is_resolving = false;
 
         let cmd = app.resolve_merge();
         assert!(cmd.is_some());
-        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
 
         // Simulate a ChangesRefreshed event where workspace still reports change-a
         // as needing merge (which would normally set MergeWait in the reducer).
@@ -4140,8 +4160,7 @@ mod tests {
         app.apply_display_statuses_from_reducer(&display_map);
 
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::ResolveWait,
+            app.changes[0].display_status_cache, "resolve pending",
             "ResolveWait must survive ChangesRefreshed after immediate resolve"
         );
     }
@@ -4155,8 +4174,8 @@ mod tests {
         let mut app = AppState::new(changes);
 
         // Both changes are merge-wait candidates.
-        app.changes[0].queue_status = QueueStatus::MergeWait;
-        app.changes[1].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
+        app.changes[1].display_status_cache = "merge wait".to_string();
         app.mode = AppMode::Running;
         app.is_resolving = false;
 
@@ -4168,7 +4187,7 @@ mod tests {
             app.is_resolving,
             "first resolve_merge() must set is_resolving=true immediately"
         );
-        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
 
         // 2nd M press on change-b: must take queue path and not start immediately.
         app.cursor_index = 1;
@@ -4177,7 +4196,7 @@ mod tests {
             second_cmd.is_none(),
             "second resolve_merge() must queue while resolve is in progress"
         );
-        assert_eq!(app.changes[1].queue_status, QueueStatus::ResolveWait);
+        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
         assert!(
             app.resolve_queue_set.contains("change-b"),
             "second change must be queued for resolve"
@@ -4193,11 +4212,11 @@ mod tests {
         let mut app = AppState::new(changes);
 
         // Set up: change-a is currently resolving
-        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "resolving".to_string();
         app.is_resolving = true;
 
         // change-b is archived (typical state before merge deferred)
-        app.changes[1].queue_status = QueueStatus::Archived;
+        app.changes[1].display_status_cache = "archived".to_string();
 
         // Simulate MergeDeferred event for change-b during resolve
         app.handle_merge_deferred(
@@ -4208,8 +4227,7 @@ mod tests {
 
         // change-b should transition to ResolveWait
         assert_eq!(
-            app.changes[1].queue_status,
-            QueueStatus::ResolveWait,
+            app.changes[1].display_status_cache, "resolve pending",
             "MergeDeferred during resolve should transition to ResolveWait"
         );
         // change-b should be added to resolve queue
@@ -4225,7 +4243,7 @@ mod tests {
         let mut app = AppState::new(changes);
 
         // Set up: change-a is currently resolving
-        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "resolving".to_string();
         app.is_resolving = true;
 
         // Simulate MergeDeferred event for change-a (the currently resolving change)
@@ -4237,8 +4255,7 @@ mod tests {
 
         // change-a should remain Resolving (not transition to ResolveWait)
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::Resolving,
+            app.changes[0].display_status_cache, "resolving",
             "Currently resolving change should remain Resolving"
         );
         // change-a should NOT be added to resolve queue
@@ -4257,11 +4274,11 @@ mod tests {
         let mut app = AppState::new(changes);
 
         // Set up: change-a is currently resolving
-        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "resolving".to_string();
         app.is_resolving = true;
 
         // change-b is archived (typical state before merge deferred)
-        app.changes[1].queue_status = QueueStatus::Archived;
+        app.changes[1].display_status_cache = "archived".to_string();
 
         // Simulate MergeDeferred event for change-b (different from resolving change)
         app.handle_merge_deferred(
@@ -4272,8 +4289,7 @@ mod tests {
 
         // change-b should transition to ResolveWait
         assert_eq!(
-            app.changes[1].queue_status,
-            QueueStatus::ResolveWait,
+            app.changes[1].display_status_cache, "resolve pending",
             "Other change should transition to ResolveWait"
         );
         // change-b should be added to resolve queue
@@ -4292,7 +4308,7 @@ mod tests {
         app.is_resolving = false;
 
         // change-a is archived (typical state before merge deferred)
-        app.changes[0].queue_status = QueueStatus::Archived;
+        app.changes[0].display_status_cache = "archived".to_string();
 
         // Simulate MergeDeferred event for change-a when not resolving (manual intervention)
         app.handle_merge_deferred(
@@ -4303,8 +4319,7 @@ mod tests {
 
         // change-a should transition to MergeWait
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::MergeWait,
+            app.changes[0].display_status_cache, "merge wait",
             "MergeDeferred (manual) when not resolving should transition to MergeWait"
         );
         // change-a should NOT be added to resolve queue
@@ -4326,7 +4341,7 @@ mod tests {
 
         // No resolve in progress.
         app.is_resolving = false;
-        app.changes[0].queue_status = QueueStatus::Archived;
+        app.changes[0].display_status_cache = "archived".to_string();
 
         // Auto-resumable deferral (e.g. change-a's merge was in progress when change-b tried).
         let cmd = app.handle_merge_deferred(
@@ -4337,8 +4352,7 @@ mod tests {
 
         // Must show ResolveWait, NOT MergeWait.
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::ResolveWait,
+            app.changes[0].display_status_cache, "resolve pending",
             "auto-resumable MergeDeferred must display as ResolveWait, not MergeWait"
         );
 
@@ -4367,8 +4381,8 @@ mod tests {
 
         // No resolve is running.
         app.is_resolving = false;
-        app.changes[0].queue_status = QueueStatus::Merged;
-        app.changes[1].queue_status = QueueStatus::Archived;
+        app.changes[0].display_status_cache = "merged".to_string();
+        app.changes[1].display_status_cache = "archived".to_string();
 
         // change-b receives auto-resumable MergeDeferred while no resolve is active.
         let cmd = app.handle_merge_deferred(
@@ -4379,8 +4393,7 @@ mod tests {
 
         // Status must be ResolveWait.
         assert_eq!(
-            app.changes[1].queue_status,
-            QueueStatus::ResolveWait,
+            app.changes[1].display_status_cache, "resolve pending",
             "change must transition to ResolveWait"
         );
 
@@ -4409,8 +4422,8 @@ mod tests {
 
         // Resolve IS running for change-a.
         app.is_resolving = true;
-        app.changes[0].queue_status = QueueStatus::Resolving;
-        app.changes[1].queue_status = QueueStatus::Archived;
+        app.changes[0].display_status_cache = "resolving".to_string();
+        app.changes[1].display_status_cache = "archived".to_string();
 
         // change-b receives auto-resumable MergeDeferred while resolve is active.
         let cmd = app.handle_merge_deferred(
@@ -4421,8 +4434,7 @@ mod tests {
 
         // Status must be ResolveWait.
         assert_eq!(
-            app.changes[1].queue_status,
-            QueueStatus::ResolveWait,
+            app.changes[1].display_status_cache, "resolve pending",
             "change must transition to ResolveWait"
         );
 
@@ -4452,7 +4464,7 @@ mod tests {
         let mut app = AppState::new(changes);
 
         // Change starts in MergeWait (from a previous manual-intervention deferral).
-        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
         app.is_resolving = false;
 
         // User presses M → resolve_merge transitions to ResolveWait.
@@ -4465,8 +4477,7 @@ mod tests {
         );
 
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::ResolveWait,
+            app.changes[0].display_status_cache, "resolve pending",
             "manual resolve blocked by merge-in-progress must show ResolveWait"
         );
     }
@@ -4478,7 +4489,7 @@ mod tests {
         let mut app = AppState::new(changes);
 
         // Change starts in MergeWait.
-        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
         app.is_resolving = false;
 
         // Dirty-base check finds uncommitted changes → ResolveFailed.
@@ -4488,8 +4499,7 @@ mod tests {
         );
 
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::MergeWait,
+            app.changes[0].display_status_cache, "merge wait",
             "manual resolve blocked by uncommitted changes must show MergeWait"
         );
     }
@@ -4844,7 +4854,7 @@ mod tests {
 
         // Simulate what start_processing / resume_processing does:
         // mark change-a as Queued (it was selected before backend rejected it).
-        app.changes[0].queue_status = QueueStatus::Queued;
+        app.changes[0].display_status_cache = "queued".to_string();
         // change-b is not queued.
         app.mode = AppMode::Running;
 
@@ -4857,14 +4867,13 @@ mod tests {
         // change-a must no longer be Queued.
         let a = app.changes.iter().find(|c| c.id == "change-a").unwrap();
         assert_eq!(
-            a.queue_status,
-            QueueStatus::NotQueued,
+            a.display_status_cache, "not queued",
             "change-a should have been reset from Queued to NotQueued"
         );
 
         // change-b was never Queued; its status should be unchanged.
         let b = app.changes.iter().find(|c| c.id == "change-b").unwrap();
-        assert_eq!(b.queue_status, QueueStatus::NotQueued);
+        assert_eq!(b.display_status_cache, "not queued");
 
         // A warning log entry should explain the rejection.
         assert!(
@@ -4881,7 +4890,7 @@ mod tests {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
         // change-a is Applying (already running), not merely Queued.
-        app.changes[0].queue_status = QueueStatus::Applying;
+        app.changes[0].display_status_cache = "applying".to_string();
         app.mode = AppMode::Running;
 
         app.handle_orchestrator_event(OrchestratorEvent::ParallelStartRejected {
@@ -4891,7 +4900,7 @@ mod tests {
 
         // Applying should not be disturbed.
         let a = app.changes.iter().find(|c| c.id == "change-a").unwrap();
-        assert_eq!(a.queue_status, QueueStatus::Applying);
+        assert_eq!(a.display_status_cache, "applying");
     }
 
     /// Safety-net regression: AllCompleted must reset any lingering Queued changes so that
@@ -4900,7 +4909,7 @@ mod tests {
     fn test_all_completed_resets_remaining_queued() {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
-        app.changes[0].queue_status = QueueStatus::Queued;
+        app.changes[0].display_status_cache = "queued".to_string();
         app.mode = AppMode::Running;
 
         app.handle_orchestrator_event(OrchestratorEvent::AllCompleted);
@@ -4908,8 +4917,7 @@ mod tests {
         assert_eq!(app.mode, AppMode::Select);
         let a = app.changes.iter().find(|c| c.id == "change-a").unwrap();
         assert_eq!(
-            a.queue_status,
-            QueueStatus::NotQueued,
+            a.display_status_cache, "not queued",
             "Queued change should be reset to NotQueued after AllCompleted"
         );
     }
@@ -4924,12 +4932,12 @@ mod tests {
         // Enter Stopped mode with change-a execution-marked.
         app.mode = AppMode::Stopped;
         app.changes[0].selected = true;
-        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].display_status_cache = "not queued".to_string();
 
         // User presses F5: resume_processing sets change-a to Queued.
         let cmd = app.resume_processing();
         assert!(cmd.is_some(), "resume_processing should return a command");
-        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+        assert_eq!(app.changes[0].display_status_cache, "queued");
         assert_eq!(app.mode, AppMode::Running);
 
         // Backend rejects change-a (became uncommitted between last refresh and F5).
@@ -4939,7 +4947,7 @@ mod tests {
         });
 
         // change-a must not remain Queued.
-        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+        assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert!(
             app.logs
                 .iter()
@@ -4955,7 +4963,7 @@ mod tests {
         let mut app = AppState::new(changes);
 
         // Simulate that the change has already reached Merged state.
-        app.changes[0].queue_status = QueueStatus::Merged;
+        app.changes[0].display_status_cache = "merged".to_string();
 
         // A spurious ResolveFailed event arrives after the merge succeeded.
         app.handle_orchestrator_event(OrchestratorEvent::ResolveFailed {
@@ -4964,8 +4972,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::Merged,
+            app.changes[0].display_status_cache, "merged",
             "ResolveFailed must not demote a Merged change to MergeWait"
         );
         assert!(
@@ -4983,7 +4990,7 @@ mod tests {
         let mut app = AppState::new(changes);
 
         // Simulate that the change has already reached Merged state.
-        app.changes[0].queue_status = QueueStatus::Merged;
+        app.changes[0].display_status_cache = "merged".to_string();
 
         // The reducer display map says "merged" → TUI must keep Merged.
         let mut display_map = std::collections::HashMap::new();
@@ -4991,8 +4998,7 @@ mod tests {
         app.apply_display_statuses_from_reducer(&display_map);
 
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::Merged,
+            app.changes[0].display_status_cache, "merged",
             "reducer-driven display must not demote a Merged change to MergeWait"
         );
     }
@@ -5009,8 +5015,7 @@ mod tests {
         app.apply_display_statuses_from_reducer(&display_map);
 
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::Blocked,
+            app.changes[0].display_status_cache, "blocked",
             "reducer-driven display must not demote a Blocked change to MergeWait"
         );
     }
@@ -5027,8 +5032,7 @@ mod tests {
         app.apply_display_statuses_from_reducer(&display_map);
 
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::Merged,
+            app.changes[0].display_status_cache, "merged",
             "reducer-driven display must not transition a Merged change away from Merged"
         );
     }
@@ -5044,11 +5048,11 @@ mod tests {
         let mut app = AppState::new(changes);
 
         // Simulate: A is Applying, B and C are Blocked+selected (execution marks present)
-        app.changes[0].queue_status = QueueStatus::Applying;
+        app.changes[0].display_status_cache = "applying".to_string();
         app.changes[0].selected = false;
-        app.changes[1].queue_status = QueueStatus::Blocked;
+        app.changes[1].display_status_cache = "blocked".to_string();
         app.changes[1].selected = true;
-        app.changes[2].queue_status = QueueStatus::Blocked;
+        app.changes[2].display_status_cache = "blocked".to_string();
         app.changes[2].selected = true;
 
         // Press F5 (start_processing) – should return None (no NotQueued changes)
@@ -5059,13 +5063,11 @@ mod tests {
             "start_processing must return None when only Blocked changes are selected"
         );
         assert_eq!(
-            app.changes[1].queue_status,
-            QueueStatus::Blocked,
+            app.changes[1].display_status_cache, "blocked",
             "Blocked change B must remain Blocked after start_processing"
         );
         assert_eq!(
-            app.changes[2].queue_status,
-            QueueStatus::Blocked,
+            app.changes[2].display_status_cache, "blocked",
             "Blocked change C must remain Blocked after start_processing"
         );
     }
@@ -5076,21 +5078,19 @@ mod tests {
         let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Applying;
+        app.changes[0].display_status_cache = "applying".to_string();
         app.changes[0].selected = true;
-        app.changes[1].queue_status = QueueStatus::Blocked;
+        app.changes[1].display_status_cache = "blocked".to_string();
         app.changes[1].selected = true;
 
         app.handle_orchestrator_event(OrchestratorEvent::Stopped);
 
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::NotQueued,
+            app.changes[0].display_status_cache, "not queued",
             "Applying change must be reset to NotQueued on Stopped"
         );
         assert_eq!(
-            app.changes[1].queue_status,
-            QueueStatus::NotQueued,
+            app.changes[1].display_status_cache, "not queued",
             "Blocked change must be reset to NotQueued on Stopped"
         );
         assert_eq!(app.mode, AppMode::Stopped);
@@ -5102,21 +5102,19 @@ mod tests {
         let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Queued;
+        app.changes[0].display_status_cache = "queued".to_string();
         app.changes[0].selected = true;
-        app.changes[1].queue_status = QueueStatus::Blocked;
+        app.changes[1].display_status_cache = "blocked".to_string();
         app.changes[1].selected = true;
 
         app.handle_orchestrator_event(OrchestratorEvent::AllCompleted);
 
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::NotQueued,
+            app.changes[0].display_status_cache, "not queued",
             "Queued change must be reset to NotQueued on AllCompleted"
         );
         assert_eq!(
-            app.changes[1].queue_status,
-            QueueStatus::NotQueued,
+            app.changes[1].display_status_cache, "not queued",
             "Blocked change must be reset to NotQueued on AllCompleted"
         );
         assert_eq!(app.mode, AppMode::Select);
@@ -5143,11 +5141,14 @@ mod tests {
 
         app.apply_display_statuses_from_reducer(&display_map);
 
-        assert_eq!(app.changes[0].queue_status, QueueStatus::Applying);
-        assert_eq!(app.changes[1].queue_status, QueueStatus::MergeWait);
+        assert_eq!(app.changes[0].display_status_cache, "applying");
+        assert_eq!(app.changes[1].display_status_cache, "merge wait");
 
         // Verify active classification works correctly.
-        assert!(matches!(app.changes[0].queue_status, QueueStatus::Applying));
+        assert!(matches!(
+            app.changes[0].display_status_cache.as_str(),
+            "applying"
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -5162,15 +5163,15 @@ mod tests {
         let mut app = AppState::new(changes);
 
         // Scenarios: dependency blocked, merge wait, resolving.
-        let scenarios: &[(&str, QueueStatus)] = &[
-            ("blocked", QueueStatus::Blocked),
-            ("merge wait", QueueStatus::MergeWait),
-            ("resolve pending", QueueStatus::ResolveWait),
-            ("resolving", QueueStatus::Resolving),
-            ("archived", QueueStatus::Archived),
-            ("merged", QueueStatus::Merged),
-            ("queued", QueueStatus::Queued),
-            ("not queued", QueueStatus::NotQueued),
+        let scenarios: &[(&str, &str)] = &[
+            ("blocked", "blocked"),
+            ("merge wait", "merge wait"),
+            ("resolve pending", "resolve pending"),
+            ("resolving", "resolving"),
+            ("archived", "archived"),
+            ("merged", "merged"),
+            ("queued", "queued"),
+            ("not queued", "not queued"),
         ];
 
         for (reducer_str, expected_tui_status) in scenarios {
@@ -5179,7 +5180,7 @@ mod tests {
             app.apply_display_statuses_from_reducer(&display_map);
 
             assert_eq!(
-                app.changes[0].queue_status, *expected_tui_status,
+                app.changes[0].display_status_cache, *expected_tui_status,
                 "reducer '{}' should map to {:?}",
                 reducer_str, expected_tui_status
             );
@@ -5188,7 +5189,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Phase 3.3: toggle_selection in Running mode emits commands without
-    // mutating queue_status locally.
+    // mutating display_status_cache locally.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -5201,36 +5202,34 @@ mod tests {
         app.mode = AppMode::Running;
 
         // Simulate c1 in NotQueued state.
-        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].display_status_cache = "not queued".to_string();
 
-        // toggle_selection should return AddToQueue command and NOT mutate queue_status.
+        // toggle_selection should return AddToQueue command and NOT mutate display_status_cache.
         let cmd = app.toggle_selection();
         assert!(
             matches!(cmd, Some(TuiCommand::AddToQueue(ref id)) if id == "c1"),
             "expected AddToQueue command, got {:?}",
             cmd
         );
-        // queue_status must NOT have been locally changed to Queued.
+        // display_status_cache must NOT have been locally changed to Queued.
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::NotQueued,
-            "queue_status must NOT be mutated locally; reducer drives it"
+            app.changes[0].display_status_cache, "not queued",
+            "display_status_cache must NOT be mutated locally; reducer drives it"
         );
 
         // Simulate c2 already Queued.
         app.cursor_index = 1;
-        app.changes[1].queue_status = QueueStatus::Queued;
+        app.changes[1].display_status_cache = "queued".to_string();
         let cmd2 = app.toggle_selection();
         assert!(
             matches!(cmd2, Some(TuiCommand::RemoveFromQueue(ref id)) if id == "c2"),
             "expected RemoveFromQueue command, got {:?}",
             cmd2
         );
-        // queue_status must NOT have been locally changed to NotQueued.
+        // display_status_cache must NOT have been locally changed to NotQueued.
         assert_eq!(
-            app.changes[1].queue_status,
-            QueueStatus::Queued,
-            "queue_status must NOT be mutated locally; reducer drives it"
+            app.changes[1].display_status_cache, "queued",
+            "display_status_cache must NOT be mutated locally; reducer drives it"
         );
     }
 
@@ -5243,7 +5242,7 @@ mod tests {
         let changes = vec![create_test_change("c1", 0, 3)];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::MergeWait;
+        app.changes[0].display_status_cache = "merge wait".to_string();
 
         // Space on MergeWait toggles selection only (no queue change).
         let cmd = app.toggle_selection();
@@ -5256,8 +5255,8 @@ mod tests {
             "Space on MergeWait must not issue queue commands, got {:?}",
             cmd
         );
-        // queue_status must still be MergeWait.
-        assert_eq!(app.changes[0].queue_status, QueueStatus::MergeWait);
+        // display_status_cache must still be MergeWait.
+        assert_eq!(app.changes[0].display_status_cache, "merge wait");
     }
 
     #[test]
@@ -5265,7 +5264,7 @@ mod tests {
         let changes = vec![create_test_change("c1", 0, 3)];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::ResolveWait;
+        app.changes[0].display_status_cache = "resolve pending".to_string();
 
         // Space on ResolveWait toggles selection only (no queue change).
         let cmd = app.toggle_selection();
@@ -5277,7 +5276,7 @@ mod tests {
             "Space on ResolveWait must not issue queue commands, got {:?}",
             cmd
         );
-        assert_eq!(app.changes[0].queue_status, QueueStatus::ResolveWait);
+        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
     }
 
     // -----------------------------------------------------------------------
@@ -5321,8 +5320,8 @@ mod tests {
         display_map.insert("change-a".to_string(), "not queued");
         app.apply_display_statuses_from_reducer(&display_map);
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::NotQueued,
+            app.changes[0].display_status_cache,
+            "not queued",
             "display sync should apply reducer snapshot – but reducer already says queued, so this tests the raw override path"
         );
 
@@ -5330,11 +5329,10 @@ mod tests {
         let guard2 = shared.blocking_read();
         let real_map = guard2.all_display_statuses();
         drop(guard2);
-        app.changes[0].queue_status = QueueStatus::Queued; // restore as start_processing set
+        app.changes[0].display_status_cache = "queued".to_string(); // restore as start_processing set
         app.apply_display_statuses_from_reducer(&real_map);
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::Queued,
+            app.changes[0].display_status_cache, "queued",
             "reducer snapshot must preserve Queued through ChangesRefreshed display sync"
         );
     }
@@ -5349,7 +5347,7 @@ mod tests {
         let mut app = AppState::new(changes);
         app.mode = AppMode::Stopped;
         app.changes[0].selected = true;
-        app.changes[0].queue_status = QueueStatus::NotQueued;
+        app.changes[0].display_status_cache = "not queued".to_string();
 
         let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
             vec!["change-a".to_string()],
@@ -5391,7 +5389,7 @@ mod tests {
         // F5 – queues the change and syncs the reducer.
         let cmd = app.start_processing();
         assert!(cmd.is_some());
-        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+        assert_eq!(app.changes[0].display_status_cache, "queued");
 
         // Simulate initial parallel ChangesRefreshed (workspace scan returns nothing special).
         {
@@ -5411,8 +5409,7 @@ mod tests {
         let display_map = shared.blocking_read().all_display_statuses();
         app.apply_display_statuses_from_reducer(&display_map);
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::Queued,
+            app.changes[0].display_status_cache, "queued",
             "initial parallel ChangesRefreshed must not regress a queued row to not-queued"
         );
     }
@@ -5441,7 +5438,7 @@ mod tests {
         // F5 – queues the change in TUI and syncs the reducer.
         let cmd = app.start_processing();
         assert!(cmd.is_some());
-        assert_eq!(app.changes[0].queue_status, QueueStatus::Queued);
+        assert_eq!(app.changes[0].display_status_cache, "queued");
 
         // Simulate run_orchestrator_parallel replacing shared state (the regression source).
         // Without the fix this would clear queue_intent back to NotQueued.
@@ -5474,8 +5471,7 @@ mod tests {
         let display_map = shared.blocking_read().all_display_statuses();
         app.apply_display_statuses_from_reducer(&display_map);
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::Queued,
+            app.changes[0].display_status_cache, "queued",
             "state reset followed by AddToQueue must preserve Queued through ChangesRefreshed"
         );
     }
@@ -5552,8 +5548,7 @@ mod tests {
         let display_map = shared.blocking_read().all_display_statuses();
         app.apply_display_statuses_from_reducer(&display_map);
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::Queued,
+            app.changes[0].display_status_cache, "queued",
             "dependency resolution must restore queued display, not not-queued"
         );
     }
@@ -5587,8 +5582,8 @@ mod tests {
                 "change-b".to_string(),
             ));
         }
-        app.changes[0].queue_status = QueueStatus::Queued;
-        app.changes[1].queue_status = QueueStatus::Queued;
+        app.changes[0].display_status_cache = "queued".to_string();
+        app.changes[1].display_status_cache = "queued".to_string();
         app.mode = AppMode::Running;
 
         // Backend rejects only change-a.
@@ -5598,7 +5593,7 @@ mod tests {
         });
 
         // change-a must be reset in both TUI and reducer.
-        assert_eq!(app.changes[0].queue_status, QueueStatus::NotQueued);
+        assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert_eq!(
             shared.blocking_read().display_status("change-a"),
             "not queued",
@@ -5606,7 +5601,7 @@ mod tests {
         );
 
         // change-b must remain Queued in both TUI and reducer.
-        assert_eq!(app.changes[1].queue_status, QueueStatus::Queued);
+        assert_eq!(app.changes[1].display_status_cache, "queued");
         assert_eq!(
             shared.blocking_read().display_status("change-b"),
             "queued",
@@ -5628,7 +5623,7 @@ mod tests {
         ];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "resolving".to_string();
 
         app.handle_all_completed();
 
@@ -5649,8 +5644,8 @@ mod tests {
         ];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Merged; // already done
-        app.changes[1].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "merged".to_string(); // already done
+        app.changes[1].display_status_cache = "resolving".to_string();
         app.is_resolving = true;
 
         // Simulate resolve completion
@@ -5672,8 +5667,8 @@ mod tests {
         ];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Applying; // still active
-        app.changes[1].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "applying".to_string(); // still active
+        app.changes[1].display_status_cache = "resolving".to_string();
         app.is_resolving = true;
 
         app.handle_resolve_completed("change-b".to_string(), None);
@@ -5691,7 +5686,7 @@ mod tests {
         let changes = vec![create_test_change("change-a", 3, 3)];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "resolving".to_string();
         app.is_resolving = true;
 
         app.handle_resolve_failed("change-a".to_string(), "conflict".to_string());
@@ -5714,15 +5709,14 @@ mod tests {
         ];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Resolving;
+        app.changes[0].display_status_cache = "resolving".to_string();
         app.changes[0].selected = true;
-        app.changes[1].queue_status = QueueStatus::Merged;
+        app.changes[1].display_status_cache = "merged".to_string();
 
         app.handle_stopped();
 
         assert_eq!(
-            app.changes[0].queue_status,
-            QueueStatus::NotQueued,
+            app.changes[0].display_status_cache, "not queued",
             "Resolving change must be reset to NotQueued on Stop"
         );
         // selected should be preserved
@@ -5755,7 +5749,7 @@ mod tests {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.changes[0].queue_status = QueueStatus::Applying;
+        app.changes[0].display_status_cache = "applying".to_string();
 
         app.try_transition_to_select();
 
