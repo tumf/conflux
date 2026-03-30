@@ -51,20 +51,6 @@ pub async fn base_dirty_reason(repo_root: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Classify whether a dirty-base reason is auto-resumable (i.e. will clear automatically
-/// once a preceding merge/resolve completes) or requires manual user intervention.
-///
-/// Auto-resumable reasons:
-/// - Merge in progress (MERGE_HEAD exists) — another merge/resolve is active
-///
-/// Manual-intervention reasons:
-/// - Working tree has uncommitted changes — user must repair the workspace
-pub fn is_dirty_reason_auto_resumable(reason: &str) -> bool {
-    reason.contains("Merge in progress")
-        || reason.contains("MERGE_HEAD")
-        || reason.contains("Resolve in progress")
-}
-
 /// Result of a merge attempt
 #[derive(Debug)]
 pub enum MergeAttempt {
@@ -204,8 +190,8 @@ impl ParallelExecutor {
                     self.retry_deferred_merges().await;
                 }
                 Ok(MergeAttempt::Deferred(reason)) => {
-                    // Merge deferred: classify by auto-resumable vs manual intervention.
-                    let auto_resumable = is_dirty_reason_auto_resumable(&reason);
+                    // Merge deferred: only resolve-in-progress reasons are auto-resumable.
+                    let auto_resumable = reason.contains("Resolve in progress");
                     if auto_resumable {
                         self.resolve_wait_changes
                             .insert(workspace_result.change_id.clone());
@@ -445,7 +431,7 @@ impl ParallelExecutor {
                 Ok(())
             }
             MergeAttempt::Deferred(reason) => {
-                let auto_resumable = is_dirty_reason_auto_resumable(&reason);
+                let auto_resumable = reason.contains("Resolve in progress");
                 if auto_resumable {
                     // Auto-resumable: another merge/resolve is in progress.
                     // Track as deferred so retry_deferred_merges picks it up.
@@ -717,50 +703,30 @@ pub async fn resolve_deferred_merge(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
-    fn test_is_dirty_reason_auto_resumable_merge_in_progress() {
-        assert!(is_dirty_reason_auto_resumable(
-            "Merge in progress (MERGE_HEAD exists)"
-        ));
+    fn test_resolve_in_progress_reason_is_auto_resumable() {
+        let auto_resumable =
+            "Resolve in progress for another change".contains("Resolve in progress");
+        assert!(auto_resumable);
     }
 
     #[test]
-    fn test_is_dirty_reason_auto_resumable_merge_head_present() {
-        assert!(is_dirty_reason_auto_resumable("MERGE_HEAD exists"));
+    fn test_merge_in_progress_reason_is_not_auto_resumable() {
+        let auto_resumable =
+            "Merge in progress (MERGE_HEAD exists)".contains("Resolve in progress");
+        assert!(!auto_resumable);
     }
 
     #[test]
-    fn test_is_dirty_reason_auto_resumable_resolve_in_progress() {
-        assert!(is_dirty_reason_auto_resumable(
-            "Resolve in progress for another change"
-        ));
+    fn test_uncommitted_changes_reason_is_not_auto_resumable() {
+        let auto_resumable = "Working tree has uncommitted changes".contains("Resolve in progress");
+        assert!(!auto_resumable);
     }
 
     #[test]
-    fn test_is_dirty_reason_not_auto_resumable_uncommitted_changes() {
-        assert!(!is_dirty_reason_auto_resumable(
-            "Working tree has uncommitted changes"
-        ));
-    }
-
-    #[test]
-    fn test_is_dirty_reason_not_auto_resumable_uncommitted_with_details() {
-        assert!(!is_dirty_reason_auto_resumable(
-            "Working tree has uncommitted changes:\n M src/main.rs"
-        ));
-    }
-
-    #[test]
-    fn test_is_dirty_reason_not_auto_resumable_empty() {
-        assert!(!is_dirty_reason_auto_resumable(""));
-    }
-
-    #[test]
-    fn test_is_dirty_reason_not_auto_resumable_archive_incomplete() {
-        assert!(!is_dirty_reason_auto_resumable(
-            "Archive incomplete for 'change-a': worktree may be dirty"
-        ));
+    fn test_archive_incomplete_reason_is_not_auto_resumable() {
+        let auto_resumable = "Archive incomplete for 'change-a': worktree may be dirty"
+            .contains("Resolve in progress");
+        assert!(!auto_resumable);
     }
 }
