@@ -1,8 +1,7 @@
-import React, { useCallback, useEffect, useRef } from 'react';
+import React, { useCallback, useRef } from 'react';
 import { ArrowLeft } from 'lucide-react';
 import { ElicitationRequest, ProposalChatMessage, ProposalSession, ToolCallInfo, ToolCallStatus } from '../api/types';
 import { useProposalWebSocket } from '../hooks/useProposalWebSocket';
-import { listProposalSessionMessages } from '../api/restClient';
 import { ChatMessageList } from './ChatMessageList';
 import { ChatInput } from './ChatInput';
 import { ElicitationDialog } from './ElicitationDialog';
@@ -19,7 +18,6 @@ interface ProposalChatProps {
   onBack: () => void;
   onMerge: () => void;
   onClose: () => void;
-  onHydrateMessages: (sessionId: string, messages: ProposalChatMessage[]) => void;
   onAppendMessage: (sessionId: string, message: ProposalChatMessage) => void;
   onStartAssistantTurn: (sessionId: string, messageId: string, turnId?: string) => void;
   onStreamingChunk: (sessionId: string, messageId: string, content: string, turnId?: string) => void;
@@ -42,7 +40,6 @@ export function ProposalChat({
   onBack,
   onMerge,
   onClose,
-  onHydrateMessages,
   onAppendMessage,
   onStartAssistantTurn,
   onStreamingChunk,
@@ -56,36 +53,22 @@ export function ProposalChat({
 }: ProposalChatProps) {
   const pendingMessageIdRef = useRef<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-
-    listProposalSessionMessages(projectId, session.id)
-      .then((response) => {
-        if (cancelled) return;
-        onHydrateMessages(
-          session.id,
-          response.messages.map((message) => ({
-            ...message,
-            hydrated: true,
-          })),
-        );
-      })
-      .catch((error) => {
-        console.error('Failed to hydrate proposal session history', {
-          sessionId: session.id,
-          projectId,
-          error,
-        });
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [onHydrateMessages, projectId, session.id]);
-
   const { sendPrompt, sendElicitationResponse, status } = useProposalWebSocket({
     projectId,
     sessionId: session.id,
+    hasActiveTurn: () => pendingMessageIdRef.current !== null,
+    onUserMessage: useCallback(
+      (message: { id: string; content: string; timestamp: string }) => {
+        onAppendMessage(session.id, {
+          id: message.id,
+          role: 'user',
+          content: message.content,
+          timestamp: message.timestamp,
+          hydrated: true,
+        });
+      },
+      [onAppendMessage, session.id],
+    ),
     onMessageChunk: useCallback(
       (content: string, messageId?: string, turnId?: string) => {
         const resolvedMessageId = messageId ?? pendingMessageIdRef.current ?? `assistant-${session.id}-${Date.now()}`;
@@ -144,17 +127,9 @@ export function ProposalChat({
 
   const handleSend = useCallback(
     (content: string) => {
-      // Create a user message and append it locally
-      const userMsg: ProposalChatMessage = {
-        id: `user-${Date.now()}`,
-        role: 'user',
-        content,
-        timestamp: new Date().toISOString(),
-      };
-      onAppendMessage(session.id, userMsg);
       sendPrompt(content);
     },
-    [session.id, onAppendMessage, sendPrompt],
+    [sendPrompt],
   );
 
   const handleElicitationSubmit = useCallback(

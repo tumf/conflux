@@ -281,14 +281,14 @@ impl ProposalSessionManager {
         &mut self,
         session_id: &str,
         content: &str,
-    ) -> Result<(), ProposalSessionError> {
+    ) -> Result<ProposalSessionMessageRecord, ProposalSessionError> {
         let session = self
             .sessions
             .get_mut(session_id)
             .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
         session.next_user_seq += 1;
         let now = Utc::now().to_rfc3339();
-        session.message_history.push(ProposalSessionMessageRecord {
+        let message = ProposalSessionMessageRecord {
             id: format!("{}-user-{}", session.id, session.next_user_seq),
             role: "user".to_string(),
             content: content.to_string(),
@@ -296,8 +296,9 @@ impl ProposalSessionManager {
             turn_id: None,
             hydrated: Some(true),
             tool_calls: None,
-        });
-        Ok(())
+        };
+        session.message_history.push(message.clone());
+        Ok(message)
     }
 
     /// Append an assistant text chunk to the active turn in message history.

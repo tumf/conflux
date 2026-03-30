@@ -19,6 +19,8 @@ export type ProposalWsStatus = 'connecting' | 'connected' | 'disconnected' | 'er
 export interface UseProposalWebSocketOptions {
   projectId: string | null;
   sessionId: string | null;
+  hasActiveTurn?: () => boolean;
+  onUserMessage?: (message: { id: string; content: string; timestamp: string }) => void;
   onMessageChunk?: (content: string, messageId?: string, turnId?: string) => void;
   onToolCall?: (toolCall: ToolCallInfo, messageId?: string, turnId?: string) => void;
   onToolCallUpdate?: (toolCallId: string, status: ToolCallStatus, messageId?: string, turnId?: string) => void;
@@ -76,6 +78,9 @@ export function useProposalWebSocket(options: UseProposalWebSocketOptions) {
 
     ws.onclose = () => {
       setStatus('disconnected');
+      if (callbacksRef.current.hasActiveTurn?.()) {
+        callbacksRef.current.onError?.('WebSocket disconnected');
+      }
       wsRef.current = null;
     };
 
@@ -141,6 +146,13 @@ export function handleServerMessage(
   callbacks: UseProposalWebSocketOptions,
 ) {
   switch (msg.type) {
+    case 'user_message':
+      callbacks.onUserMessage?.({
+        id: msg.id,
+        content: msg.content,
+        timestamp: msg.timestamp,
+      });
+      break;
     case 'agent_message_chunk':
       callbacks.onMessageChunk?.(msg.text, msg.message_id, msg.turn_id);
       break;
