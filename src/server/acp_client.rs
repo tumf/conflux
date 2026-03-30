@@ -306,6 +306,23 @@ pub struct AcpClient {
 }
 
 impl AcpClient {
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        let (stdin_tx, _stdin_rx) = mpsc::channel::<String>(1);
+        let (notification_tx, notification_rx) = mpsc::channel::<AcpMessage>(1);
+        let (_response_tx, response_rx) = mpsc::channel::<JsonRpcResponse>(1);
+        Self {
+            stdin_tx,
+            notification_tx,
+            notification_rx: Mutex::new(notification_rx),
+            next_id: AtomicU64::new(1),
+            response_rx: Mutex::new(response_rx),
+            child: Mutex::new(None),
+            initialized: Mutex::new(false),
+            working_dir: PathBuf::new(),
+        }
+    }
+
     /// Spawn a new ACP subprocess in the given working directory.
     pub async fn spawn(
         config: &ProposalSessionConfig,

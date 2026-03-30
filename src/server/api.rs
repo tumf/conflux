@@ -3258,6 +3258,9 @@ pub enum ProposalWsServerMessage {
     AgentMessageChunk {
         text: String,
     },
+    AgentThoughtChunk {
+        text: String,
+    },
     ToolCall {
         tool_call_id: String,
         title: String,
@@ -3475,12 +3478,16 @@ fn build_replay_ws_messages(messages: Vec<ProposalSessionMessageRecord>) -> Vec<
 
         if msg.role == "assistant" {
             if !msg.content.is_empty() {
-                replay_messages.push(
-                    serde_json::to_string(&ProposalWsServerMessage::AgentMessageChunk {
+                let replay_chunk = if msg.is_thought == Some(true) {
+                    ProposalWsServerMessage::AgentThoughtChunk {
                         text: msg.content.clone(),
-                    })
-                    .unwrap_or_default(),
-                );
+                    }
+                } else {
+                    ProposalWsServerMessage::AgentMessageChunk {
+                        text: msg.content.clone(),
+                    }
+                };
+                replay_messages.push(serde_json::to_string(&replay_chunk).unwrap_or_default());
             }
             if let Some(tool_calls) = msg.tool_calls {
                 for tool_call in tool_calls {
@@ -3583,8 +3590,7 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                 }
 
                 let ws_message = match update.update {
-                    crate::server::acp_client::AcpEvent::AgentMessageChunk { content }
-                    | crate::server::acp_client::AcpEvent::AgentThoughtChunk { content } => {
+                    crate::server::acp_client::AcpEvent::AgentMessageChunk { content } => {
                         let text = content.map(|c| c.text).unwrap_or_default();
                         let _ = state_for_notifs
                             .proposal_session_manager
@@ -3592,6 +3598,15 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                             .await
                             .append_assistant_chunk(&session_id_for_notifs, &text);
                         Some(ProposalWsServerMessage::AgentMessageChunk { text })
+                    }
+                    crate::server::acp_client::AcpEvent::AgentThoughtChunk { content } => {
+                        let text = content.map(|c| c.text).unwrap_or_default();
+                        let _ = state_for_notifs
+                            .proposal_session_manager
+                            .write()
+                            .await
+                            .append_assistant_thought_chunk(&session_id_for_notifs, &text);
+                        Some(ProposalWsServerMessage::AgentThoughtChunk { text })
                     }
                     crate::server::acp_client::AcpEvent::ToolCall {
                         tool_call_id,

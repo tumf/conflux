@@ -22,6 +22,7 @@ export interface UseProposalWebSocketOptions {
   hasActiveTurn?: () => boolean;
   onUserMessage?: (message: { id: string; content: string; timestamp: string }) => void;
   onMessageChunk?: (content: string, messageId?: string, turnId?: string) => void;
+  onThoughtChunk?: (content: string, messageId?: string, turnId?: string) => void;
   onToolCall?: (toolCall: ToolCallInfo, messageId?: string, turnId?: string) => void;
   onToolCallUpdate?: (toolCallId: string, status: ToolCallStatus, messageId?: string, turnId?: string) => void;
   onElicitationRequest?: (elicitation: ElicitationRequest) => void;
@@ -155,6 +156,9 @@ export function handleServerMessage(
       break;
     case 'agent_message_chunk':
       callbacks.onMessageChunk?.(msg.text, msg.message_id, msg.turn_id);
+      break;
+    case 'agent_thought_chunk':
+      callbacks.onThoughtChunk?.(msg.text, msg.message_id, msg.turn_id);
       break;
     case 'tool_call':
       callbacks.onToolCall?.(

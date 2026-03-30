@@ -38,6 +38,22 @@ describe('handleServerMessage', () => {
     expect(onMessageChunk).toHaveBeenCalledWith('partial', 'assistant-1', 'turn-1');
   });
 
+  it('dispatches thought chunks with message/turn ids', () => {
+    const onThoughtChunk = vi.fn();
+
+    handleServerMessage(
+      {
+        type: 'agent_thought_chunk',
+        text: 'thinking...',
+        message_id: 'assistant-1',
+        turn_id: 'turn-1',
+      },
+      makeCallbacks({ onThoughtChunk }),
+    );
+
+    expect(onThoughtChunk).toHaveBeenCalledWith('thinking...', 'assistant-1', 'turn-1');
+  });
+
   it('dispatches tool call events and updates', () => {
     const onToolCall = vi.fn();
     const onToolCallUpdate = vi.fn();

@@ -80,6 +80,12 @@ export function ProposalChat({
       },
       [onStartAssistantTurn, onStreamingChunk, session.id],
     ),
+    onThoughtChunk: useCallback(
+      (_content: string, _messageId?: string, _turnId?: string) => {
+        // Intentionally ignored for now; thought chunks are separated at protocol level.
+      },
+      [],
+    ),
     onToolCall: useCallback(
       (toolCall: ToolCallInfo, messageId?: string, turnId?: string) => {
         const resolvedMessageId = messageId ?? pendingMessageIdRef.current ?? `assistant-${session.id}-${Date.now()}`;

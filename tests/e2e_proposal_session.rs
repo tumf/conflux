@@ -257,10 +257,10 @@ async fn proposal_session_ws_accepts_frontend_message_aliases() {
     assert_eq!(user_json["type"], "user_message");
     assert_eq!(user_json["content"], "alias-check");
 
-    let chunk_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
-    let chunk_json: Value = serde_json::from_str(&chunk_message).unwrap();
-    assert_eq!(chunk_json["type"], "agent_message_chunk");
-    assert_eq!(chunk_json["text"], "echo:alias-check");
+    let thought_chunk_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let thought_chunk_json: Value = serde_json::from_str(&thought_chunk_message).unwrap();
+    assert_eq!(thought_chunk_json["type"], "agent_thought_chunk");
+    assert_eq!(thought_chunk_json["text"], "echo:alias-check");
 
     let turn_complete_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let turn_complete_json: Value = serde_json::from_str(&turn_complete_message).unwrap();
@@ -513,10 +513,10 @@ async fn proposal_session_ws_cancel_and_reconnect_history_work() {
     assert_eq!(user_json["type"], "user_message");
     assert_eq!(user_json["content"], "history-check");
 
-    let chunk_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
-    let chunk_json: Value = serde_json::from_str(&chunk_message).unwrap();
-    assert_eq!(chunk_json["type"], "agent_message_chunk");
-    assert_eq!(chunk_json["text"], "echo:history-check");
+    let thought_chunk_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let thought_chunk_json: Value = serde_json::from_str(&thought_chunk_message).unwrap();
+    assert_eq!(thought_chunk_json["type"], "agent_thought_chunk");
+    assert_eq!(thought_chunk_json["text"], "echo:history-check");
 
     let turn_complete_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let turn_complete_json: Value = serde_json::from_str(&turn_complete_message).unwrap();
@@ -556,7 +556,7 @@ async fn proposal_session_ws_cancel_and_reconnect_history_work() {
         .into_text()
         .unwrap();
     let replay_json: Value = serde_json::from_str(&replay_message).unwrap();
-    assert_eq!(replay_json["type"], "agent_message_chunk");
+    assert_eq!(replay_json["type"], "agent_thought_chunk");
     assert_eq!(replay_json["text"], "echo:history-check");
 
     let replay_turn_complete = reconnect_socket
@@ -644,6 +644,8 @@ async fn proposal_session_multi_session_websockets_stay_independent() {
     assert_eq!(user_json_b["type"], "user_message");
     assert_eq!(user_json_a["content"], "alpha");
     assert_eq!(user_json_b["content"], "beta");
+    assert_eq!(json_a["type"], "agent_thought_chunk");
+    assert_eq!(json_b["type"], "agent_thought_chunk");
     assert_eq!(json_a["text"], "echo:alpha");
     assert_eq!(json_b["text"], "echo:beta");
 
