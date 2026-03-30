@@ -134,6 +134,14 @@ export function ProposalChat({
     [sendPrompt],
   );
 
+  const handleExamplePromptSelect = useCallback(
+    (content: string) => {
+      if (!content.trim()) return;
+      sendPrompt(content);
+    },
+    [sendPrompt],
+  );
+
   const handleElicitationSubmit = useCallback(
     (data: Record<string, unknown>) => {
       if (!activeElicitation) return;
@@ -209,6 +217,8 @@ export function ProposalChat({
           <ChatMessageList
             messages={messages}
             streamingContent={streamingContent}
+            isAgentResponding={isAgentResponding}
+            onExamplePromptSelect={handleExamplePromptSelect}
           />
           <ChatInput
             onSend={handleSend}
@@ -220,7 +230,7 @@ export function ProposalChat({
                   ? 'Agent is responding...'
                   : activeElicitation
                     ? 'Please respond to the agent request first'
-                    : 'Type a message... (Ctrl+Enter to send)'
+                    : 'Type a message... (Enter to send, Shift+Enter for newline)'
             }
           />
         </div>
