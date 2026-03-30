@@ -23,3 +23,7 @@
 - [x] 4.2 `pending_changes` ローカル変数を削除し、`shared_state.pending_changes()` を参照
 - [x] 4.3 `changes_processed`, `total_changes` を削除し、`shared_state` のカウンターを参照
 - [x] 4.4 全テスト通過を確認、`cargo clippy -- -D warnings` クリア
+
+## Acceptance #1 Failure Follow-up
+
+- [x] `cargo fmt` のフォーマット変更（`src/orchestrator.rs`, `src/tui/orchestrator.rs`）をコミットし、git working tree をクリーンにする

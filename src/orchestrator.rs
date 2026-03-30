@@ -348,7 +348,10 @@ impl Orchestrator {
             // Log warning when approaching limit (80%)
             let warning_threshold = (max_iterations as f32 * 0.8) as u32;
             if iteration == warning_threshold {
-                warn!("Approaching max iterations: {}/{}", iteration, max_iterations);
+                warn!(
+                    "Approaching max iterations: {}/{}",
+                    iteration, max_iterations
+                );
             }
 
             // Stop if max iterations reached
@@ -463,10 +466,9 @@ impl Orchestrator {
             &snapshot.progress,
             snapshot.empty_commit,
         ) {
-                warn!("{}", stall_reason);
-                self.mark_change_stalled(&next.id, &stall_reason).await;
-                return LoopControl::Continue;
-
+            warn!("{}", stall_reason);
+            self.mark_change_stalled(&next.id, &stall_reason).await;
+            return LoopControl::Continue;
         }
 
         if let Some(progress) = &mut self.progress {
@@ -829,8 +831,8 @@ impl Orchestrator {
 
         // Run on_finish hook
         let processed = self.shared_state.read().await.changes_processed();
-        let finish_context = HookContext::new(processed, total_changes, 0, false)
-            .with_status(finish_status);
+        let finish_context =
+            HookContext::new(processed, total_changes, 0, false).with_status(finish_status);
         self.hooks
             .run_hook(HookType::OnFinish, &finish_context)
             .await?;
@@ -1068,7 +1070,11 @@ impl Orchestrator {
 
     /// Record an error and check if circuit breaker should trip
     /// Returns true if the change should be skipped due to repeated errors
-    async fn record_error_and_check_circuit_breaker(&mut self, change_id: &str, error: &str) -> bool {
+    async fn record_error_and_check_circuit_breaker(
+        &mut self,
+        change_id: &str,
+        error: &str,
+    ) -> bool {
         let cb_config = self.config.get_error_circuit_breaker();
         let circuit_breaker_config = CircuitBreakerConfig {
             enabled: cb_config.enabled,
@@ -1076,7 +1082,11 @@ impl Orchestrator {
         };
 
         let mut state = self.shared_state.write().await;
-        if state.record_error_and_check_circuit_breaker(change_id, error, circuit_breaker_config.clone()) {
+        if state.record_error_and_check_circuit_breaker(
+            change_id,
+            error,
+            circuit_breaker_config.clone(),
+        ) {
             error!(
                 "Circuit breaker triggered for '{}': same error occurred {} times consecutively",
                 change_id, circuit_breaker_config.threshold

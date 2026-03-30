@@ -556,7 +556,6 @@ pub async fn run_orchestrator(
                 if let Some(ws) = &web_state {
                     ws.apply_execution_event(&processing_completed_event).await;
                 }
-
             }
             Ok(ChangeProcessResult::ApplySuccessIncomplete) => {
                 // Send ApplyCompleted event
@@ -573,7 +572,6 @@ pub async fn run_orchestrator(
                 if let Some(ws) = &web_state {
                     ws.apply_execution_event(&apply_completed_event).await;
                 }
-
             }
             Ok(ChangeProcessResult::AcceptanceContinue) => {
                 // Send ApplyCompleted event
@@ -607,7 +605,6 @@ pub async fn run_orchestrator(
                 if let Some(ws) = &web_state {
                     ws.apply_execution_event(&acceptance_completed_event).await;
                 }
-
             }
             Ok(ChangeProcessResult::AcceptanceContinueExceeded) => {
                 // Send ApplyCompleted event
@@ -638,7 +635,6 @@ pub async fn run_orchestrator(
                 if let Some(ws) = &web_state {
                     ws.apply_execution_event(&acceptance_completed_event).await;
                 }
-
             }
             Ok(ChangeProcessResult::AcceptanceBlocked) => {
                 // Send ApplyCompleted event
@@ -681,7 +677,6 @@ pub async fn run_orchestrator(
                 let reason = "Implementation blocker detected - requires manual intervention";
                 serial_service.mark_stalled(&change_id, reason);
                 shared_state.write().await.remove_from_pending(&change_id);
-
             }
             Ok(ChangeProcessResult::AcceptanceFailed { .. }) => {
                 // Send ApplyCompleted event
@@ -715,7 +710,6 @@ pub async fn run_orchestrator(
                 if let Some(ws) = &web_state {
                     ws.apply_execution_event(&acceptance_completed_event).await;
                 }
-
             }
             Ok(ChangeProcessResult::AcceptanceCommandFailed { error }) => {
                 // Send ApplyCompleted event
@@ -756,7 +750,6 @@ pub async fn run_orchestrator(
                         error
                     ))))
                     .await;
-
             }
             Ok(ChangeProcessResult::ApplyFailed { error }) => {
                 let processing_error_event = OrchestratorEvent::ProcessingError {
@@ -772,7 +765,6 @@ pub async fn run_orchestrator(
                 if let Some(ws) = &web_state {
                     ws.apply_execution_event(&processing_error_event).await;
                 }
-
             }
             Ok(ChangeProcessResult::Archived) => {
                 // Change was complete and successfully archived
@@ -807,7 +799,6 @@ pub async fn run_orchestrator(
                         ws.apply_execution_event(&dispatch_event).await;
                     }
                 }
-
             }
             Ok(ChangeProcessResult::Stalled { error }) => {
                 let processing_error_event = OrchestratorEvent::ProcessingError {
@@ -888,7 +879,8 @@ pub async fn run_orchestrator(
 
     // Run on_finish hook after all changes processed or stopped
     let state = shared_state.read().await;
-    let complete_context = HookContext::new(state.changes_processed(), state.total_changes(), 0, false);
+    let complete_context =
+        HookContext::new(state.changes_processed(), state.total_changes(), 0, false);
     if let Err(e) = hooks.run_hook(HookType::OnFinish, &complete_context).await {
         let _ = tx
             .send(OrchestratorEvent::Log(LogEntry::warn(format!(
