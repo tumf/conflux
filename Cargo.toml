@@ -1,6 +1,6 @@
 [package]
 name = "cflx"
-version = "0.5.70"
+version = "0.5.71"
 edition = "2021"
 default-run = "cflx"
 description = "Conflux – a spec-driven parallel coding orchestrator that runs AI agents on git worktrees"
