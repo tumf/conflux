@@ -8,12 +8,16 @@
 
 use std::sync::OnceLock;
 
+use async_trait::async_trait;
+
 use chrono::{Local, Utc};
 use ratatui::style::Color;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::debug;
+
+use crate::orchestration::state::OrchestratorState;
 
 #[cfg(feature = "web-monitoring")]
 use utoipa::ToSchema;
@@ -448,6 +452,26 @@ pub enum ExecutionEvent {
     },
 }
 
+/// Frontend-agnostic sink for execution events and state transitions.
+#[async_trait]
+pub trait EventSink: Send + Sync {
+    /// Handle an execution event emitted by orchestration logic.
+    async fn on_event(&self, event: &ExecutionEvent);
+
+    /// Handle reducer state transition notifications.
+    async fn on_state_changed(&self, state: &OrchestratorState);
+}
+
+/// No-op sink used for state-only update notifications.
+pub struct NoopEventSink;
+
+#[async_trait]
+impl EventSink for NoopEventSink {
+    async fn on_event(&self, _event: &ExecutionEvent) {}
+
+    async fn on_state_changed(&self, _state: &OrchestratorState) {}
+}
+
 /// Helper to send events through the channel.
 ///
 /// Logs debug message if sending fails (channel closed).
@@ -457,6 +481,59 @@ pub async fn send_event(tx: &Option<mpsc::Sender<ExecutionEvent>>, event: Execut
             debug!("Failed to send execution event: {}", e);
         }
     }
+}
+
+/// Dispatches an event to reducer and all frontend sinks.
+pub async fn dispatch_event(
+    state: &tokio::sync::RwLock<OrchestratorState>,
+    sinks: &[std::sync::Arc<dyn EventSink>],
+    event: ExecutionEvent,
+) {
+    let state_snapshot = {
+        let mut guard = state.write().await;
+        guard.apply_execution_event(&event);
+        guard.clone()
+    };
+
+    for sink in sinks {
+        sink.on_event(&event).await;
+    }
+
+    for sink in sinks {
+        sink.on_state_changed(&state_snapshot).await;
+    }
+}
+
+/// Build sink list for CLI mode (no frontend sink, reducer update only).
+pub fn cli_event_sinks() -> Vec<std::sync::Arc<dyn EventSink>> {
+    vec![std::sync::Arc::new(NoopEventSink)]
+}
+
+/// Sink used by tests to collect emitted events.
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct MockEventSink {
+    events: tokio::sync::Mutex<Vec<ExecutionEvent>>,
+}
+
+#[allow(dead_code)]
+impl MockEventSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn events(&self) -> Vec<ExecutionEvent> {
+        self.events.lock().await.clone()
+    }
+}
+
+#[async_trait]
+impl EventSink for MockEventSink {
+    async fn on_event(&self, event: &ExecutionEvent) {
+        self.events.lock().await.push(event.clone());
+    }
+
+    async fn on_state_changed(&self, _state: &OrchestratorState) {}
 }
 
 #[cfg(test)]
@@ -471,6 +548,30 @@ mod tests {
         };
         let debug_str = format!("{:?}", event);
         assert!(debug_str.contains("WorkspaceCreated"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_event_notifies_mock_sink() {
+        let state = tokio::sync::RwLock::new(crate::orchestration::state::OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        ));
+        let mock_sink = std::sync::Arc::new(MockEventSink::new());
+        let sinks: Vec<std::sync::Arc<dyn EventSink>> = vec![mock_sink.clone()];
+
+        dispatch_event(
+            &state,
+            &sinks,
+            ExecutionEvent::ProcessingStarted("change-a".to_string()),
+        )
+        .await;
+
+        let captured = mock_sink.events().await;
+        assert_eq!(captured.len(), 1);
+        assert!(matches!(
+            captured.first(),
+            Some(ExecutionEvent::ProcessingStarted(id)) if id == "change-a"
+        ));
     }
 
     #[test]

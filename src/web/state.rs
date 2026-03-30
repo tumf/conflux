@@ -2,10 +2,12 @@
 //!
 //! Provides thread-safe state access and broadcasting for WebSocket clients.
 
-use crate::events::{ExecutionEvent, LogEntry};
+use crate::events::{EventSink, ExecutionEvent, LogEntry};
 use crate::openspec::Change;
 use crate::tui::types::WorktreeInfo;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 
 #[cfg(feature = "web-monitoring")]
@@ -237,6 +239,26 @@ fn refresh_summary(state: &mut OrchestratorStateSnapshot) {
         .filter(|change| change.queue_status.as_ref().is_some_and(|s| s == "queued"))
         .count();
     state.last_updated = chrono::Utc::now().to_rfc3339();
+}
+
+/// Event sink implementation for web monitoring state updates.
+pub struct WebEventSink {
+    web_state: Arc<WebState>,
+}
+
+impl WebEventSink {
+    pub fn new(web_state: Arc<WebState>) -> Self {
+        Self { web_state }
+    }
+}
+
+#[async_trait]
+impl EventSink for WebEventSink {
+    async fn on_event(&self, event: &ExecutionEvent) {
+        self.web_state.apply_execution_event(event).await;
+    }
+
+    async fn on_state_changed(&self, _state: &crate::orchestration::state::OrchestratorState) {}
 }
 
 /// Shared web state with broadcast channel for updates

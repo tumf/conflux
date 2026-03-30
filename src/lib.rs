@@ -33,7 +33,7 @@ mod history;
 mod hooks;
 mod merge_stall_monitor;
 mod openspec;
-mod orchestration;
+pub mod orchestration;
 mod orchestrator;
 mod parallel;
 mod parallel_run_service;

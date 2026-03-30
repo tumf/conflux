@@ -5,7 +5,7 @@ use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::error_history::CircuitBreakerConfig;
-use crate::events::ExecutionEvent;
+use crate::events::{cli_event_sinks, dispatch_event, ExecutionEvent};
 use crate::execution::apply::{check_task_progress, create_progress_commit};
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
@@ -400,10 +400,8 @@ impl Orchestrator {
 
     /// Update shared state with an execution event
     async fn update_shared_state(&self, event: ExecutionEvent) {
-        self.shared_state
-            .write()
-            .await
-            .apply_execution_event(&event);
+        let sinks: Vec<std::sync::Arc<dyn crate::events::EventSink>> = cli_event_sinks();
+        dispatch_event(self.shared_state.as_ref(), &sinks, event).await;
     }
 
     /// Handle Archived result
@@ -786,10 +784,8 @@ impl Orchestrator {
             };
             if is_new_change {
                 // Update shared state: processing started
-                self.shared_state
-                    .write()
-                    .await
-                    .apply_execution_event(&ExecutionEvent::ProcessingStarted(next.id.clone()));
+                self.update_shared_state(ExecutionEvent::ProcessingStarted(next.id.clone()))
+                    .await;
 
                 // Note: OnChangeStart hook is called by process_change() internally
             }
@@ -1620,13 +1616,11 @@ mod tests {
 
         // ApplyCompleted increments per-change apply count in shared state
         orchestrator
-            .shared_state
-            .write()
-            .await
-            .apply_execution_event(&crate::events::ExecutionEvent::ApplyCompleted {
+            .update_shared_state(crate::events::ExecutionEvent::ApplyCompleted {
                 change_id: "change-a".to_string(),
                 revision: "serial".to_string(),
-            });
+            })
+            .await;
 
         let state = orchestrator.shared_state.read().await;
         assert_eq!(state.apply_count("change-a"), 1);
