@@ -86,7 +86,7 @@ function renderInlineMarkdown(text: string): React.ReactNode {
     const codeMatch = remaining.match(/^`([^`]+)`/);
     if (codeMatch) {
       parts.push(
-        <code key={key++} className="rounded bg-[#27272a] px-1 py-0.5 font-mono text-[0.85em] text-[#a5b4fc]">
+        <code key={key++} className="rounded bg-border px-1 py-0.5 font-mono text-[0.85em] text-accent">
           {codeMatch[1]}
         </code>,
       );
@@ -354,17 +354,17 @@ export function ChatMessageList({
         {messages.length === 0 && streamingIds.length === 0 && (
           <div className="flex flex-1 items-center justify-center py-16">
             <div className="flex max-w-md flex-col items-center gap-3 text-center">
-              <div className="flex size-10 items-center justify-center rounded-full bg-[#1e1b4b]">
-                <Bot className="size-5 text-[#a5b4fc]" />
+              <div className="flex size-10 items-center justify-center rounded-full bg-accent/20">
+                <Bot className="size-5 text-accent" />
               </div>
-              <p className="text-sm font-medium text-[#d4d4d8]">Start a conversation with the agent</p>
-              <p className="text-xs text-[#71717a]">Try one of these prompts to get started:</p>
+              <p className="text-sm font-medium text-text">Start a conversation with the agent</p>
+              <p className="text-xs text-text-subtle">Try one of these prompts to get started:</p>
               <div className="flex flex-wrap items-center justify-center gap-2">
                 {EXAMPLE_PROMPTS.map((prompt) => (
                   <button
                     key={prompt}
                     type="button"
-                    className="rounded-full border border-[#27272a] bg-[#111113] px-3 py-1 text-xs text-[#a1a1aa] transition-colors hover:border-[#3f3f46] hover:text-[#d4d4d8]"
+                    className="rounded-full border border-border bg-surface px-3 py-1 text-xs text-text-muted transition-colors hover:border-border-hover hover:text-text"
                     onClick={() => onExamplePromptSelect?.(prompt)}
                   >
                     {prompt}
@@ -423,14 +423,14 @@ function MessageBubble({ message }: { message: ProposalChatMessage }) {
     <div className={`group flex items-start gap-3 ${isUser ? 'flex-row-reverse' : ''}`}>
       <div
         className={`flex size-7 shrink-0 items-center justify-center rounded-full ${
-          isUser ? 'bg-[#27272a]' : 'bg-[#1e1b4b]'
+          isUser ? 'bg-border' : 'bg-accent/20'
         }`}
       >
-        {isUser ? <User className="size-4 text-[#a1a1aa]" /> : <Bot className="size-4 text-[#a5b4fc]" />}
+        {isUser ? <User className="size-4 text-text-muted" /> : <Bot className="size-4 text-accent" />}
       </div>
       <div
         className={`relative min-w-0 max-w-[80%] space-y-2 rounded-lg px-3 py-2 text-sm ${
-          isUser ? 'bg-[#1e1b4b]/60 text-[#e0e7ff]' : 'bg-[#18181b] text-[#d4d4d8]'
+          isUser ? 'bg-accent/20 text-text' : 'bg-surface-2 text-text'
         }`}
       >
         {!isUser && (

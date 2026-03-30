@@ -166,6 +166,16 @@ The Dashboard SHALL model active-turn state explicitly and SHALL enable or disab
 **When**: The WebSocket connection closes unexpectedly
 **Then**: The active turn is treated as failed, `isAgentResponding` is set to false, and the input is re-enabled (though still disabled due to disconnected state, it will become usable upon reconnection)
 
+### Requirement: proposal-session-ui-semantic-tokens
+
+The Dashboard chat components SHALL use semantic color tokens defined in the CSS `@theme` block rather than hardcoded hex color values. This ensures consistency and enables future theming.
+
+#### Scenario: no-hardcoded-hex-in-chat-components
+
+**Given**: The chat-related component source files (ProposalChat, ChatMessageList, ChatInput, ToolCallIndicator, ProposalChangesList, ElicitationDialog)
+**When**: The source code is inspected
+**Then**: No hardcoded hex color values (e.g., `#27272a`, `#6366f1`) are used in Tailwind class names; all colors reference semantic tokens
+
 ### Requirement: proposal-session-ui-mobile-changes-drawer
 
 The Dashboard SHALL provide access to the proposal session Changes list on mobile viewports (below the `md` breakpoint) via a slide-in drawer accessible from the chat header.

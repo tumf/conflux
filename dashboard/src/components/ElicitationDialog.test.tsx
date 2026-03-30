@@ -2,7 +2,7 @@
 
 import React from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 import { ElicitationDialog } from './ElicitationDialog';
@@ -114,5 +114,83 @@ describe('ElicitationDialog', () => {
 
     expect(onCancel).toHaveBeenCalledTimes(1);
     expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('applies dialog accessibility semantics and closes on Escape', async () => {
+    const onSubmit = vi.fn();
+    const onDecline = vi.fn();
+    const onCancel = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <ElicitationDialog
+        elicitation={elicitation}
+        onSubmit={onSubmit}
+        onDecline={onDecline}
+        onCancel={onCancel}
+      />,
+    );
+
+    const dialog = screen.getByRole('dialog', { name: 'Agent Request' });
+    expect(dialog.getAttribute('aria-modal')).toBe('true');
+    expect(dialog.getAttribute('aria-labelledby')).toBeTruthy();
+
+    await user.keyboard('{Escape}');
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('traps focus within dialog when tabbing', async () => {
+    const onSubmit = vi.fn();
+    const onDecline = vi.fn();
+    const onCancel = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <ElicitationDialog
+        elicitation={elicitation}
+        onSubmit={onSubmit}
+        onDecline={onDecline}
+        onCancel={onCancel}
+      />,
+    );
+
+    const dialog = screen.getByRole('dialog', { name: 'Agent Request' });
+    const submitButton = within(dialog).getByRole('button', { name: 'Submit' });
+    const closeButton = within(dialog).getByRole('button', { name: 'Close' });
+
+    submitButton.focus();
+    expect(document.activeElement).toBe(submitButton);
+
+    await user.tab();
+    expect(document.activeElement).toBe(closeButton);
+
+    closeButton.focus();
+    expect(document.activeElement).toBe(closeButton);
+
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(submitButton);
+  });
+
+  it('closes when clicking the backdrop', async () => {
+    const onSubmit = vi.fn();
+    const onDecline = vi.fn();
+    const onCancel = vi.fn();
+    const user = userEvent.setup();
+
+    const { container } = render(
+      <ElicitationDialog
+        elicitation={elicitation}
+        onSubmit={onSubmit}
+        onDecline={onDecline}
+        onCancel={onCancel}
+      />,
+    );
+
+    const backdrop = container.firstElementChild as HTMLElement;
+    await user.click(backdrop);
+
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(onDecline).not.toHaveBeenCalled();
   });
 });

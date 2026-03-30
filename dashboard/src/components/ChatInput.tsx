@@ -37,7 +37,7 @@ export function ChatInput({ onSend, disabled = false, placeholder = 'Type a mess
   }, [value]);
 
   return (
-    <div className="flex items-end gap-2 border-t border-[#27272a] p-3">
+    <div className="flex items-end gap-2 border-t border-border p-3">
       <textarea
         ref={textareaRef}
         value={value}
@@ -46,12 +46,12 @@ export function ChatInput({ onSend, disabled = false, placeholder = 'Type a mess
         disabled={disabled}
         placeholder={placeholder}
         rows={1}
-        className="min-h-[2.25rem] flex-1 resize-none rounded-md border border-[#27272a] bg-[#111113] px-3 py-2 text-sm text-[#fafafa] placeholder:text-[#52525b] focus:border-[#6366f1] focus:outline-none disabled:opacity-50"
+        className="min-h-[2.25rem] flex-1 resize-none rounded-md border border-border bg-surface px-3 py-2 text-sm text-text placeholder:text-text-subtle focus:border-accent focus:outline-none disabled:opacity-50"
       />
       <button
         onClick={handleSubmit}
         disabled={disabled || !value.trim()}
-        className="flex size-9 shrink-0 items-center justify-center rounded-md bg-[#6366f1] text-white transition-colors hover:bg-[#4f46e5] disabled:opacity-50 disabled:hover:bg-[#6366f1]"
+        className="flex size-9 shrink-0 items-center justify-center rounded-md bg-accent text-white transition-colors hover:bg-accent-hover disabled:opacity-50 disabled:hover:bg-accent"
         aria-label="Send message"
       >
         <SendHorizontal className="size-4" />

@@ -9,26 +9,26 @@ interface ToolCallIndicatorProps {
 const statusConfig: Record<ToolCallStatus, { icon: React.ReactNode; color: string; bg: string; label: string }> = {
   pending: {
     icon: <Wrench className="size-3" />,
-    color: 'text-[#71717a]',
-    bg: 'bg-[#27272a]',
+    color: 'text-text-muted',
+    bg: 'bg-border',
     label: 'Pending',
   },
   in_progress: {
     icon: <Loader2 className="size-3 animate-spin" />,
-    color: 'text-[#f59e0b]',
-    bg: 'bg-[#451a03]/50',
+    color: 'text-warning',
+    bg: 'bg-warning/15',
     label: 'Running',
   },
   completed: {
     icon: <CheckCircle2 className="size-3" />,
-    color: 'text-[#22c55e]',
-    bg: 'bg-[#052e16]/50',
+    color: 'text-success',
+    bg: 'bg-success/15',
     label: 'Done',
   },
   failed: {
     icon: <XCircle className="size-3" />,
-    color: 'text-[#ef4444]',
-    bg: 'bg-[#450a0a]/50',
+    color: 'text-error',
+    bg: 'bg-error/15',
     label: 'Failed',
   },
 };

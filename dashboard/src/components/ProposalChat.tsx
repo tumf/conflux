@@ -168,23 +168,23 @@ export function ProposalChat({
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between border-b border-[#27272a] px-3 py-2">
+      <div className="flex items-center justify-between border-b border-border px-3 py-2">
         <div className="flex items-center gap-2">
           <button
             onClick={onBack}
-            className="rounded p-1 text-[#52525b] transition-colors hover:text-[#a1a1aa]"
+            className="rounded p-1 text-text-subtle transition-colors hover:text-text-muted"
             aria-label="Back to project"
           >
             <ArrowLeft className="size-4" />
           </button>
           <div className="flex items-center gap-1.5">
-            <span className="text-sm font-medium text-[#fafafa]">Proposal Session</span>
-            <span className="rounded bg-[#27272a] px-1.5 py-0.5 font-mono text-xs text-[#71717a]">
+            <span className="text-sm font-medium text-text">Proposal Session</span>
+            <span className="rounded bg-border px-1.5 py-0.5 font-mono text-xs text-text-muted">
               {session.worktree_branch}
             </span>
             <span
               className={`size-2 rounded-full ${
-                wsConnected ? 'bg-[#22c55e]' : 'bg-[#52525b]'
+                wsConnected ? 'bg-success' : 'bg-text-subtle'
               }`}
               title={wsConnected ? 'Connected' : 'Disconnected'}
             />
@@ -236,7 +236,7 @@ export function ProposalChat({
         </div>
 
         {/* Changes sidebar */}
-        <div className="hidden w-56 shrink-0 flex-col border-l border-[#27272a] md:flex">
+        <div className="hidden w-56 shrink-0 flex-col border-l border-border md:flex">
           <ProposalChangesList
             projectId={projectId}
             sessionId={session.id}
