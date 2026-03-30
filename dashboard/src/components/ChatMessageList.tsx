@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { User, Bot } from 'lucide-react';
+import { Bot, Copy, User } from 'lucide-react';
 import { ProposalChatMessage } from '../api/types';
 import { ToolCallIndicator } from './ToolCallIndicator';
 
@@ -9,62 +9,70 @@ interface ChatMessageListProps {
   streamingContent: Record<string, string>;
 }
 
-function renderMarkdownSimple(content: string): React.ReactNode {
-  // Simple markdown rendering: code blocks, bold, inline code
-  // Full markdown library is Future Work
-  const lines = content.split('\n');
-  const elements: React.ReactNode[] = [];
-  let inCodeBlock = false;
-  let codeLines: string[] = [];
-  let codeKey = 0;
+function copyTextToClipboard(text: string): void {
+  if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) {
+    return;
+  }
+  void navigator.clipboard.writeText(text);
+}
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line.startsWith('```')) {
-      if (inCodeBlock) {
-        elements.push(
-          <pre key={`code-${codeKey++}`} className="my-2 overflow-x-auto rounded bg-[#18181b] p-2 font-mono text-xs text-[#d4d4d8]">
-            <code>{codeLines.join('\n')}</code>
-          </pre>,
-        );
-        codeLines = [];
-        inCodeBlock = false;
-      } else {
-        inCodeBlock = true;
-      }
-      continue;
-    }
-    if (inCodeBlock) {
-      codeLines.push(line);
-    } else {
-      elements.push(
-        <p key={`line-${i}`} className="min-h-[1.25em] whitespace-pre-wrap break-words">
-          {renderInlineMarkdown(line)}
-        </p>,
-      );
-    }
+function formatRelativeTime(timestamp: string): string {
+  const target = new Date(timestamp).getTime();
+  if (Number.isNaN(target)) {
+    return 'time unavailable';
   }
 
-  // Unclosed code block
-  if (inCodeBlock && codeLines.length > 0) {
-    elements.push(
-      <pre key={`code-${codeKey}`} className="my-2 overflow-x-auto rounded bg-[#18181b] p-2 font-mono text-xs text-[#d4d4d8]">
-        <code>{codeLines.join('\n')}</code>
-      </pre>,
-    );
+  const diffSeconds = Math.round((target - Date.now()) / 1000);
+  const absSeconds = Math.abs(diffSeconds);
+  const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
+
+  if (absSeconds < 60) {
+    return rtf.format(diffSeconds, 'second');
   }
 
-  return elements;
+  const diffMinutes = Math.round(diffSeconds / 60);
+  if (Math.abs(diffMinutes) < 60) {
+    return rtf.format(diffMinutes, 'minute');
+  }
+
+  const diffHours = Math.round(diffSeconds / 3600);
+  if (Math.abs(diffHours) < 24) {
+    return rtf.format(diffHours, 'hour');
+  }
+
+  const diffDays = Math.round(diffSeconds / 86400);
+  return rtf.format(diffDays, 'day');
+}
+
+function renderCodeBlock(code: string, language: string | null, key: string): React.ReactNode {
+  return (
+    <div key={key} className="my-2 overflow-hidden rounded border border-[#27272a] bg-[#18181b]">
+      <div className="flex items-center justify-between border-b border-[#27272a] px-2 py-1 text-[11px] text-[#a1a1aa]">
+        <span>{language ?? 'code'}</span>
+        <button
+          type="button"
+          onClick={() => copyTextToClipboard(code)}
+          className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[#d4d4d8] transition hover:bg-[#27272a]"
+          title="Copy code"
+          aria-label="Copy code"
+        >
+          <Copy className="size-3" />
+          <span>Copy</span>
+        </button>
+      </div>
+      <pre className="overflow-x-auto p-2 font-mono text-xs text-[#d4d4d8]">
+        <code>{code}</code>
+      </pre>
+    </div>
+  );
 }
 
 function renderInlineMarkdown(text: string): React.ReactNode {
-  // Handle inline code and bold
   const parts: React.ReactNode[] = [];
   let remaining = text;
   let key = 0;
 
   while (remaining.length > 0) {
-    // Inline code
     const codeMatch = remaining.match(/^`([^`]+)`/);
     if (codeMatch) {
       parts.push(
@@ -76,7 +84,6 @@ function renderInlineMarkdown(text: string): React.ReactNode {
       continue;
     }
 
-    // Bold
     const boldMatch = remaining.match(/^\*\*([^*]+)\*\*/);
     if (boldMatch) {
       parts.push(<strong key={key++}>{boldMatch[1]}</strong>);
@@ -84,38 +91,195 @@ function renderInlineMarkdown(text: string): React.ReactNode {
       continue;
     }
 
-    // Find next special character
-    const nextSpecial = remaining.search(/[`*]/);
+    const linkMatch = remaining.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/);
+    if (linkMatch) {
+      parts.push(
+        <a
+          key={key++}
+          href={linkMatch[2]}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-[#818cf8] underline underline-offset-2 hover:text-[#a5b4fc]"
+        >
+          {linkMatch[1]}
+        </a>,
+      );
+      remaining = remaining.slice(linkMatch[0].length);
+      continue;
+    }
+
+    const nextSpecial = remaining.search(/[`*\[]/);
     if (nextSpecial === -1) {
       parts.push(remaining);
       break;
     }
+
     if (nextSpecial === 0) {
-      // Not a matched pattern, consume the character
       parts.push(remaining[0]);
       remaining = remaining.slice(1);
-    } else {
-      parts.push(remaining.slice(0, nextSpecial));
-      remaining = remaining.slice(nextSpecial);
+      continue;
     }
+
+    parts.push(remaining.slice(0, nextSpecial));
+    remaining = remaining.slice(nextSpecial);
   }
 
   return parts.length === 1 ? parts[0] : <>{parts}</>;
 }
 
+function renderMarkdownSimple(content: string): React.ReactNode {
+  const lines = content.split('\n');
+  const elements: React.ReactNode[] = [];
+
+  let inCodeBlock = false;
+  let codeLines: string[] = [];
+  let codeLanguage: string | null = null;
+  let codeKey = 0;
+
+  let currentUlItems: string[] = [];
+  let currentOlItems: string[] = [];
+
+  const flushUnorderedList = () => {
+    if (currentUlItems.length === 0) {
+      return;
+    }
+    elements.push(
+      <ul key={`ul-${elements.length}`} className="my-1 list-disc space-y-1 pl-6">
+        {currentUlItems.map((item, idx) => (
+          <li key={`ul-item-${idx}`} className="break-words">
+            {renderInlineMarkdown(item)}
+          </li>
+        ))}
+      </ul>,
+    );
+    currentUlItems = [];
+  };
+
+  const flushOrderedList = () => {
+    if (currentOlItems.length === 0) {
+      return;
+    }
+    elements.push(
+      <ol key={`ol-${elements.length}`} className="my-1 list-decimal space-y-1 pl-6">
+        {currentOlItems.map((item, idx) => (
+          <li key={`ol-item-${idx}`} className="break-words">
+            {renderInlineMarkdown(item)}
+          </li>
+        ))}
+      </ol>,
+    );
+    currentOlItems = [];
+  };
+
+  const flushCodeBlock = () => {
+    if (!inCodeBlock) {
+      return;
+    }
+    elements.push(renderCodeBlock(codeLines.join('\n'), codeLanguage, `code-${codeKey++}`));
+    inCodeBlock = false;
+    codeLines = [];
+    codeLanguage = null;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (line.startsWith('```')) {
+      flushUnorderedList();
+      flushOrderedList();
+
+      if (inCodeBlock) {
+        flushCodeBlock();
+      } else {
+        inCodeBlock = true;
+        codeLanguage = line.slice(3).trim() || null;
+      }
+      continue;
+    }
+
+    if (inCodeBlock) {
+      codeLines.push(line);
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,3})\s+(.+)$/);
+    if (headingMatch) {
+      flushUnorderedList();
+      flushOrderedList();
+
+      const level = headingMatch[1].length;
+      const text = headingMatch[2];
+      if (level === 1) {
+        elements.push(
+          <h1 key={`line-${i}`} className="mt-2 text-xl font-semibold text-white">
+            {renderInlineMarkdown(text)}
+          </h1>,
+        );
+      } else if (level === 2) {
+        elements.push(
+          <h2 key={`line-${i}`} className="mt-2 text-lg font-semibold text-white">
+            {renderInlineMarkdown(text)}
+          </h2>,
+        );
+      } else {
+        elements.push(
+          <h3 key={`line-${i}`} className="mt-2 text-base font-semibold text-[#e4e4e7]">
+            {renderInlineMarkdown(text)}
+          </h3>,
+        );
+      }
+      continue;
+    }
+
+    const unorderedMatch = line.match(/^\s*[-*]\s+(.+)$/);
+    if (unorderedMatch) {
+      flushOrderedList();
+      currentUlItems.push(unorderedMatch[1]);
+      continue;
+    }
+
+    const orderedMatch = line.match(/^\s*\d+\.\s+(.+)$/);
+    if (orderedMatch) {
+      flushUnorderedList();
+      currentOlItems.push(orderedMatch[1]);
+      continue;
+    }
+
+    if (/^\s*---\s*$/.test(line)) {
+      flushUnorderedList();
+      flushOrderedList();
+      elements.push(<hr key={`line-${i}`} className="my-3 border-[#3f3f46]" />);
+      continue;
+    }
+
+    flushUnorderedList();
+    flushOrderedList();
+
+    elements.push(
+      <p key={`line-${i}`} className="min-h-[1.25em] whitespace-pre-wrap break-words">
+        {renderInlineMarkdown(line)}
+      </p>,
+    );
+  }
+
+  flushCodeBlock();
+  flushUnorderedList();
+  flushOrderedList();
+
+  return elements;
+}
+
 export function ChatMessageList({ messages, streamingContent }: ChatMessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll to bottom on new messages or streaming updates
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, streamingContent]);
 
-  // Collect streaming message IDs that aren't finalized yet
   const streamingIds = Object.keys(streamingContent);
 
   return (
-    <div className="flex-1 overflow-y-auto p-4 space-y-4">
+    <div className="flex-1 space-y-4 overflow-y-auto p-4">
       {messages.length === 0 && streamingIds.length === 0 && (
         <div className="flex flex-1 items-center justify-center py-16">
           <p className="text-sm text-[#52525b]">Start a conversation with the agent</p>
@@ -126,7 +290,6 @@ export function ChatMessageList({ messages, streamingContent }: ChatMessageListP
         <MessageBubble key={msg.id} message={msg} />
       ))}
 
-      {/* Render streaming messages that aren't finalized */}
       {streamingIds
         .filter((id) => !messages.some((m) => m.id === id))
         .map((id) => (
@@ -150,26 +313,35 @@ function MessageBubble({ message }: { message: ProposalChatMessage }) {
   const isUser = message.role === 'user';
 
   return (
-    <div className={`flex items-start gap-3 ${isUser ? 'flex-row-reverse' : ''}`}>
+    <div className={`group flex items-start gap-3 ${isUser ? 'flex-row-reverse' : ''}`}>
       <div
         className={`flex size-7 shrink-0 items-center justify-center rounded-full ${
           isUser ? 'bg-[#27272a]' : 'bg-[#1e1b4b]'
         }`}
       >
-        {isUser ? (
-          <User className="size-4 text-[#a1a1aa]" />
-        ) : (
-          <Bot className="size-4 text-[#a5b4fc]" />
-        )}
+        {isUser ? <User className="size-4 text-[#a1a1aa]" /> : <Bot className="size-4 text-[#a5b4fc]" />}
       </div>
-      <div
-        className={`min-w-0 max-w-[80%] space-y-2 rounded-lg px-3 py-2 text-sm ${
-          isUser
-            ? 'bg-[#1e1b4b]/60 text-[#e0e7ff]'
-            : 'bg-[#18181b] text-[#d4d4d8]'
-        }`}
-      >
+      <div className={`relative min-w-0 max-w-[80%] space-y-2 rounded-lg px-3 py-2 text-sm ${
+        isUser ? 'bg-[#1e1b4b]/60 text-[#e0e7ff]' : 'bg-[#18181b] text-[#d4d4d8]'
+      }`}>
+        {!isUser && (
+          <button
+            type="button"
+            onClick={() => copyTextToClipboard(message.content)}
+            className="absolute right-2 top-2 inline-flex items-center gap-1 rounded bg-[#27272a]/90 px-1.5 py-1 text-xs text-[#d4d4d8] opacity-0 transition hover:bg-[#3f3f46] group-hover:opacity-100"
+            title="Copy message"
+            aria-label="Copy message"
+          >
+            <Copy className="size-3" />
+            <span>Copy</span>
+          </button>
+        )}
+
         <div>{renderMarkdownSimple(message.content)}</div>
+
+        <p className="text-[11px] text-[#71717a] opacity-0 transition group-hover:opacity-100" title={message.timestamp}>
+          {formatRelativeTime(message.timestamp)}
+        </p>
 
         {message.tool_calls && message.tool_calls.length > 0 && (
           <div className="flex flex-wrap gap-1.5 pt-1">
