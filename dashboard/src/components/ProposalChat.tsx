@@ -1,6 +1,12 @@
 import React, { useCallback, useRef } from 'react';
 import { ArrowLeft } from 'lucide-react';
-import { ElicitationRequest, ProposalChatMessage, ProposalSession, ToolCallInfo, ToolCallStatus } from '../api/types';
+import {
+  ElicitationRequest,
+  ProposalChatMessage,
+  ProposalSession,
+  ToolCallInfo,
+  ToolCallStatus,
+} from '../api/types';
 import { useProposalWebSocket } from '../hooks/useProposalWebSocket';
 import { ChatMessageList } from './ChatMessageList';
 import { ChatInput } from './ChatInput';
@@ -19,6 +25,15 @@ interface ProposalChatProps {
   onMerge: () => void;
   onClose: () => void;
   onAppendMessage: (sessionId: string, message: ProposalChatMessage) => void;
+  onUpsertServerUserMessage: (
+    sessionId: string,
+    message: { id: string; content: string; timestamp: string },
+  ) => void;
+  onUpdateMessageSendStatus: (
+    sessionId: string,
+    messageId: string,
+    sendStatus: 'sent' | 'pending' | 'failed',
+  ) => void;
   onStartAssistantTurn: (sessionId: string, messageId: string, turnId?: string) => void;
   onStreamingChunk: (sessionId: string, messageId: string, content: string, turnId?: string) => void;
   onCompleteAssistantTurn: (sessionId: string, stopReason?: string) => void;
@@ -41,6 +56,8 @@ export function ProposalChat({
   onMerge,
   onClose,
   onAppendMessage,
+  onUpsertServerUserMessage,
+  onUpdateMessageSendStatus,
   onStartAssistantTurn,
   onStreamingChunk,
   onCompleteAssistantTurn,
@@ -59,15 +76,32 @@ export function ProposalChat({
     hasActiveTurn: () => pendingMessageIdRef.current !== null,
     onUserMessage: useCallback(
       (message: { id: string; content: string; timestamp: string }) => {
-        onAppendMessage(session.id, {
-          id: message.id,
-          role: 'user',
-          content: message.content,
-          timestamp: message.timestamp,
-          hydrated: true,
-        });
+        onUpsertServerUserMessage(session.id, message);
       },
-      [onAppendMessage, session.id],
+      [onUpsertServerUserMessage, session.id],
+    ),
+    onPromptQueued: useCallback(
+      (clientMessageId: string) => {
+        onUpdateMessageSendStatus(session.id, clientMessageId, 'pending');
+      },
+      [onUpdateMessageSendStatus, session.id],
+    ),
+    onPromptSendStarted: useCallback(
+      (clientMessageId: string) => {
+        onUpdateMessageSendStatus(session.id, clientMessageId, 'pending');
+      },
+      [onUpdateMessageSendStatus, session.id],
+    ),
+    onPromptSendFailed: useCallback(
+      (clientMessageId: string, error: string) => {
+        console.error('Proposal WS prompt send failed:', {
+          sessionId: session.id,
+          clientMessageId,
+          error,
+        });
+        onUpdateMessageSendStatus(session.id, clientMessageId, 'failed');
+      },
+      [onUpdateMessageSendStatus, session.id],
     ),
     onMessageChunk: useCallback(
       (content: string, messageId?: string, turnId?: string) => {
@@ -127,17 +161,28 @@ export function ProposalChat({
 
   const handleSend = useCallback(
     (content: string) => {
-      sendPrompt(content);
+      const tempMessageId = `user-pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const timestamp = new Date().toISOString();
+
+      onAppendMessage(session.id, {
+        id: tempMessageId,
+        role: 'user',
+        content,
+        timestamp,
+        sendStatus: status === 'connected' ? 'sent' : 'pending',
+      });
+
+      sendPrompt(content, tempMessageId);
     },
-    [sendPrompt],
+    [onAppendMessage, sendPrompt, session.id, status],
   );
 
   const handleExamplePromptSelect = useCallback(
     (content: string) => {
       if (!content.trim()) return;
-      sendPrompt(content);
+      handleSend(content);
     },
-    [sendPrompt],
+    [handleSend],
   );
 
   const handleElicitationSubmit = useCallback(
@@ -162,6 +207,19 @@ export function ProposalChat({
   }, [activeElicitation, sendElicitationResponse, onElicitation]);
 
   const wsConnected = status === 'connected';
+
+  const handleRetryMessage = useCallback(
+    (messageId: string) => {
+      const target = messages.find((message) => message.id === messageId && message.role === 'user');
+      if (!target) {
+        console.warn('Retry requested for missing user message', { sessionId: session.id, messageId });
+        return;
+      }
+      onUpdateMessageSendStatus(session.id, messageId, 'pending');
+      sendPrompt(target.content, messageId);
+    },
+    [messages, onUpdateMessageSendStatus, sendPrompt, session.id],
+  );
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
@@ -205,17 +263,18 @@ export function ProposalChat({
             streamingContent={streamingContent}
             isAgentResponding={isAgentResponding}
             onExamplePromptSelect={handleExamplePromptSelect}
+            onRetryMessage={handleRetryMessage}
           />
           <ChatInput
             onSend={handleSend}
-            disabled={!wsConnected || isAgentResponding || !!activeElicitation}
+            disabled={isAgentResponding || !!activeElicitation}
             placeholder={
-              !wsConnected
-                ? 'Connecting...'
-                : isAgentResponding
-                  ? 'Agent is responding...'
-                  : activeElicitation
-                    ? 'Please respond to the agent request first'
+              isAgentResponding
+                ? 'Agent is responding...'
+                : activeElicitation
+                  ? 'Please respond to the agent request first'
+                  : !wsConnected
+                    ? 'Disconnected. Message will be queued and sent on reconnect.'
                     : 'Type a message... (Enter to send, Shift+Enter for newline)'
             }
           />

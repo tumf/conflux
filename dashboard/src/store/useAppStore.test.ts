@@ -328,6 +328,72 @@ describe('useAppStore - proposal chat state transitions', () => {
     expect(state.streamingContent['assistant-1']).toBeUndefined();
     expect(state.isAgentResponding).toBe(false);
   });
+
+  it('upserts server user message and marks it as sent', () => {
+    const sessionId = 'session-1';
+    const pendingMessage = {
+      id: 'msg-1',
+      role: 'user' as const,
+      content: 'queued',
+      timestamp: '2026-03-30T00:00:00.000Z',
+      sendStatus: 'pending' as const,
+    };
+
+    let state = appReducer(createState(), {
+      type: 'APPEND_CHAT_MESSAGE',
+      payload: { sessionId, message: pendingMessage },
+    });
+
+    state = appReducer(state, {
+      type: 'UPSERT_SERVER_USER_MESSAGE',
+      payload: {
+        sessionId,
+        message: {
+          id: 'msg-1',
+          content: 'queued',
+          timestamp: '2026-03-30T00:00:02.000Z',
+        },
+      },
+    });
+
+    const messages = state.chatMessagesBySessionId[sessionId] || [];
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      id: 'msg-1',
+      role: 'user',
+      content: 'queued',
+      sendStatus: 'sent',
+      hydrated: true,
+      timestamp: '2026-03-30T00:00:02.000Z',
+    });
+  });
+
+  it('updates user message send status to failed for retry UI', () => {
+    const sessionId = 'session-1';
+    const message = {
+      id: 'msg-2',
+      role: 'user' as const,
+      content: 'hello',
+      timestamp: '2026-03-30T00:00:00.000Z',
+      sendStatus: 'pending' as const,
+    };
+
+    let state = appReducer(createState(), {
+      type: 'APPEND_CHAT_MESSAGE',
+      payload: { sessionId, message },
+    });
+
+    state = appReducer(state, {
+      type: 'UPDATE_CHAT_MESSAGE_SEND_STATUS',
+      payload: {
+        sessionId,
+        messageId: 'msg-2',
+        sendStatus: 'failed',
+      },
+    });
+
+    expect(state.chatMessagesBySessionId[sessionId]?.[0].sendStatus).toBe('failed');
+  });
 });
 
 describe('useAppStore - ancillary actions', () => {
