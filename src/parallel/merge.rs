@@ -182,7 +182,6 @@ impl ParallelExecutor {
                         )
                         .await;
                     }
-
                 }
                 Ok(MergeAttempt::Deferred(reason)) => {
                     // Merge deferred: only resolve-in-progress reasons are auto-resumable.
