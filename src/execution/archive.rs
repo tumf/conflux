@@ -199,6 +199,60 @@ pub async fn is_archive_commit_complete(change_id: &str, base_path: Option<&Path
 ///
 /// Returns an error if `openspec/changes/<change_id>` still exists, indicating
 /// the change was not properly archived.
+async fn try_direct_archive_commit(change_id: &str, repo_root: &Path) -> Result<bool> {
+    let commit_message = format!("Archive: {}", change_id);
+
+    debug!(
+        change_id = %change_id,
+        repo_root = %repo_root.display(),
+        "Attempting direct archive commit before AI resolve"
+    );
+
+    let add_output = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .map_err(|e| OrchestratorError::GitCommand(format!("Failed to run 'git add -A': {}", e)))?;
+
+    if !add_output.status.success() {
+        let stderr = String::from_utf8_lossy(&add_output.stderr);
+        return Err(OrchestratorError::GitCommand(format!(
+            "Failed to stage files for archive commit: {}",
+            stderr.trim()
+        )));
+    }
+
+    let commit_output = Command::new("git")
+        .args(["commit", "-m", &commit_message])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .map_err(|e| {
+            OrchestratorError::GitCommand(format!("Failed to run direct archive commit: {}", e))
+        })?;
+
+    if !commit_output.status.success() {
+        let stderr = String::from_utf8_lossy(&commit_output.stderr);
+        warn!(
+            change_id = %change_id,
+            repo_root = %repo_root.display(),
+            exit_code = ?commit_output.status.code(),
+            stderr = %stderr.trim(),
+            "Direct archive commit failed; falling back to AI resolve"
+        );
+        return Ok(false);
+    }
+
+    debug!(
+        change_id = %change_id,
+        repo_root = %repo_root.display(),
+        "Direct archive commit succeeded"
+    );
+
+    Ok(true)
+}
+
 pub async fn ensure_archive_commit<F, Fut>(
     change_id: &str,
     repo_root: &Path,
@@ -279,6 +333,10 @@ where
                         }
                     }
                 }
+            } else if try_direct_archive_commit(change_id, repo_root).await?
+                && is_archive_commit_complete(change_id, Some(repo_root)).await?
+            {
+                return Ok(());
             }
 
             let prompt = format!(
@@ -1023,11 +1081,8 @@ mod tests {
         assert!(!result);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn test_ensure_archive_commit_retries_after_pre_commit() {
-        use std::os::unix::fs::PermissionsExt;
-
+    async fn test_direct_archive_commit_success_skips_ai_resolve() {
         let temp_dir = TempDir::new().unwrap();
         let repo_root = temp_dir.path();
 
@@ -1049,35 +1104,8 @@ mod tests {
         fs::create_dir_all(&archive_dir).unwrap();
         fs::write(archive_dir.join("archive.txt"), "archived").unwrap();
 
-        let hooks_dir = repo_root.join(".git/hooks");
-        let hook_path = hooks_dir.join("pre-commit");
-        let hook_contents = "#!/bin/sh\n\
-if [ ! -f .git/hooks/pre-commit-ran ]; then\n\
-  echo 'hooked' >> openspec/changes/archive/change-a/archive.txt\n\
-  git add openspec/changes/archive/change-a/archive.txt\n\
-  touch .git/hooks/pre-commit-ran\n\
-  exit 1\n\
-fi\n\
-exit 0\n";
-        fs::write(&hook_path, hook_contents).unwrap();
-        let mut perms = fs::metadata(&hook_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&hook_path, perms).unwrap();
-
-        let resolver_script = repo_root.join("archive-resolver.sh");
-        let script_contents = "#!/bin/sh\nset -e\n\
-git add -A\n\
-if ! git commit -m 'Archive: change-a'; then\n\
-  git add -A\n\
-  git commit -m 'Archive: change-a'\n\
-fi\n";
-        fs::write(&resolver_script, script_contents).unwrap();
-        let mut perms = fs::metadata(&resolver_script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&resolver_script, perms).unwrap();
-
         let config = OrchestratorConfig {
-            resolve_command: Some("sh archive-resolver.sh".to_string()),
+            resolve_command: Some("sh -c 'exit 42'".to_string()),
             ..Default::default()
         };
         let agent = AgentRunner::new(config.clone());
@@ -1098,6 +1126,86 @@ fi\n";
             .await
             .unwrap();
         assert!(result);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_direct_archive_commit_fallback_to_ai_resolve_on_pre_commit_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let repo_root = temp_dir.path();
+
+            init_git_repo(repo_root);
+
+            fs::write(repo_root.join("README.md"), "base").unwrap();
+            Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(repo_root)
+                .output()
+                .unwrap();
+            Command::new("git")
+                .args(["commit", "-m", "Base"])
+                .current_dir(repo_root)
+                .output()
+                .unwrap();
+
+            let archive_dir = repo_root.join("openspec/changes/archive/change-a");
+            fs::create_dir_all(&archive_dir).unwrap();
+            fs::write(archive_dir.join("archive.txt"), "archived").unwrap();
+
+            let hooks_dir = repo_root.join(".git/hooks");
+            let hook_path = hooks_dir.join("pre-commit");
+            let hook_contents = "#!/bin/sh\n\
+if [ ! -f .git/hooks/pre-commit-ran ]; then\n\
+  echo 'hooked' >> openspec/changes/archive/change-a/archive.txt\n\
+  git add openspec/changes/archive/change-a/archive.txt\n\
+  touch .git/hooks/pre-commit-ran\n\
+  exit 1\n\
+fi\n\
+exit 0\n";
+            fs::write(&hook_path, hook_contents).unwrap();
+            let mut perms = fs::metadata(&hook_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&hook_path, perms).unwrap();
+
+            let resolver_script = repo_root.join("archive-resolver.sh");
+            let script_contents = "#!/bin/sh\nset -e\n\
+git add -A\n\
+if ! git commit -m 'Archive: change-a'; then\n\
+  git add -A\n\
+  git commit -m 'Archive: change-a'\n\
+fi\n";
+            fs::write(&resolver_script, script_contents).unwrap();
+            let mut perms = fs::metadata(&resolver_script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&resolver_script, perms).unwrap();
+
+            let config = OrchestratorConfig {
+                resolve_command: Some("sh archive-resolver.sh".to_string()),
+                ..Default::default()
+            };
+            let agent = AgentRunner::new(config.clone());
+            let ai_runner = make_ai_runner(&config);
+
+            ensure_archive_commit(
+                "change-a",
+                repo_root,
+                &agent,
+                &ai_runner,
+                VcsBackend::Git,
+                |_| async {},
+            )
+            .await
+            .unwrap();
+
+            let result = is_archive_commit_complete("change-a", Some(repo_root))
+                .await
+                .unwrap();
+            assert!(result);
+        });
     }
 
     // ===========================
