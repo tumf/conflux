@@ -1,7 +1,8 @@
 ---
 change_type: implementation
 priority: high
-dependencies: []
+dependencies:
+  - clarify-orchestration-hierarchy
 references:
   - src/tui/state.rs
   - src/web/state.rs
