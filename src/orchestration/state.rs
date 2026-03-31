@@ -131,6 +131,8 @@ pub enum TerminalState {
     Archived,
     /// Successfully merged to the base branch (parallel only).
     Merged,
+    /// Rejected after acceptance blocker detection.
+    Rejected(String),
     /// Encountered a non-recoverable error.
     Error(String),
     /// Stopped by user request.
@@ -209,6 +211,7 @@ impl ChangeRuntimeState {
         match &self.terminal {
             TerminalState::Archived => return "archived",
             TerminalState::Merged => return "merged",
+            TerminalState::Rejected(_) => return "rejected",
             TerminalState::Error(_) => return "error",
             TerminalState::Stopped => return "stopped",
             TerminalState::None => {}
@@ -247,6 +250,7 @@ impl ChangeRuntimeState {
             "archiving" => ratatui::style::Color::Magenta,
             "archived" => ratatui::style::Color::Blue,
             "merged" => ratatui::style::Color::LightBlue,
+            "rejected" => ratatui::style::Color::LightRed,
             "merge wait" => ratatui::style::Color::LightMagenta,
             "resolving" => ratatui::style::Color::LightCyan,
             "resolve pending" => ratatui::style::Color::Magenta,
@@ -715,7 +719,12 @@ impl OrchestratorState {
                 // Permanently completed changes (Archived, Merged) cannot be re-queued.
                 {
                     let rt = self.runtime_entry(&change_id);
-                    if matches!(rt.terminal, TerminalState::Archived | TerminalState::Merged) {
+                    if matches!(
+                        rt.terminal,
+                        TerminalState::Archived
+                            | TerminalState::Merged
+                            | TerminalState::Rejected(_)
+                    ) {
                         return ReduceOutcome::NoOp;
                     }
                     // Already queued and not in a retryable terminal state – no-op.
@@ -908,6 +917,16 @@ impl OrchestratorState {
                 if !rt.is_terminal() {
                     rt.terminal = TerminalState::Error(error.clone());
                     rt.activity = ActivityState::Idle;
+                }
+            }
+            ExecutionEvent::ChangeRejected { change_id, reason } => {
+                self.remove_from_pending(change_id);
+                let rt = self.runtime_entry(change_id);
+                if !rt.is_terminal() {
+                    rt.terminal = TerminalState::Rejected(reason.clone());
+                    rt.activity = ActivityState::Idle;
+                    rt.wait_state = WaitState::None;
+                    rt.queue_intent = QueueIntent::NotQueued;
                 }
             }
 
@@ -1367,6 +1386,9 @@ mod tests {
         rt.terminal = TerminalState::Merged;
         assert_eq!(rt.display_color(), ratatui::style::Color::LightBlue);
 
+        rt.terminal = TerminalState::Rejected("blocked".to_string());
+        assert_eq!(rt.display_color(), ratatui::style::Color::LightRed);
+
         rt.terminal = TerminalState::Stopped;
         assert_eq!(rt.display_color(), ratatui::style::Color::DarkGray);
 
@@ -1446,6 +1468,11 @@ mod tests {
         // StopChange on already-terminal → NoOp.
         let outcome6 = state.apply_command(ReducerCommand::StopChange("c".to_string()));
         assert!(matches!(outcome6, ReduceOutcome::NoOp));
+
+        // Rejected is a permanent terminal state and cannot be re-queued.
+        state.runtime_entry("c").terminal = TerminalState::Rejected("blocked".to_string());
+        let outcome7 = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert!(matches!(outcome7, ReduceOutcome::NoOp));
     }
 
     // -----------------------------------------------------------------------

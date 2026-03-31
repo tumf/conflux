@@ -21,8 +21,8 @@ use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::{
-    acceptance_test_streaming, archive_change, AcceptanceResult, ArchiveContext, ArchiveResult,
-    OutputHandler,
+    acceptance_test_streaming, archive_change, execute_rejection_flow, AcceptanceResult,
+    ArchiveContext, ArchiveResult, OutputHandler,
 };
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser::TaskProgress;
@@ -487,6 +487,19 @@ impl SerialRunService {
                 )
                 .await
                 {
+                    Ok((AcceptanceResult::Blocked, _attempt_number, _command)) => {
+                        let reason = "Implementation blocker detected".to_string();
+                        let base_branch =
+                            crate::vcs::git::commands::get_current_branch(&self.repo_root)
+                                .await
+                                .map_err(crate::error::OrchestratorError::from_vcs_error)?
+                                .unwrap_or_else(|| "main".to_string());
+
+                        execute_rejection_flow(&change.id, &reason, &self.repo_root, &base_branch)
+                            .await?;
+
+                        Ok(ChangeProcessResult::Rejected { reason })
+                    }
                     Ok((result, _attempt_number, _command)) => Ok(self.process_acceptance_result(
                         &change.id,
                         agent,
@@ -598,7 +611,9 @@ impl SerialRunService {
                     "Acceptance blocked for {} - implementation blocker detected",
                     change_id
                 );
-                ChangeProcessResult::AcceptanceBlocked
+                ChangeProcessResult::ApplyFailed {
+                    error: "Blocked acceptance reached unexpected fallback path".to_string(),
+                }
             }
             AcceptanceResult::Fail { findings } => {
                 warn!(
@@ -668,8 +683,8 @@ pub enum ChangeProcessResult {
     AcceptanceContinue,
     /// Acceptance CONTINUE limit exceeded
     AcceptanceContinueExceeded,
-    /// Acceptance blocked due to implementation blocker
-    AcceptanceBlocked,
+    /// Acceptance blocked and change was rejected
+    Rejected { reason: String },
 }
 
 /// Helper function to check if progress is complete
@@ -787,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_acceptance_result_blocked_returns_correct_variant() {
+    fn test_process_acceptance_result_blocked_returns_fallback_error_variant() {
         use crate::agent::AgentRunner;
         use crate::orchestration::AcceptanceResult;
 
@@ -804,7 +819,11 @@ mod tests {
             || false, // Not a single-change stop
         );
 
-        assert!(matches!(result, ChangeProcessResult::AcceptanceBlocked));
+        assert!(matches!(
+            result,
+            ChangeProcessResult::ApplyFailed { ref error }
+            if error == "Blocked acceptance reached unexpected fallback path"
+        ));
     }
 
     #[test]

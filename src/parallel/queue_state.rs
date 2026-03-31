@@ -242,7 +242,7 @@ impl ParallelExecutor {
             workspace_result.error
         );
 
-        // Handle result (success or failure)
+        // Handle result (failure, rejection, or success)
         if let Some(error) = &workspace_result.error {
             error!("Change '{}' failed: {}", workspace_result.change_id, error);
             self.failed_tracker.mark_failed(&workspace_result.change_id);
@@ -254,6 +254,31 @@ impl ParallelExecutor {
                 },
             )
             .await;
+        } else if let Some(reason) = &workspace_result.rejected {
+            info!(
+                "Change '{}' rejected after acceptance blocker: {}",
+                workspace_result.change_id, reason
+            );
+            send_event(
+                &self.event_tx,
+                ParallelEvent::ChangeRejected {
+                    change_id: workspace_result.change_id.clone(),
+                    reason: reason.clone(),
+                },
+            )
+            .await;
+            // Rejected flow completes resolve on base and should not proceed to merge.
+            // Ensure preserved workspace is cleaned up.
+            if let Err(e) = self
+                .workspace_manager
+                .cleanup_workspace(&workspace_result.workspace_name)
+                .await
+            {
+                error!(
+                    "Failed to cleanup rejected workspace '{}' for change '{}': {}",
+                    workspace_result.workspace_name, workspace_result.change_id, e
+                );
+            }
         } else {
             info!(
                 "Change '{}' completed successfully",

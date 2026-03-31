@@ -554,15 +554,16 @@ impl Orchestrator {
                     next.id
                 );
             }
-            ChangeProcessResult::AcceptanceBlocked => {
-                warn!(
-                    "Acceptance blocked for {} - implementation blocker detected, marking as stalled",
-                    next.id
+            ChangeProcessResult::Rejected { reason } => {
+                info!(
+                    "Acceptance blocked for {} - rejected flow completed: {}",
+                    next.id, reason
                 );
-                // Mark change as stalled to prevent re-selection and archive
-                let reason = "Implementation blocker detected - requires manual intervention";
-                self.mark_change_stalled(&next.id, reason).await;
-                serial_service.mark_stalled(&next.id, reason);
+                self.update_shared_state(ExecutionEvent::ChangeRejected {
+                    change_id: next.id.clone(),
+                    reason: reason.clone(),
+                })
+                .await;
             }
             ChangeProcessResult::AcceptanceFailed { .. } => {
                 info!("Acceptance failed for {}, will retry apply", next.id);
@@ -683,7 +684,7 @@ impl Orchestrator {
             | ChangeProcessResult::AcceptanceContinueExceeded
             | ChangeProcessResult::AcceptanceFailed { .. }
             | ChangeProcessResult::AcceptanceCommandFailed { .. }
-            | ChangeProcessResult::AcceptanceBlocked => {
+            | ChangeProcessResult::Rejected { .. } => {
                 self.handle_acceptance_result(next, serial_service, &result)
                     .await;
                 Ok(LoopControl::Continue)
@@ -1627,7 +1628,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_acceptance_blocked_prevents_reapply_and_archive() {
+    async fn test_rejected_result_marks_change_rejected_state() {
         use crate::serial_run_service::ChangeProcessResult;
         use tempfile::TempDir;
 
@@ -1638,36 +1639,17 @@ mod tests {
 
         let blocked_change = create_test_change("blocked-change", 3, 5);
 
-        // Simulate AcceptanceBlocked result
-        let result = ChangeProcessResult::AcceptanceBlocked;
+        let result = ChangeProcessResult::Rejected {
+            reason: "Implementation blocker detected".to_string(),
+        };
 
-        // Process the result through handle_change_result
         orchestrator
             .handle_change_result(result, &blocked_change, &mut serial_service)
             .await
             .unwrap();
 
-        // Verify the change is marked as stalled in orchestrator
-        assert!(orchestrator
-            .shared_state
-            .read()
-            .await
-            .stalled_change_ids()
-            .contains(&blocked_change.id));
-
-        // Verify the change is marked as stalled in serial service
-        assert!(serial_service.is_stalled(&blocked_change.id));
-
-        // Create a list with the blocked change and another eligible change
-        let changes = vec![
-            blocked_change.clone(),
-            create_test_change("other-change", 2, 5),
-        ];
-
-        // Filter should exclude the blocked change
-        let eligible = orchestrator.filter_stalled_changes(&changes).await;
-        assert_eq!(eligible.len(), 1);
-        assert_eq!(eligible[0].id, "other-change");
+        let state = orchestrator.shared_state.read().await;
+        assert_eq!(state.display_status(&blocked_change.id), "rejected");
     }
 
     /// Regression: when ALL requested changes are rejected by start-time eligibility filtering,

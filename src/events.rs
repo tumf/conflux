@@ -242,6 +242,8 @@ pub enum ExecutionEvent {
     /// Acceptance failed for a change
     #[allow(dead_code)]
     AcceptanceFailed { change_id: String, error: String },
+    /// Change rejected after acceptance blocker detection
+    ChangeRejected { change_id: String, reason: String },
     /// Acceptance output (streaming)
     #[allow(dead_code)]
     AcceptanceOutput {

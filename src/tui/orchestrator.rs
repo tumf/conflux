@@ -658,7 +658,7 @@ pub async fn run_orchestrator(
                 )
                 .await;
             }
-            Ok(ChangeProcessResult::AcceptanceBlocked) => {
+            Ok(ChangeProcessResult::Rejected { reason }) => {
                 // Send ApplyCompleted event
                 let apply_completed_event = OrchestratorEvent::ApplyCompleted {
                     change_id: change_id.clone(),
@@ -687,16 +687,23 @@ pub async fn run_orchestrator(
                 .await;
 
                 let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::warn(
-                        "Acceptance blocked - implementation blocker detected, stopping apply loop"
-                            .to_string(),
-                    )))
+                    .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                        "Acceptance blocked - rejection flow completed: {}",
+                        reason
+                    ))))
                     .await;
 
-                // Mark as stalled in SerialRunService and remove from pending to prevent re-selection and archive
-                let reason = "Implementation blocker detected - requires manual intervention";
-                serial_service.mark_stalled(&change_id, reason);
-                shared_state.write().await.remove_from_pending(&change_id);
+                dispatch_event(
+                    &tx,
+                    &shared_state,
+                    #[cfg(feature = "web-monitoring")]
+                    web_state.as_ref(),
+                    OrchestratorEvent::ChangeRejected {
+                        change_id: change_id.clone(),
+                        reason,
+                    },
+                )
+                .await;
             }
             Ok(ChangeProcessResult::AcceptanceFailed { .. }) => {
                 // Send ApplyCompleted event
@@ -1378,13 +1385,9 @@ mod tests {
         );
     }
 
-    /// Test that AcceptanceBlocked prevents re-selection and archive in TUI serial mode.
-    /// Verifies that:
-    /// 1. The blocked change is marked as stalled in SerialRunService
-    /// 2. The blocked change is removed from pending_changes
-    /// 3. Blocked change cannot be re-selected through pending_changes filtering
+    /// Test helper behavior for rejection-like removal from pending in TUI serial mode.
     #[tokio::test]
-    async fn test_tui_acceptance_blocked_prevents_reselection_and_archive() {
+    async fn test_tui_rejection_removes_from_pending_selection() {
         use crate::serial_run_service::SerialRunService;
         use std::collections::HashSet;
         use tempfile::TempDir;
