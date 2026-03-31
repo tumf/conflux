@@ -38,9 +38,13 @@ Conflux automates the OpenSpec change workflow: list → dependency analysis →
 
 ## Domain Context
 - **OpenSpec**: A specification management system for AI-assisted development
-- **Change**: A unit of work defined in `openspec/changes/{change_id}/`
+- **Orchestration**: Top-level runtime that manages one or more Projects and the end-to-end workflow lifecycle
+- **Project**: A scoped execution unit backed by one `OrchestratorState`, containing a set of Changes processed together in Serial or Parallel mode
+- **Change**: A unit of work defined in `openspec/changes/{change_id}/` and executed within exactly one Project
 - **Task**: Individual items within a change's `tasks.md` file
 - **Agent**: AI tool (Claude Code, OpenCode, Codex) that processes changes
+
+The system hierarchy is `Orchestration 1--* Project 1--* Change`.
 
 ## Important Constraints
 - Support multiple AI agents through configurable commands
