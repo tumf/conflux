@@ -495,8 +495,14 @@ impl SerialRunService {
                                 .map_err(crate::error::OrchestratorError::from_vcs_error)?
                                 .unwrap_or_else(|| "main".to_string());
 
-                        execute_rejection_flow(&change.id, &reason, &self.repo_root, &base_branch)
-                            .await?;
+                        execute_rejection_flow(
+                            &change.id,
+                            &reason,
+                            &self.repo_root,
+                            &base_branch,
+                            &self.repo_root,
+                        )
+                        .await?;
 
                         Ok(ChangeProcessResult::Rejected { reason })
                     }

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::{OrchestratorError, Result};
 use crate::vcs::git::commands as git_commands;
@@ -47,6 +47,27 @@ async fn run_openspec_resolve(change_id: &str, workspace_path: &Path) -> Result<
     Ok(())
 }
 
+async fn cleanup_worktree(repo_root: &Path, worktree_path: &Path) {
+    let worktree_path_str = worktree_path.to_string_lossy();
+    match git_commands::worktree_remove(repo_root, &worktree_path_str).await {
+        Ok(()) => {
+            info!(
+                worktree = %worktree_path.display(),
+                repo_root = %repo_root.display(),
+                "Removed rejected worktree"
+            );
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                worktree = %worktree_path.display(),
+                repo_root = %repo_root.display(),
+                "Failed to remove rejected worktree (may already be removed)"
+            );
+        }
+    }
+}
+
 /// Execute rejection flow for acceptance-blocked changes.
 ///
 /// Flow:
@@ -59,19 +80,21 @@ pub async fn execute_rejection_flow(
     reason: &str,
     workspace_path: &Path,
     base_branch: &str,
+    repo_root: &Path,
 ) -> Result<()> {
     info!(
         change_id = %change_id,
         workspace = %workspace_path.display(),
+        repo_root = %repo_root.display(),
         base_branch = %base_branch,
         "Starting rejection flow"
     );
 
-    git_commands::checkout(workspace_path, base_branch)
+    git_commands::checkout(repo_root, base_branch)
         .await
         .map_err(OrchestratorError::from_vcs_error)?;
 
-    let rejected_path = rejected_file_path(workspace_path, change_id);
+    let rejected_path = rejected_file_path(repo_root, change_id);
     let rejected_parent = rejected_path.parent().ok_or_else(|| {
         OrchestratorError::AgentCommand(format!(
             "Invalid REJECTED.md path for change '{}'",
@@ -85,7 +108,7 @@ pub async fn execute_rejection_flow(
     let relative_rejected_path = format!("openspec/changes/{}/REJECTED.md", change_id);
     let add_output = Command::new("git")
         .args(["add", &relative_rejected_path])
-        .current_dir(workspace_path)
+        .current_dir(repo_root)
         .output()
         .await?;
     if !add_output.status.success() {
@@ -99,7 +122,7 @@ pub async fn execute_rejection_flow(
     let commit_message = format!("reject(openspec): {}", change_id);
     let commit_output = Command::new("git")
         .args(["commit", "-m", &commit_message])
-        .current_dir(workspace_path)
+        .current_dir(repo_root)
         .output()
         .await?;
     if !commit_output.status.success() {
@@ -112,7 +135,9 @@ pub async fn execute_rejection_flow(
 
     debug!(change_id = %change_id, "Committed REJECTED.md on base branch");
 
-    run_openspec_resolve(change_id, workspace_path).await?;
+    run_openspec_resolve(change_id, repo_root).await?;
+
+    cleanup_worktree(repo_root, workspace_path).await;
 
     info!(change_id = %change_id, "Rejection flow completed");
     Ok(())
@@ -121,6 +146,64 @@ pub async fn execute_rejection_flow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fn write_executable_script(path: &Path, content: &str) {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o755)
+            .open(path)
+            .expect("create script");
+        file.write_all(content.as_bytes()).expect("write script");
+        file.sync_all().expect("sync script");
+    }
+
+    async fn init_git_repo(path: &Path) {
+        let status = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(path)
+            .status()
+            .await
+            .expect("git init failed");
+        assert!(status.success());
+
+        let status = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(path)
+            .status()
+            .await
+            .expect("git config email failed");
+        assert!(status.success());
+
+        let status = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(path)
+            .status()
+            .await
+            .expect("git config name failed");
+        assert!(status.success());
+
+        fs::write(path.join("README.md"), "# test\n").expect("write readme");
+        let status = Command::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .status()
+            .await
+            .expect("git add failed");
+        assert!(status.success());
+
+        let status = Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(path)
+            .status()
+            .await
+            .expect("git commit failed");
+        assert!(status.success());
+    }
 
     #[test]
     fn test_rejected_markdown_contains_reason() {
@@ -133,5 +216,93 @@ mod tests {
     fn test_rejected_file_path_layout() {
         let path = rejected_file_path(Path::new("/tmp/ws"), "change-a");
         assert!(path.ends_with("openspec/changes/change-a/REJECTED.md"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejection_flow_creates_marker_commits_and_cleans_worktree() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp_dir.path();
+        init_git_repo(repo_root).await;
+
+        let change_id = "blocked-change";
+        let change_dir = repo_root.join("openspec").join("changes").join(change_id);
+        fs::create_dir_all(&change_dir).expect("create change dir");
+        fs::write(change_dir.join("proposal.md"), "# proposal\n").expect("write proposal");
+        fs::write(change_dir.join("tasks.md"), "- [ ] task\n").expect("write tasks");
+
+        let script_dir = repo_root.join("mock-bin");
+        fs::create_dir_all(&script_dir).expect("create script dir");
+        write_executable_script(
+            &script_dir.join("openspec"),
+            "#!/bin/bash\nif [ \"$1\" = \"resolve\" ]; then\n  exit 0\nfi\necho \"unexpected openspec command\" >&2\nexit 1\n",
+        );
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", script_dir.display(), original_path),
+            );
+        }
+
+        let current_branch = git_commands::get_current_branch(repo_root)
+            .await
+            .expect("current branch")
+            .expect("branch name");
+
+        let worktree_parent = repo_root.join(".worktrees");
+        fs::create_dir_all(&worktree_parent).expect("create worktree parent");
+        let worktree_path = worktree_parent.join(change_id);
+        git_commands::worktree_add(
+            repo_root,
+            worktree_path.to_str().expect("worktree path"),
+            &format!("wt/{}", change_id),
+            &current_branch,
+        )
+        .await
+        .expect("create worktree");
+
+        let result = execute_rejection_flow(
+            change_id,
+            "Implementation blocker detected",
+            &worktree_path,
+            &current_branch,
+            repo_root,
+        )
+        .await;
+
+        unsafe {
+            std::env::set_var("PATH", original_path);
+        }
+
+        assert!(result.is_ok(), "rejection flow should succeed: {result:?}");
+
+        let marker_path = change_dir.join("REJECTED.md");
+        assert!(marker_path.exists(), "REJECTED.md must be created");
+        let marker = fs::read_to_string(&marker_path).expect("read marker");
+        assert!(marker.contains("change_id: blocked-change"));
+        assert!(marker.contains("reason: Implementation blocker detected"));
+
+        let head_message = Command::new("git")
+            .args(["log", "-1", "--pretty=%s"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .expect("read commit message");
+        assert!(head_message.status.success());
+        let message = String::from_utf8_lossy(&head_message.stdout);
+        assert!(message
+            .trim()
+            .starts_with("reject(openspec): blocked-change"));
+
+        let list = git_commands::list_worktrees(repo_root)
+            .await
+            .expect("list worktrees after cleanup");
+        assert!(
+            !list
+                .iter()
+                .any(|(path, _, _, _, _)| path == &worktree_path.to_string_lossy()),
+            "rejected worktree must be removed"
+        );
     }
 }

@@ -644,6 +644,7 @@ impl ParallelExecutor {
                             &reason,
                             &workspace.path,
                             &resolved_base,
+                            &repo_root,
                         )
                         .await
                         {
