@@ -19,6 +19,7 @@ pub mod apply;
 pub mod archive;
 pub mod hooks;
 pub mod output;
+pub mod rejection;
 pub mod selection;
 pub mod state;
 
@@ -34,5 +35,7 @@ pub use archive::{archive_change, archive_change_streaming, ArchiveContext, Arch
 pub use output::{
     ChannelOutputHandler, ContextualOutputHandler, LogOutputHandler, OutputHandler, OutputMessage,
 };
+#[allow(unused_imports)]
+pub use rejection::execute_rejection_flow;
 #[allow(unused_imports)]
 pub use state::OrchestratorState;

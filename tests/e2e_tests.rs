@@ -15,6 +15,8 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use conflux::orchestration::execute_rejection_flow;
+
 // Global counter for unique script names across parallel tests
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1386,6 +1388,117 @@ async fn test_git_worktree_staged_changes_error() {
         "Staged file should be detected with 'A' status"
     );
     assert!(!status.is_empty(), "Repo should have staged changes");
+}
+
+#[tokio::test]
+async fn test_blocked_rejection_flow_end_to_end_creates_marker_and_removes_worktree() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let repo_root = temp_dir.path();
+
+    if !init_git_repo(repo_root).await {
+        println!("Skipping test: git not available");
+        return;
+    }
+
+    let change_id = "blocked-e2e";
+    let change_dir = repo_root.join("openspec/changes").join(change_id);
+    fs::create_dir_all(&change_dir).unwrap();
+    fs::write(change_dir.join("proposal.md"), "# proposal\n").unwrap();
+    fs::write(change_dir.join("tasks.md"), "- [ ] task\n").unwrap();
+
+    let script_id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mock_bin = repo_root.join(format!("mock_bin_{}", script_id));
+    fs::create_dir_all(&mock_bin).unwrap();
+    let mock_openspec = mock_bin.join("openspec");
+
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut openspec_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o755)
+        .open(&mock_openspec)
+        .unwrap();
+    openspec_file
+        .write_all(
+            b"#!/bin/bash\nif [ \"$1\" = \"resolve\" ]; then\n  exit 0\nfi\necho \"unexpected openspec command\" >&2\nexit 1\n",
+        )
+        .unwrap();
+    openspec_file.sync_all().unwrap();
+    drop(openspec_file);
+
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    unsafe {
+        std::env::set_var("PATH", format!("{}:{}", mock_bin.display(), original_path));
+    }
+
+    let base_branch = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(repo_root)
+        .output()
+        .unwrap();
+    assert!(base_branch.status.success());
+    let base_branch = String::from_utf8(base_branch.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let worktree_path = repo_root.join(".worktrees").join(change_id);
+    fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
+
+    let add_output = Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            &format!("wt/{}", change_id),
+            worktree_path.to_str().unwrap(),
+            &base_branch,
+        ])
+        .current_dir(repo_root)
+        .output()
+        .unwrap();
+    assert!(add_output.status.success());
+
+    let result = execute_rejection_flow(
+        change_id,
+        "E2E acceptance blocked",
+        &worktree_path,
+        &base_branch,
+        repo_root,
+    )
+    .await;
+
+    unsafe {
+        std::env::set_var("PATH", original_path);
+    }
+
+    assert!(
+        result.is_ok(),
+        "rejection flow should succeed in e2e: {:?}",
+        result
+    );
+
+    let rejected_marker = change_dir.join("REJECTED.md");
+    assert!(
+        rejected_marker.exists(),
+        "REJECTED.md must exist after rejection"
+    );
+    let content = fs::read_to_string(rejected_marker).unwrap();
+    assert!(content.contains("change_id: blocked-e2e"));
+    assert!(content.contains("reason: E2E acceptance blocked"));
+
+    let list_output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .unwrap();
+    assert!(list_output.status.success());
+    let list_text = String::from_utf8(list_output.stdout).unwrap();
+    assert!(
+        !list_text.contains(worktree_path.to_str().unwrap()),
+        "rejected worktree should be removed"
+    );
 }
 
 // Note: E2E tests for command queue staggering and retry are covered

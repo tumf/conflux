@@ -13,6 +13,8 @@ pub struct WorkspaceResult {
     pub final_revision: Option<String>,
     /// Error message if failed
     pub error: Option<String>,
+    /// Rejection reason when acceptance was blocked and rejection flow completed
+    pub rejected: Option<String>,
 }
 
 /// Tracks failed changes and their dependencies to enable automatic skipping.

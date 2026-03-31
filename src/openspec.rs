@@ -426,6 +426,13 @@ pub fn list_changes_native() -> Result<Vec<Change>> {
             continue;
         }
 
+        // Skip rejected changes (REJECTED.md is committed as terminal marker)
+        let rejected_marker = path.join("REJECTED.md");
+        if rejected_marker.exists() {
+            debug!("Skipping change '{}' - REJECTED.md marker found", dir_name);
+            continue;
+        }
+
         // Parse tasks.md for this change
         let (completed_tasks, total_tasks) = match task_parser::parse_change(dir_name) {
             Ok(progress) => (progress.completed, progress.total),
@@ -575,6 +582,32 @@ mod tests {
         for change in &changes {
             assert!(!change.id.is_empty(), "change ID should not be empty");
         }
+    }
+
+    #[test]
+    fn test_list_changes_native_skips_rejected_marker() {
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let change_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("change-rejected");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(change_dir.join("proposal.md"), "# proposal").unwrap();
+        fs::write(change_dir.join("REJECTED.md"), "# rejected").unwrap();
+
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = list_changes_native().unwrap();
+
+        env::set_current_dir(original_dir).unwrap();
+
+        assert!(
+            !result.iter().any(|change| change.id == "change-rejected"),
+            "changes with REJECTED.md must be skipped"
+        );
     }
 
     #[test]

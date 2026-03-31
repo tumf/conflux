@@ -17,6 +17,7 @@ const statusConfig: Record<string, { color: string; bg: string }> = {
   resolving: { color: 'text-[#f59e0b]', bg: 'bg-[#451a03]/50' },
   archived: { color: 'text-[#22c55e]', bg: 'bg-[#052e16]/50' },
   merged: { color: 'text-[#22c55e]', bg: 'bg-[#052e16]/50' },
+  rejected: { color: 'text-[#f87171]', bg: 'bg-[#7f1d1d]/50' },
   error: { color: 'text-[#ef4444]', bg: 'bg-[#450a0a]/50' },
 };
 
@@ -29,6 +30,7 @@ const progressBarColor: Record<string, string> = {
   resolving: 'bg-[#f59e0b]',
   archived: 'bg-[#22c55e]',
   merged: 'bg-[#22c55e]',
+  rejected: 'bg-[#f87171]',
   error: 'bg-[#ef4444]',
 };
 

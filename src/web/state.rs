@@ -68,7 +68,7 @@ pub struct ChangeStatus {
     pub dependencies: Vec<String>,
     /// Queue status (for parallel/serial execution tracking)
     /// Aligned with TUI display status values: "not queued", "queued", "blocked", "processing",
-    /// "accepting", "archiving", "archived", "merged", "merge wait", "resolving", "resolve pending", "error"
+    /// "accepting", "archiving", "archived", "merged", "rejected", "merge wait", "resolving", "resolve pending", "error"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_status: Option<String>,
     /// Current iteration number for apply/archive loops

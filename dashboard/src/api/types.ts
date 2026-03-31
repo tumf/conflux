@@ -13,6 +13,7 @@ export type ChangeStatus =
   | 'resolving'
   | 'archived'
   | 'merged'
+  | 'rejected'
   | 'error';
 
 export interface RemoteProject {

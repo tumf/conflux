@@ -18,6 +18,7 @@ use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
 use crate::execution::state::{detect_workspace_state, WorkspaceState};
+use crate::orchestration::execute_rejection_flow;
 use crate::vcs::WorkspaceStatus;
 
 use super::cleanup::WorkspaceCleanupGuard;
@@ -194,6 +195,7 @@ impl ParallelExecutor {
                         workspace_name: workspace.name,
                         final_revision: None,
                         error: None,
+                        rejected: None,
                     };
                 }
                 WorkspaceState::Archived => {
@@ -235,6 +237,7 @@ impl ParallelExecutor {
                                 workspace_name: workspace.name,
                                 final_revision: Some(rev),
                                 error: None,
+                                rejected: None,
                             };
                         }
                         Err(e) => {
@@ -253,6 +256,7 @@ impl ParallelExecutor {
                                     "Archived resume: failed to read workspace revision: {}",
                                     e
                                 )),
+                                rejected: None,
                             };
                         }
                     }
@@ -345,12 +349,16 @@ impl ParallelExecutor {
                                 .await;
                         }
                         cancel_monitor.abort();
-                        return WorkspaceResult {
-                            change_id,
-                            workspace_name: workspace.name,
-                            final_revision: None,
-                            error: None, // No error - intentionally stopped
-                        };
+                                    return WorkspaceResult {
+                                        change_id,
+                                        workspace_name: workspace.name,
+                                        final_revision: None,
+                                        error: None, // No error - intentionally stopped
+                                        rejected: None,
+                                    };
+
+
+
                     }
                 }
 
@@ -369,6 +377,7 @@ impl ParallelExecutor {
                             "Max apply+acceptance cycles ({}) reached",
                             MAX_APPLY_ACCEPTANCE_CYCLES
                         )),
+                        rejected: None,
                     };
                 }
 
@@ -422,6 +431,7 @@ impl ParallelExecutor {
                                         workspace_name: workspace.name,
                                         final_revision: None,
                                         error: None, // No error - intentionally stopped
+                                        rejected: None,
                                     };
                                 }
                             }
@@ -433,6 +443,7 @@ impl ParallelExecutor {
                             workspace_name: workspace.name,
                             final_revision: None,
                             error: Some(format!("Apply failed: {}", e)),
+                            rejected: None,
                         };
                     }
                 };
@@ -523,6 +534,7 @@ impl ParallelExecutor {
                                     "Acceptance CONTINUE limit ({}) exceeded",
                                     max_continues
                                 )),
+                                rejected: None,
                             };
                         } else {
                             info!(
@@ -610,35 +622,73 @@ impl ParallelExecutor {
                             workspace_name: workspace.name,
                             final_revision: None,
                             error: Some(format!("Acceptance command failed: {}", error)),
+                            rejected: None,
                         };
                     }
                     Ok((
                         crate::orchestration::AcceptanceResult::Blocked,
                         acceptance_iteration,
                     )) => {
+                        let reason = "Implementation blocker detected".to_string();
                         warn!(
-                            "Acceptance blocked for {} - implementation blocker detected",
+                            "Acceptance blocked for {} - running rejection flow",
                             change_id
                         );
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx
-                                .send(ParallelEvent::Log(
-                                    LogEntry::warn("Acceptance blocked - implementation blocker detected, workspace preserved for manual follow-up")
-                                        .with_change_id(&change_id)
-                                        .with_operation("acceptance")
-                                        .with_iteration(acceptance_iteration),
-                                ))
-                                .await;
+
+                        let resolved_base = base_branch
+                            .clone()
+                            .unwrap_or_else(|| "main".to_string());
+
+                        match execute_rejection_flow(
+                            &change_id,
+                            &reason,
+                            &workspace.path,
+                            &resolved_base,
+                            &repo_root,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(
+                                            LogEntry::warn(format!(
+                                                "Acceptance blocked - rejection flow completed ({})",
+                                                resolved_base
+                                            ))
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
+                                        ))
+                                        .await;
+                                    let _ = tx
+                                        .send(ParallelEvent::ChangeStopped {
+                                            change_id: change_id.clone(),
+                                        })
+                                        .await;
+                                }
+
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name: workspace.name,
+                                    final_revision: None,
+                                    error: None,
+                                    rejected: Some(reason),
+                                };
+                            }
+                            Err(e) => {
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name: workspace.name,
+                                    final_revision: None,
+                                    error: Some(format!(
+                                        "Rejected flow failed after blocked acceptance: {}",
+                                        e
+                                    )),
+                                    rejected: None,
+                                };
+                            }
                         }
-                        // Stop apply loop and preserve workspace
-                        return WorkspaceResult {
-                            change_id,
-                            workspace_name: workspace.name,
-                            final_revision: None,
-                            error: Some(
-                                "Implementation blocker detected - workspace preserved".to_string(),
-                            ),
-                        };
                     }
                     Ok((
                         crate::orchestration::AcceptanceResult::Cancelled,
@@ -668,6 +718,7 @@ impl ParallelExecutor {
                                     workspace_name: workspace.name,
                                     final_revision: None,
                                     error: None, // No error - intentionally stopped
+                                    rejected: None,
                                 };
                             }
                         }
@@ -679,6 +730,7 @@ impl ParallelExecutor {
                             workspace_name: workspace.name,
                             final_revision: None,
                             error: Some("Acceptance cancelled".to_string()),
+                            rejected: None,
                         };
                     }
                     Err(e) => {
@@ -708,6 +760,7 @@ impl ParallelExecutor {
                                         workspace_name: workspace.name,
                                         final_revision: None,
                                         error: None, // No error - intentionally stopped
+                                        rejected: None,
                                     };
                                 }
                             }
@@ -719,6 +772,7 @@ impl ParallelExecutor {
                             workspace_name: workspace.name,
                             final_revision: None,
                             error: Some(format!("Acceptance error: {}", e)),
+                            rejected: None,
                         };
                     }
                 }
@@ -768,6 +822,7 @@ impl ParallelExecutor {
                         workspace_name: workspace.name,
                         final_revision: Some(archive_revision),
                         error: None,
+                        rejected: None,
                     }
                 }
                 Err(e) => {
@@ -796,6 +851,7 @@ impl ParallelExecutor {
                                     workspace_name: workspace.name,
                                     final_revision: None,
                                     error: None, // No error - intentionally stopped
+                                    rejected: None,
                                 };
                             }
                         }
@@ -816,6 +872,7 @@ impl ParallelExecutor {
                         workspace_name: workspace.name,
                         final_revision: None,
                         error: Some(format!("Archive failed: {}", e)),
+                        rejected: None,
                     }
                 }
             }
