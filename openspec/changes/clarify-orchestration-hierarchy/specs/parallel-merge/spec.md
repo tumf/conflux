@@ -2,7 +2,7 @@
 
 ### Requirement: merge-attempt-resolve-priority
 
-archive 完了後の merge 試行において、resolve カウンター（`auto_resolve_count` + `manual_resolve_count`）を最優先でチェックする。これは Project スコープ（同一 `OrchestratorState` 内）の resolve 進行状況である。resolve 進行中であれば auto_resumable な MergeDeferred として即座に返す。resolve が進行中でなく base が dirty な場合は、reason の内容に関わらず常に `auto_resumable=false` の MergeDeferred とする。
+archive 完了後の merge 試行において、システムは resolve カウンター（`auto_resolve_count` + `manual_resolve_count`）を最優先でチェックしなければならない（MUST）。これは Project スコープ（同一 `OrchestratorState` 内）の resolve 進行状況である。resolve 進行中であれば auto_resumable な MergeDeferred として即座に返さなければならない（MUST）。resolve が進行中でなく base が dirty な場合は、reason の内容に関わらず常に `auto_resumable=false` の MergeDeferred としなければならない（MUST）。
 
 #### Scenario: archive-completed-while-another-change-resolving
 
