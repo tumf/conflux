@@ -1,8 +1,8 @@
 ## Specification Tasks
 
-- [ ] `frontend-abstraction/spec.md` に Core / Frontend 責務境界の総則 requirement を追加 (expected: Core 所有状態・Frontend 所有状態・Frontend 禁止状態が ADDED requirement として定義される)
-- [ ] `orchestration-state/spec.md` の既存「Resolve Wait Queue Ownership」要件に Core 所有の注記を追加 (expected: resolve queue / serialization が Core 所有であり Frontend がローカルコピーを持ってはならないことが明記される)
-- [ ] 全 spec delta を validate --strict で検証 (expected: validation passed)
+- [x] `frontend-abstraction/spec.md` に Core / Frontend 責務境界の総則 requirement を追加 (expected: Core 所有状態・Frontend 所有状態・Frontend 禁止状態が ADDED requirement として定義される)
+- [x] `orchestration-state/spec.md` の既存「Resolve Wait Queue Ownership」要件に Core 所有の注記を追加 (expected: resolve queue / serialization が Core 所有であり Frontend がローカルコピーを持ってはならないことが明記される)
+- [x] 全 spec delta を validate --strict で検証 (expected: validation passed)
 
 ## Future Work
 
