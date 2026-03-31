@@ -1815,6 +1815,48 @@ async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_wor
 }
 
 #[tokio::test]
+async fn test_handle_merge_result_triggers_reanalysis() {
+    use crate::parallel::MergeResult;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, _rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.needs_reanalysis = false;
+
+    executor
+        .handle_merge_result(MergeResult {
+            change_id: "change-ok".to_string(),
+            workspace_name: "ws-change-ok".to_string(),
+            outcome: Ok(()),
+        })
+        .await;
+
+    assert!(
+        executor.needs_reanalysis,
+        "successful background merge should trigger scheduler re-analysis"
+    );
+
+    executor.needs_reanalysis = false;
+    executor
+        .handle_merge_result(MergeResult {
+            change_id: "change-err".to_string(),
+            workspace_name: "ws-change-err".to_string(),
+            outcome: Err("merge failed".to_string()),
+        })
+        .await;
+
+    assert!(
+        executor.needs_reanalysis,
+        "failed background merge should also trigger scheduler re-analysis"
+    );
+}
+
+#[tokio::test]
 async fn test_debounce_with_queue_changes() {
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;

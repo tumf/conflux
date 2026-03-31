@@ -65,12 +65,10 @@ impl ParallelExecutor {
     ///
     /// # Arguments
     /// * `workspace_result` - Result from archived workspace
-    /// * `cleanup_guard` - Guard for workspace cleanup tracking
     pub(super) async fn handle_merge_and_cleanup(
         &mut self,
         workspace_result: super::types::WorkspaceResult,
-        cleanup_guard: &mut super::cleanup::WorkspaceCleanupGuard,
-    ) {
+    ) -> Result<()> {
         let revisions = vec![workspace_result.workspace_name.clone()];
         let change_ids = vec![workspace_result.change_id.clone()];
 
@@ -185,9 +183,6 @@ impl ParallelExecutor {
                         .await;
                     }
 
-                    // A merge just completed: auto-resumable deferred changes may now be
-                    // unblocked (the base was dirty because this merge was in progress).
-                    self.retry_deferred_merges().await;
                 }
                 Ok(MergeAttempt::Deferred(reason)) => {
                     // Merge deferred: only resolve-in-progress reasons are auto-resumable.
@@ -208,9 +203,6 @@ impl ParallelExecutor {
                         &workspace_result.workspace_name,
                         crate::vcs::WorkspaceStatus::MergeWait,
                     );
-
-                    // Preserve this workspace from cleanup
-                    cleanup_guard.preserve(&workspace_result.workspace_name);
 
                     send_event(
                         &self.event_tx,
@@ -238,8 +230,6 @@ impl ParallelExecutor {
                     );
                     tracing::error!("{}", error_msg);
                     send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
-                    // Preserve workspace on merge error to allow debugging
-                    cleanup_guard.preserve(&workspace_result.workspace_name);
                 }
             }
         } else {
@@ -248,6 +238,8 @@ impl ParallelExecutor {
                 workspace_result.workspace_name
             );
         }
+
+        Ok(())
     }
 
     pub(super) async fn attempt_merge(
