@@ -262,10 +262,32 @@ class OpenSpecManager:
         # Validate spec deltas (strict mode)
         if strict:
             specs_dir = change_dir / "specs"
-            if specs_dir.exists() and specs_dir.is_dir():
+            no_delta_marker_name = ".no-delta"
+
+            if not specs_dir.exists() or not specs_dir.is_dir():
+                errors.append(
+                    f"{change_id}: No spec deltas found (required in strict mode)"
+                )
+                return errors
+
+            no_delta_marker = specs_dir / no_delta_marker_name
+            has_no_delta_marker = no_delta_marker.exists() and no_delta_marker.is_file()
+            spec_delta_dirs = [item for item in specs_dir.iterdir() if item.is_dir()]
+
+            if has_no_delta_marker and spec_delta_dirs:
+                errors.append(
+                    f"{change_id}: specs/{no_delta_marker_name} conflicts with existing spec delta directories"
+                )
+                return errors
+
+            if has_no_delta_marker:
+                # Intentional no-delta change, strict validation passes.
+                return errors
+
+            if spec_delta_dirs:
                 spec_errors = self._validate_specs_dir(specs_dir, change_id)
                 errors.extend(spec_errors)
-            elif strict:
+            else:
                 errors.append(
                     f"{change_id}: No spec deltas found (required in strict mode)"
                 )
