@@ -29,7 +29,7 @@ mod workspace;
 pub use crate::events::ExecutionEvent as ParallelEvent;
 
 pub use merge::{base_dirty_reason, resolve_deferred_merge};
-pub use types::{FailedChangeTracker, WorkspaceResult};
+pub use types::{FailedChangeTracker, MergeResult, WorkspaceResult};
 
 // Re-exports used in tests via `use super::super::*`.
 #[cfg(test)]

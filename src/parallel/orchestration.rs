@@ -118,6 +118,7 @@ impl ParallelExecutor {
         let max_parallelism = self.workspace_manager.max_concurrent();
         let semaphore = Arc::new(Semaphore::new(max_parallelism));
         let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+        let (merge_result_tx, mut merge_result_rx) = tokio::sync::mpsc::channel(64);
         let mut in_flight: HashSet<String> = HashSet::new();
         let mut queued: Vec<crate::openspec::Change> = changes;
         let mut iteration = 1u32;
@@ -216,7 +217,7 @@ impl ParallelExecutor {
                 Some(result) = join_set.join_next() => {
                     match result {
                         Ok(workspace_result) => {
-                            self.handle_workspace_completion(workspace_result, max_parallelism, &mut in_flight, &mut cleanup_guard).await;
+                            self.handle_workspace_completion(workspace_result, max_parallelism, &mut in_flight, &merge_result_tx).await;
 
                             // Trigger re-analysis on next iteration.
                             // If a manual resolve is still active, keep the generic completion reason;
@@ -237,6 +238,12 @@ impl ParallelExecutor {
                             error!("Task panicked: {:?}", e);
                         }
                     }
+                }
+
+                // Background merge completion: merge+cleanup finished asynchronously
+                Some(merge_result) = merge_result_rx.recv() => {
+                    self.handle_merge_result(merge_result).await;
+                    reanalysis_reason = ReanalysisReason::ResolveCompletion;
                 }
 
                 // Queue notification: dynamic queue has new items

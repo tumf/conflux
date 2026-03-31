@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
@@ -16,7 +16,7 @@ use crate::events::LogEntry;
 use super::cleanup::WorkspaceCleanupGuard;
 use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
-use super::{ParallelEvent, ParallelExecutor, WorkspaceResult};
+use super::{MergeResult, ParallelEvent, ParallelExecutor, WorkspaceResult};
 
 impl ParallelExecutor {
     /// Check if debounce period has elapsed for queue changes.
@@ -229,7 +229,7 @@ impl ParallelExecutor {
         workspace_result: WorkspaceResult,
         max_parallelism: usize,
         in_flight: &mut HashSet<String>,
-        cleanup_guard: &mut WorkspaceCleanupGuard,
+        merge_result_tx: &mpsc::Sender<MergeResult>,
     ) {
         // Remove from in-flight
         in_flight.remove(&workspace_result.change_id);
@@ -285,10 +285,80 @@ impl ParallelExecutor {
                 workspace_result.change_id
             );
 
-            // Attempt merge if archive completed successfully
+            // Run merge+cleanup in background and report result back to scheduler loop.
             if workspace_result.final_revision.is_some() {
-                self.handle_merge_and_cleanup(workspace_result, cleanup_guard)
-                    .await;
+                self.spawn_merge_task(workspace_result, merge_result_tx.clone());
+            }
+        }
+    }
+
+    fn spawn_merge_task(
+        &self,
+        workspace_result: WorkspaceResult,
+        merge_result_tx: mpsc::Sender<MergeResult>,
+    ) {
+        let mut merge_executor = ParallelExecutor::new(
+            self.repo_root.clone(),
+            self.config.clone(),
+            self.event_tx.clone(),
+        );
+        merge_executor.max_conflict_retries = self.max_conflict_retries;
+        merge_executor.shared_stagger_state = self.shared_stagger_state.clone();
+        merge_executor.auto_resolve_count = self.auto_resolve_count.clone();
+        merge_executor.cancel_token = self.cancel_token.clone();
+        merge_executor.manual_resolve_count = self.manual_resolve_count.clone();
+        merge_executor.hooks = self.hooks.clone();
+
+        tokio::spawn(async move {
+            let change_id = workspace_result.change_id.clone();
+            let workspace_name = workspace_result.workspace_name.clone();
+            let outcome = merge_executor
+                .handle_merge_and_cleanup(workspace_result)
+                .await
+                .map_err(|error| error.to_string());
+
+            if let Err(send_error) = merge_result_tx
+                .send(MergeResult {
+                    change_id,
+                    workspace_name,
+                    outcome,
+                })
+                .await
+            {
+                warn!(
+                    "Failed to send merge result to scheduler loop: {}",
+                    send_error
+                );
+            }
+        });
+    }
+
+    pub(super) async fn handle_merge_result(&mut self, merge_result: MergeResult) {
+        match merge_result.outcome {
+            Ok(()) => {
+                info!(
+                    "Background merge task completed successfully for '{}'",
+                    merge_result.change_id
+                );
+                self.retry_deferred_merges().await;
+                self.needs_reanalysis = true;
+            }
+            Err(error) => {
+                error!(
+                    "Background merge task failed for '{}' (workspace '{}'): {}",
+                    merge_result.change_id, merge_result.workspace_name, error
+                );
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Error {
+                        message: format!(
+                            "Background merge failed for '{}' (workspace '{}'): {}",
+                            merge_result.change_id, merge_result.workspace_name, error
+                        ),
+                    },
+                )
+                .await;
+                self.needs_reanalysis = true;
             }
         }
     }

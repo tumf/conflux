@@ -17,6 +17,17 @@ pub struct WorkspaceResult {
     pub rejected: Option<String>,
 }
 
+/// Result of a background merge operation triggered after workspace completion.
+#[derive(Debug, Clone)]
+pub struct MergeResult {
+    /// Change associated with this merge attempt.
+    pub change_id: String,
+    /// Workspace name that produced this merge attempt.
+    pub workspace_name: String,
+    /// Outcome of the merge attempt.
+    pub outcome: std::result::Result<(), String>,
+}
+
 /// Tracks failed changes and their dependencies to enable automatic skipping.
 ///
 /// When a change fails, any changes that depend on it should be skipped
