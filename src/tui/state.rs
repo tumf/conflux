@@ -59,9 +59,9 @@ fn apply_remote_status(change: &mut ChangeState, status: &str) {
         return;
     }
 
-    // Only set queued/idle if we're not already in a terminal state.
-    if matches!(next, "queued" | "not queued") && matches!(current, "archived" | "merged" | "error")
-    {
+    // Only set queued/idle if we're not already in an immutable terminal state.
+    // Note: error is intentionally excluded to allow error -> queued retry transitions.
+    if matches!(next, "queued" | "not queued") && matches!(current, "archived" | "merged") {
         return;
     }
 
@@ -2807,6 +2807,8 @@ mod guards {
                 ToggleActionResult::Command(TuiCommand::StopChange(id), Some(log_msg))
             }
             "error" => {
+                // Error rows in Running mode must mirror queue operations:
+                // selected=true => AddToQueue, selected=false => RemoveFromQueue.
                 change.selected = !change.selected;
                 if change.is_new {
                     change.is_new = false;
@@ -2814,11 +2816,15 @@ mod guards {
                 }
                 let id = change.id.clone();
                 let log_msg = if change.selected {
-                    format!("Marked for retry: {}", id)
+                    format!("Marked for retry and added to queue: {}", id)
                 } else {
-                    format!("Retry mark cleared: {}", id)
+                    format!("Retry mark cleared and removed from queue: {}", id)
                 };
-                ToggleActionResult::StateOnly(Some(log_msg))
+                if change.selected {
+                    ToggleActionResult::Command(TuiCommand::AddToQueue(id), Some(log_msg))
+                } else {
+                    ToggleActionResult::Command(TuiCommand::RemoveFromQueue(id), Some(log_msg))
+                }
             }
             // Completed, Archived, Merged, Blocked - cannot change status
             _ => ToggleActionResult::None,
@@ -3444,6 +3450,45 @@ mod tests {
     }
 
     #[test]
+    fn test_update_change_status_blocks_archived_and_merged_to_queued() {
+        let mut archived = ChangeState {
+            id: "archived-change".to_string(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            display_status_cache: "archived".to_string(),
+            display_color_cache: Color::Blue,
+            error_message_cache: None,
+            selected: false,
+            is_new: false,
+            is_parallel_eligible: true,
+            has_worktree: false,
+            started_at: None,
+            elapsed_time: None,
+            iteration_number: None,
+        };
+        apply_remote_status(&mut archived, "queued");
+        assert_eq!(archived.display_status_cache, "archived");
+
+        let mut merged = ChangeState {
+            id: "merged-change".to_string(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            display_status_cache: "merged".to_string(),
+            display_color_cache: Color::LightBlue,
+            error_message_cache: None,
+            selected: false,
+            is_new: false,
+            is_parallel_eligible: true,
+            has_worktree: false,
+            started_at: None,
+            elapsed_time: None,
+            iteration_number: None,
+        };
+        apply_remote_status(&mut merged, "queued");
+        assert_eq!(merged.display_status_cache, "merged");
+    }
+
+    #[test]
     fn test_running_mode_error_change_toggle_sets_retry_mark() {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
@@ -3454,17 +3499,45 @@ mod tests {
         let command = app.toggle_selection();
 
         assert!(
-            command.is_none(),
-            "error retry mark should be local state only"
+            matches!(command, Some(TuiCommand::AddToQueue(ref id)) if id == "test-change"),
+            "error retry mark should emit AddToQueue command"
         );
         assert!(
             app.changes[0].selected,
             "Space should set retry mark on error change"
         );
-        assert!(app
-            .logs
-            .iter()
-            .any(|log| log.message.contains("Marked for retry: test-change")));
+        assert!(app.logs.iter().any(|log| log
+            .message
+            .contains("Marked for retry and added to queue: test-change")));
+    }
+
+    #[test]
+    fn test_running_mode_error_change_toggle_queue() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].set_error_message_cache("boom".to_string());
+        app.changes[0].selected = false;
+
+        // First space: mark retry and add to queue
+        let first_command = app.toggle_selection();
+        assert!(
+            matches!(first_command, Some(TuiCommand::AddToQueue(ref id)) if id == "test-change")
+        );
+        assert!(app.changes[0].selected);
+
+        // Simulate queue state reflected by reducer
+        app.changes[0].set_display_status_cache("error");
+
+        // Second space: clear retry mark and remove from queue
+        let second_command = app.toggle_selection();
+        assert!(
+            matches!(second_command, Some(TuiCommand::RemoveFromQueue(ref id)) if id == "test-change")
+        );
+        assert!(!app.changes[0].selected);
+        assert!(app.logs.iter().any(|log| log
+            .message
+            .contains("Retry mark cleared and removed from queue: test-change")));
     }
 
     #[test]
