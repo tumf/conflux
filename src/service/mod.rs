@@ -12,7 +12,6 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::config::defaults::get_server_log_path;
 use crate::error::{OrchestratorError, Result};
 
 #[cfg(target_os = "macos")]
@@ -42,6 +41,7 @@ mod platform {
     use std::path::Path;
 
     use super::*;
+    use crate::config::defaults::get_server_log_path;
 
     fn plist_path() -> Result<PathBuf> {
         let home = dirs::home_dir().ok_or_else(|| {

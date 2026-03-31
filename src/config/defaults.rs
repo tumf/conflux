@@ -307,11 +307,13 @@ pub fn default_workspace_base_dir(repo_root: Option<&std::path::Path>) -> PathBu
 /// - Uses `${XDG_STATE_HOME}/cflx/server.log` when XDG_STATE_HOME is set and non-empty
 /// - Falls back to `~/.local/state/cflx/server.log` when home directory is available
 /// - Falls back to `{temp_dir}/cflx-server.log` when home directory is unavailable
+#[cfg(target_os = "macos")]
 pub fn get_server_log_path() -> PathBuf {
     let xdg_state_home = std::env::var("XDG_STATE_HOME").ok();
     get_server_log_path_from(xdg_state_home.as_deref(), dirs::home_dir())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn get_server_log_path_from(xdg_state_home: Option<&str>, home_dir: Option<PathBuf>) -> PathBuf {
     if let Some(xdg_state_home) = xdg_state_home {
         if !xdg_state_home.is_empty() {
