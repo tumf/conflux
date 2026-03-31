@@ -8,5 +8,4 @@
 
 ## Future Work
 
-- agent の archive プロンプトに `.no-delta` マーカーの作成ガイダンスを追加
-- proposal 作成時に change_type に応じて `.no-delta` を自動生成する機能
+- agent の archive プロンプトに `.no-delta` マーカーの存在と用途の説明を追加
