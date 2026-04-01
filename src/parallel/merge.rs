@@ -72,13 +72,36 @@ impl ParallelExecutor {
         let revisions = vec![workspace_result.workspace_name.clone()];
         let change_ids = vec![workspace_result.change_id.clone()];
 
-        // Find workspace path for archive verification
+        // Find workspace path for archive verification.
+        // First check in-memory list, then fall back to filesystem discovery
+        // (needed when merge runs in a spawned executor with an empty workspace list).
         let workspace_path = self
             .workspace_manager
             .workspaces()
             .iter()
             .find(|workspace| workspace.name == workspace_result.workspace_name)
             .map(|workspace| workspace.path.clone());
+        let workspace_path = match workspace_path {
+            Some(p) => Some(p),
+            None => {
+                match self
+                    .workspace_manager
+                    .find_existing_workspace(&workspace_result.change_id)
+                    .await
+                {
+                    Ok(Some(info)) => Some(info.path),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to discover workspace for '{}': {}",
+                            workspace_result.change_id,
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+        };
 
         if let Some(path) = workspace_path {
             let archive_paths = vec![path];
