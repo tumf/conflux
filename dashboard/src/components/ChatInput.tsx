@@ -3,19 +3,21 @@ import { SendHorizontal } from 'lucide-react';
 
 interface ChatInputProps {
   onSend: (content: string) => void;
-  disabled?: boolean;
+  status?: 'ready' | 'submitted' | 'streaming' | 'error';
   placeholder?: string;
 }
 
-export function ChatInput({ onSend, disabled = false, placeholder = 'Type a message...' }: ChatInputProps) {
+export function ChatInput({ onSend, status = 'ready', placeholder = 'Type a message...' }: ChatInputProps) {
   const [value, setValue] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const disabled = status !== 'ready';
 
   const handleSubmit = useCallback(() => {
     const trimmed = value.trim();
     if (!trimmed || disabled) return;
-    onSend(trimmed);
     setValue('');
+    onSend(trimmed);
   }, [value, disabled, onSend]);
 
   const handleKeyDown = useCallback(
@@ -43,10 +45,9 @@ export function ChatInput({ onSend, disabled = false, placeholder = 'Type a mess
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onKeyDown={handleKeyDown}
-        disabled={disabled}
         placeholder={placeholder}
         rows={1}
-        className="min-h-[2.25rem] flex-1 resize-none rounded-md border border-border bg-surface px-3 py-2 text-sm text-text placeholder:text-text-subtle focus:border-accent focus:outline-none disabled:opacity-50"
+        className="min-h-[2.25rem] flex-1 resize-none rounded-md border border-border bg-surface px-3 py-2 text-sm text-text placeholder:text-text-subtle focus:border-accent focus:outline-none"
       />
       <button
         onClick={handleSubmit}

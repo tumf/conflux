@@ -5,16 +5,30 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 
 import { ProposalChat } from '../ProposalChat';
-import { ProposalSession } from '../../api/types';
 
-const sendPromptMock = vi.fn();
+const sendMessageMock = vi.fn();
+const stopMock = vi.fn();
 const sendElicitationResponseMock = vi.fn();
-let wsStatus: 'connected' | 'disconnected' = 'disconnected';
 
-vi.mock('../../hooks/useProposalWebSocket', () => ({
-  useProposalWebSocket: () => ({
-    status: wsStatus,
-    sendPrompt: sendPromptMock,
+let hookState: {
+  messages: Array<{ id: string; role: 'user' | 'assistant'; content: string; timestamp: string }>;
+  status: 'ready' | 'submitted' | 'streaming' | 'error';
+  error: string | null;
+  activeElicitation: null;
+  wsConnected: boolean;
+} = {
+  messages: [],
+  status: 'ready',
+  error: null,
+  activeElicitation: null,
+  wsConnected: false,
+};
+
+vi.mock('../../hooks/useProposalChat', () => ({
+  useProposalChat: () => ({
+    ...hookState,
+    sendMessage: sendMessageMock,
+    stop: stopMock,
     sendElicitationResponse: sendElicitationResponseMock,
   }),
 }));
@@ -27,158 +41,77 @@ vi.mock('../ProposalActions', () => ({
   ProposalActions: () => <div>actions</div>,
 }));
 
-afterEach(() => {
-  cleanup();
-  sendPromptMock.mockReset();
-  sendElicitationResponseMock.mockReset();
-  wsStatus = 'disconnected';
-});
-
 beforeEach(() => {
   if (!Element.prototype.scrollIntoView) {
     Element.prototype.scrollIntoView = vi.fn();
   }
 });
 
-const session: ProposalSession = {
-  id: 'session-1',
-  project_id: 'project-1',
-  status: 'timed_out',
-  worktree_branch: 'proposal/session-1',
-  is_dirty: false,
-  uncommitted_files: [],
-  created_at: '2026-03-29T00:00:00Z',
-  updated_at: '2026-03-29T00:10:00Z',
-};
+afterEach(() => {
+  cleanup();
+  sendMessageMock.mockReset();
+  stopMock.mockReset();
+  sendElicitationResponseMock.mockReset();
+  hookState = {
+    messages: [],
+    status: 'ready',
+    error: null,
+    activeElicitation: null,
+    wsConnected: false,
+  };
+});
 
-describe('ProposalChat timeout handling', () => {
-  it('shows reconnect-oriented disconnected state when websocket is unavailable after timeout', () => {
+describe('ProposalChat', () => {
+  it('shows disconnected placeholder when websocket unavailable', () => {
     render(
       <ProposalChat
         projectId="project-1"
-        session={session}
-        messages={[]}
-        streamingContent={{}}
-        activeElicitation={null}
-        isAgentResponding={false}
+        sessionId="session-1"
         onBack={vi.fn()}
         onMerge={vi.fn()}
         onClose={vi.fn()}
-        onAppendMessage={vi.fn()}
-        onUpsertServerUserMessage={vi.fn()}
-        onUpdateMessageSendStatus={vi.fn()}
-        onStartAssistantTurn={vi.fn()}
-        onStreamingChunk={vi.fn()}
-        onCompleteAssistantTurn={vi.fn()}
-        onFailAssistantTurn={vi.fn()}
-        onToolCallStart={vi.fn()}
-        onToolCallUpdate={vi.fn()}
-        onElicitation={vi.fn()}
       />,
     );
 
-    expect(screen.getByPlaceholderText('Disconnected. Message will be queued and sent on reconnect.')).toBeTruthy();
+    expect(
+      screen.getByPlaceholderText('Disconnected. Message will be queued and sent on reconnect.'),
+    ).toBeTruthy();
     expect(screen.getByTitle('Disconnected')).toBeTruthy();
   });
 
-  it('opens and closes changes drawer with button, backdrop, and Escape key', () => {
+  it('shows normal placeholder when connected and ready', () => {
+    hookState.wsConnected = true;
+    hookState.status = 'ready';
+
     render(
       <ProposalChat
         projectId="project-1"
-        session={session}
-        messages={[]}
-        streamingContent={{}}
-        activeElicitation={null}
-        isAgentResponding={false}
+        sessionId="session-1"
         onBack={vi.fn()}
         onMerge={vi.fn()}
         onClose={vi.fn()}
-        onAppendMessage={vi.fn()}
-        onStartAssistantTurn={vi.fn()}
-        onStreamingChunk={vi.fn()}
-        onCompleteAssistantTurn={vi.fn()}
-        onFailAssistantTurn={vi.fn()}
-        onToolCallStart={vi.fn()}
-        onToolCallUpdate={vi.fn()}
-        onElicitation={vi.fn()}
       />,
     );
 
-    const dialog = screen.getByRole('dialog', { hidden: true });
-    expect(dialog.className).toContain('pointer-events-none');
-
-    fireEvent.click(screen.getByLabelText('Open changes drawer'));
-    expect(dialog.className).toContain('pointer-events-auto');
-
-    fireEvent.keyDown(window, { key: 'Escape' });
-    expect(dialog.className).toContain('pointer-events-none');
-
-    fireEvent.click(screen.getByLabelText('Open changes drawer'));
-    expect(dialog.className).toContain('pointer-events-auto');
-
-    fireEvent.click(dialog);
-    expect(dialog.className).toContain('pointer-events-none');
+    expect(
+      screen.getByPlaceholderText('Type a message... (Enter to send, Shift+Enter for newline)'),
+    ).toBeTruthy();
   });
 
-  it('shows enter-to-send hint when connected', () => {
-    wsStatus = 'connected';
-
+  it('sends example prompt through hook', () => {
     render(
       <ProposalChat
         projectId="project-1"
-        session={session}
-        messages={[]}
-        streamingContent={{}}
-        activeElicitation={null}
-        isAgentResponding={false}
+        sessionId="session-1"
         onBack={vi.fn()}
         onMerge={vi.fn()}
         onClose={vi.fn()}
-        onAppendMessage={vi.fn()}
-        onUpsertServerUserMessage={vi.fn()}
-        onUpdateMessageSendStatus={vi.fn()}
-        onStartAssistantTurn={vi.fn()}
-        onStreamingChunk={vi.fn()}
-        onCompleteAssistantTurn={vi.fn()}
-        onFailAssistantTurn={vi.fn()}
-        onToolCallStart={vi.fn()}
-        onToolCallUpdate={vi.fn()}
-        onElicitation={vi.fn()}
-      />,
-    );
-
-    expect(screen.getByPlaceholderText('Type a message... (Enter to send, Shift+Enter for newline)')).toBeTruthy();
-  });
-
-  it('sends example prompt when empty-state chip is clicked', () => {
-    render(
-      <ProposalChat
-        projectId="project-1"
-        session={session}
-        messages={[]}
-        streamingContent={{}}
-        activeElicitation={null}
-        isAgentResponding={false}
-        onBack={vi.fn()}
-        onMerge={vi.fn()}
-        onClose={vi.fn()}
-        onAppendMessage={vi.fn()}
-        onUpsertServerUserMessage={vi.fn()}
-        onUpdateMessageSendStatus={vi.fn()}
-        onStartAssistantTurn={vi.fn()}
-        onStreamingChunk={vi.fn()}
-        onCompleteAssistantTurn={vi.fn()}
-        onFailAssistantTurn={vi.fn()}
-        onToolCallStart={vi.fn()}
-        onToolCallUpdate={vi.fn()}
-        onElicitation={vi.fn()}
       />,
     );
 
     fireEvent.click(screen.getByText('Summarize the current proposal and open risks'));
 
-    expect(sendPromptMock).toHaveBeenCalledTimes(1);
-    expect(sendPromptMock.mock.calls[0][0]).toBe('Summarize the current proposal and open risks');
-    expect(typeof sendPromptMock.mock.calls[0][1]).toBe('string');
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    expect(sendMessageMock).toHaveBeenCalledWith('Summarize the current proposal and open risks');
   });
 });

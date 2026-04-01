@@ -1,13 +1,8 @@
-import React, { useCallback, useState, useRef } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { ArrowLeft, PanelRight } from 'lucide-react';
-import {
-  ElicitationRequest,
-  ProposalChatMessage,
-  ProposalSession,
-  ToolCallInfo,
-  ToolCallStatus,
-} from '../api/types';
-import { useProposalWebSocket } from '../hooks/useProposalWebSocket';
+
+import { ProposalSession } from '../api/types';
+import { useProposalChat } from '../hooks/useProposalChat';
 import { ChatMessageList } from './ChatMessageList';
 import { ChatInput } from './ChatInput';
 import { ElicitationDialog } from './ElicitationDialog';
@@ -17,221 +12,87 @@ import { ChangesDrawer } from './ChangesDrawer';
 
 interface ProposalChatProps {
   projectId: string;
-  session: ProposalSession;
-  messages: ProposalChatMessage[];
-  streamingContent: Record<string, string>;
-  activeElicitation: ElicitationRequest | null;
-  isAgentResponding: boolean;
+  sessionId: string;
   onBack: () => void;
   onMerge: () => void;
   onClose: () => void;
-  onAppendMessage: (sessionId: string, message: ProposalChatMessage) => void;
-  onUpsertServerUserMessage: (
-    sessionId: string,
-    message: { id: string; content: string; timestamp: string },
-  ) => void;
-  onUpdateMessageSendStatus: (
-    sessionId: string,
-    messageId: string,
-    sendStatus: 'sent' | 'pending' | 'failed',
-  ) => void;
-  onStartAssistantTurn: (sessionId: string, messageId: string, turnId?: string) => void;
-  onStreamingChunk: (sessionId: string, messageId: string, content: string, turnId?: string) => void;
-  onCompleteAssistantTurn: (sessionId: string, stopReason?: string) => void;
-  onFailAssistantTurn: (sessionId: string, error: string) => void;
-  onToolCallStart: (sessionId: string, messageId: string, toolCall: ToolCallInfo, turnId?: string) => void;
-  onToolCallUpdate: (sessionId: string, messageId: string, toolCallId: string, status: ToolCallStatus, turnId?: string) => void;
-  onElicitation: (elicitation: ElicitationRequest | null) => void;
   onClickChange?: (changeId: string) => void;
   isLoading?: boolean;
 }
 
+function statusPlaceholder(status: 'ready' | 'submitted' | 'streaming' | 'error', wsConnected: boolean): string {
+  if (!wsConnected) {
+    return 'Disconnected. Message will be queued and sent on reconnect.';
+  }
+  switch (status) {
+    case 'submitted':
+      return 'Message submitted. Waiting for agent response...';
+    case 'streaming':
+      return 'Agent is responding...';
+    case 'error':
+      return 'Last turn failed. Adjust your message and retry.';
+    case 'ready':
+    default:
+      return 'Type a message... (Enter to send, Shift+Enter for newline)';
+  }
+}
+
 export function ProposalChat({
   projectId,
-  session,
-  messages,
-  streamingContent,
-  activeElicitation,
-  isAgentResponding,
+  sessionId,
   onBack,
   onMerge,
   onClose,
-  onAppendMessage,
-  onUpsertServerUserMessage,
-  onUpdateMessageSendStatus,
-  onStartAssistantTurn,
-  onStreamingChunk,
-  onCompleteAssistantTurn,
-  onFailAssistantTurn,
-  onToolCallStart,
-  onToolCallUpdate,
-  onElicitation,
   onClickChange,
   isLoading = false,
 }: ProposalChatProps) {
   const [isChangesDrawerOpen, setIsChangesDrawerOpen] = useState(false);
-  const pendingMessageIdRef = useRef<string | null>(null);
-
-  const { sendPrompt, sendElicitationResponse, status } = useProposalWebSocket({
-    projectId,
-    sessionId: session.id,
-    hasActiveTurn: () => pendingMessageIdRef.current !== null,
-    onUserMessage: useCallback(
-      (message: { id: string; content: string; timestamp: string }) => {
-        onUpsertServerUserMessage(session.id, message);
-      },
-      [onUpsertServerUserMessage, session.id],
-    ),
-    onPromptQueued: useCallback(
-      (clientMessageId: string) => {
-        onUpdateMessageSendStatus(session.id, clientMessageId, 'pending');
-      },
-      [onUpdateMessageSendStatus, session.id],
-    ),
-    onPromptSendStarted: useCallback(
-      (clientMessageId: string) => {
-        onUpdateMessageSendStatus(session.id, clientMessageId, 'pending');
-      },
-      [onUpdateMessageSendStatus, session.id],
-    ),
-    onPromptSendFailed: useCallback(
-      (clientMessageId: string, error: string) => {
-        console.error('Proposal WS prompt send failed:', {
-          sessionId: session.id,
-          clientMessageId,
-          error,
-        });
-        onUpdateMessageSendStatus(session.id, clientMessageId, 'failed');
-      },
-      [onUpdateMessageSendStatus, session.id],
-    ),
-    onMessageChunk: useCallback(
-      (content: string, messageId?: string, turnId?: string) => {
-        const resolvedMessageId = messageId ?? pendingMessageIdRef.current ?? `assistant-${session.id}-${Date.now()}`;
-        if (!pendingMessageIdRef.current) {
-          pendingMessageIdRef.current = resolvedMessageId;
-          onStartAssistantTurn(session.id, resolvedMessageId, turnId);
-        }
-        onStreamingChunk(session.id, resolvedMessageId, content, turnId);
-      },
-      [onStartAssistantTurn, onStreamingChunk, session.id],
-    ),
-    onThoughtChunk: useCallback(
-      (_content: string, _messageId?: string, _turnId?: string) => {
-        // Intentionally ignored for now; thought chunks are separated at protocol level.
-      },
-      [],
-    ),
-    onToolCall: useCallback(
-      (toolCall: ToolCallInfo, messageId?: string, turnId?: string) => {
-        const resolvedMessageId = messageId ?? pendingMessageIdRef.current ?? `assistant-${session.id}-${Date.now()}`;
-        if (!pendingMessageIdRef.current) {
-          pendingMessageIdRef.current = resolvedMessageId;
-          onStartAssistantTurn(session.id, resolvedMessageId, turnId);
-        }
-        onToolCallStart(session.id, resolvedMessageId, toolCall, turnId);
-      },
-      [onStartAssistantTurn, onToolCallStart, session.id],
-    ),
-    onToolCallUpdate: useCallback(
-      (toolCallId: string, toolCallStatus: ToolCallStatus, messageId?: string, turnId?: string) => {
-        const resolvedMessageId = messageId ?? pendingMessageIdRef.current;
-        if (!resolvedMessageId) return;
-        onToolCallUpdate(session.id, resolvedMessageId, toolCallId, toolCallStatus, turnId);
-      },
-      [onToolCallUpdate, session.id],
-    ),
-    onElicitationRequest: useCallback(
-      (elicitation: ElicitationRequest) => {
-        onElicitation(elicitation);
-      },
-      [onElicitation],
-    ),
-    onTurnComplete: useCallback(
-      (stopReason: string, messageId?: string, turnId?: string) => {
-        const resolvedMessageId = messageId ?? pendingMessageIdRef.current;
-        if (resolvedMessageId) {
-          onCompleteAssistantTurn(session.id, stopReason);
-        }
-        pendingMessageIdRef.current = null;
-      },
-      [onCompleteAssistantTurn, session.id],
-    ),
-    onError: useCallback(
-      (message: string) => {
-        console.error('Proposal WS error:', { message, sessionId: session.id });
-        onFailAssistantTurn(session.id, message);
-        pendingMessageIdRef.current = null;
-      },
-      [onFailAssistantTurn, session.id],
-    ),
-  });
-
-  const handleSend = useCallback(
-    (content: string) => {
-      const tempMessageId = `user-pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const timestamp = new Date().toISOString();
-
-      onAppendMessage(session.id, {
-        id: tempMessageId,
-        role: 'user',
-        content,
-        timestamp,
-        sendStatus: status === 'connected' ? 'sent' : 'pending',
-      });
-
-      sendPrompt(content, tempMessageId);
-    },
-    [onAppendMessage, sendPrompt, session.id, status],
-  );
+  const {
+    messages,
+    status,
+    sendMessage,
+    stop,
+    error,
+    activeElicitation,
+    sendElicitationResponse,
+    wsConnected,
+  } = useProposalChat(projectId, sessionId);
 
   const handleExamplePromptSelect = useCallback(
     (content: string) => {
-      if (!content.trim()) return;
-      handleSend(content);
+      sendMessage(content);
     },
-    [handleSend],
+    [sendMessage],
   );
-
-  const handleElicitationSubmit = useCallback(
-    (data: Record<string, unknown>) => {
-      if (!activeElicitation) return;
-      sendElicitationResponse(activeElicitation.id, 'accept', data);
-      onElicitation(null);
-    },
-    [activeElicitation, sendElicitationResponse, onElicitation],
-  );
-
-  const handleElicitationDecline = useCallback(() => {
-    if (!activeElicitation) return;
-    sendElicitationResponse(activeElicitation.id, 'decline');
-    onElicitation(null);
-  }, [activeElicitation, sendElicitationResponse, onElicitation]);
-
-  const handleElicitationCancel = useCallback(() => {
-    if (!activeElicitation) return;
-    sendElicitationResponse(activeElicitation.id, 'cancel');
-    onElicitation(null);
-  }, [activeElicitation, sendElicitationResponse, onElicitation]);
-
-  const wsConnected = status === 'connected';
 
   const handleRetryMessage = useCallback(
     (messageId: string) => {
       const target = messages.find((message) => message.id === messageId && message.role === 'user');
       if (!target) {
-        console.warn('Retry requested for missing user message', { sessionId: session.id, messageId });
+        console.warn('Retry requested for missing user message', { sessionId, messageId });
         return;
       }
-      onUpdateMessageSendStatus(session.id, messageId, 'pending');
-      sendPrompt(target.content, messageId);
+      sendMessage(target.content);
     },
-    [messages, onUpdateMessageSendStatus, sendPrompt, session.id],
+    [messages, sendMessage, sessionId],
+  );
+
+  const activeSession: ProposalSession = useMemo(
+    () => ({
+      id: sessionId,
+      project_id: projectId,
+      status: 'active',
+      worktree_branch: sessionId,
+      is_dirty: false,
+      uncommitted_files: [],
+      created_at: '',
+      updated_at: '',
+    }),
+    [projectId, sessionId],
   );
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
-      {/* Header */}
       <div className="flex items-center justify-between border-b border-border px-3 py-2">
         <div className="flex items-center gap-2">
           <button
@@ -244,12 +105,10 @@ export function ProposalChat({
           <div className="flex items-center gap-1.5">
             <span className="text-sm font-medium text-text">Proposal Session</span>
             <span className="rounded bg-border px-1.5 py-0.5 font-mono text-xs text-text-muted">
-              {session.worktree_branch}
+              {sessionId}
             </span>
             <span
-              className={`size-2 rounded-full ${
-                wsConnected ? 'bg-success' : 'bg-text-subtle'
-              }`}
+              className={`size-2 rounded-full ${wsConnected ? 'bg-success' : 'bg-text-subtle'}`}
               title={wsConnected ? 'Connected' : 'Disconnected'}
             />
           </div>
@@ -265,46 +124,47 @@ export function ProposalChat({
           >
             <PanelRight className="size-4" />
           </button>
-          <ProposalActions
-            session={session}
-            onMerge={onMerge}
-            onClose={onClose}
-            isLoading={isLoading}
-          />
+          <ProposalActions session={activeSession} onMerge={onMerge} onClose={onClose} isLoading={isLoading} />
         </div>
       </div>
 
-      {/* Main content: chat + sidebar */}
+      {error && (
+        <div className="border-b border-red-900/60 bg-red-950/40 px-3 py-2 text-xs text-red-300">
+          {error}
+        </div>
+      )}
+
       <div className="flex flex-1 overflow-hidden">
-        {/* Chat area */}
         <div className="flex flex-1 flex-col overflow-hidden">
           <ChatMessageList
             messages={messages}
-            streamingContent={streamingContent}
-            isAgentResponding={isAgentResponding}
+            streamingContent={{}}
+            isAgentResponding={status === 'submitted' || status === 'streaming'}
             onExamplePromptSelect={handleExamplePromptSelect}
             onRetryMessage={handleRetryMessage}
           />
           <ChatInput
-            onSend={handleSend}
-            disabled={isAgentResponding || !!activeElicitation}
-            placeholder={
-              isAgentResponding
-                ? 'Agent is responding...'
-                : activeElicitation
-                  ? 'Please respond to the agent request first'
-                  : !wsConnected
-                    ? 'Disconnected. Message will be queued and sent on reconnect.'
-                    : 'Type a message... (Enter to send, Shift+Enter for newline)'
-            }
+            onSend={sendMessage}
+            status={status}
+            placeholder={statusPlaceholder(status, wsConnected)}
           />
+          {(status === 'submitted' || status === 'streaming') && (
+            <div className="border-t border-border px-3 py-2 text-xs text-text-subtle">
+              <button
+                type="button"
+                className="rounded border border-border px-2 py-1 text-text-muted hover:text-text"
+                onClick={stop}
+              >
+                Stop generation
+              </button>
+            </div>
+          )}
         </div>
 
-        {/* Changes sidebar */}
         <div className="hidden w-56 shrink-0 flex-col border-l border-border md:flex">
           <ProposalChangesList
             projectId={projectId}
-            sessionId={session.id}
+            sessionId={sessionId}
             onClickChange={onClickChange}
           />
         </div>
@@ -319,7 +179,7 @@ export function ProposalChat({
       >
         <ProposalChangesList
           projectId={projectId}
-          sessionId={session.id}
+          sessionId={sessionId}
           onClickChange={(changeId) => {
             onClickChange?.(changeId);
             setIsChangesDrawerOpen(false);
@@ -327,13 +187,12 @@ export function ProposalChat({
         />
       </ChangesDrawer>
 
-      {/* Elicitation dialog */}
       {activeElicitation && (
         <ElicitationDialog
           elicitation={activeElicitation}
-          onSubmit={handleElicitationSubmit}
-          onDecline={handleElicitationDecline}
-          onCancel={handleElicitationCancel}
+          onSubmit={(data) => sendElicitationResponse(activeElicitation.id, 'accept', data)}
+          onDecline={() => sendElicitationResponse(activeElicitation.id, 'decline')}
+          onCancel={() => sendElicitationResponse(activeElicitation.id, 'cancel')}
         />
       )}
     </div>
