@@ -175,6 +175,9 @@ pub enum RemoteStateUpdate {
         /// Per-project worktree information (project_id -> worktrees)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worktrees: Option<std::collections::HashMap<String, Vec<RemoteWorktreeInfo>>>,
+        /// Persisted dashboard UI state key-value map.
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        ui_state: std::collections::HashMap<String, String>,
         /// Whether git/sync is available (resolve_command is configured)
         #[serde(default)]
         sync_available: bool,
@@ -465,6 +468,7 @@ mod tests {
         let update = RemoteStateUpdate::FullState {
             projects: vec![],
             worktrees: Some(worktrees_map),
+            ui_state: std::collections::HashMap::new(),
             sync_available: true,
             orchestration_status: "idle".to_string(),
             active_commands: vec![],

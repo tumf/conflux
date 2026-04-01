@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 use crate::config::ProposalSessionConfig;
 use crate::openspec::ProposalMetadata;
 use crate::server::acp_client::{AcpClient, AcpError};
+use crate::server::db::{ProposalSessionDbRow, ProposalSessionUpsert, ServerDb};
 use crate::vcs::git::commands as git;
 
 // ── Types ─────────────────────────────────────────────────────────────────
@@ -32,6 +33,27 @@ pub enum ProposalSessionStatus {
     TimedOut,
     /// Session has been closed.
     Closed,
+}
+
+impl ProposalSessionStatus {
+    fn as_db_value(&self) -> &'static str {
+        match self {
+            ProposalSessionStatus::Active => "active",
+            ProposalSessionStatus::Merging => "merging",
+            ProposalSessionStatus::TimedOut => "timed_out",
+            ProposalSessionStatus::Closed => "closed",
+        }
+    }
+
+    fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "merging" => Some(Self::Merging),
+            "timed_out" => Some(Self::TimedOut),
+            "closed" => Some(Self::Closed),
+            _ => None,
+        }
+    }
 }
 
 /// Information about a single proposal session.
@@ -93,6 +115,7 @@ pub struct ProposalSession {
     pub status: ProposalSessionStatus,
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
+    pub last_db_activity_write: Option<DateTime<Utc>>,
     pub message_history: Vec<ProposalSessionMessageRecord>,
     pub active_turn_id: Option<String>,
     pub next_turn_seq: u64,
@@ -130,23 +153,82 @@ pub type SharedProposalSessionManager = Arc<RwLock<ProposalSessionManager>>;
 /// Create a new shared proposal session manager.
 pub fn create_proposal_session_manager(
     config: ProposalSessionConfig,
+    db: Option<Arc<ServerDb>>,
 ) -> SharedProposalSessionManager {
-    Arc::new(RwLock::new(ProposalSessionManager::new(config)))
+    Arc::new(RwLock::new(ProposalSessionManager::new(config, db)))
 }
 
 /// Manages proposal sessions across projects.
 pub struct ProposalSessionManager {
     config: ProposalSessionConfig,
+    db: Option<Arc<ServerDb>>,
     /// Active sessions keyed by session ID.
     sessions: HashMap<String, ProposalSession>,
 }
 
 impl ProposalSessionManager {
-    pub fn new(config: ProposalSessionConfig) -> Self {
+    pub fn new(config: ProposalSessionConfig, db: Option<Arc<ServerDb>>) -> Self {
         Self {
             config,
+            db,
             sessions: HashMap::new(),
         }
+    }
+
+    fn persist_session(&self, session: &ProposalSession) -> Result<(), ProposalSessionError> {
+        if let Some(db) = &self.db {
+            let created_at = session.created_at.to_rfc3339();
+            let updated_at = session.last_activity.to_rfc3339();
+            let payload = ProposalSessionUpsert {
+                id: &session.id,
+                project_id: &session.project_id,
+                worktree_path: &session.worktree_path.display().to_string(),
+                worktree_branch: &session.worktree_branch,
+                status: session.status.as_db_value(),
+                created_at: &created_at,
+                updated_at: &updated_at,
+                last_activity: &updated_at,
+            };
+            db.upsert_proposal_session(&payload)
+                .map_err(|e| ProposalSessionError::Persistence(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn persist_message(
+        &self,
+        session_id: &str,
+        message: &ProposalSessionMessageRecord,
+    ) -> Result<(), ProposalSessionError> {
+        if let Some(db) = &self.db {
+            db.insert_proposal_session_message(session_id, message)
+                .map_err(|e| ProposalSessionError::Persistence(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn persist_activity_if_due(&mut self, session_id: &str) -> Result<(), ProposalSessionError> {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return Err(ProposalSessionError::NotFound(session_id.to_string()));
+        };
+
+        let now = Utc::now();
+        let should_write = session
+            .last_db_activity_write
+            .map(|last| (now - last).num_seconds() >= 60)
+            .unwrap_or(true);
+        if !should_write {
+            return Ok(());
+        }
+
+        if let Some(db) = &self.db {
+            let ts = now.to_rfc3339();
+            db.update_proposal_session_activity(&session.id, &ts)
+                .map_err(|e| ProposalSessionError::Persistence(e.to_string()))?;
+            session.last_db_activity_write = Some(now);
+        }
+
+        Ok(())
     }
 
     /// Create a new proposal session for a project.
@@ -233,11 +315,14 @@ impl ProposalSessionManager {
             status: ProposalSessionStatus::Active,
             created_at: now,
             last_activity: now,
+            last_db_activity_write: None,
             message_history: Vec::new(),
             active_turn_id: None,
             next_turn_seq: 0,
             next_user_seq: 0,
         };
+
+        self.persist_session(&session)?;
 
         let info = session.to_info();
         self.sessions.insert(session_id, session);
@@ -254,14 +339,120 @@ impl ProposalSessionManager {
             .collect()
     }
 
+    pub async fn restore_session(
+        &mut self,
+        row: &ProposalSessionDbRow,
+    ) -> Result<Option<ProposalSessionInfo>, ProposalSessionError> {
+        let worktree_path = PathBuf::from(&row.worktree_path);
+        if !worktree_path.exists() {
+            if let Some(db) = &self.db {
+                db.delete_proposal_session_messages(&row.id)
+                    .map_err(|e| ProposalSessionError::Persistence(e.to_string()))?;
+                db.delete_proposal_session(&row.id)
+                    .map_err(|e| ProposalSessionError::Persistence(e.to_string()))?;
+            }
+            return Ok(None);
+        }
+
+        let status = ProposalSessionStatus::from_db_value(&row.status)
+            .unwrap_or(ProposalSessionStatus::Active);
+
+        let mut acp_config = self.config.clone();
+        let mut transport_args = acp_config.transport_args.clone();
+        if transport_args.is_empty() {
+            transport_args.push("acp".to_string());
+        }
+        if !transport_args.iter().any(|arg| arg == "--cwd") {
+            transport_args.push("--cwd".to_string());
+            transport_args.push(worktree_path.display().to_string());
+        }
+        acp_config.transport_args = transport_args;
+
+        let acp_client = AcpClient::spawn(&acp_config, &worktree_path)
+            .await
+            .map_err(ProposalSessionError::Acp)?;
+        acp_client
+            .initialize()
+            .await
+            .map_err(ProposalSessionError::Acp)?;
+        let acp_session_id = acp_client
+            .create_session()
+            .await
+            .map_err(ProposalSessionError::Acp)?;
+
+        let message_history = if let Some(db) = &self.db {
+            db.load_proposal_session_messages(&row.id)
+                .map_err(|e| ProposalSessionError::Persistence(e.to_string()))?
+        } else {
+            Vec::new()
+        };
+
+        let created_at = chrono::DateTime::parse_from_rfc3339(&row.created_at)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        let last_activity = chrono::DateTime::parse_from_rfc3339(&row.last_activity)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+
+        let mut next_turn_seq = 0_u64;
+        let mut next_user_seq = 0_u64;
+        for message in &message_history {
+            if let Some(turn_id) = &message.turn_id {
+                if let Some(num) = turn_id
+                    .rsplit('-')
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    next_turn_seq = next_turn_seq.max(num);
+                }
+            }
+            if message.role == "user" {
+                if let Some(num) = message
+                    .id
+                    .rsplit('-')
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    next_user_seq = next_user_seq.max(num);
+                }
+            }
+        }
+
+        let session = ProposalSession {
+            id: row.id.clone(),
+            project_id: row.project_id.clone(),
+            worktree_path,
+            worktree_branch: row.worktree_branch.clone(),
+            acp_client,
+            acp_session_id,
+            status,
+            created_at,
+            last_activity,
+            last_db_activity_write: Some(last_activity),
+            message_history,
+            active_turn_id: None,
+            next_turn_seq,
+            next_user_seq,
+        };
+
+        let info = session.to_info();
+        self.sessions.insert(row.id.clone(), session);
+        Ok(Some(info))
+    }
+
     /// Get a session by ID.
     pub fn get_session(&self, session_id: &str) -> Option<&ProposalSession> {
         self.sessions.get(session_id)
     }
 
-    /// Get a mutable session by ID.
-    pub fn get_session_mut(&mut self, session_id: &str) -> Option<&mut ProposalSession> {
-        self.sessions.get_mut(session_id)
+    pub fn touch_session_activity(&mut self, session_id: &str) -> Result<(), ProposalSessionError> {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.touch();
+        } else {
+            return Err(ProposalSessionError::NotFound(session_id.to_string()));
+        }
+
+        self.persist_activity_if_due(session_id)
     }
 
     /// Return serialized chat messages for a proposal session.
@@ -284,23 +475,28 @@ impl ProposalSessionManager {
         session_id: &str,
         content: &str,
     ) -> Result<ProposalSessionMessageRecord, ProposalSessionError> {
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
-        session.next_user_seq += 1;
-        let now = Utc::now().to_rfc3339();
-        let message = ProposalSessionMessageRecord {
-            id: format!("{}-user-{}", session.id, session.next_user_seq),
-            role: "user".to_string(),
-            content: content.to_string(),
-            timestamp: now,
-            turn_id: None,
-            hydrated: Some(true),
-            is_thought: None,
-            tool_calls: None,
+        let message = {
+            let session = self
+                .sessions
+                .get_mut(session_id)
+                .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
+            session.next_user_seq += 1;
+            let now = Utc::now().to_rfc3339();
+            let message = ProposalSessionMessageRecord {
+                id: format!("{}-user-{}", session.id, session.next_user_seq),
+                role: "user".to_string(),
+                content: content.to_string(),
+                timestamp: now,
+                turn_id: None,
+                hydrated: Some(true),
+                is_thought: None,
+                tool_calls: None,
+            };
+            session.message_history.push(message.clone());
+            message
         };
-        session.message_history.push(message.clone());
+
+        self.persist_message(session_id, &message)?;
         Ok(message)
     }
 
@@ -330,41 +526,52 @@ impl ProposalSessionManager {
         chunk: &str,
         is_thought: bool,
     ) -> Result<String, ProposalSessionError> {
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
+        let (turn_id, maybe_message) = {
+            let session = self
+                .sessions
+                .get_mut(session_id)
+                .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
 
-        let turn_id = if let Some(turn_id) = session.active_turn_id.clone() {
-            turn_id
-        } else {
-            session.next_turn_seq += 1;
-            let turn_id = format!("{}-turn-{}", session.id, session.next_turn_seq);
-            let now = Utc::now().to_rfc3339();
-            session.message_history.push(ProposalSessionMessageRecord {
-                id: format!("assistant-{}", turn_id),
-                role: "assistant".to_string(),
-                content: String::new(),
-                timestamp: now,
-                turn_id: Some(turn_id.clone()),
-                hydrated: Some(true),
-                is_thought: if is_thought { Some(true) } else { None },
-                tool_calls: None,
-            });
-            session.active_turn_id = Some(turn_id.clone());
-            turn_id
+            let turn_id = if let Some(turn_id) = session.active_turn_id.clone() {
+                turn_id
+            } else {
+                session.next_turn_seq += 1;
+                let turn_id = format!("{}-turn-{}", session.id, session.next_turn_seq);
+                let now = Utc::now().to_rfc3339();
+                session.message_history.push(ProposalSessionMessageRecord {
+                    id: format!("assistant-{}", turn_id),
+                    role: "assistant".to_string(),
+                    content: String::new(),
+                    timestamp: now,
+                    turn_id: Some(turn_id.clone()),
+                    hydrated: Some(true),
+                    is_thought: if is_thought { Some(true) } else { None },
+                    tool_calls: None,
+                });
+                session.active_turn_id = Some(turn_id.clone());
+                turn_id
+            };
+
+            let updated = if let Some(message) = session
+                .message_history
+                .iter_mut()
+                .rev()
+                .find(|message| message.turn_id.as_deref() == Some(turn_id.as_str()))
+            {
+                message.content.push_str(chunk);
+                if is_thought {
+                    message.is_thought = Some(true);
+                }
+                Some(message.clone())
+            } else {
+                None
+            };
+
+            (turn_id, updated)
         };
 
-        if let Some(message) = session
-            .message_history
-            .iter_mut()
-            .rev()
-            .find(|message| message.turn_id.as_deref() == Some(turn_id.as_str()))
-        {
-            message.content.push_str(chunk);
-            if is_thought {
-                message.is_thought = Some(true);
-            }
+        if let Some(message) = maybe_message {
+            self.persist_message(session_id, &message)?;
         }
 
         Ok(turn_id)
@@ -456,11 +663,26 @@ impl ProposalSessionManager {
     /// Mark the active assistant turn complete.
     #[allow(dead_code)]
     pub fn complete_active_turn(&mut self, session_id: &str) -> Result<(), ProposalSessionError> {
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
-        session.active_turn_id = None;
+        let maybe_message = {
+            let session = self
+                .sessions
+                .get_mut(session_id)
+                .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
+            let active_turn_id = session.active_turn_id.clone();
+            session.active_turn_id = None;
+            active_turn_id.and_then(|turn_id| {
+                session
+                    .message_history
+                    .iter()
+                    .rev()
+                    .find(|m| m.turn_id.as_deref() == Some(turn_id.as_str()))
+                    .cloned()
+            })
+        };
+
+        if let Some(message) = maybe_message {
+            self.persist_message(session_id, &message)?;
+        }
         Ok(())
     }
 
@@ -544,6 +766,13 @@ impl ProposalSessionManager {
             );
         }
 
+        if let Some(db) = &self.db {
+            db.delete_proposal_session_messages(&session.id)
+                .map_err(|e| ProposalSessionError::Persistence(e.to_string()))?;
+            db.delete_proposal_session(&session.id)
+                .map_err(|e| ProposalSessionError::Persistence(e.to_string()))?;
+        }
+
         Ok(())
     }
 
@@ -607,6 +836,13 @@ impl ProposalSessionManager {
                 branch = %worktree_branch,
                 "Failed to delete proposal branch after merge"
             );
+        }
+
+        if let Some(db) = &self.db {
+            db.delete_proposal_session_messages(&session.id)
+                .map_err(|e| ProposalSessionError::Persistence(e.to_string()))?;
+            db.delete_proposal_session(&session.id)
+                .map_err(|e| ProposalSessionError::Persistence(e.to_string()))?;
         }
 
         Ok(())
@@ -701,6 +937,18 @@ impl ProposalSessionManager {
                 );
                 session.acp_client.kill().await;
                 session.status = ProposalSessionStatus::TimedOut;
+                if let Some(db) = &self.db {
+                    if let Err(e) = db.update_proposal_session_status(
+                        &id,
+                        ProposalSessionStatus::TimedOut.as_db_value(),
+                    ) {
+                        warn!(
+                            session_id = %id,
+                            error = %e,
+                            "Failed to persist timed-out proposal session status"
+                        );
+                    }
+                }
             }
         }
     }
@@ -785,6 +1033,9 @@ pub enum ProposalSessionError {
 
     #[error("Merge conflict: {0}")]
     MergeConflict(String),
+
+    #[error("Persistence error: {0}")]
+    Persistence(String),
 }
 
 #[cfg(test)]
@@ -883,14 +1134,14 @@ mod tests {
     #[test]
     fn test_proposal_session_manager_new() {
         let config = ProposalSessionConfig::default();
-        let manager = ProposalSessionManager::new(config);
+        let manager = ProposalSessionManager::new(config, None);
         assert!(manager.sessions.is_empty());
     }
 
     #[test]
     fn test_proposal_session_manager_list_empty() {
         let config = ProposalSessionConfig::default();
-        let manager = ProposalSessionManager::new(config);
+        let manager = ProposalSessionManager::new(config, None);
         let sessions = manager.list_sessions("proj1");
         assert!(sessions.is_empty());
     }
@@ -898,7 +1149,7 @@ mod tests {
     #[test]
     fn test_append_assistant_thought_chunk_sets_is_thought() {
         let config = ProposalSessionConfig::default();
-        let mut manager = ProposalSessionManager::new(config);
+        let mut manager = ProposalSessionManager::new(config, None);
 
         let session_id = "ps-test".to_string();
         manager.sessions.insert(
@@ -913,6 +1164,7 @@ mod tests {
                 status: ProposalSessionStatus::Active,
                 created_at: Utc::now(),
                 last_activity: Utc::now(),
+                last_db_activity_write: None,
                 message_history: Vec::new(),
                 active_turn_id: None,
                 next_turn_seq: 0,

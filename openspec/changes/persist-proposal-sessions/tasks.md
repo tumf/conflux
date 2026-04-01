@@ -2,10 +2,10 @@
 
 ### Phase 1: SQLite Schema and ServerDb Methods
 
-- [ ] 1.1 Add migration v2 to `src/server/db.rs`: create `ui_state`, `proposal_sessions`, `proposal_session_messages` tables; bump `SCHEMA_VERSION` to 2 (verification: `cargo test test_server_db` passes)
-- [ ] 1.2 Add `ServerDb` methods for ui_state: `get_ui_state`, `set_ui_state`, `delete_ui_state`, `get_all_ui_state` (verification: new unit test `test_ui_state_crud` in `db.rs`)
-- [ ] 1.3 Add `ServerDb` methods for proposal sessions: `upsert_proposal_session`, `update_proposal_session_status`, `update_proposal_session_activity`, `load_active_proposal_sessions`, `delete_proposal_session` (verification: new unit test `test_proposal_session_crud` in `db.rs`)
-- [ ] 1.4 Add `ServerDb` methods for session messages: `insert_proposal_session_message`, `load_proposal_session_messages`, `delete_proposal_session_messages` (verification: new unit test `test_proposal_session_messages_crud` in `db.rs`)
+- [x] 1.1 Add migration v2 to `src/server/db.rs`: create `ui_state`, `proposal_sessions`, `proposal_session_messages` tables; bump `SCHEMA_VERSION` to 2 (verification: `cargo test test_server_db` passes)
+- [x] 1.2 Add `ServerDb` methods for ui_state: `get_ui_state`, `set_ui_state`, `delete_ui_state`, `get_all_ui_state` (verification: new unit test `test_ui_state_crud` in `db.rs`)
+- [x] 1.3 Add `ServerDb` methods for proposal sessions: `upsert_proposal_session`, `update_proposal_session_status`, `update_proposal_session_activity`, `load_active_proposal_sessions`, `delete_proposal_session` (verification: new unit test `test_proposal_session_crud` in `db.rs`)
+- [x] 1.4 Add `ServerDb` methods for session messages: `insert_proposal_session_message`, `load_proposal_session_messages`, `delete_proposal_session_messages` (verification: new unit test `test_proposal_session_messages_crud` in `db.rs`)
 
 ### Phase 2: ProposalSessionManager Persistence
 

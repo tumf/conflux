@@ -375,6 +375,25 @@ export async function listProposalSessionMessages(
 }
 
 /**
+ * Persist one dashboard UI-state key.
+ */
+export async function setUiState(key: string, value: string): Promise<void> {
+  return fetchAPI(`/ui-state/${encodeURIComponent(key)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ value }),
+  });
+}
+
+/**
+ * Delete one dashboard UI-state key.
+ */
+export async function deleteUiState(key: string): Promise<void> {
+  return fetchAPI(`/ui-state/${encodeURIComponent(key)}`, {
+    method: 'DELETE',
+  });
+}
+
+/**
  * Get the WebSocket URL for a proposal session
  */
 export function getProposalSessionWsUrl(

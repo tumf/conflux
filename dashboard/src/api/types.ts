@@ -92,6 +92,8 @@ export interface FullState {
   /** Flattened changes extracted from projects for easy access */
   changes: RemoteChange[];
   worktrees?: Record<string, WorktreeInfo[]>;
+  /** Persisted dashboard UI state key-value pairs */
+  ui_state?: Record<string, string>;
   /** Whether git/sync is available (resolve_command is configured on server) */
   sync_available?: boolean;
   /** Global orchestration status */
