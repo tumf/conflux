@@ -79,8 +79,33 @@ pub async fn run_server(
     // Create log broadcast channel for streaming execution logs to WebSocket clients.
     let (log_tx, _) = tokio::sync::broadcast::channel(crate::server::api::SERVER_LOG_BUFFER_SIZE);
 
-    let proposal_session_manager =
-        proposal_session::create_proposal_session_manager(proposal_session_config);
+    let proposal_session_manager = proposal_session::create_proposal_session_manager(
+        proposal_session_config,
+        Some(db.clone()),
+    );
+
+    // Restore proposal sessions persisted in sqlite.
+    {
+        let active_sessions = db.load_active_proposal_sessions()?;
+        let mut manager = proposal_session_manager.write().await;
+        for row in active_sessions {
+            match manager.restore_session(&row).await {
+                Ok(Some(_)) => {
+                    info!(session_id = %row.id, "Restored proposal session from database");
+                }
+                Ok(None) => {
+                    info!(session_id = %row.id, "Removed stale persisted proposal session");
+                }
+                Err(e) => {
+                    warn!(
+                        session_id = %row.id,
+                        error = %e,
+                        "Failed to restore persisted proposal session"
+                    );
+                }
+            }
+        }
+    }
 
     let app_state = api::AppState {
         registry,

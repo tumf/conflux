@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -6,9 +7,34 @@ use serde::Serialize;
 use tracing::{debug, info};
 
 use crate::error::{OrchestratorError, Result};
+use crate::server::proposal_session::ProposalSessionMessageRecord;
 
 const DB_FILE_NAME: &str = "cflx.db";
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
+
+#[derive(Debug, Clone)]
+pub struct ProposalSessionDbRow {
+    pub id: String,
+    pub project_id: String,
+    pub worktree_path: String,
+    pub worktree_branch: String,
+    pub status: String,
+    pub created_at: String,
+    pub last_activity: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProposalSessionUpsert<'a> {
+    pub id: &'a str,
+    pub project_id: &'a str,
+    pub worktree_path: &'a str,
+    pub worktree_branch: &'a str,
+    pub status: &'a str,
+    pub acp_session_id: &'a str,
+    pub created_at: &'a str,
+    pub updated_at: &'a str,
+    pub last_activity: &'a str,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeEventRow {
@@ -204,6 +230,66 @@ impl ServerDb {
                         updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                         PRIMARY KEY (project_id, change_id)
                     );
+                    ",
+                )?;
+                conn.pragma_update(None, "user_version", 1)?;
+            }
+
+            if current_version < 2 {
+                conn.execute_batch(
+                    "
+                    CREATE TABLE IF NOT EXISTS ui_state (
+                        key           TEXT PRIMARY KEY,
+                        value         TEXT NOT NULL,
+                        updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    );
+
+                    CREATE TABLE IF NOT EXISTS proposal_sessions (
+                        id            TEXT PRIMARY KEY,
+                        project_id    TEXT NOT NULL,
+                        worktree_path TEXT NOT NULL,
+                        worktree_branch TEXT NOT NULL,
+                        status        TEXT NOT NULL,
+                        created_at    TEXT NOT NULL,
+                        updated_at    TEXT NOT NULL,
+                        last_activity TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_proposal_sessions_project ON proposal_sessions(project_id);
+                    CREATE INDEX IF NOT EXISTS idx_proposal_sessions_status ON proposal_sessions(status);
+
+                    CREATE TABLE IF NOT EXISTS proposal_session_messages (
+                        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id    TEXT NOT NULL REFERENCES proposal_sessions(id) ON DELETE CASCADE,
+                        message_id    TEXT NOT NULL,
+                        role          TEXT NOT NULL,
+                        content       TEXT NOT NULL,
+                        timestamp     TEXT NOT NULL,
+                        turn_id       TEXT,
+                        hydrated      INTEGER,
+                        is_thought    INTEGER,
+                        tool_calls_json TEXT
+                    );
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_session_messages_unique
+                        ON proposal_session_messages(session_id, message_id);
+                    CREATE INDEX IF NOT EXISTS idx_proposal_session_messages_session
+                        ON proposal_session_messages(session_id, id);
+                    ",
+                )?;
+                conn.pragma_update(None, "user_version", 2)?;
+            }
+
+            if current_version < 3 {
+                conn.execute_batch(
+                    "
+                    ALTER TABLE proposal_sessions
+                    ADD COLUMN acp_session_id TEXT NOT NULL DEFAULT '';
+
+                    ALTER TABLE proposal_session_messages
+                    ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+
+                    UPDATE proposal_session_messages
+                    SET seq = id
+                    WHERE seq = 0;
                     ",
                 )?;
                 conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -579,13 +665,241 @@ impl ServerDb {
             Ok(count)
         })
     }
+
+    pub fn get_ui_state(&self, key: &str) -> Result<Option<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT value FROM ui_state WHERE key = ?1")?;
+            let mut rows = stmt.query(params![key])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(row.get(0)?))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    pub fn set_ui_state(&self, key: &str, value: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO ui_state (key, value, updated_at)
+                 VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                 ON CONFLICT(key)
+                 DO UPDATE SET value = excluded.value, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                params![key, value],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_ui_state(&self, key: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM ui_state WHERE key = ?1", params![key])?;
+            Ok(())
+        })
+    }
+
+    pub fn get_all_ui_state(&self) -> Result<HashMap<String, String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT key, value FROM ui_state")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows.into_iter().collect())
+        })
+    }
+
+    pub fn upsert_proposal_session(&self, session: &ProposalSessionUpsert<'_>) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO proposal_sessions (
+                    id, project_id, worktree_path, worktree_branch, status, acp_session_id, created_at, updated_at, last_activity
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id)
+                 DO UPDATE SET
+                    project_id = excluded.project_id,
+                    worktree_path = excluded.worktree_path,
+                    worktree_branch = excluded.worktree_branch,
+                    status = excluded.status,
+                    acp_session_id = excluded.acp_session_id,
+                    updated_at = excluded.updated_at,
+                    last_activity = excluded.last_activity",
+                params![
+                    session.id,
+                    session.project_id,
+                    session.worktree_path,
+                    session.worktree_branch,
+                    session.status,
+                    session.acp_session_id,
+                    session.created_at,
+                    session.updated_at,
+                    session.last_activity,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_proposal_session_status(&self, session_id: &str, status: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE proposal_sessions
+                 SET status = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE id = ?1",
+                params![session_id, status],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_proposal_session_activity(
+        &self,
+        session_id: &str,
+        activity_at: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE proposal_sessions
+                 SET last_activity = ?2, updated_at = ?2
+                 WHERE id = ?1",
+                params![session_id, activity_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn load_active_proposal_sessions(&self) -> Result<Vec<ProposalSessionDbRow>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_id, worktree_path, worktree_branch, status, created_at, updated_at, last_activity
+                 FROM proposal_sessions
+                 WHERE status IN ('active', 'timed_out', 'merging')
+                 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(ProposalSessionDbRow {
+                        id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        worktree_path: row.get(2)?,
+                        worktree_branch: row.get(3)?,
+                        status: row.get(4)?,
+                        created_at: row.get(5)?,
+                        last_activity: row.get(7)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn delete_proposal_session(&self, session_id: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM proposal_sessions WHERE id = ?1",
+                params![session_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_proposal_session_message(
+        &self,
+        session_id: &str,
+        message: &ProposalSessionMessageRecord,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let hydrated = message.hydrated.unwrap_or(true);
+            let is_thought = message.is_thought.unwrap_or(false);
+            let tool_calls_json = message
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| serde_json::to_string(calls).ok());
+            let next_seq: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM proposal_session_messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "INSERT INTO proposal_session_messages (
+                    session_id, message_id, role, content, timestamp, turn_id, hydrated, is_thought, tool_calls_json, seq
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(session_id, message_id)
+                 DO UPDATE SET
+                    role = excluded.role,
+                    content = excluded.content,
+                    timestamp = excluded.timestamp,
+                    turn_id = excluded.turn_id,
+                    hydrated = excluded.hydrated,
+                    is_thought = excluded.is_thought,
+                    tool_calls_json = excluded.tool_calls_json,
+                    seq = excluded.seq",
+                params![
+                    session_id,
+                    message.id,
+                    message.role,
+                    message.content,
+                    message.timestamp,
+                    message.turn_id,
+                    if hydrated { 1 } else { 0 },
+                    if is_thought { 1 } else { 0 },
+                    tool_calls_json,
+                    next_seq,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn load_proposal_session_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ProposalSessionMessageRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, message_id, role, content, timestamp, turn_id, hydrated, is_thought, tool_calls_json, seq
+                 FROM proposal_session_messages
+                 WHERE session_id = ?1
+                 ORDER BY seq ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![session_id], |row| {
+                    let tool_calls_json: Option<String> = row.get(8)?;
+                    Ok(ProposalSessionMessageRecord {
+                        id: row.get(1)?,
+                        role: row.get(2)?,
+                        content: row.get(3)?,
+                        timestamp: row.get(4)?,
+                        turn_id: row.get(5)?,
+                        hydrated: row.get::<_, Option<i64>>(6)?.map(|v| v == 1),
+                        is_thought: row.get::<_, Option<i64>>(7)?.map(|v| v == 1),
+                        tool_calls: tool_calls_json
+                            .and_then(|json| serde_json::from_str(&json).ok()),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn delete_proposal_session_messages(&self, session_id: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM proposal_session_messages WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
 
-    use super::ServerDb;
+    use super::{ProposalSessionUpsert, ServerDb};
+    use crate::server::proposal_session::ProposalSessionMessageRecord;
 
     #[test]
     fn test_server_db_init_and_run_crud() {
@@ -706,5 +1020,106 @@ mod tests {
         assert_eq!(deleted, 1);
         let remaining_logs = db.query_logs(10, None, None).unwrap();
         assert!(remaining_logs.is_empty());
+    }
+
+    #[test]
+    fn test_ui_state_crud() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ServerDb::new(temp_dir.path()).unwrap();
+
+        db.set_ui_state("selectedProjectId", "proj-1").unwrap();
+        assert_eq!(
+            db.get_ui_state("selectedProjectId").unwrap().as_deref(),
+            Some("proj-1")
+        );
+
+        db.set_ui_state("selectedProjectId", "proj-2").unwrap();
+        assert_eq!(
+            db.get_ui_state("selectedProjectId").unwrap().as_deref(),
+            Some("proj-2")
+        );
+
+        let all = db.get_all_ui_state().unwrap();
+        assert_eq!(
+            all.get("selectedProjectId").map(String::as_str),
+            Some("proj-2")
+        );
+
+        db.delete_ui_state("selectedProjectId").unwrap();
+        assert!(db.get_ui_state("selectedProjectId").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_proposal_session_crud() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ServerDb::new(temp_dir.path()).unwrap();
+
+        let upsert = ProposalSessionUpsert {
+            id: "ps-1",
+            project_id: "proj-1",
+            worktree_path: "/tmp/proposal-1",
+            worktree_branch: "proposal/ps-1",
+            status: "active",
+            acp_session_id: "acp-session-1",
+            created_at: "2026-01-01T00:00:00Z",
+            updated_at: "2026-01-01T00:00:00Z",
+            last_activity: "2026-01-01T00:00:00Z",
+        };
+        db.upsert_proposal_session(&upsert).unwrap();
+
+        let loaded = db.load_active_proposal_sessions().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "ps-1");
+        assert_eq!(loaded[0].status, "active");
+
+        db.update_proposal_session_status("ps-1", "timed_out")
+            .unwrap();
+        let loaded = db.load_active_proposal_sessions().unwrap();
+        assert_eq!(loaded[0].status, "timed_out");
+
+        db.delete_proposal_session("ps-1").unwrap();
+        let loaded = db.load_active_proposal_sessions().unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn test_proposal_session_messages_crud() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ServerDb::new(temp_dir.path()).unwrap();
+
+        db.upsert_proposal_session(&ProposalSessionUpsert {
+            id: "ps-1",
+            project_id: "proj-1",
+            worktree_path: "/tmp/proposal-1",
+            worktree_branch: "proposal/ps-1",
+            status: "active",
+            acp_session_id: "acp-session-1",
+            created_at: "2026-01-01T00:00:00Z",
+            updated_at: "2026-01-01T00:00:00Z",
+            last_activity: "2026-01-01T00:00:00Z",
+        })
+        .unwrap();
+
+        let message = ProposalSessionMessageRecord {
+            id: "ps-1-user-1".to_string(),
+            role: "user".to_string(),
+            content: "hello".to_string(),
+            timestamp: "2026-01-01T00:00:01Z".to_string(),
+            turn_id: None,
+            hydrated: Some(true),
+            is_thought: None,
+            tool_calls: None,
+        };
+        db.insert_proposal_session_message("ps-1", &message)
+            .unwrap();
+
+        let loaded = db.load_proposal_session_messages("ps-1").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "ps-1-user-1");
+        assert_eq!(loaded[0].content, "hello");
+
+        db.delete_proposal_session_messages("ps-1").unwrap();
+        let loaded = db.load_proposal_session_messages("ps-1").unwrap();
+        assert!(loaded.is_empty());
     }
 }

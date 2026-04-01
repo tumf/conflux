@@ -12,6 +12,8 @@ interface WSMessage {
   projects?: RemoteProject[];
   /** Per-project worktree information */
   worktrees?: FullState['worktrees'];
+  /** Persisted dashboard UI state */
+  ui_state?: FullState['ui_state'];
   /** Whether git/sync is available (resolve_command is configured) */
   sync_available?: boolean;
   /** Global orchestration status */
@@ -82,6 +84,7 @@ export class WebSocketClient {
                 projects,
                 changes,
                 worktrees: message.worktrees,
+                ui_state: message.ui_state,
                 sync_available: message.sync_available,
                 orchestration_status: message.orchestration_status,
               };

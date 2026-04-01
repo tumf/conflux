@@ -27,6 +27,7 @@ export interface AppState {
   fileBrowseContext: FileBrowseContext | null;
   proposalSessionsByProjectId: Record<string, ProposalSession[]>;
   activeProposalSessionId: string | null;
+  uiState: Record<string, string>;
   activeCommands: ActiveCommand[];
 }
 
@@ -55,6 +56,7 @@ const initialState: AppState = {
   fileBrowseContext: null,
   proposalSessionsByProjectId: {},
   activeProposalSessionId: null,
+  uiState: {},
   activeCommands: [],
 };
 
@@ -66,6 +68,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         projects: action.payload.projects,
         syncAvailable: action.payload.sync_available ?? false,
         orchestrationStatus: action.payload.orchestration_status ?? 'idle',
+        uiState: action.payload.ui_state ?? {},
         activeCommands: action.payload.active_commands ?? [],
       };
       if (action.payload.worktrees) {

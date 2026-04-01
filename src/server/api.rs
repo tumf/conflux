@@ -12,7 +12,7 @@ use axum::{
     http::{header, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -253,6 +253,65 @@ fn default_logs_limit() -> usize {
     100
 }
 
+/// GET /api/v1/ui-state - return all persisted dashboard UI state.
+async fn get_ui_state(State(state): State<AppState>) -> Response {
+    match &state.db {
+        Some(db) => match db.get_all_ui_state() {
+            Ok(ui_state) => (StatusCode::OK, Json(serde_json::json!(ui_state))).into_response(),
+            Err(e) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load ui-state: {}", e),
+            ),
+        },
+        None => (StatusCode::OK, Json(serde_json::json!({}))).into_response(),
+    }
+}
+
+/// PUT /api/v1/ui-state/{key} - upsert single UI state key/value.
+async fn put_ui_state(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let value = match payload.get("value").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => {
+            return error_response(StatusCode::BAD_REQUEST, "Missing string field 'value'");
+        }
+    };
+
+    match &state.db {
+        Some(db) => match db.set_ui_state(&key, value) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to save ui-state: {}", e),
+            ),
+        },
+        None => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server database is not configured",
+        ),
+    }
+}
+
+/// DELETE /api/v1/ui-state/{key} - remove single UI state entry.
+async fn delete_ui_state(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    match &state.db {
+        Some(db) => match db.delete_ui_state(&key) {
+            Ok(()) => (StatusCode::NO_CONTENT, Json(serde_json::Value::Null)).into_response(),
+            Err(e) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to delete ui-state: {}", e),
+            ),
+        },
+        None => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server database is not configured",
+        ),
+    }
+}
+
 // ─────────────────────────────── /api/v1/version ──────────────────────────────
 
 /// GET /api/v1/version - return backend version string
@@ -342,6 +401,7 @@ pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> 
     let sync_available = state.resolve_command.is_some();
     let orchestration_status = state.orchestration_status.clone();
     let active_commands = state.active_commands.clone();
+    let db = state.db.clone();
     ws.on_upgrade(move |socket| {
         handle_ws(
             socket,
@@ -350,6 +410,7 @@ pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> 
             sync_available,
             orchestration_status,
             active_commands,
+            db,
         )
     })
 }
@@ -361,6 +422,7 @@ async fn handle_ws(
     sync_available: bool,
     orchestration_status: Arc<tokio::sync::RwLock<OrchestrationStatus>>,
     active_commands: SharedActiveCommands,
+    db: Option<Arc<ServerDb>>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
 
@@ -419,12 +481,31 @@ async fn handle_ws(
                     Some(worktrees_map)
                 };
 
+                let ui_state = if let Some(db) = &db {
+                    match db.get_all_ui_state() {
+                        Ok(state) => state,
+                        Err(e) => {
+                            warn!(error = %e, "Failed to load ui_state for websocket snapshot");
+                            std::collections::HashMap::new()
+                        }
+                    }
+                } else {
+                    std::collections::HashMap::new()
+                };
+
                 let orch_status = orchestration_status.read().await.as_str().to_string();
                 let active_cmds = {
                     let ac = active_commands.read().await;
                     ac.snapshot()
                 };
-                if let Ok(payload) = serde_json::to_string(&RemoteStateUpdate::FullState { projects: snapshot, worktrees, sync_available, orchestration_status: orch_status, active_commands: active_cmds }) {
+                if let Ok(payload) = serde_json::to_string(&RemoteStateUpdate::FullState {
+                    projects: snapshot,
+                    worktrees,
+                    ui_state,
+                    sync_available,
+                    orchestration_status: orch_status,
+                    active_commands: active_cmds,
+                }) {
                     if socket.send(Message::Text(payload.into())).await.is_err() {
                         break;
                     }
@@ -3698,8 +3779,12 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
 
                 if let Some(msg) = ws_message {
                     let mut mgr = state_for_notifs.proposal_session_manager.write().await;
-                    if let Some(s) = mgr.get_session_mut(&session_id_for_notifs) {
-                        s.touch();
+                    if let Err(e) = mgr.touch_session_activity(&session_id_for_notifs) {
+                        warn!(
+                            session_id = %session_id_for_notifs,
+                            error = %e,
+                            "Failed to persist proposal session activity"
+                        );
                     }
                     drop(mgr);
 
@@ -3766,8 +3851,12 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                         }) => {
                             {
                                 let mut mgr = state_for_recv.proposal_session_manager.write().await;
-                                if let Some(s) = mgr.get_session_mut(&session_id_for_recv) {
-                                    s.touch();
+                                if let Err(e) = mgr.touch_session_activity(&session_id_for_recv) {
+                                    warn!(
+                                        session_id = %session_id_for_recv,
+                                        error = %e,
+                                        "Failed to persist proposal session activity"
+                                    );
                                 }
                                 if let Ok(user_message) =
                                     mgr.record_user_prompt(&session_id_for_recv, &text)
@@ -3849,6 +3938,8 @@ pub fn build_router(app_state: AppState) -> Router {
     let authenticated_routes = Router::new()
         .route("/projects", get(list_projects).post(add_project))
         .route("/projects/state", get(projects_state))
+        .route("/ui-state", get(get_ui_state))
+        .route("/ui-state/{key}", put(put_ui_state).delete(delete_ui_state))
         .route("/stats/overview", get(get_stats_overview))
         .route("/stats/projects/{id}/history", get(get_project_history))
         .route("/logs", get(get_logs))
@@ -3980,6 +4071,7 @@ mod tests {
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
+                    None,
                 ),
         }
     }
@@ -4055,6 +4147,55 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_ui_state_crud_endpoints() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router_with_db(&temp_dir, None);
+
+        let put_req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/ui-state/selected_project_id")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"value":"proj-1"}"#))
+            .unwrap();
+        let put_resp = router.clone().oneshot(put_req).await.unwrap();
+        assert_eq!(put_resp.status(), StatusCode::NO_CONTENT);
+
+        let get_req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/ui-state")
+            .body(Body::empty())
+            .unwrap();
+        let get_resp = router.clone().oneshot(get_req).await.unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["selected_project_id"], "proj-1");
+
+        let delete_req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/api/v1/ui-state/selected_project_id")
+            .body(Body::empty())
+            .unwrap();
+        let delete_resp = router.clone().oneshot(delete_req).await.unwrap();
+        assert_eq!(delete_resp.status(), StatusCode::NO_CONTENT);
+
+        let get_req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/ui-state")
+            .body(Body::empty())
+            .unwrap();
+        let get_resp = router.oneshot(get_req).await.unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("selected_project_id").is_none());
     }
 
     // ── Project CRUD tests ──
@@ -4447,6 +4588,7 @@ mod tests {
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
+                    None,
                 ),
         }
     }
@@ -5571,6 +5713,7 @@ mod tests {
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
+                    None,
                 ),
         };
 
@@ -5727,6 +5870,7 @@ mod tests {
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
+                    None,
                 ),
         };
 
@@ -6104,6 +6248,7 @@ mod tests {
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
+                    None,
                 ),
         };
         let router = build_router(state_with_project);
@@ -6170,6 +6315,7 @@ mod tests {
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
+                    None,
                 ),
         };
         let router = build_router(state);
@@ -6230,6 +6376,7 @@ mod tests {
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
+                    None,
                 ),
         };
         let router = build_router(state);
@@ -6315,6 +6462,7 @@ mod tests {
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
+                    None,
                 ),
         };
         let router = build_router(state);
@@ -6398,6 +6546,7 @@ mod tests {
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
+                    None,
                 ),
         };
         let router = build_router(state);
@@ -6607,6 +6756,7 @@ mod tests {
             proposal_session_manager:
                 crate::server::proposal_session::create_proposal_session_manager(
                     crate::config::ProposalSessionConfig::default(),
+                    None,
                 ),
         };
         let router = build_router(state);
