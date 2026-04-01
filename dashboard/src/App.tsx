@@ -69,7 +69,7 @@ function App() {
   useWebSocket({
     onStateUpdate: (state) => {
       store.setFullState(state);
-      const persistedProjectId = state.ui_state?.selectedProjectId;
+      const persistedProjectId = state.ui_state?.selected_project_id;
       if (
         persistedProjectId &&
         state.projects.some((project) => project.id === persistedProjectId)
@@ -79,13 +79,13 @@ function App() {
           listProposalSessionsAPI(persistedProjectId)
             .then((sessions) => {
               store.setProposalSessions(persistedProjectId, sessions);
-              const persistedSessionId = state.ui_state?.activeProposalSessionId;
+              const persistedSessionId = state.ui_state?.active_proposal_session_id;
               if (persistedSessionId) {
                 const exists = sessions.some((session) => session.id === persistedSessionId);
                 if (exists) {
                   store.setActiveProposalSession(persistedSessionId);
                 } else {
-                  persistUiState('activeProposalSessionId', null);
+                  persistUiState('active_proposal_session_id', null);
                 }
               }
             })
@@ -94,7 +94,7 @@ function App() {
             });
         }
       } else if (persistedProjectId) {
-        persistUiState('selectedProjectId', null);
+        persistUiState('selected_project_id', null);
       }
     },
     onLogEntry: (entry) => store.appendLog(entry),
@@ -260,7 +260,7 @@ function App() {
       const session = await createProposalSessionAPI(projectId);
       store.addProposalSession(projectId, session);
       store.setActiveProposalSession(session.id);
-      persistUiState('activeProposalSessionId', session.id);
+      persistUiState('active_proposal_session_id', session.id);
       toast.success('Proposal session created');
     } catch (err) {
       toast.error(`Failed to create session: ${err instanceof APIError ? err.message : String(err)}`);
@@ -277,7 +277,7 @@ function App() {
     try {
       await mergeProposalSessionAPI(projectId, sessionId);
       store.removeProposalSession(projectId, sessionId);
-      persistUiState('activeProposalSessionId', null);
+      persistUiState('active_proposal_session_id', null);
       toast.success('Session merged successfully');
     } catch (err) {
       toast.error(`Failed to merge: ${err instanceof APIError ? err.message : String(err)}`);
@@ -312,7 +312,7 @@ function App() {
       await deleteProposalSessionAPI(projectId, targetId, true);
       store.removeProposalSession(projectId, targetId);
       if (store.state.activeProposalSessionId === targetId) {
-        persistUiState('activeProposalSessionId', null);
+        persistUiState('active_proposal_session_id', null);
       }
       setCloseSessionTarget(null);
       toast.success('Session closed');
@@ -325,26 +325,26 @@ function App() {
 
   const handleBackFromProposal = useCallback(() => {
     store.setActiveProposalSession(null);
-    persistUiState('activeProposalSessionId', null);
+    persistUiState('active_proposal_session_id', null);
   }, [persistUiState, store]);
 
   // Load proposal sessions when project is selected
   const handleSelectProjectWithSessions = useCallback((projectId: string | null) => {
     store.selectProject(projectId);
     store.setActiveProposalSession(null);
-    persistUiState('selectedProjectId', projectId);
-    persistUiState('activeProposalSessionId', null);
+    persistUiState('selected_project_id', projectId);
+    persistUiState('active_proposal_session_id', null);
     if (projectId) {
       listProposalSessionsAPI(projectId)
         .then((sessions) => {
           store.setProposalSessions(projectId, sessions);
-          const persistedSessionId = store.state.uiState.activeProposalSessionId;
+          const persistedSessionId = store.state.uiState.active_proposal_session_id;
           if (persistedSessionId) {
             const exists = sessions.some((session) => session.id === persistedSessionId);
             if (exists) {
               store.setActiveProposalSession(persistedSessionId);
             } else {
-              persistUiState('activeProposalSessionId', null);
+              persistUiState('active_proposal_session_id', null);
             }
           }
         })
@@ -470,7 +470,7 @@ function App() {
                   activeSessionId={store.state.activeProposalSessionId}
                   onSelectSession={(sessionId) => {
                     store.setActiveProposalSession(sessionId);
-                    persistUiState('activeProposalSessionId', sessionId);
+                    persistUiState('active_proposal_session_id', sessionId);
                   }}
                   onCreateSession={handleCreateProposalSession}
                   onCloseSession={(sid) => {

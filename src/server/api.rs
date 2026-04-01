@@ -282,7 +282,7 @@ async fn put_ui_state(
 
     match &state.db {
         Some(db) => match db.set_ui_state(&key, value) {
-            Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
             Err(e) => error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to save ui-state: {}", e),
@@ -4156,12 +4156,12 @@ mod tests {
 
         let put_req = Request::builder()
             .method(Method::PUT)
-            .uri("/api/v1/ui-state/selectedProjectId")
+            .uri("/api/v1/ui-state/selected_project_id")
             .header("Content-Type", "application/json")
             .body(Body::from(r#"{"value":"proj-1"}"#))
             .unwrap();
         let put_resp = router.clone().oneshot(put_req).await.unwrap();
-        assert_eq!(put_resp.status(), StatusCode::OK);
+        assert_eq!(put_resp.status(), StatusCode::NO_CONTENT);
 
         let get_req = Request::builder()
             .method(Method::GET)
@@ -4174,11 +4174,11 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["selectedProjectId"], "proj-1");
+        assert_eq!(json["selected_project_id"], "proj-1");
 
         let delete_req = Request::builder()
             .method(Method::DELETE)
-            .uri("/api/v1/ui-state/selectedProjectId")
+            .uri("/api/v1/ui-state/selected_project_id")
             .body(Body::empty())
             .unwrap();
         let delete_resp = router.clone().oneshot(delete_req).await.unwrap();
@@ -4195,7 +4195,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.get("selectedProjectId").is_none());
+        assert!(json.get("selected_project_id").is_none());
     }
 
     // ── Project CRUD tests ──

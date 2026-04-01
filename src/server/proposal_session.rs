@@ -185,6 +185,7 @@ impl ProposalSessionManager {
                 worktree_path: &session.worktree_path.display().to_string(),
                 worktree_branch: &session.worktree_branch,
                 status: session.status.as_db_value(),
+                acp_session_id: &session.acp_session_id,
                 created_at: &created_at,
                 updated_at: &updated_at,
                 last_activity: &updated_at,
@@ -354,8 +355,11 @@ impl ProposalSessionManager {
             return Ok(None);
         }
 
-        let status = ProposalSessionStatus::from_db_value(&row.status)
+        let mut status = ProposalSessionStatus::from_db_value(&row.status)
             .unwrap_or(ProposalSessionStatus::Active);
+        if status == ProposalSessionStatus::TimedOut {
+            status = ProposalSessionStatus::Active;
+        }
 
         let mut acp_config = self.config.clone();
         let mut transport_args = acp_config.transport_args.clone();
@@ -434,6 +438,8 @@ impl ProposalSessionManager {
             next_turn_seq,
             next_user_seq,
         };
+
+        self.persist_session(&session)?;
 
         let info = session.to_info();
         self.sessions.insert(row.id.clone(), session);
@@ -570,10 +576,7 @@ impl ProposalSessionManager {
             (turn_id, updated)
         };
 
-        if let Some(message) = maybe_message {
-            self.persist_message(session_id, &message)?;
-        }
-
+        let _ = maybe_message;
         Ok(turn_id)
     }
 

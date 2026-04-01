@@ -10,7 +10,7 @@ use crate::error::{OrchestratorError, Result};
 use crate::server::proposal_session::ProposalSessionMessageRecord;
 
 const DB_FILE_NAME: &str = "cflx.db";
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct ProposalSessionDbRow {
@@ -30,6 +30,7 @@ pub struct ProposalSessionUpsert<'a> {
     pub worktree_path: &'a str,
     pub worktree_branch: &'a str,
     pub status: &'a str,
+    pub acp_session_id: &'a str,
     pub created_at: &'a str,
     pub updated_at: &'a str,
     pub last_activity: &'a str,
@@ -272,6 +273,23 @@ impl ServerDb {
                         ON proposal_session_messages(session_id, message_id);
                     CREATE INDEX IF NOT EXISTS idx_proposal_session_messages_session
                         ON proposal_session_messages(session_id, id);
+                    ",
+                )?;
+                conn.pragma_update(None, "user_version", 2)?;
+            }
+
+            if current_version < 3 {
+                conn.execute_batch(
+                    "
+                    ALTER TABLE proposal_sessions
+                    ADD COLUMN acp_session_id TEXT NOT NULL DEFAULT '';
+
+                    ALTER TABLE proposal_session_messages
+                    ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+
+                    UPDATE proposal_session_messages
+                    SET seq = id
+                    WHERE seq = 0;
                     ",
                 )?;
                 conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -696,14 +714,15 @@ impl ServerDb {
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO proposal_sessions (
-                    id, project_id, worktree_path, worktree_branch, status, created_at, updated_at, last_activity
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    id, project_id, worktree_path, worktree_branch, status, acp_session_id, created_at, updated_at, last_activity
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(id)
                  DO UPDATE SET
                     project_id = excluded.project_id,
                     worktree_path = excluded.worktree_path,
                     worktree_branch = excluded.worktree_branch,
                     status = excluded.status,
+                    acp_session_id = excluded.acp_session_id,
                     updated_at = excluded.updated_at,
                     last_activity = excluded.last_activity",
                 params![
@@ -712,6 +731,7 @@ impl ServerDb {
                     session.worktree_path,
                     session.worktree_branch,
                     session.status,
+                    session.acp_session_id,
                     session.created_at,
                     session.updated_at,
                     session.last_activity,
@@ -796,10 +816,15 @@ impl ServerDb {
                 .tool_calls
                 .as_ref()
                 .and_then(|calls| serde_json::to_string(calls).ok());
+            let next_seq: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM proposal_session_messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
             conn.execute(
                 "INSERT INTO proposal_session_messages (
-                    session_id, message_id, role, content, timestamp, turn_id, hydrated, is_thought, tool_calls_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    session_id, message_id, role, content, timestamp, turn_id, hydrated, is_thought, tool_calls_json, seq
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(session_id, message_id)
                  DO UPDATE SET
                     role = excluded.role,
@@ -808,7 +833,8 @@ impl ServerDb {
                     turn_id = excluded.turn_id,
                     hydrated = excluded.hydrated,
                     is_thought = excluded.is_thought,
-                    tool_calls_json = excluded.tool_calls_json",
+                    tool_calls_json = excluded.tool_calls_json,
+                    seq = excluded.seq",
                 params![
                     session_id,
                     message.id,
@@ -819,6 +845,7 @@ impl ServerDb {
                     if hydrated { 1 } else { 0 },
                     if is_thought { 1 } else { 0 },
                     tool_calls_json,
+                    next_seq,
                 ],
             )?;
             Ok(())
@@ -831,10 +858,10 @@ impl ServerDb {
     ) -> Result<Vec<ProposalSessionMessageRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, message_id, role, content, timestamp, turn_id, hydrated, is_thought, tool_calls_json
+                "SELECT id, message_id, role, content, timestamp, turn_id, hydrated, is_thought, tool_calls_json, seq
                  FROM proposal_session_messages
                  WHERE session_id = ?1
-                 ORDER BY id ASC",
+                 ORDER BY seq ASC",
             )?;
             let rows = stmt
                 .query_map(params![session_id], |row| {
@@ -1033,6 +1060,7 @@ mod tests {
             worktree_path: "/tmp/proposal-1",
             worktree_branch: "proposal/ps-1",
             status: "active",
+            acp_session_id: "acp-session-1",
             created_at: "2026-01-01T00:00:00Z",
             updated_at: "2026-01-01T00:00:00Z",
             last_activity: "2026-01-01T00:00:00Z",
@@ -1065,6 +1093,7 @@ mod tests {
             worktree_path: "/tmp/proposal-1",
             worktree_branch: "proposal/ps-1",
             status: "active",
+            acp_session_id: "acp-session-1",
             created_at: "2026-01-01T00:00:00Z",
             updated_at: "2026-01-01T00:00:00Z",
             last_activity: "2026-01-01T00:00:00Z",
