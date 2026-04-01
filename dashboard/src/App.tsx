@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import { Plus } from 'lucide-react';
 import { Toaster, toast } from 'sonner';
 import { Header } from './components/Header';
@@ -35,13 +35,19 @@ import {
   deleteUiState,
   APIError,
 } from './api/restClient';
-
-type TabName = 'projects' | 'changes' | 'worktrees' | 'logs' | 'files';
-type DesktopCenterTab = 'changes' | 'worktrees';
-type DesktopRightTab = 'logs' | 'files';
+import {
+  DesktopCenterTab,
+  DesktopRightTab,
+  TabName,
+  UI_STATE_KEYS,
+  parsePersistedTabState,
+  resolvePersistedBrowseSelection,
+  serializeFileBrowseContext,
+} from './lib/uiStatePersistence';
 
 function App() {
   const store = useAppStore();
+  const hasHydratedFromUiStateRef = useRef(false);
 
   const persistUiState = useCallback((key: string, value: string | null) => {
     if (value === null) {
@@ -56,6 +62,19 @@ function App() {
     });
   }, []);
 
+  const clearPersistedBrowseState = useCallback((keys?: string[]) => {
+    const browseKeys = keys ?? [
+      UI_STATE_KEYS.fileBrowseContext,
+      UI_STATE_KEYS.desktopCenterTab,
+      UI_STATE_KEYS.desktopRightTab,
+      UI_STATE_KEYS.mobileActiveTab,
+    ];
+
+    browseKeys.forEach((key) => {
+      persistUiState(key, null);
+    });
+  }, [persistUiState]);
+
   const [activeTab, setActiveTab] = useState<TabName>('projects');
   const [desktopCenterTab, setDesktopCenterTab] = useState<DesktopCenterTab>('changes');
   const [desktopRightTab, setDesktopRightTab] = useState<DesktopRightTab>('logs');
@@ -66,36 +85,100 @@ function App() {
   const [deleteWorktreeTarget, setDeleteWorktreeTarget] = useState<string | null>(null);
   const [closeSessionTarget, setCloseSessionTarget] = useState<string | null>(null);
 
+  const selectDesktopCenterTab = useCallback((tab: DesktopCenterTab) => {
+    setDesktopCenterTab(tab);
+    persistUiState(UI_STATE_KEYS.desktopCenterTab, tab);
+  }, [persistUiState]);
+
+  const selectDesktopRightTab = useCallback((tab: DesktopRightTab) => {
+    setDesktopRightTab(tab);
+    persistUiState(UI_STATE_KEYS.desktopRightTab, tab);
+  }, [persistUiState]);
+
+  const selectMobileTab = useCallback((tab: TabName) => {
+    setActiveTab(tab);
+    persistUiState(UI_STATE_KEYS.mobileActiveTab, tab);
+  }, [persistUiState]);
+
   useWebSocket({
     onStateUpdate: (state) => {
       store.setFullState(state);
-      const persistedProjectId = state.ui_state?.selected_project_id;
-      if (
-        persistedProjectId &&
-        state.projects.some((project) => project.id === persistedProjectId)
-      ) {
-        if (store.state.selectedProjectId !== persistedProjectId) {
-          store.selectProject(persistedProjectId);
-          listProposalSessionsAPI(persistedProjectId)
-            .then((sessions) => {
-              store.setProposalSessions(persistedProjectId, sessions);
-              const persistedSessionId = state.ui_state?.active_proposal_session_id;
-              if (persistedSessionId) {
-                const exists = sessions.some((session) => session.id === persistedSessionId);
-                if (exists) {
-                  store.setActiveProposalSession(persistedSessionId);
-                } else {
-                  persistUiState('active_proposal_session_id', null);
-                }
-              }
-            })
-            .catch((err) => {
-              console.error('Failed to restore proposal sessions:', err);
-            });
-        }
-      } else if (persistedProjectId) {
-        persistUiState('selected_project_id', null);
+
+      if (hasHydratedFromUiStateRef.current) {
+        return;
       }
+
+      const restoredTabs = parsePersistedTabState(state.ui_state);
+      if (restoredTabs.desktopCenterTab) {
+        setDesktopCenterTab(restoredTabs.desktopCenterTab);
+      }
+      if (restoredTabs.desktopRightTab) {
+        setDesktopRightTab(restoredTabs.desktopRightTab);
+      }
+      if (restoredTabs.mobileActiveTab) {
+        setActiveTab(restoredTabs.mobileActiveTab);
+      }
+
+      const persistedProjectId = state.ui_state?.[UI_STATE_KEYS.selectedProjectId];
+      const selectedProjectId =
+        persistedProjectId && state.projects.some((project) => project.id === persistedProjectId)
+          ? persistedProjectId
+          : null;
+
+      if (!selectedProjectId) {
+        if (persistedProjectId) {
+          persistUiState(UI_STATE_KEYS.selectedProjectId, null);
+        }
+        store.selectProject(null);
+        store.setFileBrowseContext(null);
+        clearPersistedBrowseState();
+        hasHydratedFromUiStateRef.current = true;
+        return;
+      }
+
+      if (store.state.selectedProjectId !== selectedProjectId) {
+        store.selectProject(selectedProjectId);
+      }
+
+      const browseRestore = resolvePersistedBrowseSelection({
+        uiState: state.ui_state,
+        selectedProjectId,
+        projects: state.projects,
+        worktreesByProjectId: state.worktrees,
+      });
+
+      if (browseRestore.status === 'restored') {
+        store.setFileBrowseContext(browseRestore.context);
+        setDesktopCenterTab(browseRestore.tabs.desktopCenterTab);
+        setDesktopRightTab(browseRestore.tabs.desktopRightTab);
+        setActiveTab(browseRestore.tabs.mobileActiveTab);
+      } else if (browseRestore.status === 'stale') {
+        clearPersistedBrowseState(browseRestore.keysToClear);
+        store.setFileBrowseContext(null);
+      }
+
+      if (browseRestore.status === 'defer') {
+        return;
+      }
+
+      listProposalSessionsAPI(selectedProjectId)
+        .then((sessions) => {
+          store.setProposalSessions(selectedProjectId, sessions);
+          const persistedSessionId = state.ui_state?.[UI_STATE_KEYS.activeProposalSessionId];
+          if (persistedSessionId) {
+            const exists = sessions.some((session) => session.id === persistedSessionId);
+            if (exists) {
+              store.setActiveProposalSession(persistedSessionId);
+            } else {
+              persistUiState(UI_STATE_KEYS.activeProposalSessionId, null);
+            }
+          }
+          hasHydratedFromUiStateRef.current = true;
+        })
+        .catch((err) => {
+          console.error('Failed to restore proposal sessions:', err);
+          hasHydratedFromUiStateRef.current = true;
+        });
     },
     onLogEntry: (entry) => store.appendLog(entry),
     onConnectionChange: (status) => store.setConnectionStatus(status),
@@ -208,6 +291,7 @@ function App() {
       toast.success('Worktree deleted');
       if (store.state.fileBrowseContext?.type === 'worktree' && store.state.fileBrowseContext.worktreeBranch === deleteWorktreeTarget) {
         store.setFileBrowseContext(null);
+        clearPersistedBrowseState();
       }
       setDeleteWorktreeTarget(null);
       // Refresh worktree list
@@ -238,17 +322,22 @@ function App() {
   }, [store]);
 
   const handleClickChange = useCallback((changeId: string) => {
-    store.setFileBrowseContext({ type: 'change', changeId });
-    setDesktopRightTab('files');
-    setActiveTab('files');
-  }, [store]);
+    const context = { type: 'change', changeId } as const;
+    store.setFileBrowseContext(context);
+    persistUiState(UI_STATE_KEYS.fileBrowseContext, serializeFileBrowseContext(context));
+    selectDesktopCenterTab('changes');
+    selectDesktopRightTab('files');
+    selectMobileTab('files');
+  }, [persistUiState, selectDesktopCenterTab, selectDesktopRightTab, selectMobileTab, store]);
 
   const handleClickWorktree = useCallback((branch: string) => {
-    store.setFileBrowseContext({ type: 'worktree', worktreeBranch: branch });
-    setDesktopRightTab('files');
-    setActiveTab('files');
-    setDesktopCenterTab('worktrees');
-  }, [store]);
+    const context = { type: 'worktree', worktreeBranch: branch } as const;
+    store.setFileBrowseContext(context);
+    persistUiState(UI_STATE_KEYS.fileBrowseContext, serializeFileBrowseContext(context));
+    selectDesktopCenterTab('worktrees');
+    selectDesktopRightTab('files');
+    selectMobileTab('files');
+  }, [persistUiState, selectDesktopCenterTab, selectDesktopRightTab, selectMobileTab, store]);
 
   // ─── Proposal Session Handlers ────────────────────────────────────────────
 
@@ -260,7 +349,7 @@ function App() {
       const session = await createProposalSessionAPI(projectId);
       store.addProposalSession(projectId, session);
       store.setActiveProposalSession(session.id);
-      persistUiState('active_proposal_session_id', session.id);
+      persistUiState(UI_STATE_KEYS.activeProposalSessionId, session.id);
       toast.success('Proposal session created');
     } catch (err) {
       toast.error(`Failed to create session: ${err instanceof APIError ? err.message : String(err)}`);
@@ -277,7 +366,7 @@ function App() {
     try {
       await mergeProposalSessionAPI(projectId, sessionId);
       store.removeProposalSession(projectId, sessionId);
-      persistUiState('active_proposal_session_id', null);
+      persistUiState(UI_STATE_KEYS.activeProposalSessionId, null);
       toast.success('Session merged successfully');
     } catch (err) {
       toast.error(`Failed to merge: ${err instanceof APIError ? err.message : String(err)}`);
@@ -312,7 +401,7 @@ function App() {
       await deleteProposalSessionAPI(projectId, targetId, true);
       store.removeProposalSession(projectId, targetId);
       if (store.state.activeProposalSessionId === targetId) {
-        persistUiState('active_proposal_session_id', null);
+        persistUiState(UI_STATE_KEYS.activeProposalSessionId, null);
       }
       setCloseSessionTarget(null);
       toast.success('Session closed');
@@ -325,32 +414,35 @@ function App() {
 
   const handleBackFromProposal = useCallback(() => {
     store.setActiveProposalSession(null);
-    persistUiState('active_proposal_session_id', null);
+    persistUiState(UI_STATE_KEYS.activeProposalSessionId, null);
   }, [persistUiState, store]);
 
   // Load proposal sessions when project is selected
   const handleSelectProjectWithSessions = useCallback((projectId: string | null) => {
     store.selectProject(projectId);
     store.setActiveProposalSession(null);
-    persistUiState('selected_project_id', projectId);
-    persistUiState('active_proposal_session_id', null);
+    store.setFileBrowseContext(null);
+    persistUiState(UI_STATE_KEYS.selectedProjectId, projectId);
+    persistUiState(UI_STATE_KEYS.activeProposalSessionId, null);
+    clearPersistedBrowseState();
+
     if (projectId) {
       listProposalSessionsAPI(projectId)
         .then((sessions) => {
           store.setProposalSessions(projectId, sessions);
-          const persistedSessionId = store.state.uiState.active_proposal_session_id;
+          const persistedSessionId = store.state.uiState[UI_STATE_KEYS.activeProposalSessionId];
           if (persistedSessionId) {
             const exists = sessions.some((session) => session.id === persistedSessionId);
             if (exists) {
               store.setActiveProposalSession(persistedSessionId);
             } else {
-              persistUiState('active_proposal_session_id', null);
+              persistUiState(UI_STATE_KEYS.activeProposalSessionId, null);
             }
           }
         })
         .catch((err) => console.error('Failed to load proposal sessions:', err));
     }
-  }, [persistUiState, store]);
+  }, [clearPersistedBrowseState, persistUiState, store]);
 
   const handleRefreshWorktrees = useCallback(async () => {
     const projectId = store.state.selectedProjectId;
@@ -470,7 +562,7 @@ function App() {
                   activeSessionId={store.state.activeProposalSessionId}
                   onSelectSession={(sessionId) => {
                     store.setActiveProposalSession(sessionId);
-                    persistUiState('active_proposal_session_id', sessionId);
+                    persistUiState(UI_STATE_KEYS.activeProposalSessionId, sessionId);
                   }}
                   onCreateSession={handleCreateProposalSession}
                   onCloseSession={(sid) => {
@@ -505,7 +597,7 @@ function App() {
                   {(['changes', 'worktrees'] as DesktopCenterTab[]).map((tab) => (
                     <button
                       key={tab}
-                      onClick={() => setDesktopCenterTab(tab)}
+                      onClick={() => selectDesktopCenterTab(tab)}
                       className={`flex-1 py-2 text-xs font-medium transition-colors ${
                         desktopCenterTab === tab
                           ? 'border-b-2 border-[#6366f1] text-[#fafafa]'
@@ -563,7 +655,7 @@ function App() {
                       {(['logs', 'files'] as DesktopRightTab[]).map((tab) => (
                         <button
                           key={tab}
-                          onClick={() => setDesktopRightTab(tab)}
+                          onClick={() => selectDesktopRightTab(tab)}
                           className={`flex-1 py-2 text-xs font-medium transition-colors ${
                             desktopRightTab === tab
                               ? 'border-b-2 border-[#6366f1] text-[#fafafa]'
@@ -604,7 +696,7 @@ function App() {
             ).map((tab) => (
               <button
                 key={tab}
-                onClick={() => setActiveTab(tab)}
+                onClick={() => selectMobileTab(tab)}
                 className={`flex-1 py-2.5 text-xs font-medium transition-colors ${
                   activeTab === tab
                     ? 'border-b-2 border-[#6366f1] text-[#fafafa]'
