@@ -3232,6 +3232,8 @@ pub enum ProposalWsClientMessage {
     Prompt {
         #[serde(alias = "content")]
         text: String,
+        #[serde(default)]
+        client_message_id: Option<String>,
     },
     ElicitationResponse {
         #[allow(dead_code)]
@@ -3254,6 +3256,8 @@ pub enum ProposalWsServerMessage {
         id: String,
         content: String,
         timestamp: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        client_message_id: Option<String>,
     },
     AgentMessageChunk {
         text: String,
@@ -3470,6 +3474,7 @@ fn build_replay_ws_messages(messages: Vec<ProposalSessionMessageRecord>) -> Vec<
                     id: msg.id,
                     content: msg.content,
                     timestamp: msg.timestamp,
+                    client_message_id: None,
                 })
                 .unwrap_or_default(),
             );
@@ -3737,7 +3742,10 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                 Message::Text(text) => {
                     let text_str: &str = &text;
                     match serde_json::from_str::<ProposalWsClientMessage>(text_str) {
-                        Ok(ProposalWsClientMessage::Prompt { text }) => {
+                        Ok(ProposalWsClientMessage::Prompt {
+                            text,
+                            client_message_id,
+                        }) => {
                             {
                                 let mut mgr = state_for_recv.proposal_session_manager.write().await;
                                 if let Some(s) = mgr.get_session_mut(&session_id_for_recv) {
@@ -3753,6 +3761,7 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                                                     id: user_message.id,
                                                     content: user_message.content,
                                                     timestamp: user_message.timestamp,
+                                                    client_message_id,
                                                 },
                                             )
                                             .unwrap_or_default(),

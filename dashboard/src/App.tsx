@@ -322,9 +322,6 @@ function App() {
   const activeProposalSession = currentProjectSessions.find(
     (s) => s.id === store.state.activeProposalSessionId,
   );
-  const activeSessionMessages = store.state.activeProposalSessionId
-    ? store.state.chatMessagesBySessionId[store.state.activeProposalSessionId] || []
-    : [];
 
   // Get close target session for dialog
   const closeTargetSession = closeSessionTarget
@@ -426,24 +423,10 @@ function App() {
           {activeProposalSession && store.state.selectedProjectId ? (
             <ProposalChat
               projectId={store.state.selectedProjectId}
-              session={activeProposalSession}
-              messages={activeSessionMessages}
-              streamingContent={store.state.streamingContent}
-              activeElicitation={store.state.activeElicitation}
-              isAgentResponding={store.state.isAgentResponding}
+              sessionId={activeProposalSession.id}
               onBack={handleBackFromProposal}
               onMerge={handleMergeProposalSession}
               onClose={handleCloseProposalSession}
-              onAppendMessage={store.appendChatMessage}
-              onUpsertServerUserMessage={store.upsertServerUserMessage}
-              onUpdateMessageSendStatus={store.updateChatMessageSendStatus}
-              onStartAssistantTurn={store.startAssistantTurn}
-              onStreamingChunk={store.appendStreamingChunk}
-              onCompleteAssistantTurn={store.completeAssistantTurn}
-              onFailAssistantTurn={store.failAssistantTurn}
-              onToolCallStart={store.updateToolCall}
-              onToolCallUpdate={store.updateToolCallStatus}
-              onElicitation={store.setElicitation}
               onClickChange={handleClickChange}
               isLoading={isLoading}
             />

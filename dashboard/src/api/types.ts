@@ -201,7 +201,7 @@ export type ProposalWsMessageType =
 
 /** Messages sent from client to server */
 export type ProposalWsClientMessage =
-  | { type: 'prompt'; content: string }
+  | { type: 'prompt'; content: string; client_message_id?: string }
   | {
       type: 'elicitation_response';
       elicitation_id: string;
@@ -212,7 +212,7 @@ export type ProposalWsClientMessage =
 
 /** Messages received from server */
 export type ProposalWsServerMessage =
-  | { type: 'user_message'; id: string; content: string; timestamp: string }
+  | { type: 'user_message'; id: string; content: string; timestamp: string; client_message_id?: string }
   | { type: 'agent_message_chunk'; text: string; message_id?: string; turn_id?: string }
   | { type: 'agent_thought_chunk'; text: string; message_id?: string; turn_id?: string }
   | {

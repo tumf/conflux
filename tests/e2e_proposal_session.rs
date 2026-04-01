@@ -247,7 +247,12 @@ async fn proposal_session_ws_accepts_frontend_message_aliases() {
 
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({"type": "prompt", "content": "alias-check"}).to_string(),
+            serde_json::json!({
+                "type": "prompt",
+                "content": "alias-check",
+                "client_message_id": "client-1"
+            })
+            .to_string(),
         ))
         .await
         .unwrap();
@@ -256,6 +261,7 @@ async fn proposal_session_ws_accepts_frontend_message_aliases() {
     let user_json: Value = serde_json::from_str(&user_message).unwrap();
     assert_eq!(user_json["type"], "user_message");
     assert_eq!(user_json["content"], "alias-check");
+    assert_eq!(user_json["client_message_id"], "client-1");
 
     let thought_chunk_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let thought_chunk_json: Value = serde_json::from_str(&thought_chunk_message).unwrap();
@@ -503,7 +509,12 @@ async fn proposal_session_ws_cancel_and_reconnect_history_work() {
 
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({"type": "prompt", "content": "history-check"}).to_string(),
+            serde_json::json!({
+                "type": "prompt",
+                "content": "history-check",
+                "client_message_id": "client-history"
+            })
+            .to_string(),
         ))
         .await
         .unwrap();
@@ -512,6 +523,7 @@ async fn proposal_session_ws_cancel_and_reconnect_history_work() {
     let user_json: Value = serde_json::from_str(&user_message).unwrap();
     assert_eq!(user_json["type"], "user_message");
     assert_eq!(user_json["content"], "history-check");
+    assert_eq!(user_json["client_message_id"], "client-history");
 
     let thought_chunk_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let thought_chunk_json: Value = serde_json::from_str(&thought_chunk_message).unwrap();
@@ -644,6 +656,8 @@ async fn proposal_session_multi_session_websockets_stay_independent() {
     assert_eq!(user_json_b["type"], "user_message");
     assert_eq!(user_json_a["content"], "alpha");
     assert_eq!(user_json_b["content"], "beta");
+    assert!(user_json_a.get("client_message_id").is_none());
+    assert!(user_json_b.get("client_message_id").is_none());
     assert_eq!(json_a["type"], "agent_thought_chunk");
     assert_eq!(json_b["type"], "agent_thought_chunk");
     assert_eq!(json_a["text"], "echo:alpha");
