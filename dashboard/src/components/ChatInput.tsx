@@ -3,7 +3,7 @@ import { SendHorizontal } from 'lucide-react';
 
 interface ChatInputProps {
   onSend: (content: string) => void;
-  status?: 'ready' | 'submitted' | 'streaming' | 'error';
+  status?: 'ready' | 'submitted' | 'streaming' | 'recovering' | 'error';
   placeholder?: string;
 }
 

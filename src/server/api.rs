@@ -5,6 +5,7 @@
 //! NOTE: This module deliberately does NOT reference or execute `~/.wt/setup`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -3342,20 +3343,28 @@ pub enum ProposalWsServerMessage {
     },
     AgentMessageChunk {
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
     AgentThoughtChunk {
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
     ToolCall {
         tool_call_id: String,
         title: String,
         kind: String,
         status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
     ToolCallUpdate {
         tool_call_id: String,
         status: String,
         content: Vec<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
     #[allow(dead_code)]
     Elicitation {
@@ -3366,6 +3375,16 @@ pub enum ProposalWsServerMessage {
     },
     TurnComplete {
         stop_reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+    },
+    RecoveryState {
+        active: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+    },
+    Heartbeat {
+        sent_at: String,
     },
     Error {
         message: String,
@@ -3563,7 +3582,10 @@ async fn proposal_session_ws_handler(
     ws.on_upgrade(move |socket| proposal_session_ws(socket, state, session_id))
 }
 
-fn build_replay_ws_messages(messages: Vec<ProposalSessionMessageRecord>) -> Vec<String> {
+fn build_replay_ws_messages(
+    messages: Vec<ProposalSessionMessageRecord>,
+    active_turn_id: Option<String>,
+) -> Vec<String> {
     let mut replay_messages = Vec::new();
 
     for msg in messages {
@@ -3573,7 +3595,7 @@ fn build_replay_ws_messages(messages: Vec<ProposalSessionMessageRecord>) -> Vec<
                     id: msg.id,
                     content: msg.content,
                     timestamp: msg.timestamp,
-                    client_message_id: None,
+                    client_message_id: msg.client_message_id,
                 })
                 .unwrap_or_default(),
             );
@@ -3581,14 +3603,17 @@ fn build_replay_ws_messages(messages: Vec<ProposalSessionMessageRecord>) -> Vec<
         }
 
         if msg.role == "assistant" {
+            let turn_id = msg.turn_id.clone();
             if !msg.content.is_empty() {
                 let replay_chunk = if msg.is_thought == Some(true) {
                     ProposalWsServerMessage::AgentThoughtChunk {
                         text: msg.content.clone(),
+                        turn_id: turn_id.clone(),
                     }
                 } else {
                     ProposalWsServerMessage::AgentMessageChunk {
                         text: msg.content.clone(),
+                        turn_id: turn_id.clone(),
                     }
                 };
                 replay_messages.push(serde_json::to_string(&replay_chunk).unwrap_or_default());
@@ -3601,18 +3626,32 @@ fn build_replay_ws_messages(messages: Vec<ProposalSessionMessageRecord>) -> Vec<
                             title: tool_call.title,
                             kind: "tool".to_string(),
                             status: tool_call.status,
+                            turn_id: turn_id.clone(),
                         })
                         .unwrap_or_default(),
                     );
                 }
             }
-            replay_messages.push(
-                serde_json::to_string(&ProposalWsServerMessage::TurnComplete {
-                    stop_reason: "end_turn".to_string(),
-                })
-                .unwrap_or_default(),
-            );
+            if msg.turn_id.is_some() && msg.turn_id != active_turn_id {
+                replay_messages.push(
+                    serde_json::to_string(&ProposalWsServerMessage::TurnComplete {
+                        stop_reason: "end_turn".to_string(),
+                        turn_id: msg.turn_id.clone(),
+                    })
+                    .unwrap_or_default(),
+                );
+            }
         }
+    }
+
+    if !replay_messages.is_empty() || active_turn_id.is_some() {
+        replay_messages.push(
+            serde_json::to_string(&ProposalWsServerMessage::RecoveryState {
+                active: active_turn_id.is_some(),
+                turn_id: active_turn_id,
+            })
+            .unwrap_or_default(),
+        );
     }
 
     replay_messages
@@ -3683,19 +3722,24 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
     let (ws_send_tx, mut ws_send_rx) = tokio::sync::mpsc::channel::<String>(256);
 
     // Replay in-memory message history on reconnect.
-    match state
-        .proposal_session_manager
-        .read()
-        .await
-        .list_messages(&session_id)
-    {
-        Ok(messages) => {
-            for replay_message in build_replay_ws_messages(messages) {
+    let replay_payload = {
+        let manager = state.proposal_session_manager.read().await;
+        let messages = manager.list_messages(&session_id);
+        let active_turn_id = manager.get_active_turn_id(&session_id);
+        (messages, active_turn_id)
+    };
+
+    match replay_payload {
+        (Ok(messages), Ok(active_turn_id)) => {
+            for replay_message in build_replay_ws_messages(messages, active_turn_id) {
                 let _ = ws_send_tx.send(replay_message).await;
             }
         }
-        Err(e) => {
+        (Err(e), _) => {
             error!(error = %e, session_id = %session_id, "Failed to load proposal session history");
+        }
+        (_, Err(e)) => {
+            error!(error = %e, session_id = %session_id, "Failed to read active turn for recovery replay");
         }
     }
 
@@ -3717,21 +3761,23 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                 let ws_message = match update.update {
                     crate::server::acp_client::AcpEvent::AgentMessageChunk { content } => {
                         let text = content.map(|c| c.text).unwrap_or_default();
-                        let _ = state_for_notifs
+                        let turn_id = state_for_notifs
                             .proposal_session_manager
                             .write()
                             .await
-                            .append_assistant_chunk(&session_id_for_notifs, &text);
-                        Some(ProposalWsServerMessage::AgentMessageChunk { text })
+                            .append_assistant_chunk(&session_id_for_notifs, &text)
+                            .ok();
+                        Some(ProposalWsServerMessage::AgentMessageChunk { text, turn_id })
                     }
                     crate::server::acp_client::AcpEvent::AgentThoughtChunk { content } => {
                         let text = content.map(|c| c.text).unwrap_or_default();
-                        let _ = state_for_notifs
+                        let turn_id = state_for_notifs
                             .proposal_session_manager
                             .write()
                             .await
-                            .append_assistant_thought_chunk(&session_id_for_notifs, &text);
-                        Some(ProposalWsServerMessage::AgentThoughtChunk { text })
+                            .append_assistant_thought_chunk(&session_id_for_notifs, &text)
+                            .ok();
+                        Some(ProposalWsServerMessage::AgentThoughtChunk { text, turn_id })
                     }
                     crate::server::acp_client::AcpEvent::ToolCall {
                         tool_call_id,
@@ -3739,21 +3785,26 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                         kind,
                         status,
                     } => {
-                        let _ = state_for_notifs
-                            .proposal_session_manager
-                            .write()
-                            .await
-                            .record_tool_call(
+                        let turn_id = {
+                            let mut manager =
+                                state_for_notifs.proposal_session_manager.write().await;
+                            let _ = manager.record_tool_call(
                                 &session_id_for_notifs,
                                 &tool_call_id,
                                 &title,
                                 &status,
                             );
+                            manager
+                                .get_active_turn_id(&session_id_for_notifs)
+                                .ok()
+                                .flatten()
+                        };
                         Some(ProposalWsServerMessage::ToolCall {
                             tool_call_id,
                             title,
                             kind,
                             status,
+                            turn_id,
                         })
                     }
                     crate::server::acp_client::AcpEvent::ToolCallUpdate {
@@ -3761,19 +3812,24 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                         status,
                         content,
                     } => {
-                        let _ = state_for_notifs
-                            .proposal_session_manager
-                            .write()
-                            .await
-                            .update_tool_call_status(
+                        let turn_id = {
+                            let mut manager =
+                                state_for_notifs.proposal_session_manager.write().await;
+                            let _ = manager.update_tool_call_status(
                                 &session_id_for_notifs,
                                 &tool_call_id,
                                 &status,
                             );
+                            manager
+                                .get_active_turn_id(&session_id_for_notifs)
+                                .ok()
+                                .flatten()
+                        };
                         Some(ProposalWsServerMessage::ToolCallUpdate {
                             tool_call_id,
                             status,
                             content,
+                            turn_id,
                         })
                     }
                     crate::server::acp_client::AcpEvent::Elicitation {
@@ -3788,12 +3844,17 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                         schema,
                     }),
                     crate::server::acp_client::AcpEvent::TurnComplete { stop_reason } => {
-                        let _ = state_for_notifs
+                        let turn_id = state_for_notifs
                             .proposal_session_manager
                             .write()
                             .await
-                            .complete_active_turn(&session_id_for_notifs);
-                        Some(ProposalWsServerMessage::TurnComplete { stop_reason })
+                            .complete_active_turn(&session_id_for_notifs)
+                            .ok()
+                            .flatten();
+                        Some(ProposalWsServerMessage::TurnComplete {
+                            stop_reason,
+                            turn_id,
+                        })
                     }
                     crate::server::acp_client::AcpEvent::Unknown => None,
                 };
@@ -3847,9 +3908,28 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
     });
 
     let send_task = tokio::spawn(async move {
-        while let Some(json) = ws_send_rx.recv().await {
-            if ws_sender.send(Message::Text(json.into())).await.is_err() {
-                break;
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                maybe_json = ws_send_rx.recv() => {
+                    match maybe_json {
+                        Some(json) => {
+                            if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = heartbeat_interval.tick() => {
+                    let heartbeat = ProposalWsServerMessage::Heartbeat {
+                        sent_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let json = serde_json::to_string(&heartbeat).unwrap_or_default();
+                    if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -3871,6 +3951,7 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                             text,
                             client_message_id,
                         }) => {
+                            let mut should_forward_prompt = true;
                             {
                                 let mut mgr = state_for_recv.proposal_session_manager.write().await;
                                 if let Err(e) = mgr.touch_session_activity(&session_id_for_recv) {
@@ -3880,23 +3961,57 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                                         "Failed to persist proposal session activity"
                                     );
                                 }
-                                if let Ok(user_message) =
-                                    mgr.record_user_prompt(&session_id_for_recv, &text)
-                                {
-                                    let _ = ws_send_tx_for_recv
-                                        .send(
-                                            serde_json::to_string(
-                                                &ProposalWsServerMessage::UserMessage {
-                                                    id: user_message.id,
-                                                    content: user_message.content,
-                                                    timestamp: user_message.timestamp,
-                                                    client_message_id,
-                                                },
-                                            )
-                                            .unwrap_or_default(),
-                                        )
-                                        .await;
+
+                                if let Some(cid) = client_message_id.as_deref() {
+                                    match mgr.is_client_message_recorded(&session_id_for_recv, cid)
+                                    {
+                                        Ok(true) => {
+                                            should_forward_prompt = false;
+                                            debug!(
+                                                session_id = %session_id_for_recv,
+                                                client_message_id = %cid,
+                                                "Skipping duplicate prompt during reconnect recovery"
+                                            );
+                                        }
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            warn!(
+                                                session_id = %session_id_for_recv,
+                                                client_message_id = %cid,
+                                                error = %e,
+                                                "Failed duplicate prompt check"
+                                            );
+                                        }
+                                    }
                                 }
+
+                                if should_forward_prompt {
+                                    if let Ok(user_message) = mgr
+                                        .record_user_prompt_with_client_message_id(
+                                            &session_id_for_recv,
+                                            &text,
+                                            client_message_id.as_deref(),
+                                        )
+                                    {
+                                        let _ = ws_send_tx_for_recv
+                                            .send(
+                                                serde_json::to_string(
+                                                    &ProposalWsServerMessage::UserMessage {
+                                                        id: user_message.id,
+                                                        content: user_message.content,
+                                                        timestamp: user_message.timestamp,
+                                                        client_message_id,
+                                                    },
+                                                )
+                                                .unwrap_or_default(),
+                                            )
+                                            .await;
+                                    }
+                                }
+                            }
+
+                            if !should_forward_prompt {
+                                continue;
                             }
 
                             if let Err(e) = acp_client_for_recv

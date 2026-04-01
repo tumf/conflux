@@ -201,40 +201,30 @@ The Dashboard SHALL restore existing proposal-session messages when reconnecting
 **Then**: No REST API call to `listProposalSessionMessages` is made; history restoration relies entirely on WebSocket replay
 
 
-### Requirement: proposal-session-create
+### Requirement: proposal-session-websocket-turn-recovery
 
-The system shall create a proposal session with an independent worktree and ACP subprocess for a given project, and initialize proposal chat with dedicated specification-focused prompt guidance managed by the backend.
+The system shall support reconnect recovery for interrupted active turns by replaying enough message/state information for the client to determine whether the interrupted turn is still active or has already completed. The endpoint shall also provide heartbeat or keepalive behavior so long-running but otherwise idle turns are less likely to be disconnected by intermediaries.
 
-#### Scenario: create-session-success
+#### Scenario: reconnect-replays-completed-turn
 
-**Given**: A registered project with id `P1`
-**When**: `POST /api/v1/projects/P1/proposal-sessions` is called
-**Then**: A new worktree is created on branch `proposal/<session_id>` from project HEAD, an ACP subprocess is spawned in the worktree directory with `--cwd <worktree_path>`, ACP initialization completes, backend-managed specification-focused prompt guidance is prepared for the session, and session info is returned with status 201
+**Given**: A proposal session WebSocket disconnects during an active turn and the server-side turn completes before the client reconnects
+**When**: The client reconnects to the same proposal session
+**Then**: The server replays enough history/state for the client to reconcile the turn as completed without requiring prompt resubmission
 
-### Requirement: proposal-session-websocket
+#### Scenario: reconnect-replays-in-progress-turn
 
-The system shall provide a WebSocket endpoint that proxies ACP JSON-RPC messages between the Dashboard client and the ACP agent subprocess, while preserving backend-managed specification-focused prompt guidance for proposal chat.
+**Given**: A proposal session WebSocket disconnects during an active turn and the server-side turn is still in progress when the client reconnects
+**When**: The client reconnects to the same proposal session
+**Then**: The server replays enough history/state for the client to reconcile the turn as still active and continue receiving updates
 
-#### Scenario: prompt-response-flow
+#### Scenario: websocket-heartbeat-during-long-turn
 
-**Given**: An active proposal session with WebSocket connected
-**When**: The client sends `{ "type": "prompt", "text": "Create auth spec" }`
-**Then**: The server sends the prompt through ACP using the session's dedicated specification-focused guidance, and streams `session/update` notifications back as typed WebSocket messages (`agent_message_chunk`, `tool_call`, `tool_call_update`, `turn_complete`)
+**Given**: An active proposal session with a long-running turn and no user-visible message chunks for an extended interval
+**When**: The connection remains otherwise healthy
+**Then**: The server emits heartbeat or keepalive traffic often enough to reduce idle timeout disconnect risk
 
-### Requirement: proposal-session-specification-boundaries
+#### Scenario: cancel-relay-during-recovered-turn
 
-The system shall keep proposal chat within specification-authoring boundaries through backend-managed prompt guidance rather than ACP-native agent selection, and keep that guidance as internal backend-owned runtime configuration (not external prompt-file loading dependencies).
-
-#### Scenario: implementation-request-is-redirected
-
-**Given**: An active proposal chat session and a user asks the assistant to implement code
-**When**: The assistant responds through the proposal chat flow
-**Then**: The response remains specification-focused rather than performing implementation
-**And**: The response redirects the user toward proposal approval or an implementation-oriented workflow
-
-#### Scenario: clarification-is-minimized
-
-**Given**: An active proposal chat session and a user request is partially ambiguous
-**When**: The assistant prepares its response
-**Then**: The assistant prefers repository and documentation context before asking questions
-**And**: The assistant asks only blocking clarifications needed to reach an implementable specification
+**Given**: An active proposal session with an ongoing prompt turn after reconnect recovery
+**When**: The client sends `{ "type": "cancel" }`
+**Then**: The server cancels the backing turn and the turn ends with stop_reason `cancelled`

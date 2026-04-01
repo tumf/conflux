@@ -20,7 +20,10 @@ interface ProposalChatProps {
   isLoading?: boolean;
 }
 
-function statusPlaceholder(status: 'ready' | 'submitted' | 'streaming' | 'error', wsConnected: boolean): string {
+function statusPlaceholder(status: 'ready' | 'submitted' | 'streaming' | 'recovering' | 'error', wsConnected: boolean): string {
+  if (status === 'recovering') {
+    return 'Reconnecting to recover active turn...';
+  }
   if (!wsConnected) {
     return 'Disconnected. Message will be queued and sent on reconnect.';
   }
@@ -138,7 +141,7 @@ export function ProposalChat({
         <div className="flex flex-1 flex-col overflow-hidden">
           <ChatMessageList
             messages={messages}
-            isAgentResponding={status === 'submitted' || status === 'streaming'}
+            isAgentResponding={status === 'submitted' || status === 'streaming' || status === 'recovering'}
             onExamplePromptSelect={handleExamplePromptSelect}
             onRetryMessage={handleRetryMessage}
           />
@@ -147,7 +150,7 @@ export function ProposalChat({
             status={status}
             placeholder={statusPlaceholder(status, wsConnected)}
           />
-          {(status === 'submitted' || status === 'streaming') && (
+          {(status === 'submitted' || status === 'streaming' || status === 'recovering') && (
             <div className="border-t border-border px-3 py-2 text-xs text-text-subtle">
               <button
                 type="button"
