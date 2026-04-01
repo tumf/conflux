@@ -7,6 +7,7 @@ session_created = False
 pending_elicitation = {}
 opencode_config_path = os.environ.get("OPENCODE_CONFIG")
 output_path = os.environ.get("MOCK_ACP_OPENCODE_CONFIG_OUT")
+prompt_dump_path = os.environ.get("MOCK_ACP_PROMPT_DUMP_OUT")
 if opencode_config_path is not None and output_path:
     with open(output_path, "w", encoding="utf-8") as fp:
         fp.write(opencode_config_path)
@@ -57,10 +58,14 @@ for raw in sys.stdin:
         session_id = params.get("sessionId", "mock-session-1")
         prompt_blocks = params.get("prompt") or []
         content = ""
-        for block in prompt_blocks:
+        for block in reversed(prompt_blocks):
             if block.get("type") == "text":
                 content = block.get("text", "")
                 break
+        if prompt_dump_path:
+            with open(prompt_dump_path, "w", encoding="utf-8") as fp:
+                fp.write(json.dumps(prompt_blocks, ensure_ascii=False))
+
         if not content:
             content = ((params.get("message") or {}).get("content")) or ""
 
