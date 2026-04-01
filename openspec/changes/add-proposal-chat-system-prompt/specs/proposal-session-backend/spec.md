@@ -22,7 +22,7 @@ The system shall provide a WebSocket endpoint that proxies ACP JSON-RPC messages
 
 ### Requirement: proposal-session-specification-boundaries
 
-The system shall keep proposal chat within specification-authoring boundaries through backend-managed prompt guidance rather than ACP-native agent selection.
+The system shall keep proposal chat within specification-authoring boundaries through backend-managed prompt guidance rather than ACP-native agent selection, and keep that guidance as internal backend-owned runtime configuration (not external prompt-file loading dependencies).
 
 #### Scenario: implementation-request-is-redirected
 
