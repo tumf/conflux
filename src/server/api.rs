@@ -3742,9 +3742,7 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                                 None
                             }
                         };
-                        let message_id = turn_id
-                            .as_ref()
-                            .map(|id| format!("assistant-{id}"));
+                        let message_id = turn_id.as_ref().map(|id| format!("assistant-{id}"));
                         Some(ProposalWsServerMessage::AgentMessageChunk {
                             text,
                             message_id,
@@ -3769,9 +3767,7 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                                 None
                             }
                         };
-                        let message_id = turn_id
-                            .as_ref()
-                            .map(|id| format!("assistant-{id}"));
+                        let message_id = turn_id.as_ref().map(|id| format!("assistant-{id}"));
                         Some(ProposalWsServerMessage::AgentThoughtChunk {
                             text,
                             message_id,
@@ -3822,11 +3818,8 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                             .proposal_session_manager
                             .write()
                             .await
-                            .update_tool_call_status(
-                                &session_id_for_notifs,
-                                &tool_call_id,
-                                &status,
-                            ) {
+                            .update_tool_call_status(&session_id_for_notifs, &tool_call_id, &status)
+                        {
                             Ok((message_id, turn_id)) => (Some(message_id), turn_id),
                             Err(e) => {
                                 warn!(

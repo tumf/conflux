@@ -535,7 +535,10 @@ async fn proposal_session_ws_cancel_and_reconnect_history_work() {
     let turn_complete_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let turn_complete_json: Value = serde_json::from_str(&turn_complete_message).unwrap();
     assert_eq!(turn_complete_json["type"], "turn_complete");
-    assert_eq!(turn_complete_json["message_id"], thought_chunk_json["message_id"]);
+    assert_eq!(
+        turn_complete_json["message_id"],
+        thought_chunk_json["message_id"]
+    );
     assert_eq!(turn_complete_json["turn_id"], thought_chunk_json["turn_id"]);
 
     socket
@@ -586,7 +589,10 @@ async fn proposal_session_ws_cancel_and_reconnect_history_work() {
         .unwrap();
     let replay_turn_complete_json: Value = serde_json::from_str(&replay_turn_complete).unwrap();
     assert_eq!(replay_turn_complete_json["type"], "turn_complete");
-    assert_eq!(replay_turn_complete_json["message_id"], replay_json["message_id"]);
+    assert_eq!(
+        replay_turn_complete_json["message_id"],
+        replay_json["message_id"]
+    );
     assert_eq!(replay_turn_complete_json["turn_id"], replay_json["turn_id"]);
 
     server_task.abort();
