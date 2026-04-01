@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use futures_util::StreamExt;
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -96,6 +97,22 @@ async fn create_project(router: axum::Router, remote_url: String) -> (axum::Rout
     (router, project_id)
 }
 
+async fn next_non_heartbeat_json(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Value {
+    use futures_util::StreamExt;
+
+    loop {
+        let message = socket.next().await.unwrap().unwrap().into_text().unwrap();
+        let json: Value = serde_json::from_str(&message).unwrap();
+        if json["type"] != "heartbeat" {
+            return json;
+        }
+    }
+}
+
 fn make_state_with_transport_env(
     temp_dir: &TempDir,
     transport_env: std::collections::HashMap<String, String>,
@@ -177,6 +194,90 @@ async fn proposal_session_create_and_list_use_frontend_contract_shape() {
 }
 
 #[tokio::test]
+async fn proposal_session_prompt_injects_backend_managed_spec_guidance() {
+    let temp_dir = TempDir::new().unwrap();
+    let origin = create_local_git_repo(temp_dir.path());
+    let remote_url = format!("file://{}", origin.to_string_lossy());
+
+    let prompt_dump_path = temp_dir.path().join("mock-acp-prompt.json");
+    let mut transport_env = std::collections::HashMap::new();
+    transport_env.insert(
+        "MOCK_ACP_PROMPT_DUMP_OUT".to_string(),
+        prompt_dump_path.display().to_string(),
+    );
+
+    let state = make_state_with_transport_env(&temp_dir, transport_env);
+    let router = build_router(state.clone());
+
+    let (_router, project_id) = create_project(router.clone(), remote_url).await;
+
+    let create_req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/projects/{project_id}/proposal-sessions"))
+        .body(Body::empty())
+        .unwrap();
+    let create_resp = router.clone().oneshot(create_req).await.unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    let create_body = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&create_body).unwrap();
+    let session_id = created["id"].as_str().unwrap().to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_router = router.clone();
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, serve_router).await.unwrap();
+    });
+
+    use futures_util::{SinkExt, StreamExt};
+
+    let ws_url = format!("ws://{addr}/api/v1/proposal-sessions/{session_id}/ws");
+    let (mut socket, _) = connect_async(ws_url).await.unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "type": "prompt",
+                "content": "spec guidance check"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let _ = socket.next().await.unwrap().unwrap();
+    let _ = socket.next().await.unwrap().unwrap();
+
+    let prompt_dump_raw = fs::read_to_string(&prompt_dump_path).unwrap();
+    let prompt_dump_json: Value = serde_json::from_str(&prompt_dump_raw).unwrap();
+    let prompt_blocks = prompt_dump_json.as_array().unwrap();
+
+    assert!(
+        prompt_blocks.len() >= 2,
+        "backend should prepend dedicated guidance before user prompt"
+    );
+
+    let system_text = prompt_blocks[0]["text"].as_str().unwrap_or_default();
+    assert!(
+        system_text.contains("specification-focused assistant"),
+        "first prompt block should contain dedicated spec-focused guidance"
+    );
+    assert!(
+        system_text.contains("Do not implement production code"),
+        "guidance should include implementation-boundary instruction"
+    );
+
+    let user_text = prompt_blocks.last().unwrap()["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(user_text, "spec guidance check");
+
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn proposal_session_create_does_not_inject_default_opencode_config_env() {
     let temp_dir = TempDir::new().unwrap();
     let origin = create_local_git_repo(temp_dir.path());
@@ -243,7 +344,7 @@ async fn proposal_session_ws_accepts_frontend_message_aliases() {
     let ws_url = format!("ws://{addr}/api/v1/proposal-sessions/{session_id}/ws");
     let (mut socket, _) = connect_async(ws_url).await.unwrap();
 
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::SinkExt;
 
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -257,19 +358,16 @@ async fn proposal_session_ws_accepts_frontend_message_aliases() {
         .await
         .unwrap();
 
-    let user_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
-    let user_json: Value = serde_json::from_str(&user_message).unwrap();
+    let user_json = next_non_heartbeat_json(&mut socket).await;
     assert_eq!(user_json["type"], "user_message");
     assert_eq!(user_json["content"], "alias-check");
     assert_eq!(user_json["client_message_id"], "client-1");
 
-    let thought_chunk_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
-    let thought_chunk_json: Value = serde_json::from_str(&thought_chunk_message).unwrap();
+    let thought_chunk_json = next_non_heartbeat_json(&mut socket).await;
     assert_eq!(thought_chunk_json["type"], "agent_thought_chunk");
     assert_eq!(thought_chunk_json["text"], "echo:alias-check");
 
-    let turn_complete_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
-    let turn_complete_json: Value = serde_json::from_str(&turn_complete_message).unwrap();
+    let turn_complete_json = next_non_heartbeat_json(&mut socket).await;
     assert_eq!(turn_complete_json["type"], "turn_complete");
     assert_eq!(turn_complete_json["stop_reason"], "end_turn");
 
@@ -502,7 +600,7 @@ async fn proposal_session_ws_cancel_and_reconnect_history_work() {
         axum::serve(listener, serve_router).await.unwrap();
     });
 
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::SinkExt;
 
     let ws_url = format!("ws://{addr}/api/v1/proposal-sessions/{session_id}/ws");
     let (mut socket, _) = connect_async(ws_url.clone()).await.unwrap();
@@ -519,20 +617,24 @@ async fn proposal_session_ws_cancel_and_reconnect_history_work() {
         .await
         .unwrap();
 
-    let user_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
-    let user_json: Value = serde_json::from_str(&user_message).unwrap();
+    let user_json = next_non_heartbeat_json(&mut socket).await;
     assert_eq!(user_json["type"], "user_message");
     assert_eq!(user_json["content"], "history-check");
     assert_eq!(user_json["client_message_id"], "client-history");
 
-    let thought_chunk_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
-    let thought_chunk_json: Value = serde_json::from_str(&thought_chunk_message).unwrap();
+    let thought_chunk_json = next_non_heartbeat_json(&mut socket).await;
     assert_eq!(thought_chunk_json["type"], "agent_thought_chunk");
     assert_eq!(thought_chunk_json["text"], "echo:history-check");
+    assert!(thought_chunk_json["message_id"].is_string());
+    assert!(thought_chunk_json["turn_id"].is_string());
 
-    let turn_complete_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
-    let turn_complete_json: Value = serde_json::from_str(&turn_complete_message).unwrap();
+    let turn_complete_json = next_non_heartbeat_json(&mut socket).await;
     assert_eq!(turn_complete_json["type"], "turn_complete");
+    assert_eq!(
+        turn_complete_json["message_id"],
+        thought_chunk_json["message_id"]
+    );
+    assert_eq!(turn_complete_json["turn_id"], thought_chunk_json["turn_id"]);
 
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -541,45 +643,128 @@ async fn proposal_session_ws_cancel_and_reconnect_history_work() {
         .await
         .unwrap();
 
-    let cancelled_message = socket.next().await.unwrap().unwrap().into_text().unwrap();
-    let cancelled_json: Value = serde_json::from_str(&cancelled_message).unwrap();
+    let cancelled_json = next_non_heartbeat_json(&mut socket).await;
     assert_eq!(cancelled_json["type"], "turn_complete");
     assert_eq!(cancelled_json["stop_reason"], "cancelled");
 
     drop(socket);
 
     let (mut reconnect_socket, _) = connect_async(ws_url).await.unwrap();
-    let replay_user_message = reconnect_socket
-        .next()
-        .await
-        .unwrap()
-        .unwrap()
-        .into_text()
-        .unwrap();
-    let replay_user_json: Value = serde_json::from_str(&replay_user_message).unwrap();
+    let replay_user_json = next_non_heartbeat_json(&mut reconnect_socket).await;
     assert_eq!(replay_user_json["type"], "user_message");
     assert_eq!(replay_user_json["content"], "history-check");
+    assert_eq!(replay_user_json["client_message_id"], "client-history");
 
-    let replay_message = reconnect_socket
-        .next()
-        .await
-        .unwrap()
-        .unwrap()
-        .into_text()
-        .unwrap();
-    let replay_json: Value = serde_json::from_str(&replay_message).unwrap();
+    let replay_json = next_non_heartbeat_json(&mut reconnect_socket).await;
     assert_eq!(replay_json["type"], "agent_thought_chunk");
     assert_eq!(replay_json["text"], "echo:history-check");
+    assert!(replay_json["message_id"].is_string());
+    assert!(replay_json["turn_id"].is_string());
 
-    let replay_turn_complete = reconnect_socket
-        .next()
-        .await
-        .unwrap()
-        .unwrap()
-        .into_text()
-        .unwrap();
-    let replay_turn_complete_json: Value = serde_json::from_str(&replay_turn_complete).unwrap();
+    let replay_turn_complete_json = next_non_heartbeat_json(&mut reconnect_socket).await;
     assert_eq!(replay_turn_complete_json["type"], "turn_complete");
+    assert_eq!(
+        replay_turn_complete_json["message_id"],
+        replay_json["message_id"]
+    );
+    assert_eq!(replay_turn_complete_json["turn_id"], replay_json["turn_id"]);
+
+    let replay_recovery_state_json = next_non_heartbeat_json(&mut reconnect_socket).await;
+    assert_eq!(replay_recovery_state_json["type"], "recovery_state");
+    assert_eq!(replay_recovery_state_json["active"], false);
+
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn proposal_session_reconnect_does_not_duplicate_acknowledged_prompt() {
+    let temp_dir = TempDir::new().unwrap();
+    let origin = create_local_git_repo(temp_dir.path());
+    let remote_url = format!("file://{}", origin.to_string_lossy());
+    let state = make_state(&temp_dir);
+    let router = build_router(state.clone());
+
+    let (_router, project_id) = create_project(router.clone(), remote_url).await;
+
+    let create_req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/projects/{project_id}/proposal-sessions"))
+        .body(Body::empty())
+        .unwrap();
+    let create_resp = router.clone().oneshot(create_req).await.unwrap();
+    let create_body = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&create_body).unwrap();
+    let session_id = created["id"].as_str().unwrap().to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_router = router.clone();
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, serve_router).await.unwrap();
+    });
+
+    use futures_util::SinkExt;
+
+    let ws_url = format!("ws://{addr}/api/v1/proposal-sessions/{session_id}/ws");
+    let (mut socket, _) = connect_async(ws_url.clone()).await.unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "type": "prompt",
+                "content": "dedupe-check",
+                "client_message_id": "client-dedupe"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let ack_json = next_non_heartbeat_json(&mut socket).await;
+    assert_eq!(ack_json["type"], "user_message");
+    assert_eq!(ack_json["client_message_id"], "client-dedupe");
+
+    drop(socket);
+
+    let (mut reconnect_socket, _) = connect_async(ws_url).await.unwrap();
+    let replay_user_json = next_non_heartbeat_json(&mut reconnect_socket).await;
+    assert_eq!(replay_user_json["type"], "user_message");
+    assert_eq!(replay_user_json["client_message_id"], "client-dedupe");
+
+    loop {
+        let replay_json = next_non_heartbeat_json(&mut reconnect_socket).await;
+        if replay_json["type"] == "recovery_state" {
+            break;
+        }
+    }
+
+    reconnect_socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "type": "prompt",
+                "content": "dedupe-check",
+                "client_message_id": "client-dedupe"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let maybe_duplicate = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        reconnect_socket.next(),
+    )
+    .await;
+    if let Ok(Some(Ok(message))) = maybe_duplicate {
+        let payload = message.into_text().unwrap();
+        let payload_json: Value = serde_json::from_str(&payload).unwrap();
+        assert_ne!(
+            payload_json["type"], "user_message",
+            "duplicate prompt must not generate a second user_message"
+        );
+    }
 
     server_task.abort();
 }
@@ -629,7 +814,7 @@ async fn proposal_session_multi_session_websockets_stay_independent() {
     .await
     .unwrap();
 
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::SinkExt;
 
     socket_a
         .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -644,14 +829,10 @@ async fn proposal_session_multi_session_websockets_stay_independent() {
         .await
         .unwrap();
 
-    let user_a = socket_a.next().await.unwrap().unwrap().into_text().unwrap();
-    let user_b = socket_b.next().await.unwrap().unwrap().into_text().unwrap();
-    let chunk_a = socket_a.next().await.unwrap().unwrap().into_text().unwrap();
-    let chunk_b = socket_b.next().await.unwrap().unwrap().into_text().unwrap();
-    let user_json_a: Value = serde_json::from_str(&user_a).unwrap();
-    let user_json_b: Value = serde_json::from_str(&user_b).unwrap();
-    let json_a: Value = serde_json::from_str(&chunk_a).unwrap();
-    let json_b: Value = serde_json::from_str(&chunk_b).unwrap();
+    let user_json_a = next_non_heartbeat_json(&mut socket_a).await;
+    let user_json_b = next_non_heartbeat_json(&mut socket_b).await;
+    let json_a = next_non_heartbeat_json(&mut socket_a).await;
+    let json_b = next_non_heartbeat_json(&mut socket_b).await;
     assert_eq!(user_json_a["type"], "user_message");
     assert_eq!(user_json_b["type"], "user_message");
     assert_eq!(user_json_a["content"], "alpha");

@@ -199,6 +199,8 @@ export type ProposalWsMessageType =
   | 'tool_call_update'
   | 'elicitation'
   | 'turn_complete'
+  | 'recovery_state'
+  | 'heartbeat'
   | 'error';
 
 /** Messages sent from client to server */
@@ -246,6 +248,8 @@ export type ProposalWsServerMessage =
       } | null;
     }
   | { type: 'turn_complete'; stop_reason: string; message_id?: string; turn_id?: string }
+  | { type: 'recovery_state'; active: boolean; turn_id?: string }
+  | { type: 'heartbeat'; sent_at: string }
   | { type: 'error'; message: string };
 
 export type ProposalChatRole = 'user' | 'assistant';

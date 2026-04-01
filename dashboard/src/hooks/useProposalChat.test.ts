@@ -151,7 +151,7 @@ describe('useProposalChat', () => {
     expect(result.current.messages[0].sendStatus).toBe('sent');
   });
 
-  it('marks turn error and schedules reconnect when disconnected mid-turn', async () => {
+  it('enters recovering and schedules reconnect when disconnected mid-turn', async () => {
     const { result } = renderHook(() => useProposalChat('project-1', 'session-1'));
 
     await act(async () => {
@@ -172,11 +172,7 @@ describe('useProposalChat', () => {
       socket.emitClose();
     });
 
-    act(() => {
-      vi.runOnlyPendingTimers();
-    });
-
-    expect(result.current.status).toBe('error');
+    expect(result.current.status).toBe('recovering');
 
     act(() => {
       vi.advanceTimersByTime(1000);
@@ -210,6 +206,78 @@ describe('useProposalChat', () => {
     expect(result.current.status).toBe('streaming');
   });
 
+  it('keeps recovering until replay indicates completed turn', async () => {
+    const { result } = renderHook(() => useProposalChat('project-1', 'session-1'));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const socket = MockWebSocket.instances[0];
+
+    act(() => {
+      socket.emitOpen();
+      result.current.sendMessage('recover me');
+      socket.emitMessage({ type: 'agent_message_chunk', text: 'partial', message_id: 'assistant-1' });
+    });
+
+    act(() => {
+      socket.emitClose();
+    });
+
+    expect(['recovering', 'streaming']).toContain(result.current.status);
+
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+
+    const reconnectSocket = MockWebSocket.instances[1];
+
+    act(() => {
+      reconnectSocket.emitOpen();
+      reconnectSocket.emitMessage({ type: 'recovery_state', active: false });
+      reconnectSocket.emitMessage({ type: 'turn_complete', stop_reason: 'end_turn' });
+    });
+
+    expect(result.current.status).toBe('ready');
+    expect(result.current.error).toBeNull();
+  });
+
+  it('does not flush duplicate prompt once server already acknowledged it', async () => {
+    const { result } = renderHook(() => useProposalChat('project-1', 'session-1'));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const firstSocket = MockWebSocket.instances[0];
+
+    act(() => {
+      result.current.sendMessage('once only');
+      firstSocket.emitOpen();
+      const firstSent = JSON.parse(firstSocket.sentMessages[0]);
+      firstSocket.emitMessage({
+        type: 'user_message',
+        id: 'server-user-ack',
+        content: 'once only',
+        timestamp: '2026-04-01T00:00:00Z',
+        client_message_id: firstSent.client_message_id,
+      });
+      firstSocket.emitClose();
+    });
+
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+
+    const reconnectSocket = MockWebSocket.instances[1];
+    act(() => {
+      reconnectSocket.emitOpen();
+    });
+
+    expect(reconnectSocket.sentMessages).toHaveLength(0);
+  });
+
   it('hydrates history from REST and preserves it after websocket connect', async () => {
     listProposalSessionMessagesMock.mockResolvedValueOnce({
       messages: [
@@ -238,5 +306,98 @@ describe('useProposalChat', () => {
 
     expect(result.current.messages).toHaveLength(1);
     expect(result.current.messages[0].id).toBe('history-1');
+  });
+
+  it('ignores stale history response after session switch', async () => {
+    let resolveSessionA: ((value: { messages: Array<{ id: string; role: "assistant"; content: string; timestamp: string }> }) => void) | null = null;
+    listProposalSessionMessagesMock
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveSessionA = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: 'history-b',
+            role: 'assistant',
+            content: 'session-b',
+            timestamp: '2026-04-01T00:00:00Z',
+          },
+        ],
+      });
+
+    const { result, rerender } = renderHook(
+      ({ projectId, sessionId }) => useProposalChat(projectId, sessionId),
+      {
+        initialProps: { projectId: 'project-1', sessionId: 'session-a' as string | null },
+      },
+    );
+
+    rerender({ projectId: 'project-1', sessionId: 'session-b' });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      resolveSessionA?.({
+        messages: [
+          {
+            id: 'history-a',
+            role: 'assistant',
+            content: 'session-a',
+            timestamp: '2026-03-31T00:00:00Z',
+          },
+        ],
+      });
+      await Promise.resolve();
+    });
+
+    expect(result.current.messages).toHaveLength(1);
+    expect(result.current.messages[0].id).toBe('history-b');
+    expect(result.current.messages[0].content).toBe('session-b');
+  });
+
+  it('does not duplicate assistant content when replay re-emits same message_id', async () => {
+    listProposalSessionMessagesMock.mockResolvedValueOnce({
+      messages: [
+        {
+          id: 'assistant-turn-1',
+          role: 'assistant',
+          content: 'Persisted response',
+          timestamp: '2026-03-30T00:00:00Z',
+          turn_id: 'turn-1',
+        },
+      ],
+    });
+
+    const { result } = renderHook(() => useProposalChat('project-1', 'session-1'));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const socket = MockWebSocket.instances[0];
+    act(() => {
+      socket.emitOpen();
+      socket.emitMessage({
+        type: 'agent_message_chunk',
+        message_id: 'assistant-turn-1',
+        turn_id: 'turn-1',
+        text: 'Persisted response',
+      });
+      socket.emitMessage({
+        type: 'turn_complete',
+        stop_reason: 'end_turn',
+        message_id: 'assistant-turn-1',
+        turn_id: 'turn-1',
+      });
+    });
+
+    expect(result.current.messages).toHaveLength(1);
+    expect(result.current.messages[0].id).toBe('assistant-turn-1');
+    expect(result.current.messages[0].content).toBe('Persisted response');
   });
 });
