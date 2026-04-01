@@ -4,6 +4,7 @@
 //! and the reanalysis/dispatch cycle that drives the parallel execution scheduler.
 
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, Semaphore};
@@ -305,9 +306,12 @@ impl ParallelExecutor {
         merge_executor.max_conflict_retries = self.max_conflict_retries;
         merge_executor.shared_stagger_state = self.shared_stagger_state.clone();
         merge_executor.auto_resolve_count = self.auto_resolve_count.clone();
+        merge_executor.pending_merge_count = self.pending_merge_count.clone();
         merge_executor.cancel_token = self.cancel_token.clone();
         merge_executor.manual_resolve_count = self.manual_resolve_count.clone();
         merge_executor.hooks = self.hooks.clone();
+
+        self.pending_merge_count.fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
             let change_id = workspace_result.change_id.clone();
@@ -334,6 +338,8 @@ impl ParallelExecutor {
     }
 
     pub(super) async fn handle_merge_result(&mut self, merge_result: MergeResult) {
+        self.pending_merge_count.fetch_sub(1, Ordering::Relaxed);
+
         match merge_result.outcome {
             Ok(()) => {
                 info!(

@@ -125,6 +125,8 @@ pub struct ParallelExecutor {
     manual_resolve_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Counter for active automatic resolve operations
     auto_resolve_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Counter for background merge tasks that have been spawned but not yet handled by scheduler.
+    pending_merge_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[cfg(test)]
