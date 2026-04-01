@@ -2,7 +2,7 @@
 
 ### Requirement: proposal-session-websocket
 
-The system shall provide a WebSocket endpoint that proxies ACP or OpenCode session updates between the Dashboard client and the proposal-session backend. History replay and reconnect recovery SHALL be defined so that the Dashboard can restore proposal-session state idempotently. Replay or restoration traffic SHALL NOT require the client to render the same logical user message, assistant turn, or tool-call sequence more than once.
+The system shall provide a WebSocket endpoint that proxies ACP or OpenCode session updates between the Dashboard client and the proposal-session backend. REST message history SHALL be the authoritative hydration baseline for initial session load/reload. WebSocket replay and reconnect recovery SHALL use stable `message_id` and `turn_id` identity on assistant/tool-call/turn-complete events so the Dashboard can reconcile updates idempotently against already hydrated state. Replay or restoration traffic SHALL NOT require the client to render the same logical user message, assistant turn, or tool-call sequence more than once.
 
 #### Scenario: reconnect-restoration-is-idempotent
 

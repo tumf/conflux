@@ -3344,10 +3344,14 @@ pub enum ProposalWsServerMessage {
     AgentMessageChunk {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
     AgentThoughtChunk {
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
@@ -3357,12 +3361,16 @@ pub enum ProposalWsServerMessage {
         kind: String,
         status: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
     ToolCallUpdate {
         tool_call_id: String,
         status: String,
         content: Vec<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
@@ -3375,6 +3383,8 @@ pub enum ProposalWsServerMessage {
     },
     TurnComplete {
         stop_reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
@@ -3603,16 +3613,19 @@ fn build_replay_ws_messages(
         }
 
         if msg.role == "assistant" {
+            let message_id = Some(msg.id.clone());
             let turn_id = msg.turn_id.clone();
             if !msg.content.is_empty() {
                 let replay_chunk = if msg.is_thought == Some(true) {
                     ProposalWsServerMessage::AgentThoughtChunk {
                         text: msg.content.clone(),
+                        message_id: message_id.clone(),
                         turn_id: turn_id.clone(),
                     }
                 } else {
                     ProposalWsServerMessage::AgentMessageChunk {
                         text: msg.content.clone(),
+                        message_id: message_id.clone(),
                         turn_id: turn_id.clone(),
                     }
                 };
@@ -3626,6 +3639,7 @@ fn build_replay_ws_messages(
                             title: tool_call.title,
                             kind: "tool".to_string(),
                             status: tool_call.status,
+                            message_id: message_id.clone(),
                             turn_id: turn_id.clone(),
                         })
                         .unwrap_or_default(),
@@ -3636,7 +3650,8 @@ fn build_replay_ws_messages(
                 replay_messages.push(
                     serde_json::to_string(&ProposalWsServerMessage::TurnComplete {
                         stop_reason: "end_turn".to_string(),
-                        turn_id: msg.turn_id.clone(),
+                        message_id,
+                        turn_id,
                     })
                     .unwrap_or_default(),
                 );
@@ -3761,23 +3776,53 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                 let ws_message = match update.update {
                     crate::server::acp_client::AcpEvent::AgentMessageChunk { content } => {
                         let text = content.map(|c| c.text).unwrap_or_default();
-                        let turn_id = state_for_notifs
+                        let turn_id = match state_for_notifs
                             .proposal_session_manager
                             .write()
                             .await
                             .append_assistant_chunk(&session_id_for_notifs, &text)
-                            .ok();
-                        Some(ProposalWsServerMessage::AgentMessageChunk { text, turn_id })
+                        {
+                            Ok(turn_id) => Some(turn_id),
+                            Err(e) => {
+                                warn!(
+                                    session_id = %session_id_for_notifs,
+                                    error = %e,
+                                    "Failed to append assistant chunk to proposal history"
+                                );
+                                None
+                            }
+                        };
+                        let message_id = turn_id.as_ref().map(|id| format!("assistant-{id}"));
+                        Some(ProposalWsServerMessage::AgentMessageChunk {
+                            text,
+                            message_id,
+                            turn_id,
+                        })
                     }
                     crate::server::acp_client::AcpEvent::AgentThoughtChunk { content } => {
                         let text = content.map(|c| c.text).unwrap_or_default();
-                        let turn_id = state_for_notifs
+                        let turn_id = match state_for_notifs
                             .proposal_session_manager
                             .write()
                             .await
                             .append_assistant_thought_chunk(&session_id_for_notifs, &text)
-                            .ok();
-                        Some(ProposalWsServerMessage::AgentThoughtChunk { text, turn_id })
+                        {
+                            Ok(turn_id) => Some(turn_id),
+                            Err(e) => {
+                                warn!(
+                                    session_id = %session_id_for_notifs,
+                                    error = %e,
+                                    "Failed to append assistant thought chunk to proposal history"
+                                );
+                                None
+                            }
+                        };
+                        let message_id = turn_id.as_ref().map(|id| format!("assistant-{id}"));
+                        Some(ProposalWsServerMessage::AgentThoughtChunk {
+                            text,
+                            message_id,
+                            turn_id,
+                        })
                     }
                     crate::server::acp_client::AcpEvent::ToolCall {
                         tool_call_id,
@@ -3785,25 +3830,32 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                         kind,
                         status,
                     } => {
-                        let turn_id = {
-                            let mut manager =
-                                state_for_notifs.proposal_session_manager.write().await;
-                            let _ = manager.record_tool_call(
+                        let (message_id, turn_id) = match state_for_notifs
+                            .proposal_session_manager
+                            .write()
+                            .await
+                            .record_tool_call(
                                 &session_id_for_notifs,
                                 &tool_call_id,
                                 &title,
                                 &status,
-                            );
-                            manager
-                                .get_active_turn_id(&session_id_for_notifs)
-                                .ok()
-                                .flatten()
+                            ) {
+                            Ok((message_id, turn_id)) => (Some(message_id), Some(turn_id)),
+                            Err(e) => {
+                                warn!(
+                                    session_id = %session_id_for_notifs,
+                                    error = %e,
+                                    "Failed to record proposal tool call in history"
+                                );
+                                (None, None)
+                            }
                         };
                         Some(ProposalWsServerMessage::ToolCall {
                             tool_call_id,
                             title,
                             kind,
                             status,
+                            message_id,
                             turn_id,
                         })
                     }
@@ -3812,23 +3864,27 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                         status,
                         content,
                     } => {
-                        let turn_id = {
-                            let mut manager =
-                                state_for_notifs.proposal_session_manager.write().await;
-                            let _ = manager.update_tool_call_status(
-                                &session_id_for_notifs,
-                                &tool_call_id,
-                                &status,
-                            );
-                            manager
-                                .get_active_turn_id(&session_id_for_notifs)
-                                .ok()
-                                .flatten()
+                        let (message_id, turn_id) = match state_for_notifs
+                            .proposal_session_manager
+                            .write()
+                            .await
+                            .update_tool_call_status(&session_id_for_notifs, &tool_call_id, &status)
+                        {
+                            Ok((message_id, turn_id)) => (Some(message_id), turn_id),
+                            Err(e) => {
+                                warn!(
+                                    session_id = %session_id_for_notifs,
+                                    error = %e,
+                                    "Failed to update proposal tool call status in history"
+                                );
+                                (None, None)
+                            }
                         };
                         Some(ProposalWsServerMessage::ToolCallUpdate {
                             tool_call_id,
                             status,
                             content,
+                            message_id,
                             turn_id,
                         })
                     }
@@ -3844,15 +3900,26 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                         schema,
                     }),
                     crate::server::acp_client::AcpEvent::TurnComplete { stop_reason } => {
-                        let turn_id = state_for_notifs
+                        let (message_id, turn_id) = match state_for_notifs
                             .proposal_session_manager
                             .write()
                             .await
                             .complete_active_turn(&session_id_for_notifs)
-                            .ok()
-                            .flatten();
+                        {
+                            Ok(Some((message_id, turn_id))) => (Some(message_id), turn_id),
+                            Ok(None) => (None, None),
+                            Err(e) => {
+                                warn!(
+                                    session_id = %session_id_for_notifs,
+                                    error = %e,
+                                    "Failed to complete active proposal turn"
+                                );
+                                (None, None)
+                            }
+                        };
                         Some(ProposalWsServerMessage::TurnComplete {
                             stop_reason,
+                            message_id,
                             turn_id,
                         })
                     }
