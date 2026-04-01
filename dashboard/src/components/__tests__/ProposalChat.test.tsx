@@ -12,7 +12,7 @@ const sendElicitationResponseMock = vi.fn();
 
 let hookState: {
   messages: Array<{ id: string; role: 'user' | 'assistant'; content: string; timestamp: string }>;
-  status: 'ready' | 'submitted' | 'streaming' | 'error';
+  status: 'ready' | 'submitted' | 'streaming' | 'recovering' | 'error';
   error: string | null;
   activeElicitation: null;
   wsConnected: boolean;
@@ -62,6 +62,22 @@ afterEach(() => {
 });
 
 describe('ProposalChat', () => {
+  it('shows reconnect recovery placeholder when recovering status', () => {
+    hookState.status = 'recovering';
+
+    render(
+      <ProposalChat
+        projectId="project-1"
+        sessionId="session-1"
+        onBack={vi.fn()}
+        onMerge={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByPlaceholderText('Reconnecting to recover active turn...')).toBeTruthy();
+  });
+
   it('shows disconnected placeholder when websocket unavailable', () => {
     render(
       <ProposalChat

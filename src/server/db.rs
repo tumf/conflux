@@ -10,7 +10,7 @@ use crate::error::{OrchestratorError, Result};
 use crate::server::proposal_session::ProposalSessionMessageRecord;
 
 const DB_FILE_NAME: &str = "cflx.db";
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone)]
 pub struct ProposalSessionDbRow {
@@ -292,6 +292,30 @@ impl ServerDb {
                     WHERE seq = 0;
                     ",
                 )?;
+                conn.pragma_update(None, "user_version", 3)?;
+            }
+
+            if current_version < 4 {
+                let mut has_client_message_id = false;
+                {
+                    let mut stmt = conn.prepare("PRAGMA table_info(proposal_session_messages)")?;
+                    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                    for column in rows {
+                        if column? == "client_message_id" {
+                            has_client_message_id = true;
+                            break;
+                        }
+                    }
+                }
+
+                if !has_client_message_id {
+                    conn.execute_batch(
+                        "
+                        ALTER TABLE proposal_session_messages
+                        ADD COLUMN client_message_id TEXT;
+                        ",
+                    )?;
+                }
                 conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
 
@@ -823,14 +847,15 @@ impl ServerDb {
             )?;
             conn.execute(
                 "INSERT INTO proposal_session_messages (
-                    session_id, message_id, role, content, timestamp, turn_id, hydrated, is_thought, tool_calls_json, seq
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    session_id, message_id, role, content, timestamp, turn_id, client_message_id, hydrated, is_thought, tool_calls_json, seq
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(session_id, message_id)
                  DO UPDATE SET
                     role = excluded.role,
                     content = excluded.content,
                     timestamp = excluded.timestamp,
                     turn_id = excluded.turn_id,
+                    client_message_id = excluded.client_message_id,
                     hydrated = excluded.hydrated,
                     is_thought = excluded.is_thought,
                     tool_calls_json = excluded.tool_calls_json,
@@ -842,6 +867,7 @@ impl ServerDb {
                     message.content,
                     message.timestamp,
                     message.turn_id,
+                    message.client_message_id,
                     if hydrated { 1 } else { 0 },
                     if is_thought { 1 } else { 0 },
                     tool_calls_json,
@@ -858,22 +884,23 @@ impl ServerDb {
     ) -> Result<Vec<ProposalSessionMessageRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, message_id, role, content, timestamp, turn_id, hydrated, is_thought, tool_calls_json, seq
+                "SELECT id, message_id, role, content, timestamp, turn_id, client_message_id, hydrated, is_thought, tool_calls_json, seq
                  FROM proposal_session_messages
                  WHERE session_id = ?1
                  ORDER BY seq ASC",
             )?;
             let rows = stmt
                 .query_map(params![session_id], |row| {
-                    let tool_calls_json: Option<String> = row.get(8)?;
+                    let tool_calls_json: Option<String> = row.get(9)?;
                     Ok(ProposalSessionMessageRecord {
                         id: row.get(1)?,
                         role: row.get(2)?,
                         content: row.get(3)?,
                         timestamp: row.get(4)?,
                         turn_id: row.get(5)?,
-                        hydrated: row.get::<_, Option<i64>>(6)?.map(|v| v == 1),
-                        is_thought: row.get::<_, Option<i64>>(7)?.map(|v| v == 1),
+                        client_message_id: row.get(6)?,
+                        hydrated: row.get::<_, Option<i64>>(7)?.map(|v| v == 1),
+                        is_thought: row.get::<_, Option<i64>>(8)?.map(|v| v == 1),
                         tool_calls: tool_calls_json
                             .and_then(|json| serde_json::from_str(&json).ok()),
                     })
@@ -1106,6 +1133,7 @@ mod tests {
             content: "hello".to_string(),
             timestamp: "2026-01-01T00:00:01Z".to_string(),
             turn_id: None,
+            client_message_id: Some("client-1".to_string()),
             hydrated: Some(true),
             is_thought: None,
             tool_calls: None,
@@ -1117,6 +1145,7 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "ps-1-user-1");
         assert_eq!(loaded[0].content, "hello");
+        assert_eq!(loaded[0].client_message_id.as_deref(), Some("client-1"));
 
         db.delete_proposal_session_messages("ps-1").unwrap();
         let loaded = db.load_proposal_session_messages("ps-1").unwrap();

@@ -89,6 +89,8 @@ pub struct ProposalSessionMessageRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hydrated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_thought: Option<bool>,
@@ -481,6 +483,16 @@ impl ProposalSessionManager {
         session_id: &str,
         content: &str,
     ) -> Result<ProposalSessionMessageRecord, ProposalSessionError> {
+        self.record_user_prompt_with_client_message_id(session_id, content, None)
+    }
+
+    /// Record an outgoing user prompt and preserve client_message_id for reconnect dedupe.
+    pub fn record_user_prompt_with_client_message_id(
+        &mut self,
+        session_id: &str,
+        content: &str,
+        client_message_id: Option<&str>,
+    ) -> Result<ProposalSessionMessageRecord, ProposalSessionError> {
         let message = {
             let session = self
                 .sessions
@@ -494,6 +506,7 @@ impl ProposalSessionManager {
                 content: content.to_string(),
                 timestamp: now,
                 turn_id: None,
+                client_message_id: client_message_id.map(|id| id.to_string()),
                 hydrated: Some(true),
                 is_thought: None,
                 tool_calls: None,
@@ -504,6 +517,33 @@ impl ProposalSessionManager {
 
         self.persist_message(session_id, &message)?;
         Ok(message)
+    }
+
+    pub fn is_client_message_recorded(
+        &self,
+        session_id: &str,
+        client_message_id: &str,
+    ) -> Result<bool, ProposalSessionError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
+
+        Ok(session
+            .message_history
+            .iter()
+            .any(|message| message.client_message_id.as_deref() == Some(client_message_id)))
+    }
+
+    pub fn get_active_turn_id(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, ProposalSessionError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
+        Ok(session.active_turn_id.clone())
     }
 
     /// Append an assistant text chunk to the active turn in message history.
@@ -550,6 +590,7 @@ impl ProposalSessionManager {
                     content: String::new(),
                     timestamp: now,
                     turn_id: Some(turn_id.clone()),
+                    client_message_id: None,
                     hydrated: Some(true),
                     is_thought: if is_thought { Some(true) } else { None },
                     tool_calls: None,
@@ -606,6 +647,7 @@ impl ProposalSessionManager {
                 content: String::new(),
                 timestamp: now,
                 turn_id: Some(turn_id.clone()),
+                client_message_id: None,
                 hydrated: Some(true),
                 is_thought: None,
                 tool_calls: Some(Vec::new()),
@@ -665,28 +707,32 @@ impl ProposalSessionManager {
 
     /// Mark the active assistant turn complete.
     #[allow(dead_code)]
-    pub fn complete_active_turn(&mut self, session_id: &str) -> Result<(), ProposalSessionError> {
-        let maybe_message = {
+    pub fn complete_active_turn(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Option<String>, ProposalSessionError> {
+        let (completed_turn_id, maybe_message) = {
             let session = self
                 .sessions
                 .get_mut(session_id)
                 .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
             let active_turn_id = session.active_turn_id.clone();
             session.active_turn_id = None;
-            active_turn_id.and_then(|turn_id| {
+            let maybe_message = active_turn_id.clone().and_then(|turn_id| {
                 session
                     .message_history
                     .iter()
                     .rev()
                     .find(|m| m.turn_id.as_deref() == Some(turn_id.as_str()))
                     .cloned()
-            })
+            });
+            (active_turn_id, maybe_message)
         };
 
         if let Some(message) = maybe_message {
             self.persist_message(session_id, &message)?;
         }
-        Ok(())
+        Ok(completed_turn_id)
     }
 
     /// Check if a session's worktree has uncommitted changes.
