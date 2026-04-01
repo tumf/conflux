@@ -2,7 +2,7 @@
 
 ### Requirement: proposal-session-ui-history-hydration
 
-The Dashboard SHALL restore existing proposal-session messages through an idempotent history restoration flow. Initial session open, browser reload, and reconnect recovery SHALL NOT cause the same logical message or assistant turn to be rendered more than once. The UI SHALL ignore stale history restoration results that do not belong to the currently active `projectId/sessionId` session.
+The Dashboard SHALL restore existing proposal-session messages through an idempotent history restoration flow. Initial session open and browser reload SHALL hydrate from REST history as the authoritative baseline for visible chat state. WebSocket replay/recovery events SHALL be reconciled against stable message/turn identity as updates to that baseline (not blind append), so the same logical message or assistant turn is never rendered more than once. The UI SHALL ignore stale history restoration results that do not belong to the currently active `projectId/sessionId` session.
 
 #### Scenario: reopen-session-does-not-duplicate-history
 

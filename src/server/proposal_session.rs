@@ -588,7 +588,7 @@ impl ProposalSessionManager {
         tool_call_id: &str,
         title: &str,
         status: &str,
-    ) -> Result<(), ProposalSessionError> {
+    ) -> Result<(String, String), ProposalSessionError> {
         let session = self
             .sessions
             .get_mut(session_id)
@@ -633,9 +633,15 @@ impl ProposalSessionManager {
                     status: status.to_string(),
                 });
             }
+
+            return Ok((message.id.clone(), turn_id));
         }
 
-        Ok(())
+        Err(ProposalSessionError::Acp(
+            crate::server::acp_client::AcpError::Protocol(
+                "Active proposal turn missing message record for tool call".to_string(),
+            ),
+        ))
     }
 
     /// Update a tool call status in message history.
@@ -645,7 +651,7 @@ impl ProposalSessionManager {
         session_id: &str,
         tool_call_id: &str,
         status: &str,
-    ) -> Result<(), ProposalSessionError> {
+    ) -> Result<(String, Option<String>), ProposalSessionError> {
         let session = self
             .sessions
             .get_mut(session_id)
@@ -655,17 +661,25 @@ impl ProposalSessionManager {
             if let Some(tool_calls) = message.tool_calls.as_mut() {
                 if let Some(existing) = tool_calls.iter_mut().find(|call| call.id == tool_call_id) {
                     existing.status = status.to_string();
-                    break;
+                    return Ok((message.id.clone(), message.turn_id.clone()));
                 }
             }
         }
 
-        Ok(())
+        Err(ProposalSessionError::Acp(
+            crate::server::acp_client::AcpError::Protocol(format!(
+                "Tool call {} not found in proposal session {}",
+                tool_call_id, session_id
+            )),
+        ))
     }
 
     /// Mark the active assistant turn complete.
     #[allow(dead_code)]
-    pub fn complete_active_turn(&mut self, session_id: &str) -> Result<(), ProposalSessionError> {
+    pub fn complete_active_turn(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, ProposalSessionError> {
         let maybe_message = {
             let session = self
                 .sessions
@@ -684,9 +698,12 @@ impl ProposalSessionManager {
         };
 
         if let Some(message) = maybe_message {
+            let message_id = message.id.clone();
+            let turn_id = message.turn_id.clone();
             self.persist_message(session_id, &message)?;
+            return Ok(Some((message_id, turn_id)));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Check if a session's worktree has uncommitted changes.

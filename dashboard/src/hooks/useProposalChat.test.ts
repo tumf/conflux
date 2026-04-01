@@ -239,4 +239,97 @@ describe('useProposalChat', () => {
     expect(result.current.messages).toHaveLength(1);
     expect(result.current.messages[0].id).toBe('history-1');
   });
+
+  it('ignores stale history response after session switch', async () => {
+    let resolveSessionA: ((value: { messages: Array<{ id: string; role: "assistant"; content: string; timestamp: string }> }) => void) | null = null;
+    listProposalSessionMessagesMock
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveSessionA = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: 'history-b',
+            role: 'assistant',
+            content: 'session-b',
+            timestamp: '2026-04-01T00:00:00Z',
+          },
+        ],
+      });
+
+    const { result, rerender } = renderHook(
+      ({ projectId, sessionId }) => useProposalChat(projectId, sessionId),
+      {
+        initialProps: { projectId: 'project-1', sessionId: 'session-a' as string | null },
+      },
+    );
+
+    rerender({ projectId: 'project-1', sessionId: 'session-b' });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      resolveSessionA?.({
+        messages: [
+          {
+            id: 'history-a',
+            role: 'assistant',
+            content: 'session-a',
+            timestamp: '2026-03-31T00:00:00Z',
+          },
+        ],
+      });
+      await Promise.resolve();
+    });
+
+    expect(result.current.messages).toHaveLength(1);
+    expect(result.current.messages[0].id).toBe('history-b');
+    expect(result.current.messages[0].content).toBe('session-b');
+  });
+
+  it('does not duplicate assistant content when replay re-emits same message_id', async () => {
+    listProposalSessionMessagesMock.mockResolvedValueOnce({
+      messages: [
+        {
+          id: 'assistant-turn-1',
+          role: 'assistant',
+          content: 'Persisted response',
+          timestamp: '2026-03-30T00:00:00Z',
+          turn_id: 'turn-1',
+        },
+      ],
+    });
+
+    const { result } = renderHook(() => useProposalChat('project-1', 'session-1'));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const socket = MockWebSocket.instances[0];
+    act(() => {
+      socket.emitOpen();
+      socket.emitMessage({
+        type: 'agent_message_chunk',
+        message_id: 'assistant-turn-1',
+        turn_id: 'turn-1',
+        text: 'Persisted response',
+      });
+      socket.emitMessage({
+        type: 'turn_complete',
+        stop_reason: 'end_turn',
+        message_id: 'assistant-turn-1',
+        turn_id: 'turn-1',
+      });
+    });
+
+    expect(result.current.messages).toHaveLength(1);
+    expect(result.current.messages[0].id).toBe('assistant-turn-1');
+    expect(result.current.messages[0].content).toBe('Persisted response');
+  });
 });
