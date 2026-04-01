@@ -9,7 +9,7 @@ import {
 } from '../api/types';
 import { getProposalSessionWsUrl, listProposalSessionMessages } from '../api/restClient';
 
-export type ProposalChatStatus = 'ready' | 'submitted' | 'streaming' | 'error';
+export type ProposalChatStatus = 'ready' | 'submitted' | 'streaming' | 'recovering' | 'error';
 
 interface PendingPrompt {
   content: string;
@@ -49,6 +49,8 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
   const statusRef = useRef<ProposalChatStatus>('ready');
   const historyLoadedRef = useRef(false);
   const sessionGenerationRef = useRef(0);
+  const acceptedPromptIdsRef = useRef<Set<string>>(new Set());
+  const recoveryTurnIdRef = useRef<string | null>(null);
 
   const transitionStatus = useCallback((next: ProposalChatStatus, reason: string) => {
     setStatus((prev) => {
@@ -114,6 +116,14 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
     const queue = [...pendingPromptsRef.current];
     pendingPromptsRef.current = [];
     queue.forEach((prompt) => {
+      if (acceptedPromptIdsRef.current.has(prompt.clientMessageId)) {
+        console.info('proposal-chat skipped duplicate prompt flush after reconnect', {
+          clientMessageId: prompt.clientMessageId,
+          at: nowIso(),
+        });
+        return;
+      }
+
       ws.send(
         JSON.stringify({
           type: 'prompt',
@@ -127,9 +137,20 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
   const failActiveTurn = useCallback(
     (reason: string) => {
       const current = statusRef.current;
-      if (current === 'submitted' || current === 'streaming') {
+      if (current === 'submitted' || current === 'streaming' || current === 'recovering') {
         transitionStatus('error', reason);
         setError(reason);
+      }
+    },
+    [transitionStatus],
+  );
+
+  const enterRecovery = useCallback(
+    (reason: string) => {
+      const current = statusRef.current;
+      if (current === 'submitted' || current === 'streaming') {
+        transitionStatus('recovering', reason);
+        setError(null);
       }
     },
     [transitionStatus],
@@ -152,6 +173,10 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
         case 'user_message': {
           const cid = msg.client_message_id;
           if (cid) {
+            acceptedPromptIdsRef.current.add(cid);
+            pendingPromptsRef.current = pendingPromptsRef.current.filter(
+              (prompt) => prompt.clientMessageId !== cid,
+            );
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === cid
@@ -179,6 +204,9 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
         case 'agent_message_chunk': {
           const messageId = msg.message_id ?? activeAssistantMessageIdRef.current ?? `assistant-${Date.now()}`;
           activeAssistantMessageIdRef.current = messageId;
+          if (msg.turn_id) {
+            recoveryTurnIdRef.current = msg.turn_id;
+          }
           setMessages((prev) => {
             const idx = prev.findIndex((m) => m.id === messageId);
             if (idx === -1) {
@@ -207,6 +235,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
             return copy;
           });
           transitionStatus('streaming', 'agent_message_chunk');
+          setError(null);
           break;
         }
         case 'agent_thought_chunk':
@@ -214,12 +243,16 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
         case 'tool_call': {
           const messageId = msg.message_id ?? activeAssistantMessageIdRef.current;
           if (!messageId) return;
+          if (msg.turn_id) {
+            recoveryTurnIdRef.current = msg.turn_id;
+          }
           updateToolCall(messageId, {
             id: msg.tool_call_id,
             title: msg.title,
             status: msg.status,
           });
           transitionStatus('streaming', 'tool_call');
+          setError(null);
           break;
         }
         case 'tool_call_update': {
@@ -233,8 +266,23 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
           break;
         case 'turn_complete':
           activeAssistantMessageIdRef.current = null;
+          recoveryTurnIdRef.current = null;
           transitionStatus('ready', 'turn_complete');
           setError(null);
+          break;
+        case 'recovery_state':
+          if (msg.active) {
+            recoveryTurnIdRef.current = msg.turn_id ?? recoveryTurnIdRef.current;
+            transitionStatus('recovering', 'server_recovery_state_active');
+            setError(null);
+          } else {
+            recoveryTurnIdRef.current = null;
+            transitionStatus('ready', 'server_recovery_state_ready');
+            setError(null);
+          }
+          break;
+        case 'heartbeat':
+          // Keepalive signal only; no UI changes needed.
           break;
         case 'error':
           failActiveTurn(msg.message);
@@ -317,7 +365,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
 
         const currentStatus = statusRef.current;
         if (currentStatus === 'submitted' || currentStatus === 'streaming') {
-          failActiveTurn('WebSocket disconnected during active turn');
+          enterRecovery('WebSocket disconnected during active turn');
         }
 
         if (reconnectAttemptsRef.current >= MAX_RETRIES) {
@@ -336,6 +384,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
     },
     [
       clearReconnectTimer,
+      enterRecovery,
       failActiveTurn,
       flushPendingPrompts,
       handleServerMessage,
@@ -354,6 +403,8 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
     setActiveElicitation(null);
     activeAssistantMessageIdRef.current = null;
     pendingPromptsRef.current = [];
+    acceptedPromptIdsRef.current = new Set();
+    recoveryTurnIdRef.current = null;
     historyLoadedRef.current = false;
 
     if (!projectId || !sessionId) {

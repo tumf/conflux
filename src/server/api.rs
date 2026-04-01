@@ -5,6 +5,7 @@
 //! NOTE: This module deliberately does NOT reference or execute `~/.wt/setup`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -3387,6 +3388,14 @@ pub enum ProposalWsServerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
+    RecoveryState {
+        active: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+    },
+    Heartbeat {
+        sent_at: String,
+    },
     Error {
         message: String,
     },
@@ -3583,7 +3592,10 @@ async fn proposal_session_ws_handler(
     ws.on_upgrade(move |socket| proposal_session_ws(socket, state, session_id))
 }
 
-fn build_replay_ws_messages(messages: Vec<ProposalSessionMessageRecord>) -> Vec<String> {
+fn build_replay_ws_messages(
+    messages: Vec<ProposalSessionMessageRecord>,
+    active_turn_id: Option<String>,
+) -> Vec<String> {
     let mut replay_messages = Vec::new();
 
     for msg in messages {
@@ -3593,7 +3605,7 @@ fn build_replay_ws_messages(messages: Vec<ProposalSessionMessageRecord>) -> Vec<
                     id: msg.id,
                     content: msg.content,
                     timestamp: msg.timestamp,
-                    client_message_id: None,
+                    client_message_id: msg.client_message_id,
                 })
                 .unwrap_or_default(),
             );
@@ -3634,15 +3646,27 @@ fn build_replay_ws_messages(messages: Vec<ProposalSessionMessageRecord>) -> Vec<
                     );
                 }
             }
-            replay_messages.push(
-                serde_json::to_string(&ProposalWsServerMessage::TurnComplete {
-                    stop_reason: "end_turn".to_string(),
-                    message_id,
-                    turn_id,
-                })
-                .unwrap_or_default(),
-            );
+            if msg.turn_id.is_some() && msg.turn_id != active_turn_id {
+                replay_messages.push(
+                    serde_json::to_string(&ProposalWsServerMessage::TurnComplete {
+                        stop_reason: "end_turn".to_string(),
+                        message_id,
+                        turn_id,
+                    })
+                    .unwrap_or_default(),
+                );
+            }
         }
+    }
+
+    if !replay_messages.is_empty() || active_turn_id.is_some() {
+        replay_messages.push(
+            serde_json::to_string(&ProposalWsServerMessage::RecoveryState {
+                active: active_turn_id.is_some(),
+                turn_id: active_turn_id,
+            })
+            .unwrap_or_default(),
+        );
     }
 
     replay_messages
@@ -3655,7 +3679,7 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
 
     info!(session_id = %session_id, "Proposal session WebSocket connected");
 
-    let (acp_client, acp_session_id) = {
+    let (acp_client, acp_session_id, prompt_prefix_blocks) = {
         let manager = state.proposal_session_manager.read().await;
         match manager.get_session(&session_id) {
             Some(session) => {
@@ -3672,7 +3696,28 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                         .await;
                     return;
                 }
-                (session.acp_client.clone(), session.acp_session_id.clone())
+
+                let prompt_prefix_blocks = match manager.prompt_prefix_blocks(&session_id) {
+                    Ok(blocks) => blocks.to_vec(),
+                    Err(_) => {
+                        let _ = ws_sender
+                            .send(Message::Text(
+                                serde_json::to_string(&ProposalWsServerMessage::Error {
+                                    message: "Session prompt configuration missing".to_string(),
+                                })
+                                .unwrap_or_default()
+                                .into(),
+                            ))
+                            .await;
+                        return;
+                    }
+                };
+
+                (
+                    session.acp_client.clone(),
+                    session.acp_session_id.clone(),
+                    prompt_prefix_blocks,
+                )
             }
             None => {
                 let _ = ws_sender
@@ -3692,19 +3737,24 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
     let (ws_send_tx, mut ws_send_rx) = tokio::sync::mpsc::channel::<String>(256);
 
     // Replay in-memory message history on reconnect.
-    match state
-        .proposal_session_manager
-        .read()
-        .await
-        .list_messages(&session_id)
-    {
-        Ok(messages) => {
-            for replay_message in build_replay_ws_messages(messages) {
+    let replay_payload = {
+        let manager = state.proposal_session_manager.read().await;
+        let messages = manager.list_messages(&session_id);
+        let active_turn_id = manager.get_active_turn_id(&session_id);
+        (messages, active_turn_id)
+    };
+
+    match replay_payload {
+        (Ok(messages), Ok(active_turn_id)) => {
+            for replay_message in build_replay_ws_messages(messages, active_turn_id) {
                 let _ = ws_send_tx.send(replay_message).await;
             }
         }
-        Err(e) => {
+        (Err(e), _) => {
             error!(error = %e, session_id = %session_id, "Failed to load proposal session history");
+        }
+        (_, Err(e)) => {
+            error!(error = %e, session_id = %session_id, "Failed to read active turn for recovery replay");
         }
     }
 
@@ -3925,15 +3975,35 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
     });
 
     let send_task = tokio::spawn(async move {
-        while let Some(json) = ws_send_rx.recv().await {
-            if ws_sender.send(Message::Text(json.into())).await.is_err() {
-                break;
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                maybe_json = ws_send_rx.recv() => {
+                    match maybe_json {
+                        Some(json) => {
+                            if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = heartbeat_interval.tick() => {
+                    let heartbeat = ProposalWsServerMessage::Heartbeat {
+                        sent_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let json = serde_json::to_string(&heartbeat).unwrap_or_default();
+                    if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
 
     let acp_client_for_recv = acp_client.clone();
     let acp_session_id_for_recv = acp_session_id.clone();
+    let prompt_prefix_blocks_for_recv = prompt_prefix_blocks.clone();
     let session_id_for_recv = session_id.clone();
     let state_for_recv = state.clone();
     let ws_send_tx_for_recv = ws_send_tx.clone();
@@ -3948,6 +4018,7 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                             text,
                             client_message_id,
                         }) => {
+                            let mut should_forward_prompt = true;
                             {
                                 let mut mgr = state_for_recv.proposal_session_manager.write().await;
                                 if let Err(e) = mgr.touch_session_activity(&session_id_for_recv) {
@@ -3957,27 +4028,65 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                                         "Failed to persist proposal session activity"
                                     );
                                 }
-                                if let Ok(user_message) =
-                                    mgr.record_user_prompt(&session_id_for_recv, &text)
-                                {
-                                    let _ = ws_send_tx_for_recv
-                                        .send(
-                                            serde_json::to_string(
-                                                &ProposalWsServerMessage::UserMessage {
-                                                    id: user_message.id,
-                                                    content: user_message.content,
-                                                    timestamp: user_message.timestamp,
-                                                    client_message_id,
-                                                },
-                                            )
-                                            .unwrap_or_default(),
+
+                                if let Some(cid) = client_message_id.as_deref() {
+                                    match mgr.is_client_message_recorded(&session_id_for_recv, cid)
+                                    {
+                                        Ok(true) => {
+                                            should_forward_prompt = false;
+                                            debug!(
+                                                session_id = %session_id_for_recv,
+                                                client_message_id = %cid,
+                                                "Skipping duplicate prompt during reconnect recovery"
+                                            );
+                                        }
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            warn!(
+                                                session_id = %session_id_for_recv,
+                                                client_message_id = %cid,
+                                                error = %e,
+                                                "Failed duplicate prompt check"
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if should_forward_prompt {
+                                    if let Ok(user_message) = mgr
+                                        .record_user_prompt_with_client_message_id(
+                                            &session_id_for_recv,
+                                            &text,
+                                            client_message_id.as_deref(),
                                         )
-                                        .await;
+                                    {
+                                        let _ = ws_send_tx_for_recv
+                                            .send(
+                                                serde_json::to_string(
+                                                    &ProposalWsServerMessage::UserMessage {
+                                                        id: user_message.id,
+                                                        content: user_message.content,
+                                                        timestamp: user_message.timestamp,
+                                                        client_message_id,
+                                                    },
+                                                )
+                                                .unwrap_or_default(),
+                                            )
+                                            .await;
+                                    }
                                 }
                             }
 
+                            if !should_forward_prompt {
+                                continue;
+                            }
+
                             if let Err(e) = acp_client_for_recv
-                                .send_prompt(&acp_session_id_for_recv, &text)
+                                .send_prompt_with_prefix(
+                                    &acp_session_id_for_recv,
+                                    &prompt_prefix_blocks_for_recv,
+                                    &text,
+                                )
                                 .await
                             {
                                 error!(error = %e, "Failed to send prompt to ACP");

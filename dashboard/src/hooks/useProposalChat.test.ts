@@ -151,7 +151,7 @@ describe('useProposalChat', () => {
     expect(result.current.messages[0].sendStatus).toBe('sent');
   });
 
-  it('marks turn error and schedules reconnect when disconnected mid-turn', async () => {
+  it('enters recovering and schedules reconnect when disconnected mid-turn', async () => {
     const { result } = renderHook(() => useProposalChat('project-1', 'session-1'));
 
     await act(async () => {
@@ -172,11 +172,7 @@ describe('useProposalChat', () => {
       socket.emitClose();
     });
 
-    act(() => {
-      vi.runOnlyPendingTimers();
-    });
-
-    expect(result.current.status).toBe('error');
+    expect(result.current.status).toBe('recovering');
 
     act(() => {
       vi.advanceTimersByTime(1000);
@@ -208,6 +204,78 @@ describe('useProposalChat', () => {
     });
 
     expect(result.current.status).toBe('streaming');
+  });
+
+  it('keeps recovering until replay indicates completed turn', async () => {
+    const { result } = renderHook(() => useProposalChat('project-1', 'session-1'));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const socket = MockWebSocket.instances[0];
+
+    act(() => {
+      socket.emitOpen();
+      result.current.sendMessage('recover me');
+      socket.emitMessage({ type: 'agent_message_chunk', text: 'partial', message_id: 'assistant-1' });
+    });
+
+    act(() => {
+      socket.emitClose();
+    });
+
+    expect(['recovering', 'streaming']).toContain(result.current.status);
+
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+
+    const reconnectSocket = MockWebSocket.instances[1];
+
+    act(() => {
+      reconnectSocket.emitOpen();
+      reconnectSocket.emitMessage({ type: 'recovery_state', active: false });
+      reconnectSocket.emitMessage({ type: 'turn_complete', stop_reason: 'end_turn' });
+    });
+
+    expect(result.current.status).toBe('ready');
+    expect(result.current.error).toBeNull();
+  });
+
+  it('does not flush duplicate prompt once server already acknowledged it', async () => {
+    const { result } = renderHook(() => useProposalChat('project-1', 'session-1'));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const firstSocket = MockWebSocket.instances[0];
+
+    act(() => {
+      result.current.sendMessage('once only');
+      firstSocket.emitOpen();
+      const firstSent = JSON.parse(firstSocket.sentMessages[0]);
+      firstSocket.emitMessage({
+        type: 'user_message',
+        id: 'server-user-ack',
+        content: 'once only',
+        timestamp: '2026-04-01T00:00:00Z',
+        client_message_id: firstSent.client_message_id,
+      });
+      firstSocket.emitClose();
+    });
+
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+
+    const reconnectSocket = MockWebSocket.instances[1];
+    act(() => {
+      reconnectSocket.emitOpen();
+    });
+
+    expect(reconnectSocket.sentMessages).toHaveLength(0);
   });
 
   it('hydrates history from REST and preserves it after websocket connect', async () => {

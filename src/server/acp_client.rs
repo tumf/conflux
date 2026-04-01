@@ -285,6 +285,22 @@ pub struct AcpContent {
 
 // ── AcpClient ─────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcpPromptBlock {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    pub text: String,
+}
+
+impl AcpPromptBlock {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            content_type: "text".to_string(),
+            text: text.into(),
+        }
+    }
+}
+
 /// ACP client wrapping a subprocess communicating via JSON-RPC over stdio.
 pub struct AcpClient {
     /// Sender half for writing JSON-RPC messages to the subprocess stdin.
@@ -528,14 +544,26 @@ impl AcpClient {
         session_id: &str,
         text: &str,
     ) -> Result<(), AcpError> {
+        self.send_prompt_with_prefix(session_id, &[], text).await
+    }
+
+    /// Send a prompt to the ACP session with optional prefix prompt blocks.
+    ///
+    /// Prefix blocks are prepended before the user text block and are intended
+    /// for backend-managed guidance (e.g., system-style behavioral constraints).
+    pub async fn send_prompt_with_prefix(
+        self: &Arc<Self>,
+        session_id: &str,
+        prefix_blocks: &[AcpPromptBlock],
+        text: &str,
+    ) -> Result<(), AcpError> {
+        let mut prompt = Vec::with_capacity(prefix_blocks.len() + 1);
+        prompt.extend(prefix_blocks.iter().cloned());
+        prompt.push(AcpPromptBlock::text(text));
+
         let params = serde_json::json!({
             "sessionId": session_id,
-            "prompt": [
-                {
-                    "type": "text",
-                    "text": text
-                }
-            ]
+            "prompt": prompt
         });
         let client = Arc::clone(self);
         let method = "session/prompt".to_string();
