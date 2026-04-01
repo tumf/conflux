@@ -16,14 +16,12 @@ export function ChatInput({ onSend, status = 'ready', placeholder = 'Type a mess
   const handleSubmit = useCallback(() => {
     const trimmed = value.trim();
     if (!trimmed || disabled) return;
-    setValue('');
     onSend(trimmed);
   }, [value, disabled, onSend]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key !== 'Enter') return;
-      if (e.shiftKey) return;
+      if (e.key !== 'Enter' || !e.shiftKey) return;
       e.preventDefault();
       handleSubmit();
     },
