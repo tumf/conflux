@@ -47,6 +47,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
   const unmountedRef = useRef(false);
   const activeAssistantMessageIdRef = useRef<string | null>(null);
   const statusRef = useRef<ProposalChatStatus>('ready');
+  const historyLoadedRef = useRef(false);
 
   const transitionStatus = useCallback((next: ProposalChatStatus, reason: string) => {
     setStatus((prev) => {
@@ -202,6 +203,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
             title: msg.title,
             status: msg.status,
           });
+          transitionStatus('streaming', 'tool_call');
           break;
         }
         case 'tool_call_update': {
@@ -233,7 +235,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
     wsRef.current = ws;
 
     ws.onopen = () => {
-      console.info('proposal-chat websocket connected', { sessionId });
+      console.info('proposal-chat websocket connected', { sessionId, historyLoaded: historyLoadedRef.current });
       setWsConnected(true);
       reconnectAttemptsRef.current = 0;
       clearReconnectTimer();
@@ -288,6 +290,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
     setActiveElicitation(null);
     activeAssistantMessageIdRef.current = null;
     pendingPromptsRef.current = [];
+    historyLoadedRef.current = false;
 
     if (!projectId || !sessionId) {
       setWsConnected(false);
@@ -295,19 +298,25 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
       return;
     }
 
-    listProposalSessionMessages(projectId, sessionId)
-      .then((history) => {
-        if (unmountedRef.current) return;
+    void (async () => {
+      try {
+        const history = await listProposalSessionMessages(projectId, sessionId);
+        if (unmountedRef.current) {
+          return;
+        }
         setMessages(history.messages);
-      })
-      .catch((e) => {
+      } catch (e) {
         console.warn('proposal-chat history load failed', {
           sessionId,
           error: e instanceof Error ? e.message : String(e),
         });
-      });
-
-    connect();
+      } finally {
+        historyLoadedRef.current = true;
+        if (!unmountedRef.current) {
+          connect();
+        }
+      }
+    })();
 
     return () => {
       unmountedRef.current = true;
