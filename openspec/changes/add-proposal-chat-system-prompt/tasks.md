@@ -6,6 +6,10 @@
 - [x] Update OpenSpec proposal-session backend delta to describe dedicated prompt injection and specification-only behavior boundaries, while keeping `.opencode/agent/spec.md` out of the spec requirements themselves (verification: `python3 "/Users/tumf/.agents/skills/cflx-proposal/scripts/cflx.py" validate add-proposal-chat-system-prompt --strict`).
 - [x] Run full verification for the implementation path (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`) after code changes land (verification: all commands exit 0).
 
+## Acceptance #1 Failure Follow-up
+
+- [x] Update canonical proposal-session backend specs to remove the stale `OPENCODE_CONFIG` auto-injection / spec-agent requirements that contradict backend-managed prompt injection (`openspec/specs/proposal-session-backend/spec.md`).
+
 ## Future Work
 
 - Manually dogfood proposal chat in server-mode WebUI against a real `opencode acp` binary to confirm the conversation quality matches intended spec-oriented behavior.
