@@ -10,6 +10,12 @@
 
 - [x] Update canonical proposal-session backend specs to remove the stale `OPENCODE_CONFIG` auto-injection / spec-agent requirements that contradict backend-managed prompt injection (`openspec/specs/proposal-session-backend/spec.md`).
 
+## Acceptance #3 Failure Follow-up
+
+- [x] Strengthen canonical `proposal-session-create` in `openspec/specs/proposal-session-backend/spec.md` so it explicitly requires backend-managed specification-focused prompt guidance during session initialization, matching the approved delta.
+- [x] Strengthen canonical `proposal-session-websocket` in `openspec/specs/proposal-session-backend/spec.md` so prompt forwarding explicitly uses the session's backend-managed specification-focused guidance, matching the approved delta.
+- [x] Deduplicate `openspec/specs/proposal-session-backend/spec.md` so the canonical file has a single authoritative `## Requirements` structure without repeated requirement blocks.
+
 ## Future Work
 
 - Manually dogfood proposal chat in server-mode WebUI against a real `opencode acp` binary to confirm the conversation quality matches intended spec-oriented behavior.
