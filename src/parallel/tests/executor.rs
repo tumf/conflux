@@ -317,6 +317,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         needs_reanalysis: false,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -601,6 +602,7 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         needs_reanalysis: false,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -775,6 +777,7 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         needs_reanalysis: false,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -921,6 +924,7 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         needs_reanalysis: false,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let revisions = vec![workspace_a.name];
@@ -1096,6 +1100,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         needs_reanalysis: false,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1285,6 +1290,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         needs_reanalysis: false,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1480,6 +1486,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         needs_reanalysis: false,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let revisions = vec![workspace_a.name];
@@ -1853,6 +1860,40 @@ async fn test_handle_merge_result_triggers_reanalysis() {
     assert!(
         executor.needs_reanalysis,
         "failed background merge should also trigger scheduler re-analysis"
+    );
+}
+
+#[tokio::test]
+async fn fix_scheduler_premature_exit_decrements_pending_merge_counter_on_merge_completion() {
+    use crate::parallel::MergeResult;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, _rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+
+    executor
+        .handle_merge_result(MergeResult {
+            change_id: "change-ok".to_string(),
+            workspace_name: "ws-change-ok".to_string(),
+            outcome: Ok(()),
+        })
+        .await;
+
+    assert_eq!(
+        executor.pending_merge_count.load(Ordering::Relaxed),
+        0,
+        "scheduler must clear pending merge counter after merge result is handled"
+    );
+    assert!(
+        executor.needs_reanalysis,
+        "merge completion should trigger scheduler re-analysis"
     );
 }
 

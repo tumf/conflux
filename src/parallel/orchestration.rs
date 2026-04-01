@@ -10,6 +10,7 @@ use crate::error::Result;
 use crate::events::LogEntry;
 use crate::merge_stall_monitor::MergeStallMonitor;
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -167,6 +168,7 @@ impl ParallelExecutor {
                 && in_flight.is_empty()
                 && self.resolve_wait_changes.is_empty()
                 && self.manual_resolve_active() == 0
+                && self.pending_merge_count.load(Ordering::Relaxed) == 0
             {
                 // All work completed.
                 // Keep the scheduler alive while ResolveWait retries or manual resolve are active.
@@ -203,6 +205,7 @@ impl ParallelExecutor {
                 && queued.is_empty()
                 && self.resolve_wait_changes.is_empty()
                 && self.manual_resolve_active() == 0
+                && self.pending_merge_count.load(Ordering::Relaxed) == 0
             {
                 info!(
                     "All work completed (join_set/queued/resolve_wait/manual_resolve empty), exiting scheduler loop"

@@ -157,6 +157,7 @@ impl ParallelExecutor {
             needs_reanalysis: false,
             manual_resolve_count: None,
             auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
