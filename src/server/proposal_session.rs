@@ -15,9 +15,25 @@ use tracing::{debug, info, warn};
 
 use crate::config::ProposalSessionConfig;
 use crate::openspec::ProposalMetadata;
-use crate::server::acp_client::{AcpClient, AcpError};
+use crate::server::acp_client::{AcpClient, AcpError, AcpPromptBlock};
 use crate::server::db::{ProposalSessionDbRow, ProposalSessionUpsert, ServerDb};
 use crate::vcs::git::commands as git;
+
+const PROPOSAL_CHAT_SYSTEM_PROMPT: &str = r#"You are Conflux proposal chat, a specification-focused assistant.
+
+Primary objective:
+- Help users produce clear, implementable OpenSpec change proposals.
+
+Behavior boundaries:
+- Stay within proposal/design/tasks/specification work unless the user explicitly switches workflow.
+- Do not implement production code in this chat flow.
+- If asked to implement code, redirect to implementation workflow after proposal approval.
+
+Conversation style:
+- Prefer using repository context and existing specs before asking clarifying questions.
+- Ask only blocking clarifications that are required to reach an implementable specification.
+- Keep responses concrete, scoped, and actionable for proposal authoring.
+"#;
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -114,6 +130,7 @@ pub struct ProposalSession {
     pub worktree_branch: String,
     pub acp_client: Arc<AcpClient>,
     pub acp_session_id: String,
+    pub prompt_prefix_blocks: Vec<AcpPromptBlock>,
     pub status: ProposalSessionStatus,
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
@@ -125,6 +142,10 @@ pub struct ProposalSession {
 }
 
 impl ProposalSession {
+    fn build_prompt_prefix_blocks() -> Vec<AcpPromptBlock> {
+        vec![AcpPromptBlock::text(PROPOSAL_CHAT_SYSTEM_PROMPT)]
+    }
+
     /// Convert to API-facing info struct.
     pub fn to_info(&self) -> ProposalSessionInfo {
         ProposalSessionInfo {
@@ -315,6 +336,7 @@ impl ProposalSessionManager {
             worktree_branch: branch_name.clone(),
             acp_client,
             acp_session_id,
+            prompt_prefix_blocks: ProposalSession::build_prompt_prefix_blocks(),
             status: ProposalSessionStatus::Active,
             created_at: now,
             last_activity: now,
@@ -431,6 +453,7 @@ impl ProposalSessionManager {
             worktree_branch: row.worktree_branch.clone(),
             acp_client,
             acp_session_id,
+            prompt_prefix_blocks: ProposalSession::build_prompt_prefix_blocks(),
             status,
             created_at,
             last_activity,
@@ -451,6 +474,18 @@ impl ProposalSessionManager {
     /// Get a session by ID.
     pub fn get_session(&self, session_id: &str) -> Option<&ProposalSession> {
         self.sessions.get(session_id)
+    }
+
+    /// Return immutable prompt prefix blocks for ACP prompt injection.
+    pub fn prompt_prefix_blocks(
+        &self,
+        session_id: &str,
+    ) -> Result<&[AcpPromptBlock], ProposalSessionError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
+        Ok(&session.prompt_prefix_blocks)
     }
 
     pub fn touch_session_activity(&mut self, session_id: &str) -> Result<(), ProposalSessionError> {
@@ -1210,6 +1245,7 @@ mod tests {
                 worktree_branch: "proposal/ps-test".to_string(),
                 acp_client: Arc::new(AcpClient::new_for_test()),
                 acp_session_id: "acp-session-1".to_string(),
+                prompt_prefix_blocks: ProposalSession::build_prompt_prefix_blocks(),
                 status: ProposalSessionStatus::Active,
                 created_at: Utc::now(),
                 last_activity: Utc::now(),

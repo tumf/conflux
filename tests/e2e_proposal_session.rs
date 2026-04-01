@@ -194,6 +194,90 @@ async fn proposal_session_create_and_list_use_frontend_contract_shape() {
 }
 
 #[tokio::test]
+async fn proposal_session_prompt_injects_backend_managed_spec_guidance() {
+    let temp_dir = TempDir::new().unwrap();
+    let origin = create_local_git_repo(temp_dir.path());
+    let remote_url = format!("file://{}", origin.to_string_lossy());
+
+    let prompt_dump_path = temp_dir.path().join("mock-acp-prompt.json");
+    let mut transport_env = std::collections::HashMap::new();
+    transport_env.insert(
+        "MOCK_ACP_PROMPT_DUMP_OUT".to_string(),
+        prompt_dump_path.display().to_string(),
+    );
+
+    let state = make_state_with_transport_env(&temp_dir, transport_env);
+    let router = build_router(state.clone());
+
+    let (_router, project_id) = create_project(router.clone(), remote_url).await;
+
+    let create_req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/projects/{project_id}/proposal-sessions"))
+        .body(Body::empty())
+        .unwrap();
+    let create_resp = router.clone().oneshot(create_req).await.unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    let create_body = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&create_body).unwrap();
+    let session_id = created["id"].as_str().unwrap().to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_router = router.clone();
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, serve_router).await.unwrap();
+    });
+
+    use futures_util::{SinkExt, StreamExt};
+
+    let ws_url = format!("ws://{addr}/api/v1/proposal-sessions/{session_id}/ws");
+    let (mut socket, _) = connect_async(ws_url).await.unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "type": "prompt",
+                "content": "spec guidance check"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let _ = socket.next().await.unwrap().unwrap();
+    let _ = socket.next().await.unwrap().unwrap();
+
+    let prompt_dump_raw = fs::read_to_string(&prompt_dump_path).unwrap();
+    let prompt_dump_json: Value = serde_json::from_str(&prompt_dump_raw).unwrap();
+    let prompt_blocks = prompt_dump_json.as_array().unwrap();
+
+    assert!(
+        prompt_blocks.len() >= 2,
+        "backend should prepend dedicated guidance before user prompt"
+    );
+
+    let system_text = prompt_blocks[0]["text"].as_str().unwrap_or_default();
+    assert!(
+        system_text.contains("specification-focused assistant"),
+        "first prompt block should contain dedicated spec-focused guidance"
+    );
+    assert!(
+        system_text.contains("Do not implement production code"),
+        "guidance should include implementation-boundary instruction"
+    );
+
+    let user_text = prompt_blocks.last().unwrap()["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(user_text, "spec guidance check");
+
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn proposal_session_create_does_not_inject_default_opencode_config_env() {
     let temp_dir = TempDir::new().unwrap();
     let origin = create_local_git_repo(temp_dir.path());

@@ -3664,7 +3664,7 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
 
     info!(session_id = %session_id, "Proposal session WebSocket connected");
 
-    let (acp_client, acp_session_id) = {
+    let (acp_client, acp_session_id, prompt_prefix_blocks) = {
         let manager = state.proposal_session_manager.read().await;
         match manager.get_session(&session_id) {
             Some(session) => {
@@ -3681,7 +3681,28 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                         .await;
                     return;
                 }
-                (session.acp_client.clone(), session.acp_session_id.clone())
+
+                let prompt_prefix_blocks = match manager.prompt_prefix_blocks(&session_id) {
+                    Ok(blocks) => blocks.to_vec(),
+                    Err(_) => {
+                        let _ = ws_sender
+                            .send(Message::Text(
+                                serde_json::to_string(&ProposalWsServerMessage::Error {
+                                    message: "Session prompt configuration missing".to_string(),
+                                })
+                                .unwrap_or_default()
+                                .into(),
+                            ))
+                            .await;
+                        return;
+                    }
+                };
+
+                (
+                    session.acp_client.clone(),
+                    session.acp_session_id.clone(),
+                    prompt_prefix_blocks,
+                )
             }
             None => {
                 let _ = ws_sender
@@ -3915,6 +3936,7 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
 
     let acp_client_for_recv = acp_client.clone();
     let acp_session_id_for_recv = acp_session_id.clone();
+    let prompt_prefix_blocks_for_recv = prompt_prefix_blocks.clone();
     let session_id_for_recv = session_id.clone();
     let state_for_recv = state.clone();
     let ws_send_tx_for_recv = ws_send_tx.clone();
@@ -3993,7 +4015,11 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
                             }
 
                             if let Err(e) = acp_client_for_recv
-                                .send_prompt(&acp_session_id_for_recv, &text)
+                                .send_prompt_with_prefix(
+                                    &acp_session_id_for_recv,
+                                    &prompt_prefix_blocks_for_recv,
+                                    &text,
+                                )
                                 .await
                             {
                                 error!(error = %e, "Failed to send prompt to ACP");

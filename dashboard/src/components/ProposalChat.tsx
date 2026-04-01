@@ -36,7 +36,7 @@ function statusPlaceholder(status: 'ready' | 'submitted' | 'streaming' | 'recove
       return 'Last turn failed. Adjust your message and retry.';
     case 'ready':
     default:
-      return 'Type a message... (Enter to send, Shift+Enter for newline)';
+      return 'Type a message... (Enter for newline, Shift+Enter to send)';
   }
 }
 
