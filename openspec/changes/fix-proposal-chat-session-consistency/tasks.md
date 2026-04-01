@@ -10,3 +10,7 @@
 
 - Verify whether the same session-generation / stale-response isolation pattern should also be applied to terminal WebSocket views.
 - Consider consolidating all dashboard real-time session views onto a shared event reconciliation abstraction if proposal chat and terminal chat continue to diverge.
+
+## Acceptance #2 Failure Follow-up
+
+- [x] Commit or revert the remaining unstaged changes in `src/server/api.rs` and `tests/e2e_proposal_session.rs`, then rerun acceptance with a clean working tree.
