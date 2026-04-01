@@ -138,7 +138,6 @@ export function ProposalChat({
         <div className="flex flex-1 flex-col overflow-hidden">
           <ChatMessageList
             messages={messages}
-            streamingContent={{}}
             isAgentResponding={status === 'submitted' || status === 'streaming'}
             onExamplePromptSelect={handleExamplePromptSelect}
             onRetryMessage={handleRetryMessage}

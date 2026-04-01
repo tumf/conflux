@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { AlertCircle, Bot, Clock3, Copy, RotateCcw, User } from 'lucide-react';
 
 import { ProposalChatMessage } from '../api/types';
@@ -6,8 +6,6 @@ import { ToolCallIndicator } from './ToolCallIndicator';
 
 interface ChatMessageListProps {
   messages: ProposalChatMessage[];
-  /** Content currently being streamed, keyed by message_id */
-  streamingContent: Record<string, string>;
   isAgentResponding?: boolean;
   onExamplePromptSelect?: (prompt: string) => void;
   onRetryMessage?: (messageId: string) => void;
@@ -302,7 +300,6 @@ function TypingIndicator() {
 
 export function ChatMessageList({
   messages,
-  streamingContent,
   isAgentResponding = false,
   onExamplePromptSelect,
   onRetryMessage,
@@ -312,7 +309,6 @@ export function ChatMessageList({
   const [isNearBottom, setIsNearBottom] = useState(true);
   const [hasUnreadMessages, setHasUnreadMessages] = useState(false);
 
-  const streamingIds = useMemo(() => Object.keys(streamingContent), [streamingContent]);
 
   const updateNearBottom = () => {
     const scroller = scrollerRef.current;
@@ -338,12 +334,13 @@ export function ChatMessageList({
       return;
     }
 
-    if (messages.length > 0 || streamingIds.length > 0) {
+    if (messages.length > 0) {
       setHasUnreadMessages(true);
     }
-  }, [messages, streamingIds, isNearBottom]);
+  }, [messages, isNearBottom]);
 
-  const showTypingIndicator = isAgentResponding && streamingIds.length === 0;
+  const showTypingIndicator =
+    isAgentResponding && (messages.length === 0 || messages[messages.length - 1].role !== 'assistant');
 
   return (
     <div className="relative flex-1 overflow-hidden">
@@ -353,7 +350,7 @@ export function ChatMessageList({
         data-testid="chat-scroll-container"
         onScroll={updateNearBottom}
       >
-        {messages.length === 0 && streamingIds.length === 0 && (
+        {messages.length === 0 && (
           <div className="flex flex-1 items-center justify-center py-16">
             <div className="flex max-w-md flex-col items-center gap-3 text-center">
               <div className="flex size-10 items-center justify-center rounded-full bg-accent/20">
@@ -380,20 +377,6 @@ export function ChatMessageList({
         {messages.map((msg) => (
           <MessageBubble key={msg.id} message={msg} onRetryMessage={onRetryMessage} />
         ))}
-
-        {streamingIds
-          .filter((id) => !messages.some((m) => m.id === id))
-          .map((id) => (
-            <div key={`stream-${id}`} className="flex items-start gap-3">
-              <div className="flex size-7 shrink-0 items-center justify-center rounded-full bg-[#1e1b4b]">
-                <Bot className="size-4 text-[#a5b4fc]" />
-              </div>
-              <div className="min-w-0 flex-1 rounded-lg bg-[#18181b] px-3 py-2 text-sm text-[#d4d4d8]">
-                {renderMarkdownSimple(streamingContent[id])}
-                <span className="inline-block h-4 w-1 animate-pulse bg-[#6366f1] align-middle" />
-              </div>
-            </div>
-          ))}
 
         {showTypingIndicator && <TypingIndicator />}
 
