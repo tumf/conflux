@@ -3455,6 +3455,24 @@ async fn list_proposal_session_changes(
     }
 }
 
+/// GET /api/v1/projects/{id}/proposal-sessions/{session_id}/messages
+async fn get_proposal_session_messages(
+    State(state): State<AppState>,
+    Path((_project_id, session_id)): Path<(String, String)>,
+) -> Response {
+    let manager = state.proposal_session_manager.read().await;
+    match manager.list_messages(&session_id) {
+        Ok(messages) => {
+            let response = serde_json::json!({ "messages": messages });
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(ProposalSessionError::NotFound(id)) => {
+            error_response(StatusCode::NOT_FOUND, format!("Session not found: {}", id))
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)),
+    }
+}
+
 /// GET /api/v1/proposal-sessions/{session_id}/ws
 async fn proposal_session_ws_handler(
     ws: WebSocketUpgrade,
@@ -3889,6 +3907,10 @@ pub fn build_router(app_state: AppState) -> Router {
             "/projects/{id}/proposal-sessions/{session_id}/changes",
             get(list_proposal_session_changes),
         )
+        .route(
+            "/projects/{id}/proposal-sessions/{session_id}/messages",
+            get(get_proposal_session_messages),
+        )
         .route("/control/run", post(global_control_run))
         .route("/control/stop", post(global_control_stop))
         .route("/control/status", get(global_control_status))
@@ -4018,6 +4040,21 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_proposal_session_messages_not_found_returns_404() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/proj-1/proposal-sessions/missing/messages")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // ── Project CRUD tests ──

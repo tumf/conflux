@@ -38,6 +38,46 @@ const baseMessages: ProposalChatMessage[] = [
 describe('ChatMessageList', () => {
   const writeText = vi.fn();
 
+  it('shows typing indicator only until assistant message is present', () => {
+    const { rerender } = render(
+      <ChatMessageList
+        messages={[
+          {
+            id: 'u1',
+            role: 'user',
+            content: 'hello',
+            timestamp: '2026-03-30T00:00:00.000Z',
+          },
+        ]}
+        isAgentResponding
+      />,
+    );
+
+    expect(screen.getByTestId('typing-indicator')).toBeTruthy();
+
+    rerender(
+      <ChatMessageList
+        messages={[
+          {
+            id: 'u1',
+            role: 'user',
+            content: 'hello',
+            timestamp: '2026-03-30T00:00:00.000Z',
+          },
+          {
+            id: 'a1',
+            role: 'assistant',
+            content: 'response',
+            timestamp: '2026-03-30T00:00:01.000Z',
+          },
+        ]}
+        isAgentResponding
+      />,
+    );
+
+    expect(screen.queryByTestId('typing-indicator')).toBeNull();
+  });
+
   beforeEach(() => {
     scrollIntoViewMock.mockReset();
     Element.prototype.scrollIntoView = scrollIntoViewMock;
@@ -58,7 +98,7 @@ describe('ChatMessageList', () => {
   });
 
   it('does not auto-scroll and shows New messages when user scrolled up', () => {
-    const { rerender } = render(<ChatMessageList messages={baseMessages} streamingContent={{}} />);
+    const { rerender } = render(<ChatMessageList messages={baseMessages} />);
 
     const scroller = screen.getByTestId('chat-scroll-container');
     setScrollMetrics(scroller, {
@@ -70,7 +110,7 @@ describe('ChatMessageList', () => {
     scroller.dispatchEvent(new Event('scroll'));
     scrollIntoViewMock.mockClear();
 
-    rerender(<ChatMessageList messages={baseMessages} streamingContent={{ stream1: 'new chunk' }} />);
+    rerender(<ChatMessageList messages={baseMessages} />);
 
     expect(scrollIntoViewMock).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: '↓ New messages' })).toBeTruthy();
@@ -96,7 +136,7 @@ describe('ChatMessageList', () => {
       },
     ];
 
-    const { container } = render(<ChatMessageList messages={messages} streamingContent={{}} />);
+    const { container } = render(<ChatMessageList messages={messages} />);
 
     expect(screen.getByRole('heading', { level: 1, name: 'Heading One' })).toBeTruthy();
     expect(screen.getByRole('heading', { level: 2, name: 'Heading Two' })).toBeTruthy();
@@ -123,7 +163,7 @@ describe('ChatMessageList', () => {
       },
     ];
 
-    render(<ChatMessageList messages={messages} streamingContent={{}} />);
+    render(<ChatMessageList messages={messages} />);
 
     expect(screen.getByText('typescript')).toBeTruthy();
     const copyButtons = screen.getAllByRole('button', { name: 'Copy code' });
@@ -151,7 +191,7 @@ describe('ChatMessageList', () => {
       },
     ];
 
-    render(<ChatMessageList messages={messages} streamingContent={{}} onRetryMessage={onRetryMessage} />);
+    render(<ChatMessageList messages={messages} onRetryMessage={onRetryMessage} />);
 
     expect(screen.getByTestId('message-pending-indicator')).toBeTruthy();
     expect(screen.getByTestId('message-failed-indicator')).toBeTruthy();
@@ -177,7 +217,7 @@ describe('ChatMessageList', () => {
       },
     ];
 
-    render(<ChatMessageList messages={messages} streamingContent={{}} />);
+    render(<ChatMessageList messages={messages} />);
 
     const messageCopy = screen.getByRole('button', { name: 'Copy message' });
     fireEvent.click(messageCopy);
