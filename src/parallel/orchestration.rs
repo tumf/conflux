@@ -67,22 +67,29 @@ impl ParallelExecutor {
         let merge_stall_monitor_handle = if let Some(cancel_token) = &self.cancel_token {
             let merge_stall_config = self.config.get_merge_stall_detection();
             if merge_stall_config.enabled {
-                if let Some(original_branch) = self.workspace_manager.original_branch() {
-                    info!(
-                        threshold_minutes = merge_stall_config.threshold_minutes,
-                        check_interval_seconds = merge_stall_config.check_interval_seconds,
-                        base_branch = %original_branch,
-                        "Starting merge stall monitor for parallel execution"
-                    );
-                    let monitor = MergeStallMonitor::new(
-                        merge_stall_config,
-                        &self.repo_root,
-                        original_branch.to_string(),
-                    );
-                    Some(monitor.spawn_monitor(cancel_token.clone()))
-                } else {
-                    warn!("Cannot start merge stall monitor: base branch not initialized");
-                    None
+                match self
+                    .workspace_manager
+                    .ensure_original_branch_initialized()
+                    .await
+                {
+                    Ok(original_branch) => {
+                        info!(
+                            threshold_minutes = merge_stall_config.threshold_minutes,
+                            check_interval_seconds = merge_stall_config.check_interval_seconds,
+                            base_branch = %original_branch,
+                            "Starting merge stall monitor for parallel execution"
+                        );
+                        let monitor = MergeStallMonitor::new(
+                            merge_stall_config,
+                            &self.repo_root,
+                            original_branch.to_string(),
+                        );
+                        Some(monitor.spawn_monitor(cancel_token.clone()))
+                    }
+                    Err(e) => {
+                        warn!("Cannot start merge stall monitor: {}", e);
+                        None
+                    }
                 }
             } else {
                 None

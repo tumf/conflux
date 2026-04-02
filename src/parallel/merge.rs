@@ -532,9 +532,11 @@ impl ParallelExecutor {
             VcsBackend::Git | VcsBackend::Auto
         ) {
             let base_revision = self.workspace_manager.get_current_revision().await?;
-            let target_branch = self.workspace_manager.original_branch().ok_or_else(|| {
-                OrchestratorError::GitCommand("Original branch not initialized".to_string())
-            })?;
+            let target_branch = self
+                .workspace_manager
+                .ensure_original_branch_initialized()
+                .await
+                .map_err(OrchestratorError::from_vcs_error)?;
 
             if change_ids.len() != revisions.len() {
                 return Err(OrchestratorError::GitCommand(format!(

@@ -121,7 +121,11 @@ impl ParallelExecutor {
         let acceptance_tail_injected = self.acceptance_tail_injected.clone();
         let cancel_token = self.cancel_token.clone();
         let shared_stagger_state = self.shared_stagger_state.clone();
-        let base_branch = self.workspace_manager.original_branch();
+        let base_branch = self
+            .workspace_manager
+            .ensure_original_branch_initialized()
+            .await
+            .map_err(OrchestratorError::from_vcs_error)?;
         let dynamic_queue = self.dynamic_queue.clone();
         let workspace = workspace_val;
 
@@ -137,7 +141,7 @@ impl ParallelExecutor {
                 match detect_workspace_state(
                     &change_id,
                     &workspace.path,
-                    base_branch.as_deref().unwrap_or("main"),
+                    &base_branch,
                 )
                 .await
                 {
@@ -490,7 +494,7 @@ impl ParallelExecutor {
                     &config,
                     &acceptance_tail_injected,
                     &acceptance_history,
-                    base_branch.as_deref(),
+                    Some(base_branch.as_str()),
                 )
                 .await;
 
@@ -635,9 +639,7 @@ impl ParallelExecutor {
                             change_id
                         );
 
-                        let resolved_base = base_branch
-                            .clone()
-                            .unwrap_or_else(|| "main".to_string());
+                        let resolved_base = base_branch.clone();
 
                         match execute_rejection_flow(
                             &change_id,

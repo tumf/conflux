@@ -120,7 +120,8 @@ impl GitWorkspaceManager {
     }
 
     /// Ensure the original branch is initialized (with interior mutability)
-    pub async fn ensure_original_branch(&self) -> VcsResult<()> {
+    /// and return the initialized branch name.
+    pub async fn ensure_original_branch(&self) -> VcsResult<String> {
         let mut branch_guard = self.original_branch.lock().await;
         if branch_guard.is_none() {
             *branch_guard = match commands::get_current_branch(&self.repo_root).await? {
@@ -130,7 +131,10 @@ impl GitWorkspaceManager {
                 )),
             };
         }
-        Ok(())
+
+        branch_guard
+            .clone()
+            .ok_or_else(|| VcsError::git_command("Original branch not initialized"))
     }
 
     /// Create a new worktree for a change from a specific base commit
@@ -140,7 +144,7 @@ impl GitWorkspaceManager {
         base_commit: Option<&str>,
     ) -> VcsResult<GitWorkspace> {
         // Ensure original branch is initialized
-        self.ensure_original_branch().await?;
+        let _ = self.ensure_original_branch().await?;
 
         // Use change_id directly as branch name (sanitized)
         let branch_name = change_id.replace(['/', '\\', ' '], "-");
@@ -210,7 +214,7 @@ impl GitWorkspaceManager {
         }
 
         // Ensure original branch is initialized
-        self.ensure_original_branch().await?;
+        let _ = self.ensure_original_branch().await?;
 
         // Determine the target for merge (clone to avoid holding the lock)
         let original = self
@@ -961,6 +965,10 @@ impl WorkspaceManager for GitWorkspaceManager {
         &self.repo_root
     }
 
+    async fn ensure_original_branch_initialized(&self) -> VcsResult<String> {
+        self.ensure_original_branch().await
+    }
+
     fn original_branch(&self) -> Option<String> {
         // Use try_lock for synchronous access (should not block in practice)
         self.original_branch
@@ -1024,7 +1032,7 @@ impl WorkspaceManager for GitWorkspaceManager {
 
     async fn reuse_workspace(&mut self, workspace_info: &WorkspaceInfo) -> VcsResult<Workspace> {
         // Ensure original branch is initialized
-        self.ensure_original_branch().await?;
+        let _ = self.ensure_original_branch().await?;
 
         info!(
             "Reusing existing worktree '{}' at {:?}",
