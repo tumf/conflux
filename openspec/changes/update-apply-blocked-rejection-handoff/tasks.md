@@ -12,3 +12,8 @@
 
 - `tasks.md` 自体に blocked/cancelled などの多値タスク状態を導入する設計検討
 - apply/acceptance 間で構造化 blocker payload を受け渡す専用メタデータファイルの検討
+
+## Acceptance #1 Failure Follow-up
+
+- [x] apply-generated `REJECTED.md` proposal が acceptance 確認前に terminal rejection として扱われないよう、change 列挙/解析ロジックを修正する
+- [x] apply blocked handoff 中でも `openspec::list_changes_native()` 等の change discovery が対象 change を可視のまま維持する回帰テストを追加する
