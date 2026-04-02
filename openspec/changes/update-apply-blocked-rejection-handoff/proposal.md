@@ -6,6 +6,10 @@ references:
   - src/parallel/dispatch.rs
   - src/orchestration/rejection.rs
   - src/execution/state.rs
+  - skills/cflx-workflow/SKILL.md
+  - skills/cflx-workflow/references/cflx-apply.md
+  - skills/cflx-workflow/references/cflx-accept.md
+  - src/embedded_skills.rs
   - openspec/specs/parallel-execution/spec.md
   - openspec/specs/orchestration-state/spec.md
 ---
@@ -33,6 +37,8 @@ apply フェーズに `blocked / reject-proposed` 相当の正式な出口を追
 - acceptance が reject を承認しない場合は apply 継続またはエラーへ戻す
 
 既存の `AcceptanceResult::Blocked` と `REJECTED.md` ベースの終端フローは維持しつつ、apply blocker がそこへ到達するための橋渡しを追加する。
+
+この変更には、`cflx install-skills --global` で `~/.agents/skills/cflx-workflow/` へ配布される元ソースである `skills/cflx-workflow/` の更新を含む。特に apply prompt source (`skills/cflx-workflow/references/cflx-apply.md`) と accept prompt source (`skills/cflx-workflow/references/cflx-accept.md`) を、apply-generated `REJECTED.md` proposal を正式な blocked handoff 契約として扱うよう整合させる。
 
 ## Acceptance Criteria
 
