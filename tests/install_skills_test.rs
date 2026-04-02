@@ -33,7 +33,7 @@ fn create_test_skills_dir(base: &TempDir) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_project_scope_install_creates_agents_skills_dir() {
+fn test_project_scope_install_creates_agents_skills_dir_and_updates_lock_file() {
     // Embedded skills are preferred; no skills/ directory needed.
     let workdir = TempDir::new().unwrap();
 
@@ -52,20 +52,7 @@ fn test_project_scope_install_creates_agents_skills_dir() {
 
     let lock_path = workdir.path().join(".agents/.skill-lock.json");
     assert!(lock_path.exists(), "Expected lock file at {lock_path:?}");
-}
 
-#[test]
-fn test_project_scope_install_updates_lock_file() {
-    // Embedded skills are preferred; lock entry source_type must be "self".
-    let workdir = TempDir::new().unwrap();
-
-    let opts = InstallSkillsOptions {
-        global: false,
-        project_root: Some(workdir.path().to_path_buf()),
-    };
-    run_install_skills(opts).unwrap();
-
-    let lock_path = workdir.path().join(".agents/.skill-lock.json");
     let lock_manager = LockManager::new(lock_path);
     let entry = lock_manager.get_entry("cflx-proposal").unwrap();
     assert!(
@@ -81,14 +68,16 @@ fn test_project_scope_install_updates_lock_file() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_global_scope_install_uses_home_agents_dir() {
+fn test_global_scope_install_uses_home_agents_dir_and_updates_lock_file() {
     let workdir = TempDir::new().unwrap();
     let fake_home = TempDir::new().unwrap();
 
     let _guard = HOME_MUTEX.lock().unwrap();
 
     let orig_home = std::env::var("HOME").ok();
-    std::env::set_var("HOME", fake_home.path());
+    unsafe {
+        std::env::set_var("HOME", fake_home.path());
+    }
 
     let opts = InstallSkillsOptions {
         global: true,
@@ -96,9 +85,11 @@ fn test_global_scope_install_uses_home_agents_dir() {
     };
     let result = run_install_skills(opts);
 
-    match orig_home {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
+    unsafe {
+        match orig_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
     drop(_guard);
 
@@ -116,31 +107,7 @@ fn test_global_scope_install_uses_home_agents_dir() {
         lock_path.exists(),
         "Expected global lock file at {lock_path:?}"
     );
-}
 
-#[test]
-fn test_global_scope_lock_entry_exists() {
-    let workdir = TempDir::new().unwrap();
-    let fake_home = TempDir::new().unwrap();
-
-    let _guard = HOME_MUTEX.lock().unwrap();
-
-    let orig_home = std::env::var("HOME").ok();
-    std::env::set_var("HOME", fake_home.path());
-
-    let opts = InstallSkillsOptions {
-        global: true,
-        project_root: Some(workdir.path().to_path_buf()),
-    };
-    run_install_skills(opts).unwrap();
-
-    match orig_home {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
-    }
-    drop(_guard);
-
-    let lock_path = fake_home.path().join(".agents/.skill-lock.json");
     let lock_manager = LockManager::new(lock_path);
     let entry = lock_manager.get_entry("cflx-proposal").unwrap();
     assert!(
