@@ -43,6 +43,10 @@ fn default_selected() -> bool {
     true
 }
 
+fn default_remote_sync_state() -> String {
+    "unknown".to_string()
+}
+
 /// A project group from the remote server
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RemoteProject {
@@ -60,6 +64,30 @@ pub struct RemoteProject {
     pub is_busy: bool,
     /// Error message, if any
     pub error: Option<String>,
+    /// Computed sync classification: up_to_date/ahead/behind/diverged/unknown
+    #[serde(default = "default_remote_sync_state")]
+    pub sync_state: String,
+    /// Number of commits local is ahead of remote
+    #[serde(default)]
+    pub ahead_count: u32,
+    /// Number of commits local is behind remote
+    #[serde(default)]
+    pub behind_count: u32,
+    /// Whether sync attention is currently required
+    #[serde(default)]
+    pub sync_required: bool,
+    /// Local SHA used for latest classification
+    #[serde(default)]
+    pub local_sha: Option<String>,
+    /// Remote SHA used for latest classification
+    #[serde(default)]
+    pub remote_sha: Option<String>,
+    /// ISO 8601 timestamp for latest remote sync-state check
+    #[serde(default)]
+    pub last_remote_check_at: Option<String>,
+    /// Latest remote check error details when refresh failed
+    #[serde(default)]
+    pub remote_check_error: Option<String>,
     /// Changes belonging to this project
     pub changes: Vec<RemoteChange>,
 }

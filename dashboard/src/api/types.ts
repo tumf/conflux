@@ -16,6 +16,8 @@ export type ChangeStatus =
   | 'rejected'
   | 'error';
 
+export type RemoteSyncState = 'up_to_date' | 'ahead' | 'behind' | 'diverged' | 'unknown';
+
 export interface RemoteProject {
   id: string;
   /** Display name in "repo@branch" format */
@@ -25,6 +27,22 @@ export interface RemoteProject {
   status: ProjectStatus;
   is_busy: boolean;
   error: string | null;
+  /** Computed sync classification against remote branch */
+  sync_state: RemoteSyncState;
+  /** Number of commits local is ahead of remote */
+  ahead_count: number;
+  /** Number of commits local is behind remote */
+  behind_count: number;
+  /** Whether sync attention is currently required */
+  sync_required: boolean;
+  /** Local SHA used for latest sync-state check */
+  local_sha: string | null;
+  /** Remote SHA used for latest sync-state check */
+  remote_sha: string | null;
+  /** Timestamp of latest remote sync-state check */
+  last_remote_check_at: string | null;
+  /** Latest remote check error details when refresh failed */
+  remote_check_error: string | null;
   /** Changes nested within this project (from server) */
   changes: RemoteChange[];
 }

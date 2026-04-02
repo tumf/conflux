@@ -123,6 +123,13 @@ pub async fn run_server(
         proposal_session_manager,
     };
 
+    {
+        let registry_for_monitor = app_state.registry.clone();
+        tokio::spawn(async move {
+            api::run_remote_sync_state_monitor(registry_for_monitor).await;
+        });
+    }
+
     // Build router.
     let router = api::build_router(app_state.clone());
 

@@ -132,6 +132,14 @@ pub fn full_state_json(project_id: &str, project_name: &str, changes_json: &[Str
                     "status": "idle",
                     "is_busy": false,
                     "error": null,
+                    "sync_state": "up_to_date",
+                    "ahead_count": 0,
+                    "behind_count": 0,
+                    "sync_required": false,
+                    "local_sha": null,
+                    "remote_sha": null,
+                    "last_remote_check_at": null,
+                    "remote_check_error": null,
                     "changes": [{changes}]
                 }}
             ],
@@ -200,6 +208,14 @@ pub fn make_remote_project(id: &str, name: &str, changes: Vec<RemoteChange>) -> 
         status: "idle".to_string(),
         is_busy: false,
         error: None,
+        sync_state: "up_to_date".to_string(),
+        ahead_count: 0,
+        behind_count: 0,
+        sync_required: false,
+        local_sha: None,
+        remote_sha: None,
+        last_remote_check_at: None,
+        remote_check_error: None,
         changes,
     }
 }

@@ -11,7 +11,7 @@ afterEach(() => {
 });
 
 describe('ChatInput', () => {
-  it('preserves newline on Enter and sends on Shift+Enter', () => {
+  it('sends on Enter and preserves multiline input with Shift+Enter', () => {
     const onSend = vi.fn();
 
     render(<ChatInput onSend={onSend} status="ready" />);
@@ -21,13 +21,12 @@ describe('ChatInput', () => {
     fireEvent.change(textarea, { target: { value: 'hello' } });
     fireEvent.keyDown(textarea, { key: 'Enter' });
 
-    expect(onSend).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith('hello');
 
-    fireEvent.change(textarea, { target: { value: 'line1' } });
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: true });
 
     expect(onSend).toHaveBeenCalledTimes(1);
-    expect(onSend).toHaveBeenCalledWith('line1');
   });
 
   it('keeps textarea enabled while send button is disabled during non-ready states', () => {
@@ -42,7 +41,7 @@ describe('ChatInput', () => {
     expect(sendButton.disabled).toBe(true);
   });
 
-  it('keeps input value after sending', () => {
+  it('clears input immediately after successful send', () => {
     const onSend = vi.fn();
 
     render(<ChatInput onSend={onSend} status="ready" />);
@@ -53,6 +52,6 @@ describe('ChatInput', () => {
     fireEvent.click(screen.getByLabelText('Send message'));
 
     expect(onSend).toHaveBeenCalledWith('trim me');
-    expect(textarea.value).toBe('trim me ');
+    expect(textarea.value).toBe('');
   });
 });

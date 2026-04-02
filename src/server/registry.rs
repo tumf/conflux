@@ -53,6 +53,65 @@ impl OrchestrationStatus {
     }
 }
 
+/// Computed synchronization state between local and remote refs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectSyncState {
+    /// Local and remote point to the same commit.
+    UpToDate,
+    /// Local has commits not present on remote.
+    Ahead,
+    /// Remote has commits not present on local.
+    Behind,
+    /// Local and remote both have unique commits.
+    Diverged,
+    /// Sync state could not be determined due to refresh failure.
+    #[default]
+    Unknown,
+}
+
+impl ProjectSyncState {
+    /// Return the snake_case representation for API payloads.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProjectSyncState::UpToDate => "up_to_date",
+            ProjectSyncState::Ahead => "ahead",
+            ProjectSyncState::Behind => "behind",
+            ProjectSyncState::Diverged => "diverged",
+            ProjectSyncState::Unknown => "unknown",
+        }
+    }
+}
+
+/// Persisted per-project remote synchronization metadata.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectSyncMetadata {
+    /// Computed synchronization classification.
+    #[serde(default)]
+    pub sync_state: ProjectSyncState,
+    /// Number of commits local is ahead of remote.
+    #[serde(default)]
+    pub ahead_count: u32,
+    /// Number of commits local is behind remote.
+    #[serde(default)]
+    pub behind_count: u32,
+    /// Whether this project currently requires operator sync attention.
+    #[serde(default)]
+    pub sync_required: bool,
+    /// Local branch SHA used for latest classification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_sha: Option<String>,
+    /// Remote branch SHA used for latest classification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_sha: Option<String>,
+    /// ISO 8601 timestamp when the latest remote check finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_remote_check_at: Option<String>,
+    /// Error message from the latest failed check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_check_error: Option<String>,
+}
+
 /// A managed project entry in the registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectEntry {
@@ -65,6 +124,9 @@ pub struct ProjectEntry {
     /// Current execution status.
     #[serde(default)]
     pub status: ProjectStatus,
+    /// Latest computed synchronization metadata.
+    #[serde(default)]
+    pub sync_metadata: ProjectSyncMetadata,
     /// ISO 8601 creation timestamp.
     pub created_at: String,
 }
@@ -79,6 +141,7 @@ impl ProjectEntry {
             remote_url,
             branch,
             status: ProjectStatus::default(),
+            sync_metadata: ProjectSyncMetadata::default(),
             created_at,
         }
     }
@@ -239,6 +302,19 @@ impl ProjectRegistry {
             OrchestratorError::ConfigLoad(format!("Project not found: id={}", id))
         })?;
         entry.status = status;
+        self.save()
+    }
+
+    /// Update per-project remote sync metadata and persist.
+    pub fn set_sync_metadata(
+        &mut self,
+        id: &str,
+        sync_metadata: ProjectSyncMetadata,
+    ) -> Result<()> {
+        let entry = self.projects.get_mut(id).ok_or_else(|| {
+            OrchestratorError::ConfigLoad(format!("Project not found: id={}", id))
+        })?;
+        entry.sync_metadata = sync_metadata;
         self.save()
     }
 

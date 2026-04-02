@@ -24,6 +24,15 @@ else
   echo "llm-tldr cache not found at ${ROOT_WORKTREE_PATH}/.tldr/cache; skipping copy" 1>&2
 fi
 
+echo "Copying dashboard build artifacts into worktree..."
+if [ -d "${ROOT_WORKTREE_PATH}/dashboard/dist" ]; then
+  mkdir -p dashboard
+  rm -rf dashboard/dist
+  cp -R "${ROOT_WORKTREE_PATH}/dashboard/dist" dashboard/dist
+else
+  echo "dashboard/dist not found at ${ROOT_WORKTREE_PATH}/dashboard/dist; skipping copy (cargo build may fail)" 1>&2
+fi
+
 hooks_dir="$(git rev-parse --git-dir 2>/dev/null)/hooks"
 if [ -n "$hooks_dir" ]; then
   case "$hooks_dir" in

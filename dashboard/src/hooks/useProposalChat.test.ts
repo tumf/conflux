@@ -243,6 +243,42 @@ describe('useProposalChat', () => {
     expect(result.current.error).toBeNull();
   });
 
+  it('returns to ready when reconnect recovery confirms no active turn', async () => {
+    const { result } = renderHook(() => useProposalChat('project-1', 'session-1'));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const socket = MockWebSocket.instances[0];
+
+    act(() => {
+      socket.emitOpen();
+      result.current.sendMessage('recover me');
+      socket.emitMessage({ type: 'agent_message_chunk', text: 'partial', message_id: 'assistant-1' });
+    });
+
+    act(() => {
+      socket.emitClose();
+    });
+
+    expect(['recovering', 'streaming']).toContain(result.current.status);
+
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+
+    const reconnectSocket = MockWebSocket.instances[1];
+
+    act(() => {
+      reconnectSocket.emitOpen();
+      reconnectSocket.emitMessage({ type: 'recovery_state', active: false });
+    });
+
+    expect(result.current.status).toBe('ready');
+    expect(result.current.error).toBeNull();
+  });
+
   it('does not flush duplicate prompt once server already acknowledged it', async () => {
     const { result } = renderHook(() => useProposalChat('project-1', 'session-1'));
 
