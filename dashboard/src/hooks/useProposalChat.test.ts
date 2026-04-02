@@ -134,6 +134,8 @@ describe('useProposalChat', () => {
       vi.runOnlyPendingTimers();
     });
 
+    expect(result.current.submissionLock.isLocked).toBe(true);
+
     const sent = JSON.parse(socket.sentMessages[0]);
 
     act(() => {
@@ -149,6 +151,7 @@ describe('useProposalChat', () => {
     expect(result.current.messages).toHaveLength(1);
     expect(result.current.messages[0].id).toBe('server-user-1');
     expect(result.current.messages[0].sendStatus).toBe('sent');
+    expect(result.current.submissionLock.isLocked).toBe(false);
   });
 
   it('enters recovering and schedules reconnect when disconnected mid-turn', async () => {
@@ -167,6 +170,7 @@ describe('useProposalChat', () => {
     });
 
     expect(result.current.status).toBe('streaming');
+    expect(result.current.submissionLock.isLocked).toBe(true);
 
     act(() => {
       socket.emitClose();
@@ -204,6 +208,7 @@ describe('useProposalChat', () => {
     });
 
     expect(result.current.status).toBe('streaming');
+    expect(result.current.submissionLock.isLocked).toBe(true);
   });
 
   it('keeps recovering until replay indicates completed turn', async () => {
@@ -302,6 +307,8 @@ describe('useProposalChat', () => {
       firstSocket.emitClose();
     });
 
+    expect(result.current.submissionLock.isLocked).toBe(false);
+
     act(() => {
       vi.advanceTimersByTime(1000);
     });
@@ -312,6 +319,46 @@ describe('useProposalChat', () => {
     });
 
     expect(reconnectSocket.sentMessages).toHaveLength(0);
+  });
+
+  it('allows next submission after ACK even while assistant is streaming', async () => {
+    const { result } = renderHook(() => useProposalChat('project-1', 'session-1'));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const socket = MockWebSocket.instances[0];
+
+    act(() => {
+      socket.emitOpen();
+      result.current.sendMessage('first');
+    });
+
+    const firstPrompt = JSON.parse(socket.sentMessages[0]);
+
+    act(() => {
+      socket.emitMessage({
+        type: 'user_message',
+        id: 'server-first',
+        content: 'first',
+        timestamp: '2026-04-01T00:00:00Z',
+        client_message_id: firstPrompt.client_message_id,
+      });
+      socket.emitMessage({ type: 'agent_message_chunk', text: 'still streaming', message_id: 'assistant-1' });
+    });
+
+    expect(result.current.status).toBe('streaming');
+    expect(result.current.submissionLock.isLocked).toBe(false);
+
+    act(() => {
+      result.current.sendMessage('second');
+    });
+
+    expect(socket.sentMessages).toHaveLength(2);
+    const secondPrompt = JSON.parse(socket.sentMessages[1]);
+    expect(secondPrompt.content).toBe('second');
+    expect(result.current.submissionLock.isLocked).toBe(true);
   });
 
   it('hydrates history from REST and preserves it after websocket connect', async () => {

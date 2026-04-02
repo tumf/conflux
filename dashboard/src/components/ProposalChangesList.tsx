@@ -65,13 +65,13 @@ export function ProposalChangesList({ projectId, sessionId, onClickChange }: Pro
       </div>
       {changes.map((change) => (
         <button
-          key={change.change_id}
-          onClick={() => onClickChange?.(change.change_id)}
+          key={change.id}
+          onClick={() => onClickChange?.(change.id)}
           className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-text-muted transition-colors hover:bg-border/50"
         >
           <FileText className="size-3.5 shrink-0 text-accent" />
           <div className="min-w-0">
-            <div className="truncate font-mono">{change.change_id}</div>
+            <div className="truncate font-mono">{change.id}</div>
             {change.title && (
               <div className="truncate text-text-subtle">{change.title}</div>
             )}
