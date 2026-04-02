@@ -45,6 +45,18 @@ class OpenSpecManager:
         self.archive_dir = self.changes_dir / "archive"
         self.specs_dir = self.root_dir / "openspec" / "specs"
 
+    def _is_valid_change_dir(self, change_dir: Path) -> bool:
+        """Return True when directory is a valid change (has proposal.md)."""
+        return (change_dir / "proposal.md").exists()
+
+    @staticmethod
+    def _warn_invalid_change_dir(change_dir: Path) -> None:
+        """Emit warning for invalid change directory."""
+        print(
+            f"Warning: Ignoring invalid change directory '{change_dir.name}' (missing proposal.md)",
+            file=sys.stderr,
+        )
+
     def list_changes(
         self, show_specs: bool = False, include_archived: bool = False
     ) -> List[Dict]:
@@ -58,6 +70,9 @@ class OpenSpecManager:
 
         for item in self.changes_dir.iterdir():
             if item.is_dir() and item.name != "archive":
+                if not self._is_valid_change_dir(item):
+                    self._warn_invalid_change_dir(item)
+                    continue
                 change_info = self._get_change_info(item)
                 if change_info:
                     changes.append(change_info)
@@ -65,6 +80,9 @@ class OpenSpecManager:
         if include_archived and self.archive_dir.exists():
             for item in self.archive_dir.iterdir():
                 if item.is_dir():
+                    if not self._is_valid_change_dir(item):
+                        self._warn_invalid_change_dir(item)
+                        continue
                     change_info = self._get_change_info(item, archived=True)
                     if change_info:
                         changes.append(change_info)
@@ -201,13 +219,21 @@ class OpenSpecManager:
         """Find the directory for a given change ID."""
         # Check active changes
         change_dir = self.changes_dir / change_id
-        if change_dir.exists():
+        if change_dir.exists() and self._is_valid_change_dir(change_dir):
             return change_dir
+        if change_dir.exists() and not self._is_valid_change_dir(change_dir):
+            self._warn_invalid_change_dir(change_dir)
 
         # Check archive
         archive_change_dir = self.archive_dir / change_id
-        if archive_change_dir.exists():
+        if archive_change_dir.exists() and self._is_valid_change_dir(
+            archive_change_dir
+        ):
             return archive_change_dir
+        if archive_change_dir.exists() and not self._is_valid_change_dir(
+            archive_change_dir
+        ):
+            self._warn_invalid_change_dir(archive_change_dir)
 
         return None
 
