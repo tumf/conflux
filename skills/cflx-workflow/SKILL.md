@@ -82,6 +82,9 @@ Before changing any task to `[x]`, verify all applicable conditions below are tr
 2. The artifact is reachable from the intended flow when the task claims runtime integration.
 3. The relevant verification command has been run successfully, or concrete blocker evidence has been recorded.
 4. The task description still matches reality. If the task is too broad or ambiguous, refine it before completion.
+5. Tasks claiming unit-test coverage are complete only when tests are genuinely unit-scoped and do not rely on real stateful external boundaries.
+6. If added tests require real stateful external boundaries, classify them as integration/e2e evidence; do not use them as unit-test completion evidence.
+7. Unit-test completion is invalid when the only evidence is integration-style tests that exercise real git/process/filesystem/network/database/timer flows.
 
 Never mark a task complete based only on any of the following:
 
@@ -122,11 +125,20 @@ Never mark a task complete based only on any of the following:
 - External deployment needed
 ```
 
+### Unit Test Boundary Policy
+
+- Unit tests MUST NOT directly depend on real stateful external boundaries.
+- Treat the following as unit-test external boundaries: VCS/SCM, network/API, database, real filesystem state, real OS process/CLI tool execution, clock/sleep/timer, and environment-dependent permissions/credentials/OS state.
+- For logic-oriented tasks, extract decision logic into helpers/traits/interfaces/pure functions and verify with mocks/fakes/in-memory doubles.
+- If a test must exercise real external boundaries, classify it as integration/e2e rather than unit.
+
 ### Mock-First Policy
 
 - Mock external dependencies when possible
 - Do not block on missing API keys/credentials
 - Implement stub/fixture for external services
+- For unit-test tasks, isolate decision logic from boundary access and verify with mocks/fakes/in-memory doubles
+- Unit-test completion is invalid when tests rely on real stateful external boundaries
 - Only truly non-mockable dependencies go to Future Work
 
 ### Implementation Blocker Escalation
@@ -231,6 +243,8 @@ Before running checks, read `proposal.md` and detect the `Change Type` field:
    - FAIL if `tasks.md` claims completion but the corresponding code/tests/entrypoints do not exist
    - FAIL if a change was archived/spec-promoted while implementation tasks were marked complete without repository evidence
    - FAIL if the only evidence for an *implementation* task is `openspec/` edits
+   - FAIL if a task claims unit-test coverage but evidence is integration-style tests relying on real stateful external boundaries (classification mismatch)
+   - For classification mismatch findings, require follow-up to either extract pure decision logic for unit tests or reclassify coverage as integration/e2e and update checklist claims
    - Exception: for `spec-only` changes, `openspec/` spec delta edits ARE the expected artifact
 
 ### Output Format
