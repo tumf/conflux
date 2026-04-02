@@ -9,7 +9,7 @@ import {
 } from '../api/types';
 import { getProposalSessionWsUrl, listProposalSessionMessages } from '../api/restClient';
 
-export type ProposalChatStatus = 'ready' | 'submitted' | 'streaming' | 'error';
+export type ProposalChatStatus = 'ready' | 'submitted' | 'streaming' | 'recovering' | 'error';
 
 interface PendingPrompt {
   content: string;
@@ -48,6 +48,9 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
   const activeAssistantMessageIdRef = useRef<string | null>(null);
   const statusRef = useRef<ProposalChatStatus>('ready');
   const historyLoadedRef = useRef(false);
+  const sessionGenerationRef = useRef(0);
+  const acceptedPromptIdsRef = useRef<Set<string>>(new Set());
+  const recoveryTurnIdRef = useRef<string | null>(null);
 
   const transitionStatus = useCallback((next: ProposalChatStatus, reason: string) => {
     setStatus((prev) => {
@@ -113,6 +116,14 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
     const queue = [...pendingPromptsRef.current];
     pendingPromptsRef.current = [];
     queue.forEach((prompt) => {
+      if (acceptedPromptIdsRef.current.has(prompt.clientMessageId)) {
+        console.info('proposal-chat skipped duplicate prompt flush after reconnect', {
+          clientMessageId: prompt.clientMessageId,
+          at: nowIso(),
+        });
+        return;
+      }
+
       ws.send(
         JSON.stringify({
           type: 'prompt',
@@ -126,7 +137,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
   const failActiveTurn = useCallback(
     (reason: string) => {
       const current = statusRef.current;
-      if (current === 'submitted' || current === 'streaming') {
+      if (current === 'submitted' || current === 'streaming' || current === 'recovering') {
         transitionStatus('error', reason);
         setError(reason);
       }
@@ -134,12 +145,38 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
     [transitionStatus],
   );
 
+  const enterRecovery = useCallback(
+    (reason: string) => {
+      const current = statusRef.current;
+      if (current === 'submitted' || current === 'streaming') {
+        transitionStatus('recovering', reason);
+        setError(null);
+      }
+    },
+    [transitionStatus],
+  );
+
   const handleServerMessage = useCallback(
-    (msg: ProposalWsServerMessage) => {
+    (msg: ProposalWsServerMessage, generation: number) => {
+      if (sessionGenerationRef.current !== generation || unmountedRef.current) {
+        console.debug('proposal-chat discard stale websocket event', {
+          projectId,
+          sessionId,
+          generation,
+          currentGeneration: sessionGenerationRef.current,
+          type: msg.type,
+          at: nowIso(),
+        });
+        return;
+      }
       switch (msg.type) {
         case 'user_message': {
           const cid = msg.client_message_id;
           if (cid) {
+            acceptedPromptIdsRef.current.add(cid);
+            pendingPromptsRef.current = pendingPromptsRef.current.filter(
+              (prompt) => prompt.clientMessageId !== cid,
+            );
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === cid
@@ -167,6 +204,9 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
         case 'agent_message_chunk': {
           const messageId = msg.message_id ?? activeAssistantMessageIdRef.current ?? `assistant-${Date.now()}`;
           activeAssistantMessageIdRef.current = messageId;
+          if (msg.turn_id) {
+            recoveryTurnIdRef.current = msg.turn_id;
+          }
           setMessages((prev) => {
             const idx = prev.findIndex((m) => m.id === messageId);
             if (idx === -1) {
@@ -183,6 +223,10 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
             }
             const copy = [...prev];
             const target = copy[idx];
+            const isReplayDuplicate = Boolean(msg.message_id) && target.content === msg.text;
+            if (isReplayDuplicate) {
+              return prev;
+            }
             copy[idx] = {
               ...target,
               content: `${target.content}${msg.text}`,
@@ -191,6 +235,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
             return copy;
           });
           transitionStatus('streaming', 'agent_message_chunk');
+          setError(null);
           break;
         }
         case 'agent_thought_chunk':
@@ -198,12 +243,16 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
         case 'tool_call': {
           const messageId = msg.message_id ?? activeAssistantMessageIdRef.current;
           if (!messageId) return;
+          if (msg.turn_id) {
+            recoveryTurnIdRef.current = msg.turn_id;
+          }
           updateToolCall(messageId, {
             id: msg.tool_call_id,
             title: msg.title,
             status: msg.status,
           });
           transitionStatus('streaming', 'tool_call');
+          setError(null);
           break;
         }
         case 'tool_call_update': {
@@ -217,8 +266,23 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
           break;
         case 'turn_complete':
           activeAssistantMessageIdRef.current = null;
+          recoveryTurnIdRef.current = null;
           transitionStatus('ready', 'turn_complete');
           setError(null);
+          break;
+        case 'recovery_state':
+          if (msg.active) {
+            recoveryTurnIdRef.current = msg.turn_id ?? recoveryTurnIdRef.current;
+            transitionStatus('recovering', 'server_recovery_state_active');
+            setError(null);
+          } else {
+            recoveryTurnIdRef.current = null;
+            transitionStatus('ready', 'server_recovery_state_ready');
+            setError(null);
+          }
+          break;
+        case 'heartbeat':
+          // Keepalive signal only; no UI changes needed.
           break;
         case 'error':
           failActiveTurn(msg.message);
@@ -228,68 +292,119 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
     [appendOrUpdateMessage, failActiveTurn, transitionStatus, updateToolCall, updateToolCallStatus],
   );
 
-  const connect = useCallback(() => {
-    if (!projectId || !sessionId || unmountedRef.current) return;
-
-    const ws = new WebSocket(getProposalSessionWsUrl(projectId, sessionId));
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      console.info('proposal-chat websocket connected', { sessionId, historyLoaded: historyLoadedRef.current });
-      setWsConnected(true);
-      reconnectAttemptsRef.current = 0;
-      clearReconnectTimer();
-      flushPendingPrompts();
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        handleServerMessage(JSON.parse(event.data) as ProposalWsServerMessage);
-      } catch (e) {
-        console.error('proposal-chat websocket parse failure', {
+  const connect = useCallback(
+    (generation: number) => {
+      if (!projectId || !sessionId || unmountedRef.current) return;
+      if (sessionGenerationRef.current !== generation) {
+        console.debug('proposal-chat skip stale websocket connect attempt', {
+          projectId,
           sessionId,
-          error: e instanceof Error ? e.message : String(e),
+          generation,
+          currentGeneration: sessionGenerationRef.current,
+          at: nowIso(),
         });
-      }
-    };
-
-    ws.onerror = () => {
-      console.error('proposal-chat websocket error', { sessionId });
-    };
-
-    ws.onclose = () => {
-      setWsConnected(false);
-      wsRef.current = null;
-
-      if (unmountedRef.current) return;
-
-      const currentStatus = statusRef.current;
-      if (currentStatus === 'submitted' || currentStatus === 'streaming') {
-        failActiveTurn('WebSocket disconnected during active turn');
-      }
-
-      if (reconnectAttemptsRef.current >= MAX_RETRIES) {
-        failActiveTurn('WebSocket reconnect limit reached');
         return;
       }
 
-      const nextAttempt = reconnectAttemptsRef.current + 1;
-      reconnectAttemptsRef.current = nextAttempt;
-      const delay = Math.min(
-        RECONNECT_DELAYS_MS[Math.min(nextAttempt - 1, RECONNECT_DELAYS_MS.length - 1)],
-        MAX_RECONNECT_DELAY_MS,
-      );
-      reconnectTimerRef.current = window.setTimeout(connect, delay);
-    };
-  }, [clearReconnectTimer, failActiveTurn, flushPendingPrompts, handleServerMessage, projectId, sessionId]);
+      const ws = new WebSocket(getProposalSessionWsUrl(projectId, sessionId));
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (sessionGenerationRef.current !== generation || unmountedRef.current) {
+          ws.close();
+          return;
+        }
+        console.info('proposal-chat websocket connected', {
+          sessionId,
+          historyLoaded: historyLoadedRef.current,
+          generation,
+        });
+        setWsConnected(true);
+        reconnectAttemptsRef.current = 0;
+        clearReconnectTimer();
+        flushPendingPrompts();
+      };
+
+      ws.onmessage = (event) => {
+        if (sessionGenerationRef.current !== generation || unmountedRef.current) {
+          console.debug('proposal-chat discard stale websocket frame', {
+            projectId,
+            sessionId,
+            generation,
+            currentGeneration: sessionGenerationRef.current,
+            at: nowIso(),
+          });
+          return;
+        }
+        try {
+          handleServerMessage(JSON.parse(event.data) as ProposalWsServerMessage, generation);
+        } catch (e) {
+          console.error('proposal-chat websocket parse failure', {
+            sessionId,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      };
+
+      ws.onerror = () => {
+        if (sessionGenerationRef.current !== generation || unmountedRef.current) {
+          return;
+        }
+        console.error('proposal-chat websocket error', { sessionId, generation });
+      };
+
+      ws.onclose = () => {
+        if (sessionGenerationRef.current !== generation) {
+          return;
+        }
+
+        setWsConnected(false);
+        wsRef.current = null;
+
+        if (unmountedRef.current) return;
+
+        const currentStatus = statusRef.current;
+        if (currentStatus === 'submitted' || currentStatus === 'streaming') {
+          enterRecovery('WebSocket disconnected during active turn');
+        }
+
+        if (reconnectAttemptsRef.current >= MAX_RETRIES) {
+          failActiveTurn('WebSocket reconnect limit reached');
+          return;
+        }
+
+        const nextAttempt = reconnectAttemptsRef.current + 1;
+        reconnectAttemptsRef.current = nextAttempt;
+        const delay = Math.min(
+          RECONNECT_DELAYS_MS[Math.min(nextAttempt - 1, RECONNECT_DELAYS_MS.length - 1)],
+          MAX_RECONNECT_DELAY_MS,
+        );
+        reconnectTimerRef.current = window.setTimeout(() => connect(generation), delay);
+      };
+    },
+    [
+      clearReconnectTimer,
+      enterRecovery,
+      failActiveTurn,
+      flushPendingPrompts,
+      handleServerMessage,
+      projectId,
+      sessionId,
+    ],
+  );
 
   useEffect(() => {
     unmountedRef.current = false;
+    const generation = sessionGenerationRef.current + 1;
+    sessionGenerationRef.current = generation;
+
     setMessages([]);
     setError(null);
     setActiveElicitation(null);
     activeAssistantMessageIdRef.current = null;
     pendingPromptsRef.current = [];
+    acceptedPromptIdsRef.current = new Set();
+    recoveryTurnIdRef.current = null;
     historyLoadedRef.current = false;
 
     if (!projectId || !sessionId) {
@@ -298,22 +413,43 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
       return;
     }
 
+    console.info('proposal-chat initialize session generation', {
+      projectId,
+      sessionId,
+      generation,
+      at: nowIso(),
+    });
+
     void (async () => {
       try {
         const history = await listProposalSessionMessages(projectId, sessionId);
-        if (unmountedRef.current) {
+        if (unmountedRef.current || sessionGenerationRef.current !== generation) {
+          console.debug('proposal-chat discard stale history response', {
+            projectId,
+            sessionId,
+            generation,
+            currentGeneration: sessionGenerationRef.current,
+            at: nowIso(),
+          });
           return;
         }
         setMessages(history.messages);
       } catch (e) {
+        if (sessionGenerationRef.current !== generation) {
+          return;
+        }
         console.warn('proposal-chat history load failed', {
           sessionId,
+          generation,
           error: e instanceof Error ? e.message : String(e),
         });
       } finally {
+        if (sessionGenerationRef.current !== generation) {
+          return;
+        }
         historyLoadedRef.current = true;
         if (!unmountedRef.current) {
-          connect();
+          connect(generation);
         }
       }
     })();
@@ -321,7 +457,10 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
     return () => {
       unmountedRef.current = true;
       clearReconnectTimer();
-      if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
+      if (
+        wsRef.current &&
+        (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)
+      ) {
         wsRef.current.close();
       }
       wsRef.current = null;
