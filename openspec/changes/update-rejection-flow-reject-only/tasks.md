@@ -14,3 +14,7 @@
 ## Acceptance #2 Failure Follow-up
 
 - [x] `src/orchestration/rejection.rs` の未コミット差分を整理し、acceptance 開始時点で `git status --porcelain` が空になるようにする
+
+## Acceptance #3 Failure Follow-up
+
+- [x] `src/orchestration/rejection.rs` の未コミット差分を解消し、acceptance 開始時点で `git status --porcelain` が空になることを確認する
