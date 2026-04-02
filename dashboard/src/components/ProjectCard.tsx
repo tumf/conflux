@@ -1,6 +1,6 @@
 import React from 'react';
 import { RefreshCw, Loader2, Trash2 } from 'lucide-react';
-import { RemoteProject, ActiveCommand } from '../api/types';
+import { RemoteProject, ActiveCommand, RemoteSyncState } from '../api/types';
 
 interface ProjectCardProps {
   project: RemoteProject;
@@ -21,6 +21,22 @@ const statusConfig: Record<string, { dot: string; text: string; bg: string }> = 
   stopped: { dot: 'bg-[#ef4444]', text: 'text-[#ef4444]', bg: 'bg-[#450a0a]/40' },
 };
 
+const syncStateLabel: Record<RemoteSyncState, string> = {
+  up_to_date: 'Up to date',
+  ahead: 'Ahead',
+  behind: 'Behind',
+  diverged: 'Diverged',
+  unknown: 'Unknown',
+};
+
+const syncStateClass: Record<RemoteSyncState, string> = {
+  up_to_date: 'border-[#14532d] bg-[#052e16]/40 text-[#22c55e]',
+  ahead: 'border-[#1d4ed8] bg-[#1e3a8a]/30 text-[#60a5fa]',
+  behind: 'border-[#7c2d12] bg-[#431407]/40 text-[#fb923c]',
+  diverged: 'border-[#7f1d1d] bg-[#450a0a]/40 text-[#f87171]',
+  unknown: 'border-[#3f3f46] bg-[#18181b] text-[#a1a1aa]',
+};
+
 export function ProjectCard({
   project,
   isSelected,
@@ -33,6 +49,8 @@ export function ProjectCard({
 }: ProjectCardProps) {
   const [repo, branch] = [project.repo, project.branch];
   const cfg = statusConfig[project.status] ?? statusConfig.idle;
+  const syncState = project.sync_state ?? 'unknown';
+  const syncCounts = `${project.ahead_count}↑ ${project.behind_count}↓`;
 
   // Check if base root is busy (sync operates on base root)
   const baseBusy = activeCommands.some(
@@ -73,6 +91,16 @@ export function ProjectCard({
           <div className={`size-1.5 rounded-full ${cfg.dot}`} />
           <span className={`text-xs font-medium ${cfg.text}`}>{project.status}</span>
         </div>
+      </div>
+
+      <div className="mb-2 flex items-center gap-2">
+        <span
+          className={`inline-flex items-center rounded border px-2 py-0.5 text-[11px] font-medium ${syncStateClass[syncState]}`}
+          title={project.remote_check_error ?? undefined}
+        >
+          {syncStateLabel[syncState]}
+        </span>
+        <span className="text-[11px] text-[#a1a1aa]">{syncCounts}</span>
       </div>
 
       <div className="flex gap-1.5">

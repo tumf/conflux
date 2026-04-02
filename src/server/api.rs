@@ -4,6 +4,7 @@
 //!
 //! NOTE: This module deliberately does NOT reference or execute `~/.wt/setup`.
 
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,7 +30,8 @@ use crate::server::proposal_session::{
     ProposalSessionError, ProposalSessionMessageRecord, SharedProposalSessionManager,
 };
 use crate::server::registry::{
-    server_worktree_branch, OrchestrationStatus, ProjectEntry, ProjectStatus, SharedRegistry,
+    server_worktree_branch, OrchestrationStatus, ProjectEntry, ProjectStatus, ProjectSyncMetadata,
+    ProjectSyncState, SharedRegistry,
 };
 use crate::server::runner::{ProjectRunRequest, SharedRunners};
 use crate::server::terminal::{
@@ -41,6 +43,9 @@ use crate::vcs::GitWorkspaceManager;
 
 /// Maximum number of log entries retained in server-side log buffer (broadcast channel capacity)
 pub const SERVER_LOG_BUFFER_SIZE: usize = 1000;
+
+/// Poll interval for background remote sync-state monitoring.
+const REMOTE_SYNC_MONITOR_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Shared application state passed to axum handlers.
 #[derive(Clone)]
@@ -390,6 +395,249 @@ pub async fn projects_state(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn sync_metadata_unknown(reason: impl Into<String>) -> ProjectSyncMetadata {
+    ProjectSyncMetadata {
+        sync_state: ProjectSyncState::Unknown,
+        ahead_count: 0,
+        behind_count: 0,
+        sync_required: false,
+        local_sha: None,
+        remote_sha: None,
+        last_remote_check_at: Some(now_rfc3339()),
+        remote_check_error: Some(reason.into()),
+    }
+}
+
+fn parse_remote_head_sha(ls_remote_stdout: &str) -> Option<String> {
+    ls_remote_stdout
+        .split_whitespace()
+        .next()
+        .map(|sha| sha.to_string())
+}
+
+fn parse_left_right_count(stdout: &str) -> Option<(u32, u32)> {
+    let mut parts = stdout.split_whitespace();
+    let ahead = parts.next()?.parse::<u32>().ok()?;
+    let behind = parts.next()?.parse::<u32>().ok()?;
+    Some((ahead, behind))
+}
+
+fn classify_sync_state(ahead_count: u32, behind_count: u32) -> ProjectSyncState {
+    match (ahead_count, behind_count) {
+        (0, 0) => ProjectSyncState::UpToDate,
+        (a, 0) if a > 0 => ProjectSyncState::Ahead,
+        (0, b) if b > 0 => ProjectSyncState::Behind,
+        _ => ProjectSyncState::Diverged,
+    }
+}
+
+async fn compute_project_sync_metadata(
+    project_id: &str,
+    remote_url: &str,
+    branch: &str,
+    local_repo_path: &std::path::Path,
+) -> ProjectSyncMetadata {
+    debug!(
+        project_id,
+        branch,
+        local_repo = %local_repo_path.display(),
+        "Starting remote sync-state check"
+    );
+
+    let ls_remote = tokio::process::Command::new("git")
+        .args(["ls-remote", "--heads", remote_url, branch])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    let remote_sha = match ls_remote {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            match parse_remote_head_sha(&stdout) {
+                Some(sha) => sha,
+                None => {
+                    warn!(
+                        project_id,
+                        branch, "Remote branch head not found during sync-state check"
+                    );
+                    return sync_metadata_unknown(format!(
+                        "Branch '{}' not found on remote '{}'",
+                        branch, remote_url
+                    ));
+                }
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            warn!(project_id, branch, error = %stderr, "git ls-remote failed during sync-state check");
+            return sync_metadata_unknown(format!("git ls-remote failed: {}", stderr));
+        }
+        Err(error) => {
+            warn!(project_id, branch, error = %error, "Failed to execute git ls-remote during sync-state check");
+            return sync_metadata_unknown(format!("Failed to run git ls-remote: {}", error));
+        }
+    };
+
+    let fetch_refspec = format!("refs/heads/{}:refs/remotes/origin/{}", branch, branch);
+    let fetch_remote = tokio::process::Command::new("git")
+        .args(["fetch", remote_url, &fetch_refspec])
+        .current_dir(local_repo_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    match fetch_remote {
+        Ok(output) if output.status.success() => {
+            debug!(
+                project_id,
+                branch, "Fetched remote head for sync-state computation"
+            );
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            warn!(project_id, branch, error = %stderr, "git fetch failed during sync-state check");
+            return sync_metadata_unknown(format!("git fetch failed: {}", stderr));
+        }
+        Err(error) => {
+            warn!(project_id, branch, error = %error, "Failed to execute git fetch during sync-state check");
+            return sync_metadata_unknown(format!("Failed to run git fetch: {}", error));
+        }
+    }
+
+    let local_ref = format!("refs/heads/{}", branch);
+    let local_rev = tokio::process::Command::new("git")
+        .args(["rev-parse", &local_ref])
+        .current_dir(local_repo_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    let local_sha = match local_rev {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            warn!(project_id, branch, error = %stderr, "git rev-parse failed during sync-state check");
+            return sync_metadata_unknown(format!("git rev-parse failed: {}", stderr));
+        }
+        Err(error) => {
+            warn!(project_id, branch, error = %error, "Failed to execute git rev-parse during sync-state check");
+            return sync_metadata_unknown(format!("Failed to run git rev-parse: {}", error));
+        }
+    };
+
+    let origin_ref = format!("refs/remotes/origin/{}", branch);
+    let range = format!("{}...{}", local_ref, origin_ref);
+    let rev_list = tokio::process::Command::new("git")
+        .args(["rev-list", "--left-right", "--count", &range])
+        .current_dir(local_repo_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    let (ahead_count, behind_count) = match rev_list {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            match parse_left_right_count(&stdout) {
+                Some(counts) => counts,
+                None => {
+                    warn!(project_id, branch, output = %stdout.trim(), "Unexpected rev-list count output during sync-state check");
+                    return sync_metadata_unknown(
+                        "Failed to parse git rev-list ahead/behind counts",
+                    );
+                }
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            warn!(project_id, branch, error = %stderr, "git rev-list failed during sync-state check");
+            return sync_metadata_unknown(format!("git rev-list failed: {}", stderr));
+        }
+        Err(error) => {
+            warn!(project_id, branch, error = %error, "Failed to execute git rev-list during sync-state check");
+            return sync_metadata_unknown(format!("Failed to run git rev-list: {}", error));
+        }
+    };
+
+    let sync_state = classify_sync_state(ahead_count, behind_count);
+    let sync_required = !matches!(sync_state, ProjectSyncState::UpToDate);
+    let checked_at = now_rfc3339();
+
+    info!(
+        project_id,
+        branch,
+        sync_state = sync_state.as_str(),
+        ahead_count,
+        behind_count,
+        "Completed remote sync-state check"
+    );
+
+    ProjectSyncMetadata {
+        sync_state,
+        ahead_count,
+        behind_count,
+        sync_required,
+        local_sha: Some(local_sha),
+        remote_sha: Some(remote_sha),
+        last_remote_check_at: Some(checked_at),
+        remote_check_error: None,
+    }
+}
+
+async fn refresh_project_sync_states_once(registry: &SharedRegistry) {
+    let (entries, data_dir) = {
+        let reg = registry.read().await;
+        (reg.list(), reg.data_dir().to_path_buf())
+    };
+
+    if entries.is_empty() {
+        debug!("Skipping remote sync-state refresh because no projects are registered");
+        return;
+    }
+
+    for entry in entries {
+        let local_repo_path = data_dir.join(&entry.id);
+        let metadata = compute_project_sync_metadata(
+            &entry.id,
+            &entry.remote_url,
+            &entry.branch,
+            &local_repo_path,
+        )
+        .await;
+
+        let mut reg = registry.write().await;
+        if let Err(error) = reg.set_sync_metadata(&entry.id, metadata) {
+            warn!(
+                project_id = %entry.id,
+                error = %error,
+                "Failed to persist sync metadata after refresh"
+            );
+        }
+    }
+}
+
+/// Run periodic remote sync-state monitoring for all registered server projects.
+pub async fn run_remote_sync_state_monitor(registry: SharedRegistry) {
+    info!(
+        interval_seconds = REMOTE_SYNC_MONITOR_INTERVAL.as_secs(),
+        "Starting remote sync-state monitor loop"
+    );
+    let mut interval = tokio::time::interval(REMOTE_SYNC_MONITOR_INTERVAL);
+    loop {
+        interval.tick().await;
+        refresh_project_sync_states_once(&registry).await;
+    }
+}
+
 /// GET /api/v1/ws - WebSocket stream of remote state updates
 ///
 /// Current behavior:
@@ -599,6 +847,14 @@ async fn build_remote_project_snapshot_async(
         status: status_str.to_string(),
         is_busy,
         error: None,
+        sync_state: entry.sync_metadata.sync_state.as_str().to_string(),
+        ahead_count: entry.sync_metadata.ahead_count,
+        behind_count: entry.sync_metadata.behind_count,
+        sync_required: entry.sync_metadata.sync_required,
+        local_sha: entry.sync_metadata.local_sha.clone(),
+        remote_sha: entry.sync_metadata.remote_sha.clone(),
+        last_remote_check_at: entry.sync_metadata.last_remote_check_at.clone(),
+        remote_check_error: entry.sync_metadata.remote_check_error.clone(),
         changes,
     }
 }
@@ -4294,6 +4550,111 @@ mod tests {
         build_router(state)
     }
 
+    async fn run_sync_monitor_once_for_tests(state: &AppState) {
+        refresh_project_sync_states_once(&state.registry).await;
+    }
+
+    async fn rev_parse(repo: &std::path::Path, rev: &str) -> Option<String> {
+        let output = tokio::process::Command::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(repo)
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    async fn append_commit_to_remote(
+        remote_url: &str,
+        branch: &str,
+        file_name: &str,
+        contents: &str,
+    ) -> Option<String> {
+        let work_dir = tempfile::TempDir::new().ok()?;
+        let work_path = work_dir.path();
+
+        let clone = tokio::process::Command::new("git")
+            .args(["clone", remote_url, work_path.to_str()?])
+            .status()
+            .await
+            .ok()?;
+        if !clone.success() {
+            return None;
+        }
+
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(work_path)
+            .status()
+            .await
+            .ok()?;
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(work_path)
+            .status()
+            .await
+            .ok()?;
+
+        let checkout = tokio::process::Command::new("git")
+            .args(["checkout", branch])
+            .current_dir(work_path)
+            .status()
+            .await
+            .ok()?;
+        if !checkout.success() {
+            return None;
+        }
+
+        std::fs::write(work_path.join(file_name), contents).ok()?;
+        tokio::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(work_path)
+            .status()
+            .await
+            .ok()?;
+        let commit = tokio::process::Command::new("git")
+            .args(["commit", "-m", "advance remote"])
+            .current_dir(work_path)
+            .status()
+            .await
+            .ok()?;
+        if !commit.success() {
+            return None;
+        }
+
+        let push = tokio::process::Command::new("git")
+            .args(["push", "origin", branch])
+            .current_dir(work_path)
+            .status()
+            .await
+            .ok()?;
+        if !push.success() {
+            return None;
+        }
+
+        rev_parse(work_path, "HEAD").await
+    }
+
+    #[test]
+    fn test_classify_sync_state_variants() {
+        assert!(matches!(
+            classify_sync_state(0, 0),
+            ProjectSyncState::UpToDate
+        ));
+        assert!(matches!(classify_sync_state(2, 0), ProjectSyncState::Ahead));
+        assert!(matches!(
+            classify_sync_state(0, 3),
+            ProjectSyncState::Behind
+        ));
+        assert!(matches!(
+            classify_sync_state(4, 1),
+            ProjectSyncState::Diverged
+        ));
+    }
+
     // ── Auth tests ──
 
     #[tokio::test]
@@ -4894,6 +5255,125 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["started"], 0);
         assert_eq!(json["skipped"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_projects_state_includes_sync_metadata_fields_after_monitor_refresh() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_string_lossy());
+
+        let state = make_state(&temp_dir, None);
+        let router = build_router(state.clone());
+
+        let add_body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+        let add_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(add_body.to_string()))
+            .unwrap();
+        let add_resp = router.clone().oneshot(add_req).await.unwrap();
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+
+        run_sync_monitor_once_for_tests(&state).await;
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let project = &json["projects"][0];
+        assert_eq!(project["sync_state"], "up_to_date");
+        assert_eq!(project["ahead_count"], 0);
+        assert_eq!(project["behind_count"], 0);
+        assert_eq!(project["sync_required"], false);
+        assert!(project["local_sha"].as_str().is_some());
+        assert!(project["remote_sha"].as_str().is_some());
+        assert!(project["last_remote_check_at"].as_str().is_some());
+        assert!(project["remote_check_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_sync_monitor_is_non_invasive_and_never_runs_sync_or_resolve() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_string_lossy());
+
+        let mut state = make_state(&temp_dir, None);
+        state.resolve_command = Some("false".to_string());
+        let router = build_router(state.clone());
+
+        let add_body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+        let add_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(add_body.to_string()))
+            .unwrap();
+        let add_resp = router.clone().oneshot(add_req).await.unwrap();
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+
+        let add_body = axum::body::to_bytes(add_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let add_json: serde_json::Value = serde_json::from_slice(&add_body).unwrap();
+        let project_id = add_json["id"].as_str().unwrap();
+
+        let local_repo_path = temp_dir.path().join(project_id);
+        let local_sha_before = rev_parse(&local_repo_path, "refs/heads/main")
+            .await
+            .unwrap();
+
+        let _remote_sha_after = append_commit_to_remote(
+            &format!("file://{}", origin.to_string_lossy()),
+            "main",
+            "remote-only.txt",
+            "remote advance",
+        )
+        .await
+        .unwrap();
+
+        run_sync_monitor_once_for_tests(&state).await;
+
+        let local_sha_after = rev_parse(&local_repo_path, "refs/heads/main")
+            .await
+            .unwrap();
+        assert_eq!(
+            local_sha_before, local_sha_after,
+            "monitoring must not mutate local branch tip via git/sync"
+        );
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let project = &json["projects"][0];
+
+        assert_eq!(project["sync_state"], "behind");
+        assert_eq!(project["ahead_count"], 0);
+        assert!(project["behind_count"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(project["sync_required"], true);
     }
 
     #[tokio::test]
@@ -7355,6 +7835,14 @@ mod tests {
             status: "idle".to_string(),
             is_busy: false,
             error: None,
+            sync_state: "up_to_date".to_string(),
+            ahead_count: 0,
+            behind_count: 0,
+            sync_required: false,
+            local_sha: None,
+            remote_sha: None,
+            last_remote_check_at: None,
+            remote_check_error: None,
             changes: vec![],
         };
 
