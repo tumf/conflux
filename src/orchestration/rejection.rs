@@ -167,7 +167,13 @@ pub async fn execute_rejection_flow(
 
     let commit_message = format!("reject(openspec): {}", change_id);
     let commit_output = Command::new("git")
-        .args(["commit", "-m", &commit_message, "--", &relative_rejected_path])
+        .args([
+            "commit",
+            "-m",
+            &commit_message,
+            "--",
+            &relative_rejected_path,
+        ])
         .current_dir(repo_root)
         .output()
         .await?;
@@ -345,8 +351,7 @@ mod tests {
             .await
             .expect("read committed paths");
         assert!(committed_paths.status.success());
-        let committed_paths_stdout =
-            String::from_utf8_lossy(&committed_paths.stdout).into_owned();
+        let committed_paths_stdout = String::from_utf8_lossy(&committed_paths.stdout).into_owned();
         let committed_paths = committed_paths_stdout
             .lines()
             .map(str::trim)
