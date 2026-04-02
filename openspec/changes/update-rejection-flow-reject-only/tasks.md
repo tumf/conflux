@@ -10,3 +10,7 @@
 
 - rejected change を archive ツリーへ移す専用 policy が必要かを別 proposal で検討する
 - `REJECTED.md` marker を使う active change filtering と historical audit UX の見直し
+
+## Acceptance #2 Failure Follow-up
+
+- [x] `src/orchestration/rejection.rs` の未コミット差分を整理し、acceptance 開始時点で `git status --porcelain` が空になるようにする
