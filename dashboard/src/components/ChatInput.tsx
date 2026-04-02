@@ -3,22 +3,26 @@ import { SendHorizontal } from 'lucide-react';
 
 interface ChatInputProps {
   onSend: (content: string) => void;
-  status?: 'ready' | 'submitted' | 'streaming' | 'recovering' | 'error';
+  isSubmissionLocked?: boolean;
   placeholder?: string;
+  clearVersion?: number;
 }
 
-export function ChatInput({ onSend, status = 'ready', placeholder = 'Type a message...' }: ChatInputProps) {
+export function ChatInput({
+  onSend,
+  isSubmissionLocked = false,
+  placeholder = 'Type a message...',
+  clearVersion = 0,
+}: ChatInputProps) {
   const [value, setValue] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-
-  const disabled = status !== 'ready';
+  const prevClearVersionRef = useRef(clearVersion);
 
   const handleSubmit = useCallback(() => {
     const trimmed = value.trim();
-    if (!trimmed || disabled) return;
+    if (!trimmed || isSubmissionLocked) return;
     onSend(trimmed);
-    setValue('');
-  }, [value, disabled, onSend]);
+  }, [value, isSubmissionLocked, onSend]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -28,6 +32,12 @@ export function ChatInput({ onSend, status = 'ready', placeholder = 'Type a mess
     },
     [handleSubmit],
   );
+
+  useEffect(() => {
+    if (clearVersion === prevClearVersionRef.current) return;
+    prevClearVersionRef.current = clearVersion;
+    setValue('');
+  }, [clearVersion]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -46,11 +56,12 @@ export function ChatInput({ onSend, status = 'ready', placeholder = 'Type a mess
         onKeyDown={handleKeyDown}
         placeholder={placeholder}
         rows={1}
-        className="min-h-[2.25rem] flex-1 resize-none rounded-md border border-border bg-surface px-3 py-2 text-sm text-text placeholder:text-text-subtle focus:border-accent focus:outline-none"
+        disabled={isSubmissionLocked}
+        className="min-h-[2.25rem] flex-1 resize-none rounded-md border border-border bg-surface px-3 py-2 text-sm text-text placeholder:text-text-subtle focus:border-accent focus:outline-none disabled:opacity-70"
       />
       <button
         onClick={handleSubmit}
-        disabled={disabled || !value.trim()}
+        disabled={isSubmissionLocked || !value.trim()}
         className="flex size-9 shrink-0 items-center justify-center rounded-md bg-accent text-white transition-colors hover:bg-accent-hover disabled:opacity-50 disabled:hover:bg-accent"
         aria-label="Send message"
       >
