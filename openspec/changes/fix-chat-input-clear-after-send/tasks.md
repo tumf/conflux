@@ -8,3 +8,8 @@
 ## Future Work
 
 - Consider adding a defensive timeout or telemetry for cases where the backend never emits `turn_complete`, if real-world reports continue after the frontend regression fix.
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Update the affected ProposalChat placeholder expectation or implementation so the existing ProposalChat test suite passes with the intended Enter/Shift+Enter UX copy.
+- [x] Re-run the relevant dashboard Vitest suite and record passing evidence for the changed chat input and proposal chat components.

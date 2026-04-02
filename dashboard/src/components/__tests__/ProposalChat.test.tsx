@@ -110,7 +110,7 @@ describe('ProposalChat', () => {
     );
 
     expect(
-      screen.getByPlaceholderText('Type a message... (Enter for newline, Shift+Enter to send)'),
+      screen.getByPlaceholderText('Type a message... (Shift+Enter for newline, Enter to send)'),
     ).toBeTruthy();
   });
 
