@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::cleanup::WorkspaceCleanupGuard;
@@ -64,7 +65,11 @@ impl ParallelExecutor {
         );
 
         // Start merge stall monitor if enabled
-        let merge_stall_monitor_handle = if let Some(cancel_token) = &self.cancel_token {
+        // The monitor gets its own isolated CancellationToken so that stall detection
+        // cannot cancel parallel execution. The monitor token is cancelled when the
+        // orchestration loop finishes to clean up the background task.
+        let monitor_stop_token = CancellationToken::new();
+        let merge_stall_monitor_handle = if self.cancel_token.is_some() {
             let merge_stall_config = self.config.get_merge_stall_detection();
             if merge_stall_config.enabled {
                 match self
@@ -84,7 +89,7 @@ impl ParallelExecutor {
                             &self.repo_root,
                             original_branch.to_string(),
                         );
-                        Some(monitor.spawn_monitor(cancel_token.clone()))
+                        Some(monitor.spawn_monitor(monitor_stop_token.clone()))
                     }
                     Err(e) => {
                         warn!("Cannot start merge stall monitor: {}", e);
@@ -277,6 +282,7 @@ impl ParallelExecutor {
         }
 
         // Clean up merge stall monitor
+        monitor_stop_token.cancel();
         if let Some(handle) = merge_stall_monitor_handle {
             handle.abort();
         }
