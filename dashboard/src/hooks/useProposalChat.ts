@@ -11,6 +11,11 @@ import { getProposalSessionWsUrl, listProposalSessionMessages } from '../api/res
 
 export type ProposalChatStatus = 'ready' | 'submitted' | 'streaming' | 'recovering' | 'error';
 
+interface SubmissionLock {
+  isLocked: boolean;
+  clearVersion: number;
+}
+
 interface PendingPrompt {
   content: string;
   clientMessageId: string;
@@ -39,6 +44,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
   const [error, setError] = useState<string | null>(null);
   const [activeElicitation, setActiveElicitation] = useState<ElicitationRequest | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
+  const [submissionLock, setSubmissionLock] = useState<SubmissionLock>({ isLocked: false, clearVersion: 0 });
 
   const wsRef = useRef<WebSocket | null>(null);
   const pendingPromptsRef = useRef<PendingPrompt[]>([]);
@@ -67,6 +73,33 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
       window.clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
     }
+  }, []);
+
+  const updateSubmissionLock = useCallback((nextLocked: boolean, reason: string) => {
+    setSubmissionLock((prev) => {
+      if (prev.isLocked !== nextLocked) {
+        console.info('proposal-chat submission lock transition', {
+          previousLocked: prev.isLocked,
+          nextLocked,
+          reason,
+          at: nowIso(),
+        });
+      }
+      return {
+        isLocked: nextLocked,
+        clearVersion: nextLocked ? prev.clearVersion : prev.clearVersion + 1,
+      };
+    });
+  }, []);
+
+  const clearSubmissionLock = useCallback(() => {
+    setSubmissionLock((prev) => {
+      if (!prev.isLocked) return prev;
+      return {
+        isLocked: false,
+        clearVersion: prev.clearVersion + 1,
+      };
+    });
   }, []);
 
   const appendOrUpdateMessage = useCallback((nextMessage: ProposalChatMessage) => {
@@ -141,8 +174,9 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
         transitionStatus('error', reason);
         setError(reason);
       }
+      clearSubmissionLock();
     },
-    [transitionStatus],
+    [clearSubmissionLock, transitionStatus],
   );
 
   const enterRecovery = useCallback(
@@ -190,15 +224,18 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
                   : m,
               ),
             );
-          } else {
-            appendOrUpdateMessage({
-              id: msg.id,
-              role: 'user',
-              content: msg.content,
-              timestamp: msg.timestamp,
-              sendStatus: 'sent',
-            });
+            clearSubmissionLock();
+            break;
           }
+
+          appendOrUpdateMessage({
+            id: msg.id,
+            role: 'user',
+            content: msg.content,
+            timestamp: msg.timestamp,
+            sendStatus: 'sent',
+          });
+          clearSubmissionLock();
           break;
         }
         case 'agent_message_chunk': {
@@ -289,7 +326,16 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
           break;
       }
     },
-    [appendOrUpdateMessage, failActiveTurn, transitionStatus, updateToolCall, updateToolCallStatus],
+    [
+      appendOrUpdateMessage,
+      clearSubmissionLock,
+      failActiveTurn,
+      projectId,
+      sessionId,
+      transitionStatus,
+      updateToolCall,
+      updateToolCallStatus,
+    ],
   );
 
   const connect = useCallback(
@@ -409,6 +455,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
 
     if (!projectId || !sessionId) {
       setWsConnected(false);
+      setSubmissionLock({ isLocked: false, clearVersion: 0 });
       transitionStatus('ready', 'missing_session_or_project');
       return;
     }
@@ -473,7 +520,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
       if (!sessionId) return;
       const trimmed = content.trim();
       if (!trimmed) return;
-      if (statusRef.current !== 'ready') return;
+      if (submissionLock.isLocked) return;
 
       const clientMessageId = `user-pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       appendOrUpdateMessage({
@@ -484,8 +531,9 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
         sendStatus: wsConnected ? 'sent' : 'pending',
       });
 
-      transitionStatus('submitted', 'send_message');
       setError(null);
+      updateSubmissionLock(true, 'send_message');
+      transitionStatus('submitted', 'send_message');
 
       const payload = JSON.stringify({
         type: 'prompt',
@@ -501,7 +549,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
 
       ws.send(payload);
     },
-    [appendOrUpdateMessage, sessionId, transitionStatus, wsConnected],
+    [appendOrUpdateMessage, sessionId, transitionStatus, submissionLock.isLocked, updateSubmissionLock, wsConnected],
   );
 
   const stop = useCallback(() => {
@@ -541,7 +589,18 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
       activeElicitation,
       sendElicitationResponse,
       wsConnected,
+      submissionLock,
     }),
-    [activeElicitation, error, messages, sendElicitationResponse, sendMessage, status, stop, wsConnected],
+    [
+      activeElicitation,
+      error,
+      messages,
+      sendElicitationResponse,
+      sendMessage,
+      status,
+      stop,
+      wsConnected,
+      submissionLock,
+    ],
   );
 }
