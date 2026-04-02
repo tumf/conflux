@@ -1006,43 +1006,6 @@ mod tests {
         assert_eq!(config.get_command_inactivity_timeout_max_retries(), 3);
     }
 
-    #[test]
-    fn test_merge_stall_detection_defaults() {
-        let config = OrchestratorConfig::default();
-        let merge_stall = config.get_merge_stall_detection();
-        assert!(merge_stall.enabled);
-        assert_eq!(merge_stall.threshold_minutes, 30);
-        assert_eq!(merge_stall.check_interval_seconds, 60);
-    }
-
-    #[test]
-    fn test_parse_merge_stall_detection_config() {
-        let jsonc = r#"{
-            "merge_stall_detection": {
-                "enabled": true,
-                "threshold_minutes": 30,
-                "check_interval_seconds": 60
-            }
-        }"#;
-        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
-        let merge_stall = config.get_merge_stall_detection();
-        assert!(merge_stall.enabled);
-        assert_eq!(merge_stall.threshold_minutes, 30);
-        assert_eq!(merge_stall.check_interval_seconds, 60);
-    }
-
-    #[test]
-    fn test_merge_stall_detection_disabled() {
-        let jsonc = r#"{
-            "merge_stall_detection": {
-                "enabled": false
-            }
-        }"#;
-        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
-        let merge_stall = config.get_merge_stall_detection();
-        assert!(!merge_stall.enabled);
-    }
-
     // === Tests for XDG config path precedence ===
 
     #[test]

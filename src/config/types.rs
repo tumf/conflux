@@ -40,18 +40,6 @@ fn default_error_circuit_breaker_threshold() -> usize {
     DEFAULT_ERROR_CIRCUIT_BREAKER_THRESHOLD
 }
 
-fn default_merge_stall_detection_enabled() -> bool {
-    defaults::DEFAULT_MERGE_STALL_DETECTION_ENABLED
-}
-
-fn default_merge_stall_threshold_minutes() -> u64 {
-    defaults::DEFAULT_MERGE_STALL_THRESHOLD_MINUTES
-}
-
-fn default_merge_stall_check_interval_seconds() -> u64 {
-    defaults::DEFAULT_MERGE_STALL_CHECK_INTERVAL_SECONDS
-}
-
 // ── Logging ────────────────────────────────────────────────────────────────
 
 /// Logging configuration.
@@ -115,32 +103,6 @@ impl Default for ErrorCircuitBreakerConfig {
         Self {
             enabled: default_error_circuit_breaker_enabled(),
             threshold: default_error_circuit_breaker_threshold(),
-        }
-    }
-}
-
-// ── Merge stall detection ──────────────────────────────────────────────────
-
-/// Merge stall detection configuration for monitoring merge progress.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MergeStallDetectionConfig {
-    /// Enable merge stall detection based on merge commit inactivity.
-    #[serde(default = "default_merge_stall_detection_enabled")]
-    pub enabled: bool,
-    /// Threshold in minutes for merge inactivity before triggering stall.
-    #[serde(default = "default_merge_stall_threshold_minutes")]
-    pub threshold_minutes: u64,
-    /// Check interval in seconds for monitoring merge progress.
-    #[serde(default = "default_merge_stall_check_interval_seconds")]
-    pub check_interval_seconds: u64,
-}
-
-impl Default for MergeStallDetectionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: defaults::DEFAULT_MERGE_STALL_DETECTION_ENABLED,
-            threshold_minutes: defaults::DEFAULT_MERGE_STALL_THRESHOLD_MINUTES,
-            check_interval_seconds: defaults::DEFAULT_MERGE_STALL_CHECK_INTERVAL_SECONDS,
         }
     }
 }
@@ -215,10 +177,6 @@ pub struct OrchestratorConfig {
     /// Error circuit breaker configuration (same error detection).
     #[serde(default)]
     pub error_circuit_breaker: Option<ErrorCircuitBreakerConfig>,
-
-    /// Merge stall detection configuration (merge commit inactivity).
-    #[serde(default)]
-    pub merge_stall_detection: Option<MergeStallDetectionConfig>,
 
     /// Delay between completion check retries in milliseconds.
     /// Default: 500ms
@@ -689,11 +647,6 @@ impl OrchestratorConfig {
             self.error_circuit_breaker = other.error_circuit_breaker;
         }
 
-        // Merge stall detection
-        if other.merge_stall_detection.is_some() {
-            self.merge_stall_detection = other.merge_stall_detection;
-        }
-
         // Completion check config
         if other.completion_check_delay_ms.is_some() {
             self.completion_check_delay_ms = other.completion_check_delay_ms;
@@ -857,11 +810,6 @@ impl OrchestratorConfig {
     /// Get error circuit breaker configuration, returning defaults if not set.
     pub fn get_error_circuit_breaker(&self) -> ErrorCircuitBreakerConfig {
         self.error_circuit_breaker.clone().unwrap_or_default()
-    }
-
-    /// Get merge stall detection configuration, returning defaults if not set.
-    pub fn get_merge_stall_detection(&self) -> MergeStallDetectionConfig {
-        self.merge_stall_detection.clone().unwrap_or_default()
     }
 
     /// Get the maximum iterations limit.

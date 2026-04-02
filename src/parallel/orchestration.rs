@@ -8,13 +8,11 @@
 
 use crate::error::Result;
 use crate::events::LogEntry;
-use crate::merge_stall_monitor::MergeStallMonitor;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::cleanup::WorkspaceCleanupGuard;
@@ -63,45 +61,6 @@ impl ParallelExecutor {
             "Starting order-based execution with re-analysis for {} changes",
             changes.len()
         );
-
-        // Start merge stall monitor if enabled
-        // The monitor gets its own isolated CancellationToken so that stall detection
-        // cannot cancel parallel execution. The monitor token is cancelled when the
-        // orchestration loop finishes to clean up the background task.
-        let monitor_stop_token = CancellationToken::new();
-        let merge_stall_monitor_handle = if self.cancel_token.is_some() {
-            let merge_stall_config = self.config.get_merge_stall_detection();
-            if merge_stall_config.enabled {
-                match self
-                    .workspace_manager
-                    .ensure_original_branch_initialized()
-                    .await
-                {
-                    Ok(original_branch) => {
-                        info!(
-                            threshold_minutes = merge_stall_config.threshold_minutes,
-                            check_interval_seconds = merge_stall_config.check_interval_seconds,
-                            base_branch = %original_branch,
-                            "Starting merge stall monitor for parallel execution"
-                        );
-                        let monitor = MergeStallMonitor::new(
-                            merge_stall_config,
-                            &self.repo_root,
-                            original_branch.to_string(),
-                        );
-                        Some(monitor.spawn_monitor(monitor_stop_token.clone()))
-                    }
-                    Err(e) => {
-                        warn!("Cannot start merge stall monitor: {}", e);
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
 
         // Prepare for parallel execution (clean check for git)
         info!("Preparing for parallel execution...");
@@ -279,12 +238,6 @@ impl ParallelExecutor {
                     // Timer expired, loop will re-check needs_reanalysis and debounce
                 }
             }
-        }
-
-        // Clean up merge stall monitor
-        monitor_stop_token.cancel();
-        if let Some(handle) = merge_stall_monitor_handle {
-            handle.abort();
         }
 
         // Drop cleanup guard without calling commit()
