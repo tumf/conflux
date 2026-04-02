@@ -156,6 +156,13 @@ Manual verification rule:
   * If truly non-mockable: move to Out of Scope / Future Work (without checkboxes) with clear justification
 - Do NOT defer tasks to Future Work based on missing credentials if mocking is possible
 
+**Unit test boundary policy (apply mode)**:
+- Unit tests MUST NOT directly depend on real stateful external boundaries.
+- Treat VCS/SCM, network/API, database, real filesystem state, real OS process/CLI tool execution, clock/sleep/timer, and environment-dependent permissions/credentials/OS state as external boundaries for unit-test classification.
+- If a task claims unit-test coverage, extract decision logic into helpers/traits/interfaces/pure functions and verify with mocks/fakes/in-memory doubles.
+- If the added test must touch a real external boundary, classify that evidence as integration/e2e (not unit) and keep unit-test checklist claims unchecked until genuine unit-scoped tests exist.
+- Never mark a unit-test task complete when evidence is only integration-style tests that exercise real boundary state.
+
 **Implementation Blocker escalation**:
 When you determine that implementation is impossible due to:
 - Specification contradictions (conflicting requirements that cannot be resolved autonomously)

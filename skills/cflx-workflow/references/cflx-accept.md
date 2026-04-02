@@ -88,6 +88,8 @@ Required checks (only run if no valid Implementation Blocker exists):
    - FAIL if a task marked `[x]` claims runtime behavior, code, tests, or wiring that cannot be located in the repo.
    - FAIL if a merge/archive/spec-promotion occurred without corresponding implementation evidence for completed tasks.
    - FAIL if acceptance evidence relies only on proposal/spec/task documents rather than executable code/tests/integration points.
+   - FAIL on unit/integration classification mismatch: when a task claims unit-test coverage but the cited tests rely on real stateful external boundaries (e.g., real git repo, real CLI/process, real filesystem/database/network/timer).
+   - For mismatch FAILs, require follow-up tasks to either (a) extract pure decision logic and add genuine unit-scoped tests with mocks/fakes, or (b) reclassify the tests/checklist claim as integration/e2e.
    - Exception for `spec-only` changes: `openspec/` edits ARE the implementation artifact; runtime evidence is NOT required.
 
 When evaluating completed tasks, use this evidence hierarchy:
