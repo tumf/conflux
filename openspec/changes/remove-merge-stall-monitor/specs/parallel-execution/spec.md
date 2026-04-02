@@ -6,10 +6,10 @@ The system SHALL send completion events and messages only when processing comple
 
 The system SHALL distinguish between successful completion, completion with errors, graceful stop, and cancellation.
 
-Progress monitors (such as merge stall detection) SHALL NOT directly cancel parallel execution. Monitors SHALL report observations as events to the orchestration loop, which decides the appropriate response based on policy. By default, monitor events result in warning logs only and do not interrupt queue execution.
+The parallel execution subsystem SHALL NOT run a merge stall monitor based on historical base-branch merge commit timestamps. Queue execution MUST NOT be interrupted or annotated by a monitor that does not observe current queue or scheduler progress.
 
 **Priority**: HIGH
-**Rationale**: Incorrect completion messages mislead users about the processing status and can cause confusion when resuming work. Additionally, allowing monitors to directly cancel execution violates separation of concerns between observation and control, causing queue execution failures unrelated to the queue's own logic.
+**Rationale**: Incorrect completion messages mislead users about the processing status and can cause confusion when resuming work. A monitor that watches unrelated historical merge activity does not represent actual queue health and should not participate in parallel execution.
 
 #### Scenario: Graceful stop during parallel execution should not show success message
 
@@ -53,21 +53,9 @@ Progress monitors (such as merge stall detection) SHALL NOT directly cancel para
 **And** should display "Processing completed with errors" warning message
 **And** should NOT display "All changes processed successfully" message
 
-#### Scenario: Merge stall detection does not cancel parallel execution
+#### Scenario: Parallel execution does not start merge stall monitoring
 
 **Given** the orchestrator is running in parallel mode
-**And** a merge stall monitor is active
-**And** the last merge commit on the base branch is older than the configured threshold
-**When** the merge stall monitor detects a stall
-**Then** a warning log is emitted with elapsed time and threshold
-**And** a `ParallelEvent::Warning` is sent to the orchestration loop
-**And** the parallel execution loop continues processing queued changes
-**And** the shared `CancellationToken` is NOT cancelled by the monitor
-
-#### Scenario: Queue execution starts regardless of past merge inactivity
-
-**Given** the base branch has no merge commits within the configured stall threshold
-**And** the user initiates parallel execution via `cflx queue` or TUI
 **When** the parallel execution loop starts
-**Then** queued changes are dispatched normally
-**And** the merge stall monitor may emit a warning but does not prevent execution
+**Then** it does not start a merge stall monitor based on historical base-branch merge commits
+**And** queue execution proceeds based only on actual execution state, user stop requests, and real processing failures
