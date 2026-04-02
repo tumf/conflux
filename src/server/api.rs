@@ -962,7 +962,9 @@ async fn list_remote_changes_in_worktree(
         let last_modified = latest_modified_rfc3339(&[&proposal_path, &tasks_path])
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
-        let (status, iteration_number) = if let Some(wt_path) = worktree_by_change.get(dir_name) {
+        let (status, iteration_number) = if path.join("REJECTED.md").exists() {
+            ("rejected".to_string(), None)
+        } else if let Some(wt_path) = worktree_by_change.get(dir_name) {
             match detect_workspace_state(dir_name, wt_path, base_branch).await {
                 Ok(WorkspaceState::Created) => ("queued".to_string(), None),
                 Ok(WorkspaceState::Applying { iteration }) => {

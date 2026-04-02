@@ -35,11 +35,11 @@ fn extract_rejected_reason(content: &str) -> Option<String> {
 }
 
 async fn resolve_rejection_reason(
-    repo_root: &Path,
+    workspace_path: &Path,
     change_id: &str,
     fallback_reason: &str,
 ) -> String {
-    let rejected_path = rejected_file_path(repo_root, change_id);
+    let rejected_path = rejected_file_path(workspace_path, change_id);
 
     match tokio::fs::read_to_string(&rejected_path).await {
         Ok(content) => {
@@ -127,11 +127,11 @@ pub async fn execute_rejection_flow(
         "Starting rejection flow"
     );
 
+    let effective_reason = resolve_rejection_reason(workspace_path, change_id, reason).await;
+
     git_commands::checkout(repo_root, base_branch)
         .await
         .map_err(OrchestratorError::from_vcs_error)?;
-
-    let effective_reason = resolve_rejection_reason(repo_root, change_id, reason).await;
 
     let rejected_path = rejected_file_path(repo_root, change_id);
     let rejected_parent = rejected_path.parent().ok_or_else(|| {
@@ -178,12 +178,19 @@ pub async fn execute_rejection_flow(
 
     debug!(change_id = %change_id, "Committed REJECTED.md on base branch");
 
-    run_openspec_resolve(change_id, repo_root).await?;
+    let resolve_result = run_openspec_resolve(change_id, repo_root).await;
+    if let Err(ref e) = resolve_result {
+        warn!(
+            change_id = %change_id,
+            error = %e,
+            "openspec resolve failed during rejection flow, continuing with cleanup"
+        );
+    }
 
     cleanup_worktree(repo_root, workspace_path).await;
 
     info!(change_id = %change_id, "Rejection flow completed");
-    Ok(())
+    resolve_result
 }
 
 #[cfg(test)]
