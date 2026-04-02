@@ -58,32 +58,6 @@ async fn resolve_rejection_reason(
     }
 }
 
-async fn run_openspec_resolve(change_id: &str, workspace_path: &Path) -> Result<()> {
-    let output = Command::new("openspec")
-        .arg("resolve")
-        .arg(change_id)
-        .current_dir(workspace_path)
-        .output()
-        .await
-        .map_err(|e| {
-            OrchestratorError::AgentCommand(format!(
-                "Failed to execute openspec resolve for '{}': {}",
-                change_id, e
-            ))
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(OrchestratorError::AgentCommand(format!(
-            "openspec resolve failed for '{}': {}",
-            change_id,
-            stderr.trim()
-        )));
-    }
-
-    Ok(())
-}
-
 async fn cleanup_worktree(repo_root: &Path, worktree_path: &Path) {
     let worktree_path_str = worktree_path.to_string_lossy();
     match git_commands::worktree_remove(repo_root, &worktree_path_str).await {
@@ -110,8 +84,9 @@ async fn cleanup_worktree(repo_root: &Path, worktree_path: &Path) {
 /// Flow:
 /// 1. checkout base branch
 /// 2. write openspec/changes/<id>/REJECTED.md
-/// 3. commit on base branch
-/// 4. run openspec resolve <id>
+/// 3. stage only openspec/changes/<id>/REJECTED.md
+/// 4. commit on base branch
+/// 5. cleanup rejected worktree
 pub async fn execute_rejection_flow(
     change_id: &str,
     reason: &str,
@@ -162,9 +137,43 @@ pub async fn execute_rejection_flow(
         )));
     }
 
+    let staged_paths_output = Command::new("git")
+        .args(["diff", "--cached", "--name-only"])
+        .current_dir(repo_root)
+        .output()
+        .await?;
+    if !staged_paths_output.status.success() {
+        return Err(OrchestratorError::AgentCommand(format!(
+            "git diff --cached --name-only failed for rejection '{}': {}",
+            change_id,
+            String::from_utf8_lossy(&staged_paths_output.stderr).trim()
+        )));
+    }
+
+    let staged_paths_stdout = String::from_utf8_lossy(&staged_paths_output.stdout).into_owned();
+    let staged_paths = staged_paths_stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    if staged_paths != vec![relative_rejected_path.clone()] {
+        return Err(OrchestratorError::AgentCommand(format!(
+            "rejection flow staged unexpected files for '{}': {:?}",
+            change_id, staged_paths
+        )));
+    }
+
     let commit_message = format!("reject(openspec): {}", change_id);
     let commit_output = Command::new("git")
-        .args(["commit", "-m", &commit_message])
+        .args([
+            "commit",
+            "-m",
+            &commit_message,
+            "--",
+            &relative_rejected_path,
+        ])
         .current_dir(repo_root)
         .output()
         .await?;
@@ -178,39 +187,16 @@ pub async fn execute_rejection_flow(
 
     debug!(change_id = %change_id, "Committed REJECTED.md on base branch");
 
-    let resolve_result = run_openspec_resolve(change_id, repo_root).await;
-    if let Err(ref e) = resolve_result {
-        warn!(
-            change_id = %change_id,
-            error = %e,
-            "openspec resolve failed during rejection flow, continuing with cleanup"
-        );
-    }
-
     cleanup_worktree(repo_root, workspace_path).await;
 
     info!(change_id = %change_id, "Rejection flow completed");
-    resolve_result
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    fn write_executable_script(path: &Path, content: &str) {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o755)
-            .open(path)
-            .expect("create script");
-        file.write_all(content.as_bytes()).expect("write script");
-        file.sync_all().expect("sync script");
-    }
 
     async fn init_git_repo(path: &Path) {
         let status = Command::new("git")
@@ -312,21 +298,6 @@ mod tests {
         fs::write(change_dir.join("proposal.md"), "# proposal\n").expect("write proposal");
         fs::write(change_dir.join("tasks.md"), "- [ ] task\n").expect("write tasks");
 
-        let script_dir = repo_root.join("mock-bin");
-        fs::create_dir_all(&script_dir).expect("create script dir");
-        write_executable_script(
-            &script_dir.join("openspec"),
-            "#!/bin/bash\nif [ \"$1\" = \"resolve\" ]; then\n  exit 0\nfi\necho \"unexpected openspec command\" >&2\nexit 1\n",
-        );
-
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        unsafe {
-            std::env::set_var(
-                "PATH",
-                format!("{}:{}", script_dir.display(), original_path),
-            );
-        }
-
         let current_branch = git_commands::get_current_branch(repo_root)
             .await
             .expect("current branch")
@@ -353,10 +324,6 @@ mod tests {
         )
         .await;
 
-        unsafe {
-            std::env::set_var("PATH", original_path);
-        }
-
         assert!(result.is_ok(), "rejection flow should succeed: {result:?}");
 
         let marker_path = change_dir.join("REJECTED.md");
@@ -376,6 +343,26 @@ mod tests {
         assert!(message
             .trim()
             .starts_with("reject(openspec): blocked-change"));
+
+        let committed_paths = Command::new("git")
+            .args(["show", "--name-only", "--pretty=format:", "HEAD"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .expect("read committed paths");
+        assert!(committed_paths.status.success());
+        let committed_paths_stdout = String::from_utf8_lossy(&committed_paths.stdout).into_owned();
+        let committed_paths = committed_paths_stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            committed_paths,
+            vec!["openspec/changes/blocked-change/REJECTED.md".to_string()],
+            "rejection commit must contain only REJECTED.md"
+        );
 
         let list = git_commands::list_worktrees(repo_root)
             .await

@@ -1396,7 +1396,7 @@ This ensures quality gates are always enforced, even after interruptions.
 
 ParallelRunService は、コミットツリーに存在しない change の除外と警告通知を CLI/TUI のどちらの経路でも同一ロジックで実行しなければならない（SHALL）。
 
-Acceptance が `Blocked` を返した場合、ParallelRunService は rejection フロー（REJECTED.md 生成 → base コミット → resolve → worktree 削除）を実行し、`WorkspaceResult` で `error: None, rejected: Some(reason)` を返さなければならない（SHALL）。
+Acceptance が `Blocked` を返した場合、ParallelRunService は rejection フロー（`REJECTED.md` 生成 → `REJECTED.md` のみを base にコミット → worktree 削除）を実行し、`WorkspaceResult` で `error: None, rejected: Some(reason)` を返さなければならない（SHALL）。
 
 #### Scenario: CLI uses ParallelRunService
 
@@ -1564,3 +1564,22 @@ ParallelRunService SHALL support blocked handoff from both acceptance and apply 
 - **WHEN** acceptance does not confirm rejection
 - **THEN** the rejection flow does not execute
 - **AND** the runtime returns the change to a non-terminal state for further action
+
+
+### Requirement: ParallelRunService rejection flow on blocked execution
+
+ParallelRunService SHALL treat a confirmed blocked verdict as a terminal rejection after the base branch has recorded `openspec/changes/<change_id>/REJECTED.md`. Parallel rejection handling SHALL NOT rely on `openspec resolve <change_id>` and SHALL NOT merge additional worktree files into the base branch. After the reject marker commit succeeds, the runtime SHALL emit a rejected result, preserve the rejection reason, and clean up the rejected worktree.
+
+#### Scenario: parallel rejected result is driven by REJECTED marker commit
+
+- **GIVEN** acceptance confirms a blocked verdict in parallel mode
+- **WHEN** the rejection flow commits `openspec/changes/fix-auth/REJECTED.md` on the base branch
+- **THEN** the workspace result is returned as rejected
+- **AND** no further resolve step is required to finalize the rejection
+
+#### Scenario: rejected worktree changes are not merged to base
+
+- **GIVEN** a rejected worktree contains code, tasks, and spec changes in addition to `REJECTED.md`
+- **WHEN** the rejection flow completes
+- **THEN** the base branch receives only `openspec/changes/fix-auth/REJECTED.md`
+- **AND** the remaining worktree-only files are discarded with worktree cleanup

@@ -426,6 +426,16 @@ pub fn list_changes_native() -> Result<Vec<Change>> {
             continue;
         }
 
+        // Rejected marker committed on base means this change is terminal and must
+        // not be re-queued in subsequent runs.
+        if path.join("REJECTED.md").exists() {
+            debug!(
+                "Skipping change '{}' from active list - REJECTED.md marker exists",
+                dir_name
+            );
+            continue;
+        }
+
         // Parse tasks.md for this change
         let (completed_tasks, total_tasks) = match task_parser::parse_change(dir_name) {
             Ok(progress) => (progress.completed, progress.total),
@@ -578,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn test_list_changes_native_keeps_apply_blocked_change_with_rejected_proposal() {
+    fn test_list_changes_native_excludes_rejected_marker_changes() {
         let _lock = crate::test_support::cwd_lock().lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let change_dir = temp_dir
@@ -591,7 +601,7 @@ mod tests {
         fs::write(change_dir.join("tasks.md"), "- [ ] pending task").unwrap();
         fs::write(
             change_dir.join("REJECTED.md"),
-            "# REJECTED\n\n- reason: apply blocked\n",
+            "# REJECTED\n\n- reason: blocked\n",
         )
         .unwrap();
 
@@ -602,12 +612,10 @@ mod tests {
 
         env::set_current_dir(original_dir).unwrap();
 
-        let change = result
-            .iter()
-            .find(|change| change.id == "change-rejected")
-            .expect("changes with apply-generated REJECTED.md proposal must stay visible");
-        assert_eq!(change.completed_tasks, 0);
-        assert_eq!(change.total_tasks, 1);
+        assert!(
+            result.iter().all(|change| change.id != "change-rejected"),
+            "changes with REJECTED.md marker must be excluded from active change list"
+        );
     }
 
     #[test]
