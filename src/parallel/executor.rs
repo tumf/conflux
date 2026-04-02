@@ -87,7 +87,11 @@ pub async fn execute_apply_in_workspace(
     _acceptance_history: &Arc<Mutex<crate::history::AcceptanceHistory>>,
     _acceptance_tail_injected: &Arc<Mutex<std::collections::HashMap<String, bool>>>,
     _initial_iteration: u32,
-) -> Result<(String, u32)> {
+) -> Result<(
+    String,
+    u32,
+    Option<crate::execution::apply::ApplyBlockedHandoff>,
+)> {
     // Validate that workspace_path is a worktree, not the base repository
     match git_commands::is_worktree(repo_root, workspace_path).await {
         Ok(true) => {
@@ -216,8 +220,12 @@ pub async fn execute_apply_in_workspace(
         Err(e) => return Err(e),
     };
 
-    // Return revision and iteration count
-    Ok((apply_result.revision, apply_result.iterations))
+    // Return revision, iteration count, and apply-blocked handoff metadata
+    Ok((
+        apply_result.revision,
+        apply_result.iterations,
+        apply_result.blocked_handoff,
+    ))
 }
 
 /// Execute archive command in a workspace with streaming output
