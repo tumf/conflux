@@ -93,6 +93,18 @@ class OpenSpecManager:
         self.archive_dir = self.changes_dir / "archive"
         self.specs_dir = self.root_dir / "openspec" / "specs"
 
+    def _is_valid_change_dir(self, change_dir: Path) -> bool:
+        """Return True when directory is a valid change (has proposal.md)."""
+        return (change_dir / "proposal.md").exists()
+
+    @staticmethod
+    def _warn_invalid_change_dir(change_dir: Path) -> None:
+        """Emit warning for invalid change directory."""
+        print(
+            f"Warning: Ignoring invalid change directory '{change_dir.name}' (missing proposal.md)",
+            file=sys.stderr,
+        )
+
     def list_changes(self, show_specs: bool = False) -> List[Dict]:
         """List all changes or specs."""
         if show_specs:
@@ -104,6 +116,9 @@ class OpenSpecManager:
 
         for item in self.changes_dir.iterdir():
             if item.is_dir() and item.name != "archive":
+                if not self._is_valid_change_dir(item):
+                    self._warn_invalid_change_dir(item)
+                    continue
                 change_info = self._get_change_info(item)
                 if change_info:
                     changes.append(change_info)
@@ -112,6 +127,9 @@ class OpenSpecManager:
         if self.archive_dir.exists():
             for item in self.archive_dir.iterdir():
                 if item.is_dir():
+                    if not self._is_valid_change_dir(item):
+                        self._warn_invalid_change_dir(item)
+                        continue
                     change_info = self._get_change_info(item, archived=True)
                     if change_info:
                         changes.append(change_info)
@@ -137,7 +155,9 @@ class OpenSpecManager:
 
         return sorted(specs, key=lambda x: x["name"])
 
-    def _get_change_info(self, change_dir: Path, archived: bool = False) -> Optional[Dict]:
+    def _get_change_info(
+        self, change_dir: Path, archived: bool = False
+    ) -> Optional[Dict]:
         """Extract change information from directory."""
         proposal_file = change_dir / "proposal.md"
         tasks_file = change_dir / "tasks.md"
@@ -232,7 +252,9 @@ class OpenSpecManager:
                 if spec_dir.is_dir():
                     spec_file = spec_dir / "spec.md"
                     if spec_file.exists():
-                        info["specs"][spec_dir.name] = spec_file.read_text(encoding="utf-8")
+                        info["specs"][spec_dir.name] = spec_file.read_text(
+                            encoding="utf-8"
+                        )
 
         if deltas_only and "specs" in info:
             # Only return spec deltas
@@ -244,13 +266,21 @@ class OpenSpecManager:
         """Find the directory for a given change ID."""
         # Check active changes
         change_dir = self.changes_dir / change_id
-        if change_dir.exists():
+        if change_dir.exists() and self._is_valid_change_dir(change_dir):
             return change_dir
+        if change_dir.exists() and not self._is_valid_change_dir(change_dir):
+            self._warn_invalid_change_dir(change_dir)
 
         # Check archive
         archive_change_dir = self.archive_dir / change_id
-        if archive_change_dir.exists():
+        if archive_change_dir.exists() and self._is_valid_change_dir(
+            archive_change_dir
+        ):
             return archive_change_dir
+        if archive_change_dir.exists() and not self._is_valid_change_dir(
+            archive_change_dir
+        ):
+            self._warn_invalid_change_dir(archive_change_dir)
 
         return None
 
@@ -366,7 +396,9 @@ class OpenSpecManager:
                         risk_warnings = self._check_archive_risk(specs_dir, change_id)
                         warnings.extend(risk_warnings)
             elif strict:
-                errors.append(f"{change_id}: No spec deltas found (required in strict mode)")
+                errors.append(
+                    f"{change_id}: No spec deltas found (required in strict mode)"
+                )
 
         return errors, warnings
 
@@ -410,7 +442,11 @@ class OpenSpecManager:
                     task_text,
                     re.IGNORECASE,
                 )
-                if strict and evidence_mode != "off" and self._looks_like_behavior_task(task_text):
+                if (
+                    strict
+                    and evidence_mode != "off"
+                    and self._looks_like_behavior_task(task_text)
+                ):
                     if verification_match is None:
                         self._append_evidence_issue(
                             errors,
@@ -432,7 +468,11 @@ class OpenSpecManager:
                             )
 
             # Check for tasks without checkboxes in active sections
-            if not in_excluded_section and re.match(r"^\s*[-*]\s+[^[]", line) and line.strip():
+            if (
+                not in_excluded_section
+                and re.match(r"^\s*[-*]\s+[^[]", line)
+                and line.strip()
+            ):
                 # Might be a task without checkbox
                 if not line.strip().startswith(("##", "#", "---", "```")):
                     errors.append(
@@ -520,7 +560,10 @@ class OpenSpecManager:
             content = spec_file.read_text(encoding="utf-8")
             if "## ADDED Requirements" in content:
                 has_added = True
-            if "## MODIFIED Requirements" in content or "## REMOVED Requirements" in content:
+            if (
+                "## MODIFIED Requirements" in content
+                or "## REMOVED Requirements" in content
+            ):
                 has_risky = True
 
         if has_risky and not has_added:
@@ -532,7 +575,9 @@ class OpenSpecManager:
 
         return warnings
 
-    def archive_change(self, change_id: str, skip_specs: bool = False) -> Tuple[bool, str]:
+    def archive_change(
+        self, change_id: str, skip_specs: bool = False
+    ) -> Tuple[bool, str]:
         """Archive a deployed change."""
         change_dir = self.changes_dir / change_id
 
@@ -549,15 +594,19 @@ class OpenSpecManager:
         if not is_valid:
             return False, f"Validation failed:\n" + "\n".join(errors)
         if warnings:
-            return False, f"Validation warnings must be resolved before archive:\n" + "\n".join(
-                warnings
+            return (
+                False,
+                f"Validation warnings must be resolved before archive:\n"
+                + "\n".join(warnings),
             )
 
         # Simulate spec promotion before moving anything; fail early on no-op / missing targets
         if not skip_specs:
             sim_errors = self._simulate_spec_promotion(change_dir)
             if sim_errors:
-                return False, "Spec promotion simulation failed:\n" + "\n".join(sim_errors)
+                return False, "Spec promotion simulation failed:\n" + "\n".join(
+                    sim_errors
+                )
 
         # Create archive directory if needed
         self.archive_dir.mkdir(parents=True, exist_ok=True)
@@ -628,7 +677,9 @@ class OpenSpecManager:
 
             if canonical_spec.exists():
                 canonical_content = canonical_spec.read_text(encoding="utf-8")
-                merged_content, _ = _shared_merge_spec_delta(canonical_content, delta_content)
+                merged_content, _ = _shared_merge_spec_delta(
+                    canonical_content, delta_content
+                )
                 canonical_spec.write_text(merged_content, encoding="utf-8")
             else:
                 canonical_spec.write_text(
@@ -695,7 +746,11 @@ def print_change_detail(change: Dict, json_output: bool = False):
         print(f"\n{Colors.BOLD}Spec Deltas:{Colors.RESET}")
         for spec_name, spec_content in change["specs"].items():
             print(f"\n  {Colors.CYAN}{spec_name}:{Colors.RESET}")
-            print(f"  {spec_content[:300]}..." if len(spec_content) > 300 else f"  {spec_content}")
+            print(
+                f"  {spec_content[:300]}..."
+                if len(spec_content) > 300
+                else f"  {spec_content}"
+            )
 
 
 def main():
@@ -708,20 +763,26 @@ def main():
 
     # list command
     list_parser = subparsers.add_parser("list", help="List changes or specs")
-    list_parser.add_argument("--specs", action="store_true", help="List specs instead of changes")
+    list_parser.add_argument(
+        "--specs", action="store_true", help="List specs instead of changes"
+    )
 
     # show command
     show_parser = subparsers.add_parser("show", help="Show change details")
     show_parser.add_argument("change_id", help="Change ID to show")
     show_parser.add_argument("--json", action="store_true", help="Output as JSON")
-    show_parser.add_argument("--deltas-only", action="store_true", help="Show only spec deltas")
+    show_parser.add_argument(
+        "--deltas-only", action="store_true", help="Show only spec deltas"
+    )
 
     # validate command
     validate_parser = subparsers.add_parser("validate", help="Validate changes")
     validate_parser.add_argument(
         "change_id", nargs="?", help="Change ID to validate (omit for all)"
     )
-    validate_parser.add_argument("--strict", action="store_true", help="Strict validation mode")
+    validate_parser.add_argument(
+        "--strict", action="store_true", help="Strict validation mode"
+    )
     validate_parser.add_argument(
         "--evidence",
         choices=("off", "warn", "error"),
@@ -733,7 +794,9 @@ def main():
     archive_parser = subparsers.add_parser("archive", help="Archive a deployed change")
     archive_parser.add_argument("change_id", help="Change ID to archive")
     archive_parser.add_argument("--yes", action="store_true", help="Skip confirmation")
-    archive_parser.add_argument("--skip-specs", action="store_true", help="Skip spec updates")
+    archive_parser.add_argument(
+        "--skip-specs", action="store_true", help="Skip spec updates"
+    )
 
     args = parser.parse_args()
 
@@ -772,7 +835,9 @@ def main():
                 print(f"{Colors.GREEN}✓ Validation passed{Colors.RESET}")
                 return 0
             else:
-                print(f"{Colors.RED}✗ Validation failed:{Colors.RESET}", file=sys.stderr)
+                print(
+                    f"{Colors.RED}✗ Validation failed:{Colors.RESET}", file=sys.stderr
+                )
                 for error in errors:
                     print(f"  {error}", file=sys.stderr)
                 return 1
@@ -784,7 +849,9 @@ def main():
                     print("Cancelled")
                     return 0
 
-            success, message = manager.archive_change(args.change_id, skip_specs=args.skip_specs)
+            success, message = manager.archive_change(
+                args.change_id, skip_specs=args.skip_specs
+            )
             if success:
                 print(f"{Colors.GREEN}✓ {message}{Colors.RESET}")
                 return 0
