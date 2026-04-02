@@ -31,7 +31,6 @@ mod error_history;
 mod execution;
 mod history;
 mod hooks;
-mod merge_stall_monitor;
 mod openspec;
 pub mod orchestration;
 mod orchestrator;
