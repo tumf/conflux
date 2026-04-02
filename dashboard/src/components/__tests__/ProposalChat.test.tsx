@@ -16,21 +16,27 @@ let hookState: {
   error: string | null;
   activeElicitation: null;
   wsConnected: boolean;
+  submissionLock: { isLocked: boolean; clearVersion: number };
 } = {
   messages: [],
   status: 'ready',
   error: null,
   activeElicitation: null,
   wsConnected: false,
+  submissionLock: {
+    isLocked: false,
+    clearVersion: 0,
+  },
 };
 
 vi.mock('../../hooks/useProposalChat', () => ({
-  useProposalChat: () => ({
-    ...hookState,
-    sendMessage: sendMessageMock,
-    stop: stopMock,
-    sendElicitationResponse: sendElicitationResponseMock,
-  }),
+    useProposalChat: () => ({
+      ...hookState,
+      sendMessage: sendMessageMock,
+      stop: stopMock,
+      sendElicitationResponse: sendElicitationResponseMock,
+    }),
+
 }));
 
 vi.mock('../ProposalChangesList', () => ({
@@ -58,8 +64,13 @@ afterEach(() => {
     error: null,
     activeElicitation: null,
     wsConnected: false,
+    submissionLock: {
+      isLocked: false,
+      clearVersion: 0,
+    },
   };
 });
+
 
 describe('ProposalChat', () => {
   it('shows reconnect recovery placeholder when recovering status', () => {

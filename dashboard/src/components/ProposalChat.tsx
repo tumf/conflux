@@ -59,6 +59,7 @@ export function ProposalChat({
     activeElicitation,
     sendElicitationResponse,
     wsConnected,
+    submissionLock,
   } = useProposalChat(projectId, sessionId);
 
   const handleExamplePromptSelect = useCallback(
@@ -147,8 +148,9 @@ export function ProposalChat({
           />
           <ChatInput
             onSend={sendMessage}
-            status={status}
+            isSubmissionLocked={submissionLock.isLocked}
             placeholder={statusPlaceholder(status, wsConnected)}
+            clearVersion={submissionLock.clearVersion}
           />
           {(status === 'submitted' || status === 'streaming' || status === 'recovering') && (
             <div className="border-t border-border px-3 py-2 text-xs text-text-subtle">
