@@ -380,6 +380,12 @@ pub trait WorkspaceManager: Send + Sync {
     /// Get the repository root path.
     fn repo_root(&self) -> &Path;
 
+    /// Ensure original branch is initialized and return it.
+    ///
+    /// Implementations should lazily capture the current branch if needed.
+    /// Returns an error for unrecoverable states (for example detached HEAD).
+    async fn ensure_original_branch_initialized(&self) -> VcsResult<String>;
+
     /// Get the original branch name captured for parallel execution.
     ///
     /// Returns None if the branch has not been captured yet.

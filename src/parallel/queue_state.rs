@@ -62,26 +62,24 @@ impl ParallelExecutor {
     ///
     /// A dependency is considered resolved if its archive commit is present in the base branch.
     /// This indicates that the dependency's artifacts are available for dependent changes.
-    pub(super) async fn is_dependency_resolved(&self, dep_id: &str) -> bool {
-        let original_branch = match self.workspace_manager.original_branch() {
-            Some(branch) => branch,
-            None => {
-                warn!("Original branch not initialized, assuming dependency not resolved");
-                return false;
-            }
-        };
+    pub(super) async fn is_dependency_resolved(&self, dep_id: &str) -> Result<bool> {
+        let original_branch = self
+            .workspace_manager
+            .ensure_original_branch_initialized()
+            .await
+            .map_err(OrchestratorError::from_vcs_error)?;
 
         // Check if the archive commit for this dependency exists in the base branch
         match crate::execution::state::is_merged_to_base(dep_id, &self.repo_root, &original_branch)
             .await
         {
-            Ok(is_merged) => is_merged,
+            Ok(is_merged) => Ok(is_merged),
             Err(e) => {
                 warn!(
                     "Failed to check if dependency '{}' is merged to base: {}, assuming not resolved",
                     dep_id, e
                 );
-                false
+                Ok(false)
             }
         }
     }
@@ -171,8 +169,26 @@ impl ParallelExecutor {
             if let Some(deps) = analysis_result.dependencies.get(change_id) {
                 let mut unresolved_deps = Vec::new();
                 for dep_id in deps {
-                    if !self.is_dependency_resolved(dep_id).await {
-                        unresolved_deps.push(dep_id.clone());
+                    match self.is_dependency_resolved(dep_id).await {
+                        Ok(true) => {}
+                        Ok(false) => unresolved_deps.push(dep_id.clone()),
+                        Err(e) => {
+                            error!(
+                                "Failed to evaluate dependency resolution for '{}' (dependency '{}'): {}",
+                                change_id, dep_id, e
+                            );
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::Error {
+                                    message: format!(
+                                        "Failed to evaluate dependency resolution for '{}' (dependency '{}'): {}",
+                                        change_id, dep_id, e
+                                    ),
+                                },
+                            )
+                            .await;
+                            unresolved_deps.push(dep_id.clone());
+                        }
                     }
                 }
 

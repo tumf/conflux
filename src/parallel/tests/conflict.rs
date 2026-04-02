@@ -153,6 +153,10 @@ impl WorkspaceManager for MockWorkspaceManager {
         vec![]
     }
 
+    async fn ensure_original_branch_initialized(&self) -> VcsResult<String> {
+        Ok("main".to_string())
+    }
+
     fn original_branch(&self) -> Option<String> {
         Some("main".to_string())
     }

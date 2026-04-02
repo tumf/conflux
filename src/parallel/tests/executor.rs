@@ -186,6 +186,10 @@ impl WorkspaceManager for TestWorkspaceManager {
         &self.repo_root
     }
 
+    async fn ensure_original_branch_initialized(&self) -> VcsResult<String> {
+        Ok("main".to_string())
+    }
+
     fn original_branch(&self) -> Option<String> {
         Some("main".to_string())
     }
@@ -2699,9 +2703,141 @@ async fn test_merge_proceeds_when_archive_complete() {
             );
         }
         Err(e) => {
-            // This is also acceptable - merge may fail for other reasons (e.g., original branch not initialized)
-            // but it should not be deferred due to archive verification
+            // This is also acceptable - merge may fail for other reasons (e.g., merge conflicts)
+            // but it should not be deferred due to archive verification.
             println!("Merge failed with error (acceptable): {}", e);
+        }
+    }
+}
+
+/// Regression: detached HEAD must be reported as execution error, not MergeWait/deferred.
+#[tokio::test]
+async fn test_attempt_merge_errors_on_detached_head() {
+    use std::fs;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    // Create temporary repository
+    let temp_dir = TempDir::new().unwrap();
+    let repo_root = temp_dir.path();
+
+    // Initialize git repo
+    Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Create initial commit
+    fs::write(repo_root.join("README.md"), "initial").unwrap();
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "Initial"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Create archive directory but NOT openspec/changes/test-change (proper archive)
+    let archive_dir = repo_root.join("openspec/changes/archive/test-change");
+    fs::create_dir_all(&archive_dir).unwrap();
+    fs::write(archive_dir.join("spec.md"), "# Archived").unwrap();
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "Archive: test-change"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Detach HEAD explicitly
+    let detached_rev = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+    let detached_rev = String::from_utf8_lossy(&detached_rev.stdout)
+        .trim()
+        .to_string();
+    Command::new("git")
+        .args(["checkout", detached_rev.as_str()])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Create worktree for the change (outside the main repo to avoid dirty working tree)
+    let workspace_base = TempDir::new().unwrap();
+    let workspace_path = workspace_base.path().join("ws-test-change");
+
+    Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            "ws-test-change",
+            workspace_path.to_str().unwrap(),
+            "HEAD",
+        ])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .unwrap();
+
+    // Create executor
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let (tx, _rx) = mpsc::channel(10);
+    let executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
+
+    let revisions = vec!["ws-test-change".to_string()];
+    let change_ids = vec!["test-change".to_string()];
+    let archive_paths = vec![workspace_path.clone()];
+
+    let result = executor
+        .attempt_merge(&revisions, &change_ids, &archive_paths)
+        .await;
+
+    match result {
+        Ok(MergeAttempt::Deferred(reason)) => {
+            panic!("Detached HEAD must not become MergeDeferred: {}", reason);
+        }
+        Ok(MergeAttempt::Merged { revision }) => {
+            panic!("Detached HEAD must not merge successfully: {}", revision);
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("Detached HEAD state detected"),
+                "Expected detached HEAD error, got: {}",
+                msg
+            );
         }
     }
 }

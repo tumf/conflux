@@ -174,6 +174,10 @@ impl WorkspaceManager for ResumeTestManager {
     fn repo_root(&self) -> &Path {
         &self.workspace_path
     }
+    async fn ensure_original_branch_initialized(&self) -> VcsResult<String> {
+        Ok("main".to_string())
+    }
+
     fn original_branch(&self) -> Option<String> {
         Some("main".to_string())
     }
