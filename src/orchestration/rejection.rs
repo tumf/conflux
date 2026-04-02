@@ -14,11 +14,48 @@ fn rejected_file_path(workspace_path: &Path, change_id: &str) -> PathBuf {
         .join("REJECTED.md")
 }
 
+pub fn has_rejection_proposal(workspace_path: &Path, change_id: &str) -> bool {
+    rejected_file_path(workspace_path, change_id).is_file()
+}
+
 fn rejected_markdown(change_id: &str, reason: &str) -> String {
     format!(
         "# REJECTED\n\n- change_id: {}\n- reason: {}\n",
         change_id, reason
     )
+}
+
+fn extract_rejected_reason(content: &str) -> Option<String> {
+    content
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("- reason:").map(str::trim))
+        .filter(|reason| !reason.is_empty())
+        .map(ToString::to_string)
+}
+
+async fn resolve_rejection_reason(
+    repo_root: &Path,
+    change_id: &str,
+    fallback_reason: &str,
+) -> String {
+    let rejected_path = rejected_file_path(repo_root, change_id);
+
+    match tokio::fs::read_to_string(&rejected_path).await {
+        Ok(content) => {
+            if let Some(reason) = extract_rejected_reason(&content) {
+                info!(
+                    change_id = %change_id,
+                    rejected_path = %rejected_path.display(),
+                    "Using reason extracted from existing apply-generated REJECTED.md proposal"
+                );
+                reason
+            } else {
+                fallback_reason.to_string()
+            }
+        }
+        Err(_) => fallback_reason.to_string(),
+    }
 }
 
 async fn run_openspec_resolve(change_id: &str, workspace_path: &Path) -> Result<()> {
@@ -94,6 +131,8 @@ pub async fn execute_rejection_flow(
         .await
         .map_err(OrchestratorError::from_vcs_error)?;
 
+    let effective_reason = resolve_rejection_reason(repo_root, change_id, reason).await;
+
     let rejected_path = rejected_file_path(repo_root, change_id);
     let rejected_parent = rejected_path.parent().ok_or_else(|| {
         OrchestratorError::AgentCommand(format!(
@@ -103,7 +142,11 @@ pub async fn execute_rejection_flow(
     })?;
 
     tokio::fs::create_dir_all(rejected_parent).await?;
-    tokio::fs::write(&rejected_path, rejected_markdown(change_id, reason)).await?;
+    tokio::fs::write(
+        &rejected_path,
+        rejected_markdown(change_id, &effective_reason),
+    )
+    .await?;
 
     let relative_rejected_path = format!("openspec/changes/{}/REJECTED.md", change_id);
     let add_output = Command::new("git")
@@ -213,9 +256,41 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_rejected_reason_parses_reason_line() {
+        let content = "# REJECTED\n\n- change_id: change-a\n- reason: apply blocked handoff\n";
+        let reason = extract_rejected_reason(content);
+        assert_eq!(reason.as_deref(), Some("apply blocked handoff"));
+    }
+
+    #[test]
+    fn test_extract_rejected_reason_returns_none_without_reason_line() {
+        let content = "# REJECTED\n\n- change_id: change-a\n";
+        let reason = extract_rejected_reason(content);
+        assert!(reason.is_none());
+    }
+
+    #[test]
     fn test_rejected_file_path_layout() {
         let path = rejected_file_path(Path::new("/tmp/ws"), "change-a");
         assert!(path.ends_with("openspec/changes/change-a/REJECTED.md"));
+    }
+
+    #[test]
+    fn test_has_rejection_proposal_detects_marker_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let change_dir = temp_dir.path().join("openspec/changes/change-a");
+        std::fs::create_dir_all(&change_dir).unwrap();
+
+        assert!(
+            !has_rejection_proposal(temp_dir.path(), "change-a"),
+            "proposal should be absent before REJECTED.md exists"
+        );
+
+        std::fs::write(change_dir.join("REJECTED.md"), "# REJECTED").unwrap();
+        assert!(
+            has_rejection_proposal(temp_dir.path(), "change-a"),
+            "proposal should be detected after REJECTED.md is created"
+        );
     }
 
     #[tokio::test]

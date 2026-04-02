@@ -453,12 +453,23 @@ impl SerialRunService {
         // Abort the background cancel monitoring task now that apply is complete
         cancel_task.abort();
 
-        // Check if apply loop completed successfully
-        if apply_result.completed {
-            info!(
-                "Apply loop completed for {} after {} iterations",
-                change.id, apply_result.iterations
-            );
+        let apply_blocked_handoff = apply_result.blocked_handoff.clone();
+
+        // Check if apply loop completed successfully or detected blocked handoff.
+        if apply_result.completed || apply_blocked_handoff.is_some() {
+            if apply_result.completed {
+                info!(
+                    "Apply loop completed for {} after {} iterations",
+                    change.id, apply_result.iterations
+                );
+            } else if let Some(ref handoff) = apply_blocked_handoff {
+                warn!(
+                    change_id = %change.id,
+                    rejected_path = %handoff.rejected_path.display(),
+                    iterations = apply_result.iterations,
+                    "Apply blocked handoff detected; proceeding to acceptance with incomplete tasks"
+                );
+            }
 
             // Increment apply count for this change
             self.increment_apply_count(&change.id);
@@ -466,12 +477,20 @@ impl SerialRunService {
             // Re-fetch change to get updated task counts after apply
             let (updated_change, is_complete) = Self::refetch_change_after_apply(&change.id);
 
-            if is_complete {
-                let updated_change = updated_change.unwrap(); // Safe: checked above
-                info!(
-                    "Tasks complete for {}, running acceptance test...",
-                    change.id
-                );
+            if is_complete || apply_blocked_handoff.is_some() {
+                let updated_change = updated_change.unwrap_or_else(|| change.clone());
+                if is_complete {
+                    info!(
+                        "Tasks complete for {}, running acceptance test...",
+                        change.id
+                    );
+                } else if let Some(ref handoff) = apply_blocked_handoff {
+                    warn!(
+                        change_id = %change.id,
+                        rejected_path = %handoff.rejected_path.display(),
+                        "Running acceptance for apply-blocked handoff with unchecked tasks"
+                    );
+                }
 
                 // Update operation to "acceptance" before running acceptance test
                 Self::update_operation_tracker(&operation_tracker, "acceptance");

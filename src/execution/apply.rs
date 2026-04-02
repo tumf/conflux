@@ -23,7 +23,7 @@ use crate::task_parser::TaskProgress;
 use crate::vcs::{VcsBackend, VcsResult, WorkspaceManager};
 use std::fs;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -544,6 +544,32 @@ pub struct ApplyLoopResult {
     pub completed: bool,
     /// Number of iterations executed
     pub iterations: u32,
+    /// Apply detected blocker handoff proposal (`REJECTED.md`) and stopped apply loop.
+    pub blocked_handoff: Option<ApplyBlockedHandoff>,
+}
+
+/// Structured metadata for apply-blocked handoff via `REJECTED.md` proposal artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyBlockedHandoff {
+    /// Absolute path to detected proposal file.
+    pub rejected_path: PathBuf,
+}
+
+fn detect_apply_blocked_handoff(
+    workspace_path: &Path,
+    change_id: &str,
+) -> Option<ApplyBlockedHandoff> {
+    if !crate::orchestration::has_rejection_proposal(workspace_path, change_id) {
+        return None;
+    }
+
+    let rejected_path = workspace_path
+        .join("openspec")
+        .join("changes")
+        .join(change_id)
+        .join("REJECTED.md");
+
+    Some(ApplyBlockedHandoff { rejected_path })
 }
 
 /// Execute apply iterations until tasks are complete or max iterations reached.
@@ -636,6 +662,19 @@ where
         // Send progress event
         if progress.total > 0 {
             event_handler.on_progress_updated(change_id, progress.completed, progress.total);
+        }
+
+        // Apply-blocked handoff: if apply has produced REJECTED.md proposal,
+        // stop apply loop and hand off to acceptance even when tasks remain unchecked.
+        if let Some(blocked_handoff) = detect_apply_blocked_handoff(workspace_path, change_id) {
+            info!(
+                change_id = change_id,
+                rejected_path = %blocked_handoff.rejected_path.display(),
+                completed = progress.completed,
+                total = progress.total,
+                "Apply blocked handoff detected via REJECTED.md; exiting apply loop for acceptance"
+            );
+            break false;
         }
 
         // Check if already complete
@@ -948,16 +987,24 @@ where
         String::new()
     };
 
+    let blocked_handoff = if apply_succeeded {
+        None
+    } else {
+        detect_apply_blocked_handoff(workspace_path, change_id)
+    };
+
     Ok(ApplyLoopResult {
         revision,
         completed: apply_succeeded,
         iterations: iteration,
+        blocked_handoff,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     // === ApplyConfig tests ===
 
@@ -1150,5 +1197,103 @@ mod tests {
         let actual = format_wip_commit_message(change_id, &progress, iteration);
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_detect_apply_blocked_handoff_absent_without_rejected_marker() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+
+        std::fs::create_dir_all(workspace.join("openspec/changes/change-a")).unwrap();
+
+        let handoff = detect_apply_blocked_handoff(workspace, "change-a");
+        assert!(handoff.is_none());
+    }
+
+    #[test]
+    fn test_detect_apply_blocked_handoff_present_with_rejected_marker() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let rejected_path = workspace
+            .join("openspec")
+            .join("changes")
+            .join("change-a")
+            .join("REJECTED.md");
+
+        std::fs::create_dir_all(rejected_path.parent().unwrap()).unwrap();
+        std::fs::write(&rejected_path, "# REJECTED\n- reason: blocked\n").unwrap();
+
+        let handoff = detect_apply_blocked_handoff(workspace, "change-a");
+        assert!(handoff.is_some());
+        assert_eq!(
+            handoff.unwrap().rejected_path,
+            rejected_path,
+            "detected handoff should point to REJECTED.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_apply_loop_returns_blocked_handoff_without_stall_loop() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let change_id = "blocked-change";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] pending\n",
+        )
+        .unwrap();
+        std::fs::write(
+            change_dir.join("REJECTED.md"),
+            "# REJECTED\n\n- change_id: blocked-change\n- reason: apply blocked\n",
+        )
+        .unwrap();
+
+        let config = OrchestratorConfig::default();
+        let mut agent = AgentRunner::new(config.clone());
+        let queue_config = crate::command_queue::CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 0,
+            retry_delay_ms: 0,
+            retry_error_patterns: Vec::new(),
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 0,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: false,
+        };
+        let shared_state = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let ai_runner = crate::ai_command_runner::AiCommandRunner::new(queue_config, shared_state);
+
+        let result = execute_apply_loop(
+            change_id,
+            workspace,
+            &config,
+            &mut agent,
+            VcsBackend::Auto,
+            None,
+            None,
+            &ApplyLoopHookContext::serial(0, 1, 1),
+            &NoOpEventHandler,
+            None,
+            &ai_runner,
+            |_line| async move {},
+        )
+        .await
+        .expect("apply loop should return blocked handoff without error");
+
+        assert!(
+            !result.completed,
+            "blocked handoff should not be treated as completed apply"
+        );
+        assert_eq!(
+            result.iterations, 1,
+            "blocked handoff should exit before retry/stall loop"
+        );
+        assert!(
+            result.blocked_handoff.is_some(),
+            "blocked handoff metadata must be returned"
+        );
     }
 }

@@ -191,15 +191,25 @@ You MUST record an Implementation Blocker and escalate to acceptance review:
 [What action would unblock implementation - e.g., spec clarification, external system access, requirement change]
 ```
 
-2. Output to stdout immediately after recording:
-```
-IMPLEMENTATION_BLOCKER:
-Category: [SpecContradiction | ExternalConstraint]
-Summary: [One-line description]
-See tasks.md ## Implementation Blocker #N for details
+2. Create or update `openspec/changes/<change_id>/REJECTED.md` as an apply-generated rejection proposal artifact (non-terminal until acceptance confirms):
+```markdown
+# REJECTED
+
+- change_id: <change_id>
+- reason: [same one-line blocker summary]
+- proposed_by: apply
 ```
 
-3. After outputting the blocker, you MAY continue working on other unblocked tasks if any remain, or output normal completion if all actionable tasks are done.
+3. Output to stdout immediately after recording:
+```
+IMPLEMENTATION_BLOCKER:
+category: [SpecContradiction | ExternalConstraint]
+tasks_section: Implementation Blocker #N
+rejection_proposal: openspec/changes/<change_id>/REJECTED.md
+human_action_required: acceptance must confirm rejection proposal
+```
+
+4. After outputting the blocker, you MAY continue working on other unblocked tasks if any remain, or output normal completion if all actionable tasks are done.
 
 Use an Implementation Blocker instead of falsely completing tasks when:
 - the spec requires runtime behavior but no implementable entrypoint can be wired from repo context

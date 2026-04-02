@@ -159,15 +159,24 @@ If apply determines the change is currently impossible to implement (for example
    - owner: <team_or_role>
    - decision_due: <YYYY-MM-DD>
    ```
-2. The blocker section is human-facing and MUST NOT use checkboxes.
-3. Output a machine-readable marker at the end of apply output:
+2. Create or update `openspec/changes/<change-id>/REJECTED.md` as an **apply-generated rejection proposal artifact** (not terminal by itself). Include at minimum:
+   ```markdown
+   # REJECTED
+
+   - change_id: <change-id>
+   - reason: <same blocker summary>
+   - proposed_by: apply
+   ```
+3. The blocker section is human-facing and MUST NOT use checkboxes.
+4. Output a machine-readable marker at the end of apply output:
    ```text
    IMPLEMENTATION_BLOCKER:
    category: <...>
    tasks_section: "Implementation Blocker #<n>"
-   human_action_required: see openspec/changes/<change-id>/tasks.md#implementation-blocker-<n>
+   rejection_proposal: openspec/changes/<change-id>/REJECTED.md
+   human_action_required: acceptance must confirm rejection proposal
    ```
-4. Keep evidence concrete and actionable so acceptance can judge whether loop stop is warranted.
+5. Keep evidence concrete and actionable so acceptance can judge whether loop stop is warranted.
 
 ### Apply Completion Criteria
 
@@ -308,6 +317,7 @@ Recommended:
 - Missing secrets MUST NOT cause CONTINUE if mocking is possible
 - Dirty working tree is always FAIL
 - `ACCEPTANCE: BLOCKED` is allowed only when a valid `Implementation Blocker #<n>` exists with concrete evidence and unblock actions
+- For apply-blocked handoff, `openspec/changes/<change-id>/REJECTED.md` is a **proposal artifact**; acceptance must explicitly confirm before runtime executes rejection flow
 - If blocker data is weak, speculative, or fixable within repo scope, return FAIL instead of BLOCKED
 
 **For detailed guidance**, read [references/cflx-accept.md](references/cflx-accept.md).

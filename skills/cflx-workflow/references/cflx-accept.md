@@ -39,14 +39,16 @@ Permission Error Acceptance:
 
 Implementation Blocker review:
 1. Check if tasks.md contains any "## Implementation Blocker #N" sections
-2. If Implementation Blocker(s) exist:
+2. Check whether `openspec/changes/<change_id>/REJECTED.md` exists (apply-generated rejection proposal artifact)
+3. If Implementation Blocker(s) exist:
    a. Review each blocker's Category, Root Cause, Evidence, Impact, and Resolution Required
    b. Verify the blocker is legitimate (spec contradiction or truly non-mockable external constraint)
-   c. If blocker is valid:
+   c. Verify `REJECTED.md` proposal content aligns with blocker summary when present
+   d. If blocker is valid:
       - Output "ACCEPTANCE: BLOCKED"
       - Do NOT output FINDINGS or update tasks.md
-      - The orchestrator will stop the apply loop and preserve the workspace
-   d. If blocker is NOT valid (issue is mockable or solvable autonomously):
+      - The orchestrator will confirm rejection proposal and execute rejection flow
+   e. If blocker is NOT valid (issue is mockable or solvable autonomously):
       - Treat as acceptance FAIL
       - Add finding: "Implementation Blocker #N is not valid: [reason]. Agent must [specific action]."
 

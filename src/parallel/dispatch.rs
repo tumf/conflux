@@ -406,8 +406,8 @@ impl ParallelExecutor {
                 )
                 .await;
 
-                let (revision, final_iteration) = match apply_result {
-                    Ok((rev, iter)) => (rev, iter),
+                let (revision, final_iteration, blocked_handoff) = match apply_result {
+                    Ok((rev, iter, blocked_handoff)) => (rev, iter, blocked_handoff),
                     Err(e) => {
                         // Check if this was a single-change stop
                         let error_str = e.to_string();
@@ -454,6 +454,26 @@ impl ParallelExecutor {
 
                 // Update cumulative iteration count
                 cumulative_iteration = final_iteration;
+
+                if let Some(handoff) = &blocked_handoff {
+                    info!(
+                        change_id = %change_id,
+                        rejected_path = %handoff.rejected_path.display(),
+                        "Apply emitted blocked handoff proposal; forwarding to acceptance"
+                    );
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::Log(
+                                LogEntry::warn(format!(
+                                    "Apply blocked handoff detected via {}",
+                                    handoff.rejected_path.display()
+                                ))
+                                .with_change_id(&change_id)
+                                .with_operation("apply"),
+                            ))
+                            .await;
+                    }
+                }
 
                 // Send ApplyCompleted event
                 if let Some(ref tx) = event_tx {
@@ -633,7 +653,17 @@ impl ParallelExecutor {
                         crate::orchestration::AcceptanceResult::Blocked,
                         acceptance_iteration,
                     )) => {
-                        let reason = "Implementation blocker detected".to_string();
+                        let reason = blocked_handoff
+                            .as_ref()
+                            .map(|handoff| {
+                                format!(
+                                    "Acceptance-confirmed apply blocker (proposal: {})",
+                                    handoff.rejected_path.display()
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                "Acceptance-confirmed implementation blocker".to_string()
+                            });
                         warn!(
                             "Acceptance blocked for {} - running rejection flow",
                             change_id

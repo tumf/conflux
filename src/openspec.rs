@@ -426,13 +426,6 @@ pub fn list_changes_native() -> Result<Vec<Change>> {
             continue;
         }
 
-        // Skip rejected changes (REJECTED.md is committed as terminal marker)
-        let rejected_marker = path.join("REJECTED.md");
-        if rejected_marker.exists() {
-            debug!("Skipping change '{}' - REJECTED.md marker found", dir_name);
-            continue;
-        }
-
         // Parse tasks.md for this change
         let (completed_tasks, total_tasks) = match task_parser::parse_change(dir_name) {
             Ok(progress) => (progress.completed, progress.total),
@@ -585,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn test_list_changes_native_skips_rejected_marker() {
+    fn test_list_changes_native_keeps_apply_blocked_change_with_rejected_proposal() {
         let _lock = crate::test_support::cwd_lock().lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let change_dir = temp_dir
@@ -595,7 +588,12 @@ mod tests {
             .join("change-rejected");
         fs::create_dir_all(&change_dir).unwrap();
         fs::write(change_dir.join("proposal.md"), "# proposal").unwrap();
-        fs::write(change_dir.join("REJECTED.md"), "# rejected").unwrap();
+        fs::write(change_dir.join("tasks.md"), "- [ ] pending task").unwrap();
+        fs::write(
+            change_dir.join("REJECTED.md"),
+            "# REJECTED\n\n- reason: apply blocked\n",
+        )
+        .unwrap();
 
         let original_dir = env::current_dir().unwrap();
         env::set_current_dir(temp_dir.path()).unwrap();
@@ -604,10 +602,12 @@ mod tests {
 
         env::set_current_dir(original_dir).unwrap();
 
-        assert!(
-            !result.iter().any(|change| change.id == "change-rejected"),
-            "changes with REJECTED.md must be skipped"
-        );
+        let change = result
+            .iter()
+            .find(|change| change.id == "change-rejected")
+            .expect("changes with apply-generated REJECTED.md proposal must stay visible");
+        assert_eq!(change.completed_tasks, 0);
+        assert_eq!(change.total_tasks, 1);
     }
 
     #[test]
