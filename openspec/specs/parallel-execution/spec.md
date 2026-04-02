@@ -1396,7 +1396,7 @@ This ensures quality gates are always enforced, even after interruptions.
 
 ParallelRunService は、コミットツリーに存在しない change の除外と警告通知を CLI/TUI のどちらの経路でも同一ロジックで実行しなければならない（SHALL）。
 
-Acceptance が `Blocked` を返した場合、ParallelRunService は rejection フロー（REJECTED.md 生成 → base コミット → resolve → worktree 削除）を実行し、`WorkspaceResult` で `error: None, rejected: Some(reason)` を返さなければならない（SHALL）。
+Acceptance が `Blocked` を返した場合、ParallelRunService は rejection フロー（`REJECTED.md` 生成 → `REJECTED.md` のみを base にコミット → worktree 削除）を実行し、`WorkspaceResult` で `error: None, rejected: Some(reason)` を返さなければならない（SHALL）。
 
 #### Scenario: CLI uses ParallelRunService
 

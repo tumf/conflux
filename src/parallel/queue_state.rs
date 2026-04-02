@@ -284,8 +284,8 @@ impl ParallelExecutor {
                 },
             )
             .await;
-            // Rejected flow completes resolve on base and should not proceed to merge.
-            // Ensure preserved workspace is cleaned up.
+            // Rejected flow is terminal after base-side REJECTED marker commit
+            // and should not proceed to merge. Ensure preserved workspace is cleaned up.
             if let Err(e) = self
                 .workspace_manager
                 .cleanup_workspace(&workspace_result.workspace_name)
