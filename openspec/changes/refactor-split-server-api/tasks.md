@@ -18,3 +18,8 @@
 ## Future Work
 
 - 各ハンドラのエラー型を統一する（別 proposal で扱う）
+
+## Acceptance #1 Failure Follow-up
+
+- [x] `test_stats_and_logs_endpoints_return_data` が `POST /api/v1/projects` で 201 を再び返すように修正し、`cargo test test_stats_and_logs_endpoints_return_data -- --nocapture` を再実行して通過を確認する
+- [x] `src/server/api/mod.rs` に残っている API テストを責務別サブモジュールへ移し、`src/server/api/mod.rs` にはルーター構築と共有ロジックのテストだけを残す

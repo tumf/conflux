@@ -410,6 +410,250 @@ pub(super) async fn get_logs(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    use crate::server::api::{build_router, AppState, SERVER_LOG_BUFFER_SIZE};
+    use crate::server::registry::{create_shared_registry, OrchestrationStatus};
+
+    fn make_state(temp_dir: &TempDir, auth_token: Option<&str>) -> AppState {
+        let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        AppState {
+            registry,
+            runners: crate::server::runner::create_shared_runners(),
+            db: Some(crate::server::db::ServerDb::new(temp_dir.path()).unwrap()),
+            auth_token: auth_token.map(std::string::ToString::to_string),
+            max_concurrent_total: 4,
+            resolve_command: None,
+            log_tx,
+            orchestration_status: Arc::new(tokio::sync::RwLock::new(OrchestrationStatus::default())),
+            terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
+            proposal_session_manager: crate::server::proposal_session::create_proposal_session_manager(
+                crate::config::ProposalSessionConfig::default(),
+                None,
+            ),
+        }
+    }
+
+    fn create_local_git_repo(parent: &std::path::Path) -> std::path::PathBuf {
+        let repo_path = parent.join("test-origin");
+        let src = parent.join("test-src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        std::fs::write(src.join("README.md"), "hello").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&src)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                src.to_str().unwrap(),
+                repo_path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        repo_path
+    }
+
+    #[tokio::test]
+    async fn test_stats_and_logs_endpoints_require_auth() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = build_router(make_state(&temp_dir, Some("secret-token")));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/stats/overview")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/logs")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_stats_and_logs_endpoints_return_data() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let router = build_router(make_state(&temp_dir, None));
+
+        let add_body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+        let add_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(add_body.to_string()))
+            .unwrap();
+        let add_resp = router.clone().oneshot(add_req).await.unwrap();
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+
+        let body_bytes = axum::body::to_bytes(add_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let project_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let project_id = project_json["id"].as_str().unwrap();
+
+        let db = crate::server::db::ServerDb::new(temp_dir.path()).unwrap();
+        db.insert_change_event(
+            project_id,
+            "change-1",
+            None,
+            "apply",
+            1,
+            true,
+            1234,
+            Some(0),
+            None,
+            Some("ok"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_log(
+            Some(project_id),
+            "info",
+            "persisted-log",
+            Some("change-1"),
+            Some("apply"),
+            Some(1),
+        )
+        .unwrap();
+
+        let overview_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/stats/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(overview_resp.status(), StatusCode::OK);
+
+        let overview_body = axum::body::to_bytes(overview_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let overview_json: serde_json::Value = serde_json::from_slice(&overview_body).unwrap();
+
+        assert_eq!(overview_json["summary"]["success_count"], 1);
+        assert_eq!(overview_json["summary"]["failure_count"], 0);
+        assert_eq!(overview_json["summary"]["in_progress_count"], 0);
+        assert_eq!(overview_json["summary"]["average_duration_ms"], 1234.0);
+
+        let recent_events = overview_json["recent_events"]
+            .as_array()
+            .expect("recent_events must be an array");
+        assert!(!recent_events.is_empty(), "recent_events must not be empty");
+        let first_event = &recent_events[0];
+        assert_eq!(first_event["project_id"], project_id);
+        assert_eq!(first_event["change_id"], "change-1");
+        assert_eq!(first_event["operation"], "apply");
+        assert_eq!(first_event["result"], "success");
+        assert!(
+            first_event["timestamp"].as_str().is_some(),
+            "recent_events[0].timestamp must be a string"
+        );
+
+        let project_stats = overview_json["project_stats"]
+            .as_array()
+            .expect("project_stats must be an array");
+        assert!(!project_stats.is_empty(), "project_stats must not be empty");
+        let first_project_stats = &project_stats[0];
+        assert_eq!(first_project_stats["project_id"], project_id);
+        assert_eq!(first_project_stats["success_count"], 1);
+        assert_eq!(first_project_stats["failure_count"], 0);
+        assert_eq!(first_project_stats["in_progress_count"], 0);
+        assert_eq!(first_project_stats["average_duration_ms"], 1234.0);
+        assert_eq!(first_project_stats["apply_success_rate"], 1.0);
+
+        let history_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/v1/stats/projects/{}/history?limit=10",
+                        project_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history_resp.status(), StatusCode::OK);
+
+        let history_body = axum::body::to_bytes(history_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let history_json: serde_json::Value = serde_json::from_slice(&history_body).unwrap();
+        assert!(!history_json.as_array().unwrap().is_empty());
+
+        let logs_resp = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/logs?project_id={}&limit=10", project_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logs_resp.status(), StatusCode::OK);
+
+        let logs_body = axum::body::to_bytes(logs_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let logs_json: serde_json::Value = serde_json::from_slice(&logs_body).unwrap();
+        assert!(!logs_json.as_array().unwrap().is_empty());
+    }
+}
+
 /// List change IDs in a project worktree that should be included in the next run.
 /// Error changes are excluded unless they have been explicitly re-marked.
 pub(super) async fn list_selected_change_ids_in_worktree(
