@@ -5,6 +5,19 @@ use crate::tui::state::WarningPopup;
 use super::AppState;
 
 impl AppState {
+    pub(crate) fn handle_processing_error(&mut self, id: String, error: String) {
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
+            change.set_error_message_cache(error.clone());
+            change.selected = false;
+            if let Some(started) = change.started_at {
+                change.elapsed_time = Some(started.elapsed());
+            }
+        }
+        self.add_log(LogEntry::error(format!("Error in {}: {}", id, error)));
+        self.error_change_id = Some(id.clone());
+        self.current_change = None;
+    }
+
     pub(crate) fn handle_apply_failed(&mut self, change_id: String, error: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_error_message_cache(error.clone());
@@ -56,6 +69,13 @@ impl AppState {
         self.add_log(LogEntry::error(message));
 
         self.try_transition_to_select();
+    }
+
+    pub(crate) fn handle_change_stop_failed(&mut self, change_id: String, error: String) {
+        self.add_log(LogEntry::error(format!(
+            "Failed to stop {}: {}",
+            change_id, error
+        )));
     }
 
     pub(crate) fn handle_merge_deferred(

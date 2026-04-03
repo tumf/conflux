@@ -19,3 +19,9 @@
 
 - [x] `handle_apply_started` / `handle_archive_started` / `handle_acceptance_started` / `handle_resolve_started` / `handle_analysis_started` を `src/tui/state/event_handlers/processing.rs` へ移動し、開始系ハンドラの責務を spec と tasks に一致させる
 - [x] 完了系ハンドラのみを `src/tui/state/event_handlers/completion.rs` に残し、完了系と開始系の分類に対するテストを更新して `cargo fmt --check && cargo clippy -- -D warnings && cargo test` を再実行する
+
+## Acceptance #2 Failure Follow-up
+
+- [x] `handle_processing_completed` / `handle_all_completed` を `src/tui/state/event_handlers/completion.rs` へ移動し、`processing.rs` には開始系ハンドラのみを残す
+- [x] `handle_processing_error` / `handle_change_stop_failed` を `src/tui/state/event_handlers/errors.rs` へ移動し、`completion.rs` からエラー系責務を除去する
+- [x] `handle_dependency_blocked` / `handle_dependency_resolved` の配置先を spec に沿って整理し、必要なら proposal/spec/tasks を実装実態に合わせて更新したうえで、各サブモジュールの責務に対するテストと `cargo fmt --check && cargo clippy -- -D warnings && cargo test` を再実行する

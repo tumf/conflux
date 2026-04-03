@@ -2,12 +2,47 @@ use std::collections::HashSet;
 
 use crate::task_parser;
 use crate::tui::events::{LogEntry, TuiCommand};
+use crate::tui::types::{AppMode, StopMode};
 
 use crate::tui::state::WarningPopup;
 
 use super::AppState;
 
 impl AppState {
+    pub(crate) fn handle_processing_completed(&mut self, id: String) {
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
+            change.set_display_status_cache("archiving");
+            if let Ok(progress) = task_parser::parse_change(&id) {
+                change.completed_tasks = progress.completed;
+                change.total_tasks = progress.total;
+            }
+        }
+        self.add_log(LogEntry::success(format!("Completed: {}", id)));
+    }
+
+    pub(crate) fn handle_all_completed(&mut self) {
+        if matches!(self.mode, AppMode::Stopped | AppMode::Error) {
+            if let Some(started) = self.orchestration_started_at {
+                self.orchestration_elapsed = Some(started.elapsed());
+            }
+            return;
+        }
+
+        for change in &mut self.changes {
+            if matches!(change.display_status_cache.as_str(), "queued" | "blocked") {
+                change.set_display_status_cache("not queued");
+            }
+        }
+
+        self.mode = AppMode::Select;
+        self.current_change = None;
+        self.stop_mode = StopMode::None;
+        if let Some(started) = self.orchestration_started_at {
+            self.orchestration_elapsed = Some(started.elapsed());
+        }
+        self.add_log(LogEntry::success("All changes processed successfully"));
+    }
+
     pub(crate) fn handle_change_archived(&mut self, id: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
             change.set_display_status_cache("archived");
@@ -156,34 +191,5 @@ impl AppState {
             }
         }
         self.add_log(LogEntry::info(format!("Stopped: {}", change_id)));
-    }
-
-    pub(crate) fn handle_change_stop_failed(&mut self, change_id: String, error: String) {
-        self.add_log(LogEntry::error(format!(
-            "Failed to stop {}: {}",
-            change_id, error
-        )));
-    }
-
-    pub(crate) fn handle_dependency_blocked(&mut self, change_id: String) {
-        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            change.set_display_status_cache("blocked");
-        }
-        self.add_log(LogEntry::info(format!(
-            "Change '{}' blocked by dependencies",
-            change_id
-        )));
-    }
-
-    pub(crate) fn handle_dependency_resolved(&mut self, change_id: String) {
-        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            if change.display_status_cache == "blocked" {
-                change.set_display_status_cache("queued");
-            }
-        }
-        self.add_log(LogEntry::info(format!(
-            "Change '{}' dependencies resolved",
-            change_id
-        )));
     }
 }

@@ -2,11 +2,34 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::openspec::Change;
+use crate::tui::events::LogEntry;
 use crate::tui::types::WorktreeInfo;
 
 use super::AppState;
 
 impl AppState {
+    pub(crate) fn handle_dependency_blocked(&mut self, change_id: String) {
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            change.set_display_status_cache("blocked");
+        }
+        self.add_log(LogEntry::info(format!(
+            "Change '{}' blocked by dependencies",
+            change_id
+        )));
+    }
+
+    pub(crate) fn handle_dependency_resolved(&mut self, change_id: String) {
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            if change.display_status_cache == "blocked" {
+                change.set_display_status_cache("queued");
+            }
+        }
+        self.add_log(LogEntry::info(format!(
+            "Change '{}' dependencies resolved",
+            change_id
+        )));
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_changes_refreshed(
         &mut self,
