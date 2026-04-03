@@ -16,3 +16,8 @@
 
 - [x] Preserve gate-specific archive-readiness diagnostics in parallel acceptance logs/events instead of reducing failures to generic tail-line counts.
 - [x] Update completion claims in `tasks.md` to match the actual implemented diagnostic coverage, or implement the remaining operator-facing reporting paths.
+
+## Acceptance #2 Failure Follow-up
+
+- [x] Preserve archive-readiness blocker details in every parallel operator-facing reporting path, including emitted acceptance failure event/log messages, instead of falling back to generic tail-line-count text.
+- [x] Add a parallel acceptance regression test that proves archive-readiness findings remain gate-specific when parallel acceptance fails, and update checklist completion claims only after that coverage exists.

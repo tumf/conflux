@@ -725,6 +725,19 @@ pub async fn execute_archive_in_workspace(
 
 /// Execute acceptance test in a workspace with streaming output
 #[allow(clippy::too_many_arguments)]
+fn format_acceptance_failure_log_message(findings: &[String]) -> String {
+    let finding_count = findings.len();
+    let blocking_gate_context = findings
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "no acceptance findings captured".to_string());
+
+    format!(
+        "Acceptance failed ({} findings), blocking gate context: {}",
+        finding_count, blocking_gate_context
+    )
+}
+
 pub async fn execute_acceptance_in_workspace(
     change_id: &str,
     workspace_path: &Path,
@@ -1149,9 +1162,8 @@ pub async fn execute_acceptance_in_workspace(
             if let Some(ref tx) = event_tx {
                 let _ = tx
                     .send(ParallelEvent::Log(
-                        crate::events::LogEntry::warn(format!(
-                            "Acceptance test failed ({} tail lines)",
-                            findings_for_tasks.len()
+                        crate::events::LogEntry::warn(format_acceptance_failure_log_message(
+                            &findings_for_tasks,
                         ))
                         .with_change_id(change_id)
                         .with_operation("acceptance")
@@ -1177,6 +1189,7 @@ pub async fn execute_acceptance_in_workspace(
 
 #[cfg(test)]
 mod tests {
+    use super::format_acceptance_failure_log_message;
     use crate::task_parser::TaskProgress;
 
     #[test]
@@ -1247,6 +1260,34 @@ mod tests {
         );
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_format_acceptance_failure_log_message_includes_blocking_gate_context() {
+        let message = format_acceptance_failure_log_message(&[
+            "archive-readiness gate failed: cargo clippy -- -D warnings (src/lib.rs:42)"
+                .to_string(),
+            "second finding".to_string(),
+        ]);
+
+        assert!(
+            message.contains("Acceptance failed (2 findings), blocking gate context:"),
+            "message should include finding count and blocking gate context prefix"
+        );
+        assert!(
+            message.contains("cargo clippy -- -D warnings"),
+            "message should preserve gate-specific failure context"
+        );
+    }
+
+    #[test]
+    fn test_format_acceptance_failure_log_message_handles_empty_findings() {
+        let message = format_acceptance_failure_log_message(&[]);
+
+        assert_eq!(
+            message,
+            "Acceptance failed (0 findings), blocking gate context: no acceptance findings captured"
+        );
     }
 
     #[test]
