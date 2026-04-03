@@ -8,7 +8,7 @@
 //!
 //! 1. **Created**: Workspace created, no apply commits → Start apply
 //! 2. **Applying**: WIP commits exist, apply in progress → Resume apply (next iteration)
-//! 3. **Applied**: Apply complete, archive not complete → Archive only
+//! 3. **Applied**: Apply complete, archive not complete → Resume decision is delegated to worktree routing (non-terminal resumes go to apply or acceptance, never direct archive)
 //! 4. **Archiving**: Archive files moved, commit not complete → Archive loop
 //! 5. **Archived**: Archive complete, not merged to main → Merge only
 //! 6. **Merged**: Merged to main → Skip & Cleanup
@@ -22,7 +22,7 @@
 //! match state {
 //!     WorkspaceState::Created => { /* start apply */ }
 //!     WorkspaceState::Applying { iteration } => { /* resume from iteration */ }
-//!     WorkspaceState::Applied => { /* archive only */ }
+//!     WorkspaceState::Applied => { /* defer to resume-action router (apply or acceptance) */ }
 //!     WorkspaceState::Archiving => { /* archive loop */ }
 //!     WorkspaceState::Archived => { /* merge only */ }
 //!     WorkspaceState::Merged => { /* skip & cleanup */ }

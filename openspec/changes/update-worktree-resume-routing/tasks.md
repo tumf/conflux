@@ -9,3 +9,7 @@
 ## Future Work
 
 - Verify whether TUI/web wording should distinguish “resume to acceptance” from generic archiving labels once implementation lands.
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Update `src/execution/state.rs` documentation/comments/examples so resumed `WorkspaceState::Applied` no longer imply direct archive-only routing and instead match the new apply-or-acceptance resume semantics.
