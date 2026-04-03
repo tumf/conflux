@@ -31,3 +31,9 @@
 - [x] Implement the dedicated `rejecting` runtime stage required by the proposal/specs instead of routing apply-generated `REJECTED.md` handoff back into acceptance/apply-only states; added dedicated `Rejecting` workspace/runtime stage and routing in `src/execution/state.rs`, `src/parallel/dispatch.rs`, `src/vcs/mod.rs`, and reducer state handling in `src/orchestration/state.rs`.
 - [x] Update API/UI/runtime status derivation so a non-terminal workspace with `REJECTED.md` is surfaced as `rejecting` rather than immediately `rejected`; updated worktree-first state mapping in `src/server/api.rs` so `WorkspaceState::Rejecting` maps to `"rejecting"` while base-branch-only marker remains terminal `"rejected"`.
 - [x] Fix the full `cargo test` regression before claiming archive readiness; verified full suite is green via `cargo test` (`1374 passed; 0 failed; 6 ignored`) and targeted config regression test remains green (`cargo test config::tests::test_config_merge_partial_project_inherits_global -- --nocapture`).
+
+## Acceptance #4 Failure Follow-up
+
+- [x] Implement the dedicated rejecting review protocol required by the proposal instead of auto-confirming every rejection proposal; runtime now executes `run_rejection_review(...)` before deciding confirm/resume in both resume-rejecting and apply-blocked paths (`src/parallel/dispatch.rs`, `src/serial_run_service.rs`, `src/orchestration/rejection.rs`).
+- [x] Add real runtime parsing/handling for `REJECTION_REVIEW: CONFIRM|RESUME` and the `resume_apply` path, including removal of worktree `REJECTED.md` and task recovery updates via `handle_resume_apply_from_rejecting(...)` (`src/orchestration/rejection.rs`), with protocol routing in parallel/serial execution.
+- [x] Align apply-stage handoff messaging and semantics with rejecting review rather than acceptance; apply loop now explicitly logs and documents "rejecting review" handoff (`src/execution/apply.rs:667-676`).

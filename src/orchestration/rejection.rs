@@ -3,8 +3,16 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
+use crate::ai_command_runner::{AiCommandRunner, OutputLine};
+use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::vcs::git::commands as git_commands;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionReviewVerdict {
+    Confirm,
+    Resume,
+}
 
 fn rejected_file_path(workspace_path: &Path, change_id: &str) -> PathBuf {
     workspace_path
@@ -16,6 +24,156 @@ fn rejected_file_path(workspace_path: &Path, change_id: &str) -> PathBuf {
 
 pub fn has_rejection_proposal(workspace_path: &Path, change_id: &str) -> bool {
     rejected_file_path(workspace_path, change_id).is_file()
+}
+
+fn resolve_rejection_review_command(template: &str, prompt: &str, change_id: &str) -> String {
+    let command = OrchestratorConfig::expand_change_id(template, change_id);
+    OrchestratorConfig::expand_prompt(&command, prompt)
+}
+
+fn rejection_review_prompt(change_id: &str) -> String {
+    format!(
+        "load skills: cflx-workflow\n\nRejecting review id:{}\n\nchange_id: {}\nproposal_path: openspec/changes/{}/proposal.md\ntasks_path: openspec/changes/{}/tasks.md\nrejected_path: openspec/changes/{}/REJECTED.md",
+        change_id, change_id, change_id, change_id, change_id
+    )
+}
+
+fn parse_rejection_review_output(output: &str) -> Option<RejectionReviewVerdict> {
+    let mut in_code_block = false;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            continue;
+        }
+
+        if trimmed == "REJECTION_REVIEW: CONFIRM" {
+            return Some(RejectionReviewVerdict::Confirm);
+        }
+        if trimmed == "REJECTION_REVIEW: RESUME" {
+            return Some(RejectionReviewVerdict::Resume);
+        }
+    }
+
+    None
+}
+
+fn append_recovery_task_section(existing: &str, change_id: &str) -> String {
+    let heading = "## Rejecting Recovery Tasks";
+    let task = format!(
+        "- [ ] Investigate blocker in openspec/changes/{}/REJECTED.md and implement a non-rejection recovery path before rerunning apply",
+        change_id
+    );
+
+    if existing.contains(heading) {
+        if existing.contains(&task) {
+            return existing.to_string();
+        }
+        return format!("{}\n{}\n", existing.trim_end(), task);
+    }
+
+    format!("{}\n\n{}\n\n{}\n", existing.trim_end(), heading, task)
+}
+
+pub async fn run_rejection_review(
+    change_id: &str,
+    workspace_path: &Path,
+    config: &OrchestratorConfig,
+    ai_runner: &AiCommandRunner,
+) -> Result<RejectionReviewVerdict> {
+    let command_template = config.get_acceptance_command()?;
+    let prompt = rejection_review_prompt(change_id);
+    let command = resolve_rejection_review_command(command_template, &prompt, change_id);
+
+    info!(
+        change_id = %change_id,
+        workspace = %workspace_path.display(),
+        "Starting dedicated rejecting review"
+    );
+
+    let (mut child, mut output_rx) = ai_runner
+        .execute_streaming_with_retry(
+            &command,
+            Some(workspace_path),
+            Some("rejecting"),
+            Some(change_id),
+        )
+        .await?;
+
+    let mut stdout = String::new();
+    while let Some(line) = output_rx.recv().await {
+        match line {
+            OutputLine::Stdout(s) => {
+                stdout.push_str(&s);
+                stdout.push('\n');
+            }
+            OutputLine::Stderr(_) => {}
+        }
+    }
+
+    let status = child.wait().await.map_err(|e| {
+        OrchestratorError::AgentCommand(format!(
+            "Failed to wait for rejecting review command for change '{}': {}",
+            change_id, e
+        ))
+    })?;
+
+    if !status.success() {
+        return Err(OrchestratorError::AgentCommand(format!(
+            "Rejecting review command failed with exit code {:?} for change '{}'",
+            status.code(),
+            change_id
+        )));
+    }
+
+    parse_rejection_review_output(&stdout).ok_or_else(|| {
+        OrchestratorError::AgentCommand(format!(
+            "Rejecting review output missing required marker for '{}' (expected exactly one of REJECTION_REVIEW: CONFIRM|RESUME)",
+            change_id
+        ))
+    })
+}
+
+pub async fn handle_resume_apply_from_rejecting(
+    change_id: &str,
+    workspace_path: &Path,
+) -> Result<()> {
+    let rejected_path = rejected_file_path(workspace_path, change_id);
+    if rejected_path.exists() {
+        tokio::fs::remove_file(&rejected_path).await?;
+    }
+
+    let tasks_path = workspace_path
+        .join("openspec")
+        .join("changes")
+        .join(change_id)
+        .join("tasks.md");
+    let current = tokio::fs::read_to_string(&tasks_path).await.map_err(|e| {
+        OrchestratorError::AgentCommand(format!(
+            "Failed to read tasks.md while resuming apply for '{}': {}",
+            change_id, e
+        ))
+    })?;
+    let updated = append_recovery_task_section(&current, change_id);
+    tokio::fs::write(&tasks_path, updated).await.map_err(|e| {
+        OrchestratorError::AgentCommand(format!(
+            "Failed to update tasks.md while resuming apply for '{}': {}",
+            change_id, e
+        ))
+    })?;
+
+    info!(
+        change_id = %change_id,
+        rejected_path = %rejected_path.display(),
+        tasks_path = %tasks_path.display(),
+        "Resumed apply from rejecting review"
+    );
+
+    Ok(())
 }
 
 fn rejected_markdown(change_id: &str, reason: &str) -> String {
