@@ -37,3 +37,8 @@
 - [x] Implement the dedicated rejecting review protocol required by the proposal instead of auto-confirming every rejection proposal; runtime now executes `run_rejection_review(...)` before deciding confirm/resume in both resume-rejecting and apply-blocked paths (`src/parallel/dispatch.rs`, `src/serial_run_service.rs`, `src/orchestration/rejection.rs`).
 - [x] Add real runtime parsing/handling for `REJECTION_REVIEW: CONFIRM|RESUME` and the `resume_apply` path, including removal of worktree `REJECTED.md` and task recovery updates via `handle_resume_apply_from_rejecting(...)` (`src/orchestration/rejection.rs`), with protocol routing in parallel/serial execution.
 - [x] Align apply-stage handoff messaging and semantics with rejecting review rather than acceptance; apply loop now explicitly logs and documents "rejecting review" handoff (`src/execution/apply.rs:667-676`).
+
+## Acceptance #5 Failure Follow-up
+
+- [x] Fix the blocking full-suite `cargo test` failure before claiming archive readiness; re-verified the previously flaky target now passes (`cargo test config::defaults::tests::test_cleanup_old_logs_retains_exactly_n_days -- --nocapture`).
+- [x] Re-run the full archive-readiness gate set after fixing the above regression and confirm `"/Users/tumf/Library/Python/3.9/bin/pre-commit" run --all-files`, `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` all pass in the same workspace state (verified in one sequential run).
