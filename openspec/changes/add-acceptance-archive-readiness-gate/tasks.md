@@ -11,3 +11,8 @@
 
 - If needed later, make archive-readiness commands configurable per project while preserving a truthful default policy.
 - Consider surfacing readiness status directly in the TUI/Web UI before archive begins.
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Preserve gate-specific archive-readiness diagnostics in parallel acceptance logs/events instead of reducing failures to generic tail-line counts.
+- [x] Update completion claims in `tasks.md` to match the actual implemented diagnostic coverage, or implement the remaining operator-facing reporting paths.

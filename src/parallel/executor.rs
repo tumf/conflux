@@ -1113,12 +1113,21 @@ pub async fn execute_acceptance_in_workspace(
                 attempt_number,
             ))
         }
-        ParseResult::Fail { .. } => {
-            let findings_for_tasks = tail_findings.clone();
+        ParseResult::Fail { findings } => {
+            let findings_for_tasks = if findings.is_empty() {
+                tail_findings.clone()
+            } else {
+                findings
+            };
+            let blocking_gate_context = findings_for_tasks
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "no acceptance findings captured".to_string());
             info!(
-                "Acceptance failed for: {} ({} tail lines)",
+                "Acceptance failed for: {} ({} findings), blocking gate context: {}",
                 change_id,
-                findings_for_tasks.len()
+                findings_for_tasks.len(),
+                blocking_gate_context
             );
             let attempt_number = agent.next_acceptance_attempt_number(change_id);
             let attempt = crate::history::AcceptanceAttempt {

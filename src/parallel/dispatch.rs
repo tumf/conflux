@@ -591,19 +591,25 @@ impl ParallelExecutor {
                         crate::orchestration::AcceptanceResult::Fail { findings },
                         acceptance_iteration,
                     )) => {
+                        let blocking_gate_context = findings
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "no acceptance findings captured".to_string());
                         warn!(
-                            "Acceptance failed for {} ({} tail lines) (cycle {}), returning to apply loop",
+                            "Acceptance failed for {} ({} findings) (cycle {}), blocking gate context: {}; returning to apply loop",
                             change_id,
                             findings.len(),
-                            cycle_count
+                            cycle_count,
+                            blocking_gate_context
                         );
                         // Note: tasks.md is now updated by the acceptance agent itself
                         if let Some(ref tx) = event_tx {
                             let _ = tx
                                 .send(ParallelEvent::Log(
                                     LogEntry::warn(format!(
-                                        "Acceptance failed ({} tail lines), returning to apply loop (cycle {})",
+                                        "Acceptance failed ({} findings), blocking gate context: {}; returning to apply loop (cycle {})",
                                         findings.len(),
+                                        blocking_gate_context,
                                         cycle_count
                                     ))
                                     .with_change_id(&change_id)
