@@ -19,6 +19,7 @@ use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
 use crate::execution::state::{detect_workspace_state, WorkspaceState};
 use crate::orchestration::execute_rejection_flow;
+use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
 
 use super::cleanup::WorkspaceCleanupGuard;
@@ -30,6 +31,79 @@ use super::types::WorkspaceResult;
 use super::workspace;
 use super::ParallelEvent;
 use super::ParallelExecutor;
+
+#[cfg(test)]
+mod tests {
+    use super::{decide_resume_action, ResumeAction};
+    use crate::execution::state::WorkspaceState;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn decide_resume_action_routes_applied_with_incomplete_tasks_to_apply() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("openspec/changes/change-incomplete");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(
+            tasks_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n- [ ] pending\n",
+        )
+        .unwrap();
+
+        let action =
+            decide_resume_action("change-incomplete", tmp.path(), &WorkspaceState::Applied);
+        assert_eq!(action, ResumeAction::Apply);
+    }
+
+    #[test]
+    fn decide_resume_action_routes_applied_with_complete_tasks_to_acceptance() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("openspec/changes/change-complete");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(
+            tasks_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n- [x] done2\n",
+        )
+        .unwrap();
+
+        let action = decide_resume_action("change-complete", tmp.path(), &WorkspaceState::Applied);
+        assert_eq!(action, ResumeAction::Acceptance);
+    }
+
+    #[test]
+    fn decide_resume_action_keeps_archived_as_terminal() {
+        let tmp = TempDir::new().unwrap();
+        let action = decide_resume_action("change-archived", tmp.path(), &WorkspaceState::Archived);
+        assert_eq!(action, ResumeAction::Terminal);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResumeAction {
+    Terminal,
+    Apply,
+    Acceptance,
+}
+
+pub(super) fn decide_resume_action(
+    change_id: &str,
+    workspace_path: &std::path::Path,
+    state: &WorkspaceState,
+) -> ResumeAction {
+    match state {
+        WorkspaceState::Merged | WorkspaceState::Archived => ResumeAction::Terminal,
+        WorkspaceState::Archiving => ResumeAction::Acceptance,
+        WorkspaceState::Applied => {
+            match task_parser::parse_progress_with_fallback(change_id, Some(workspace_path)) {
+                Ok(progress) if progress.total > 0 && progress.completed >= progress.total => {
+                    ResumeAction::Acceptance
+                }
+                Ok(_) | Err(_) => ResumeAction::Apply,
+            }
+        }
+        WorkspaceState::Created | WorkspaceState::Applying { .. } => ResumeAction::Apply,
+    }
+}
 
 impl ParallelExecutor {
     /// Dispatch a single change to a workspace for apply + acceptance + archive.
@@ -138,13 +212,7 @@ impl ParallelExecutor {
             // A resumed workspace may be in any state; we must not blindly run the full
             // pipeline for terminal states (Archived, Merged) or already-applied states.
             let effective_state = if was_resumed {
-                match detect_workspace_state(
-                    &change_id,
-                    &workspace.path,
-                    &base_branch,
-                )
-                .await
-                {
+                match detect_workspace_state(&change_id, &workspace.path, &base_branch).await {
                     Ok(state) => {
                         let state_label = format!("{:?}", state);
                         if let Some(ref tx) = event_tx {
@@ -172,11 +240,32 @@ impl ParallelExecutor {
                 WorkspaceState::Created
             };
 
+            let resume_action = if was_resumed {
+                decide_resume_action(&change_id, &workspace.path, &effective_state)
+            } else {
+                ResumeAction::Apply
+            };
+
+            if was_resumed {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::Log(
+                            LogEntry::info(format!(
+                                "Resume routing for {}: state={:?} -> {:?}",
+                                change_id, effective_state, resume_action
+                            ))
+                            .with_change_id(&change_id),
+                        ))
+                        .await;
+                }
+            }
+
             // Early return for terminal states: Archived and Merged workspaces must not
             // re-enter the apply/acceptance/archive pipeline.  Doing so silently creates
             // duplicate apply commits or masks already-complete work as a fresh start.
-            match &effective_state {
-                WorkspaceState::Merged => {
+            if matches!(resume_action, ResumeAction::Terminal) {
+                match &effective_state {
+                    WorkspaceState::Merged => {
                     info!(
                         "Change '{}' workspace already merged to base, skipping all processing",
                         change_id
@@ -265,7 +354,8 @@ impl ParallelExecutor {
                         }
                     }
                 }
-                _ => {}
+                    _ => {}
+                }
             }
 
             // Create agent for acceptance testing
@@ -308,14 +398,8 @@ impl ParallelExecutor {
             });
 
             // Apply+Acceptance loop: retry apply when acceptance fails.
-            // For workspaces in Applied or Archiving state the apply step already
-            // ran in a previous execution; skip the apply loop body and proceed
-            // directly to the acceptance + archive stages so we avoid creating a
-            // spurious duplicate "Apply: <change_id>" commit.
-            let skip_apply = matches!(
-                effective_state,
-                WorkspaceState::Applied | WorkspaceState::Archiving
-            );
+            // Resume routing determines whether we start from apply or acceptance.
+            let skip_apply = matches!(resume_action, ResumeAction::Acceptance);
 
             let _apply_revision = loop {
                 // Skip apply for workspaces that were already applied in a previous run.
@@ -591,19 +675,25 @@ impl ParallelExecutor {
                         crate::orchestration::AcceptanceResult::Fail { findings },
                         acceptance_iteration,
                     )) => {
+                        let blocking_gate_context = findings
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "no acceptance findings captured".to_string());
                         warn!(
-                            "Acceptance failed for {} ({} tail lines) (cycle {}), returning to apply loop",
+                            "Acceptance failed for {} ({} findings) (cycle {}), blocking gate context: {}; returning to apply loop",
                             change_id,
                             findings.len(),
-                            cycle_count
+                            cycle_count,
+                            blocking_gate_context
                         );
                         // Note: tasks.md is now updated by the acceptance agent itself
                         if let Some(ref tx) = event_tx {
                             let _ = tx
                                 .send(ParallelEvent::Log(
                                     LogEntry::warn(format!(
-                                        "Acceptance failed ({} tail lines), returning to apply loop (cycle {})",
+                                        "Acceptance failed ({} findings), blocking gate context: {}; returning to apply loop (cycle {})",
                                         findings.len(),
+                                        blocking_gate_context,
                                         cycle_count
                                     ))
                                     .with_change_id(&change_id)

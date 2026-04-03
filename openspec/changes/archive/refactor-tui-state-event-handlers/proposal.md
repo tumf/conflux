@@ -28,7 +28,7 @@ references:
 - `state/event_handlers/completion.rs` — `handle_processing_completed`, `handle_all_completed`, `handle_change_archived`, `handle_merge_completed`, `handle_resolve_completed`, `handle_acceptance_completed`, `handle_branch_merge_started/completed/failed`
 - `state/event_handlers/errors.rs` — `handle_processing_error`, `handle_apply_failed`, `handle_archive_failed`, `handle_resolve_failed`, `handle_change_stop_failed`, `handle_error`
 - `state/event_handlers/output.rs` — `handle_apply_output`, `handle_archive_output`, `handle_acceptance_output`, `handle_analysis_output`, `handle_resolve_output`
-- `state/event_handlers/refresh.rs` — `handle_changes_refreshed`, `handle_worktrees_refreshed`
+- `state/event_handlers/refresh.rs` — `handle_dependency_blocked`, `handle_dependency_resolved`, `handle_changes_refreshed`, `handle_worktrees_refreshed`
 
 `AppState` 構造体は `state/mod.rs` に残し、メソッドを `impl AppState` ブロックとして各サブモジュールで実装する。
 

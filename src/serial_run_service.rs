@@ -641,10 +641,15 @@ impl SerialRunService {
                 }
             }
             AcceptanceResult::Fail { findings } => {
+                let blocking_gate_context = findings
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "no acceptance findings captured".to_string());
                 warn!(
-                    "Acceptance failed for {} ({} tail lines), will retry apply",
+                    "Acceptance failed for {} ({} findings), blocking gate context: {}; will retry apply",
                     change_id,
-                    findings.len()
+                    findings.len(),
+                    blocking_gate_context
                 );
                 // Note: tasks.md is now updated by the acceptance agent itself
                 ChangeProcessResult::AcceptanceFailed { findings }
@@ -824,6 +829,58 @@ mod tests {
         // but select_next_change returns the first match which would be 'b' if it's complete)
         // Actually, reading the implementation, it prioritizes incomplete first, so should be 'a'
         assert_eq!(next.map(|c| c.id.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn test_process_acceptance_result_archive_readiness_fail_blocks_archive_progression() {
+        use crate::agent::AgentRunner;
+        use crate::orchestration::AcceptanceResult;
+
+        let temp_dir = TempDir::new().unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+        let findings = vec![
+            "blocking gate: cargo clippy -- -D warnings".to_string(),
+            "src/orchestration/archive.rs:459".to_string(),
+        ];
+
+        let result = service.process_acceptance_result(
+            "test-change",
+            &agent,
+            AcceptanceResult::Fail {
+                findings: findings.clone(),
+            },
+            || false,
+        );
+
+        assert!(matches!(
+            result,
+            ChangeProcessResult::AcceptanceFailed { findings: returned }
+            if returned == findings
+        ));
+    }
+
+    #[test]
+    fn test_process_acceptance_result_archive_readiness_pass_allows_archive_progression() {
+        use crate::agent::AgentRunner;
+        use crate::orchestration::AcceptanceResult;
+
+        let temp_dir = TempDir::new().unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+
+        let result = service.process_acceptance_result(
+            "test-change",
+            &agent,
+            AcceptanceResult::Pass,
+            || false,
+        );
+
+        assert!(matches!(result, ChangeProcessResult::AcceptancePassed));
     }
 
     #[test]

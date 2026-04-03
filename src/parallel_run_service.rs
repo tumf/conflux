@@ -162,6 +162,7 @@ impl ParallelRunService {
             HookRunner::new(self.config.get_hooks(), &self.repo_root)
         };
 
+        let has_dynamic_queue = dynamic_queue.is_some();
         let mut executor = ParallelExecutor::with_backend_and_queue_and_stagger(
             self.repo_root.clone(),
             self.config.clone(),
@@ -171,6 +172,12 @@ impl ParallelRunService {
             Some(self.shared_stagger_state.clone()),
         );
         executor.set_no_resume(self.no_resume);
+
+        if has_dynamic_queue {
+            // Loop-based frontends (TUI/server) should stay alive when idle
+            // and wait for new queue notifications.
+            executor.set_persistent_lifetime();
+        }
 
         executor.set_hooks(hooks);
 
