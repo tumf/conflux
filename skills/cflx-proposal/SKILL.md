@@ -27,10 +27,15 @@ Create structured change proposals for Conflux (OpenSpec-based) projects through
 - Do not ask the user to choose or confirm the `change-id`; generate a concise unique verb-led slug yourself.
 - If the request is sufficiently clear after context gathering, draft the proposal directly instead of forcing an extra clarification round.
 - For implementation-oriented proposals, make tasks evidence-bearing: each behavior-changing task should name repository-verifiable code, tests, or commands.
+- Before choosing `spec-only`, explicitly classify the user's desired artifact as one of: `spec/documentation`, `implementation`, or `both`.
+- If the user's request is phrased as a concrete product, UI, API, route, form, workflow, or behavior change, default to `implementation` or `hybrid`, not `spec-only`, unless the user explicitly asks for spec-only or documentation-only work.
+- If canonical specs already describe the requested behavior but the codebase still lacks implementation, do NOT create another `spec-only` proposal unless the user explicitly asks to update spec artifacts only.
+- When selecting `spec-only`, explicitly state in the user-facing response that the proposal will NOT implement the feature and will only update tracked specification artifacts.
 
 ## When to Use This Skill
 
 Trigger this skill when users request:
+
 - "Create a proposal for..."
 - "Draft a change proposal"
 - "Propose a new feature"
@@ -40,6 +45,7 @@ Trigger this skill when users request:
 ## Key Characteristics
 
 **Human-Interactive Mode**:
+
 - Ask clarifying questions to understand requirements
 - Guide users through proposal structure
 - Discuss design decisions and trade-offs
@@ -69,16 +75,22 @@ openspec/changes/<change-id>/
 First, gather available context proactively before asking questions.
 
 **Context to gather first**:
+
 - Prior user messages, goals, and constraints from the current session
 - Repository-specific instructions such as `AGENTS.md` or `openspec/AGENTS.md` when present
 - Existing related specs, archived changes, and relevant source/test modules
 - Existing architecture or workflow boundaries already mentioned in the conversation
 
 **Begin the user-facing proposal response with**:
+
 - `Premise / Context`
 - 3-6 concise bullets summarizing the gathered facts that will shape the proposal
+- `Requested Artifact` with one of: `spec/documentation`, `implementation`, or `both`
+
+If the inferred requested artifact is `implementation` or `both`, do not silently downgrade the proposal to `spec-only`.
 
 **Ask questions only if still necessary after context gathering**:
+
 - What problem does this solve?
 - What are the acceptance criteria?
 - Are there any constraints or dependencies?
@@ -87,6 +99,7 @@ First, gather available context proactively before asking questions.
 If the answer is already inferable from the repository and current conversation, skip the question and proceed.
 
 **Research existing code**:
+
 ```bash
 # Review existing specs
  python3 "<SKILL_ROOT>/scripts/cflx.py" list --specs
@@ -97,20 +110,34 @@ ls <relevant-directory>
 ```
 
 **Strict validation note (common gotcha)**:
+
 - In strict mode, include at least one spec delta under `openspec/changes/<id>/specs/<capability>/spec.md`.
 - For bugfix-only proposals (no intended new behavior), add a minimal `## MODIFIED Requirements` delta with at least one `### Requirement:` and one `#### Scenario:`.
 
 ### 2. Classify Change Type
 
-Every proposal MUST include a `Change Type` field in `proposal.md`. Use this decision table:
+Every proposal MUST include a `Change Type` field in `proposal.md`. First classify the user's desired artifact:
 
-| Type | When to use |
-|------|-------------|
-| `spec-only` | The proposal's primary output is a canonical spec update. No new runtime code, CLI wiring, or tests are required. All tasks are specification or documentation work. |
-| `implementation` | The proposal drives source code changes, tests, CLI wiring, or runtime behavior. Spec deltas describe what the code must satisfy. |
-| `hybrid` | The proposal combines spec authoring with implementation work — for example, adding a new spec capability and immediately implementing it in the same change. |
+- `spec/documentation`: the user explicitly wants proposal, spec, documentation, archive-readiness, or canonical requirement updates
+- `implementation`: the user wants code, UI, API wiring, routes, forms, tests, runtime behavior, or removal of existing behavior in the product
+- `both`: the user wants both spec and implementation to move together
+
+Use this decision table:
+
+| Type             | When to use                                                                                                                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `spec-only`      | The user's primary requested artifact is a canonical spec or documentation update. No new runtime code, CLI wiring, UI work, or tests are required. All tasks are specification or documentation work. |
+| `implementation` | The proposal drives source code changes, tests, CLI wiring, UI work, or runtime behavior. Spec deltas describe what the code must satisfy.                                                             |
+| `hybrid`         | The proposal combines spec authoring with implementation work — for example, adding a new spec capability and immediately implementing it in the same change.                                          |
+
+**Strong defaults**:
+
+- If the request is phrased as adding/removing/fixing a concrete product behavior, UI, page, route, form, API integration, workflow, or runtime feature, treat it as `implementation` by default.
+- If existing canonical specs already describe the target behavior and the repo still lacks implementation, choose `implementation`, not `spec-only`, unless the user explicitly asks for spec cleanup only.
+- Never choose `spec-only` merely because a backend surface already exists; if user-visible behavior is still missing from code, the default remains `implementation`.
 
 **When to split instead of using `hybrid`**:
+
 - If the spec authoring and the implementation can be reviewed and deployed independently, split into two proposals.
 - Use `hybrid` only when spec and code must ship atomically to preserve correctness.
 
@@ -118,17 +145,17 @@ When drafting `proposal.md`, prefer YAML frontmatter at the top for machine-read
 
 ```yaml
 ---
-change_type: spec-only   # or: implementation | hybrid
-priority: medium         # high | medium | low
-dependencies: []         # optional change-id list; overrides body `## Dependencies`
-references: []           # optional string list of related files/specs/changes
+change_type: spec-only # or: implementation | hybrid
+priority: medium # high | medium | low
+dependencies: [] # optional change-id list; overrides body `## Dependencies`
+references: [] # optional string list of related files/specs/changes
 ---
 ```
 
 Keep the human-readable line near the top as well for backward-compatible readability:
 
 ```markdown
-**Change Type**: spec-only   <!-- or: implementation | hybrid -->
+**Change Type**: spec-only <!-- or: implementation | hybrid -->
 ```
 
 ### 3. Evaluate Split Boundaries (Default: Split)
@@ -138,6 +165,7 @@ Before writing anything, evaluate whether the request should be split into multi
 **Default rule**: if scopes are independent or weakly coupled, split into separate `openspec/changes/<change-id>/` proposals.
 
 **Keep as a single proposal only when**:
+
 - The scopes are tightly coupled and must ship atomically to preserve correctness.
 - The acceptance criteria cannot be verified independently.
 
@@ -146,6 +174,7 @@ When keeping a single proposal despite multiple scopes, explicitly record the ra
 ### 3. Generate Change ID
 
 **Rules**:
+
 - Verb-led (e.g., `add-auth`, `fix-validation`, `refactor-api`)
 - Kebab-case (lowercase with hyphens)
 - Must NOT include date prefixes or suffixes (forbidden: `2026-02-07-add-auth`, `add-auth-2026-02-07`)
@@ -153,6 +182,7 @@ When keeping a single proposal despite multiple scopes, explicitly record the ra
 - Unique within the project
 
 **Execution rule**:
+
 - Generate the `change-id` yourself.
 - Do not ask the user to confirm or choose it.
 - If a collision is possible, disambiguate automatically (for example by adding a short suffix).
@@ -164,6 +194,7 @@ When keeping a single proposal despite multiple scopes, explicitly record the ra
 Create `openspec/changes/<id>/proposal.md`:
 
 **Required sections**:
+
 - YAML frontmatter with `change_type`, `priority`, optional `dependencies`, optional `references`
 - Title (H1)
 - Problem/Context
@@ -178,6 +209,7 @@ Create `openspec/changes/<id>/proposal.md`:
 Create `openspec/changes/<id>/tasks.md`:
 
 **Task format for `implementation` or `hybrid` proposals**:
+
 ```markdown
 ## Implementation Tasks
 
@@ -192,6 +224,7 @@ Create `openspec/changes/<id>/tasks.md`:
 ```
 
 **Task format for `spec-only` proposals** — use `## Specification Tasks` instead of `## Implementation Tasks`, and include a one-line expected canonical outcome for each delta:
+
 ```markdown
 ## Specification Tasks
 
@@ -207,6 +240,7 @@ Create `openspec/changes/<id>/tasks.md`:
 > **Note**: For `spec-only` proposals, each spec delta should include a short comment describing how the canonical spec changes after archive. This allows acceptance to evaluate archive-readiness without expecting runtime integration evidence.
 
 **Guidelines**:
+
 - Break into small, verifiable steps
 - Include verification methods
 - Specify integration/wiring tasks
@@ -214,6 +248,7 @@ Create `openspec/changes/<id>/tasks.md`:
 - Prefer concrete repository evidence in verification notes (source paths, test files, or runnable commands), not vague statements like "verify implementation works"
 
 **External dependency policy (mock-first / verification-first)**:
+
 - If a requirement cannot be verified locally without credentials or external systems, design mock/stub/fixture-based verification.
 - Do not change production/runtime behavior to "use mocks"; mocks/stubs/fixtures are for tests and local verification.
 - Only truly non-mockable dependencies (human decisions, real external systems, long-wait checks) go to Out of Scope / Future Work.
@@ -223,6 +258,7 @@ Create `openspec/changes/<id>/tasks.md`:
 ### 6. Design Documentation (Optional)
 
 Create `openspec/changes/<id>/design.md` when:
+
 - Change spans multiple systems
 - Architectural decisions need documentation
 - Trade-offs require explanation
@@ -237,6 +273,7 @@ Design documentation is strongly recommended when the proposal introduces orches
 Create `openspec/changes/<id>/specs/<capability>/spec.md`:
 
 **Format**:
+
 ```markdown
 ## ADDED Requirements
 
@@ -268,6 +305,7 @@ Create `openspec/changes/<id>/specs/<capability>/spec.md`:
 ```
 
 **Critical rules**:
+
 - Each requirement must have at least one scenario
 - Use ADDED/MODIFIED/REMOVED sections
 - Be specific and testable
@@ -277,11 +315,13 @@ Create `openspec/changes/<id>/specs/<capability>/spec.md`:
 ### 8. Validate Proposal
 
 Run validation:
+
 ```bash
  python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict
 ```
 
 **If validation fails**:
+
 - Show errors to user
 - Discuss fixes
 - Apply corrections
@@ -292,6 +332,7 @@ Run validation:
 ### 9. Final Review
 
 Present complete proposal to user:
+
 - Show directory structure
 - Summarize key points
 - Highlight task count
@@ -313,11 +354,13 @@ When the proposal was split into multiple independent change proposals, always p
 When designing tasks, follow mock-first approach:
 
 **Prefer**:
+
 - Mock/stub/fixture implementations
 - Test doubles for external APIs
 - Local verification without credentials
 
 **Avoid**:
+
 - Blocking on missing API keys
 - Requiring real external services
 - Deferring mockable dependencies
@@ -327,6 +370,7 @@ When designing tasks, follow mock-first approach:
 ## Task Classification
 
 **AI-Executable Tasks** (include with checkbox):
+
 - Code implementation
 - Unit/integration tests
 - Documentation updates
@@ -334,6 +378,7 @@ When designing tasks, follow mock-first approach:
 - Local verification
 
 **Future Work Tasks** (no checkbox):
+
 - Manual approval required
 - Human decision-making
 - External system deployment
@@ -344,21 +389,25 @@ When designing tasks, follow mock-first approach:
 ## Question Examples
 
 ### Understanding Requirements
+
 - "What's the primary user need this addresses?"
 - "Are there any security or performance requirements?"
 - "What's the expected timeline for this change?"
 
 ### Clarifying Scope
+
 - "Should this include error handling for edge cases?"
 - "Do we need backward compatibility?"
 - "Are there related features we should consider?"
 
 ### Design Decisions
+
 - "Would you prefer approach A (simpler) or B (more flexible)?"
 - "Should we optimize for performance or maintainability?"
 - "Where should this integrate with the existing system?"
 
 ### Verification
+
 - "How should we verify this is working correctly?"
 - "What would constitute a successful implementation?"
 - "Are there specific test scenarios we should cover?"
@@ -390,6 +439,7 @@ python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict --evidence error
 ## Best Practices
 
 ### Communication
+
 - Ask one question at a time (avoid overwhelming)
 - Summarize understanding before proceeding
 - Present options with recommendations
@@ -398,6 +448,7 @@ python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict --evidence error
 - When you must ask a question, state the recommended default and what would change based on the answer
 
 ### Proposal Quality
+
 - Keep scope focused and minimal
 - Break large changes into multiple proposals
 - Include clear acceptance criteria
@@ -405,6 +456,7 @@ python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict --evidence error
 - Make implementation-facing tasks hard to mark complete without source/test evidence
 
 ### User Experience
+
 - Be responsive to feedback
 - Iterate on content based on input
 - Present information clearly
@@ -413,6 +465,7 @@ python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict --evidence error
 ## Common Patterns
 
 ### Feature Addition
+
 1. Understand user need
 2. Review existing architecture
 3. Propose minimal viable solution
@@ -420,6 +473,7 @@ python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict --evidence error
 5. Add spec requirements
 
 ### Bug Fix
+
 1. Understand the bug behavior
 2. Identify root cause area
 3. Propose fix approach
@@ -427,6 +481,7 @@ python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict --evidence error
 5. Add MODIFIED spec if behavior changes
 
 ### Refactoring
+
 1. Clarify refactoring goals
 2. Identify affected components
 3. Plan incremental steps
@@ -436,18 +491,21 @@ python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict --evidence error
 ## Troubleshooting
 
 ### User Unclear About Requirements
+
 - Ask more specific questions
 - Provide examples or options
 - Start with minimal scope
 - Plan for iteration
 
 ### Complex Dependencies
+
 - Discuss mock-first approach
 - Identify what's truly non-mockable
 - Plan integration points
 - Document assumptions
 
 ### Large Scope
+
 - Suggest breaking into multiple proposals
 - Identify core vs. nice-to-have
 - Prioritize with user
