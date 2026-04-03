@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::time::Instant;
 
 use crate::task_parser;
 use crate::tui::events::{LogEntry, TuiCommand};
@@ -9,54 +8,6 @@ use crate::tui::state::WarningPopup;
 use super::AppState;
 
 impl AppState {
-    pub(crate) fn handle_apply_started(&mut self, change_id: String, command: String) {
-        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            if change.started_at.is_none() {
-                change.started_at = Some(Instant::now());
-            }
-            change.set_display_status_cache("applying");
-            change.elapsed_time = None;
-            change.iteration_number = None;
-        }
-        self.add_log(
-            LogEntry::info(format!("Apply started: {}", change_id))
-                .with_operation("apply")
-                .with_change_id(&change_id),
-        );
-        self.add_log(
-            LogEntry::info(format!("  Command: {}", command))
-                .with_operation("apply")
-                .with_change_id(&change_id),
-        );
-    }
-
-    pub(crate) fn handle_archive_started(&mut self, id: String, command: String) {
-        if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-            if change.started_at.is_none() {
-                change.started_at = Some(Instant::now());
-            }
-            change.set_display_status_cache("archiving");
-            change.iteration_number = None;
-            let worktree_path = self.worktree_paths.get(&id).map(|p| p.as_path());
-            if let Ok(progress) = task_parser::parse_progress_with_fallback(&id, worktree_path) {
-                if progress.total > 0 {
-                    change.completed_tasks = progress.completed;
-                    change.total_tasks = progress.total;
-                }
-            }
-        }
-        self.add_log(
-            LogEntry::info(format!("Archiving: {}", id))
-                .with_operation("archive")
-                .with_change_id(&id),
-        );
-        self.add_log(
-            LogEntry::info(format!("  Command: {}", command))
-                .with_operation("archive")
-                .with_change_id(&id),
-        );
-    }
-
     pub(crate) fn handle_change_archived(&mut self, id: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
             change.set_display_status_cache("archived");
@@ -72,35 +23,6 @@ impl AppState {
             }
         }
         self.add_log(LogEntry::info(format!("Archived: {}", id)));
-    }
-
-    pub(crate) fn handle_resolve_started(&mut self, change_id: String, command: String) {
-        self.is_resolving = true;
-        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            if change.started_at.is_none() {
-                change.started_at = Some(Instant::now());
-            }
-            change.set_display_status_cache("resolving");
-            change.elapsed_time = None;
-            change.iteration_number = None;
-        }
-        self.add_log(
-            LogEntry::info(format!("Resolving merge for '{}'", change_id))
-                .with_operation("resolve")
-                .with_change_id(&change_id),
-        );
-        self.add_log(
-            LogEntry::info(format!("  Command: {}", command))
-                .with_operation("resolve")
-                .with_change_id(&change_id),
-        );
-    }
-
-    pub(crate) fn handle_analysis_started(&mut self, remaining_changes: usize) {
-        self.add_log(LogEntry::info(format!(
-            "Re-analyzing queued changes for dispatch (remaining: {})",
-            remaining_changes
-        )));
     }
 
     pub(crate) fn handle_resolve_completed(
@@ -188,26 +110,6 @@ impl AppState {
             wt.is_merging = false;
             wt.has_commits_ahead = false;
         }
-    }
-
-    pub(crate) fn handle_acceptance_started(&mut self, change_id: String, command: String) {
-        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            if change.started_at.is_none() {
-                change.started_at = Some(Instant::now());
-            }
-            change.set_display_status_cache("accepting");
-            change.iteration_number = None;
-        }
-        self.add_log(
-            LogEntry::info(format!("Acceptance started: {}", change_id))
-                .with_operation("acceptance")
-                .with_change_id(&change_id),
-        );
-        self.add_log(
-            LogEntry::info(format!("  Command: {}", command))
-                .with_operation("acceptance")
-                .with_change_id(&change_id),
-        );
     }
 
     pub(crate) fn handle_acceptance_completed(&mut self, change_id: String) {

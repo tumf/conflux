@@ -14,3 +14,8 @@
 
 - ガード関数群 (`validate_*`) の分離は別 proposal で扱う
 - `ChangeState` のサブモジュール化も別 proposal とする
+
+## Acceptance #1 Failure Follow-up
+
+- [x] `handle_apply_started` / `handle_archive_started` / `handle_acceptance_started` / `handle_resolve_started` / `handle_analysis_started` を `src/tui/state/event_handlers/processing.rs` へ移動し、開始系ハンドラの責務を spec と tasks に一致させる
+- [x] 完了系ハンドラのみを `src/tui/state/event_handlers/completion.rs` に残し、完了系と開始系の分類に対するテストを更新して `cargo fmt --check && cargo clippy -- -D warnings && cargo test` を再実行する
