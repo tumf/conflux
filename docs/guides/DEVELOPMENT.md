@@ -25,10 +25,50 @@ The binary will be available at `target/release/cflx`.
 
 ## Testing
 
+### Test tiers (default-path vs heavy real-boundary)
+
+Conflux separates tests into two explicit tiers:
+
+- **Default-path (fast)**: `cargo test`
+  - Everyday developer loop and acceptance baseline.
+  - Includes unit tests and lightweight integration tests.
+- **Heavy tier (opt-in)**: `cargo test --features heavy-tests`
+  - Includes real-boundary suites that exercise real `git`, worktrees, OS process behavior, and similar expensive integration/E2E paths.
+
+### Current test surface classification inventory
+
+| Suite | Classification | Default path | Notes |
+|---|---|---|---|
+| `tests/run_exit_tests.rs` | fast integration | yes | Process behavior verification without long-lived real-boundary orchestration |
+| `tests/no_backup_files_test.rs` | fast integration/contract | yes | Repository hygiene guard |
+| `tests/install_skills_test.rs` | fast integration | yes | Filesystem + embedded skill install behavior |
+| `tests/e2e_tests.rs` | heavy contract/E2E (opt-in) | no (requires `heavy-tests`) | Mock-basedだが長時間化しやすいため heavy tier へ分離 |
+| `tests/e2e_proposal_session.rs` | heavy E2E / real-boundary | no (requires `heavy-tests`) | Real git repo + websocket/session boundary |
+| `tests/e2e_git_worktree_tests.rs` | heavy E2E / real-boundary | no (requires `heavy-tests`) | Real git worktree lifecycle + merge/conflict |
+| `tests/process_cleanup_test.rs` | heavy integration / real-boundary | no (requires `heavy-tests`) | OS process group and signal semantics |
+| `tests/merge_conflict_check_tests.rs` | heavy integration / real-boundary | no (requires `heavy-tests`) | Real `git merge-tree` process + repo mutation |
+| `src/parallel/tests/executor.rs` (selected tests) | heavy integration / real-boundary | no (requires `heavy-tests`) | Real git repo/worktree/merge lifecycle used by parallel executor merge tests |
+| `src/server/api.rs` (selected tests) | heavy integration / real-boundary | no (requires `heavy-tests`) | Real repo setup / project add flow / setup script behavior |
+| `src/ai_command_runner.rs` (selected inactivity-timeout tests) | heavy integration / real-time | no (requires `heavy-tests`) | Deliberately waits on inactivity timeout/retry behavior and is too slow for default path |
+| `src/orchestration/archive.rs` (selected retry/verify test) | heavy integration / shell-retry | no (requires `heavy-tests`) | End-to-end archive retry verification via shell script and filesystem mutation |
+
+For heavy suites, keep `#![cfg(feature = "heavy-tests")]` at file top so they remain opt-in by design.
+
+### Validation by phase
+
+- **Pre-commit hook**: `cargo fmt --all` + `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- **Local developer loop**: `cargo test`
+- **Acceptance baseline**: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`
+- **Broader readiness / explicit E2E**: `cargo test --features heavy-tests`
+
 ### Run tests
 
 ```bash
+# default-path fast suite
 cargo test
+
+# explicit heavy suite
+cargo test --features heavy-tests
 ```
 
 ### Run tests with coverage

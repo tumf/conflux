@@ -802,7 +802,7 @@ mod tests {
         let runner = AiCommandRunner::new(config, shared_state);
 
         let (mut handle, mut rx) = runner
-            .execute_streaming_with_retry("sleep 1", None, Some("test"), None)
+            .execute_streaming_with_retry("sleep 0.2", None, Some("test"), None)
             .await
             .unwrap();
 
@@ -961,8 +961,7 @@ mod tests {
         );
     }
 
-    /// Verify that inactivity timeout fires for a streaming pipeline that produces no output,
-    /// and that the output channel receives a user-facing message containing "inactivity timeout".
+    #[cfg(feature = "heavy-tests")]
     #[tokio::test]
     async fn test_inactivity_timeout_streaming_pipeline() {
         let shared_state = Arc::new(Mutex::new(None));
@@ -1020,8 +1019,7 @@ mod tests {
         );
     }
 
-    /// Verify that inactivity-timeout retries work: a command that produces no output
-    /// triggers the inactivity timeout and is re-run up to `inactivity_timeout_max_retries` times.
+    #[cfg(feature = "heavy-tests")]
     #[tokio::test]
     async fn test_inactivity_timeout_retry() {
         let shared_state = Arc::new(Mutex::new(None));
