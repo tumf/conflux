@@ -970,8 +970,20 @@ async fn list_remote_changes_in_worktree(
                 Ok(WorkspaceState::Applying { iteration }) => {
                     ("applying".to_string(), Some(iteration))
                 }
-                Ok(WorkspaceState::Applied) => ("archiving".to_string(), None),
-                Ok(WorkspaceState::Archiving) => ("archiving".to_string(), None),
+                Ok(WorkspaceState::Applied) => {
+                    match task_parser::parse_progress_with_fallback(
+                        dir_name,
+                        Some(wt_path.as_path()),
+                    ) {
+                        Ok(progress)
+                            if progress.total > 0 && progress.completed >= progress.total =>
+                        {
+                            ("accepting".to_string(), None)
+                        }
+                        Ok(_) | Err(_) => ("applying".to_string(), None),
+                    }
+                }
+                Ok(WorkspaceState::Archiving) => ("accepting".to_string(), None),
                 Ok(WorkspaceState::Archived) => ("archived".to_string(), None),
                 Ok(WorkspaceState::Merged) => ("merged".to_string(), None),
                 Err(_) => ("idle".to_string(), None),
