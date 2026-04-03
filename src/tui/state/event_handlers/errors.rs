@@ -154,6 +154,41 @@ mod tests {
     }
 
     #[test]
+    fn processing_error_keeps_app_mode() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Running;
+        app.current_change = Some("test-change".to_string());
+        app.changes[0].selected = true;
+
+        app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
+
+        assert_eq!(app.mode, AppMode::Running);
+        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
+        assert_eq!(change.display_status_cache, "error");
+        assert!(!change.selected);
+        assert_eq!(app.error_change_id, Some("test-change".to_string()));
+        assert_eq!(app.current_change, None);
+    }
+
+    #[test]
+    fn processing_error_from_select_mode() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Select;
+        app.changes[0].selected = true;
+
+        app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
+
+        assert_eq!(app.mode, AppMode::Select);
+        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
+        assert_eq!(change.display_status_cache, "error");
+        assert!(!change.selected);
+    }
+
+    #[test]
     fn handle_resolve_failed_does_not_demote_merged() {
         let changes = vec![create_test_change("change-a", 1, 1)];
         let mut app = AppState::new(changes);

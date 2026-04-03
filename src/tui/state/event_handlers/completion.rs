@@ -193,3 +193,65 @@ impl AppState {
         self.add_log(LogEntry::info(format!("Stopped: {}", change_id)));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openspec::{Change, ProposalMetadata};
+
+    fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
+        Change {
+            id: id.to_string(),
+            completed_tasks: completed,
+            total_tasks: total,
+            last_modified: "now".to_string(),
+            dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
+        }
+    }
+
+    #[test]
+    fn processing_completed_updates_status() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.handle_processing_completed("test-change".to_string());
+
+        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
+        assert_eq!(change.display_status_cache, "archiving");
+    }
+
+    #[test]
+    fn all_completed_transitions_to_select() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Running;
+        app.handle_all_completed();
+
+        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.current_change, None);
+    }
+
+    #[test]
+    fn all_completed_preserves_error_mode() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Error;
+        app.handle_all_completed();
+
+        assert_eq!(app.mode, AppMode::Error);
+    }
+
+    #[test]
+    fn all_completed_keeps_stopped_mode() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Stopped;
+
+        app.handle_all_completed();
+
+        assert_eq!(app.mode, AppMode::Stopped);
+    }
+}
