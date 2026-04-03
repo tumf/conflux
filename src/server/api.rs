@@ -5713,7 +5713,6 @@ mod tests {
         assert_eq!(fix_a["status"], "not queued");
         assert_eq!(fix_b["selected"], true);
         assert_eq!(fix_b["status"], "not queued");
-
     }
 
     #[tokio::test]
