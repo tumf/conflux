@@ -30,3 +30,8 @@
 
 - [x] `handle_dependency_blocked` / `handle_dependency_resolved` を既存 spec/proposal で定義済みのカテゴリへ移動するか、`refresh.rs` に置くなら proposal/spec/tasks の責務定義を更新して配置根拠を明文化する
 - [x] `handle_processing_completed` / `handle_all_completed` / `handle_processing_error` など移動済みハンドラの責務テストを対応するサブモジュールへ移し、`tasks.md` の完了主張とテスト配置を一致させたうえで `cargo fmt --check && cargo clippy -- -D warnings && cargo test` を再実行する
+
+## Acceptance #4 Failure Follow-up
+
+- [x] `processing.rs` に残っている `handle_all_completed` の責務テスト（例: blocked/queued の完了遷移確認）を `completion.rs` へ移し、移動済み完了系ハンドラのテスト配置を実装責務と一致させる
+- [x] 上記テスト再配置後に `cargo fmt --check && cargo clippy -- -D warnings && cargo test` を再実行し、`tasks.md` の完了主張と実際のテスト配置が一致することを確認する

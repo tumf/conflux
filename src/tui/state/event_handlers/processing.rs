@@ -247,23 +247,6 @@ mod tests {
     }
 
     #[test]
-    fn handle_all_completed_resets_blocked_to_not_queued() {
-        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
-        let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
-        app.changes[0].display_status_cache = "queued".to_string();
-        app.changes[0].selected = true;
-        app.changes[1].display_status_cache = "blocked".to_string();
-        app.changes[1].selected = true;
-
-        app.handle_all_completed();
-
-        assert_eq!(app.changes[0].display_status_cache, "not queued");
-        assert_eq!(app.changes[1].display_status_cache, "not queued");
-        assert_eq!(app.mode, AppMode::Select);
-    }
-
-    #[test]
     fn stopped_resets_resolving_changes() {
         let changes = vec![
             create_test_change("change-a", 3, 3),
