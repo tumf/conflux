@@ -802,7 +802,7 @@ mod tests {
         let runner = AiCommandRunner::new(config, shared_state);
 
         let (mut handle, mut rx) = runner
-            .execute_streaming_with_retry("sleep 1", None, Some("test"), None)
+            .execute_streaming_with_retry("sleep 0.2", None, Some("test"), None)
             .await
             .unwrap();
 

@@ -43,7 +43,7 @@ fn heavy_real_boundary_suites_stay_feature_gated() {
         );
     }
 
-    let function_gated: [(&str, &[&str]); 4] = [
+    let function_gated: [(&str, &[&str]); 6] = [
         (
             "src/parallel/tests/executor.rs",
             &[
@@ -69,6 +69,17 @@ fn heavy_real_boundary_suites_stay_feature_gated() {
         (
             "src/orchestration/archive.rs",
             &["test_archive_change_retries_until_verified"],
+        ),
+        (
+            "src/command_queue.rs",
+            &[
+                "test_inactivity_timeout_triggers",
+                "test_inactivity_timeout_error_message_format",
+            ],
+        ),
+        (
+            "src/hooks.rs",
+            &["test_hook_runner_timeout", "test_index_lock_wait_timeout"],
         ),
     ];
 

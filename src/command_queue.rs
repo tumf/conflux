@@ -891,6 +891,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "heavy-tests")]
     #[tokio::test]
     async fn test_inactivity_timeout_triggers() {
         use std::process::Stdio;
@@ -1005,7 +1006,7 @@ mod tests {
             .execute_with_retry_streaming(
                 || {
                     let mut cmd = Command::new("sleep");
-                    cmd.arg("2").stdout(Stdio::piped()).stderr(Stdio::piped());
+                    cmd.arg("0.2").stdout(Stdio::piped()).stderr(Stdio::piped());
                     cmd
                 },
                 None::<fn(StreamingOutputLine) -> std::future::Ready<()>>,
@@ -1019,6 +1020,7 @@ mod tests {
         assert!(status.success());
     }
 
+    #[cfg(feature = "heavy-tests")]
     #[tokio::test]
     async fn test_inactivity_timeout_error_message_format() {
         use std::process::Stdio;
@@ -1122,14 +1124,14 @@ mod tests {
     async fn test_no_timeout_with_stderr_only_bytes() {
         use std::process::Stdio;
 
-        // Inactivity timeout of 5 seconds; command emits to stderr every 1s for 3s
+        // Inactivity timeout of 1 second; command emits to stderr every 0.2s
         let config = CommandQueueConfig {
             stagger_delay_ms: 0,
             max_retries: 1,
             retry_delay_ms: 50,
             retry_error_patterns: vec![],
             retry_if_duration_under_secs: 0,
-            inactivity_timeout_secs: 5,
+            inactivity_timeout_secs: 1,
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
@@ -1143,7 +1145,7 @@ mod tests {
                     let mut cmd = Command::new("sh");
                     cmd.args([
                         "-c",
-                        "printf 'err1' >&2; sleep 1; printf 'err2' >&2; sleep 1; printf 'err3' >&2",
+                        "printf 'err1' >&2; sleep 0.2; printf 'err2' >&2; sleep 0.2; printf 'err3' >&2",
                     ])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
