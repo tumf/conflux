@@ -537,17 +537,19 @@ pub async fn handle_tui_command(
                 }
             });
         }
-        TuiCommand::StopChange(id) => {
-            // Apply reducer command first so shared state reflects stopped intent.
+        TuiCommand::DequeueChange(id) => {
+            // Apply reducer command first so shared state reflects stop-and-dequeue intent.
             shared_state
                 .write()
                 .await
-                .apply_command(ReducerCommand::StopChange(id.clone()));
+                .apply_command(ReducerCommand::DequeueChange(id.clone()));
             // Stop a single active change (serial/parallel modes)
             // For serial mode: set a flag that orchestrator checks before each operation
             // For parallel mode: cancel the workspace task for this change
-            ctx.app
-                .add_log(LogEntry::info(format!("Stop request received for: {}", id)));
+            ctx.app.add_log(LogEntry::info(format!(
+                "Stop-and-dequeue request received for: {}",
+                id
+            )));
             // The actual cancellation is handled by the orchestrator via dynamic_queue.mark_stopped()
             ctx.dynamic_queue.mark_stopped(id.clone()).await;
         }

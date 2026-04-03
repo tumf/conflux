@@ -434,7 +434,10 @@ pub enum ExecutionEvent {
     BranchMergeCompleted { branch_name: String },
     /// Branch merge failed (TUI worktree view)
     BranchMergeFailed { branch_name: String, error: String },
-    /// Change stopped successfully (single-change stop)
+    /// Change force-stopped and dequeued successfully (single-change stop-and-dequeue)
+    ChangeDequeued { change_id: String },
+    /// Legacy single-change stop event (kept for compatibility)
+    #[allow(dead_code)]
     ChangeStopped { change_id: String },
     /// Change stop failed (single-change stop)
     #[allow(dead_code)]

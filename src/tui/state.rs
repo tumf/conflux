@@ -1481,7 +1481,12 @@ impl AppState {
             }
 
             // Single-change stop events
-            OrchestratorEvent::ChangeStopped { change_id } => self.handle_change_stopped(change_id),
+            OrchestratorEvent::ChangeDequeued { change_id } => {
+                self.handle_change_dequeued(change_id)
+            }
+            OrchestratorEvent::ChangeStopped { change_id } => {
+                self.handle_change_dequeued(change_id)
+            }
             OrchestratorEvent::ChangeStopFailed { change_id, error } => {
                 self.handle_change_stop_failed(change_id, error)
             }
@@ -2145,7 +2150,7 @@ impl AppState {
         }
     }
 
-    fn handle_change_stopped(&mut self, change_id: String) {
+    fn handle_change_dequeued(&mut self, change_id: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             // Transition to NotQueued and clear execution mark
             change.set_display_status_cache("not queued");
@@ -2155,7 +2160,10 @@ impl AppState {
                 change.elapsed_time = Some(started.elapsed());
             }
         }
-        self.add_log(LogEntry::info(format!("Stopped: {}", change_id)));
+        self.add_log(LogEntry::info(format!(
+            "Stopped and dequeued: {}",
+            change_id
+        )));
     }
 
     fn handle_change_stop_failed(&mut self, change_id: String, error: String) {
@@ -2782,11 +2790,11 @@ mod guards {
                 ToggleActionResult::StateOnly(Some(log_msg))
             }
             "applying" | "accepting" | "archiving" | "resolving" => {
-                // Active (in-flight) changes: issue stop request
-                // State transition happens when ChangeStopped event is received
+                // Active (in-flight) changes: issue stop-and-dequeue request
+                // State transition happens when ChangeDequeued event is received
                 let id = change.id.clone();
-                let log_msg = format!("Stop requested: {}", id);
-                ToggleActionResult::Command(TuiCommand::StopChange(id), Some(log_msg))
+                let log_msg = format!("Stop-and-dequeue requested: {}", id);
+                ToggleActionResult::Command(TuiCommand::DequeueChange(id), Some(log_msg))
             }
             "error" => {
                 // Error rows in Running mode must mirror queue operations:
@@ -3221,7 +3229,7 @@ mod tests {
         // No StopChange command should appear
         assert!(!commands
             .iter()
-            .any(|c| matches!(c, TuiCommand::StopChange(_))));
+            .any(|c| matches!(c, TuiCommand::DequeueChange(_))));
     }
 
     #[test]
