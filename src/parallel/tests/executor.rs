@@ -1547,7 +1547,10 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
 
     let acceptance_output = "ACCEPTANCE: FAIL\n\nFINDINGS:\n- archive-readiness gate failed: cargo clippy -- -D warnings (src/lib.rs:42)\n- secondary finding\n";
     let config = create_test_config_with(OrchestratorConfig {
-        acceptance_command: Some(format!("printf '{}'", acceptance_output.replace('\n', "\\n"))),
+        acceptance_command: Some(format!(
+            "printf '{}'",
+            acceptance_output.replace('\n', "\\n")
+        )),
         ..Default::default()
     });
 
