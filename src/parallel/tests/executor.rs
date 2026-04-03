@@ -1923,10 +1923,13 @@ async fn test_debounce_with_queue_changes() {
     // Immediate check: should NOT reanalyze (debounce active)
     assert!(!executor.should_reanalyze(false).await);
 
-    // Wait for debounce period to expire (10 seconds + margin)
-    tokio::time::sleep(Duration::from_secs(11)).await;
+    // Simulate debounce period expiry without wall-clock waiting.
+    {
+        let mut last_change = executor.last_queue_change_at.lock().await;
+        *last_change = Some(Instant::now() - Duration::from_secs(11));
+    }
 
-    // After debounce: should reanalyze
+    // After simulated debounce expiry: should reanalyze
     assert!(executor.should_reanalyze(false).await);
 }
 
@@ -2265,10 +2268,13 @@ async fn test_concurrent_reanalysis_queue_dispatch() {
     // Immediate check: should NOT reanalyze (debounce active)
     assert!(!executor.should_reanalyze(false).await);
 
-    // Wait for debounce period to expire
-    tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+    // Simulate debounce period expiry without waiting 11 real seconds.
+    {
+        let mut last_change = executor.last_queue_change_at.lock().await;
+        *last_change = Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
+    }
 
-    // After debounce: should reanalyze
+    // After simulated debounce expiry: should reanalyze
     assert!(executor.should_reanalyze(false).await);
 
     // Verify AnalysisStarted event would be emitted
