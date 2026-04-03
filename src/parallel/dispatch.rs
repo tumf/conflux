@@ -34,7 +34,7 @@ use super::ParallelExecutor;
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_resume_action, ResumeAction};
+    use super::{decide_resume_action, should_run_apply, ResumeAction};
     use crate::execution::state::WorkspaceState;
     use std::fs;
     use tempfile::TempDir;
@@ -76,6 +76,15 @@ mod tests {
         let action = decide_resume_action("change-archived", tmp.path(), &WorkspaceState::Archived);
         assert_eq!(action, ResumeAction::Terminal);
     }
+
+    #[test]
+    fn should_run_apply_consumes_skip_flag_after_first_cycle() {
+        let mut skip_apply_once = true;
+
+        assert!(!should_run_apply(&mut skip_apply_once));
+        assert!(!skip_apply_once);
+        assert!(should_run_apply(&mut skip_apply_once));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +111,15 @@ pub(super) fn decide_resume_action(
             }
         }
         WorkspaceState::Created | WorkspaceState::Applying { .. } => ResumeAction::Apply,
+    }
+}
+
+fn should_run_apply(skip_apply_once: &mut bool) -> bool {
+    if *skip_apply_once {
+        *skip_apply_once = false;
+        false
+    } else {
+        true
     }
 }
 
@@ -399,11 +417,13 @@ impl ParallelExecutor {
 
             // Apply+Acceptance loop: retry apply when acceptance fails.
             // Resume routing determines whether we start from apply or acceptance.
-            let skip_apply = matches!(resume_action, ResumeAction::Acceptance);
+            // The acceptance-only shortcut is consumed after one cycle so that any
+            // acceptance FAIL/command error path re-enters apply on the next cycle.
+            let mut skip_apply_once = matches!(resume_action, ResumeAction::Acceptance);
 
             let _apply_revision = loop {
-                // Skip apply for workspaces that were already applied in a previous run.
-                if skip_apply {
+                // Skip apply only for the first cycle when resuming from an already-applied state.
+                if !should_run_apply(&mut skip_apply_once) {
                     if let Some(ref tx) = event_tx {
                         let _ = tx
                             .send(ParallelEvent::Log(
