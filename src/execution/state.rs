@@ -8,8 +8,8 @@
 //!
 //! 1. **Created**: Workspace created, no apply commits → Start apply
 //! 2. **Applying**: WIP commits exist, apply in progress → Resume apply (next iteration)
-//! 3. **Applied**: Apply complete, archive not complete → Archive only
-//! 4. **Archiving**: Archive files moved, commit not complete → Archive loop
+//! 3. **Applied**: Apply complete, archive not complete → Resume decision is delegated to worktree routing (non-terminal resumes go to apply or acceptance, never direct archive)
+//! 4. **Archiving**: Archive files moved, commit not complete → Resume archive to finish in-progress archive step (this state occurs only after acceptance has already handed off to archive)
 //! 5. **Archived**: Archive complete, not merged to main → Merge only
 //! 6. **Merged**: Merged to main → Skip & Cleanup
 //!
@@ -22,8 +22,8 @@
 //! match state {
 //!     WorkspaceState::Created => { /* start apply */ }
 //!     WorkspaceState::Applying { iteration } => { /* resume from iteration */ }
-//!     WorkspaceState::Applied => { /* archive only */ }
-//!     WorkspaceState::Archiving => { /* archive loop */ }
+//!     WorkspaceState::Applied => { /* defer to resume-action router (apply or acceptance) */ }
+//!     WorkspaceState::Archiving => { /* resume archive loop after acceptance handoff */ }
 //!     WorkspaceState::Archived => { /* merge only */ }
 //!     WorkspaceState::Merged => { /* skip & cleanup */ }
 //! }
@@ -378,7 +378,9 @@ pub async fn has_apply_commit(change_id: &str, repo_root: &Path) -> Result<bool>
 /// 1. Check if merged to base branch → `Merged`
 /// 2. Check if archive commit complete → `Archived`
 /// 3. Check if archive files exist (but commit incomplete) → `Archiving`
+///    - This only resumes an archive step that was already started after acceptance handoff.
 /// 4. Check if apply commit exists → `Applied`
+///    - Resume router decides apply vs acceptance from worktree task progress; no direct archive jump for non-terminal resumes.
 /// 5. Check for WIP commits → `Applying { iteration }`
 /// 6. Otherwise → `Created`
 ///
