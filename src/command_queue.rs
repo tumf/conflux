@@ -891,18 +891,19 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "heavy-tests")]
     #[tokio::test]
     async fn test_inactivity_timeout_triggers() {
         use std::process::Stdio;
 
-        // Configure with short inactivity timeout (3 seconds)
+        // Configure with short inactivity timeout (1 second)
         let config = CommandQueueConfig {
             stagger_delay_ms: 100,
             max_retries: 1,
             retry_delay_ms: 50,
             retry_error_patterns: vec![],
             retry_if_duration_under_secs: 0,
-            inactivity_timeout_secs: 3,
+            inactivity_timeout_secs: 1,
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
@@ -926,9 +927,9 @@ mod tests {
 
         let elapsed = start.elapsed();
 
-        // Should fail due to inactivity timeout + grace period (approximately 4 seconds)
+        // Should fail due to inactivity timeout + grace period (approximately 2 seconds)
         // Allow some margin for timing
-        assert!(elapsed.as_secs() >= 3 && elapsed.as_secs() <= 10);
+        assert!(elapsed.as_secs_f64() >= 1.0 && elapsed.as_secs_f64() <= 6.0);
 
         // Process should have been killed
         if let Ok((status, _)) = result {
@@ -945,27 +946,27 @@ mod tests {
     async fn test_no_timeout_with_periodic_output() {
         use std::process::Stdio;
 
-        // Configure with inactivity timeout (5 seconds)
+        // Configure with inactivity timeout (1 second)
         let config = CommandQueueConfig {
             stagger_delay_ms: 100,
             max_retries: 1,
             retry_delay_ms: 50,
             retry_error_patterns: vec![],
             retry_if_duration_under_secs: 0,
-            inactivity_timeout_secs: 5,
+            inactivity_timeout_secs: 1,
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
         };
         let queue = CommandQueue::new(config);
 
-        // Command that outputs periodically (every 1 second for 3 iterations)
+        // Command that outputs periodically (every 0.2 second for 3 iterations)
         // Should NOT timeout because output keeps resetting the timer
         let (status, _) = queue
             .execute_with_retry_streaming(
                 || {
                     let mut cmd = Command::new("sh");
-                    cmd.args(["-c", "for i in 1 2 3; do echo \"line $i\"; sleep 1; done"])
+                    cmd.args(["-c", "for i in 1 2 3; do echo \"line $i\"; sleep 0.2; done"])
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped());
                     cmd
@@ -1005,7 +1006,7 @@ mod tests {
             .execute_with_retry_streaming(
                 || {
                     let mut cmd = Command::new("sleep");
-                    cmd.arg("2").stdout(Stdio::piped()).stderr(Stdio::piped());
+                    cmd.arg("0.2").stdout(Stdio::piped()).stderr(Stdio::piped());
                     cmd
                 },
                 None::<fn(StreamingOutputLine) -> std::future::Ready<()>>,
@@ -1019,8 +1020,7 @@ mod tests {
         assert!(status.success());
     }
 
-    /// Verify that the user-facing error message for inactivity timeout contains
-    /// "inactivity timeout", the configured timeout seconds, and operation context.
+    #[cfg(feature = "heavy-tests")]
     #[tokio::test]
     async fn test_inactivity_timeout_error_message_format() {
         use std::process::Stdio;
@@ -1031,7 +1031,7 @@ mod tests {
             retry_delay_ms: 50,
             retry_error_patterns: vec![],
             retry_if_duration_under_secs: 0,
-            inactivity_timeout_secs: 2,
+            inactivity_timeout_secs: 1,
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
@@ -1059,10 +1059,10 @@ mod tests {
             err.contains("inactivity timeout"),
             "Error message must mention 'inactivity timeout': {err}"
         );
-        // Must contain the timeout duration (2s)
+        // Must contain the timeout duration (1s)
         assert!(
-            err.contains("2s"),
-            "Error message must include timeout seconds '2s': {err}"
+            err.contains("1s"),
+            "Error message must include timeout seconds '1s': {err}"
         );
         // Must contain operation context
         assert!(
@@ -1076,35 +1076,35 @@ mod tests {
         );
     }
 
-    /// Verify that byte reception without newlines resets the inactivity timer.
-    /// A command that emits bytes periodically but never emits a newline must NOT
-    /// trigger an inactivity timeout.
     #[tokio::test]
     async fn test_no_timeout_with_bytes_without_newlines() {
         use std::process::Stdio;
 
-        // Inactivity timeout of 5 seconds; command emits bytes every 1s for 3s (no newlines)
+        // Inactivity timeout of 1 second; command emits bytes every 0.2s (no newlines)
         let config = CommandQueueConfig {
             stagger_delay_ms: 0,
             max_retries: 1,
             retry_delay_ms: 50,
             retry_error_patterns: vec![],
             retry_if_duration_under_secs: 0,
-            inactivity_timeout_secs: 5,
+            inactivity_timeout_secs: 1,
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
         };
         let queue = CommandQueue::new(config);
 
-        // printf writes bytes without newlines; sleep gaps between them
+        // printf writes bytes without newlines; short sleep gaps between them
         let (status, _) = queue
             .execute_with_retry_streaming(
                 || {
                     let mut cmd = Command::new("sh");
-                    cmd.args(["-c", "printf '.'; sleep 1; printf '.'; sleep 1; printf '.'"])
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped());
+                    cmd.args([
+                        "-c",
+                        "printf '.'; sleep 0.2; printf '.'; sleep 0.2; printf '.'",
+                    ])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
                     cmd
                 },
                 None::<fn(StreamingOutputLine) -> std::future::Ready<()>>,
@@ -1124,14 +1124,14 @@ mod tests {
     async fn test_no_timeout_with_stderr_only_bytes() {
         use std::process::Stdio;
 
-        // Inactivity timeout of 5 seconds; command emits to stderr every 1s for 3s
+        // Inactivity timeout of 1 second; command emits to stderr every 0.2s
         let config = CommandQueueConfig {
             stagger_delay_ms: 0,
             max_retries: 1,
             retry_delay_ms: 50,
             retry_error_patterns: vec![],
             retry_if_duration_under_secs: 0,
-            inactivity_timeout_secs: 5,
+            inactivity_timeout_secs: 1,
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
@@ -1145,7 +1145,7 @@ mod tests {
                     let mut cmd = Command::new("sh");
                     cmd.args([
                         "-c",
-                        "printf 'err1' >&2; sleep 1; printf 'err2' >&2; sleep 1; printf 'err3' >&2",
+                        "printf 'err1' >&2; sleep 0.2; printf 'err2' >&2; sleep 0.2; printf 'err3' >&2",
                     ])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());

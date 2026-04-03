@@ -4,8 +4,10 @@ use super::super::*;
 use crate::command_queue::CommandQueueConfig;
 use crate::config::defaults::default_retry_patterns;
 use crate::config::OrchestratorConfig;
-use crate::vcs::{GitWorkspaceManager, WorkspaceManager, WorkspaceStatus};
+#[cfg(feature = "heavy-tests")]
+use crate::vcs::GitWorkspaceManager;
 use crate::vcs::{VcsBackend, VcsError, VcsResult, VcsWarning, Workspace, WorkspaceInfo};
+use crate::vcs::{WorkspaceManager, WorkspaceStatus};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -331,6 +333,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
     assert!(executor.skip_reason_for_change("change-c").is_none());
 }
 
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_resolve_merge_aborts_when_base_dirty() {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -364,6 +367,7 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
     assert!(!merge_messages.contains("Merge change: change-a"));
 }
 
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_resolve_merge_executes_selected_change_only() {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -450,6 +454,7 @@ async fn test_resolve_merge_executes_selected_change_only() {
     assert!(!merge_messages.contains("Merge change: change-b"));
 }
 
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_uses_resolve_command_with_change_ids() {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -622,6 +627,7 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         .unwrap();
 }
 
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_allows_non_merge_head_after_merges() {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -797,6 +803,7 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         .unwrap();
 }
 
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_retries_when_merge_left_in_progress() {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -944,6 +951,7 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         .unwrap();
 }
 
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_retries_when_merge_commit_missing() {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -1130,6 +1138,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
     assert!(merge_messages.contains("Merge change: change-b"));
 }
 
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_resolves_conflict_with_resolve_command() {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -1313,6 +1322,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
     assert!(merged_contents.contains('B'));
 }
 
+#[cfg(feature = "heavy-tests")]
 #[cfg(unix)]
 #[tokio::test]
 async fn test_merge_retries_after_pre_commit_changes() {
@@ -1923,10 +1933,13 @@ async fn test_debounce_with_queue_changes() {
     // Immediate check: should NOT reanalyze (debounce active)
     assert!(!executor.should_reanalyze(false).await);
 
-    // Wait for debounce period to expire (10 seconds + margin)
-    tokio::time::sleep(Duration::from_secs(11)).await;
+    // Simulate debounce period expiry without wall-clock waiting.
+    {
+        let mut last_change = executor.last_queue_change_at.lock().await;
+        *last_change = Some(Instant::now() - Duration::from_secs(11));
+    }
 
-    // After debounce: should reanalyze
+    // After simulated debounce expiry: should reanalyze
     assert!(executor.should_reanalyze(false).await);
 }
 
@@ -1971,6 +1984,7 @@ async fn test_queue_notification_triggers_reanalysis() {
     );
 }
 
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_attempt_merge_defers_when_change_not_archived() {
     use std::fs;
@@ -2071,6 +2085,7 @@ async fn test_attempt_merge_defers_when_change_not_archived() {
     }
 }
 
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_attempt_merge_succeeds_when_change_archived() {
     use std::fs;
@@ -2265,10 +2280,13 @@ async fn test_concurrent_reanalysis_queue_dispatch() {
     // Immediate check: should NOT reanalyze (debounce active)
     assert!(!executor.should_reanalyze(false).await);
 
-    // Wait for debounce period to expire
-    tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+    // Simulate debounce period expiry without waiting 11 real seconds.
+    {
+        let mut last_change = executor.last_queue_change_at.lock().await;
+        *last_change = Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
+    }
 
-    // After debounce: should reanalyze
+    // After simulated debounce expiry: should reanalyze
     assert!(executor.should_reanalyze(false).await);
 
     // Verify AnalysisStarted event would be emitted
@@ -2332,6 +2350,7 @@ async fn test_on_merged_hook_execution() {
 }
 
 /// Test that attempt_merge defers when worktree is dirty
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_attempt_merge_deferred_when_resolve_active() {
     use std::fs;
@@ -2414,6 +2433,7 @@ async fn test_attempt_merge_deferred_when_resolve_active() {
     manual_resolve_counter.store(0, Ordering::SeqCst);
 }
 
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_deferred_when_worktree_dirty() {
     use std::fs;
@@ -2513,6 +2533,7 @@ async fn test_merge_deferred_when_worktree_dirty() {
 }
 
 /// Test that attempt_merge defers when archive entry is missing
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_deferred_when_archive_entry_missing() {
     use std::fs;
@@ -2595,6 +2616,7 @@ async fn test_merge_deferred_when_archive_entry_missing() {
 }
 
 /// Test that attempt_merge proceeds when archive is complete
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_proceeds_when_archive_complete() {
     use std::fs;
@@ -2711,6 +2733,7 @@ async fn test_merge_proceeds_when_archive_complete() {
 }
 
 /// Regression: detached HEAD must be reported as execution error, not MergeWait/deferred.
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_attempt_merge_errors_on_detached_head() {
     use std::fs;

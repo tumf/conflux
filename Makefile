@@ -1,4 +1,4 @@
-.PHONY: install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test check openapi check-openapi publish build-linux build-linux-x86 build-linux-arm server-install server-start server-stop server-restart server-logs server-status dashboard-build
+.PHONY: install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy check openapi check-openapi publish build-linux build-linux-x86 build-linux-arm server-install server-start server-stop server-restart server-logs server-status dashboard-build
 
 # Ensure rustup-managed toolchain is used (not Homebrew rustc)
 RUSTUP_BIN := $(HOME)/.rustup/toolchains/stable-$(shell rustup show active-toolchain 2>/dev/null | awk '{print $$1}' | sed 's/^stable-//')/bin
@@ -83,12 +83,17 @@ lint:
 	@echo "Running clippy..."
 	cargo clippy -- -D warnings
 
-# Run tests
+# Run default-path tests (fast developer loop)
 test:
-	@echo "Running tests..."
+	@echo "Running default-path tests..."
 	cargo test
 
-# Run all checks (format, lint, test)
+# Run heavy real-boundary E2E/integration tests explicitly
+test-heavy:
+	@echo "Running heavy test tier (feature=heavy-tests)..."
+	cargo test --features heavy-tests
+
+# Run all default-path checks (format, lint, fast tests)
 check: fmt lint test
 	@echo "All checks passed!"
 

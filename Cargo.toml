@@ -1,6 +1,6 @@
 [package]
 name = "cflx"
-version = "0.5.96"
+version = "0.5.99"
 edition = "2021"
 default-run = "cflx"
 description = "Conflux – a spec-driven parallel coding orchestrator that runs AI agents on git worktrees"
@@ -52,6 +52,7 @@ required-features = ["web-monitoring"]
 [features]
 default = ["web-monitoring"]
 web-monitoring = ["axum", "tower", "tower-http", "qrcode", "local-ip-address", "utoipa", "utoipa-swagger-ui", "portable-pty", "rusqlite"]
+heavy-tests = []
 
 [dependencies]
 tokio = { version = "1", features = ["full", "process"] }

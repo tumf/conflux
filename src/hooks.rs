@@ -1096,6 +1096,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "heavy-tests")]
     #[tokio::test]
     async fn test_hook_runner_timeout() {
         let json =
@@ -2032,6 +2033,7 @@ mod tests {
         assert!(released, "Expected lock to be released");
     }
 
+    #[cfg(feature = "heavy-tests")]
     #[tokio::test]
     async fn test_index_lock_wait_timeout() {
         // Lock file persists beyond timeout
