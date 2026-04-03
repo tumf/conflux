@@ -1,9 +1,11 @@
 //! Tests for ParallelExecutor and related functionality.
 
 use super::super::*;
+use crate::agent::AgentRunner;
 use crate::command_queue::CommandQueueConfig;
 use crate::config::defaults::default_retry_patterns;
 use crate::config::OrchestratorConfig;
+use crate::parallel::executor::execute_acceptance_in_workspace;
 #[cfg(feature = "heavy-tests")]
 use crate::vcs::GitWorkspaceManager;
 use crate::vcs::{VcsBackend, VcsError, VcsResult, VcsWarning, Workspace, WorkspaceInfo};
@@ -1524,6 +1526,132 @@ async fn test_merge_retries_after_pre_commit_changes() {
 
     let hook_contents = std::fs::read_to_string(repo_root.join("hooked.txt")).unwrap();
     assert!(hook_contents.contains("hooked"));
+}
+
+#[tokio::test]
+async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_context() {
+    use crate::acceptance::AcceptanceResult as ParsedAcceptanceResult;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_root = TempDir::new().unwrap();
+    init_git_repo(repo_root.path()).await;
+
+    // Create a workspace commit so acceptance diff context has a real delta target.
+    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n").unwrap();
+    Command::new("git")
+        .args(["add", "feature.rs"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "Apply: change-a"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .unwrap();
+
+    let acceptance_output = "ACCEPTANCE: FAIL\n\nFINDINGS:\n- archive-readiness gate failed: cargo clippy -- -D warnings (src/lib.rs:42)\n- secondary finding\n";
+    let config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some(format!(
+            "printf '{}'",
+            acceptance_output.replace('\n', "\\n")
+        )),
+        ..Default::default()
+    });
+
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+    let mut agent = AgentRunner::new(config.clone());
+    let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
+
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+
+    let (result, _iteration) = execute_acceptance_in_workspace(
+        "change-a",
+        repo_root.path(),
+        &mut agent,
+        Some(event_tx),
+        None,
+        &ai_runner,
+        &config,
+        &acceptance_tail_injected,
+        &acceptance_history,
+        Some("main"),
+    )
+    .await
+    .unwrap();
+
+    match result {
+        crate::orchestration::AcceptanceResult::Fail { findings } => {
+            assert_eq!(findings.len(), 2);
+            assert!(
+                findings[0].contains("archive-readiness gate failed: cargo clippy -- -D warnings"),
+                "first finding should retain gate-specific archive-readiness context"
+            );
+            assert_eq!(
+                ParsedAcceptanceResult::Fail {
+                    findings: findings.clone()
+                },
+                ParsedAcceptanceResult::Fail {
+                    findings: vec![
+                        "archive-readiness gate failed: cargo clippy -- -D warnings (src/lib.rs:42)"
+                            .to_string(),
+                        "secondary finding".to_string(),
+                    ]
+                },
+                "acceptance parsing should preserve findings used by parallel failure reporting"
+            );
+        }
+        other => panic!("expected acceptance fail result, got {:?}", other),
+    }
+
+    let mut saw_gate_specific_warn_log = false;
+    let mut saw_acceptance_completed = false;
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            crate::events::ExecutionEvent::Log(entry) => {
+                if entry.level == crate::events::LogLevel::Warn
+                    && entry.operation.as_deref() == Some("acceptance")
+                    && entry.message.contains("blocking gate context")
+                    && entry
+                        .message
+                        .contains("archive-readiness gate failed: cargo clippy -- -D warnings")
+                {
+                    saw_gate_specific_warn_log = true;
+                }
+            }
+            crate::events::ExecutionEvent::AcceptanceCompleted { change_id } => {
+                if change_id == "change-a" {
+                    saw_acceptance_completed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_gate_specific_warn_log,
+        "parallel acceptance must emit a warn log that keeps archive-readiness gate context"
+    );
+    assert!(
+        saw_acceptance_completed,
+        "parallel acceptance should emit AcceptanceCompleted after failure handling"
+    );
 }
 
 #[tokio::test]
