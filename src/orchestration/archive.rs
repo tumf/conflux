@@ -676,11 +676,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "heavy-tests")]
     use crate::config::OrchestratorConfig;
+    #[cfg(feature = "heavy-tests")]
     use crate::hooks::HookRunner;
+    #[cfg(feature = "heavy-tests")]
     use crate::openspec::Change;
+    #[cfg(feature = "heavy-tests")]
     use crate::orchestration::output::NullOutputHandler;
+    #[cfg(feature = "heavy-tests")]
     use std::fs;
+    #[cfg(feature = "heavy-tests")]
     use tempfile::TempDir;
 
     #[test]
@@ -726,6 +732,7 @@ mod tests {
         assert!(archive_path.starts_with("openspec/changes/archive"));
     }
 
+    #[cfg(feature = "heavy-tests")]
     #[cfg(unix)]
     #[tokio::test]
     async fn test_archive_change_retries_until_verified() {

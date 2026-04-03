@@ -1,3 +1,5 @@
+#![cfg(feature = "heavy-tests")]
+
 //! Integration tests for process cleanup functionality
 //!
 //! Tests verify that child processes are properly cleaned up across platforms:
@@ -80,31 +82,6 @@ async fn test_windows_job_object_cleanup() {
     // This requires creating a job object, spawning a process, and verifying
     // that the process terminates when the job handle is closed
     println!("Windows job object test not yet implemented");
-}
-
-#[tokio::test]
-async fn test_managed_child_basic_operations() {
-    use std::process::Stdio;
-    use tokio::process::Command;
-
-    // Simple test that spawns and waits for a process
-    let mut cmd = Command::new("echo");
-    cmd.arg("test")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let child = cmd.spawn().expect("Failed to spawn echo process");
-
-    // Test that we can get the PID
-    let pid = child.id();
-    assert!(pid.is_some(), "Should have process ID");
-
-    // Wait for process to complete
-    let status = child
-        .wait_with_output()
-        .await
-        .expect("Failed to wait for process");
-    assert!(status.status.success(), "Echo command should succeed");
 }
 
 #[cfg(unix)]

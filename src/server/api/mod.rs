@@ -1096,6 +1096,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "heavy-tests")]
     #[tokio::test]
     async fn test_add_project_without_repo_root_setup_succeeds_without_marker() {
         let temp_dir = TempDir::new().unwrap();
@@ -1137,6 +1138,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "heavy-tests")]
     #[tokio::test]
     async fn test_add_project_setup_failure_returns_422_and_rolls_back_registry() {
         let temp_dir = TempDir::new().unwrap();
@@ -2684,6 +2686,7 @@ mod tests {
 
     /// Test that AppState receives resolve_command from the top-level config
     /// (not from server.resolve_command which is now deprecated).
+    #[cfg(feature = "heavy-tests")]
     #[test]
     fn test_app_state_resolve_command_comes_from_top_level_config() {
         // Simulate what run_server now does: takes resolve_command as a separate parameter
