@@ -484,6 +484,7 @@ async fn test_git_worktree_staged_changes_error() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn test_blocked_rejection_flow_end_to_end_creates_marker_and_removes_worktree() {
     let temp_dir = tempfile::tempdir().unwrap();
     let repo_root = temp_dir.path();
