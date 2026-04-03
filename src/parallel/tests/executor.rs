@@ -1,9 +1,11 @@
 //! Tests for ParallelExecutor and related functionality.
 
 use super::super::*;
+use crate::agent::AgentRunner;
 use crate::command_queue::CommandQueueConfig;
 use crate::config::defaults::default_retry_patterns;
 use crate::config::OrchestratorConfig;
+use crate::parallel::executor::execute_acceptance_in_workspace;
 #[cfg(feature = "heavy-tests")]
 use crate::vcs::GitWorkspaceManager;
 use crate::vcs::{VcsBackend, VcsError, VcsResult, VcsWarning, Workspace, WorkspaceInfo};
@@ -324,6 +326,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        scheduler_lifetime: SchedulerLifetime::Finite,
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -612,6 +615,7 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        scheduler_lifetime: SchedulerLifetime::Finite,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -788,6 +792,7 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        scheduler_lifetime: SchedulerLifetime::Finite,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -936,6 +941,7 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        scheduler_lifetime: SchedulerLifetime::Finite,
     };
 
     let revisions = vec![workspace_a.name];
@@ -1113,6 +1119,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        scheduler_lifetime: SchedulerLifetime::Finite,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1304,6 +1311,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        scheduler_lifetime: SchedulerLifetime::Finite,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1501,6 +1509,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        scheduler_lifetime: SchedulerLifetime::Finite,
     };
 
     let revisions = vec![workspace_a.name];
@@ -1517,6 +1526,132 @@ async fn test_merge_retries_after_pre_commit_changes() {
 
     let hook_contents = std::fs::read_to_string(repo_root.join("hooked.txt")).unwrap();
     assert!(hook_contents.contains("hooked"));
+}
+
+#[tokio::test]
+async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_context() {
+    use crate::acceptance::AcceptanceResult as ParsedAcceptanceResult;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_root = TempDir::new().unwrap();
+    init_git_repo(repo_root.path()).await;
+
+    // Create a workspace commit so acceptance diff context has a real delta target.
+    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n").unwrap();
+    Command::new("git")
+        .args(["add", "feature.rs"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "Apply: change-a"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .unwrap();
+
+    let acceptance_output = "ACCEPTANCE: FAIL\n\nFINDINGS:\n- archive-readiness gate failed: cargo clippy -- -D warnings (src/lib.rs:42)\n- secondary finding\n";
+    let config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some(format!(
+            "printf '{}'",
+            acceptance_output.replace('\n', "\\n")
+        )),
+        ..Default::default()
+    });
+
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+    let mut agent = AgentRunner::new(config.clone());
+    let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
+
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+
+    let (result, _iteration) = execute_acceptance_in_workspace(
+        "change-a",
+        repo_root.path(),
+        &mut agent,
+        Some(event_tx),
+        None,
+        &ai_runner,
+        &config,
+        &acceptance_tail_injected,
+        &acceptance_history,
+        Some("main"),
+    )
+    .await
+    .unwrap();
+
+    match result {
+        crate::orchestration::AcceptanceResult::Fail { findings } => {
+            assert_eq!(findings.len(), 2);
+            assert!(
+                findings[0].contains("archive-readiness gate failed: cargo clippy -- -D warnings"),
+                "first finding should retain gate-specific archive-readiness context"
+            );
+            assert_eq!(
+                ParsedAcceptanceResult::Fail {
+                    findings: findings.clone()
+                },
+                ParsedAcceptanceResult::Fail {
+                    findings: vec![
+                        "archive-readiness gate failed: cargo clippy -- -D warnings (src/lib.rs:42)"
+                            .to_string(),
+                        "secondary finding".to_string(),
+                    ]
+                },
+                "acceptance parsing should preserve findings used by parallel failure reporting"
+            );
+        }
+        other => panic!("expected acceptance fail result, got {:?}", other),
+    }
+
+    let mut saw_gate_specific_warn_log = false;
+    let mut saw_acceptance_completed = false;
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            crate::events::ExecutionEvent::Log(entry) => {
+                if entry.level == crate::events::LogLevel::Warn
+                    && entry.operation.as_deref() == Some("acceptance")
+                    && entry.message.contains("blocking gate context")
+                    && entry
+                        .message
+                        .contains("archive-readiness gate failed: cargo clippy -- -D warnings")
+                {
+                    saw_gate_specific_warn_log = true;
+                }
+            }
+            crate::events::ExecutionEvent::AcceptanceCompleted { change_id } => {
+                if change_id == "change-a" {
+                    saw_acceptance_completed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_gate_specific_warn_log,
+        "parallel acceptance must emit a warn log that keeps archive-readiness gate context"
+    );
+    assert!(
+        saw_acceptance_completed,
+        "parallel acceptance should emit AcceptanceCompleted after failure handling"
+    );
 }
 
 #[tokio::test]
@@ -1909,6 +2044,68 @@ async fn fix_scheduler_premature_exit_decrements_pending_merge_counter_on_merge_
         executor.needs_reanalysis,
         "merge completion should trigger scheduler re-analysis"
     );
+}
+
+#[tokio::test]
+async fn test_scheduler_lifetime_controls_idle_exit_behavior() {
+    use tempfile::TempDir;
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let mut finite_executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), config.clone(), None);
+
+    assert!(
+        finite_executor.should_exit_when_idle(true, true, true),
+        "finite scheduler must exit when all work is drained"
+    );
+
+    finite_executor.set_persistent_lifetime();
+    assert!(
+        !finite_executor.should_exit_when_idle(true, true, true),
+        "persistent scheduler must remain alive while idle"
+    );
+
+    assert!(
+        !finite_executor.should_exit_when_idle(false, true, true),
+        "scheduler must not exit when active join tasks remain"
+    );
+}
+
+#[tokio::test]
+async fn test_idle_queue_addition_marks_reanalysis_and_enqueues_change() {
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::tui::queue::DynamicQueue;
+
+    let config = create_test_config();
+    let mut executor = ParallelExecutor::new(PathBuf::from("/tmp/test-repo"), config, None);
+    executor.set_persistent_lifetime();
+
+    // Use an existing change ID in this repository so list_changes_native can resolve it.
+    let change_id = "fix-scheduler-premature-exit";
+
+    let dynamic_queue = Arc::new(DynamicQueue::new());
+    dynamic_queue.push(change_id.to_string()).await;
+    executor.set_dynamic_queue(dynamic_queue);
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+    let mut reason = ReanalysisReason::Initial;
+
+    let queue_changed = executor
+        .check_dynamic_queue_and_add_changes(&mut queued, &in_flight, &mut reason)
+        .await;
+
+    assert!(
+        queue_changed,
+        "dynamic queue additions should trigger reanalysis"
+    );
+    assert_eq!(reason.to_string(), "queue");
+    assert!(executor.needs_reanalysis);
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, change_id);
 }
 
 #[tokio::test]
