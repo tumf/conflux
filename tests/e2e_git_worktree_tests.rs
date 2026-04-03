@@ -1,3 +1,5 @@
+#![cfg(feature = "heavy-tests")]
+
 //! Git worktree / real-boundary E2E integration tests.
 //!
 //! These tests intentionally use real git repositories, worktree commands, and

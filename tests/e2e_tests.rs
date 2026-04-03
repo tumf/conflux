@@ -1,3 +1,5 @@
+#![cfg(feature = "heavy-tests")]
+
 //! End-to-End Tests for OpenSpec Orchestrator
 //!
 //! These tests verify the complete workflow:

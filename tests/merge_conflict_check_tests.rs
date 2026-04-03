@@ -1,3 +1,5 @@
+#![cfg(feature = "heavy-tests")]
+
 //! Integration tests for git merge-tree conflict detection
 //!
 //! These tests verify that git merge-tree behaves as expected:

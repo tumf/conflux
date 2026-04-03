@@ -1,3 +1,5 @@
+#![cfg(feature = "heavy-tests")]
+
 //! Integration tests for process cleanup functionality
 //!
 //! Tests verify that child processes are properly cleaned up across platforms:
