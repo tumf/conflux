@@ -724,7 +724,6 @@ pub async fn execute_archive_in_workspace(
 }
 
 /// Execute acceptance test in a workspace with streaming output
-#[allow(clippy::too_many_arguments)]
 fn format_acceptance_failure_log_message(findings: &[String]) -> String {
     let finding_count = findings.len();
     let blocking_gate_context = findings
@@ -738,6 +737,7 @@ fn format_acceptance_failure_log_message(findings: &[String]) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_acceptance_in_workspace(
     change_id: &str,
     workspace_path: &Path,

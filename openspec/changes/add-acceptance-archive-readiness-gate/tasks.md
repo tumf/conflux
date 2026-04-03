@@ -21,3 +21,8 @@
 
 - [x] Preserve archive-readiness blocker details in every parallel operator-facing reporting path, including emitted acceptance failure event/log messages, instead of falling back to generic tail-line-count text.
 - [x] Add a parallel acceptance regression test that proves archive-readiness findings remain gate-specific when parallel acceptance fails, and update checklist completion claims only after that coverage exists.
+
+## Acceptance #3 Failure Follow-up
+
+- [x] Add a true parallel acceptance regression test that exercises the parallel failure path end-to-end enough to verify emitted operator-facing event/log messages keep the archive-readiness blocking gate context, rather than only testing the string-formatting helper.
+- [x] Keep `tasks.md` completion claims aligned with the implemented regression coverage; do not mark the parallel regression item complete until that coverage exists.
