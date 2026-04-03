@@ -51,3 +51,15 @@
 - **WHEN** a test exercises a real external boundary such as `git merge-tree`, worktree operations, OS process cleanup, or websocket protocol flow
 - **THEN** the test MAY remain in the repository as integration, contract, or e2e coverage
 - **AND** its placement, naming, or surrounding documentation SHALL NOT imply that it is pure unit coverage
+
+#### Scenario: Duplicate unit-test execution across crate targets is removed
+
+- **WHEN** the same internal test module can be reached through both library and binary crate targets
+- **THEN** the repository SHALL consolidate test ownership so the same unit-test logic is not unintentionally executed twice
+- **AND** test placement SHALL make it clear whether coverage belongs to the library crate, the binary crate, or an integration target
+
+#### Scenario: Timing-sensitive tests avoid unnecessary wall-clock delay
+
+- **WHEN** a test verifies debounce, retry, timeout, scheduler, or polling behavior that does not require real elapsed-time realism
+- **THEN** the repository SHALL prefer deterministic time control, injected timing configuration, or equivalent test-only mechanisms over multi-second real-time sleeps
+- **AND** the slowest tests SHALL NOT derive most of their runtime from avoidable wall-clock waiting

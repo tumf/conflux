@@ -29,6 +29,14 @@ The current test suite partially follows these rules, but several files still mi
   - Why: Some tests derive value specifically from exercising real `git`, process, websocket, or filesystem contracts.
   - Alternatives considered: convert all external-boundary tests to mocks; rejected because it would reduce contract confidence and exceeds requested scope.
 
+- Decision: Treat duplicate unit-test execution caused by library/binary target overlap as a hygiene issue within scope.
+  - Why: Duplicate execution inflates runtime, obscures test ownership, and makes cleanup incomplete if only file-level redundancy is addressed.
+  - Alternatives considered: leave crate-target overlap untouched and only reorganize test files; rejected because measured runtime cost is materially affected by duplicate target execution.
+
+- Decision: Prefer deterministic time control over real elapsed-time waiting in timing-sensitive tests where behavior under test does not require wall-clock realism.
+  - Why: debounce/retry/polling tests should verify logic, not consume 10+ seconds of runtime per case.
+  - Alternatives considered: keep real sleeps for behavioral fidelity; rejected where fake/injected time can verify the same behavior faster and more deterministically.
+
 ## Risks / Trade-offs
 
 - Removing tests can accidentally reduce behavior coverage.
@@ -39,6 +47,12 @@ The current test suite partially follows these rules, but several files still mi
 
 - Reclassification may reveal that some current "unit-style" tests are actually integration tests, increasing perceived integration footprint.
   - Mitigation: accept truthful classification as the desired outcome and extract pure helpers only where it clearly improves maintainability.
+
+- Refactoring timing-sensitive tests can accidentally weaken behavioral fidelity if fake time does not match runtime semantics.
+  - Mitigation: keep real-time coverage only where external timing behavior itself is the contract, and otherwise use deterministic time control for internal scheduler/debounce logic.
+
+- Consolidating duplicate execution paths across library and binary targets can expose accidental reliance on binary-local module declarations.
+  - Mitigation: move shared logic behind the library crate boundary first, then keep binary-specific tests only where they validate binary-only behavior.
 
 ## Migration Plan
 
