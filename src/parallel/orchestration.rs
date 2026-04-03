@@ -21,8 +21,24 @@ use super::events::send_event;
 use super::types::WorkspaceResult;
 use super::ParallelEvent;
 use super::ParallelExecutor;
+use super::SchedulerLifetime;
 
 impl ParallelExecutor {
+    pub(super) fn should_exit_when_idle(
+        &self,
+        join_set_empty: bool,
+        queued_empty: bool,
+        in_flight_empty: bool,
+    ) -> bool {
+        join_set_empty
+            && queued_empty
+            && in_flight_empty
+            && self.resolve_wait_changes.is_empty()
+            && self.manual_resolve_active() == 0
+            && self.pending_merge_count.load(Ordering::Relaxed) == 0
+            && self.scheduler_lifetime == SchedulerLifetime::Finite
+    }
+
     /// Execute changes with order-based dependency analysis and concurrent re-analysis.
     ///
     /// This method uses a `tokio::select!` based scheduler loop that:
@@ -134,19 +150,22 @@ impl ParallelExecutor {
             .await;
 
             // Step 2: Re-analysis if needed and debounce elapsed
-            if self.needs_reanalysis
-                && queued.is_empty()
+            let work_drained = queued.is_empty()
                 && in_flight.is_empty()
                 && self.resolve_wait_changes.is_empty()
                 && self.manual_resolve_active() == 0
-                && self.pending_merge_count.load(Ordering::Relaxed) == 0
-            {
-                // All work completed.
-                // Keep the scheduler alive while ResolveWait retries or manual resolve are active.
+                && self.pending_merge_count.load(Ordering::Relaxed) == 0;
+            if self.needs_reanalysis && work_drained {
+                if self.scheduler_lifetime == SchedulerLifetime::Finite {
+                    info!(
+                        "All changes completed (queued/in-flight/resolve_wait/manual_resolve empty), stopping"
+                    );
+                    break;
+                }
                 info!(
-                    "All changes completed (queued/in-flight/resolve_wait/manual_resolve empty), stopping"
+                    "Scheduler idle with no work; waiting for dynamic queue notifications (persistent lifetime)"
                 );
-                break;
+                self.needs_reanalysis = false;
             }
 
             if self.needs_reanalysis && !queued.is_empty() {
@@ -172,12 +191,11 @@ impl ParallelExecutor {
             }
 
             // Step 3: Check if all work is done (before waiting on select)
-            if join_set.is_empty()
-                && queued.is_empty()
-                && self.resolve_wait_changes.is_empty()
-                && self.manual_resolve_active() == 0
-                && self.pending_merge_count.load(Ordering::Relaxed) == 0
-            {
+            if self.should_exit_when_idle(
+                join_set.is_empty(),
+                queued.is_empty(),
+                in_flight.is_empty(),
+            ) {
                 info!(
                     "All work completed (join_set/queued/resolve_wait/manual_resolve empty), exiting scheduler loop"
                 );

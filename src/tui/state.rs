@@ -3350,6 +3350,28 @@ mod tests {
     }
 
     #[test]
+    fn test_retry_error_changes_returns_error_rows_to_queued_status() {
+        let change_a = create_test_change("error-a", 0, 1);
+        let change_b = create_test_change("error-b", 0, 1);
+        let change_ok = create_test_change("ok", 0, 1);
+
+        let mut app = AppState::new(vec![change_a, change_b, change_ok]);
+        app.mode = AppMode::Error;
+        app.changes[0].set_error_message_cache("boom-a".to_string());
+        app.changes[1].set_error_message_cache("boom-b".to_string());
+
+        let command = app.retry_error_changes();
+
+        assert!(
+            matches!(command, Some(TuiCommand::StartProcessing(ids)) if ids == vec!["error-a".to_string(), "error-b".to_string()])
+        );
+        assert_eq!(app.mode, AppMode::Running);
+        assert_eq!(app.changes[0].display_status_cache, "queued");
+        assert_eq!(app.changes[1].display_status_cache, "queued");
+        assert_eq!(app.changes[2].display_status_cache, "not queued");
+    }
+
+    #[test]
     fn test_selected_count() {
         // Changes start unselected
         let changes = vec![

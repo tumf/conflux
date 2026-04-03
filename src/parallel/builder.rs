@@ -18,7 +18,10 @@ use crate::config::OrchestratorConfig;
 use crate::hooks::HookRunner;
 use crate::vcs::{GitWorkspaceManager, VcsBackend, WorkspaceManager};
 
-use super::{FailedChangeTracker, ParallelEvent, ParallelExecutor, DEFAULT_MAX_CONFLICT_RETRIES};
+use super::{
+    FailedChangeTracker, ParallelEvent, ParallelExecutor, SchedulerLifetime,
+    DEFAULT_MAX_CONFLICT_RETRIES,
+};
 
 impl ParallelExecutor {
     /// Create a new parallel executor with automatic VCS detection
@@ -158,6 +161,7 @@ impl ParallelExecutor {
             manual_resolve_count: None,
             auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            scheduler_lifetime: SchedulerLifetime::Finite,
         }
     }
 
@@ -194,6 +198,16 @@ impl ParallelExecutor {
     /// Set the dynamic queue for runtime change additions (TUI mode).
     pub fn set_dynamic_queue(&mut self, dynamic_queue: Arc<crate::tui::queue::DynamicQueue>) {
         self.dynamic_queue = Some(dynamic_queue);
+    }
+
+    /// Configure scheduler lifetime policy.
+    pub fn set_scheduler_lifetime(&mut self, lifetime: SchedulerLifetime) {
+        self.scheduler_lifetime = lifetime;
+    }
+
+    /// Keep scheduler alive until explicit stop (loop-based frontends).
+    pub fn set_persistent_lifetime(&mut self) {
+        self.set_scheduler_lifetime(SchedulerLifetime::Persistent);
     }
 
     /// Set the manual resolve counter for tracking active manual resolve operations (TUI mode).
