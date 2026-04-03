@@ -324,6 +324,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        scheduler_lifetime: SchedulerLifetime::Finite,
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -612,6 +613,7 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        scheduler_lifetime: SchedulerLifetime::Finite,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -788,6 +790,7 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        scheduler_lifetime: SchedulerLifetime::Finite,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -936,6 +939,7 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        scheduler_lifetime: SchedulerLifetime::Finite,
     };
 
     let revisions = vec![workspace_a.name];
@@ -1113,6 +1117,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        scheduler_lifetime: SchedulerLifetime::Finite,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1304,6 +1309,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        scheduler_lifetime: SchedulerLifetime::Finite,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1501,6 +1507,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        scheduler_lifetime: SchedulerLifetime::Finite,
     };
 
     let revisions = vec![workspace_a.name];
@@ -1909,6 +1916,68 @@ async fn fix_scheduler_premature_exit_decrements_pending_merge_counter_on_merge_
         executor.needs_reanalysis,
         "merge completion should trigger scheduler re-analysis"
     );
+}
+
+#[tokio::test]
+async fn test_scheduler_lifetime_controls_idle_exit_behavior() {
+    use tempfile::TempDir;
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let mut finite_executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), config.clone(), None);
+
+    assert!(
+        finite_executor.should_exit_when_idle(true, true, true),
+        "finite scheduler must exit when all work is drained"
+    );
+
+    finite_executor.set_persistent_lifetime();
+    assert!(
+        !finite_executor.should_exit_when_idle(true, true, true),
+        "persistent scheduler must remain alive while idle"
+    );
+
+    assert!(
+        !finite_executor.should_exit_when_idle(false, true, true),
+        "scheduler must not exit when active join tasks remain"
+    );
+}
+
+#[tokio::test]
+async fn test_idle_queue_addition_marks_reanalysis_and_enqueues_change() {
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::tui::queue::DynamicQueue;
+
+    let config = create_test_config();
+    let mut executor = ParallelExecutor::new(PathBuf::from("/tmp/test-repo"), config, None);
+    executor.set_persistent_lifetime();
+
+    // Use an existing change ID in this repository so list_changes_native can resolve it.
+    let change_id = "fix-scheduler-premature-exit";
+
+    let dynamic_queue = Arc::new(DynamicQueue::new());
+    dynamic_queue.push(change_id.to_string()).await;
+    executor.set_dynamic_queue(dynamic_queue);
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+    let mut reason = ReanalysisReason::Initial;
+
+    let queue_changed = executor
+        .check_dynamic_queue_and_add_changes(&mut queued, &in_flight, &mut reason)
+        .await;
+
+    assert!(
+        queue_changed,
+        "dynamic queue additions should trigger reanalysis"
+    );
+    assert_eq!(reason.to_string(), "queue");
+    assert!(executor.needs_reanalysis);
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, change_id);
 }
 
 #[tokio::test]
