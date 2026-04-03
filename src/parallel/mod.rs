@@ -34,7 +34,7 @@ pub use types::{FailedChangeTracker, MergeResult, WorkspaceResult};
 // Re-exports used in tests via `use super::super::*`.
 #[cfg(test)]
 pub use crate::vcs::Workspace;
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 pub use merge::MergeAttempt;
 
 use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};

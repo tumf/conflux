@@ -49,6 +49,8 @@ Conflux separates tests into two explicit tiers:
 | `tests/merge_conflict_check_tests.rs` | heavy integration / real-boundary | no (requires `heavy-tests`) | Real `git merge-tree` process + repo mutation |
 | `src/parallel/tests/executor.rs` (selected tests) | heavy integration / real-boundary | no (requires `heavy-tests`) | Real git repo/worktree/merge lifecycle used by parallel executor merge tests |
 | `src/server/api.rs` (selected tests) | heavy integration / real-boundary | no (requires `heavy-tests`) | Real repo setup / project add flow / setup script behavior |
+| `src/ai_command_runner.rs` (selected inactivity-timeout tests) | heavy integration / real-time | no (requires `heavy-tests`) | Deliberately waits on inactivity timeout/retry behavior and is too slow for default path |
+| `src/orchestration/archive.rs` (selected retry/verify test) | heavy integration / shell-retry | no (requires `heavy-tests`) | End-to-end archive retry verification via shell script and filesystem mutation |
 
 For heavy suites, keep `#![cfg(feature = "heavy-tests")]` at file top so they remain opt-in by design.
 

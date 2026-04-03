@@ -43,7 +43,7 @@ fn heavy_real_boundary_suites_stay_feature_gated() {
         );
     }
 
-    let function_gated: [(&str, &[&str]); 2] = [
+    let function_gated: [(&str, &[&str]); 4] = [
         (
             "src/parallel/tests/executor.rs",
             &[
@@ -58,6 +58,17 @@ fn heavy_real_boundary_suites_stay_feature_gated() {
                 "test_add_project_without_repo_root_setup_succeeds_without_marker",
                 "test_app_state_resolve_command_comes_from_top_level_config",
             ],
+        ),
+        (
+            "src/ai_command_runner.rs",
+            &[
+                "test_inactivity_timeout_streaming_pipeline",
+                "test_inactivity_timeout_retry",
+            ],
+        ),
+        (
+            "src/orchestration/archive.rs",
+            &["test_archive_change_retries_until_verified"],
         ),
     ];
 
