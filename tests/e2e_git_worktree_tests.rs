@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use conflux::orchestration::execute_rejection_flow;
 
+#[path = "support/shared_test_support.rs"]
 mod shared_test_support;
 
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(0);

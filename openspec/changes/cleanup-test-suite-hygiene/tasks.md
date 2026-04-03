@@ -14,3 +14,8 @@
 
 - Expand the hygiene policy to include a spec-to-test mapping artifact if the team wants continuous reporting of scenario-to-test coverage.
 - Consider adding CI checks or lint-like guards that reject new tests with ambiguous scope or unsynchronized process-global mutations.
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Move `tests/shared_test_support.rs` out of the top-level `tests/` entrypoint set (for example into `tests/support/` with an explicit module import) so `cargo test -- --list` no longer builds/runs a standalone empty integration-test target for shared helpers.
+- [x] Replace the unsupported duplicate-execution verification note in `openspec/changes/cleanup-test-suite-hygiene/inventory.md` with concrete evidence from the current repo state (for example representative test-name uniqueness from `cargo test -- --list`), instead of claiming an unobserved `running 0 tests` result for `src/main.rs`.

@@ -58,8 +58,11 @@
 
 - Duplicate test-target execution cleanup:
   - Change: `src/main.rs` now uses `#![cfg(not(test))]`.
-  - Verification evidence: `cargo test -- --list` shows `Running unittests src/main.rs` with `running 0 tests`, while unit suites execute under `src/lib.rs`.
-  - Expected runtime impact: removes unintended duplicate unit-test execution path through the binary target.
+  - Verification evidence (from current `cargo test -- --list` output captured in `/tmp/cflx-test-list.txt`):
+    - `Running unittests src/lib.rs` is present.
+    - representative unit tests such as `parallel::tests::executor::test_debounce_with_queue_changes` and `parallel::tests::executor::test_concurrent_reanalysis_queue_dispatch` are listed once in the `src/lib.rs` unit-test inventory.
+    - no standalone `tests/shared_test_support.rs` integration target appears after moving helper code to `tests/support/shared_test_support.rs`.
+  - Expected runtime impact: removes unintended duplicate target execution and avoids helper-only integration target overhead.
 
 - Timing-sensitive debounce tests:
   - Change: `src/parallel/tests/executor.rs` no longer waits `tokio::time::sleep(Duration::from_secs(11))` in debounce tests; tests now set `last_queue_change_at` to an expired instant.

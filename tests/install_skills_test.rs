@@ -8,6 +8,7 @@ use conflux::install_skills::{run_install_skills, InstallSkillsOptions};
 use std::fs;
 use tempfile::TempDir;
 
+#[path = "support/shared_test_support.rs"]
 mod shared_test_support;
 
 // ---------------------------------------------------------------------------
