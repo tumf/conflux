@@ -1,0 +1,46 @@
+---
+change_type: implementation
+priority: medium
+dependencies: []
+references:
+  - openspec/specs/parallel-execution/spec.md
+  - openspec/specs/orchestration-state/spec.md
+  - src/execution/apply.rs
+  - src/orchestration/rejection.rs
+---
+
+# Change: Split rejection review from acceptance
+
+**Change Type**: implementation
+
+## Problem / Context
+
+現在の blocked handoff は、`apply` が `openspec/changes/<change_id>/REJECTED.md` を生成した後も rejection review を通常の acceptance フローに内包している。これにより、実装品質の検証である acceptance と、change を reject すべきかの審査が同じステップに混在している。
+
+既存仕様では apply-generated `REJECTED.md` は rejection proposal であり、acceptance がそれを confirm したときのみ terminal rejection になる。また、base branch に反映されるのは `REJECTED.md` のみで、他の worktree 変更は捨てられる。
+
+ユーザー要件として、workflow 上 `accept` と reject review は分離されなければならない。新しい専用ステータス `rejecting` を導入し、`apply` が rejection proposal を生成した change は通常 acceptance に進まず `rejecting` に入る。`rejecting` は `REJECTED.md` を審査し、(1) reject を認めて `REJECTED.md` のみを base に反映するか、(2) reject を棄却して `REJECTED.md` を除去し apply に戻すか、のどちらかを決定する。さらに reject 棄却時には、`tasks.md` に reject ではない解決方針のタスクを追加しなければならない。
+
+## Proposed Solution
+
+- apply-generated `REJECTED.md` を acceptance handoff ではなく rejection-review handoff として扱う。
+- shared runtime state / display status に `rejecting` を追加し、通常 acceptance から独立した active stage とする。
+- `rejecting` は `REJECTED.md` をレビューし、`confirm_rejection` または `resume_apply` を返す。
+- `confirm_rejection` の場合は既存の rejection flow を維持し、base branch には `openspec/changes/<change_id>/REJECTED.md` のみを commit する。
+- `resume_apply` の場合は worktree から `REJECTED.md` を除去し、`tasks.md` に reject 以外の解決タスクを追加した上で `applying` に戻す。
+- parallel / serial の resume・表示・API・イベントは `rejecting` を独立した実行段階として扱う。
+
+## Acceptance Criteria
+
+- apply が `REJECTED.md` を生成した change は通常 acceptance ではなく `rejecting` に遷移する。
+- `rejecting` は rejection proposal の妥当性を判定し、`confirm_rejection` または `resume_apply` の二択を返す。
+- `confirm_rejection` 時、base branch に反映されるのは `REJECTED.md` のみである。
+- `resume_apply` 時、worktree の `REJECTED.md` は削除され、`tasks.md` に reject 以外の解決タスクが追加され、change は `applying` に戻る。
+- TUI / Web API / shared state の表示で `rejecting` が独立した active status として観測できる。
+- resume 時に `REJECTED.md` が存在する非 terminal workspace は `accepting` ではなく `rejecting` に復元される。
+
+## Out of Scope
+
+- `REJECTED.md` 以外の proposal / tasks / spec / code 変更を base branch に反映する rejection merge モード
+- rejection review の結果に第三の判定（保留、手動承認待ち等）を追加すること
+- rejection review の根拠を外部 DB や別メタデータファイルに永続化すること
