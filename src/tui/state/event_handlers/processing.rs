@@ -134,3 +134,204 @@ impl AppState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openspec::{Change, ProposalMetadata};
+
+    fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
+        Change {
+            id: id.to_string(),
+            completed_tasks: completed,
+            total_tasks: total,
+            last_modified: "now".to_string(),
+            dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
+        }
+    }
+
+    #[test]
+    fn processing_started_sets_current_change_and_applying_state() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.handle_processing_started("change-a".to_string());
+
+        assert_eq!(app.current_change, Some("change-a".to_string()));
+        let change = app.changes.iter().find(|c| c.id == "change-a").unwrap();
+        assert_eq!(change.display_status_cache, "applying");
+        assert!(change.started_at.is_some());
+    }
+
+    #[test]
+    fn processing_error_keeps_app_mode() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Running;
+        app.current_change = Some("test-change".to_string());
+        app.changes[0].selected = true;
+
+        app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
+
+        assert_eq!(app.mode, AppMode::Running);
+        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
+        assert_eq!(change.display_status_cache, "error");
+        assert!(!change.selected);
+        assert_eq!(app.error_change_id, Some("test-change".to_string()));
+        assert_eq!(app.current_change, None);
+    }
+
+    #[test]
+    fn processing_error_from_select_mode() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Select;
+        app.changes[0].selected = true;
+
+        app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
+
+        assert_eq!(app.mode, AppMode::Select);
+        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
+        assert_eq!(change.display_status_cache, "error");
+        assert!(!change.selected);
+    }
+
+    #[test]
+    fn processing_completed_updates_status() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.handle_processing_completed("test-change".to_string());
+
+        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
+        assert_eq!(change.display_status_cache, "archiving");
+    }
+
+    #[test]
+    fn all_completed_transitions_to_select() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Running;
+        app.handle_all_completed();
+
+        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.current_change, None);
+    }
+
+    #[test]
+    fn all_completed_preserves_error_mode() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.mode = AppMode::Error;
+        app.handle_all_completed();
+
+        assert_eq!(app.mode, AppMode::Error);
+    }
+
+    #[test]
+    fn all_completed_keeps_stopped_mode() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Stopped;
+
+        app.handle_all_completed();
+
+        assert_eq!(app.mode, AppMode::Stopped);
+    }
+
+    #[test]
+    fn stopped_resets_display_status_cache() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.changes[0].display_status_cache = "queued".to_string();
+        app.changes[0].selected = true;
+
+        app.handle_stopped();
+
+        assert_eq!(app.mode, AppMode::Stopped);
+        assert_eq!(app.changes[0].display_status_cache, "not queued");
+        assert!(app.changes[0].selected);
+    }
+
+    #[test]
+    fn handle_stopped_resets_blocked_to_not_queued() {
+        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].display_status_cache = "applying".to_string();
+        app.changes[0].selected = true;
+        app.changes[1].display_status_cache = "blocked".to_string();
+        app.changes[1].selected = true;
+
+        app.handle_stopped();
+
+        assert_eq!(app.changes[0].display_status_cache, "not queued");
+        assert_eq!(app.changes[1].display_status_cache, "not queued");
+        assert_eq!(app.mode, AppMode::Stopped);
+    }
+
+    #[test]
+    fn handle_all_completed_resets_blocked_to_not_queued() {
+        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].display_status_cache = "queued".to_string();
+        app.changes[0].selected = true;
+        app.changes[1].display_status_cache = "blocked".to_string();
+        app.changes[1].selected = true;
+
+        app.handle_all_completed();
+
+        assert_eq!(app.changes[0].display_status_cache, "not queued");
+        assert_eq!(app.changes[1].display_status_cache, "not queued");
+        assert_eq!(app.mode, AppMode::Select);
+    }
+
+    #[test]
+    fn stopped_resets_resolving_changes() {
+        let changes = vec![
+            create_test_change("change-a", 3, 3),
+            create_test_change("change-b", 2, 4),
+        ];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].display_status_cache = "resolving".to_string();
+        app.changes[0].selected = true;
+        app.changes[1].display_status_cache = "merged".to_string();
+
+        app.handle_stopped();
+
+        assert_eq!(app.changes[0].display_status_cache, "not queued");
+        assert!(app.changes[0].selected);
+        assert_eq!(app.mode, AppMode::Stopped);
+    }
+
+    #[test]
+    fn try_transition_to_select_no_op_when_not_running() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Stopped;
+
+        app.try_transition_to_select();
+
+        assert_eq!(app.mode, AppMode::Stopped);
+    }
+
+    #[test]
+    fn try_transition_to_select_stays_running_with_active() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].display_status_cache = "applying".to_string();
+
+        app.try_transition_to_select();
+
+        assert_eq!(app.mode, AppMode::Running);
+    }
+}
