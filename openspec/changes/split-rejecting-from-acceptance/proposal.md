@@ -27,18 +27,21 @@ references:
 
 - apply-generated `REJECTED.md` を acceptance handoff ではなく rejection-review handoff として扱う。
 - shared runtime state / display status に `rejecting` を追加し、通常 acceptance から独立した active stage とする。
-- `rejecting` は `REJECTED.md` をレビューし、`confirm_rejection` または `resume_apply` を返す。
-- `confirm_rejection` の場合は既存の rejection flow を維持し、base branch には `openspec/changes/<change_id>/REJECTED.md` のみを commit する。
-- `resume_apply` の場合は worktree から `REJECTED.md` を除去し、`tasks.md` に reject 以外の解決タスクを追加した上で `applying` に戻す。
+- `rejecting` は acceptance とは別の専用 review operation として `REJECTED.md` をレビューし、最終行に machine-readable verdict marker を 1 つだけ出力する。
+- rejecting review の verdict marker は `REJECTION_REVIEW: CONFIRM` または `REJECTION_REVIEW: RESUME` のみとし、runtime はこの dedicated protocol を parse して次段に進む。
+- `confirm_rejection` / `REJECTION_REVIEW: CONFIRM` の場合は既存の rejection flow を維持し、base branch には `openspec/changes/<change_id>/REJECTED.md` のみを commit する。
+- `resume_apply` / `REJECTION_REVIEW: RESUME` の場合は worktree から `REJECTED.md` を除去し、`tasks.md` に reject ではない解決タスクを追加した上で `applying` に戻す。
+- apply-generated `REJECTED.md` handoff は通常 acceptance に送らず rejecting review にルーティングし、通常 acceptance は `REJECTED.md` のない changes のみを扱う。
 - parallel / serial の resume・表示・API・イベントは `rejecting` を独立した実行段階として扱う。
 - rejecting 導入に伴うエージェント挙動の仕様変更は product code だけでなく `skills/cflx-workflow/` 配下の workflow skill source を canonical source として更新する。
 
 ## Acceptance Criteria
 
 - apply が `REJECTED.md` を生成した change は通常 acceptance ではなく `rejecting` に遷移する。
-- `rejecting` は rejection proposal の妥当性を判定し、`confirm_rejection` または `resume_apply` の二択を返す。
-- `confirm_rejection` 時、base branch に反映されるのは `REJECTED.md` のみである。
-- `resume_apply` 時、worktree の `REJECTED.md` は削除され、`tasks.md` に reject 以外の解決タスクが追加され、change は `applying` に戻る。
+- `rejecting` は rejection proposal の妥当性を判定し、runtime が parse 可能な dedicated verdict marker として `REJECTION_REVIEW: CONFIRM` または `REJECTION_REVIEW: RESUME` の二択だけを返す。
+- `confirm_rejection` / `REJECTION_REVIEW: CONFIRM` 時、base branch に反映されるのは `REJECTED.md` のみである。
+- `resume_apply` / `REJECTION_REVIEW: RESUME` 時、worktree の `REJECTED.md` は削除され、`tasks.md` に reject 以外の解決タスクが追加され、change は `applying` に戻る。
+- apply-generated `REJECTED.md` handoff は通常 acceptance ではなく rejecting review に入り、`ACCEPTANCE: BLOCKED` はこの handoff の最終判断に使われない。
 - TUI / Web API / shared state の表示で `rejecting` が独立した active status として観測できる。
 - resume 時に `REJECTED.md` が存在する非 terminal workspace は `accepting` ではなく `rejecting` に復元される。
 - workflow skill source (`skills/cflx-workflow/SKILL.md` と関連 reference) が rejecting 分離後の handoff / verdict / task-update semantics と整合する。

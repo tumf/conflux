@@ -4,7 +4,9 @@
 
 ParallelRunService SHALL support blocked handoff from both acceptance and apply execution phases. When apply execution records a blocker by generating `openspec/changes/<change_id>/REJECTED.md` as a rejection proposal, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT enter the normal acceptance flow. Instead, the runtime SHALL run rejection review and require one of two outcomes: `confirm_rejection` or `resume_apply`.
 
-`confirm_rejection` SHALL execute the rejection flow and finalize the change as rejected after the base branch records `openspec/changes/<change_id>/REJECTED.md`. `resume_apply` SHALL delete the worktree-local `REJECTED.md`, append at least one non-rejection recovery task to the worktree-local `tasks.md`, and return the change to apply so that the blocker is addressed as normal implementation work.
+The rejecting review operation SHALL end with exactly one dedicated marker line: `REJECTION_REVIEW: CONFIRM` or `REJECTION_REVIEW: RESUME`. Runtime routing SHALL parse that marker instead of relying on `ACCEPTANCE: BLOCKED` for apply-generated rejection proposals.
+
+`confirm_rejection` / `REJECTION_REVIEW: CONFIRM` SHALL execute the rejection flow and finalize the change as rejected after the base branch records `openspec/changes/<change_id>/REJECTED.md`. `resume_apply` / `REJECTION_REVIEW: RESUME` SHALL delete the worktree-local `REJECTED.md`, append at least one non-rejection recovery task to the worktree-local `tasks.md`, and return the change to apply so that the blocker is addressed as normal implementation work.
 
 Parallel rejection handling SHALL NOT rely on `openspec resolve <change_id>` and SHALL NOT merge additional worktree files into the base branch. When rejection is confirmed, the base branch SHALL receive only `openspec/changes/<change_id>/REJECTED.md`.
 
@@ -16,6 +18,13 @@ Parallel rejection handling SHALL NOT rely on `openspec resolve <change_id>` and
 - **THEN** the workspace enters `rejecting`
 - **AND** the change does not enter the normal acceptance flow
 - **AND** apply does not immediately retry the same change
+
+#### Scenario: rejecting review uses dedicated verdict marker
+
+- **GIVEN** a workspace is in `rejecting`
+- **WHEN** the rejecting review operation completes successfully
+- **THEN** its final marker is exactly one of `REJECTION_REVIEW: CONFIRM` or `REJECTION_REVIEW: RESUME`
+- **AND** runtime routing does not require `ACCEPTANCE: BLOCKED` to choose the next step
 
 #### Scenario: rejecting confirms rejection
 
