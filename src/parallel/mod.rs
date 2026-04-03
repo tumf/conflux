@@ -49,6 +49,15 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_MAX_CONFLICT_RETRIES: u32 = 3;
 
+/// Defines when the parallel scheduler should terminate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerLifetime {
+    /// Finite execution (CLI `run`): stop once no queued/in-flight work remains.
+    Finite,
+    /// Persistent execution (loop-based/TUI): keep waiting for queue notifications until stopped.
+    Persistent,
+}
+
 /// Global lock for serializing all merge/resolve operations to base branch.
 ///
 /// This ensures that only one merge operation can modify the base branch
@@ -127,6 +136,8 @@ pub struct ParallelExecutor {
     auto_resolve_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Counter for background merge tasks that have been spawned but not yet handled by scheduler.
     pending_merge_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Scheduler lifetime policy (finite for CLI run, persistent for loop-based frontends).
+    scheduler_lifetime: SchedulerLifetime,
 }
 
 #[cfg(test)]
