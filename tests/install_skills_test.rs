@@ -1,17 +1,14 @@
+use agent_skills_rs::LockManager;
+use conflux::install_skills::{run_install_skills, InstallSkillsOptions};
 /// Integration / filesystem tests for `cflx install-skills`.
 ///
 /// These tests verify that `run_install_skills` correctly writes skills to
 /// the expected directories and updates the matching lock file for both
 /// project-scope and global-scope installs using bundled skills.
 use std::fs;
-use std::sync::Mutex;
-
-use agent_skills_rs::LockManager;
-use conflux::install_skills::{run_install_skills, InstallSkillsOptions};
 use tempfile::TempDir;
 
-/// Single process-wide mutex for tests that mutate the HOME env variable.
-static HOME_MUTEX: Mutex<()> = Mutex::new(());
+mod shared_test_support;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -72,7 +69,7 @@ fn test_global_scope_install_uses_home_agents_dir_and_updates_lock_file() {
     let workdir = TempDir::new().unwrap();
     let fake_home = TempDir::new().unwrap();
 
-    let _guard = HOME_MUTEX.lock().unwrap();
+    let _guard = shared_test_support::env_lock();
 
     let orig_home = std::env::var("HOME").ok();
     unsafe {
