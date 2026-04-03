@@ -101,6 +101,8 @@ pub enum ActivityState {
     Applying,
     /// Currently running acceptance checks.
     Accepting,
+    /// Currently running dedicated rejection review.
+    Rejecting,
     /// Currently archiving.
     Archiving,
     /// Currently executing a merge resolve.
@@ -207,7 +209,7 @@ impl ChangeRuntimeState {
     /// Derive the display status string used by TUI and Web.
     ///
     /// Returns one of: "not queued", "queued", "blocked", "applying",
-    /// "accepting", "archiving", "resolving", "merge wait", "resolve pending",
+    /// "accepting", "rejecting", "archiving", "resolving", "merge wait", "resolve pending",
     /// "archived", "merged", "error", "stopped".
     pub fn display_status(&self) -> &'static str {
         // Terminal states take precedence.
@@ -223,6 +225,7 @@ impl ChangeRuntimeState {
         match self.activity {
             ActivityState::Applying => return "applying",
             ActivityState::Accepting => return "accepting",
+            ActivityState::Rejecting => return "rejecting",
             ActivityState::Archiving => return "archiving",
             ActivityState::Resolving => return "resolving",
             ActivityState::Idle => {}
@@ -250,6 +253,7 @@ impl ChangeRuntimeState {
             "blocked" => ratatui::style::Color::Gray,
             "applying" => ratatui::style::Color::Cyan,
             "accepting" => ratatui::style::Color::LightGreen,
+            "rejecting" => ratatui::style::Color::LightYellow,
             "archiving" => ratatui::style::Color::Magenta,
             "archived" => ratatui::style::Color::Blue,
             "merged" => ratatui::style::Color::LightBlue,
@@ -951,6 +955,36 @@ impl OrchestratorState {
                     rt.activity = ActivityState::Idle;
                     rt.wait_state = WaitState::None;
                     rt.queue_intent = QueueIntent::NotQueued;
+                }
+            }
+
+            // Workspace status synchronization events (parallel mode)
+            ExecutionEvent::WorkspaceStatusUpdated {
+                workspace_name: _,
+                status,
+            } => {
+                if let Some(change_id) = self.current_change_id.clone() {
+                    let rt = self.runtime_entry(&change_id);
+                    if !rt.is_terminal() && !rt.dequeued {
+                        match status {
+                            crate::vcs::WorkspaceStatus::Applying => {
+                                rt.activity = ActivityState::Applying;
+                            }
+                            crate::vcs::WorkspaceStatus::Accepting => {
+                                rt.activity = ActivityState::Accepting;
+                            }
+                            crate::vcs::WorkspaceStatus::Rejecting => {
+                                rt.activity = ActivityState::Rejecting;
+                            }
+                            crate::vcs::WorkspaceStatus::Archiving => {
+                                rt.activity = ActivityState::Archiving;
+                            }
+                            crate::vcs::WorkspaceStatus::Resolving => {
+                                rt.activity = ActivityState::Resolving;
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
 

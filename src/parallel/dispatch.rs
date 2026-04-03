@@ -92,6 +92,7 @@ pub(super) enum ResumeAction {
     Terminal,
     Apply,
     Acceptance,
+    Rejecting,
 }
 
 pub(super) fn decide_resume_action(
@@ -102,6 +103,7 @@ pub(super) fn decide_resume_action(
     match state {
         WorkspaceState::Merged | WorkspaceState::Archived => ResumeAction::Terminal,
         WorkspaceState::Archiving => ResumeAction::Acceptance,
+        WorkspaceState::Rejecting => ResumeAction::Rejecting,
         WorkspaceState::Applied => {
             match task_parser::parse_progress_with_fallback(change_id, Some(workspace_path)) {
                 Ok(progress) if progress.total > 0 && progress.completed >= progress.total => {
@@ -419,6 +421,75 @@ impl ParallelExecutor {
             // Resume routing determines whether we start from apply or acceptance.
             // The acceptance-only shortcut is consumed after one cycle so that any
             // acceptance FAIL/command error path re-enters apply on the next cycle.
+            // Rejecting resumes are handled as an immediate rejection review branch.
+            if matches!(resume_action, ResumeAction::Rejecting) {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::WorkspaceStatusUpdated {
+                            workspace_name: workspace.name.clone(),
+                            status: WorkspaceStatus::Rejecting,
+                        })
+                        .await;
+                }
+
+                let rejected_path = workspace
+                    .path
+                    .join("openspec")
+                    .join("changes")
+                    .join(&change_id)
+                    .join("REJECTED.md");
+                let reason = format!(
+                    "Resumed rejecting review confirmed (proposal: {})",
+                    rejected_path.display()
+                );
+                let resolved_base = base_branch.clone();
+                match execute_rejection_flow(
+                    &change_id,
+                    &reason,
+                    &workspace.path,
+                    &resolved_base,
+                    &repo_root,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::ChangeRejected {
+                                    change_id: change_id.clone(),
+                                    reason: reason.clone(),
+                                })
+                                .await;
+                            let _ = tx
+                                .send(ParallelEvent::ChangeDequeued {
+                                    change_id: change_id.clone(),
+                                })
+                                .await;
+                        }
+                        cancel_monitor.abort();
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: None,
+                            rejected: Some(reason),
+                        };
+                    }
+                    Err(e) => {
+                        cancel_monitor.abort();
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: Some(format!(
+                                "Rejected flow failed while resuming rejecting stage: {}",
+                                e
+                            )),
+                            rejected: None,
+                        };
+                    }
+                }
+            }
             let mut skip_apply_once = matches!(resume_action, ResumeAction::Acceptance);
 
             let _apply_revision = loop {
@@ -563,19 +634,75 @@ impl ParallelExecutor {
                     info!(
                         change_id = %change_id,
                         rejected_path = %handoff.rejected_path.display(),
-                        "Apply emitted blocked handoff proposal; forwarding to acceptance"
+                        "Apply emitted blocked handoff proposal; routing to rejecting stage"
                     );
                     if let Some(ref tx) = event_tx {
                         let _ = tx
+                            .send(ParallelEvent::WorkspaceStatusUpdated {
+                                workspace_name: workspace.name.clone(),
+                                status: WorkspaceStatus::Rejecting,
+                            })
+                            .await;
+                        let _ = tx
                             .send(ParallelEvent::Log(
                                 LogEntry::warn(format!(
-                                    "Apply blocked handoff detected via {}",
+                                    "Apply blocked handoff detected via {}; entering rejecting stage",
                                     handoff.rejected_path.display()
                                 ))
                                 .with_change_id(&change_id)
-                                .with_operation("apply"),
+                                .with_operation("rejecting"),
                             ))
                             .await;
+                    }
+
+                    let reason = format!(
+                        "Apply-blocked rejection confirmed (proposal: {})",
+                        handoff.rejected_path.display()
+                    );
+                    let resolved_base = base_branch.clone();
+                    match execute_rejection_flow(
+                        &change_id,
+                        &reason,
+                        &workspace.path,
+                        &resolved_base,
+                        &repo_root,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::ChangeRejected {
+                                        change_id: change_id.clone(),
+                                        reason: reason.clone(),
+                                    })
+                                    .await;
+                                let _ = tx
+                                    .send(ParallelEvent::ChangeDequeued {
+                                        change_id: change_id.clone(),
+                                    })
+                                    .await;
+                            }
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: None,
+                                rejected: Some(reason),
+                            };
+                        }
+                        Err(e) => {
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!(
+                                    "Rejected flow failed after apply blocked handoff: {}",
+                                    e
+                                )),
+                                rejected: None,
+                            };
+                        }
                     }
                 }
 
