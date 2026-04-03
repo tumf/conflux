@@ -22,6 +22,6 @@
 
 ## Acceptance #2 Failure Follow-up
 
-- [ ] Fix `config::tests::test_config_merge_partial_project_inherits_global` failing at `src/config/mod.rs:1306` in full `cargo test` run.
-- [ ] Fix server API selection/control regressions surfaced by full `cargo test`: `test_global_control_run_records_call` (`src/server/api.rs:5357`), `test_global_control_run_skips_unremarked_error_changes` (`src/server/api.rs:2318`), `test_global_control_stop_records_call` (`src/server/api.rs:5822`), `test_stop_and_dequeue_change_clears_only_target_selection` (`src/server/api.rs:5666`), and `test_toggle_all_change_selection_remarks_error_changes_for_next_run` (`src/server/api.rs:5784`).
-- [ ] Re-run `cargo test` and confirm zero failures before marking acceptance follow-up complete.
+- [x] Fix `config::tests::test_config_merge_partial_project_inherits_global` failing at `src/config/mod.rs:1306` in full `cargo test` run (verified green via targeted run: `cargo test config::tests::test_config_merge_partial_project_inherits_global -- --nocapture`).
+- [x] Fix server API selection/control regressions surfaced by full `cargo test`: `test_global_control_run_records_call` (`src/server/api.rs:5357`), `test_global_control_run_skips_unremarked_error_changes` (`src/server/api.rs:2318`), `test_global_control_stop_records_call` (`src/server/api.rs:5822`), `test_stop_and_dequeue_change_clears_only_target_selection` (`src/server/api.rs:5666`), and `test_toggle_all_change_selection_remarks_error_changes_for_next_run` (`src/server/api.rs:5784`) (verified green via targeted runs for each test).
+- [x] Re-run `cargo test` and confirm zero failures before marking acceptance follow-up complete (final full run reports no failures; doc-tests tail ended with `ok. 0 passed; 0 failed; 18 ignored; ...`).
